@@ -158,7 +158,7 @@ pub fn set(on: bool) {
     ON.store(on, Ordering::Relaxed);
     if on {
         note(format!(
-            "Moonglow Toolset {} on {} {}, {} UTC",
+            "Moonscar Toolset {} on {} {}, {} UTC",
             mg_core::release::version(),
             std::env::consts::OS,
             std::env::consts::ARCH,

@@ -1,3 +1,11 @@
+> [!NOTE]
+> **This is Moonscar**, a tweaked version of
+> [Moonglow Toolset](https://github.com/jadzziaa/moonglow-toolset) for the
+> **Scars of Risenholm** persistent world. It is kept on the `moonscar` branch
+> and installs alongside Moonglow, so you can use both. For general use, and
+> for Moonglow's own releases and issues, see the
+> [original project](https://github.com/jadzziaa/moonglow-toolset).
+
 <p align="center">
   <img src="packaging/icons/moonglow.svg" width="128" height="128" alt="Moonglow Toolset">
 </p>
@@ -109,14 +117,17 @@ Moonglow's later work follows what builders have long asked of Aurora
 
 ## Download
 
-Packages for each system are on the
-[releases page](https://github.com/jadzziaa/moonglow-toolset/releases/latest):
+Moonscar's packages for each system are on this fork's
+[releases page](https://github.com/weavejester/moonglow-toolset/releases/latest).
+They install as Moonscar Toolset, next to any copy of Moonglow; the two share
+their settings. Moonglow's own packages are on
+[its releases page](https://github.com/jadzziaa/moonglow-toolset/releases/latest).
 
 | System | Package |
 | --- | --- |
-| Linux (x86-64) | `Moonglow-<version>-x86_64.AppImage`: make it executable and run it (glibc 2.35 or newer) |
-| Windows 10 and 11 | `Moonglow-<version>-windows-x64-setup.exe` |
-| macOS 11 and later | `Moonglow-<version>-macos.dmg` |
+| Linux (x86-64) | `Moonscar-<version>-x86_64.AppImage`: make it executable and run it (glibc 2.35 or newer) |
+| Windows 10 and 11 | `Moonscar-<version>-windows-x64-setup.exe` |
+| macOS 11 and later | `Moonscar-<version>-macos.dmg` |
 
 Moonglow finds the game where Steam installs it; otherwise choose its folder
 in Tools › Options › Folders. The packages aren't signed yet: Windows'
@@ -125,8 +136,9 @@ say how to allow it).
 
 ### Scoop (Windows)
 
-With [Scoop](https://scoop.sh), this repository is the bucket; `scoop update
-moonglow` then follows the releases:
+The Scoop bucket installs Moonglow, not Moonscar. With
+[Scoop](https://scoop.sh), the original repository is the bucket; `scoop update
+moonglow` then follows its releases:
 
 ```powershell
 scoop bucket add moonglow https://github.com/jadzziaa/moonglow-toolset
@@ -135,14 +147,14 @@ scoop install moonglow
 
 ### Nix
 
-On NixOS, you can run Moonglow straight from this repository:
+On NixOS, you can run Moonscar straight from this repository:
 
 ```sh
-nix run github:jadzziaa/moonglow-toolset                 # the GUI
-nix shell github:jadzziaa/moonglow-toolset -c mg --help   # the command-line tools
+nix run github:weavejester/moonglow-toolset/moonscar                 # the GUI
+nix shell github:weavejester/moonglow-toolset/moonscar -c mg --help   # the command-line tools
 ```
 
-The flake builds from source, so you'll get the latest commit on `develop`
+The flake builds from source, so you'll get the latest commit on `moonscar`
 rather than the last release. With Nix on another Linux distribution, `mg`
 works as it is, but the GUI typically needs a wrapper such as
 [nixGL](https://github.com/nix-community/nixGL) to reach your graphics drivers.

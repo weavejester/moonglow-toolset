@@ -20,7 +20,7 @@ pub(crate) fn latest_release() -> Result<String, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
         .https_only(true)
-        .user_agent(concat!("Moonglow/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Moonscar/", env!("CARGO_PKG_VERSION")))
         .accept("application/vnd.github+json")
         .build()
         .into();

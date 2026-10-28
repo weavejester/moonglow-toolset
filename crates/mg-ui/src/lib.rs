@@ -1077,12 +1077,12 @@ impl Moonglow {
     pub fn title(&self) -> String {
         match (&self.ws, self.module_path()) {
             (Some(ws), Some(p)) => format!(
-                "Moonglow Toolset - {}{}",
+                "Moonscar Toolset - {}{}",
                 p.file_name().unwrap_or_default().to_string_lossy(),
                 if ws.is_modified() { " *" } else { "" }
             ),
-            (Some(_), None) => "Moonglow Toolset - (new module)".into(),
-            _ => "Moonglow Toolset".into(),
+            (Some(_), None) => "Moonscar Toolset - (new module)".into(),
+            _ => "Moonscar Toolset".into(),
         }
     }
 

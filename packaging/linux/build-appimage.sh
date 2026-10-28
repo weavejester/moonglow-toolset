@@ -1,8 +1,8 @@
 #!/bin/sh
-# Builds Moonglow-<version>-<arch>.AppImage in target/dist/.
+# Builds Moonscar-<version>-<arch>.AppImage in target/dist/.
 #
 # A link to the image named mg runs the command-line tools instead of the
-# GUI: `ln -s Moonglow-<version>-<arch>.AppImage ~/.local/bin/mg`.
+# GUI: `ln -s Moonscar-<version>-<arch>.AppImage ~/.local/bin/mg`.
 #
 # Needs appimagetool (https://github.com/AppImage/appimagetool/releases):
 # on PATH, or named by $APPIMAGETOOL. Build on the oldest distribution the
@@ -11,7 +11,7 @@
 # Without appimagetool, the AppDir is left in target/dist/AppDir.
 set -eu
 cd "$(dirname "$0")/../.."
-ID=io.github.moonglow_toolset.Moonglow
+ID=io.github.weavejester.Moonscar
 ARCH=$(uname -m)
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 OUT=target/dist
@@ -59,5 +59,5 @@ if [ -z "$TOOL" ]; then
 fi
 # --no-appstream: the metainfo has no homepage yet, which appstreamcli
 # reports as a warning and appimagetool as a failure.
-ARCH=$ARCH "$TOOL" --no-appstream "$APPDIR" "$OUT/Moonglow-$VERSION-$ARCH.AppImage"
-echo "$OUT/Moonglow-$VERSION-$ARCH.AppImage"
+ARCH=$ARCH "$TOOL" --no-appstream "$APPDIR" "$OUT/Moonscar-$VERSION-$ARCH.AppImage"
+echo "$OUT/Moonscar-$VERSION-$ARCH.AppImage"

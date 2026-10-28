@@ -1958,7 +1958,7 @@ fn update_notice_and_options() {
     let dir = mg_testkit::output_dir("screens");
     let answer = |tag: &str| {
         format!(
-            r#"{{"tag_name":"{tag}","html_url":"https://github.com/jadzziaa/moonglow-toolset/releases/tag/{tag}","draft":false,"prerelease":false}}"#
+            r#"{{"tag_name":"{tag}","html_url":"https://github.com/weavejester/moonglow-toolset/releases/tag/{tag}","draft":false,"prerelease":false}}"#
         )
     };
     let newer = answer("v2.5.0");

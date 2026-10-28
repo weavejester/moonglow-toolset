@@ -7,8 +7,8 @@ fn main() {
     }
     let mut res = winresource::WindowsResource::new();
     res.set_icon("../../packaging/icons/moonglow.ico")
-        .set("ProductName", "Moonglow Toolset")
-        .set("FileDescription", "Moonglow Toolset")
+        .set("ProductName", "Moonscar Toolset")
+        .set("FileDescription", "Moonscar Toolset")
         .set("LegalCopyright", "GPL-3.0-only");
     // Without a resource compiler (cross builds), the program still builds,
     // only without its icon.

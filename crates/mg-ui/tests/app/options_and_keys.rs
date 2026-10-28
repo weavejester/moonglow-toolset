@@ -185,7 +185,7 @@ fn the_command_palette_finds_a_command_and_runs_it() {
     assert!(h.state().command_palette.is_none());
     open(&mut h);
     type_into_hint(&mut h, hint, "about");
-    h.get_by_label("About Moonglow Toolset").click();
+    h.get_by_label("About Moonscar Toolset").click();
     h.run();
     assert!(h.state().command_palette.is_none());
     h.get_by_label_contains("GNU General Public License");
@@ -324,7 +324,7 @@ fn menus_by_the_keyboard() {
     // Right twice from File: View (round the ends the other way: Help).
     key(&mut h, egui::Key::F10);
     key(&mut h, egui::Key::ArrowLeft);
-    assert!(shown(&h, "About Moonglow") && !shown(&h, "Save As"));
+    assert!(shown(&h, "About Moonscar") && !shown(&h, "Save As"));
     key(&mut h, egui::Key::ArrowRight);
     key(&mut h, egui::Key::ArrowRight);
     key(&mut h, egui::Key::ArrowRight);
@@ -381,9 +381,9 @@ fn menus_by_the_keyboard() {
     // Alt and another menu's letter, with one open: that one.
     alt(&mut h, egui::Key::V);
     alt(&mut h, egui::Key::H);
-    assert!(shown(&h, "About Moonglow") && !shown(&h, "Hide All Panels"));
+    assert!(shown(&h, "About Moonscar") && !shown(&h, "Hide All Panels"));
     key(&mut h, egui::Key::Escape);
-    assert!(!shown(&h, "About Moonglow"));
+    assert!(!shown(&h, "About Moonscar"));
     // Escape in a submenu closes the submenu, and the menu stays.
     alt(&mut h, egui::Key::T);
     for _ in 0..4 {
@@ -432,7 +432,7 @@ fn the_user_manual_opens_from_help_and_follows_its_links() {
     h.get_by_label("Placing objects");
     h.get_by_label("Help").click();
     h.run();
-    h.get_by_label("About Moonglow Toolset").click();
+    h.get_by_label("About Moonscar Toolset").click();
     h.run();
     h.get_by_label(&format!("Version {}", mg_core::release::version()));
 }
@@ -468,7 +468,7 @@ fn the_theme_is_set_in_options() {
 fn release_answer(tag: &str) -> String {
     serde_json::json!({
         "tag_name": tag,
-        "html_url": format!("https://github.com/jadzziaa/moonglow-toolset/releases/tag/{tag}"),
+        "html_url": format!("https://github.com/weavejester/moonglow-toolset/releases/tag/{tag}"),
         "draft": false,
         "prerelease": false,
     })
@@ -508,7 +508,7 @@ fn check_for_updates_says_what_is_newest() {
     h.run();
     h.get_by_label_contains("Check for Updates").click();
     h.run();
-    h.get_by_label(&format!("Moonglow 99.0.0 is out (you have {current})."));
+    h.get_by_label(&format!("Moonscar 99.0.0 is out (you have {current})."));
     h.get_by_label("Open the release page");
     assert_eq!(asked.load(Ordering::SeqCst), 1);
     assert!(h.state().updates.notice.is_none(), "the notice is the automatic check's");
@@ -517,7 +517,7 @@ fn check_for_updates_says_what_is_newest() {
         Some(std::sync::Arc::new(move || Ok(release_answer(&format!("v{current}")))));
     h.get_by_label("Check Again").click();
     h.run();
-    h.get_by_label(&format!("Moonglow {current} is the newest."));
+    h.get_by_label(&format!("Moonscar {current} is the newest."));
     // Offline.
     h.state_mut().updates.fetch =
         Some(std::sync::Arc::new(|| Err("not connected to the Internet".into())));
@@ -532,7 +532,7 @@ fn check_for_updates_says_what_is_newest() {
     h.run_steps(2);
     h.get_by_label("Check Again").click();
     h.run();
-    h.get_by_label(&format!("Moonglow 99.0.0 is out (you have {current})."));
+    h.get_by_label(&format!("Moonscar 99.0.0 is out (you have {current})."));
     h.get_by_label("This copy is updated by Scoop: scoop update moonglow.");
     h.get_by_label("Close").click();
     h.run();
@@ -552,7 +552,7 @@ fn check_for_updates_says_what_is_newest() {
 fn the_update_notice_appears_and_is_dismissed() {
     use std::sync::atomic::Ordering;
     let current = mg_core::release::version();
-    let told = format!("Moonglow 99.0.0 is out (you have {current}).");
+    let told = format!("Moonscar 99.0.0 is out (you have {current}).");
     let (app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
     assert_eq!(app.settings.update_checked, None);
     let mut h = harness(app, 1280.0, 800.0);
@@ -583,7 +583,7 @@ fn the_update_notice_appears_and_is_dismissed() {
     app.settings = settings;
     let mut h = harness(app, 1280.0, 800.0);
     h.run();
-    h.get_by_label(&format!("Moonglow 99.1.0 is out (you have {current})."));
+    h.get_by_label(&format!("Moonscar 99.1.0 is out (you have {current})."));
     h.get_by_label("×").click();
     h.run();
     assert!(h.state().updates.notice.is_none());
@@ -677,7 +677,7 @@ fn the_update_check_asks_on_its_own_thread() {
         h.run_steps(1);
     }
     h.run_steps(2);
-    h.get_by_label(&format!("Moonglow 99.0.0 is out (you have {current})."));
+    h.get_by_label(&format!("Moonscar 99.0.0 is out (you have {current})."));
     assert!(h.query_by_label("Asking GitHub for the latest release…").is_none());
     assert!(!h.state().updates.checking());
     assert!(h.state().updates.notice.is_none(), "the window's check, not the automatic one");

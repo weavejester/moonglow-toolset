@@ -1,5 +1,5 @@
 {
-  description = "Moonglow Toolset: a module toolset for Neverwinter Nights: Enhanced Edition";
+  description = "Moonscar Toolset (Moonglow tweaked for the Scars of Risenholm): a module toolset for Neverwinter Nights: Enhanced Edition";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -60,7 +60,7 @@
           '';
 
           postInstall = ''
-            id=io.github.moonglow_toolset.Moonglow
+            id=io.github.weavejester.Moonscar
             install -Dm644 packaging/linux/$id.desktop -t $out/share/applications
             install -Dm644 packaging/linux/moonglow-mime.xml $out/share/mime/packages/$id.xml
             install -Dm644 packaging/icons/moonglow.svg $out/share/icons/hicolor/scalable/apps/$id.svg

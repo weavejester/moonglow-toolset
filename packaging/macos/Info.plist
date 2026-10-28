@@ -5,15 +5,15 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>Moonglow Toolset</string>
+  <string>Moonscar Toolset</string>
   <key>CFBundleName</key>
-  <string>Moonglow Toolset</string>
+  <string>Moonscar Toolset</string>
   <key>CFBundleExecutable</key>
   <string>moonglow</string>
   <key>CFBundleIconFile</key>
   <string>moonglow</string>
   <key>CFBundleIdentifier</key>
-  <string>io.github.moonglow-toolset.Moonglow</string>
+  <string>io.github.weavejester.Moonscar</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundlePackageType</key>

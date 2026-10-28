@@ -706,7 +706,7 @@ fn no_area(app: &mut Moonglow, ui: &mut Ui) {
 fn welcome(app: &mut Moonglow, ui: &mut Ui) {
     ui.vertical_centered(|ui| {
         ui.add_space(40.0);
-        ui.heading("Moonglow Toolset");
+        ui.heading("Moonscar Toolset");
         ui.label("A module toolset for Neverwinter Nights: Enhanced Edition.");
         ui.add_space(20.0);
         if ui.button("New Module…").clicked() {

@@ -233,18 +233,18 @@ pub(crate) fn about_window(app: &mut Moonglow, ctx: &egui::Context) {
     }
     let mut open = true;
     let mut check = false;
-    egui::Window::new("About Moonglow Toolset")
-        .open(crate::widgets::open_unless_escape(ctx, "About Moonglow Toolset", &mut open))
+    egui::Window::new("About Moonscar Toolset")
+        .open(crate::widgets::open_unless_escape(ctx, "About Moonscar Toolset", &mut open))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("Moonglow Toolset");
+                ui.heading("Moonscar Toolset");
                 ui.label(format!("Version {}", mg_core::release::version()));
                 if ui
                     .button("Check for Updates…")
-                    .on_hover_text("Ask GitHub whether a newer Moonglow is out")
+                    .on_hover_text("Ask GitHub whether a newer Moonscar is out")
                     .clicked()
                 {
                     check = true;
@@ -254,9 +254,14 @@ pub(crate) fn about_window(app: &mut Moonglow, ctx: &egui::Context) {
             });
             ui.add_space(10.0);
             ui.label(
-                "Moonglow is free software: you can redistribute it and/or modify it under \
-                 the terms of the GNU General Public License, version 3. It comes with no \
-                 warranty.",
+                "Moonscar is a modified version of Moonglow Toolset, tweaked for the Scars of \
+                 Risenholm persistent world.",
+            );
+            ui.add_space(6.0);
+            ui.label(
+                "Moonscar, like Moonglow, is free software: you can redistribute it and/or \
+                 modify it under the terms of the GNU General Public License, version 3. It \
+                 comes with no warranty.",
             );
             ui.add_space(6.0);
             ui.label(

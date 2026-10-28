@@ -465,9 +465,9 @@ impl Id {
             Id::CheckUpdates => (
                 "check-updates",
                 "Check for Updates…",
-                "Ask GitHub whether a newer Moonglow is out (nothing is downloaded)",
+                "Ask GitHub whether a newer Moonscar is out (nothing is downloaded)",
             ),
-            Id::About => ("about", "About Moonglow Toolset", ""),
+            Id::About => ("about", "About Moonscar Toolset", ""),
             Id::PreviewWindow => ("preview-window", "Preview Window", ""),
             Id::FullScreen => ("full-screen", "Full Screen", ""),
             Id::CloseTab => ("close-tab", "Close Tab", "The tab in front"),

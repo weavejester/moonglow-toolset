@@ -28,7 +28,7 @@ which sets it as it starts (`mg_core::release`). A release:
 2. Brings `Cargo.lock` along (`cargo metadata --format-version 1 > /dev/null`):
    only the `mg` and `moonglow` entries change.
 3. Adds a `<release version="…" date="…">` entry at the top of
-   `<releases>` in `linux/io.github.moonglow_toolset.Moonglow.metainfo.xml`.
+   `<releases>` in `linux/io.github.weavejester.Moonscar.metainfo.xml`.
 4. Is committed ("Version 2.9.0") and tagged `v2.9.0`; the tag builds the
    packages and drafts the GitHub release.
 5. Once the release is published, the Scoop manifest follows ([Scoop](#scoop)).
@@ -42,7 +42,7 @@ which sets it as it starts (`mg_core::release`). A release:
 | `macos/` | `Info.plist` and `build-app.sh`. |
 | `third_party_licenses.py` | Writes `THIRD-PARTY-LICENSES.txt`: every crate the programs are built from, its license, and the license texts. |
 
-The application ID is `io.github.moonglow_toolset.Moonglow`
+The application ID is `io.github.weavejester.Moonscar`
 (`io.github.moonglow-toolset.Moonglow` on macOS, where bundle IDs take no
 underscores). It names the desktop entry, the icon, the AppStream component
 and the Wayland app ID (`APP_ID` in `apps/moonglow/src/main.rs`); change
@@ -73,7 +73,7 @@ as on every current desktop.
 ```sh
 packaging/flatpak/build-flatpak.sh
 flatpak install --user target/dist/Moonglow-*.flatpak
-flatpak run io.github.moonglow_toolset.Moonglow
+flatpak run io.github.weavejester.Moonscar
 ```
 
 The script lists the crates in `Cargo.lock` as the build's sources
@@ -92,7 +92,7 @@ A game elsewhere (another Steam library, GOG, Beamdog's client) needs its
 folder added:
 
 ```sh
-flatpak override --user --filesystem="/path/to/Neverwinter Nights:ro" io.github.moonglow_toolset.Moonglow
+flatpak override --user --filesystem="/path/to/Neverwinter Nights:ro" io.github.weavejester.Moonscar
 ```
 
 Test Module starts the game inside the sandbox, with the Flatpak runtime's

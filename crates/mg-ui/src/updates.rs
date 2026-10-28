@@ -16,10 +16,10 @@ use crate::Moonglow;
 /// GitHub's latest release of Moonglow (REST API): drafts and pre-releases
 /// are never it.
 pub const LATEST_API: &str =
-    "https://api.github.com/repos/jadzziaa/moonglow-toolset/releases/latest";
+    "https://api.github.com/repos/weavejester/moonglow-toolset/releases/latest";
 
 /// The releases' page, where a release's own page isn't known.
-pub const RELEASES_PAGE: &str = "https://github.com/jadzziaa/moonglow-toolset/releases/latest";
+pub const RELEASES_PAGE: &str = "https://github.com/weavejester/moonglow-toolset/releases/latest";
 
 /// How long the automatic check waits between two requests, seconds.
 pub const DAY: u64 = 24 * 60 * 60;
@@ -121,7 +121,7 @@ pub fn parse_latest(json: &str) -> Result<Option<Release>, String> {
     let page = value
         .get("html_url")
         .and_then(serde_json::Value::as_str)
-        .filter(|u| u.starts_with("https://github.com/jadzziaa/moonglow-toolset/releases/"))
+        .filter(|u| u.starts_with("https://github.com/weavejester/moonglow-toolset/releases/"))
         .unwrap_or(RELEASES_PAGE)
         .to_string();
     Ok(Some(Release { version, page }))
@@ -187,7 +187,7 @@ impl Installer {
     /// How to update through it.
     pub fn how(self) -> &'static str {
         match self {
-            Installer::Flatpak => "flatpak update io.github.moonglow_toolset.Moonglow",
+            Installer::Flatpak => "flatpak update io.github.weavejester.Moonscar",
             Installer::Scoop => "scoop update moonglow",
             Installer::Nix => "update the flake or channel it comes from",
         }
@@ -289,7 +289,7 @@ fn start(app: &mut Moonglow, auto: bool, manual: bool) {
     let Some(fetch) = app.updates.fetch.clone() else {
         if manual {
             app.updates.report =
-                Some(Outcome::Failed("This copy of Moonglow doesn't check for updates".into()));
+                Some(Outcome::Failed("This copy of Moonscar doesn't check for updates".into()));
         }
         return;
     };
@@ -366,7 +366,7 @@ pub(crate) fn notice_bar(app: &mut Moonglow, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("ℹ").color(ui.visuals().hyperlink_color));
             ui.label(format!(
-                "Moonglow {} is out (you have {}).",
+                "Moonscar {} is out (you have {}).",
                 release.version,
                 Version::current()
             ));
@@ -394,10 +394,10 @@ pub(crate) fn notice_bar(app: &mut Moonglow, ui: &mut egui::Ui) {
 fn said(ui: &mut egui::Ui, outcome: &Outcome) {
     match outcome {
         Outcome::Newest => {
-            ui.label(format!("Moonglow {} is the newest.", Version::current()));
+            ui.label(format!("Moonscar {} is the newest.", Version::current()));
         }
         Outcome::Newer(r) => {
-            ui.label(format!("Moonglow {} is out (you have {}).", r.version, Version::current()));
+            ui.label(format!("Moonscar {} is out (you have {}).", r.version, Version::current()));
             ui.hyperlink_to("Open the release page", &r.page)
                 .on_hover_text("What is new in it, and its downloads (opens the browser)");
         }
@@ -476,7 +476,7 @@ pub(crate) fn options_page(
     let response = ui
         .add_enabled(!managed, egui::Checkbox::new(&mut shown, "Check for updates automatically"))
         .on_hover_text(
-            "Once a day at most, in the background, ask GitHub whether a newer Moonglow is out, \
+            "Once a day at most, in the background, ask GitHub whether a newer Moonscar is out, \
              and say so under the toolbar",
         );
     if response.changed() {
@@ -492,7 +492,7 @@ pub(crate) fn options_page(
         ui.colored_label(
             ui.visuals().warn_fg_color,
             format!(
-                "This copy is updated by {}: {}. Moonglow doesn't check by itself; Help › \
+                "This copy is updated by {}: {}. Moonscar doesn't check by itself; Help › \
                  Check for Updates… still asks.",
                 i.name(),
                 i.how()
@@ -507,7 +507,7 @@ pub(crate) fn options_page(
     if let Some(version) = skipped.clone() {
         ui.horizontal(|ui| {
             crate::widgets::field_label(ui, "Not reminded about");
-            ui.label(format!("Moonglow {version}"));
+            ui.label(format!("Moonscar {version}"));
             if ui
                 .button("Remind Me Again")
                 .on_hover_text("The notice tells of this version again")
@@ -556,8 +556,8 @@ mod tests {
     fn answer(tag: &str, draft: bool, pre: bool) -> String {
         serde_json::json!({
             "tag_name": tag,
-            "name": format!("Moonglow Toolset {tag}"),
-            "html_url": format!("https://github.com/jadzziaa/moonglow-toolset/releases/tag/{tag}"),
+            "name": format!("Moonscar Toolset {tag}"),
+            "html_url": format!("https://github.com/weavejester/moonglow-toolset/releases/tag/{tag}"),
             "draft": draft,
             "prerelease": pre,
             "assets": [],
@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(latest.version, v("2.10.0"));
         assert_eq!(
             latest.page,
-            "https://github.com/jadzziaa/moonglow-toolset/releases/tag/v2.10.0"
+            "https://github.com/weavejester/moonglow-toolset/releases/tag/v2.10.0"
         );
         assert_eq!(parse_latest(&answer("v2.5.0", true, false)).unwrap(), None);
         assert_eq!(parse_latest(&answer("v2.5.0", false, true)).unwrap(), None);
@@ -626,7 +626,7 @@ mod tests {
         let plain = Path::new("/home/me/Applications/Moonglow.AppImage");
         assert_eq!(detect(None, false, plain), None);
         assert_eq!(
-            detect(Some("io.github.moonglow_toolset.Moonglow"), false, plain),
+            detect(Some("io.github.weavejester.Moonscar"), false, plain),
             Some(Installer::Flatpak)
         );
         assert_eq!(detect(None, true, Path::new("/app/bin/moonglow")), Some(Installer::Flatpak));

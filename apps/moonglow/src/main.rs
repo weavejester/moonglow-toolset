@@ -70,11 +70,13 @@ impl Dialogs for NativeDialogs {
     }
 }
 
+/// The name of eframe's settings folder. Moonscar keeps Moonglow's, so the two
+/// share their settings (the game folder, the user folder and so on).
 const APP_NAME: &str = "Moonglow Toolset";
 
 /// The desktop entry's name (Linux: Wayland's app ID and X11's class, which
 /// match the window to `packaging/linux/<APP_ID>.desktop` and its icon).
-const APP_ID: &str = "io.github.moonglow_toolset.Moonglow";
+const APP_ID: &str = "io.github.weavejester.Moonscar";
 
 /// Where eframe keeps the settings.
 const SETTINGS_KEY: &str = "moonglow-settings";
@@ -157,7 +159,7 @@ fn crash_reports() {
             "crashed"
         };
         let report = format!(
-            "Moonglow Toolset {} {what}.\n\n{info}\n\nPlugins enabled: {plugins}\n\nBacktrace:\n{}\n",
+            "Moonscar Toolset {} {what}.\n\n{info}\n\nPlugins enabled: {plugins}\n\nBacktrace:\n{}\n",
             env!("CARGO_PKG_VERSION"),
             std::backtrace::Backtrace::force_capture()
         );
@@ -220,7 +222,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_title("Moonglow Toolset")
+            .with_title("Moonscar Toolset")
             .with_app_id(APP_ID)
             .with_icon(window_icon()),
         wgpu_options: egui_wgpu::WgpuConfiguration {

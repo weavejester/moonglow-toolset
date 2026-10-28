@@ -1,5 +1,5 @@
-# Builds Moonglow's Windows installer, target\dist\Moonglow-<version>-windows-x64-setup.exe,
-# and the same files as a zip, Moonglow-<version>-windows-x64.zip (to unpack
+# Builds Moonscar's Windows installer, target\dist\Moonscar-<version>-windows-x64-setup.exe,
+# and the same files as a zip, Moonscar-<version>-windows-x64.zip (to unpack
 # anywhere and run; what Scoop installs: bucket\moonglow.json).
 # Needs Rust, Python 3 and Inno Setup 6 (iscc on PATH, or in its usual folder).
 $ErrorActionPreference = "Stop"

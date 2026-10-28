@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.moonglow_toolset.Moonglow</id>
+  <id>io.github.weavejester.Moonscar</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-only</project_license>
-  <name>Moonglow Toolset</name>
+  <name>Moonscar Toolset</name>
   <developer id="io.github.moonglow_toolset">
     <name>The Moonglow Toolset contributors</name>
   </developer>
@@ -22,7 +22,7 @@
       of Neverwinter Nights: Enhanced Edition.
     </p>
   </description>
-  <launchable type="desktop-id">io.github.moonglow_toolset.Moonglow.desktop</launchable>
+  <launchable type="desktop-id">io.github.weavejester.Moonscar.desktop</launchable>
   <provides>
     <binary>moonglow</binary>
     <mediatype>application/x-nwn-module</mediatype>

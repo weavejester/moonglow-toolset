@@ -1,4 +1,4 @@
-# Flatpak build of Moonglow Toolset.
+# Flatpak build of Moonscar Toolset.
 #
 # Builds offline from vendored crates, listed in cargo-sources.json (made
 # from Cargo.lock by cargo_sources.py beside this file):
@@ -6,7 +6,7 @@
 #   packaging/flatpak/build-flatpak.sh
 #
 # (packaging/README.md has the details.)
-id: io.github.moonglow_toolset.Moonglow
+id: io.github.weavejester.Moonscar
 runtime: org.freedesktop.Platform
 runtime-version: "25.08"
 sdk: org.freedesktop.Sdk
@@ -45,11 +45,11 @@ modules:
       - cargo --offline build --profile dist --locked -p moonglow -p mg
       - install -Dm755 target/dist/moonglow -t /app/bin/
       - install -Dm755 target/dist/mg -t /app/bin/
-      - install -Dm644 packaging/linux/io.github.moonglow_toolset.Moonglow.desktop -t /app/share/applications/
-      - install -Dm644 packaging/linux/io.github.moonglow_toolset.Moonglow.metainfo.xml -t /app/share/metainfo/
-      - install -Dm644 packaging/linux/moonglow-mime.xml /app/share/mime/packages/io.github.moonglow_toolset.Moonglow.xml
-      - install -Dm644 packaging/icons/moonglow.svg /app/share/icons/hicolor/scalable/apps/io.github.moonglow_toolset.Moonglow.svg
-      - for s in 16 24 32 48 64 128 256 512; do install -Dm644 packaging/icons/moonglow-$s.png /app/share/icons/hicolor/${s}x$s/apps/io.github.moonglow_toolset.Moonglow.png; done
+      - install -Dm644 packaging/linux/io.github.weavejester.Moonscar.desktop -t /app/share/applications/
+      - install -Dm644 packaging/linux/io.github.weavejester.Moonscar.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 packaging/linux/moonglow-mime.xml /app/share/mime/packages/io.github.weavejester.Moonscar.xml
+      - install -Dm644 packaging/icons/moonglow.svg /app/share/icons/hicolor/scalable/apps/io.github.weavejester.Moonscar.svg
+      - for s in 16 24 32 48 64 128 256 512; do install -Dm644 packaging/icons/moonglow-$s.png /app/share/icons/hicolor/${s}x$s/apps/io.github.weavejester.Moonscar.png; done
       - install -Dm644 LICENSE -t /app/share/doc/moonglow/
       - python3 packaging/third_party_licenses.py --output /app/share/doc/moonglow/THIRD-PARTY-LICENSES.txt
       - cp -r docs/manual /app/share/doc/moonglow/manual
