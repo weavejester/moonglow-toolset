@@ -1,9 +1,9 @@
 ---
 type: Manual Page
 title: Options
-description: The Options dialog page by page (folders, area, general, script editor, conversation editor, sounds, verify, language, keyboard, updates) and where the settings are kept.
+description: The Options dialog page by page (folders, area, general with the graphics backend, script editor, conversation editor, sounds, verify, language, keyboard, updates) and where the settings are kept.
 tags: [manual, options]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-27T06:06:29Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T00:19:15Z }
 ---
 
 # Options
@@ -83,6 +83,20 @@ the module is opened again from its file.
 - **Interface size**: the whole interface, text and all, from 90% to 200%
   of its usual size.
 - **Light theme**: dark text on light, rather than the dark theme.
+- **Graphics backend** (Automatic): what the window, the area view and
+  the previews draw with. **Automatic** is the graphics library's
+  (wgpu's) choice, except that an AMD GPU on Windows draws through
+  Direct3D 12 rather than Vulkan: AMD's Windows Vulkan driver drew
+  areas' tiles wrong (see [Troubleshooting](13-troubleshooting.md#tiles-disappear-on-an-amd-gpu-under-windows)).
+  Or choose one: **Vulkan** or **Direct3D 12** on Windows, **Vulkan**
+  on Linux, **Metal** on macOS (the only one there); only the
+  platform's are offered. (Not OpenGL: Moonglow's renderer draws
+  particles, the game's shaders and more wrong there.) It takes effect the next time
+  Moonglow starts, and the page says what this run draws with. A backend
+  with no adapter on this machine falls back to Automatic, and the log
+  says so. The `WGPU_BACKEND` environment variable (`vulkan`, `dx12`,
+  `metal`), when set, decides over this setting: a way out if the
+  one chosen doesn't start.
 - **Open a module on the area opened last**: on by default; the first
   time, the first area the module tree lists (see
   [Modules](03-modules.md)).
@@ -229,7 +243,8 @@ the module is opened again from its file.
   Moonglow fills in: `{files}` (the scripts to compile), `{src}` (a
   scratch folder the module's scripts are written to), `{out}` (the
   folder the compiled scripts are read from), `{game}`, `{user}` and
-  `{haks}` (the module's haks, comma-separated). An option whose place
+  `{haks}` (the module's haks, comma-separated: a hak whose path has a
+  comma in it can't be passed so, and the compile says which). An option whose place
   has nothing to give is left out. Generate Debug Information adds `-g`
   to the usual lines.
 - The editor's **font size**, syntax **colors** and **Background**
