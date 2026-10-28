@@ -7,7 +7,9 @@ members = ["crates/*", "apps/*"]
 # the one line a release changes (packaging/README.md). The libraries
 # keep "0.0.0", so that a release rebuilds the programs alone; what they
 # say of the release they read from the program (mg_core::release).
-version = "2.11.0"
+# Moonscar numbers its releases apart from Moonglow's (1.0.0 is based on
+# Moonglow 2.11.0); the update check follows this fork's releases.
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.98"
 license = "GPL-3.0-only"
