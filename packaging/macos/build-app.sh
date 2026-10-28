@@ -19,7 +19,7 @@ for t in aarch64-apple-darwin x86_64-apple-darwin; do
 done
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-for b in moonglow mg; do
+for b in moonscar ms; do
     lipo -create -output "$APP/Contents/MacOS/$b" \
         target/aarch64-apple-darwin/dist/$b target/x86_64-apple-darwin/dist/$b
 done

@@ -10,6 +10,11 @@ autotests = false
 
 # One test binary (tests/groups/cli.rs, each test file a module of it): a
 # binary per file was 23 links for 34 tests, run one binary at a time.
+# Moonscar names its command-line tool apart from Moonglow's `mg`.
+[[bin]]
+name = "ms"
+path = "src/main.rs"
+
 [[test]]
 name = "cli"
 path = "tests/groups/cli.rs"

@@ -2,7 +2,9 @@
 > **This is Moonscar**, a tweaked version of
 > [Moonglow Toolset](https://github.com/jadzziaa/moonglow-toolset) for the
 > **Scars of Risenholm** persistent world. It is kept on the `moonscar` branch
-> and installs alongside Moonglow, so you can use both. For general use, and
+> and installs alongside Moonglow, so you can use both: its programs are
+> `moonscar` and `ms` (Moonglow's `moonglow` and `mg`), so where the
+> documentation says `mg`, type `ms`. For general use, and
 > for Moonglow's own releases and issues, see the
 > [original project](https://github.com/jadzziaa/moonglow-toolset).
 

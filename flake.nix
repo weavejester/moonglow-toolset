@@ -43,7 +43,7 @@
           # Test Module starts the game client with this environment, and the
           # client links OpenAL.
           postFixup = ''
-            wrapProgram $out/bin/moonglow \
+            wrapProgram $out/bin/moonscar \
               --prefix LD_LIBRARY_PATH : ${
                 lib.makeLibraryPath [
                   pkgs.libGL
@@ -71,10 +71,10 @@
 
           meta = {
             description = "A module toolset for Neverwinter Nights: Enhanced Edition";
-            homepage = "https://github.com/jadzziaa/moonglow-toolset";
+            homepage = "https://github.com/weavejester/moonglow-toolset";
             license = lib.licenses.gpl3Only;
             platforms = systems;
-            mainProgram = "moonglow";
+            mainProgram = "moonscar";
           };
         };
       });

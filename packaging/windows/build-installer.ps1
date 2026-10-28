@@ -16,7 +16,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $portable = "target\dist\portable"
 if (Test-Path $portable) { Remove-Item -Recurse -Force $portable }
 New-Item -ItemType Directory -Path $portable | Out-Null
-Copy-Item target\dist\moonglow.exe, target\dist\mg.exe, target\dist\THIRD-PARTY-LICENSES.txt $portable
+Copy-Item target\dist\moonscar.exe, target\dist\ms.exe, target\dist\THIRD-PARTY-LICENSES.txt $portable
 Copy-Item LICENSE (Join-Path $portable "LICENSE.txt")
 Copy-Item -Recurse docs\manual (Join-Path $portable "manual")
 $zip = "target\dist\Moonglow-$version-windows-x64.zip"

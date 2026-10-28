@@ -1,8 +1,8 @@
 #!/bin/sh
 # Builds Moonscar-<version>-<arch>.AppImage in target/dist/.
 #
-# A link to the image named mg runs the command-line tools instead of the
-# GUI: `ln -s Moonscar-<version>-<arch>.AppImage ~/.local/bin/mg`.
+# A link to the image named ms runs the command-line tools instead of the
+# GUI: `ln -s Moonscar-<version>-<arch>.AppImage ~/.local/bin/ms`.
 #
 # Needs appimagetool (https://github.com/AppImage/appimagetool/releases):
 # on PATH, or named by $APPIMAGETOOL. Build on the oldest distribution the
@@ -22,7 +22,7 @@ rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
     "$APPDIR/usr/share/metainfo" "$APPDIR/usr/share/mime/packages" \
     "$APPDIR/usr/share/icons/hicolor/scalable/apps" "$APPDIR/usr/share/doc/moonglow"
-install -m 755 target/dist/moonglow target/dist/mg "$APPDIR/usr/bin/"
+install -m 755 target/dist/moonscar target/dist/ms "$APPDIR/usr/bin/"
 install -m 644 packaging/linux/$ID.desktop "$APPDIR/usr/share/applications/"
 install -m 644 packaging/linux/$ID.metainfo.xml "$APPDIR/usr/share/metainfo/$ID.appdata.xml"
 install -m 644 packaging/linux/moonglow-mime.xml "$APPDIR/usr/share/mime/packages/$ID.xml"
@@ -42,13 +42,13 @@ ln -s usr/share/icons/hicolor/256x256/apps/$ID.png "$APPDIR/$ID.png"
 ln -s $ID.png "$APPDIR/.DirIcon"
 cat > "$APPDIR/AppRun" <<'RUN'
 #!/bin/sh
-# Started through a link named mg, the command-line tools; else the GUI.
+# Started through a link named ms, the command-line tools; else the GUI.
 # (The AppImage's runtime gives the name it was started by as $ARGV0.)
 HERE=$(dirname "$(readlink -f "$0")")
 case "$(basename "${ARGV0:-$0}")" in
-    mg) exec "$HERE/usr/bin/mg" "$@" ;;
+    ms) exec "$HERE/usr/bin/ms" "$@" ;;
 esac
-exec "$HERE/usr/bin/moonglow" "$@"
+exec "$HERE/usr/bin/moonscar" "$@"
 RUN
 chmod 755 "$APPDIR/AppRun"
 

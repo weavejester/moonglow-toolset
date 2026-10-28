@@ -28,7 +28,7 @@ use mg_module::{Module, ModuleLocation};
 use mg_resman::{GameInstall, ResKey, ResMan};
 
 #[derive(Parser)]
-#[command(name = "mg", version, about = "Moonglow Toolset command-line tools")]
+#[command(name = "ms", version, about = "Moonscar Toolset command-line tools")]
 struct Cli {
     /// Game install (default: $NWN_ROOT or the usual Steam location).
     #[arg(long, global = true)]

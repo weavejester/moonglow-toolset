@@ -24,7 +24,7 @@
   </description>
   <launchable type="desktop-id">io.github.weavejester.Moonscar.desktop</launchable>
   <provides>
-    <binary>moonglow</binary>
+    <binary>moonscar</binary>
     <mediatype>application/x-nwn-module</mediatype>
   </provides>
   <categories>

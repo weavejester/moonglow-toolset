@@ -70,7 +70,7 @@ mod watch;
 /// is left alone.)
 fn mg() -> std::process::Command {
     let home = mg_testkit::output_dir("mg-home");
-    let mut mg = std::process::Command::new(env!("CARGO_BIN_EXE_mg"));
+    let mut mg = std::process::Command::new(env!("CARGO_BIN_EXE_ms"));
     mg.env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CACHE_HOME", home.join("cache"))
         .env("APPDATA", home.join("data"));

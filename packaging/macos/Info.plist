@@ -9,7 +9,7 @@
   <key>CFBundleName</key>
   <string>Moonscar Toolset</string>
   <key>CFBundleExecutable</key>
-  <string>moonglow</string>
+  <string>moonscar</string>
   <key>CFBundleIconFile</key>
   <string>moonglow</string>
   <key>CFBundleIdentifier</key>

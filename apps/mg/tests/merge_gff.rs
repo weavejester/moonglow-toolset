@@ -186,7 +186,7 @@ fn git_merges_two_builders_branches() {
     let repo: PathBuf = root.join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     ok(&repo, &["init", "-q", "-b", "main"]);
-    let driver = format!("'{}' merge-gff %O %A %B --path %P", env!("CARGO_BIN_EXE_mg"));
+    let driver = format!("'{}' merge-gff %O %A %B --path %P", env!("CARGO_BIN_EXE_ms"));
     ok(&repo, &["config", "merge.mg-gff.name", "Moonglow GFF merge"]);
     ok(&repo, &["config", "merge.mg-gff.driver", &driver]);
     std::fs::write(

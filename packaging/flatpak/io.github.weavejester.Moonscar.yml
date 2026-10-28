@@ -12,7 +12,7 @@ runtime-version: "25.08"
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-command: moonglow
+command: moonscar
 finish-args:
   - --share=ipc
   - --socket=wayland
@@ -43,8 +43,8 @@ modules:
     build-commands:
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
       - cargo --offline build --profile dist --locked -p moonglow -p mg
-      - install -Dm755 target/dist/moonglow -t /app/bin/
-      - install -Dm755 target/dist/mg -t /app/bin/
+      - install -Dm755 target/dist/moonscar -t /app/bin/
+      - install -Dm755 target/dist/ms -t /app/bin/
       - install -Dm644 packaging/linux/io.github.weavejester.Moonscar.desktop -t /app/share/applications/
       - install -Dm644 packaging/linux/io.github.weavejester.Moonscar.metainfo.xml -t /app/share/metainfo/
       - install -Dm644 packaging/linux/moonglow-mime.xml /app/share/mime/packages/io.github.weavejester.Moonscar.xml

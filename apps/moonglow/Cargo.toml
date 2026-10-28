@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Moonscar names its program apart from Moonglow's, so both can be installed.
+[[bin]]
+name = "moonscar"
+path = "src/main.rs"
+
 [dependencies]
 eframe.workspace = true
 egui.workspace = true
