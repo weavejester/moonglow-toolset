@@ -2,9 +2,11 @@
 ;
 ;   iscc /DVersion=0.1.0 /DSource=..\..\target\dist packaging\windows\moonglow.iss
 ;
-; Source holds moonscar.exe, ms.exe and THIRD-PARTY-LICENSES.txt
-; (packaging/windows/build-installer.ps1 puts them there). Installs per user
-; by default (no administrator rights), per machine when chosen.
+; Source holds moonscar.exe, ms.exe, dxcompiler.dll (DXC, which Direct3D 12
+; compiles shaders with: packaging/windows/dxc.ps1) and
+; THIRD-PARTY-LICENSES.txt (packaging/windows/build-installer.ps1 puts them
+; there). Installs per user by default (no administrator rights), per
+; machine when chosen.
 
 #ifndef Version
   #define Version "0.0.0"
@@ -43,6 +45,7 @@ Name: modassoc; Description: "Open modules (.mod) with Moonscar Toolset"; GroupD
 [Files]
 Source: "{#Source}\moonscar.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Source}\ms.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Source}\dxcompiler.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"
 Source: "{#Source}\THIRD-PARTY-LICENSES.txt"; DestDir: "{app}"
 Source: "..\..\docs\manual\*"; DestDir: "{app}\manual"; Flags: recursesubdirs skipifsourcedoesntexist

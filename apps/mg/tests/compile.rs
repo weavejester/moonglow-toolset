@@ -17,9 +17,7 @@ fn compile(root: &Path, dir: &Path, module: &Path, more: &[&str]) -> Value {
         .args(more)
         // (A data folder that starts empty: what was compiled before is
         // remembered there.)
-        .env("XDG_DATA_HOME", dir.join("data"))
-        .env("APPDATA", dir.join("data"))
-        .env("HOME", dir.join("data"))
+        .env("MOONGLOW_DATA_DIR", dir.join("data"))
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
@@ -84,6 +82,106 @@ fn a_second_compile_passes_over_what_is_unchanged() {
     assert_eq!(with["scripts"], ncs as u64, "{with}");
     let again = compile(&root, &dir, &chess, &["--ndb"]);
     assert_eq!(again["scripts"], 0, "{again}");
+}
+
+/// `mg compile --uncompiled` and `mg build` remember what they compiled
+/// where `mg compile` (and the window) do: the next compile passes over
+/// it. A project is one to them whether named by its folder or by its
+/// `nasher.cfg`.
+#[test]
+fn uncompiled_and_build_remember_what_they_compiled() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("mg-compile-remembered");
+    std::fs::create_dir_all(dir.join("user")).unwrap();
+    let chess = dir.join("chess.mod");
+    std::fs::copy(root.join("data/mod/Neverwinter Chess.mod"), &chess).unwrap();
+    let mut m = mg_module::Module::open(&chess).unwrap();
+    m.set(ResKey::parse("fresh", ResType::NSS).unwrap(), b"void main() {}\n".to_vec());
+    m.save().unwrap();
+    // (Those without a compiled script: the new one, and include files.)
+    let none = (m.keys_of(ResType::NSS))
+        .filter(|k| !m.contains(&ResKey::new(k.resref, ResType::NCS)))
+        .count() as u64;
+
+    let first = compile(&root, &dir, &chess, &["--uncompiled"]);
+    assert_eq!(first["scripts"], none, "{first}");
+    // The others were never compiled here: all but those just compiled.
+    let next = compile(&root, &dir, &chess, &[]);
+    assert_eq!(next["unchanged"], none, "{next}");
+
+    let kept = || walk(&dir.join("data")).into_iter().filter(|p| is_json(p)).count();
+    assert_eq!(kept(), 1);
+    let project = dir.join("project");
+    let mg = |args: &[&str]| {
+        let out = crate::mg()
+            .args(["--root", root.to_str().unwrap(), "--user-dir"])
+            .arg(dir.join("user"))
+            .args(args)
+            .env("MOONGLOW_DATA_DIR", dir.join("data"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    mg(&["init", chess.to_str().unwrap(), project.to_str().unwrap()]);
+    let built = dir.join("built.mod");
+    mg(&["build", project.to_str().unwrap(), "-o", built.to_str().unwrap()]);
+    assert_eq!(kept(), 2, "mg build remembers what it compiled");
+    // (A project's tree keeps no compiled scripts: they are made again.)
+    let by_cfg = compile(&root, &dir, &project.join("nasher.cfg"), &[]);
+    assert!(by_cfg["scripts"].as_u64().unwrap() > 10, "{by_cfg}");
+    assert_eq!(kept(), 2, "named by its nasher.cfg, the same project");
+}
+
+/// Scripts that include the base game's `x2_inc_cutscene` (its
+/// `CutCreateObjectCopy` is declared `object` and defined `void`) compile,
+/// as in Aurora (El Grillo's report: they failed): the warning is said
+/// once, with how many scripts it was met in, on standard error and in
+/// the JSON.
+#[test]
+fn x2_inc_cutscene_s_includers_compile_with_one_warning() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("mg-compile-return-types");
+    std::fs::create_dir_all(dir.join("user")).unwrap();
+    let chess = dir.join("chess.mod");
+    std::fs::copy(root.join("data/mod/Neverwinter Chess.mod"), &chess).unwrap();
+    let mut m = mg_module::Module::open(&chess).unwrap();
+    for (name, main) in [
+        ("cut_a", "{}"),
+        (
+            "cut_b",
+            "{ object o = CutCreateObjectCopy(0.0, OBJECT_SELF, GetLocation(OBJECT_SELF)); }",
+        ),
+    ] {
+        let text = format!("#include \"x2_inc_cutscene\"\nvoid main() {main}\n");
+        m.set(ResKey::parse(name, ResType::NSS).unwrap(), text.into_bytes());
+    }
+    m.save().unwrap();
+    let json = compile(&root, &dir, &chess, &["--all"]);
+    assert_eq!(json["failed"], 0, "{json}");
+    let warnings = json["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{json}");
+    let w = &warnings[0];
+    assert_eq!(
+        (&w["script"], &w["line"], &w["scripts"]),
+        (&"x2_inc_cutscene".into(), &628.into(), &2.into())
+    );
+    assert!(w["message"].as_str().unwrap().contains("declared object at x2_inc_cutscene.nss(303)"));
+    let m = mg_module::Module::open(&chess).unwrap();
+    assert!(m.contains(&ResKey::parse("cut_b", ResType::NCS).unwrap()));
+
+    // As text: on standard error, once.
+    let out = crate::mg()
+        .args(["--root", root.to_str().unwrap(), "--user-dir"])
+        .arg(dir.join("user"))
+        .args(["compile", "--all"])
+        .arg(&chess)
+        .env("MOONGLOW_DATA_DIR", dir.join("data"))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert_eq!(said.matches("WARNING: CutCreateObjectCopy").count(), 1, "{said}");
+    assert!(said.contains("(in 2 scripts)"), "{said}");
 }
 
 fn is_json(p: &Path) -> bool {

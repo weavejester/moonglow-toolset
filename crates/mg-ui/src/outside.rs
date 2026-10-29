@@ -217,6 +217,17 @@ impl Moonglow {
         let Some(root) = self.module_root() else {
             self.outside.watch = None;
             self.outside.looking = None;
+            // (A module kept in one file: its own project files beside it,
+            // `krezk.moonglow.toml`, looked at as they are, a few small
+            // files.)
+            if let Some(ws) = self.ws.as_mut()
+                && matches!(ws.module.location, Some(mg_module::ModuleLocation::Archive(_)))
+            {
+                let had = ws.module.project_file.found;
+                if ws.module.reread_project_file() {
+                    self.log_project_file(true, had);
+                }
+            }
             return;
         };
         // (And the builder's own project file, in a hidden folder the
@@ -393,8 +404,9 @@ impl Moonglow {
             let every = std::time::Duration::from_secs(3);
             self.outside.content = Some(Watch::start(paths, false, every));
         }
-        // (Held by something else, a job: looked at once it is free.)
-        if crate::exclusive(&mut self.game).is_none() {
+        // (Held by something else, a job: looked at once it is free. Not
+        // let go of by the 3D views here: only when something changed.)
+        if self.game_data_held() {
             crate::trace::changed("content", || "the game data is held: not looked at".into());
             return;
         }
@@ -606,7 +618,21 @@ impl Moonglow {
         }
         // (And the scripts that include them.)
         let Some(scripts) = self.with_includers(&scripts) else { return };
-        let (compiled, _) = crate::script_view::compile_stale(self, &scripts);
+        // A module with no unsaved changes has none after: what is
+        // compiled is made from the files as they are, and a folder's
+        // compiled scripts are written beside them at once (a project
+        // keeps none: they are build output).
+        let clean = self.ws.as_ref().is_some_and(|ws| !ws.is_modified());
+        let (compiled, _) = crate::script_view::compile_stale_into(self, &scripts, clean);
+        if clean && !compiled.is_empty() {
+            let made: Vec<ResKey> = (compiled.iter())
+                .filter_map(|n| mg_core::ResRef::from_str(n).ok())
+                .flat_map(|r| [ResType::NCS, ResType::NDB].map(|t| ResKey::new(r, t)))
+                .collect();
+            if let Some(Err(e)) = self.ws.as_mut().map(|ws| ws.module.write_made(&made)) {
+                self.log.error(e.to_string());
+            }
+        }
         if !compiled.is_empty() {
             self.log.info(format!(
                 "Compiled (changed outside Moonglow): {}",

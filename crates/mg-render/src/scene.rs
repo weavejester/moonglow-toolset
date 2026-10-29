@@ -45,6 +45,18 @@ pub struct Instance {
     /// corners (read from the client: `surfaces_in_the_client` in
     /// `client_render.rs`).
     pub grass: bool,
+    /// The sun's and moon's shadows fall on it ([`Scene::shadows`]): the
+    /// client darkens an area's tiles and its static placeables alone,
+    /// not what moves (a dynamic placeable, a door, a creature), read
+    /// from its pictures (`shadows_look` in `client_render.rs`).
+    pub receives_shadows: bool,
+    /// Its meshes flagged `shadow` cast shadows (with `render 0` meshes
+    /// that only do): on, unless it is a marker, see-through or grass.
+    pub casts_shadows: bool,
+    /// It casts a shadow from the nearest light that casts them
+    /// ([`Scene::light_shadows`]): a creature, as the client's do where
+    /// the area has no sun or moon shadows at the time.
+    pub casts_light_shadows: bool,
 }
 
 impl Instance {
@@ -62,6 +74,9 @@ impl Instance {
             unlit: false,
             tile: false,
             grass: false,
+            receives_shadows: false,
+            casts_shadows: true,
+            casts_light_shadows: false,
         }
     }
 }
@@ -100,7 +115,19 @@ pub struct PointLight {
     pub ambient_only: bool,
     /// 1 (highest) to 5: which lights are kept past 32.
     pub priority: u32,
+    /// A creature's shadow can be cast from it ([`Scene::light_shadows`]):
+    /// a light node flagged `shadow` of a radius of 10 m or more (the
+    /// tiles' flames, radius 7, cast none in the client; a placeable's
+    /// `LightColor` light, 10, does).
+    pub casts_shadows: bool,
+    /// How far above the light its shadows are cast from, metres (its
+    /// node's `verticaldisplacement`: a placeable's light, 3, casts
+    /// shorter shadows than one from where it is, as the client's).
+    pub shadow_lift: f32,
 }
+
+/// The least radius of a light a creature's shadow is cast from.
+pub const SHADOW_LIGHT_RADIUS: f32 = 10.0;
 
 /// The game's `cutoff-range-multiplier` setting.
 pub const CUTOFF_RANGE_MULTIPLIER: f32 = 2.0;
@@ -124,7 +151,17 @@ impl PointLight {
             cutoff: radius * CUTOFF_RANGE_MULTIPLIER * intensity,
             ambient_only,
             priority,
+            casts_shadows: false,
+            shadow_lift: 0.0,
         }
+    }
+
+    /// This light, casting creatures' shadows where `shadow` (its node's
+    /// flag) and its `radius` is [`SHADOW_LIGHT_RADIUS`] or more, from
+    /// `lift` metres above it.
+    pub fn casting(self, shadow: bool, radius: f32, lift: f32) -> Self {
+        let casts_shadows = shadow && radius >= SHADOW_LIGHT_RADIUS;
+        PointLight { casts_shadows, shadow_lift: lift, ..self }
     }
 }
 
@@ -161,6 +198,21 @@ impl Default for AreaLight {
 pub fn bgr_linear(c: u32) -> Vec3 {
     let ch = |shift: u32| (((c >> shift) & 0xFF) as f32 / 255.0).powf(2.2);
     Vec3::new(ch(0), ch(8), ch(16))
+}
+
+/// The sun's or moon's shadows over a scene (or the lights'), as the game's shadow plane
+/// lays them (`docs/research/notes_shaders.md` §G): what the area light
+/// ([`Scene::area`], its direction) shades of what receives them
+/// ([`Instance::receives_shadows`]) is darkened, black laid over it as
+/// much as the area's Shadow Opacity says, less towards the top of the
+/// screen (the plane's fade) and in fog.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunShadows {
+    /// The area's `ShadowOpacity`, 0 to 1.
+    pub opacity: f32,
+    /// Where the fade of the shadows up the screen ends: the area's fog
+    /// clip distance (`FogClipDist`), as the client's fog is always on.
+    pub fade_limit: f32,
 }
 
 /// Linear fog by view depth, blended in gamma space.
@@ -203,6 +255,13 @@ pub struct Scene {
     pub time: f32,
     /// What the game's shaders read of the area besides its light.
     pub environment: Environment,
+    /// The area light's shadows; `None`: none.
+    pub shadows: Option<SunShadows>,
+    /// The shadows cast from point lights (each instance that
+    /// [`Instance::casts_light_shadows`] casts one from the nearest light
+    /// that [`PointLight::casts_shadows`]), as dark as these say; `None`:
+    /// none.
+    pub light_shadows: Option<SunShadows>,
 }
 
 /// What the game's shaders read of an area besides its light
@@ -321,6 +380,14 @@ impl Camera {
         Mat4::look_at_rh(self.eye, self.target, Vec3::Z)
     }
 
+    /// How far a point of a view `height` points tall is at the target
+    /// (across the view, as up it): what a drag of a point moves there, so
+    /// that what is dragged follows the pointer. The area view's pan, its
+    /// lift and its arrows seen end on, and the model viewer's pan.
+    pub fn per_point(&self, height: f32) -> f32 {
+        2.0 * self.eye.distance(self.target) * (self.fov_y / 2.0).tan() / height.max(1.0)
+    }
+
     pub fn projection(&self, aspect: f32) -> Mat4 {
         Mat4::perspective_rh(self.fov_y, aspect.max(1e-3), self.near, self.far)
     }
@@ -335,6 +402,25 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step of `per_point` at the target, across the view, is a point
+    /// on the screen: what is dragged follows the pointer.
+    #[test]
+    fn a_point_at_the_target_is_per_point_there() {
+        let target = Vec3::new(10.0, 20.0, 0.0);
+        for distance in [5.0, 40.0, 300.0] {
+            let c = Camera::orbit(target, distance, 0.7, 0.9);
+            let (w, h) = (1200.0, 800.0);
+            let m = c.projection(w / h) * c.view();
+            let on_screen = |p: Vec3| {
+                let v = m.project_point3(p);
+                glam::Vec2::new((v.x + 1.0) / 2.0 * w, (1.0 - v.y) / 2.0 * h)
+            };
+            let right = (c.target - c.eye).cross(Vec3::Z).normalize();
+            let step = on_screen(target + right * c.per_point(h)) - on_screen(target);
+            assert!((step.length() - 1.0).abs() < 1e-3, "{distance}: {step}");
+        }
+    }
 
     /// The client's uniforms for these lights (read back through a debug
     /// shader): colour and cutoff.

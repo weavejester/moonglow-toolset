@@ -343,7 +343,9 @@ fn a_lighting_scheme_is_given_to_the_areas() {
     let row = (0..env.len()).find(|&r| env.get(r, "LABEL") == Some("InteriorDark")).unwrap();
     let cell = |c: &str| i64::from(env.get_int(row, c).unwrap());
 
-    let scheme = ["cave1", "--lighting-scheme", "interiordark", "--set", "SunFogAmount=5"];
+    // (A seed, so that the tiles' lights picked are not by chance their own.)
+    let scheme =
+        ["cave1", "--lighting-scheme", "interiordark", "--seed", "1", "--set", "SunFogAmount=5"];
     let (ok, out, err) = run(&scheme);
     assert!(ok, "{err}");
     assert!(out.contains(&format!("cave1\tLightingScheme\t(none) -> {row}")), "{out}");
@@ -374,4 +376,64 @@ fn a_lighting_scheme_is_given_to_the_areas() {
         assert!(!ok && err.contains("environment"), "{bad}: {err}");
     }
     assert_eq!(std::fs::read(&path).unwrap(), bytes, "a dry run and a refusal change nothing");
+
+    // The tiles' lights are picked with a number a run prints, a dry run
+    // too: with it, a run makes the dry run's picks, and the same picks
+    // on another copy of the module.
+    let (a, b) = (dir.join("a.mod"), dir.join("b.mod"));
+    std::fs::copy(&path, &a).unwrap();
+    std::fs::copy(&path, &b).unwrap();
+    let run_on = |module: &std::path::Path, args: &[&str]| {
+        let mut cmd = crate::mg();
+        cmd.args(["--root", root.to_str().unwrap(), "--no-user-dir", "areas"]);
+        let out = cmd.arg(module).args(args).output().unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        (text(&out.stdout), text(&out.stderr))
+    };
+    let overcast = ["--all", "--lighting-scheme", "Exterior Overcast"];
+    let (listed, said) = run_on(&a, &[&overcast[..], &["--dry-run"]].concat());
+    let seed = said.split("--seed ").nth(1).and_then(|s| s.split_whitespace().next());
+    let seed = seed.unwrap_or_else(|| panic!("no seed said: {said}"));
+    let with = [&overcast[..], &["--seed", seed]].concat();
+    assert_eq!(run_on(&a, &with).0, listed, "the dry run's picks");
+    run_on(&b, &with);
+    let tiles = |p: &std::path::Path| {
+        let are = Module::open(p).unwrap().gff(&are_key).unwrap().unwrap();
+        are.root.list("Tile_List").unwrap().to_vec()
+    };
+    assert_eq!(tiles(&a), tiles(&b), "the same number, the same picks");
+}
+
+/// A `.mod` named to `mg` with its module folder beside it (Aurora's
+/// module directory, `Caves/` beside `caves.mod`, in any case): the
+/// command reads and changes the `.mod`, as the game's server reads it,
+/// and says that the folder is left as it is, in the JSON's notes too.
+#[test]
+fn a_mod_s_folder_beside_it_is_said() {
+    let dir = mg_testkit::scratch_dir("mg-areas-folder-beside");
+    let path = dir.join("caves.mod");
+    module(&path);
+    let run = |args: &[&str]| {
+        let out = crate::mg().args(args).output().unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        (out.status.success(), text(&out.stdout), text(&out.stderr))
+    };
+    let p = path.to_str().unwrap();
+    let (ok, _, notes) = run(&["areas", p]);
+    assert!(ok && !notes.contains("module folder"), "{notes}");
+    let folder = dir.join("Caves");
+    Module::open(&path).unwrap().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
+    let (ok, _, notes) = run(&["areas", p, "--all", "--set", "SunFogAmount=5"]);
+    assert!(ok, "{notes}");
+    assert_eq!(notes.matches("has its module folder beside it").count(), 1, "{notes}");
+    assert!(notes.contains(&folder.display().to_string()), "{notes}");
+    let fog = |m: &std::path::Path| {
+        let are = Module::open(m).unwrap().gff(&key("cave1", ResType::ARE)).unwrap().unwrap();
+        are.root.integer("SunFogAmount")
+    };
+    assert_eq!((fog(&path), fog(&folder)), (Some(5), Some(2)), "the .mod changed, not the folder");
+    let (ok, json, _) = run(&["--json", "areas", p]);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(ok && json["notes"].to_string().contains("has its module folder beside it"), "{json}");
 }

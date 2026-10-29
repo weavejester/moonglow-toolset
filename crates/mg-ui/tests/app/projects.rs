@@ -225,6 +225,48 @@ fn nasher_projects_save_in_place_and_never_overwrite_other_changes() {
 /// folder's copy), edited, and saved with the module as nwn_tlk writes it;
 /// the other language is chosen in the editor.
 #[test]
+fn a_new_talk_table_of_a_project_is_made_in_it() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-talk-project-new");
+    let user = dir.join("user");
+    std::fs::create_dir_all(user.join("tlk")).unwrap();
+    let m = mg_module::Module::open(&sample_module(&dir)).unwrap();
+    let project = dir.join("project");
+    let mut m = m;
+    m.save_as(&ModuleLocation::Project { root: project.clone(), target: "default".into() })
+        .unwrap();
+    let mut app = game_app(&root, Some(user.clone()));
+    app.settings.no_last_area = true;
+    app.open_module(&project);
+    app.open_palette = false;
+    let mut h = harness(app, 1000.0, 800.0);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::TalkTable));
+    h.run();
+    h.state_mut().talk_view.new_name = "mg_new".into();
+    h.run();
+    h.get_by_label_contains("Made in the project as");
+    h.get_by_label("Create").click();
+    h.run();
+    h.run();
+    let json = project.join("src/mg_new.tlk.json");
+    let t = h.state().talk.as_ref().expect("the new table is open");
+    assert!(matches!(&t.source, mg_module::talk::Source::Json { path, .. } if *path == json));
+    assert!(!user.join("tlk/mg_new.tlk").exists(), "not in the tlk folder");
+    let cfg = std::fs::read_to_string(project.join("nasher.cfg")).unwrap();
+    assert!(cfg.contains("file = \"mg_new.tlk\"") && cfg.contains("exclude = \"**/*.tlk.json\""));
+    // The module names it; a line added and saved goes into its JSON.
+    h.get_by_label("Add Line").click();
+    h.run();
+    type_into_hint(&mut h, "the line's text", "Fresh");
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    h.run();
+    assert!(std::fs::read_to_string(&json).unwrap().contains("\"text\":\"Fresh\""));
+    let m = mg_module::Module::open(&project).unwrap();
+    assert_eq!(m.custom_tlk().unwrap().as_deref(), Some("mg_new"));
+    assert!(m.project.as_ref().unwrap().warnings.is_empty());
+}
+
+#[test]
 fn a_projects_talk_table_kept_as_json_is_edited_there() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-talk-project");
@@ -296,6 +338,21 @@ fn a_projects_talk_table_kept_as_json_is_edited_there() {
     let t = h.state().talk.as_ref().unwrap();
     assert!(matches!(&t.source, mg_module::talk::Source::Json { path, .. } if *path == de));
     assert_eq!((t.len(), t.line(0).text.as_str()), (1, "Hallo"));
+    // Changed outside Moonglow (a `git pull`): the editor reads it again;
+    // with unsaved changes here, those are kept, and said.
+    std::fs::write(&de, r#"{"language":2,"entries":[{"id":0,"text":"Servus"}]}"#).unwrap();
+    h.state_mut().reload_resources(false);
+    h.run();
+    assert_eq!(h.state().talk.as_ref().unwrap().line(0).text, "Servus");
+    assert!(!h.state().talk.as_ref().unwrap().is_dirty());
+    h.get_by_label("Add Line").click();
+    h.run();
+    std::fs::write(&de, r#"{"language":2,"entries":[{"id":0,"text":"Grüß Gott"}]}"#).unwrap();
+    h.state_mut().reload_resources(false);
+    h.run();
+    let t = h.state().talk.as_ref().unwrap();
+    assert_eq!((t.len(), t.line(0).text.as_str()), (2, "Servus"), "ours kept");
+    assert!(h.state().log.entries.iter().any(|(_, m)| m.contains("while it has unsaved changes")));
 }
 
 /// Setup Store in a project whose moonglow.toml has `[store]`: the
@@ -1024,6 +1081,234 @@ fn a_builder_code_set_in_its_window_begins_the_resrefs_proposed() {
     assert_eq!(h.state().ws.as_ref().unwrap().module.project_file.naming(), Default::default());
 }
 
+/// The text field holding `value`, of a window that asks for a name.
+fn typed_name<'h>(h: &'h Harness<'_, Moonglow>, value: &'h str) -> egui_kittest::Node<'h> {
+    let field = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some(value)
+    };
+    h.get(egui_kittest::kittest::by().predicate(field))
+}
+
+/// The builder code where a new resource's name is typed (The Domains of
+/// Dread's builder proposal, C1): New Script…, New Conversation… and New
+/// NUI Window… start with it, the cursor where the name goes (before a
+/// code that follows the name), Add Popup Text…'s conversation too, and
+/// an imported story's conversation has it.
+#[test]
+fn the_names_typed_for_new_resources_start_with_the_builder_code() {
+    let dir = project_folder("ui-code-new-names", &[]);
+    mg_module::project_file::ProjectFile::set_builder_code(&dir, Some("ab")).unwrap();
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&dir);
+    let mut h = harness(app, 1000.0, 800.0);
+    h.run();
+    let tools = |h: &mut Harness<'_, Moonglow>, item: &str| {
+        h.get_by_label("Tools").click();
+        h.run();
+        h.get_by_label_contains(item).click();
+        h.run();
+    };
+    tools(&mut h, "New Script…");
+    assert_eq!(h.state().new_script.as_deref(), Some("ab_"));
+    typed_name(&h, "ab_").type_text("gate");
+    h.run();
+    h.get_by_label("Create").click();
+    h.run();
+    let ws = h.state().ws.as_ref().unwrap();
+    assert!(ws.module.contains(&ResKey::parse("ab_gate", ResType::NSS).unwrap()));
+    tools(&mut h, "New Conversation…");
+    assert_eq!(h.state().new_dialog.as_deref(), Some("ab_"));
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    tools(&mut h, "New NUI Window…");
+    assert!(h.query_by_label("New NUI Window").is_some());
+    typed_name(&h, "ab_");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    let start = ResRef::from_str("start").unwrap();
+    assert_eq!(mg_ui::store_wizard::PopupText::of(h.state(), start, 0).name, "ab_");
+    // A story's conversation: named after its file, with the code (never
+    // twice), the next free after it.
+    let ink = dir.join("Night Watch.ink");
+    std::fs::write(&ink, "-> gate\n=== gate ===\nWho goes there?\n+ [A friend.] -> END\n").unwrap();
+    let first = h.state_mut().import_conversation(&ink).expect("imported");
+    h.run();
+    assert_eq!(first.resref.to_string(), "ab_night_watch");
+    let again = h.state_mut().import_conversation(&ink).expect("imported");
+    assert_eq!(again.resref.to_string(), "ab_night_watc001", "the name cut for the number");
+    let ab = dir.join("ab_lantern.ink");
+    std::fs::write(&ab, "-> gate\n=== gate ===\nA lantern.\n+ [Light it.] -> END\n").unwrap();
+    let own = h.state_mut().import_conversation(&ab).expect("imported");
+    assert_eq!(own.resref.to_string(), "ab_lantern");
+
+    // A pattern with the code after the name: the cursor before it.
+    std::fs::write(dir.join("moonglow.toml"), "[resrefs]\npattern = \"{name}_{code}\"\n").unwrap();
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&dir);
+    let mut h = harness(app, 1000.0, 800.0);
+    h.run();
+    tools(&mut h, "New Conversation…");
+    assert_eq!(h.state().new_dialog.as_deref(), Some("_ab"));
+    h.run();
+    typed_name(&h, "_ab").type_text("gate");
+    h.run();
+    assert_eq!(h.state().new_dialog.as_deref(), Some("gate_ab"));
+    h.get_by_label("Create").click();
+    h.run();
+    let ws = h.state().ws.as_ref().unwrap();
+    assert!(ws.module.contains(&ResKey::parse("gate_ab", ResType::DLG).unwrap()));
+}
+
+/// A ResRef typed in a wizard is taken as typed, with a button that puts
+/// the builder code in where it lacks it; the Creature Wizard's, where
+/// the module has it, becomes the next free from it with the code (C1).
+#[test]
+fn a_resref_typed_in_a_wizard_is_offered_the_builder_code() {
+    use mg_module::palette::BlueprintKind;
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = project_folder("ui-code-typed", &[]);
+    mg_module::project_file::ProjectFile::set_builder_code(&dir, Some("ab")).unwrap();
+    let mut app = game_app(&root, None);
+    app.open_module(&dir);
+    app.open_palette = false;
+    let mut h = harness(app, 1000.0, 900.0);
+    h.run();
+    h.state_mut().blueprint_wizard =
+        Some(mg_ui::blueprint_wizard::BlueprintWizard::new(BlueprintKind::Store));
+    h.run();
+    h.get_by_label("Merchants").click();
+    h.run();
+    h.get_by_label("Next >").click();
+    h.run();
+    type_into_hint(&mut h, "ab_merchants001", "shop");
+    h.run();
+    h.get_by_label("Use ab_shop").click();
+    h.run();
+    assert_eq!(h.state().blueprint_wizard.as_ref().unwrap().resref, "ab_shop");
+    assert!(h.query_by_label("Use ab_shop").is_none(), "it has the code now");
+    h.get_by_label("Finish").click();
+    h.run();
+    assert!(module_gff(&mut h, "ab_shop", ResType::UTM).is_some());
+
+    // The Creature Wizard: a ResRef the module has.
+    let guard = ResKey::parse("guard", ResType::UTC).unwrap();
+    let data = mg_gff::Gff::new(*b"UTC ").to_bytes().unwrap();
+    let made = mg_edit::Edit::SetResource { key: guard, data: Some(data) };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("guard", vec![made])));
+    h.run();
+    h.get_by_label("Wizards").click();
+    h.run();
+    h.get_by_label_contains("Creature Wizard…").click();
+    h.run();
+    let next = |h: &mut Harness<'_, Moonglow>| {
+        h.get_by_label("Next >").click();
+        h.run();
+    };
+    next(&mut h);
+    h.get_by_label("Human").click();
+    h.run();
+    for _ in 0..4 {
+        next(&mut h);
+    }
+    let w = h.state_mut().creature_wizard.as_mut().unwrap();
+    (w.first_name, w.resref) = ("Hent".into(), "guard".into());
+    h.run();
+    assert!(h.query_by_label("Use ab_guard").is_some());
+    next(&mut h);
+    h.get_by_label("Tutorial").click();
+    h.run();
+    next(&mut h);
+    next(&mut h);
+    h.query_all_by_label("Finish")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+        .unwrap()
+        .click();
+    h.run();
+    assert!(module_gff(&mut h, "ab_guard", ResType::UTC).is_some(), "the next free, with the code");
+}
+
+/// A team's own prefix, without a builder's code and by kind (`[resrefs]
+/// pattern = "tdod_{kind}{name}"`): the wizards and a copy propose it for
+/// everyone, and the Builder Code window says so.
+#[test]
+fn a_team_s_prefix_by_kind_begins_the_resrefs_proposed() {
+    use mg_module::palette::BlueprintKind;
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let rules = "[resrefs]\npattern = \"tdod_{kind}{name}\"\n\
+                 kinds = { store = \"m_\", script = \"s_\" }\n";
+    let dir = project_folder("ui-team-prefix", &[("moonglow.toml", rules)]);
+    let mut app = game_app(&root, None);
+    app.open_module(&dir);
+    app.open_palette = false;
+    let mut h = harness(app, 1000.0, 800.0);
+    h.run();
+    h.get_by_label("Edit").click();
+    h.run();
+    h.get_by_label("Builder Code…").click();
+    h.run();
+    h.get_by_label(
+        "None: the team's pattern alone. A new area named Market: tdod_market. A copy of \
+         nw_chicken: tdod_nw_chick001.",
+    );
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    // A blueprint wizard's: the store's kind.
+    h.state_mut().blueprint_wizard =
+        Some(mg_ui::blueprint_wizard::BlueprintWizard::new(BlueprintKind::Store));
+    h.run();
+    h.get_by_label("Merchants").click();
+    h.run();
+    h.get_by_label("Next >").click();
+    h.run();
+    let hint =
+        |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some("tdod_m_mercha001");
+    assert!(h.query_all(egui_kittest::kittest::by().predicate(hint)).next().is_some(), "the hint");
+    h.get_by_label("Finish").click();
+    h.run();
+    assert!(module_gff(&mut h, "tdod_m_mercha001", ResType::UTM).is_some());
+    // A copy's: a script's kind.
+    let hello = ResKey::parse("hello", ResType::NSS).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::CopyDialog(hello));
+    h.run();
+    assert_eq!(h.state().copy_as.as_ref().map(|c| c.resref.as_str()), Some("tdod_s_hello001"));
+}
+
+/// A module kept in one file keeps its project file beside it, named by
+/// it (`krezk.moonglow.toml`): read when it opens, and again when it
+/// changes.
+#[test]
+fn a_mod_s_own_project_file_is_read_and_read_again() {
+    let dir = mg_testkit::scratch_dir("ui-mod-project-file");
+    let folder = sample_module(&dir);
+    let path = dir.join("krezk.mod");
+    Module::open(&folder).unwrap().save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    std::fs::write(dir.join("krezk.moonglow.toml"), "[resrefs]\npattern = \"kz_{name}\"\n")
+        .unwrap();
+    let mut app = app_with(Vec::new());
+    app.open_module(&path);
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    assert!(logged(&h, "The project's rules are read from krezk.moonglow.toml"));
+    let naming = |h: &Harness<'_, Moonglow>| {
+        h.state().ws.as_ref().unwrap().module.project_file.naming().fit("market", "")
+    };
+    assert_eq!(naming(&h), "kz_market");
+    std::fs::write(dir.join("krezk.moonglow.toml"), "[resrefs]\npattern = \"krezk_{name}\"\n")
+        .unwrap();
+    h.state_mut().reload_changed_files();
+    h.run();
+    assert!(logged(&h, "krezk.moonglow.toml changed: its rules are read again"));
+    assert_eq!(naming(&h), "krezk_market");
+}
+
 /// A module kept in one file has no project to keep a code in: the menu
 /// item is there, and off.
 #[test]
@@ -1138,6 +1423,91 @@ fn the_variables_window_offers_the_project_s_described_variables() {
     let vars = doc.root.list("Placeable List").unwrap()[0].list("VarTable").unwrap();
     assert_eq!(vars.len(), 2);
     assert_eq!(vars[0].string("Value"), Some(&b"forge"[..]));
+}
+
+/// The Variables window's offer by the keys: Down and Up move in it,
+/// Enter takes the name (not the window's OK) and Escape closes it (not
+/// the window). A pattern is offered by what its names begin with, typed
+/// on from there.
+#[test]
+fn the_variables_window_s_offer_takes_the_keys_and_offers_patterns() {
+    use mg_ui::widgets::{FieldTarget, VarTableEdit};
+    let described = "[tdod_workbench]\ntype = \"string\"\non = [\"placeable\"]\n\n\
+        [tdod_lit]\ntype = \"int\"\n\n\
+        [\"tdod_rental_*\"]\ntype = \"int\"\non = [\"placeable\"]\nhelp = \"A room's rent\"\n";
+    let dir = project_folder("ui-offer-keys", &[("variables.toml", described)]);
+    let git = ResKey::parse("start", ResType::GIT).unwrap();
+    {
+        let mut m = Module::open(&dir).unwrap();
+        let mut g = Gff::new(*b"GIT ");
+        g.root.set("Placeable List", mg_gff::Value::List(vec![mg_gff::Struct::new(9)]));
+        m.set_gff(git, &g).unwrap();
+        m.save().unwrap();
+    }
+    let mut app = app_with(Vec::new());
+    app.open_module(&dir);
+    let path = mg_edit::GffPath::root().item("Placeable List", 0);
+    app.var_edit = Some(VarTableEdit::new(FieldTarget::new(git, path, "VarTable"), &[]));
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    let row =
+        |h: &Harness<'_, Moonglow>, i: usize| h.state().var_edit.as_ref().unwrap().rows[i].clone();
+    let hint = |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some("Name");
+    let name_field = |h: &Harness<'_, Moonglow>, _row: usize| {
+        h.get_all(egui_kittest::kittest::by().predicate(hint)).last().unwrap().click();
+    };
+    h.get_by_label("Add").click();
+    h.run();
+    name_field(&h, 0);
+    h.run();
+    h.event(egui::Event::Text("tdod_".into()));
+    h.run();
+    // The names, then the pattern's beginning, with the pattern.
+    assert!(h.query_by_label("tdod_workbench").is_some());
+    assert!(h.query_by_label("tdod_lit").is_some());
+    assert!(h.query_by_label("tdod_rental_").is_some(), "the pattern, by its beginning");
+    assert!(h.query_by_label_contains("tdod_rental_*: ").is_some());
+    // Down, Enter: the second, and the window stays open.
+    h.key_press(egui::Key::ArrowDown);
+    h.run();
+    h.key_press(egui::Key::Enter);
+    h.run();
+    h.run();
+    assert!(h.state().var_edit.is_some(), "Enter took the name, not the window's OK");
+    assert_eq!(row(&h, 0).name, "tdod_lit");
+    // A pattern taken by the keys, and typed on from.
+    h.get_by_label("Add").click();
+    h.run();
+    name_field(&h, 1);
+    h.run();
+    h.event(egui::Event::Text("tdod_r".into()));
+    h.run();
+    h.key_press(egui::Key::Enter);
+    h.run();
+    h.run();
+    assert_eq!(row(&h, 1).name, "tdod_rental_");
+    h.event(egui::Event::Text("door".into()));
+    h.run();
+    assert_eq!(row(&h, 1).name, "tdod_rental_door", "typed on, at its end");
+    assert_eq!(row(&h, 1).kind, 1, "an Int, as the pattern says");
+    // Escape closes the offer, not the window.
+    h.get_by_label("Add").click();
+    h.run();
+    name_field(&h, 2);
+    h.run();
+    h.event(egui::Event::Text("tdod_w".into()));
+    h.run();
+    assert!(h.query_by_label("tdod_workbench").is_some());
+    h.key_press(egui::Key::Escape);
+    h.run();
+    h.run();
+    assert!(h.state().var_edit.is_some(), "the window stays open");
+    assert!(h.query_by_label("tdod_workbench").is_none(), "the offer closed");
+    // With no offer, Escape is the window's.
+    h.key_press(egui::Key::Escape);
+    h.run();
+    h.run();
+    assert!(h.state().var_edit.is_none(), "closed");
 }
 
 /// Verify Module holds the module's variables to the project's
@@ -1529,6 +1899,145 @@ fn commands_allowed_by_a_committed_user_file_are_still_asked_about() {
     h.get_all_by_label("Cancel").last().unwrap().click();
     h.run();
     assert!(!logged(&h, "Update: done"));
+}
+
+/// The project's commands are in the Command Palette and take keys as any
+/// command does: their own (`key`) at first, those chosen in Options ›
+/// Keyboard after; each runs as from File › Project (saved first, asked
+/// about as it reads).
+#[test]
+fn a_project_s_command_is_in_the_palette_and_takes_keys() {
+    let rules = "[commands]\nupdate = { run = \"echo updated\", key = \"Ctrl+Shift+U\" }\n\
+                 submit = { run = \"echo submitted\", label = \"Submit for Review\" }\n";
+    let dir = project_folder("ui-project-commands-keys", &[("moonglow.toml", rules)]);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&dir);
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    // The palette finds them, under Project, and runs one.
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P);
+    h.run();
+    type_into_hint(&mut h, "Type a command's name", "submit");
+    h.get_by_label("Submit for Review…").click();
+    h.run();
+    h.run();
+    h.get_by_label("Run a Project Command?");
+    h.get_by_label("echo submitted");
+    h.get_by_label("Allow and Run").click();
+    h.run();
+    h.run();
+    assert!(logged(&h, "Submit for Review: done"), "{:?}", h.state().log.entries);
+    // Its own key, shown in File › Project.
+    h.get_by_label("File").click();
+    h.run();
+    h.get_by_label("Project").click();
+    h.run();
+    let menu = h.get_by_label_contains("Update…").accesskit_node().label().unwrap_or_default();
+    assert!(menu.contains("Ctrl+Shift+U") || menu.contains("⇧⌘U"), "{menu}");
+    h.key_press(egui::Key::Escape);
+    h.run();
+    h.key_press(egui::Key::Escape);
+    h.run();
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::U);
+    h.run();
+    h.run();
+    h.get_by_label("Run a Project Command?");
+    h.get_by_label("echo updated");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    // Options › Keyboard lists them, and another key chosen there runs it.
+    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+    h.run();
+    h.get_by_label("Keyboard").click();
+    h.run();
+    type_into_hint(&mut h, "Find a command", "project");
+    h.get_by_label("Submit for Review");
+    h.state_mut().options.as_mut().unwrap().recording = Some("project:submit".to_string());
+    h.run();
+    h.key_press(egui::Key::F8);
+    h.run();
+    h.get_all_by_label("OK").last().unwrap().click();
+    h.run();
+    assert_eq!(
+        h.state().settings.key_bindings.get("project:submit"),
+        Some(&vec!["F8".to_string()])
+    );
+    h.key_press(egui::Key::F8);
+    h.run();
+    h.run();
+    assert_eq!(
+        h.state().log.entries.iter().filter(|(_, m)| m == "Submit for Review: done").count(),
+        2,
+        "F8 runs it (allowed: without asking)"
+    );
+}
+
+/// A command that writes none of the module's files (`writes = false`, a
+/// submit) runs with the module's haks open (the open areas aren't drawn
+/// again after); any other closes them while it runs, so that a checkout
+/// may write over them. Seen from the command: the haks Moonglow has
+/// holds open (Linux's `/proc`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_project_s_command_that_writes_nothing_keeps_the_haks_open() {
+    let root = mg_testkit::corpus!();
+    let rules = "[commands]\n\
+                 submit = { run = \"ls -l /proc/$PPID/fd | grep -c mg_cmd_writes.hak; true\", writes = false }\n\
+                 update = \"ls -l /proc/$PPID/fd | grep -c mg_cmd_writes.hak; true\"\n";
+    let dir = project_folder("ui-project-commands-writes", &[("moonglow.toml", rules)]);
+    let user = dir.parent().unwrap().join("user");
+    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let mut hak = mg_erf::ErfWriter::new(*b"HAK ");
+    let table = b"2DA V2.0\n\n   Label\n0  one\n".to_vec();
+    hak.add(mg_core::ResRef::from_str("mg_cmd").unwrap(), ResType::TWODA, table).unwrap();
+    std::fs::write(user.join("hak/mg_cmd_writes.hak"), hak.to_bytes().unwrap()).unwrap();
+    let mut m = Module::open(&dir).unwrap();
+    let mut ifo = m.info().unwrap();
+    let mut listed = mg_gff::Struct::new(8);
+    listed.set("Mod_Hak", mg_gff::Value::String(b"mg_cmd_writes".to_vec()));
+    ifo.root.set("Mod_HakList", mg_gff::Value::List(vec![listed]));
+    m.set_info(&ifo).unwrap();
+    m.save().unwrap();
+    let mut app = game_app(&root, Some(user));
+    app.settings.no_last_area = true;
+    let project = std::fs::canonicalize(&dir).unwrap().display().to_string();
+    for (name, text) in [
+        ("submit", "ls -l /proc/$PPID/fd | grep -c mg_cmd_writes.hak; true"),
+        ("update", "ls -l /proc/$PPID/fd | grep -c mg_cmd_writes.hak; true"),
+    ] {
+        app.settings.allowed_commands.push((project.clone(), name.into(), text.into()));
+    }
+    app.open_module(&dir);
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    let mapped = |h: &Harness<'_, Moonglow>| -> Vec<String> {
+        h.state()
+            .log
+            .entries
+            .iter()
+            .filter_map(|(_, m)| m.strip_prefix("  "))
+            .map(String::from)
+            .collect()
+    };
+    h.state_mut().actions.push(mg_ui::Action::ProjectCommand("submit".into()));
+    h.run();
+    h.run();
+    assert!(logged(&h, "Submit: done"), "{:?}", h.state().log.entries);
+    let seen = mapped(&h);
+    assert!(
+        seen.last().is_some_and(|n| n != "0"),
+        "the hak open while it ran: {seen:?} {:?}",
+        h.state().log.entries
+    );
+    h.state_mut().actions.push(mg_ui::Action::ProjectCommand("update".into()));
+    h.run();
+    h.run();
+    assert!(logged(&h, "Update: done"), "{:?}", h.state().log.entries);
+    assert_eq!(mapped(&h).last().map(String::as_str), Some("0"), "closed while it ran");
+    // (And open again after.)
+    let ws = h.state().ws.as_ref().unwrap();
+    assert_eq!(ws.module.haks().unwrap(), ["mg_cmd_writes"]);
 }
 
 /// File › Project is there and off for a project that names no commands.

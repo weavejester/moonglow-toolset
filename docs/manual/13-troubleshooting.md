@@ -1,9 +1,9 @@
 ---
 type: Manual Page
 title: Troubleshooting
-description: Troubleshooting - the game is not found, no GPU in the area viewer, tiles that disappear on AMD under Windows (the graphics backend), Test Module does nothing, no sound, after a crash, and where Moonglow keeps its files.
+description: Troubleshooting - the game is not found, no GPU in the area viewer, an area that draws nothing or loses its tiles on AMD under Windows (the graphics backend, its startup check, the lit check and the area view's watch; what to send), Direct3D 12's shader compiler (the DXC shipped beside Moonglow, and FXC where it is missing), Test Module does nothing, no sound, after a crash, and where Moonglow keeps its files.
 tags: [manual, troubleshooting]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T00:19:15Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-29T09:42:01Z }
 ---
 
 # Troubleshooting
@@ -36,21 +36,115 @@ or NVIDIA's). **Tools › Options… › General › Graphics backend** chooses
 the backend (from the next start); the debug log's `graphics:` line
 says which adapter was taken, and why.
 
-## Tiles disappear on an AMD GPU under Windows
+## An area draws nothing, or loses its tiles, on an AMD GPU under Windows
 
-On an AMD GPU under Windows, AMD's Vulkan driver drew an area's tiles
-when the area opened, then lost them one by one (a builder's Radeon PRO,
-driver 25.10.37.03, October 2026); through Direct3D 12 they stay. Moonglow now
-draws through Direct3D 12 on such a GPU by itself (**Options › General ›
-Graphics backend**: Automatic). If you set **Vulkan** there, or
-something still looks wrong, choose **Direct3D 12** and start Moonglow
-again. To try a backend without changing the setting, start Moonglow
+Two builders' AMD GPUs under Windows went wrong in opposite ways
+(October 2026):
+
+- A Radeon PRO, through AMD's **Vulkan** driver (25.10.37.03), drew an
+  area's tiles when the area opened, then lost them one by one; through
+  Direct3D 12 they stayed.
+- A Radeon RX 580 (Windows 10, since Moonglow 2.11.0), through
+  **Direct3D 12**, drew nothing of an area but the start location's
+  marker and the doors' arrows; through Vulkan it drew it all. (The
+  marker and the arrows are drawn over the picture, not in it: they show
+  whatever the GPU draws.) Moonglow 2.13.0's checks didn't catch it.
+
+So no fixed rule serves every AMD GPU. Automatic (**Options › General
+› Graphics backend**) still takes Direct3D 12 first for AMD on Windows,
+and Moonglow looks at what it draws:
+
+- **As it starts**, before the window opens, it draws a small scene
+  offscreen and checks it. Where nothing is drawn, it takes the same
+  GPU's other backend (once: if that fails too, it keeps the first and
+  says so in a notice under the toolbar). The backend that failed is
+  remembered for this GPU and driver; Automatic passes over it until a
+  driver update. The log says what happened, and the debug log's
+  `graphics:` line what the check found on each backend.
+- **Once the game's data is read**, it draws a lit, textured test mesh
+  (red) as a tile is drawn, with Moonglow's own shader and with the
+  game's, and says whether each drew nothing of it or drew it in the
+  wrong colors. Where Moonglow's own draws it wrong, the notice offers
+  **Restart with …** (below). Where only the game's shaders draw it
+  wrong, Moonglow draws with its own for the rest of the session and the
+  notice says so (the **Shaders** button turns the game's on again): the
+  area is still drawn, only not by the game's shaders. The check draws
+  the game's own shader files, as the game installs them, even where
+  `override`, `development`, a Workshop item or a hak has its own copy
+  of one (a builder's `inc_lighting`, say), since what the game's own
+  draw is known; the debug log's `graphics: the lit check` line names
+  such copies and the colors each shader drew. The area view draws with
+  the copies the game reads.
+- **While an area is open**, it looks about once a second at how much
+  of the area's ground the GPU drew against what the camera should see
+  (the game's shaders included, once they are compiled; tiles whose
+  models failed included). Where less than a fifth of it has been drawn
+  for five seconds, a notice under the toolbar names the GPU and the
+  backend and offers **Restart with …** the other one. It closes
+  Moonglow as File › Exit does (asking about unsaved work first) and
+  starts it again with the same module; on Automatic the failing
+  backend is remembered as above, and a backend you chose in Options is
+  changed there. The watch says nothing on an empty area, while the
+  game's shaders are being compiled or textures read, with Fade
+  Geometry, with the camera turned to the sky, or while zooming; but
+  where an area waits twenty seconds for textures or shaders and none
+  comes, it judges what is drawn all the same.
+
+A shader of the game's that the graphics driver can't compile is drawn
+with Moonglow's own shader instead, and the log says which. (Under
+Direct3D 12, see the next section.)
+
+Neither builder's machine was reproduced where Moonglow is developed:
+both failures were imitated there, and the checks are waiting on the
+two builders to confirm them. If an area still draws nothing, a report
+helps most with these files from `%APPDATA%\Moonglow` (paste it into
+the File Explorer's address bar): the **debug log** of the session
+(`logs\debug-log-<date>-<time>.txt`; its lines starting `graphics` say
+what the checks found), and any `crash-<time>.txt` or
+`model-failure-<time>.txt` written then, even where Moonglow went on.
+Say too whether the area is drawn with the area view's **Shaders**
+button off.
+
+If you set a backend in Options yourself, it is kept even where the
+check fails (the notice offers the other). Where nothing helps, update
+the graphics driver, or turn the game's shaders off with the area
+view's **Shaders** button. To try a backend without changing the setting, start Moonglow
 with the `WGPU_BACKEND` environment variable set (`dx12`, `vulkan` or
 `gl`): it decides over the setting. In a Command Prompt, in the folder
 Moonglow is installed in:
 
 ```bat
 set WGPU_BACKEND=dx12
+moonglow.exe
+```
+
+## Direct3D 12's shader compiler
+
+Under Direct3D 12, shaders are compiled with Microsoft's DirectX Shader
+Compiler (DXC): the `dxcompiler.dll` installed beside `moonglow.exe` and
+`mg.exe` (the installer and the zip both have it). The debug log's
+`graphics:` line ends with which compiler was taken, "Direct3D 12
+compiles shaders with DXC (…\dxcompiler.dll)".
+
+Where that file is missing (deleted, or not copied with the programs),
+Moonglow takes Windows' older compiler, FXC, and the line says "with FXC
+(no dxcompiler.dll beside moonglow.exe)". FXC can't compile the game's
+normal-mapped lit shaders (`fslit_nm`, `fslit_sm_nm`, and copies of them
+in a module's haks, such as a skin tile's): their height map is read in
+a loop of as many steps as the view asks. Those meshes are then drawn
+with Moonglow's own shader, and the log says which; the rest draws as
+before. Install Moonglow again, or unpack the zip again, to put the file
+back.
+
+With DXC, Direct3D 12 needs a driver with shader model 6, which current
+drivers have; on an older one Direct3D 12 isn't offered at all, and
+Moonglow draws with Vulkan. To use Direct3D 12 with FXC there, start
+Moonglow with the `WGPU_DX12_COMPILER` environment variable set to `fxc`
+(it decides over the file; `dxc` takes a `dxcompiler.dll` wherever
+Windows finds one):
+
+```bat
+set WGPU_DX12_COMPILER=fxc
 moonglow.exe
 ```
 
@@ -121,11 +215,16 @@ off.)
 | What | Linux | Windows | macOS |
 | --- | --- | --- | --- |
 | Settings | `~/.local/share/moonglowtoolset` | `%APPDATA%\Moonglow Toolset\data` | `~/Library/Application Support/Moonglow-Toolset` |
-| Recovery copies, crash reports, debug logs (`logs`), prefabs (`prefabs`), plugins (`plugins`), each module's open tabs (`open-tabs`) | `~/.local/share/moonglow` | `%APPDATA%\Moonglow` | `~/Library/Application Support/Moonglow` |
+| Recovery copies, crash reports, debug logs (`logs`), prefabs (`prefabs`), variable sets (`variable-sets`), plugins (`plugins`), each module's open tabs (`open-tabs`) | `~/.local/share/moonglow` | `%APPDATA%\Moonglow` | `~/Library/Application Support/Moonglow` |
 | Conversation backups | `/tmp/moonglow-backups` | `%TEMP%\moonglow-backups` | `$TMPDIR/moonglow-backups` |
 
 On Linux, `$XDG_DATA_HOME` takes the place of `~/.local/share` when set
 (in the Flatpak: `~/.var/app/io.github.moonglow_toolset.Moonglow/data`).
+On every system, `MOONGLOW_DATA_DIR` names the second row's folder
+itself, and `MOONGLOW_CACHE_DIR` the folder of what Moonglow makes and
+can make again (the game's shaders compiled, `mg lsp`'s scripts), when
+they are set: for a run that should keep apart from yours, as the tests
+do.
 
 Moonglow never writes into the game's folder. In your user folder it
 writes only what you save there (modules, and exported archives where you

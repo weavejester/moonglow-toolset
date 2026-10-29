@@ -10,10 +10,16 @@
 //! The failures are kept ([`take_failures`]) for the application to tell
 //! the user; while a guarded step runs, [`guarding`] is true, so that a
 //! panic hook can tell a failure Moonglow carries on from a crash.
+//!
+//! [`blank_draws`] makes every scene draw nothing (tests): what a driver
+//! that draws nothing does, for the startup check ([`crate::probe`]) and
+//! the area view's watch ([`crate::watch`]) to be proved on a GPU that
+//! draws.
 
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     /// How many guarded steps are running on this thread, one inside
@@ -26,6 +32,9 @@ static FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The model that fails on purpose (tests).
 static FAILING: Mutex<Option<String>> = Mutex::new(None);
+
+/// The scene's draws are made to draw nothing ([`blank_draws`]).
+static BLANK: AtomicBool = AtomicBool::new(false);
 
 /// Whether a guarded step is running on this thread: a panic now is
 /// caught, and Moonglow carries on.
@@ -78,6 +87,76 @@ pub(crate) fn fail_if_asked(name: &str) {
     if asked.is_some_and(|a| a == name.to_ascii_lowercase()) {
         panic!("made to fail");
     }
+}
+
+/// The game's program whose pipelines are made to fail (tests).
+static FAILING_PROGRAM: Mutex<Option<String>> = Mutex::new(None);
+
+/// Makes making a pipeline with the game's program `name` fail (`None`:
+/// none), as wgpu fails it (a pipeline it refuses), to test what falls
+/// back from it: as Direct3D 12 would where FXC can't compile a program.
+#[doc(hidden)]
+pub fn fail_program(name: Option<&str>) {
+    if let Ok(mut failing) = FAILING_PROGRAM.lock() {
+        *failing = name.map(str::to_ascii_lowercase);
+    }
+}
+
+/// Whether [`fail_program`] names `name`.
+pub(crate) fn program_made_to_fail(name: &str) -> bool {
+    let asked = FAILING_PROGRAM.lock().ok().and_then(|f| f.clone());
+    asked.is_some_and(|a| a == name.to_ascii_lowercase())
+}
+
+/// The game's programs are held back ([`hold_programs`]).
+static HELD: AtomicBool = AtomicBool::new(false);
+
+/// Holds back the worker that makes the game's pipelines (`false`: lets
+/// it go on), to test what waits for them for as long as the test wants,
+/// whatever the machine's speed. Process-wide: a test that sets it takes
+/// the GPU alone.
+#[doc(hidden)]
+pub fn hold_programs(on: bool) {
+    HELD.store(on, Ordering::SeqCst);
+}
+
+/// Whether [`hold_programs`] is on.
+pub(crate) fn programs_held() -> bool {
+    HELD.load(Ordering::SeqCst)
+}
+
+/// Textures read apart are never given back ([`stall_textures`]).
+static STALLED: AtomicBool = AtomicBool::new(false);
+
+/// Makes the textures read apart never come back (`false`: they come
+/// again; those asked for meanwhile are lost), to test what tells a frame
+/// that waits for ever: its instances are left out, and it is never
+/// ready. Process-wide: a test that sets it takes the GPU alone.
+#[doc(hidden)]
+pub fn stall_textures(on: bool) {
+    STALLED.store(on, Ordering::SeqCst);
+}
+
+/// Whether [`stall_textures`] is on.
+pub(crate) fn textures_stalled() -> bool {
+    STALLED.load(Ordering::SeqCst)
+}
+
+/// Makes every scene pass draw nothing (`false`: draw again), to test
+/// what tells a renderer that draws nothing: each pass's draws are cut to
+/// its first pixel (a scissor of one pixel at its top left corner), the
+/// sky, Moonglow's meshes, the game's programs, lines and particles alike,
+/// as Heed's Radeon drew through Direct3D 12 (the egui overlays drawn over
+/// the picture, nothing in it). Process-wide: a test that sets it takes
+/// the GPU alone (`mg_testkit::gpu::alone`).
+#[doc(hidden)]
+pub fn blank_draws(on: bool) {
+    BLANK.store(on, Ordering::SeqCst);
+}
+
+/// Whether [`blank_draws`] is on.
+pub fn draws_blanked() -> bool {
+    BLANK.load(Ordering::SeqCst)
 }
 
 #[cfg(test)]

@@ -73,6 +73,11 @@ pub struct OptionsDraft {
     pub armor_on_woman: bool,
     pub light_theme: bool,
     pub graphics_backend: crate::settings::GraphicsBackend,
+    /// The backends recorded as drawing wrong ([`Settings::graphics_failures`]),
+    /// as the page shows them, and whether OK forgets them.
+    pub graphics_failures: Vec<crate::settings::GraphicsFailure>,
+    pub forget_graphics_failures: bool,
+    pub toolbar_icons_only: bool,
     /// Per cent.
     pub ui_scale: u16,
     pub minimize_on_test: bool,
@@ -136,6 +141,8 @@ pub struct OptionsDraft {
     /// The enabled plugins' commands, listed after the window's: the id
     /// each one's keys are kept under, and its name.
     pub plugin_commands: Vec<(String, String)>,
+    /// And the open project's (`[commands]`), after the plugins'.
+    pub project_commands: Vec<(String, String)>,
     /// The command (by the id its keys are kept under) taking the next key.
     pub recording: Option<String>,
     /// The game install found on this machine when Options opened, for the
@@ -158,6 +165,7 @@ impl OptionsDraft {
             page: OptionsPage::default(),
             keymap: crate::keys::Keymap::new(&s.key_bindings),
             plugin_commands: Vec::new(),
+            project_commands: Vec::new(),
             recording: None,
             detected: None,
             game_root: text(&s.game_root),
@@ -179,6 +187,9 @@ impl OptionsDraft {
             armor_on_woman: s.armor_on_woman,
             light_theme: s.light_theme,
             graphics_backend: s.graphics_backend,
+            graphics_failures: s.graphics_failures.clone(),
+            forget_graphics_failures: false,
+            toolbar_icons_only: s.toolbar_icons_only,
             ui_scale: s.ui_scale.unwrap_or(100),
             minimize_on_test: s.minimize_on_test,
             test_with_steam: !s.test_without_steam,
@@ -258,6 +269,13 @@ impl OptionsDraft {
             armor_on_woman: self.armor_on_woman,
             light_theme: self.light_theme,
             graphics_backend: self.graphics_backend,
+            // (Those recorded meanwhile kept, unless forgotten.)
+            graphics_failures: if self.forget_graphics_failures {
+                Vec::new()
+            } else {
+                s.graphics_failures.clone()
+            },
+            toolbar_icons_only: self.toolbar_icons_only,
             ui_scale: (self.ui_scale != 100).then_some(self.ui_scale.clamp(UI_SCALES[0], 300)),
             minimize_on_test: self.minimize_on_test,
             test_without_steam: !self.test_with_steam,
@@ -535,6 +553,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                     );
                             });
                             ui.checkbox(&mut draft.light_theme, "Light theme");
+                            toolbar_buttons(ui, draft);
                             graphics_backend(ui, draft, drawing_with.as_deref());
                             ui.checkbox(
                                 &mut draft.last_area,
@@ -1120,8 +1139,24 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     }
 }
 
-/// The script editor's font size and a colour per syntax element (the
-/// theme's unless "Custom" is ticked), with a preview.
+/// Options › General › Toolbar buttons: Icons and text, or Icons only
+/// (the main toolbar's and the area view's, at once).
+fn toolbar_buttons(ui: &mut Ui, draft: &mut OptionsDraft) {
+    let name = |icons_only: &bool| if *icons_only { "Icons only" } else { "Icons and text" };
+    ui.horizontal(|ui| {
+        crate::widgets::field_label(ui, "Toolbar buttons");
+        crate::widgets::dropdown("toolbar-buttons")
+            .selected_text(name(&draft.toolbar_icons_only))
+            .show(ui, &mut draft.toolbar_icons_only, &[false, true], name)
+            .on_hover_text(
+                "The buttons of the main toolbar and of the area view's toolbar: each with its \
+                 icon and its name, or, to save room, with its icon alone and its name in the \
+                 tip shown when the pointer rests on it (as in Aurora). Buttons without an icon \
+                 keep their names",
+            );
+    });
+}
+
 /// Options › General › Graphics backend: Automatic and the backends of
 /// this platform, from the next start; what this run draws with
 /// (`drawing_with`), and whether `WGPU_BACKEND` decides instead.
@@ -1136,8 +1171,10 @@ fn graphics_backend(ui: &mut Ui, draft: &mut OptionsDraft, drawing_with: Option<
             .on_hover_text(
                 "What the area view, the previews and the window draw with. Automatic: the \
                  graphics library's choice, except that an AMD GPU on Windows draws through \
-                 Direct3D 12 rather than Vulkan (AMD's Vulkan driver there drew areas' tiles \
-                 wrong). A backend with no adapter here falls back to Automatic",
+                 Direct3D 12 rather than Vulkan; checked as Moonglow starts, and where it draws \
+                 nothing, the GPU's other backend is taken. A backend with no adapter here \
+                 falls back to Automatic. A backend chosen here is kept even where the check \
+                 finds it draws nothing (a notice says so)",
             );
     });
     let mut note = "Takes effect the next time Moonglow starts.".to_string();
@@ -1148,8 +1185,37 @@ fn graphics_backend(ui: &mut Ui, draft: &mut OptionsDraft, drawing_with: Option<
         note.push_str(" WGPU_BACKEND is set, and decides over this.");
     }
     ui.weak(note);
+    // The backends found drawing wrong here, which Automatic passes over.
+    if draft.graphics_failures.is_empty() || draft.forget_graphics_failures {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        let each: Vec<String> = draft
+            .graphics_failures
+            .iter()
+            .map(|f| format!("{} on {} (driver {})", f.backend, f.adapter, f.driver))
+            .collect();
+        ui.weak(format!(
+            "Automatic passes over {}: it drew nothing here ({}).",
+            each.join(", "),
+            draft.graphics_failures.iter().map(|f| f.what.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+        if ui
+            .button("Try Again")
+            .on_hover_text(
+                "Forgets these when you choose OK: from the next start Automatic takes its \
+                 usual backend again (checked as Moonglow starts). A driver update tries it \
+                 again by itself",
+            )
+            .clicked()
+        {
+            draft.forget_graphics_failures = true;
+        }
+    });
 }
 
+/// The script editor's font size and a colour per syntax element (the
+/// theme's unless "Custom" is ticked), with a preview.
 fn script_style(ui: &mut Ui, style: &mut ScriptStyle) {
     ui.horizontal(|ui| {
         crate::widgets::field_label(ui, "Font size");
@@ -1290,13 +1356,17 @@ fn keyboard(ui: &mut Ui, draft: &mut OptionsDraft) {
         .map(|c| (c.group(), c.id().to_string(), c.name().to_string()));
     let plugins =
         draft.plugin_commands.iter().map(|(id, name)| (Group::Plugins, id.clone(), name.clone()));
-    let mut rows: Vec<(Group, String, String)> = general.chain(plugins).chain(others).collect();
+    let project =
+        draft.project_commands.iter().map(|(id, name)| (Group::Project, id.clone(), name.clone()));
+    let mut rows: Vec<(Group, String, String)> =
+        general.chain(plugins).chain(project).chain(others).collect();
     // The list is long: narrow it by a command's name, or its group's.
     let filter_id = egui::Id::new("options-keys-filter");
     let mut filter: String = ui.data(|d| d.get_temp(filter_id)).unwrap_or_default();
-    ui.add(
-        egui::TextEdit::singleline(&mut filter).hint_text("Find a command").desired_width(240.0),
-    );
+    crate::widgets::SearchField::new(filter_id.with("field"), &mut filter)
+        .hint("Find a command")
+        .width(240.0)
+        .show(ui);
     ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
     let needle = mg_core::text::Needle::new(&filter);
     rows.retain(|(group, _, name)| {
@@ -1455,6 +1525,10 @@ mod tests {
         let g = d.apply(&s);
         assert_eq!(g.graphics_backend, GraphicsBackend::Direct3d12);
         assert_eq!(OptionsDraft::from_settings(&g).graphics_backend, GraphicsBackend::Direct3d12);
+        assert!(!s.toolbar_icons_only, "icons and text unless asked");
+        d.toolbar_icons_only = true;
+        let icons = d.apply(&s);
+        assert!(icons.toolbar_icons_only && OptionsDraft::from_settings(&icons).toolbar_icons_only);
         // Unless asked: names alone, challenge ratings shown, the dark theme.
         let plain = OptionsDraft::from_settings(&s);
         assert!(!plain.name_resrefs && plain.palette_cr && !plain.light_theme);

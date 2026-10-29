@@ -43,6 +43,20 @@ pub fn file_set(module: &Module, key: &ResKey) -> Vec<ResKey> {
     types.iter().map(|t| ResKey::new(key.resref, *t)).filter(|k| module.contains(k)).collect()
 }
 
+/// The resources an export of `roots` alone takes (without what they
+/// use): each root the module has, an area with its `.git` and `.gic`
+/// (the three make one area: an archive of the `.are` alone imports no
+/// objects), each once, in the roots' order.
+pub fn with_companions(module: &Module, roots: &[ResKey]) -> Vec<ResKey> {
+    let mut out: Vec<ResKey> = Vec::new();
+    for k in roots.iter().flat_map(area_companions) {
+        if module.contains(&k) && !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    out
+}
+
 /// Writes `resources` (those the module has, each once) as files named
 /// `name.ext` in `dir` (made if missing), replacing files of those names:
 /// as they are in the module, for a `development` or `override` folder or
@@ -412,6 +426,21 @@ mod tests {
         assert_eq!(plan.missing[0].target, rr("gone"));
     }
 
+    /// Without what they use, an area's `.are` still takes its `.git` and
+    /// `.gic` (those the module has); other roots go alone.
+    #[test]
+    fn an_area_alone_takes_its_git_and_gic() {
+        let m = sample();
+        let roots =
+            [key("town", ResType::ARE), key("guard", ResType::UTC), key("nope", ResType::NSS)];
+        let names: Vec<String> =
+            with_companions(&m, &roots).iter().map(|k| k.to_string()).collect();
+        assert_eq!(names, ["town.are", "town.git", "town.gic", "guard.utc"]);
+        // (From its .git too, each once.)
+        let roots = [key("town", ResType::GIT), key("town", ResType::ARE)];
+        assert_eq!(with_companions(&m, &roots).len(), 3);
+    }
+
     #[test]
     fn export_import_round_trip_resets_factions_and_lists_areas() {
         let src = sample();
@@ -465,18 +494,19 @@ mod tests {
         let src = sample();
         let stamp = |hash: &str| Stamp {
             version: "2.0.0".into(),
-            commit: Some(Commit { hash: hash.into(), dirty: false }),
+            commit: Some(Commit { hash: hash.into(), dirty: false, named: false }),
             module: "Town".into(),
             tag: "TOWN".into(),
         };
         let keys = [key("town", ResType::ARE)];
-        let erf = export_erf(&src, &keys, &describe("The town", &stamp("aaa")), false).unwrap();
-        assert_eq!(archive_stamp(&erf), Some(stamp("aaa")));
+        let erf = export_erf(&src, &keys, &describe("The town", &stamp("aaaaaaa")), false).unwrap();
+        assert_eq!(archive_stamp(&erf), Some(stamp("aaaaaaa")));
         let text = description_text(&Erf::read(&erf).unwrap().description);
         assert_eq!(crate::stamp::read(&text).0, "The town");
-        let more = export_into_erf(&erf, &src, &keys, &describe("", &stamp("bbb")), false).unwrap();
+        let more =
+            export_into_erf(&erf, &src, &keys, &describe("", &stamp("bbbbbbb")), false).unwrap();
         let text = description_text(&Erf::read(&more).unwrap().description);
-        assert_eq!(crate::stamp::read(&text), ("The town".to_string(), Some(stamp("bbb"))));
+        assert_eq!(crate::stamp::read(&text), ("The town".to_string(), Some(stamp("bbbbbbb"))));
         // Aurora's (no stamp).
         let plain = export_erf(&src, &keys, "Aurora's", false).unwrap();
         assert_eq!(archive_stamp(&plain), None);

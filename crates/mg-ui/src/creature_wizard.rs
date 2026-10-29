@@ -247,7 +247,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     let mut looks = Looks { ready: app.thumbnails.looks(), shown: Vec::new() };
     // The ResRef the name gives, as Finish makes it (on the names' page).
     let names = Names {
-        naming: crate::blueprint_wizard::naming(app),
+        naming: crate::blueprint_wizard::naming(app, ResType::UTC),
         taken: match (w.page == NAMES_PAGE, app.ws.as_ref()) {
             (true, Some(ws)) => ws.module.keys_of(ResType::UTC).map(|k| k.resref).collect(),
             _ => Default::default(),
@@ -649,6 +649,7 @@ fn page(
             {
                 ui.colored_label(ui.visuals().warn_fg_color, e.to_string());
             }
+            crate::blueprint_wizard::code_button(ui, &mut w.resref, &names.naming);
         }
         6 => {
             ui.label("Please select the category in the palette that you wish this blueprint to appear under.");
@@ -681,12 +682,13 @@ fn make(app: &mut Moonglow, w: &CreatureWizard) {
             app.ws.as_ref().is_some_and(|ws| ws.module.contains(&ResKey::new(*r, ResType::UTC)))
         };
         // The ResRef typed, unless the module has it (then the next free
-        // one from it, as for one made from the name).
+        // one from it, as for one made from the name: with the builder's
+        // code).
         let own = ResRef::from_str(w.resref.trim()).ok().filter(|r| !r.is_empty());
-        let naming = crate::blueprint_wizard::naming(app);
+        let naming = crate::blueprint_wizard::naming(app, ResType::UTC);
         let resref = match own {
             Some(r) if !taken(&r) => r,
-            Some(r) => blueprints::resref(&r.to_string(), taken),
+            Some(r) => blueprints::resref_named(&r.to_string(), &naming, taken),
             None => blueprints::resref_named(w.first_name.trim(), &naming, taken),
         };
         let spec = w.spec(resref);

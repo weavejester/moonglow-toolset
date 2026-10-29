@@ -128,6 +128,48 @@ fn an_area_s_lighting_is_copied_and_kept_for_another() {
     assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Lighting Dusk"));
 }
 
+/// Options › General › Toolbar buttons, Icons only: the area view's
+/// toolbar too, at once: glyphs alone, named in their tips (a button with
+/// no tip of its own: its name), the toggles still toggling; buttons
+/// without a glyph keep their words.
+#[test]
+fn the_area_toolbar_shows_icons_only_when_asked() {
+    let Some((mut h, area)) = area_harness("area-icons-only") else { return };
+    h.get_by_label("🎥 Reorient Camera");
+    h.state_mut().settings.toolbar_icons_only = true;
+    h.run_steps(2);
+    assert!(h.query_by_label("🎥 Reorient Camera").is_none());
+    assert!(h.query_by_label("⊞ Grid").is_none());
+    h.get_by_label("To Scratch");
+    let camera = h.get_by_label("🎥").rect().center();
+    // The area toolbar's button with the glyph `label`: the one nearest
+    // Reorient Camera (the main toolbar's Module Properties is an ℹ too,
+    // the palette's pictures a ⊞).
+    fn tool<'h>(
+        h: &'h Harness<'_, Moonglow>,
+        label: &'h str,
+        near: egui::Pos2,
+    ) -> egui_kittest::Node<'h> {
+        let off = |n: &egui_kittest::Node<'_>| n.rect().center().distance(near);
+        h.get_all_by_label(label).min_by(|a, b| off(a).total_cmp(&off(b))).unwrap()
+    }
+    h.hover_at(camera);
+    // (A tooltip waits a moment.)
+    h.run_steps(60);
+    h.get_by_label("Reorient Camera");
+    tool(&h, "⊞", camera).hover();
+    h.run_steps(60);
+    h.get_by_label("Grid\nDisplay Grid");
+    let shown = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].grid;
+    let before = shown(&h);
+    tool(&h, "⊞", camera).click();
+    h.run_steps(2);
+    assert_ne!(shown(&h), before, "Grid toggled by its glyph");
+    tool(&h, "ℹ", camera).click();
+    h.run_steps(2);
+    assert!(h.state().dock.find_tab(&Tab::AreaProperties(area)).is_some());
+}
+
 #[test]
 fn area_properties_edit_the_area() {
     let Some((mut h, area)) = area_harness("area-props") else { return };
@@ -430,12 +472,18 @@ fn several_areas_are_edited_together() {
     h.run_steps(2);
     assert!(h.query_by_label("ResRef").is_none());
     h.get_by_label("Names, tags and comments are edited one area at a time.");
+    // The flags they differ in, each marked: natural or artificial, and
+    // shader flag 0x100 (one field holds them all).
+    assert_eq!(h.query_all_by_value("≠").count(), 2);
     h.get_by_label("Above ground").click();
     h.run_steps(2);
     let flags = |h: &mut Harness<'_, Moonglow>, name: &str| are(h, name).integer("Flags");
     assert_eq!(flags(&mut h, "cave1"), Some(0x5));
     assert_eq!(flags(&mut h, "cave2"), Some(0x1 | 0x100));
     assert_eq!(flags(&mut h, "inn"), Some(0x1));
+    h.get_by_label("Artificial").click();
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_value("≠").count(), 1, "both artificial now");
     // Variables: one added is added to each, which keeps its own. (The
     // caves' are in their ARE, as Moonglow wrote them before 1.34.3:
     // opening the window moves them to the GIT, where the game reads

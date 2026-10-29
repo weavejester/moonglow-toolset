@@ -101,6 +101,170 @@ fn a_sideways_scroll_pans_the_area_view() {
     assert!((shifted.target - before.target).length() < 0.05, "not panned");
 }
 
+/// A middle click on the area view, with `modifiers` held.
+fn middle_click(h: &mut Harness<'_, Moonglow>, pos: egui::Pos2, modifiers: egui::Modifiers) {
+    let button = egui::PointerButton::Middle;
+    h.event(egui::Event::ModifiersChanged(modifiers));
+    h.hover_at(pos);
+    h.run_steps(1);
+    // (Held through the frame: `event_modifiers` lets go after the event.)
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos, button, pressed, modifiers });
+    }
+    h.run_steps(2);
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(1);
+}
+
+/// The area view's camera set to `orbit`, drawn once.
+fn set_orbit(h: &mut Harness<'_, Moonglow>, area: ResRef, orbit: mg_ui::area_view::Orbit) {
+    h.state_mut().area_views.get_mut(&area).unwrap().orbit = Some(orbit);
+    h.run_steps(2);
+}
+
+/// El Grillo's ask (Blender's Alt + middle click): Alt + middle click on
+/// the ground puts the camera's focus there, at the ground's height, at
+/// once; the distance, the turn and the tilt stay. A plain middle click
+/// does nothing (a short middle drag never jumps the view).
+#[test]
+fn a_middle_click_puts_the_focus_on_the_ground() {
+    use glam::Vec3;
+    // Tile 5 (column 1, row 1: 10 to 20 m each way) raised a step.
+    let prepare = |m: &mut mg_module::Module, _: &mg_rules::GameData, area: ResRef| {
+        let key = ResKey::new(area, ResType::ARE);
+        let mut are = m.gff(&key).unwrap().unwrap();
+        are.root.list_mut("Tile_List").unwrap()[5].set("Tile_Height", mg_gff::Value::Int(1));
+        m.set_gff(key, &are).unwrap();
+    };
+    let Some((mut h, area)) = area_harness_with("middle-focus", "ttr01", None, 4, None, &prepare)
+    else {
+        return;
+    };
+    let orbit = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].orbit.unwrap();
+    // Looking at the area's middle from the south-west, tilted.
+    let at = Vec3::new(20.0, 20.0, 0.0);
+    set_orbit(
+        &mut h,
+        area,
+        mg_ui::area_view::Orbit { target: at, yaw: -2.2, pitch: 0.7, distance: 45.0 },
+    );
+    let raised = h.state().area_views[&area].model.as_ref().unwrap().tiles[5].position.z;
+    assert!(raised > 0.5, "tile 5 is raised: {raised}");
+    let before = orbit(&h);
+    // Alt + middle click on the raised tile's middle.
+    let on = screen(&h, area, Vec3::new(15.0, 15.0, raised));
+    let picked = h.state().area_views[&area].focus_at(on).expect("ground under the pointer");
+    assert!((picked - Vec3::new(15.0, 15.0, raised)).length() < 0.6, "on its walkmesh: {picked:?}");
+    middle_click(&mut h, on, egui::Modifiers::ALT);
+    let after = orbit(&h);
+    assert!((after.target - picked).length() < 1e-3, "the focus at {:?}", after.target);
+    assert!(after.target.z > 0.5, "at the ground's height: {}", after.target.z);
+    assert_eq!(
+        (after.distance, after.yaw, after.pitch),
+        (before.distance, before.yaw, before.pitch),
+        "the distance, the turn and the tilt kept"
+    );
+    // The point clicked is now the view's middle.
+    let rect = h.state().area_views[&area].rect;
+    assert!((screen(&h, area, picked) - rect.center()).length() < 1.0);
+    // On the flat ground beside it: a plain middle click, or one with
+    // Ctrl or Shift held (the middle drag's, up and down), leaves the
+    // camera; Alt + middle click puts the focus there, at its height.
+    let on = screen(&h, area, Vec3::new(30.0, 25.0, 0.0));
+    for held in [
+        egui::Modifiers::NONE,
+        egui::Modifiers::SHIFT,
+        egui::Modifiers::COMMAND | egui::Modifiers::CTRL,
+    ] {
+        middle_click(&mut h, on, held);
+        assert_eq!(orbit(&h), after, "{held:?} + middle click");
+    }
+    let picked = h.state().area_views[&area].focus_at(on).unwrap();
+    assert!(
+        picked.z.abs() < 0.6 && (picked.truncate() - glam::Vec2::new(30.0, 25.0)).length() < 0.6
+    );
+    middle_click(&mut h, on, egui::Modifiers::ALT);
+    let again = orbit(&h);
+    assert!((again.target - picked).length() < 1e-3, "the focus at {:?}", again.target);
+    assert_eq!((again.distance, again.yaw, again.pitch), (after.distance, after.yaw, after.pitch));
+    // Nothing in the area changed.
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), None);
+}
+
+/// Alt + middle click on the sky, or on the ground past the area's edge,
+/// leaves the camera where it was.
+#[test]
+fn a_middle_click_off_the_ground_leaves_the_camera() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("middle-sky") else { return };
+    let orbit = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].orbit.unwrap();
+    // Low over the area's south edge, looking north: the sky above, the
+    // ground past the north edge in sight.
+    let low = mg_ui::area_view::Orbit {
+        target: Vec3::new(20.0, 10.0, 0.0),
+        yaw: -std::f32::consts::FRAC_PI_2,
+        pitch: 0.25,
+        distance: 20.0,
+    };
+    set_orbit(&mut h, area, low);
+    let rect = h.state().area_views[&area].rect;
+    let sky = egui::pos2(rect.center().x, rect.min.y + 20.0);
+    assert_eq!(h.state().area_views[&area].focus_at(sky), None, "the sky");
+    middle_click(&mut h, sky, egui::Modifiers::ALT);
+    assert_eq!(orbit(&h), low, "a click on the sky");
+    middle_click(&mut h, sky, egui::Modifiers::NONE);
+    assert_eq!(orbit(&h), low);
+    // Past the area's edge, on the ground's plane (the area is 40 m).
+    let beyond = screen(&h, area, Vec3::new(20.0, 70.0, 0.0));
+    assert!(rect.contains(beyond), "in sight: {beyond:?}");
+    assert_eq!(h.state().area_views[&area].focus_at(beyond), None, "off the area");
+    middle_click(&mut h, beyond, egui::Modifiers::ALT);
+    assert_eq!(orbit(&h), low, "a click off the area");
+}
+
+/// A middle drag still turns the camera and Alt + middle drag still moves
+/// it: neither puts the focus where it began.
+#[test]
+fn a_middle_drag_turns_and_moves_the_camera_as_before() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("middle-drag") else { return };
+    let orbit = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].orbit.unwrap();
+    let start = mg_ui::area_view::Orbit {
+        target: Vec3::new(20.0, 20.0, 0.0),
+        yaw: -std::f32::consts::FRAC_PI_2,
+        pitch: 1.0,
+        distance: 40.0,
+    };
+    let drag = |h: &mut Harness<'_, Moonglow>, modifiers: egui::Modifiers| {
+        let from = screen(h, area, Vec3::new(14.0, 14.0, 0.0));
+        let to = from + egui::vec2(-90.0, 0.0);
+        let button = egui::PointerButton::Middle;
+        h.event(egui::Event::ModifiersChanged(modifiers));
+        h.hover_at(from);
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: from, button, pressed: true, modifiers });
+        for k in 1..=6 {
+            h.hover_at(from + (to - from) * (k as f32 / 6.0));
+            h.run_steps(1);
+        }
+        h.event(egui::Event::PointerButton { pos: to, button, pressed: false, modifiers });
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        h.run_steps(3);
+    };
+    set_orbit(&mut h, area, start);
+    drag(&mut h, egui::Modifiers::NONE);
+    let turned = orbit(&h);
+    assert!((turned.yaw - start.yaw).abs() > 0.3, "turned: {}", turned.yaw);
+    assert_eq!((turned.target, turned.distance), (start.target, start.distance), "not moved");
+    set_orbit(&mut h, area, start);
+    drag(&mut h, egui::Modifiers::ALT);
+    let moved = orbit(&h);
+    assert_eq!((moved.yaw, moved.pitch, moved.distance), (start.yaw, start.pitch, start.distance));
+    // Looking north, the ground follows the pointer west: the focus east.
+    let by = moved.target - start.target;
+    assert!(by.x > 2.0 && by.y.abs() < 0.6 && by.z == 0.0, "moved: {by:?}");
+}
+
 #[test]
 fn area_viewer_selects_moves_and_deletes() {
     use glam::Vec3;
@@ -2506,6 +2670,136 @@ fn adjust_location_s_visual_transforms_are_saved_and_reopened() {
     assert_eq!(visual(&mut h, 1), Some(mirror), "its file's transform is kept");
 }
 
+/// A file whose `ScaleY` and `ScaleZ` differ from its `ScaleX` (xtul's
+/// report: set by hand, or by another tool): Adjust Location's Scale
+/// shows `ScaleX`, which the game scales by, and the window says the
+/// other two are kept until Scale is changed. A turn alone keeps them;
+/// Scale changed writes the three alike, and the note goes.
+#[test]
+fn adjust_location_says_an_uneven_scale_is_kept() {
+    use glam::Vec3;
+    use mg_area::VisualTransform;
+    use mg_module::instances::{Placement, Placing, instance};
+    let Some((mut h, area)) = area_harness("visual-uneven") else { return };
+    let git_key = ResKey::new(area, ResType::GIT);
+    let uneven = VisualTransform {
+        scale: Vec3::new(0.5, 1.5, 1.0),
+        rotate: Vec3::ZERO,
+        translate: Vec3::ZERO,
+    };
+    {
+        let app = h.state_mut();
+        let game = app.game.as_deref().unwrap();
+        let key = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+        let chest = Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        let at = Placement { position: [12.0, 30.0, 0.0], rotation: 0.0 };
+        let mut item = instance(&placing, ResType::UTP, &chest, at, &[]).unwrap();
+        item.set("Static", mg_gff::Value::Byte(0));
+        item.set("VisTransformList", mg_area::edit::visual_transform_list(uneven));
+        let edit = mg_edit::Edit::InsertItem {
+            key: git_key,
+            path: mg_edit::GffPath::root(),
+            list: "Placeable List".into(),
+            index: 0,
+            item,
+        };
+        app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", vec![edit])));
+    }
+    h.run_steps(3);
+    let visual = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        VisualTransform::read(&ws.doc(&git_key).unwrap().root.list("Placeable List").unwrap()[0])
+    };
+    let at = screen(&h, area, Vec3::new(12.0, 30.0, 0.3));
+    h.hover_at(at);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(3);
+    h.get_by_label("Adjust Location…").click();
+    h.run_steps(3);
+    let note = mg_ui::area_tools::scale_note(h.state().adjust.as_ref().unwrap()).expect("a note");
+    assert!(note.starts_with("Its file has ScaleX 0.5, ScaleY 1.5 and ScaleZ 1"), "{note}");
+    assert!(h.query_by_label(&note).is_some(), "the window says so");
+    let dir = mg_testkit::scratch_dir("ui-adjust-uneven");
+    h.render().expect("render").save(dir.join("noted.png")).unwrap();
+    // A turn alone: ScaleY and ScaleZ kept.
+    let a = h.state_mut().adjust.as_mut().unwrap();
+    a.visual.rotate.x = 30.0;
+    a.visual_changed = true;
+    h.get_by_label("Apply").click();
+    h.run_steps(3);
+    let turned = VisualTransform { rotate: Vec3::new(30.0, 0.0, 0.0), ..uneven };
+    assert_eq!(visual(&mut h), Some(turned));
+    // Scale changed (dragged): the three alike, and no note.
+    let scale = h.get_by_label("Scale").rect().right_center() + egui::vec2(40.0, 0.0);
+    drag(&mut h, scale, scale + egui::vec2(10.0, 0.0));
+    h.run_steps(2);
+    assert!(h.query_by_label(&note).is_none(), "the note goes");
+    h.render().expect("render").save(dir.join("scaled.png")).unwrap();
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let v = visual(&mut h).unwrap();
+    assert!(v.scale.x != 0.5 && v.scale == Vec3::splat(v.scale.x), "{v:?}");
+}
+
+/// Placed objects edited together have no pages of lists of their own
+/// (those changed only the first object), as several blueprints have
+/// none: an inventory is edited one object at a time. A field is set on
+/// each.
+#[test]
+fn placed_objects_edited_together_leave_their_lists_alone() {
+    use mg_module::instances::{Placement, Placing, instance};
+    let prepare = |m: &mut mg_module::Module, game: &mg_rules::GameData, area: ResRef| {
+        let key = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+        let mut chest = Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+        chest.set("HasInventory", mg_gff::Value::Byte(1));
+        chest.set("Static", mg_gff::Value::Byte(0));
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        let chests: Vec<_> = [12.0, 28.0]
+            .map(|x| {
+                let at = Placement { position: [x, 30.0, 0.0], rotation: 0.0 };
+                instance(&placing, ResType::UTP, &chest, at, &[]).unwrap()
+            })
+            .into();
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        git.root.set("Placeable List", mg_gff::Value::List(chests));
+        m.set_gff(git_key, &git).unwrap();
+    };
+    let Some((mut h, area)) = area_harness_with("together-lists", "ttr01", None, 4, None, &prepare)
+    else {
+        return;
+    };
+    let git_key = ResKey::new(area, ResType::GIT);
+    let paths: Vec<_> =
+        (0..2).map(|i| mg_edit::GffPath::root().item("Placeable List", i)).collect();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Instances { area, paths }));
+    h.run_steps(4);
+    assert!(h.query_by_label("Basic").is_some(), "the window is open");
+    assert!(h.query_by_label("Inventory").is_none(), "no Inventory page");
+    assert!(h.query_by_label_contains("edited one object at a time").is_some());
+    assert!(h.get_by_label("Inventory…").accesskit_node().is_disabled());
+    h.get_by_label("Plot").click();
+    h.run_steps(3);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let list = ws.doc(&git_key).unwrap().root.list("Placeable List").unwrap().to_vec();
+    assert_eq!(list.iter().map(|p| p.integer("Plot")).collect::<Vec<_>>(), [Some(1); 2]);
+    // One of them alone has its Inventory page.
+    let one = mg_edit::GffPath::root().item("Placeable List", 0);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Instance { area, path: one }));
+    h.run_steps(4);
+    assert!(h.query_by_label("Inventory").is_some());
+}
+
 /// Static ticked in the Properties of two placed placeables edited
 /// together takes their visual transforms off, as Aurora does: one step,
 /// which Undo takes back, transforms and all. Unticked, none comes back.
@@ -3948,6 +4242,7 @@ fn properties_is_the_last_item_of_the_area_and_tree_menus() {
     let items = menu_items(&h, "Properties");
     assert_eq!(tail(&items, 2), ["Variables…", "Properties"], "{items:?}");
     assert!(items.contains(&"Delete".to_string()), "{items:?}");
+    assert!(items.contains(&"Export as Blueprint…".to_string()), "{items:?}");
     h.key_press(egui::Key::Escape);
     h.run_steps(3);
     // Its row in the module tree.
@@ -3958,7 +4253,10 @@ fn properties_is_the_last_item_of_the_area_and_tree_menus() {
     right_click(&mut h, row.center());
     let items = menu_items(&h, "Properties");
     // (A waypoint has no Preview.)
-    assert_eq!(items, ["Go To", "Copy", "Delete", "Variables…", "Properties"]);
+    assert_eq!(
+        items,
+        ["Go To", "Copy", "Delete", "Export as Blueprint…", "Variables…", "Properties"]
+    );
     h.key_press(egui::Key::Escape);
     h.run_steps(3);
     // The area's row in the module tree (left of the area's tab).
@@ -3987,4 +4285,88 @@ fn properties_is_the_last_item_of_the_area_and_tree_menus() {
             "Tile Properties…"
         ]
     );
+}
+
+/// Area Properties' shadow fields show in the view at once (the area read
+/// anew at the edit: the sun's shadows as opaque as its Shadow Opacity),
+/// and the toolbar's Shadows switch takes them away, kept for the views
+/// opened after.
+#[test]
+fn the_area_s_shadow_settings_show_at_once_and_the_switch_hides_them() {
+    let Some((mut h, area)) = area_harness("shadows") else { return };
+    let shadows = |h: &Harness<'_, Moonglow>| {
+        let view = &h.state().area_views[&area];
+        let model = view.model.as_ref().unwrap();
+        let shown = mg_area::View {
+            shadows: view.shadows,
+            creature_shadows: view.creature_shadows,
+            night: view.night,
+            ..mg_area::View::of(model)
+        };
+        shown.shadows_of(&model.lighting)
+    };
+    h.state_mut().area_views.get_mut(&area).unwrap().night = false;
+    let key = ResKey::new(area, ResType::ARE);
+    let mut are = h.state_mut().ws.as_mut().unwrap().doc(&key).unwrap().clone();
+    are.root.set("SunShadows", mg_gff::Value::Byte(1));
+    are.root.set("ShadowOpacity", mg_gff::Value::Byte(40));
+    let edit = mg_edit::Edit::SetResource { key, data: are.to_bytes().ok() };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("shadows", vec![edit])));
+    h.run_steps(3);
+    let s = shadows(&h).expect("the sun's shadows");
+    assert!((s.opacity - 0.4).abs() < 1e-6, "{s:?}");
+    h.get_by_label("◑ Shadows").click();
+    h.run_steps(2);
+    assert_eq!(shadows(&h), None);
+    assert!(h.state().settings.no_shadows);
+}
+
+/// The Shadows button's menu: held a moment it opens (its release no
+/// click), its checkboxes choose the kinds, kept in the settings for the
+/// views opened after; a click turns them all off and on again as they
+/// were.
+#[test]
+fn the_shadows_button_held_opens_the_kinds_to_choose() {
+    let Some((mut h, area)) = area_harness("shadow-kinds") else { return };
+    let kinds = |h: &Harness<'_, Moonglow>| {
+        let v = &h.state().area_views[&area];
+        [v.shadows, v.creature_shadows, v.light_shadows]
+    };
+    assert_eq!(kinds(&h), [true; 3], "the defaults");
+    // Held half a second.
+    let at = h.get_by_label("◑ Shadows").rect().center();
+    let button = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.input_mut().events.push(egui::Event::PointerMoved(at));
+    h.input_mut().events.push(button(true));
+    for _ in 0..30 {
+        h.input_mut().predicted_dt = 1.0 / 60.0;
+        h.step();
+    }
+    assert!(h.query_by_label("Light Shadows").is_some(), "open while held");
+    h.input_mut().events.push(button(false));
+    h.run_steps(2);
+    // (Open still: the release, outside it, closed it until 2.11.0.)
+    assert!(h.query_by_label("Light Shadows").is_some(), "open after the release");
+    assert_eq!(kinds(&h), [true; 3], "the release is no click");
+    h.get_by_label("Light Shadows").click();
+    h.run();
+    h.get_by_label("Creature Shadows").click();
+    h.run();
+    assert_eq!(kinds(&h), [true, false, false]);
+    let s = &h.state().settings;
+    assert!(!s.no_shadows && s.no_creature_shadows && s.no_light_shadows);
+    // A click: none; another: as they were.
+    h.key_press(egui::Key::Escape);
+    h.run();
+    h.get_by_label("◑ Shadows").click();
+    h.run();
+    assert_eq!(kinds(&h), [false; 3]);
+    h.get_by_label("◑ Shadows").click();
+    h.run();
+    assert_eq!(kinds(&h), [true, false, false]);
 }

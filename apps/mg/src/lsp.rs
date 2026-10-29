@@ -222,7 +222,8 @@ impl Server {
         self.with_index(|idx, src| idx.declaration_at(&name, at, src))
     }
 
-    /// Errors in a script: the compiler's first, as a diagnostic.
+    /// Errors in a script: the compiler's first, as a diagnostic; else
+    /// what the compile warned of in this script, each as a warning.
     fn diagnostics(&self, name: &str) -> Vec<Value> {
         let Some(text) = self.text(name) else { return Vec::new() };
         let mut c = Compiler::new(|n: &str, t: ResType| {
@@ -235,18 +236,29 @@ impl Server {
             self.game.as_ref()?.get(&k).ok().map(|d| d.into_owned())
         });
         c.set_require_entry_point(false);
-        let Err(e) = c.compile(name) else { return Vec::new() };
+        let diagnostic = |line: usize, severity: u8, message: &str| {
+            let end = text.lines().nth(line).map_or(0, |l| l.encode_utf16().count());
+            json!({
+                "range": { "start": { "line": line, "character": 0 }, "end": { "line": line, "character": end } },
+                "severity": severity,
+                "source": "nwscript",
+                "message": message,
+            })
+        };
+        let e = match c.compile(name) {
+            Ok(out) => {
+                return (out.warnings.iter())
+                    .filter(|w| w.file.eq_ignore_ascii_case(name))
+                    .map(|w| diagnostic(w.line.saturating_sub(1), 2, &w.message))
+                    .collect();
+            }
+            Err(e) => e,
+        };
         let line = e
             .location()
             .filter(|(f, _)| f.trim_end_matches(".nss").eq_ignore_ascii_case(name))
             .map_or(0, |(_, l)| l.saturating_sub(1));
-        let end = text.lines().nth(line).map_or(0, |l| l.encode_utf16().count());
-        vec![json!({
-            "range": { "start": { "line": line, "character": 0 }, "end": { "line": line, "character": end } },
-            "severity": 1,
-            "source": "nwscript",
-            "message": e.message,
-        })]
+        vec![diagnostic(line, 1, &e.message)]
     }
 
     fn publish(&self, name: &str, out: &mut impl Write) -> Result<()> {
@@ -431,6 +443,8 @@ fn kind(k: DeclKind) -> u32 {
         DeclKind::Variable | DeclKind::Local | DeclKind::Parameter => 13,
         DeclKind::Constant => 14,
         DeclKind::Struct => 23,
+        // (A field.)
+        DeclKind::Member => 8,
     }
 }
 
@@ -440,6 +454,7 @@ fn completion_kind(k: DeclKind) -> u32 {
         DeclKind::Variable | DeclKind::Local | DeclKind::Parameter => 6,
         DeclKind::Constant => 21,
         DeclKind::Struct => 22,
+        DeclKind::Member => 5,
     }
 }
 
@@ -453,11 +468,11 @@ fn encode(codepage: Codepage, text: &str) -> Vec<u8> {
 
 /// Serves the protocol on standard input and output until `exit`.
 pub(crate) fn serve(game: Option<ResMan>, codepage: Codepage) -> Result<()> {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("moonglow/scripts");
+    // (Moonglow's cache folder, as the window's: the system's temporary
+    // folder where there is none.)
+    let cache = mg_module::build::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("moonglow"))
+        .join("scripts");
     let mut server = Server {
         root: None,
         files: HashMap::new(),

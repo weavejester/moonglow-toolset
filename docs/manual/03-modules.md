@@ -3,7 +3,7 @@ type: Manual Page
 title: Modules
 description: Modules - opening and saving, where things are used and renaming, find and replace, advanced search, nasher projects, merging in git (mg merge-gff as the merge driver), the project file (moonglow.toml), your builder code, described variables (variables.toml), claimed and protected areas (the claims table), the project's commands (File › Project, update and submit), recovering unsaved work, Module Properties, haks and talk tables, the hak editor, the 2DA editor, import and export.
 tags: [manual, modules, haks, nasher]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-27T18:30:43Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T23:49:22Z }
 ---
 
 # Modules
@@ -66,7 +66,13 @@ a directory), nasher projects (see below) and the game's campaign files
   The folder opened is saved into, and with **Write a .mod beside a
   module folder on save** (Options › General, on) written as the `.mod`
   too, as Aurora does: the game and its server load the `.mod`, never
-  the folder.
+  the folder. The folder is found by its name in any case, as Aurora
+  finds it on Windows (`Mymodule/` beside `mymodule.mod` on Linux), and
+  is saved as that `.mod`. The welcome page's Recent modules end a
+  folder's name in `/` and name the folder each is in (`mymodule/ in
+  modules`, `mymodule.mod in modules`); the whole path is on hover, as
+  in the File menu. `mg` opens the `.mod` it is given, as the server
+  does, and says that the folder beside it is left as it is.
 - **File › Save** (Ctrl+S) writes the module where it came from, as an
   archive or a folder. **Save As…** writes it as a `.mod` elsewhere (a
   name with no extension: a module folder). A folder that holds
@@ -90,7 +96,12 @@ a directory), nasher projects (see below) and the game's campaign files
   script read again is compiled if **Automatically Compile Scripts on
   Save** is on (Options › Script Editor), as one saved here is, and so
   are the scripts that include it (more than 24 at once are compiled
-  in the background, and the log says so). A blueprint copied into the
+  in the background, and the log says so). A module that had no unsaved
+  changes has none after: the compiled scripts are written beside their
+  sources at once (a nasher project keeps none: they are made when it
+  packs). Commands of `mg` that save a module folder keep to the same
+  rules: what another program changed in it meanwhile is left as it is.
+  A blueprint copied into the
   folder (one another builder sent) shows in its custom palette as soon
   as it is read, as after Aurora's Refresh Palette, and one deleted or
   changed there has its entry taken out or made right (written at the
@@ -266,6 +277,21 @@ unpacking or packing between the toolset and git.
   nasher.cfg** adds a line for their kinds beside the include they lie
   under (`include = "src/**/*.{jui,txt}"`), and they are read: nasher
   packs them from then on too.
+- **A file that can't be read** (JSON broken by a merge's conflict
+  markers, say) is left out of the module, and the log says so: the rest
+  of the project opens. Mend or delete it; a save never writes over it,
+  and once mended it is read as a file added.
+- **One resource under two spellings** in a folder (`bread.UTI.json`, as
+  Aurora names a new item, beside `bread.uti.json`) is the one nasher
+  packs: its pack renames the spelling that isn't lower case over the
+  other, whichever is newer. Moonglow reads that one, the log says so,
+  and the next save leaves it alone, as `bread.uti.json`. (A module
+  folder takes the file changed last, [above](#opening-and-saving):
+  Aurora's own folders never hold both.) The same resource in two
+  folders of the project is
+  packed by nasher from one of them, in no fixed order: Moonglow reads
+  the first it finds, names the other, and leaves both for you to keep
+  one.
 - **Changes made elsewhere are picked up while the project is open.**
   Every few seconds (Options › General, the reloading switch) Moonglow
   looks for source files that another program changed, added or deleted:
@@ -298,7 +324,7 @@ unpacking or packing between the toolset and git.
   Project…**, choosing an empty folder. Moonglow writes a `nasher.cfg` as
   `nasher init` does, with everything under `src/`, its sources taking in
   scripts, GFF files as JSON, NUI windows, and the module's other kinds
-  of file (2DAs, pictures).
+  of file (2DAs, pictures, compiled scripts without their source).
 - **Build › Pack** *file* writes the module the project builds, as `nasher
   pack` does. **Test Module** (F9) packs it into the game's `modules`
   folder and starts the game on it.
@@ -328,14 +354,35 @@ unpacking or packing between the toolset and git.
   feminine table is a target of its own (`mytlkf.tlk`, of
   `mytlkf.tlk.json`), in the same language. The
   project's `tlkFlags` are used as nasher uses them (`--nwn-encoding`,
-  `--pretty`); a project that keeps its tables as CSV (`tlkFormat =
-  "csv"`) is told it isn't read. `mg build PROJECT --target tlk` makes
-  the `.tlk` as nasher does, and `mg serve` and `mg test` make it for the
-  server from the project.
+  `--pretty`; the codepages of more than a byte a character, `cp949`,
+  `cp936`, `cp932` and `cp950`, too). A project that keeps its tables as
+  CSV (`tlkFormat = "csv"`) has `<name>.tlk.csv`, as `nasher unpack`
+  writes it, read, edited and saved back as `nwn_tlk` writes CSV (which
+  keeps no language: such a table is English's); nasher's own pack
+  refuses a CSV source ("csv is not a supported source type"), and
+  Moonglow makes the table of it all the same. A line's sound length is
+  kept without a sound, as `nwn_tlk` keeps one. `mg build PROJECT
+  --target tlk` makes the `.tlk` as nasher does, and `mg serve`, `mg
+  test` and `mg watch --serve` make it for the server from the project
+  (`mg watch` builds again, and starts the server again, when the
+  table's file changes). Changed outside Moonglow while it is open (a
+  `git pull`), the table is read again in the editor; with unsaved
+  changes there, yours are kept and the log says so.
+- **A new talk table** made in the talk table editor (New Talk Table)
+  goes into the project: `<name>.tlk.json` where the project's rules put
+  `<name>.tlk`, with a target of its own in `nasher.cfg` (and the
+  feminine table's), and the module target's sources given `exclude =
+  "**/*.tlk.json"` where they would take it in.
+- **A module target that takes a table's JSON in** (no such exclude):
+  nasher packs the table into the module, converted as `nwn_tlk`
+  converts it, and so do Build › Pack and `mg build`.
 - **Compiled scripts are build output.** A project keeps scripts as `.nss`
   only, and Moonglow compiles them when it packs. A compiled script
-  without its source can't be kept in a project; Moonglow names any it
-  leaves out.
+  without its source (an old module's, whose source is lost) is kept as
+  it is, a `.ncs` file in the project: Save As nasher Project's
+  `nasher.cfg` takes `.ncs` files in, and nasher packs them as they are
+  (`nasher unpack` loses them). The log names them. Once its source is
+  in the module, its `.ncs` file goes at the next save.
 - **Locked objects stay out of the files.** A lock (the area view's
   **Lock**) is a selection aid the game ignores, so a project's area files
   don't carry it, and locking never shows in a diff. Moonglow keeps a
@@ -482,9 +529,14 @@ A team's rules for Moonglow are kept with its module, in version
 control: a `moonglow.toml` beside `nasher.cfg` in a nasher project, or
 at the root of a module folder. Moonglow reads it when the module opens,
 and again when it changes (with reloading on, Options › General), and
-the log says so. A module kept in one file (`.mod`) has none: its folder
-holds other modules too. Without the file, Moonglow does what it does
-for any module.
+the log says so. A module kept in one file (`.mod`) keeps its own
+beside it, named by it, as its folder holds other modules too:
+`krezk.moonglow.toml` (and `krezk.variables.toml`, below) beside
+`krezk.mod` (since Moonglow 2.13.0). There, what is a checkout's or a
+builder's own is not read (the log says so): `[claims]`, `[commands]`,
+`[plugins]`, `[builder]` and `.moonglow/user.toml` are a module
+folder's or a nasher project's. Without the file, Moonglow does what it
+does for any module.
 
 ```toml
 [make_static]                       # Make Placeables Static leaves dynamic:
@@ -505,6 +557,11 @@ keeper_variable = "tdod_store"      # the shopkeeper's variable: the store's tag
 
 [resrefs]
 pattern = "{code}_{name}"           # a new ResRef, by each builder's code
+
+[used]                              # what Unused counts as used, nothing naming it
+scripts = ["j_ai_*", "tdod_exec_*"] # run by ExecuteScript by a name made as it runs
+blueprints = ["tdod_spawn_*"]       # made by CreateObject so
+conversations = []
 
 [claims]
 file = "builders/claims.2da"        # who is building which area
@@ -538,7 +595,9 @@ Names are matched by globs, whatever their case: `*` any characters,
 | `[store] tag` | the store's tag: `{area}` the area's tag, `{n}` the first number no object has | the blueprint's tag, with a number where another object has it (with a `[store]` section; Aurora's, the blueprint's, without one) |
 | `[store] blueprint` | the store blueprint chosen at first | none chosen |
 | `[store] keeper_variable` | a String variable set on the shopkeeper to the store's tag | none |
-| `[resrefs] pattern` | how a builder's code goes into the ResRefs Moonglow proposes: `{code}` and `{name}` once each, the rest letters, digits and `_` (`"{name}_{code}"`, `"t{code}{name}"`) | `"{code}_{name}"`, where a builder has a code |
+| `[resrefs] pattern` | how the ResRefs Moonglow proposes are made: `{name}` once, `{code}` (the builder's code) and `{kind}` (the kind's text, by `kinds`) at most once each, the rest letters, digits and `_` (`"{name}_{code}"`, `"t{code}{name}"`). Without `{code}` it is the team's prefix, for everyone, with a code or not (`"tdod_{name}"`, `"tdod_{kind}{name}"`; since Moonglow 2.13.0) | `"{code}_{name}"`, where a builder has a code |
+| `[resrefs] kinds` | the text `{kind}` stands for, by the kind of resource: `area`, `creature`, `door`, `encounter`, `item`, `placeable`, `sound`, `store`, `trigger`, `waypoint`, `script`, `conversation` (`{ creature = "n_", item = "i_" }`); a kind not named has none. Since Moonglow 2.13.0 | no `{kind}` text |
+| `[used] scripts`, `conversations`, `blueprints` | what [Unused](09-build-and-test.md#what-counts-as-used) (Build Module, `mg verify --unused`) counts as used though nothing in the module names it: a script `ExecuteScript` runs by a name made as it runs (`"j_ai_" + sMode`), a blueprint `CreateObject` makes so (any type, by its ResRef), a conversation so started. Build Module's **Mark as Used** and **Counted as Used** write it, and `mg used`; the rest of the file is kept as written. Aurora never touches the file | none |
 | `[claims] file` | the team's [claims table](#claimed-areas), from the project's root | no claims |
 | `[claims] others` | an area another builder claimed: `"warn"` (it says so, and a save asks before it writes a change to it) or `"read-only"` (no change to it is taken) | `"warn"` |
 | `[claims] unclaimed` | an area no one claimed: `"edit"` (as without a table) or `"warn"` (as another's) | `"edit"` |
@@ -607,8 +666,10 @@ code kept (16 characters: `ab_areatransi001`). A name that begins with
 your code already doesn't get it twice: a copy of `ab_chicken001` is
 `ab_chicken002`; another builder's code is kept as part of the name. The
 team's `[resrefs] pattern` says where the code goes. Without a code,
-ResRefs are made from names alone, as Aurora makes them. The code is
-used by:
+ResRefs are made from names alone, as Aurora makes them, unless the
+team's pattern has no `{code}`: then it is the team's own prefix, for
+everyone (`tdod_{name}`, or by kind, `tdod_{kind}{name}` with `[resrefs]
+kinds`: `tdod_n_guard` for a creature). The pattern is used by:
 
 - the Area Wizard (which then shows the ResRef under the name), the
   Creature Wizard and every blueprint wizard (the ResRef field's hint);
@@ -616,10 +677,23 @@ used by:
 - **Setup Store**'s conversation and script (`ab_store001`,
   `ab_openstore001`);
 - **Copy…** and **Edit Copy…** (`ab_nw_chicken001`);
-- the Script Wizard's names (`ab_sc_001`, `ab_at_001`).
+- the Script Wizard's names (`ab_sc_001`, `ab_at_001`);
+- **New Script…**, **New Conversation…**, **New NUI Window…** and **Add
+  Popup Text…**, whose name starts with the code, the cursor where the
+  name goes (after `ab_`, or before `_ab` with a pattern `{name}_{code}`;
+  since Moonglow 2.13.0);
+- **Import Conversation**'s conversation, named after its file
+  (`ab_night_watch`; since 2.13.0);
+- plugins, which ask for a name with `ctx.module:new_name`
+  ([Plugin API](17-plugin-api.md)); `ctx.terrain:new_area`'s area is the
+  Area Wizard's.
 
-A name typed in a wizard's ResRef field, or in **New Script…** and the
-other windows that start with an empty name, is taken as typed.
+What is typed is taken as typed: a name in those windows (the code can
+be erased, for a script that must have a name of its own) and a ResRef
+typed in a wizard's ResRef field. Where a typed ResRef hasn't the code,
+the wizard offers a button that puts it in (**Use ab_shop**), and the
+Creature Wizard, where the module has the ResRef typed already, makes
+the next free one from it with the code (`ab_guard`; since 2.13.0).
 
 ### Described variables
 
@@ -628,7 +702,8 @@ one fails without a word: a variable read as another type is that
 type's empty value (an Int read as a String is `""`, a String read as
 an Int is 0), and a name is matched in its case only (`tdod_lit` is not
 `TDOD_LIT`), as the game's server shows. A team describes its
-variables in `variables.toml`, beside its `moonglow.toml` (or alone),
+variables in `variables.toml`, beside its `moonglow.toml` (or alone;
+beside a `.mod`, the module's own, `krezk.variables.toml`),
 as a table's columns are described beside it: each variable's type, the
 values it takes, the objects it goes on and a line of help.
 
@@ -699,12 +774,12 @@ help = "A test's hook: the next d20 rolled (the tests set it on the module)"
 | `on` | what it goes on: `module`, `area`, `creature`, `door`, `encounter`, `item`, `placeable`, `sound`, `store`, `trigger`, `waypoint` (blueprints, placed objects and the items they hold alike) | anything |
 | `values` | the values it takes: `["herb", "ore"]`, or each with what it means, `{ forge = "Smithing" }` | any |
 | `constants`, `prefix` | its values are a script's constants whose names begin so (`constants = "tdod_kind_inc"`, `prefix = "TDOD_KIND_"`): the project's script of that name (any folder of it), the module's, else the game's | |
-| `table`, `column` | its values are a table's rows: an Int's is a row's number (named by its `Label`), a String's a cell of `column` | |
+| `table`, `column` | its values are a table's rows (the project's table of that name, the module's, its haks' or the game's): an Int's is a row's number (named by its `Label`), a String's a cell of `column`, or without one the row's own `Label` (since Moonglow 2.13.0) | |
 | `other = true` | a value not listed is right too (the list is a help) | only those listed |
 | `min`, `max` | an Int's or a Float's range | any |
 | `help` | a line of help, shown with it | |
 | `runtime = true` | the scripts set it while the server runs (their state, a test's hook), and it is never kept in a file: no `undescribed` says it, the Variables window doesn't offer it, and Verify says where one is kept (since Moonglow 2.2.0) | kept in the module's files |
-| `undescribed` (at the top) | names (globs) that are the project's: a variable so named and described nowhere is said, with the described name nearest it (a typo) | not said |
+| `undescribed` (at the top) | names (globs) that are the project's: a variable so named and described nowhere is said, with the described name (or a builder's glob) nearest it (a typo) | not said |
 
 What the file doesn't understand is said in the log by line, as for
 `moonglow.toml`, and the rest is read; it is read again when it
@@ -712,7 +787,12 @@ changes.
 
 **In the Variables window** (an object's, a blueprint's, an area's, the
 module's), the name being typed offers the described variables that go
-on that object, each with its type and what it goes on; one chosen (or
+on that object, each with its type and what it goes on, then the
+patterns' (`tdod_rental_*`) by what their names begin with
+(`tdod_rental_`), to type on from. A click takes one, or **Down** and
+**Up** move to it and **Enter** takes it (Enter is the offer's then, not
+the window's OK); **Escape** closes the offer and leaves the window
+open. One chosen (or
 typed whole) takes its type, a value is chosen from its values, and its
 help is the name's tip. Under the list, the window says what the
 description finds wrong (another type, a value not listed, the wrong
@@ -729,22 +809,29 @@ to the descriptions:
 | `var-value` | a value none of its values (a value in another case is named: the scripts compare as written), out of its range, or no row of its table | a warning |
 | `var-object` | a variable on another kind of object than it says | a warning |
 | `var-name` | a described name in another case, and (with `undescribed`) a variable named as the project's that is described nowhere | a warning |
-| `var-runtime` | a variable described as the scripts' own (`runtime = true`) kept in the module: there from the start, on every server (a test's hook set so fixes every roll). One that a glob of the scripts' takes and that is near a name of its own entry is said with that name, as `var-name` says one (`tdod_lore_txt`, which `["tdod_lore_*"]` takes: `tdod_lore_text?`; since Moonglow 2.3.0) | an error: Verify fails |
+| `var-runtime` | a variable described as the scripts' own (`runtime = true`) kept in the module: there from the start, on every server (a test's hook set so fixes every roll). One that a glob of the scripts' takes and that is near a name of its own entry, or a name a builder's glob takes, is said with that name or glob, as `var-name` says one (`tdod_lore_txt`, which `["tdod_lore_*"]` takes: `tdod_lore_text?`; since Moonglow 2.3.0; `tdod_rentl_term`: `tdod_rental_*?`, since Moonglow 2.13.0). Verify's **Remove the variable** takes it out | an error: Verify fails |
 
 A file's own glob of the scripts' may take a builder's typo: a name is
 described by its own entry, else by the first glob that matches it, so
 put the builders' globs before the scripts'. A typo of a builder's name
 that a glob of the scripts' takes is said as `var-runtime`, with the
-builder's name it is near.
+builder's name (or glob) it is near.
 
 A plugin's tests can run these checks, and `tag-unique`, on a fixture
 that is a project of its own: `builtin = "var-runtime"`
 ([Writing plugins](16-writing-plugins.md#a-plugins-own-tests)).
 
 `mg vars MODULE` lists the descriptions, with the values a script's
-constants and a table's rows give (`--on placeable`: those that go on
-one); `mg areas --var NAME=VALUE` gives a described variable its
-described type ([Command-line tools](11-command-line.md)).
+constants and a table's rows give (the game's, the project's and the
+module's haks', since Moonglow 2.13.0; `--on placeable`: those that go
+on one); `mg vars MODULE --undescribed` lists, in their place, the
+module's variables that no description names, each with its types, what
+it is on and where, and the description it is near (one in another
+case, or the nearest name of those `undescribed` takes: a typo, most
+likely; since Moonglow 2.13.0); `mg areas --var NAME=VALUE` gives a
+described variable its described type ([Command-line
+tools](11-command-line.md)). A plugin reads the descriptions with
+`mg.vars.describe(name)` ([Plugin API](17-plugin-api.md#mg)).
 
 ### Claimed areas
 
@@ -835,9 +922,20 @@ Moonglow to run them in a terminal:
 
 ```toml
 [commands]
-update = "bin/update"
-submit = { run = "bin/submit", windows = "bin\\submit.cmd", label = "Submit for Review" }
+update = { run = "bin/update", key = "Ctrl+Shift+U" }
+submit = { run = "bin/submit", windows = "bin\\submit.cmd", label = "Submit for Review", writes = false }
 ```
+
+A command is its text, or a table of `run` (or `windows` and `unix`,
+each for its systems), `label` (its name in the menu; else its name in
+the file, `run_tests` as Run tests), `key` (the keys it asks for, as
+Options › Keyboard writes them) and `writes = false` (it writes none of
+the module's files, as a submit: the haks stay open while it runs). The
+commands are in the **Command Palette** too, under Project, and in
+**Options › Keyboard** under Project Commands, where the keys you choose
+take the place of `key` (kept by the command's name, so a team's
+`update` keeps its key from one project to the next; since Moonglow
+2.13.0).
 
 Choosing one:
 
@@ -858,14 +956,19 @@ Choosing one:
    made outside, and closes the module's haks, so that the command may
    write over any of them (Windows refuses to replace a file another
    program has open). Moonglow keeps no other file of the project open.
+   A command with `writes = false` leaves the haks open, so the open
+   areas aren't drawn again after it.
 4. **Runs it** in the project's folder, by the system's shell (`sh -c` on
    Linux and macOS, `cmd /C` on Windows), with `MOONGLOW_PROJECT` (the
    folder) and `MOONGLOW_BUILDER` (your code, where you have one) set.
    Its output comes into the log as it is written (its errors in the
    warning color), its last line in the window that shows while it
-   runs; **Cancel** stops it. The log says how it ended: done, or its
-   exit code.
-5. **Reads the project's files again**: the haks are opened again, and
+   runs; **Cancel** stops it, and what it started (a `git` it runs, the
+   shell's process group on Linux and macOS, asked to end and then made
+   to after two seconds; the shell's tree of processes on Windows). The
+   log says how it ended: done, or its exit code.
+5. **Reads the project's files again**: the haks are opened again (where
+   they were closed), and
    what the command changed is read as any [change made
    outside](#nasher-projects-version-control) is (a file you had changed too waits in
    **Changed Outside Moonglow**), with the project file and the claims
@@ -1003,6 +1106,11 @@ the game's script), and what that names in turn:
 - **A model's own files**: walkmeshes, textures (the DDS or TGA the game
   picks, and a PLT), materials and TXIs and what they name, its
   emitters' models and its supermodels.
+- **The scripts the game runs from its 2DAs**, as the module sees them
+  (a hak's `spells.2da` over the game's): a spell's impact script, an
+  area of effect's three (`vfx_persistent.2da`), the scripts of states
+  (`statescripts.2da`), traps', diseases' and poisons' (the columns
+  [Unused](09-build-and-test.md#what-counts-as-used) reads), reached from the table.
 
 Each hak resource is then **used** (reached, and this hak's copy is the
 one the game loads), **shadowed** (a hak higher in the list, or the
@@ -1217,10 +1325,13 @@ numbers at the left as it scrolls.
   goes to it, Escape clears it); **Go to** takes a row's number.
 
 **Cells are checked as you type**, as Verify Module checks a hak's
-tables: a cell that names a row of another table which isn't there (a
-feat's required feat, a spell's feat, a package's class, and the like),
-or a talk-table string that isn't, is outlined in red and says why
-under the pointer; the count above the grid goes to each in turn. Under
+tables: a cell that names a row of another table which isn't there or
+is blank (a feat's required feat, a spell's feat, a package's class, a
+class's requirement by its kind, and the like), a table which isn't
+there (a class's feat list; with the game's data), or a talk-table
+string that isn't, is outlined in red and says why under the pointer
+(a cell as the game's own copy has it, wrong there too, is the game's
+and is not: seven appearances name footstep 30 of 18); the count above the grid goes to each in turn. Under
 the grid, the selected cell is shown by what its column holds: a
 talk-table string as its text (**Strings as text** shows them so in the
 grid too), a row of another table as that row's name, with a list to
@@ -1290,6 +1401,9 @@ table = "classes"
 [columns.Name]
 kind = "strref"                 # a talk-table string's number
 
+[columns.Script]
+kind = "script"                 # a script's name, one ExecuteScript runs
+
 [[rules]]                       # a cell that must be filled...
 when = { column = "Effect", is = "CURE" }
 require = "Cures"               # ...where another says so
@@ -1304,6 +1418,7 @@ require = "Cures"               # ...where another says so
 | `flags` | any of the values together, each a bit | a bit no value has is set, or it is no number |
 | `row`, with `table` | a row's number in that table | the table has no such row |
 | `strref` | a talk-table string's number | there is no such string |
+| `script` | a script's name: a script reads the cell (`Get2DAString`) and runs it, so [Unused](09-build-and-test.md#what-counts-as-used) counts the scripts the module's table names as used | it can be no resource's name |
 
 - **A list's values** are written `values = { NAME = 1, OTHER = 2 }`
   (a value in the table's own way of writing it goes in quotes:
@@ -1361,7 +1476,12 @@ plugin reads a description with `mg.twoda.describe`
   Two options add the module resources they use (an area its blueprints,
   scripts and conversations, a conversation its scripts…), and move
   creatures out of the module's own factions into the standard ones.
-  Right-click a resource in the tree to export it. The window lists the
+  Right-click a resource in the tree to export it (several, chosen with
+  Ctrl and Shift, together); a placed object's **Export as Blueprint…**
+  writes it as a blueprint of its own ([Areas](04-areas.md)). An area's
+  `.are` takes its `.git` and `.gic` with it, the resources it uses or
+  not (without them, Import would bring the area with nothing placed in
+  it). The window lists the
   module kind by kind (areas, conversations, scripts, the blueprints,
   then the rest by extension); **Kind** lists one kind alone, **Filter**
   those whose names hold what is typed, and **Select the Listed** and
@@ -1381,9 +1501,20 @@ plugin reads a description with `mg.twoda.describe`
   Module: The Domains of Dread (TDOD)
   ```
 
+  A builder's `.mod` outside any checkout (a download of the team's
+  module) can name its base itself: a module variable `moonglow_base`
+  (a string, on the module), holding the commit the download was made
+  from, which the team's download script writes. It is stamped as `Base:
+  git 5f96447… (the module's moonglow_base)`, and Import compares it as
+  it compares a checkout's. A `.mod`'s own variable comes before the
+  checkout it lies in (a download put in a clone is the download's); a
+  module folder's or a project's checkout comes before its variable.
+
   The game and Aurora pass an archive's description by (Aurora's
   Import shows it), so the archive imports as before. `mg export` stamps
-  its archives the same way.
+  its archives the same way. Import says when the base is older than
+  the module; bringing the archive in on a branch from that base, and
+  merging, is git's (as the warning says).
 - **Export as Files…** (in the Export window, and on a resource's
   right-click menu in the module tree) writes resources as loose files,
   `name.ext`, into a folder you choose: as they are now in the toolset,

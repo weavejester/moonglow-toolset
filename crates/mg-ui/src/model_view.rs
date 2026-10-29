@@ -24,7 +24,7 @@ use mg_resman::ResKey;
 use crate::Moonglow;
 
 /// Multisampling for 3D views.
-const SAMPLES: u32 = 4;
+pub(crate) const SAMPLES: u32 = 4;
 
 /// How often a model the game's shaders move by the clock (wind-swayed
 /// grass, flowing water) is drawn again, seconds: as the area view's
@@ -40,8 +40,9 @@ pub struct Viewport3d {
     /// ([`crate::Moonglow::shader_cache_dir`]).
     pub(crate) configured: bool,
     /// The game data the area view's textures are read apart from, as the
-    /// renderer takes it ([`mg_render::Renderer::read_textures_apart`]).
-    textures_from: Option<(Arc<mg_rules::GameData>, Arc<dyn mg_render::Assets + Send + Sync>)>,
+    /// renderer takes it ([`mg_render::Renderer::read_textures_apart`]):
+    /// until the game data is to be changed ([`Viewport3d::release_game_data`]).
+    textures_from: Option<Arc<GameAssets>>,
 }
 
 /// The game data as a source of textures read apart.
@@ -63,6 +64,14 @@ impl mg_render::Assets for GameAssets {
     fn shader(&self, name: &str) -> Option<String> {
         mg_render::Assets::shader(&self.0.resman, name)
     }
+
+    fn game_shader(&self, name: &str) -> Option<String> {
+        mg_render::Assets::game_shader(&self.0.resman, name)
+    }
+
+    fn shader_origin(&self, name: &str) -> Option<String> {
+        mg_render::Assets::shader_origin(&self.0.resman, name)
+    }
 }
 
 impl std::fmt::Debug for Viewport3d {
@@ -79,20 +88,35 @@ impl Viewport3d {
     }
 
     /// `game` as the renderer reads textures apart from it: the same while
-    /// the game data is.
+    /// the game data is, and is not released.
     pub(crate) fn textures_from(
         &mut self,
         game: &Arc<mg_rules::GameData>,
     ) -> Arc<dyn mg_render::Assets + Send + Sync> {
         match &self.textures_from {
-            Some((g, from)) if Arc::ptr_eq(g, game) => from.clone(),
+            Some(from) if Arc::ptr_eq(&from.0, game) => from.clone(),
             _ => {
-                let from: Arc<dyn mg_render::Assets + Send + Sync> =
-                    Arc::new(GameAssets(game.clone()));
-                self.textures_from = Some((game.clone(), from.clone()));
+                let from = Arc::new(GameAssets(game.clone()));
+                self.textures_from = Some(from.clone());
                 from
             }
         }
+    }
+
+    /// Lets go of the game data the textures were read apart from (the
+    /// renderer's readers with it; those read are kept): to be changed, it
+    /// must be the window's alone ([`crate::exclusive`]). Taken again by the
+    /// next area view drawn. (Kept, a module's haks could not be layered
+    /// into the game data, nor its edits, once an area had been drawn; a
+    /// builder's report on 2.13.1.)
+    pub(crate) fn release_game_data(&mut self) {
+        self.textures_from = None;
+        self.renderer.read_textures_apart(&self.gpu, None);
+    }
+
+    /// Whether textures are read apart from `game` ([`Self::textures_from`]).
+    pub(crate) fn holds(&self, game: &Arc<mg_rules::GameData>) -> bool {
+        self.textures_from.as_ref().is_some_and(|from| Arc::ptr_eq(&from.0, game))
     }
 
     /// Makes the targets a view of `w` by `h` pixels renders into, and the
@@ -646,7 +670,7 @@ fn show(app: &mut Moonglow, ui: &mut egui::Ui, source: Source, embedded: bool) -
         }
         ui.checkbox(&mut view.model_lights, "Lights")
             .on_hover_text("Light the model with its own light nodes");
-        let mut shaders = app.settings.game_shaders();
+        let mut shaders = app.game_shaders();
         if ui
             .checkbox(&mut shaders, "Shaders")
             .on_hover_text(
@@ -656,10 +680,7 @@ fn show(app: &mut Moonglow, ui: &mut egui::Ui, source: Source, embedded: bool) -
             )
             .changed()
         {
-            app.settings.game_shaders = Some(shaders);
-            if let Some(vp) = app.viewport.as_mut() {
-                vp.renderer.game_shaders = shaders;
-            }
+            app.set_game_shaders(shaders);
         }
         if embedded {
             pop_out =

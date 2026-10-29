@@ -81,6 +81,13 @@ pub struct View {
     /// Grass is drawn wherever this camera sees it ([`Sight`]); `None`:
     /// none.
     pub grass: Option<Sight>,
+    /// The sun's or moon's shadows are drawn where the area has them
+    /// ([`View::shadows_of`]): cast by tiles, placeables and doors.
+    pub shadows: bool,
+    /// Creatures cast the sun's or moon's shadows too.
+    pub creature_shadows: bool,
+    /// Point lights flagged `shadow` cast shadows (`mg_render::LightShadows`).
+    pub light_shadows: bool,
 }
 
 impl View {
@@ -96,7 +103,43 @@ impl View {
             animate: true,
             fade: false,
             grass: None,
+            shadows: true,
+            creature_shadows: true,
+            light_shadows: true,
         }
+    }
+
+    /// The sun's or moon's shadows an area lit as `l` shows in this view (cast
+    /// by what [`View::shadows`] and [`View::creature_shadows`] say): the sun's
+    /// by day, if its Sun Shadows are on, the moon's at night, if its Moon
+    /// Shadows are (the client draws none for the other, read from its
+    /// pictures: `shadows_look` in `client_render.rs`), as opaque as its
+    /// Shadow Opacity; none with the lighting off, or with the view's
+    /// shadows switched off.
+    pub fn shadows_of(&self, l: &Lighting) -> Option<mg_render::SunShadows> {
+        let casting = self.shadows || self.creature_shadows;
+        (casting && self.lit && l.sky(self.night).shadows && l.shadow_opacity > 0).then(|| {
+            mg_render::SunShadows {
+                opacity: f32::from(l.shadow_opacity) / 100.0,
+                fade_limit: l.fog_clip,
+            }
+        })
+    }
+
+    /// The lights' shadows an area lit as `l` shows in this view: where
+    /// [`View::light_shadows`] asks for them and the area has no sun or moon
+    /// shadows at the time (as the client: each creature then casts one
+    /// from the nearest light that casts them, `mg_render::PointLight::casts_shadows`;
+    /// with the sun's or moon's, it casts that alone), as opaque as its
+    /// Shadow Opacity (measured in `shadows_look`).
+    pub fn light_shadows_of(&self, l: &Lighting) -> Option<mg_render::SunShadows> {
+        let sky = l.sky(self.night).shadows;
+        (self.light_shadows && self.lit && !sky && l.shadow_opacity > 0).then(|| {
+            mg_render::SunShadows {
+                opacity: f32::from(l.shadow_opacity) / 100.0,
+                fade_limit: l.fog_clip,
+            }
+        })
     }
 
     pub fn shows(&self, kind: ObjectKind) -> bool {
@@ -190,6 +233,11 @@ pub struct AreaScene {
     colors: Vec<Vec3>,
     /// Models named by tiles or previews that could not be loaded.
     pub missing: Vec<String>,
+    /// Of those, the tiles' models that were read and then broke what
+    /// builds them (a panic, caught): a renderer that fails every model
+    /// fails them all, and they are what the area view's watch expects
+    /// drawn all the same ([`AreaScene::failed_tiles`]).
+    broken: std::collections::HashSet<String>,
     /// The loaded tiles and objects that failed while posed (by where they
     /// are kept): left out from then on.
     failed: RefCell<std::collections::HashSet<usize>>,
@@ -309,16 +357,18 @@ impl AreaScene {
         let load = |name: &str| models.load(name);
         // (A model that is read and then breaks what builds it is left out,
         // as a missing one is: the toolset carries on.)
-        let loaded = |name: &str| -> Option<Loaded> {
+        // (`None`: it broke; `Some(None)`: not found, or not readable.)
+        let built = |name: &str| -> Option<Option<Loaded>> {
             mg_render::guard::guarded(name, || {
                 let model = load(name)?;
                 let anims = anim::animations(&model, &load);
                 Some(Loaded { gpu: Arc::new(GpuModel::new(gpu, model)), anims })
             })
-            .flatten()
         };
+        let loaded = |name: &str| built(name).flatten();
         let mut missing = Vec::new();
         let tile_cache = &mut self.tile_cache;
+        let broken = &mut self.broken;
         self.tiles = area
             .tiles
             .iter()
@@ -327,7 +377,11 @@ impl AreaScene {
                 tile_cache
                     .entry(name.clone())
                     .or_insert_with(|| {
-                        let l = loaded(name).map(Arc::new);
+                        let b = built(name);
+                        if b.is_none() {
+                            broken.insert(name.clone());
+                        }
+                        let l = b.flatten().map(Arc::new);
                         if l.is_none() {
                             missing.push(name.clone());
                         }
@@ -692,9 +746,20 @@ impl AreaScene {
                         .collect(),
                     ..Animation::default()
                 });
+                let new = !sims.contains_key(&key);
                 let sim =
                     sims.entry(key).or_insert_with(|| mg_render::particles::Particles::new(model));
                 sim.ground = transform.w_axis.z;
+                // (Run ahead as an object's: a forge's fire was dark for
+                // its first seconds.)
+                if new {
+                    let mut ahead = 0.0;
+                    while ahead < PARTICLES_AHEAD {
+                        let step = PARTICLES_AHEAD_STEP;
+                        sim.update(model, keys.as_ref(), view.time, step, &pose, transform);
+                        ahead += step;
+                    }
+                }
                 sim.update(model, keys.as_ref(), view.time, dt, &pose, transform);
                 sim.batches(model, keys.as_ref(), view.time, &pose, transform, camera)
             });
@@ -806,6 +871,25 @@ impl AreaScene {
 
     /// [`scene`](Self::scene) without the tiles of index `hidden` (a
     /// preview shows others there).
+    /// Where the tiles are (their middles, as their instances are placed)
+    /// that would be drawn but failed: their models read and broken while
+    /// built, or while posed. Those `hidden` (a brush's preview over them)
+    /// are not.
+    pub fn failed_tiles(&self, area: &AreaModel, hidden: &[usize]) -> Vec<Vec3> {
+        let failed = self.failed.borrow();
+        area.tiles
+            .iter()
+            .zip(&self.tiles)
+            .enumerate()
+            .filter(|(i, _)| !hidden.contains(i))
+            .filter(|(_, (tile, loaded))| match loaded {
+                Some(l) => failed.contains(&(Arc::as_ptr(l) as usize)),
+                None => tile.model.as_ref().is_some_and(|m| self.broken.contains(m)),
+            })
+            .map(|(_, (tile, _))| tile.transform().w_axis.truncate())
+            .collect()
+    }
+
     pub fn scene_hiding(&self, area: &AreaModel, view: &View, hidden: &[usize]) -> Scene {
         let mut instances = Vec::new();
         let mut lights = Vec::new();
@@ -859,6 +943,7 @@ impl AreaScene {
                 }
             }
         }
+        let lit_shadows = view.light_shadows_of(&area.lighting).is_some();
         for (o, shown) in area.objects.iter().zip(&self.objects) {
             if !view.shows(o.kind) {
                 continue;
@@ -901,7 +986,26 @@ impl AreaScene {
                 self.failed.borrow_mut().insert(key);
                 continue;
             };
-            instances.extend(drawn.into_iter().map(|i| Instance { unlit, ..i }));
+            // The sun's shadows: cast by static placeables with the tiles;
+            // by what moves (creatures, dynamic placeables, doors) where
+            // creature shadows are asked for, as the client's Creature
+            // Shadow Detail governs them (Best: they cast; Fast and Off:
+            // none); falling on static placeables.
+            let casts = match o.kind {
+                ObjectKind::Placeable if o.is_static => view.shadows,
+                ObjectKind::Placeable | ObjectKind::Door | ObjectKind::Creature => {
+                    view.creature_shadows
+                }
+                _ => false,
+            };
+            let from_lights = lit_shadows && o.kind == ObjectKind::Creature;
+            instances.extend(drawn.into_iter().map(|i| Instance {
+                unlit,
+                casts_shadows: casts && i.casts_shadows,
+                casts_light_shadows: from_lights && i.casts_shadows,
+                receives_shadows: o.is_static,
+                ..i
+            }));
             lights.extend(lit);
         }
         if !view.lit {
@@ -933,6 +1037,8 @@ impl AreaScene {
             // as the tiles' animations go on.)
             time: view.time,
             environment: mg_render::Environment::from_are(l.flags, l.wind_power),
+            shadows: view.shadows_of(l),
+            light_shadows: view.light_shadows_of(l),
         }
     }
 
@@ -1011,8 +1117,10 @@ impl AreaScene {
                 });
                 let Some(burning) = burning else { continue };
                 lights.extend(burning.lamps.iter().filter_map(|l| l.placed(at, &|_| None)));
+                // (An effect: the game casts no shadow of it.)
                 instances.push(Instance {
                     pose: Some(burning.pose.clone()),
+                    casts_shadows: false,
                     ..Instance::new(flame.gpu.clone(), at)
                 });
             }
@@ -1026,6 +1134,8 @@ impl AreaScene {
             state: posed.state.clone(),
             textures,
             tile: true,
+            receives_shadows: true,
+            casts_shadows: view.shadows,
             ..Instance::new(loaded.gpu.clone(), transform)
         });
     }
@@ -1197,5 +1307,63 @@ mod tests {
         assert_eq!(off, area_light(red, false));
         assert!(off.ambient.min_element() > 0.5 && off.ambient.x == off.ambient.z);
         assert!(off.diffuse.min_element() > 0.0);
+    }
+
+    /// The sun's shadows by day where Sun Shadows are on, the moon's at
+    /// night where Moon Shadows are, as opaque as Shadow Opacity, ending
+    /// their fade at the fog clip; none for the other, at no opacity, with
+    /// the lighting or the view's shadows off.
+    #[test]
+    fn shadows_follow_the_time_of_day_s_flag_and_the_opacity() {
+        let l = Lighting {
+            sun: crate::Sky { shadows: true, ..Default::default() },
+            moon: crate::Sky { shadows: false, ..Default::default() },
+            is_night: false,
+            day_night_cycle: false,
+            fog_clip: 60.0,
+            sky_box: 0,
+            env_map: None,
+            shadow_opacity: 30,
+            flags: 0,
+            wind_power: 0,
+        };
+        let day = View {
+            time: 0.0,
+            night: false,
+            fog: false,
+            lit: true,
+            show: [true; 9],
+            animate: false,
+            fade: false,
+            grass: None,
+            shadows: true,
+            creature_shadows: true,
+            light_shadows: false,
+        };
+        let s = day.shadows_of(&l).unwrap();
+        assert_eq!((s.opacity, s.fade_limit), (0.3, 60.0));
+        let night = View { night: true, ..day };
+        assert_eq!(night.shadows_of(&l), None);
+        let moonlit = Lighting {
+            sun: crate::Sky { shadows: false, ..l.sun },
+            moon: crate::Sky { shadows: true, ..l.moon },
+            ..l.clone()
+        };
+        assert!(night.shadows_of(&moonlit).is_some() && day.shadows_of(&moonlit).is_none());
+        assert_eq!(day.shadows_of(&Lighting { shadow_opacity: 0, ..l.clone() }), None);
+        assert_eq!(View { lit: false, ..day }.shadows_of(&l), None);
+        // (Creatures alone cast them too.)
+        assert!(View { shadows: false, ..day }.shadows_of(&l).is_some());
+        let none = View { shadows: false, creature_shadows: false, ..day };
+        assert_eq!(none.shadows_of(&l), None);
+        // The lights' only where asked, and where the area has no sun's or
+        // moon's at the time.
+        let lamps = View { light_shadows: true, ..day };
+        assert_eq!(day.light_shadows_of(&l), None);
+        assert_eq!(lamps.light_shadows_of(&l), None);
+        let s = View { night: true, ..lamps }.light_shadows_of(&l).unwrap();
+        assert_eq!((s.opacity, s.fade_limit), (0.3, 60.0));
+        assert!(lamps.light_shadows_of(&moonlit).is_some());
+        assert_eq!(View { lit: false, ..lamps }.light_shadows_of(&moonlit), None);
     }
 }

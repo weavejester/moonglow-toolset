@@ -28,12 +28,26 @@ pub struct References {
     pub query: Option<Query>,
     pub usages: Vec<Usage>,
     pub mentions: Vec<Mention>,
+    /// Of a script, the cells of the game's tables (as the module sees
+    /// them) that run it: a spell's impact script...
+    pub run: Vec<mg_module::refs::Reference>,
+    /// Of a resource, the project file's `[used]` glob that counts it as
+    /// used.
+    pub marked: Option<String>,
     /// The workspace revision the results are for.
     revision: Option<u64>,
     /// The Find field.
     pub input: String,
     /// The module's references, kept between questions.
     index: rename::UsageIndex,
+}
+
+impl References {
+    /// Looks again at the next frame: what it says changed outside the
+    /// module (the project file's `[used]`).
+    pub(crate) fn look_again(&mut self) {
+        self.revision = None;
+    }
 }
 
 /// The Rename window, while open.
@@ -45,6 +59,9 @@ pub struct RenameDraft {
     pub literals: bool,
     pub usages: usize,
     pub mentions: usize,
+    /// The NUI window's script Rename… was asked of, when `from` is the
+    /// window it belongs to.
+    pub script: Option<ResKey>,
 }
 
 /// The resource a family member stands for (an area's `.git` is the area,
@@ -75,9 +92,26 @@ impl Moonglow {
         self.actions.push(Action::OpenTab(Tab::References));
     }
 
-    /// Opens the Rename window for a resource.
+    /// The NUI window whose opener or event script `key` is (`NAME_o.nss`,
+    /// `NAME_e.nss` beside `NAME.jui` and its settings): renaming the
+    /// script alone would part it from the window.
+    pub(crate) fn window_of_script(&self, key: ResKey) -> Option<ResKey> {
+        let ws = self.ws.as_ref()?;
+        if key.restype != ResType::NSS {
+            return None;
+        }
+        let name = key.resref.to_string();
+        let window = name.strip_suffix("_o").or_else(|| name.strip_suffix("_e"))?;
+        let jui = ResKey::parse(window, ResType::JUI)?;
+        crate::nui_view::companions(&ws.module, jui).contains(&key).then_some(jui)
+    }
+
+    /// Opens the Rename window for a resource (for a NUI window's script,
+    /// the window's).
     pub fn rename_dialog(&mut self, key: ResKey) {
         let key = main_key(key);
+        let script = self.window_of_script(key).map(|_| key);
+        let key = self.window_of_script(key).unwrap_or(key);
         let Some(ws) = &mut self.ws else { return };
         // (A NUI window is renamed with what it has beside it: `rename_nui`.)
         if !rename::renamable(key.restype) && key.restype != ResType::JUI {
@@ -96,6 +130,7 @@ impl Moonglow {
             literals: false,
             usages,
             mentions,
+            script,
         });
     }
 
@@ -103,6 +138,21 @@ impl Moonglow {
     /// what names it, and (with `literals`) script strings; scripts whose
     /// source changed are compiled again.
     pub fn rename_resource(&mut self, from: ResKey, to: ResRef, literals: bool) {
+        // (A NUI window's script is renamed with its window, which takes
+        // the new name less the script's suffix.)
+        if let Some(window) = self.window_of_script(main_key(from)) {
+            let suffix = &from.resref.to_string()[window.resref.to_string().len()..];
+            let Some(to) =
+                to.to_string().strip_suffix(suffix).and_then(|n| ResRef::from_str(n).ok())
+            else {
+                self.log.error(format!(
+                    "{from} is {window}'s script: give a new name ending {suffix}, or rename the \
+                     window"
+                ));
+                return;
+            };
+            return self.rename_nui(window, to, literals);
+        }
         if from.restype == ResType::JUI {
             return self.rename_nui(from, to, literals);
         }
@@ -214,23 +264,46 @@ impl Moonglow {
     /// Renames a NUI window as one undoable command (`mg_nui::rename`):
     /// its JUI, its settings, its opener and its event script, and the
     /// module's scripts that open it; with `literals`, script strings
-    /// spelling its name too. The tabs of the window and of its two
-    /// scripts follow. Nothing is compiled: Build does that, and the log
-    /// says so.
+    /// spelling its name too. A window that was built is built again under
+    /// its new name in the same command (`mg_nui::build_renamed`), as the
+    /// other renames compile what they changed; where it can't be, the log
+    /// says why and asks for a Build. The tabs of the window and of its two
+    /// scripts follow.
     fn rename_nui(&mut self, from: ResKey, to: ResRef, literals: bool) {
         self.store_script_text();
+        // (Built as the window's Build builds: Options › Script Editor's
+        // compiler, the compile memory kept.)
+        let external = self.external_compiler();
+        let kept = self.remembered_scripts(external.as_ref());
         let Some(ws) = &mut self.ws else { return };
         if let Err(e) = ws.flush() {
             self.log.error(e.to_string());
             return;
         }
         let (old, name) = (from.resref.to_string(), to.to_string());
-        let made = match mg_nui::rename(&ws.module, &old, &name, literals) {
+        let mut made = match mg_nui::rename(&ws.module, &old, &name, literals) {
             Ok(made) => made,
             Err(e) => {
                 self.log.error(format!("Rename: {e}"));
                 return;
             }
+        };
+        // Built under its new name, in the same command: or why not.
+        let built = match &self.game {
+            Some(game) => mg_nui::build_renamed(
+                &ws.module,
+                &mut made,
+                &name,
+                &mg_nui::Build {
+                    resman: &game.resman,
+                    external: external.as_ref(),
+                    debug: self.settings.debug_info,
+                    known: Some(&self.script_stamps),
+                },
+            )
+            .map_err(|e| e.to_string()),
+            None if made.build => Err("no game install to compile with (Options)".to_owned()),
+            None => Ok(None),
         };
         let new = ResKey::new(to, from.restype);
         if let Err(e) = self.apply(made.command) {
@@ -275,11 +348,26 @@ impl Moonglow {
         for spelled in &made.spelled {
             self.warn_still_spelled(spelled);
         }
-        if made.build {
-            self.log.warn(format!(
+        match built {
+            Ok(Some(b)) => {
+                self.log.info(format!(
+                    "{new}'s scripts, and the scripts that open it, are compiled under its new \
+                     name"
+                ));
+                crate::nui_view::after_build(
+                    self,
+                    &name,
+                    &b.failed,
+                    b.remembered,
+                    &b.refits,
+                    kept.as_deref(),
+                );
+            }
+            Ok(None) => {}
+            Err(why) => self.log.warn(format!(
                 "{new}'s scripts, and the scripts that open it, aren't compiled under its new \
-                 name: Build & compile it before testing"
-            ));
+                 name ({why}): Build it before testing"
+            )),
         }
     }
 
@@ -394,6 +482,23 @@ impl Moonglow {
             self.log.warn(why);
             return;
         }
+        // A script going with it whose editor holds unsaved text: the text
+        // is stored first, a step of its own, so that Undo brings the
+        // script back as it was typed.
+        let unsaved = self.unsaved_with(key);
+        if !unsaved.is_empty() {
+            let edits = unsaved
+                .iter()
+                .filter_map(|k| {
+                    let data = Some(self.scripts.get_mut(k)?.mark_saved());
+                    Some(Edit::SetResource { key: *k, data })
+                })
+                .collect();
+            if let Err(e) = self.apply(Command::new(format!("Edit {}", unsaved[0]), edits)) {
+                self.log.error(e.to_string());
+                return;
+            }
+        }
         let Some(ws) = self.ws.as_mut() else { return };
         let with: &[ResType] = match key.restype {
             ResType::ARE => &[ResType::GIT, ResType::GIC],
@@ -441,6 +546,19 @@ impl Moonglow {
         if let Some(area) = area {
             self.area_views.remove(&area);
         }
+    }
+
+    /// The scripts that deleting `key` takes (a script itself, a NUI
+    /// window's two) whose editors hold unsaved text.
+    pub(crate) fn unsaved_with(&self, key: ResKey) -> Vec<ResKey> {
+        let Some(ws) = &self.ws else { return Vec::new() };
+        let mut scripts = crate::nui_view::companions(&ws.module, key);
+        scripts.push(key);
+        scripts.retain(|k| {
+            k.restype == ResType::NSS && self.scripts.get(k).is_some_and(|b| b.is_dirty())
+        });
+        scripts.sort();
+        scripts
     }
 
     /// Opens what a usage names, at the place.
@@ -591,11 +709,30 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         };
         app.references.usages = usages;
         app.references.mentions = mentions;
+        // (The tables are the game data's, kept read: a scan of their
+        // script columns.)
+        app.references.run = match (&query, app.game.as_deref()) {
+            (Query::Resource(k), Some(game)) if k.restype == ResType::NSS => {
+                let read = |name: &str| game.table(name).ok();
+                let mut run = mg_module::verify::table_scripts(&read);
+                run.extend(mg_module::verify::described_scripts(&ws.module, Some(&game.resman)));
+                run.retain(|r| r.target == k.resref);
+                run
+            }
+            _ => Vec::new(),
+        };
+        app.references.marked = match &query {
+            Query::Resource(k) => {
+                ws.module.project_file.used.marking(k.resref, k.restype).map(String::from)
+            }
+            _ => None,
+        };
         app.references.revision = Some(ws.revision());
     }
     ui.separator();
     let mut go = None;
     let mut go_line = None;
+    let mut go_table = None;
     let mut rename_key = None;
     ui.horizontal(|ui| match &query {
         Query::Resource(k) => {
@@ -616,6 +753,9 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
             );
         }
     });
+    // (Which tables that run it are the module's own, to open.)
+    let own_tables: Vec<bool> =
+        app.references.run.iter().map(|r| ws.module.contains(&r.from)).collect();
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         // An area's objects are said to be in the area as the rest of the
         // window names it (Options › General: Show areas by name).
@@ -657,6 +797,34 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         }
         app.references.usages = usages;
         let refs = &app.references;
+        if !refs.run.is_empty() {
+            ui.add_space(8.0);
+            ui.label(format!("Run by the game, from its 2DAs ({}):", refs.run.len()))
+                .on_hover_text(
+                    "Cells of the tables the game runs scripts from (a spell's impact script, \
+                     an area of effect's, a state's, a trap's, a disease's, a poison's), as the \
+                     module sees them: its own 2DAs and its haks' over the game's; and of the \
+                     module's own tables whose description says a column holds a script",
+                );
+            for (r, own) in refs.run.iter().zip(&own_tables) {
+                if out_of_sight(ui) {
+                    continue;
+                }
+                let text = format!("{} › {}", r.from, r.path);
+                if *own {
+                    if ui.link(text).on_hover_text("Open the module's table").clicked() {
+                        go_table = Some(r.from);
+                    }
+                } else {
+                    ui.label(text);
+                }
+            }
+        }
+        if let Some(glob) = &refs.marked {
+            ui.add_space(8.0);
+            ui.label(format!("Counted as used by the project file's [used]: {glob}"))
+                .on_hover_text("Build Module's Unused and mg verify --unused don't list it");
+        }
         if !refs.mentions.is_empty() {
             ui.add_space(8.0);
             ui.label(format!("Spelled out in scripts ({}):", refs.mentions.len())).on_hover_text(
@@ -679,6 +847,9 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     if let Some((k, line)) = go_line {
         app.go_to_line(k, line);
     }
+    if let Some(k) = go_table {
+        crate::table_view::open_in_module(app, k);
+    }
     if let Some(k) = rename_key {
         app.rename_dialog(k);
     }
@@ -693,6 +864,12 @@ fn places(n: usize) -> String {
 pub(crate) fn delete_window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some(key) = app.confirm_delete else { return };
     let why_not = app.undeletable(key);
+    let unsaved = app.unsaved_with(key);
+    let window = key.restype == ResType::JUI
+        && app
+            .ws
+            .as_ref()
+            .is_some_and(|ws| !crate::nui_view::companions(&ws.module, key).is_empty());
     let mut open = true;
     egui::Window::new("Delete from Module")
         .collapsible(false)
@@ -711,8 +888,25 @@ pub(crate) fn delete_window(app: &mut Moonglow, ctx: &egui::Context) {
                     format!("Delete the area {} and everything placed in it?", key.resref)
                 }
                 ResType::NSS => format!("Delete {key} and its compiled script?"),
+                ResType::JUI if window => {
+                    format!("Delete the NUI window {key} with its settings and its scripts?")
+                }
                 _ => format!("Delete {key}?"),
             });
+            if !unsaved.is_empty() {
+                let names: Vec<String> = unsaved.iter().map(ToString::to_string).collect();
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "{} {} unsaved text in {}: {} deleted as typed, and the {} closed.",
+                        names.join(" and "),
+                        if unsaved.len() == 1 { "has" } else { "have" },
+                        if unsaved.len() == 1 { "its editor" } else { "their editors" },
+                        if unsaved.len() == 1 { "it is" } else { "they are" },
+                        if unsaved.len() == 1 { "editor" } else { "editors" },
+                    ),
+                );
+            }
             ui.weak("Edit › Undo brings it back.");
             ui.horizontal(|ui| {
                 if ui.button("Delete").clicked() {
@@ -769,6 +963,18 @@ pub(crate) fn rename_window(app: &mut Moonglow, ctx: &egui::Context) {
                 Ok(r) if exists(r) => Some((format!("{name} already exists"), true)),
                 Ok(r) => nui_problem(r).map(|e| (e.to_string(), true)),
             };
+            if let Some(script) = draft.script {
+                ui.label(format!(
+                    "{script} is the {} of the NUI window {}: the window is renamed, and the \
+                     script takes its new name.",
+                    if script.resref.to_string().ends_with("_o") {
+                        "opener"
+                    } else {
+                        "event script"
+                    },
+                    draft.from.resref
+                ));
+            }
             ui.label(match draft.usages {
                 _ if draft.from.restype == ResType::JUI => {
                     "Its settings and its scripts are renamed with it, and the scripts that \

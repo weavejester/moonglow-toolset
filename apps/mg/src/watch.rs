@@ -59,6 +59,9 @@ pub(crate) struct Step {
     /// Scripts compiled (those that made a compiled script).
     pub compiled: Vec<String>,
     pub errors: Vec<String>,
+    /// What the compiles warned of, each once (an include's is said by
+    /// its includers).
+    pub warnings: Vec<String>,
     /// Files put into the development folder.
     pub written: Vec<String>,
     /// What changed that the server has by heart: the module was built
@@ -71,13 +74,13 @@ impl Step {
     pub(crate) fn json(&self) -> Value {
         json!({
             "event": if self.rebuild.is_empty() { "synced" } else { "rebuilt" },
-            "compiled": self.compiled, "errors": self.errors,
+            "compiled": self.compiled, "errors": self.errors, "warnings": self.warnings,
             "written": self.written, "changed": self.rebuild,
         })
     }
 
     pub(crate) fn text(&self, dev_dir: &Path) -> Vec<String> {
-        let mut out: Vec<String> = self.errors.clone();
+        let mut out: Vec<String> = self.errors.iter().chain(&self.warnings).cloned().collect();
         if !self.rebuild.is_empty() {
             let more = match self.rebuild.len() {
                 1 => String::new(),
@@ -106,6 +109,8 @@ pub(crate) struct Watcher {
     build_to: Option<PathBuf>,
     module: Module,
     seen: HashMap<ResKey, u64>,
+    /// The project's own talk table's files, as last read ([`tables`]).
+    tables: Vec<(PathBuf, u64)>,
     signature: u64,
     looked: Instant,
     /// Debug files (`.ndb`) are made with the compiled scripts.
@@ -117,6 +122,23 @@ fn stamp(data: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut h);
     h.finish()
+}
+
+/// The files of the talk table the module names that its nasher project
+/// keeps (as JSON or CSV, each language's and the feminine table's), with
+/// what they hold: a change to one is the server's to read anew when it
+/// starts, as the table is made for it then.
+fn tables(m: &Module) -> Vec<(PathBuf, u64)> {
+    let (Some(p), Ok(Some(name))) = (m.project.as_deref(), m.custom_tlk()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, u64)> = [name.clone(), mg_module::talk::feminine(&name)]
+        .iter()
+        .flat_map(|n| p.talk_tables(n).unwrap_or_default())
+        .map(|t| (t.path, stamp(&t.file)))
+        .collect();
+    out.sort();
+    out
 }
 
 fn stamps(m: &Module) -> HashMap<ResKey, u64> {
@@ -137,7 +159,8 @@ impl Watcher {
         debug: bool,
         rm: &ResMan,
     ) -> Result<(Watcher, Step)> {
-        let mut module = Module::open(project).with_context(|| project.display().to_string())?;
+        let mut module =
+            crate::open_module(project).with_context(|| project.display().to_string())?;
         let all: Vec<ResKey> = module.keys_of(ResType::NSS).copied().collect();
         let mut step = Step::default();
         compile(&mut module, rm, &all, debug, &mut step);
@@ -147,6 +170,7 @@ impl Watcher {
             dev_dir: dev_dir.to_path_buf(),
             build_to,
             seen: stamps(&module),
+            tables: tables(&module),
             module,
             signature: crate::serve::signature(project),
             looked: Instant::now(),
@@ -207,7 +231,7 @@ impl Watcher {
     /// Takes up what changed in the project's files.
     pub(crate) fn step(&mut self, rm: &ResMan) -> Result<Step> {
         let mut step = Step::default();
-        let mut module = match Module::open(&self.project) {
+        let mut module = match crate::open_module(&self.project) {
             Ok(module) => module,
             // (A file half written: the next look reads it whole.)
             Err(e) => {
@@ -221,7 +245,22 @@ impl Watcher {
             now.iter().filter(|(k, s)| self.seen.get(k) != Some(s)).map(|(k, _)| *k).collect();
         let removed: Vec<ResKey> =
             self.seen.keys().filter(|k| !now.contains_key(k)).copied().collect();
-        if changed.is_empty() && removed.is_empty() {
+        // The talk table's files (not the module's resources).
+        let tables_now = tables(&module);
+        let mut tables_changed: Vec<String> = (tables_now.iter())
+            .filter(|t| !self.tables.contains(t))
+            .chain(self.tables.iter().filter(|t| !tables_now.iter().any(|n| n.0 == t.0)))
+            .map(|(p, _)| {
+                // (Named with `/` on every system, as the module's are.)
+                let p = p.strip_prefix(&self.project).unwrap_or(p);
+                let parts: Vec<_> =
+                    p.components().map(|c| c.as_os_str().to_string_lossy()).collect();
+                parts.join("/")
+            })
+            .collect();
+        tables_changed.sort();
+        tables_changed.dedup();
+        if changed.is_empty() && removed.is_empty() && tables_changed.is_empty() {
             return Ok(step);
         }
         let scripts: Vec<ResKey> =
@@ -248,10 +287,12 @@ impl Watcher {
             .filter(|k| kind(k.restype) == Kind::Rebuild)
             .chain(&removed)
             .map(ToString::to_string)
+            .chain(tables_changed)
             .collect();
         heavy.sort();
         self.module = module;
         self.seen = now;
+        self.tables = tables_now;
         if !heavy.is_empty() {
             step.rebuild = heavy;
             self.clear_written();
@@ -283,7 +324,14 @@ impl Watcher {
 }
 
 fn compile(module: &mut Module, rm: &ResMan, names: &[ResKey], debug: bool, step: &mut Step) {
-    for r in mg_module::build::compile_named_with(module, rm, names, None, debug) {
+    let results = mg_module::build::compile_named_with(module, rm, names, None, debug);
+    for (w, n) in mg_module::build::distinct_warnings(&results) {
+        step.warnings.push(match n {
+            1 => w.message.clone(),
+            n => format!("{} (in {n} scripts)", w.message),
+        });
+    }
+    for r in results {
         match r.result {
             Ok(()) if module.contains(&ResKey::new(r.script.resref, ResType::NCS)) => {
                 step.compiled.push(r.script.resref.to_string());
@@ -296,5 +344,73 @@ fn compile(module: &mut Module, rm: &ResMan, names: &[ResKey], debug: bool, step
                 step.errors.push(e.message);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The project's own talk table (its JSON, not one of the module's
+    /// resources) changes: the watch sees it, as a change the server has
+    /// by heart, and builds the module again (the server, started again,
+    /// has the table made anew).
+    #[test]
+    fn the_project_s_talk_table_changing_is_seen() {
+        let dir = mg_testkit::scratch_dir("mg-watch-tlk");
+        let mut m = Module::new();
+        let mut info = mg_gff::Gff::new(*b"IFO ");
+        info.root.set("Mod_CustomTlk", mg_gff::Value::String(b"mytlk".to_vec()));
+        m.set_info(&info).unwrap();
+        let project = dir.join("project");
+        m.save_as(&ModuleLocation::Project { root: project.clone(), target: "default".into() })
+            .unwrap();
+        let mut cfg = std::fs::read_to_string(project.join("nasher.cfg")).unwrap();
+        cfg.push_str(
+            "\n[target]\nname = \"tlk\"\nfile = \"mytlk.tlk\"\n  [target.sources]\n  include = \
+             \"src/tlk/*.json\"\n",
+        );
+        std::fs::write(project.join("nasher.cfg"), cfg).unwrap();
+        std::fs::create_dir_all(project.join("src/tlk")).unwrap();
+        let json = project.join("src/tlk/mytlk.tlk.json");
+        std::fs::write(&json, r#"{"language":0,"entries":[{"id":0,"text":"One"}]}"#).unwrap();
+        let rm = ResMan::new();
+        let built = dir.join("built.mod");
+        let (mut w, _) =
+            Watcher::start(&project, &dir.join("dev"), Some(built.clone()), false, &rm).unwrap();
+        assert_eq!(w.tables.len(), 1);
+        // Nothing changed: nothing to do.
+        assert!(w.step(&rm).unwrap().rebuild.is_empty());
+        std::fs::write(&json, r#"{"language":0,"entries":[{"id":0,"text":"Two"}]}"#).unwrap();
+        let step = w.step(&rm).unwrap();
+        assert_eq!(step.rebuild, ["src/tlk/mytlk.tlk.json"], "{step:?}");
+        assert!(step.text(&dir).iter().any(|l| l.contains("mytlk.tlk.json changed")));
+        assert!(w.step(&rm).unwrap().rebuild.is_empty(), "seen once");
+    }
+
+    /// Scripts compiled with the base game's `x2_inc_cutscene` (a return
+    /// type declared one way and defined another, compiled as in Aurora):
+    /// the warning is said once, with how many scripts met it.
+    #[test]
+    fn a_warning_of_the_compiles_is_said_once() {
+        let root = mg_testkit::corpus!();
+        let rm = ResMan::for_game(&mg_resman::GameInstall::new(&root, None, "en")).unwrap();
+        let mut m = Module::new();
+        let names: Vec<ResKey> = ["cut_a", "cut_b"]
+            .iter()
+            .map(|n| {
+                let k = ResKey::parse(n, ResType::NSS).unwrap();
+                m.set(k, b"#include \"x2_inc_cutscene\"\nvoid main() {}\n".to_vec());
+                k
+            })
+            .collect();
+        let mut step = Step::default();
+        compile(&mut m, &rm, &names, false, &mut step);
+        assert_eq!(step.compiled, ["cut_a", "cut_b"]);
+        assert_eq!(step.warnings.len(), 1, "{step:?}");
+        assert!(step.warnings[0].contains("CutCreateObjectCopy is declared object"));
+        assert!(step.warnings[0].ends_with("(in 2 scripts)"));
+        assert!(step.text(&root).contains(&step.warnings[0]));
+        assert_eq!(step.json()["warnings"][0], step.warnings[0].as_str());
     }
 }

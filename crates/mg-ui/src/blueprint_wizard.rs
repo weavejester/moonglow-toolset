@@ -17,10 +17,32 @@ use mg_rules::item_wizard::{self, Magical};
 use crate::{Action, Moonglow, Tab};
 use mg_module::project_file::Naming;
 
-/// How new ResRefs are made in the open module: by the builder's code,
-/// in a project with one (Edit › Builder Code…).
-pub(crate) fn naming(app: &Moonglow) -> Naming {
-    app.ws.as_ref().map(|ws| ws.module.project_file.naming()).unwrap_or_default()
+/// How new ResRefs of type `t` are made in the open module: by the
+/// builder's code, in a project with one (Edit › Builder Code…), or the
+/// team's prefix (of the kind, `[resrefs] kinds`).
+pub(crate) fn naming(app: &Moonglow, t: ResType) -> Naming {
+    app.ws.as_ref().map(|ws| ws.module.project_file.naming_for(t)).unwrap_or_default()
+}
+
+/// Under a ResRef typed in a wizard, where the project's pattern would
+/// put the builder's code (or the team's prefix) and the typed one hasn't
+/// it: a button that puts it in. What is typed is taken as typed (a
+/// tag-based item's script, say, needs a name of its own).
+pub(crate) fn code_button(ui: &mut egui::Ui, typed: &mut String, naming: &Naming) {
+    let own = typed.trim();
+    if naming.is_plain() || own.is_empty() || naming.strip(own) != own {
+        return;
+    }
+    let with = naming.fit(own, "");
+    if with == own.to_ascii_lowercase() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.weak("Not named by the project's pattern.");
+        if ui.button(format!("Use {with}")).clicked() {
+            *typed = with;
+        }
+    });
 }
 
 /// A wizard's ResRef field's tip: where the ResRef left empty comes from.
@@ -345,7 +367,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         let key_taken = |app: &Moonglow, r: &ResRef| {
             app.ws.as_ref().is_some_and(|ws| ws.module.contains(&ResKey::new(*r, w.kind.restype())))
         };
-        let naming = naming(app);
+        let naming = naming(app, w.kind.restype());
         match w.page() {
             Step::ItemType => {
                 ui.heading("Item Type");
@@ -549,6 +571,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 if let Some(p) = problem {
                     ui.colored_label(ui.visuals().warn_fg_color, p);
                 }
+                code_button(ui, &mut w.resref, &naming);
                 if w.kind == BlueprintKind::Item {
                     let game = app.game.as_deref().expect("checked");
                     magic_ui(ui, &mut w, game);
@@ -583,7 +606,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         let taken = |r: &ResRef| {
             app.ws.as_ref().is_some_and(|ws| ws.module.contains(&ResKey::new(*r, w.kind.restype())))
         };
-        let naming = naming(app);
+        let naming = naming(app, w.kind.restype());
         let (resref, g) = w.build(app.game.as_deref().expect("checked"), &naming, taken);
         let key = ResKey::new(resref, w.kind.restype());
         match g.to_bytes() {

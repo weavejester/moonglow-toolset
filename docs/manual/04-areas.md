@@ -3,7 +3,7 @@ type: Manual Page
 title: Areas
 description: Areas - the viewer's toolbar, minimaps and camera, selecting, arranging and placing objects, Setup Store, duplicate tags, claimed and protected areas, painting placeables, painting terrain, tiles, Area Properties, area sounds and making tilesets.
 tags: [manual, areas, terrain, tiles]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-27T12:02:53Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T21:33:57Z }
 ---
 
 # Areas
@@ -14,6 +14,13 @@ objects with the area's lighting, fog and sky, by day or night. Areas open
 looking straight down at their middle, north up, as in Aurora.
 
 ## The toolbar
+
+Each button shows an icon and its name. With **Tools › Options ›
+General › Toolbar buttons: Icons only** the buttons that have an icon
+show it alone, and the toolbar takes about half the rows it took: rest
+the pointer on an icon and its tip names it (and gives its key, as
+Select Tiles' and Paint's do). All, None, Together, To Scratch and the
+dropdowns keep their words.
 
 - **Creatures, Doors, … Waypoints, Start**: show or hide each kind of
   object and the start location marker; **All** and **None**. What you
@@ -51,7 +58,9 @@ looking straight down at their middle, north up, as in Aurora.
   magic sparks, a portal: placeables that are only an effect show
   nothing otherwise), as do the tiles: a chimney smokes with its
   animation loop on in Tile Properties, and a torch on a wall burns where
-  its source light has a color (Tile Properties). Switched off, they hold
+  its source light has a color (Tile Properties). Particles show as they
+  do once going from the moment the area is shown, a forge's fire as
+  much as a campfire's. Switched off, they hold
   still (tiles' water and flames go on), in every area view; it stays as
   you leave it.
 - **🌿 Grass**: the grass the area grows, as the game grows it on the
@@ -116,6 +125,37 @@ looking straight down at their middle, north up, as in Aurora.
   Switched off, everything is evenly lit, whatever the area's colors and
   lights: for working in a dark area. Areas opened later open as you left
   it.
+- **◑ Shadows**: the shadows the game draws, where the area has them
+  (Area Properties' **Shadows**, sun and moon, and its **Shadow
+  Opacity**), so that you can set the opacity by eye. A click turns them
+  all off, and on again as they were; hold the button a moment, or
+  right-click it, for the kinds to choose from:
+  - **Sun and Moon Shadows**: the sun's by day and the moon's at night,
+    falling away from the sun (to the south-west, as the game's sun stands
+    for every area), cast by the tiles and the **static** placeables (a
+    model's meshes flagged `shadow`, including shadow-only meshes that
+    aren't drawn).
+  - **Creature Shadows**: creatures, dynamic placeables and doors cast the
+    sun's and moon's shadows too, posed as they stand, as the game's
+    Creature Shadow Detail at Best has them (its default; at Fast or Off,
+    none of them casts).
+  - **Light Shadows**: where the area has no sun's or moon's shadows at
+    the time (an interior, or night without Moon Shadows), each creature
+    casts one from the nearest light that casts shadows, as in the game: a
+    light with `shadow 1` and a radius of 10 m or more (a placeable's
+    light, a lamp post; the tiles' torches, 7 m, cast none), from a little
+    above it (its `verticaldisplacement`: a placeable's light 3 m).
+
+  All three are on at first. Every shadow darkens the tiles and the
+  static placeables, not dynamic ones or creatures, as in the game.
+  Opacity 100 is as dark as the game makes them; like the game, Moonglow
+  fades them toward the top of the picture (from a camera looking
+  straight down, not at all), so they look as dark as in the game from
+  the same angle; a light's shadow is lighter than the sun's at the same
+  opacity, as the game's. Grass stays bright in a shadow, and with **Fade
+  Geometry** on the roofs it leaves out cast none. Switched off (or with
+  **Lighting** off) there are none; areas opened later open as you left
+  them. Changes to the shadow fields in Area Properties show at once.
 - **🔊 Sounds**, **Ambient**, **Music**: play the placed sound objects, the
   area's ambient sound and its music, heard from where the camera looks.
 - **◎ Sound Ranges**: two circles around each placed sound that is heard
@@ -147,7 +187,9 @@ looking straight down at their middle, north up, as in Aurora.
   Location**.
 - **To Scratch**: copy the area as it is now (its `.are`, `.git` and
   `.gic`) into the scratch folder (chosen the first time; Tools › Options
-  › Folders changes it).
+  › Folders changes it), with the module's own blueprints, scripts
+  (compiled first where they changed) and conversations it uses, as
+  Export's **Include the resources they use** takes them.
 
 ## Minimaps
 
@@ -168,6 +210,7 @@ Options › Keyboard):
 | Ctrl + drag | move the camera over the area, the ground following the pointer (a closed hand shows it held; a tileset brush paints nothing with it) |
 | Right drag, or middle drag | turn the camera (W A S D move it meanwhile) |
 | Alt + middle drag, or Alt + drag begun off the selection | move the camera (Alt + drag on the selection raises or lowers it) |
+| Alt + middle click | look at the ground clicked: the camera's focus goes there at once, at the ground's height (on its walkmesh, else on the tile's floor), its distance, turn and tilt kept, as Alt + middle click in Blender; a click on the sky or off the area does nothing |
 | Wheel | zoom (slowly with Shift, or with Ctrl unless the pointer is on a selected object that takes a scale; when painting tiles, Shift is the brush's) |
 | Sideways scroll (a tilted wheel, a second wheel, two fingers sideways on a touchpad) | move the camera left and right, as the screen has it |
 | Arrow keys, W A S D, or numpad 4, 6, 8, 2 | move the camera |
@@ -177,6 +220,7 @@ Options › Keyboard):
 | Ctrl + Shift + wheel, or Ctrl + Shift + middle drag | move the camera up and down, finely |
 | Numpad 5 | look straight down at the whole area (and back to the ground) |
 | F10 | select tiles or objects (Aurora's) |
+| X, T, N, Shift+N, R, Shift+R | the tile tools: the Eraser, Refine Tile, Next and Previous Tile Appearance, Rotate Tile and clockwise ([Painting terrain](#painting-terrain)) |
 | Double-click an object in Find Instance | go to it |
 
 The keys drive the area view the pointer was in last, also while the
@@ -329,7 +373,10 @@ Aurora):
   back about its own X axis (east at Bearing 0), and **Z Rotation**
   leans it to one side about its own Y axis; the game makes them in
   that order, X outermost. **Scale** scales the model every way alike
-  (the game reads one number), and the offsets move it along the
+  (the game reads one number, `ScaleX`, and Moonglow writes the three
+  alike, as Aurora does; a file whose `ScaleY` or `ScaleZ` differs,
+  set by hand or by another tool, keeps them until Scale is changed,
+  and the window says so), and the offsets move it along the
   object's own axes, turned by its Bearing but not by the rotations.
   The area view draws all of this as the game client does. A static
   placeable is offered none, as in Aurora: the game draws a static
@@ -338,7 +385,8 @@ Aurora):
   untick **Static** in its Properties to transform it. Ticking Static
   (in Properties, or Make Static) takes the transform off, as Aurora
   does, so a static placeable with one in its file was made elsewhere:
-  the window says so, and Verify warns of it (`static-transform`).
+  the window says so, and Verify warns of it (`static-transform`), with
+  a **Take the transform off** button (since Moonglow 2.13.0).
 - **Random Facing**: turns each selected object to face a way of its
   own, at random (by the snap angle, if one is set): for trees and rocks
   placed in numbers.
@@ -377,6 +425,12 @@ Aurora):
 - **Add to Palette**: the instance as a new custom blueprint (its ResRef
   after [your builder code](03-modules.md#your-builder-code), where you
   have one).
+- **Export as Blueprint…**: the instance written into an archive (`.erf`)
+  as a blueprint of its own, made and named as Add to Palette makes one
+  (with the items it holds, each an item blueprint), but not added to the
+  module; with the module's resources it uses (its scripts, its
+  conversation), for another module's **File › Import…**. The module
+  tree's menu of a placed object has it too.
 - **Test From Here**: starts the game at the point you right-clicked,
   facing the way the camera looks, with the module as it is now (see
   [Build, verify and test](09-build-and-test.md)). **Test From Here,
@@ -395,7 +449,15 @@ Aurora):
   objects of one kind selected, one window edits them together: a field
   changed there changes in all of them. It shows the first one's values,
   with **≠** before a field where the others have another (so too for
-  blueprints edited together from the palette).
+  blueprints edited together from the palette): every field set on each
+  has the mark (names in every language, descriptions, sliders, colors,
+  appearances, the conversation, the variables, each of an area's flags),
+  and the pointer resting on it says what it means. A list the Visuals
+  page sets whole (texture and animation replacements, shader
+  parameters) says so under its heading where they differ. Inventories, classes,
+  skills, feats, spells and the other lists of an object's own are
+  edited one object at a time, so those pages aren't offered there (and
+  a placeable's **Inventory…** is grayed).
 
 ### Setup Store
 
@@ -678,7 +740,7 @@ as Aurora's Terrain tab does:
   Double-click a picture for the tile's view: its model to turn and zoom,
   and what the tileset says of it (each corner's terrain and height, each
   edge's crosser, its lights, loops, doors and sounds), with **Paint with
-  it**. Chosen from its picture, **Refine Tile** chosen next (it then
+  it**, and its textures ([A tile's textures](#a-tiles-textures)). Chosen from its picture, **Refine Tile** chosen next (it then
   reads **Refine Tile →** and the tile's model) makes the tiles you click
   or drag over that tile, wherever it fits as they stand, and leaves the
   rest. Click the picture again, or another brush, to let it go.
@@ -735,9 +797,21 @@ as Aurora's Terrain tab does:
   selects. Shift + click on Rotate Tile turns them clockwise. A tile
   that can't step (no other appearance, a tile that doesn't turn, a
   group's tile) is left as it is; when none of them can, the status
-  line says why and they (a group's, the whole group) flash red. With
-  no tile selected, the three are chosen as above, and you click the
-  tiles. They have no keys of their own.
+  line says why (at the start of the line, where a narrow view doesn't
+  cut it off) and they (a group's, the whole group) flash red.
+  **Refine Tile** clicked there refines the selected tiles as its drag
+  over them would (the first the next tile that fits, the others of its
+  kind made that tile too; with a tile chosen in the Gallery, that tile
+  wherever it fits), and the **Eraser** deletes them, as Delete does:
+  each one step to undo, the selection kept. With no tile selected, the
+  tools are chosen as above, and you click the tiles.
+- **Keys** (Tools › Options › Keyboard changes them): **X** the Eraser,
+  **T** Refine Tile, **N** Next Tile Appearance, **Shift+N** Previous
+  Tile Appearance, **R** Rotate Tile and **Shift+R** Rotate Tile
+  clockwise, with the pointer over the area view. With tiles selected
+  they work on them, as the palette's clicks do; with none, the key
+  chooses the tool, and pressed again puts it down. Their tips in the
+  palette name them.
 - Select Tiles, the Eraser, Refine Tile, the three tools above and
   Raise/Lower head the Terrain list, whatever the tileset's order. A
   right click with the Eraser, Refine Tile or the three opens the tile
@@ -836,6 +910,11 @@ another change is made in the module while the window is open (an
 object moved, a tile painted), Cancel still puts back what the window
 changed, in a step of its own, **Cancel Tile Properties**, where those
 tiles still have the window's values; what the other change did stays.
+**Undo** (Ctrl+Z) while the window is open takes its step back, and the
+window reads its tiles again: it shows them as they are now, and what
+you change in it after is written from there, that change alone (Redo
+brings its step back, which Cancel still takes back). So it does after
+any other change to its tiles (a brush, a paste, a plugin).
 
 **Height** (Moonglow's own) is the tiles' `Tile_Height`, in the
 tileset's height steps (the meters are written beside it): **-** and
@@ -863,7 +942,10 @@ height, as the game's does.
 opens) shows every tile of the tileset in place of the variants, in the
 tileset's order, groups' pieces too, with **Turn** (0°, ↺90°, ↺180°,
 ↺270°) and the same **Size** slider; only the rows in sight are drawn,
-however many tiles the tileset has. Choosing a Turn turns the tiles
+however many tiles the tileset has (a hak's of 1,872 tiles as readily as
+the game's). Its **search** narrows the pictures to the tiles whose
+model's name or number in the tileset has what you type (`a04`, `117`),
+the count saying how many of all; Escape in it clears it. Choosing a Turn turns the tiles
 chosen at once: each keeps its own tile and its lights and loops, and
 lies as the Turn says, put in as it is, whether it fits its neighbors
 or not (none of them changes); each Turn chosen is one step to undo.
@@ -880,6 +962,49 @@ tile of a group or a feature, unless the option above is on. A piece
 of a group put in alone is taken, after, for what is left of a group
 (see above: only the Eraser or the option changes it).
 
+### A tile's textures
+
+Tile Properties (folded under **Textures of** the model until you open
+it), a tile's view and the tileset editor's tile (Tools › Tilesets,
+Tiles) list the textures the tile's model draws, as the game finds them.
+The heading says how many there are and how many are missing; with
+several tiles chosen in Tile Properties, it is the first one's, and a
+variant put in shows its own at once. Each texture has a small picture
+(a PLT's in its first colors, a cube map's first face) and:
+
+- its **name**, with **Copy** beside it; a right click on it also offers
+  to read the material (`.mtr`) it is drawn through and its `.txi` as
+  text. A name longer than 16 characters says the name the game reads
+  (its first 16).
+- what the file is: **DDS**, **TGA** or **PLT**, its size in pixels, how
+  it is kept (**DXT1**, **DXT5**, **BC5**, **uncompressed**, **24-bit**…)
+  and its size on disk; and **where it comes from** in the load order:
+  **Game data**, **Hak:** and its name, **Override folder**,
+  **Development folder**, **Module** (the layer's own label on hover, as
+  `mg which` prints it). **TXI** says it has one. A DDS beats a TGA of
+  the same name within the folders, the haks and the game's archives in
+  turn, as in the game.
+- what draws it, a line each way: as which slot (**diffuse**,
+  **normal**, **specular**, **roughness**, **height**, **illumination**,
+  a custom shader's **texture6** and on) of which mesh nodes, and through
+  which material: the one its `materialname` names, else one named like
+  its bitmap, whose textures stand in slot by slot for the mesh's own (a
+  bitmap so stood in for is listed as **not drawn**); the **environment
+  map** a texture's TXI names (`default` is the tileset's `EnvMap`, else
+  `chrome1`; water's `bumpyshinytexture` too); an emitter's
+  **particles**, and the models it throws; a light's **lens flare**. On
+  hover, every node and where the materials come from. The tileset's
+  own `EnvMap` is listed too: what the meshes reflect where their
+  textures name none.
+- **Missing**, in red, with a mark for its picture: drawn, and no DDS,
+  TGA or PLT of the name is anywhere in the load order.
+
+Meshes the model doesn't draw (`render 0`) are left out, and so are the
+walkmesh (a `.wok` isn't drawn) and the doors on the tile's door hooks,
+which are door objects of their own (their textures are on the door's
+Visuals page). The tileset editor reads the model from the game data, as
+its Preview does (the module's haks, override, development): a model
+beside the `.set` alone isn't read.
 
 A tile's replacement texture (`Tile_ReplaceTex`, a `replacetexture.2da`
 row for a texture named `replace_tex` in the tile's model) isn't in the
@@ -916,7 +1041,8 @@ Properties** on the viewer's toolbar:
 
 - **Basic**: name, the tileset (fixed once made) and the size.
 - **Visual**: the lighting scheme, day and night (or always one), the sun and moon colors,
-  fog colors and amounts, shadows, the skybox, lightning, rain and snow
+  fog colors and amounts, shadows (the sun's and the moon's, and how dark
+  they are: the view draws them, see **Shadows** above), the skybox, lightning, rain and snow
   chances, as Aurora's Customize Environment sets them. The schemes are
   listed in as many columns as the page is wide; once one is clicked
   (or reached with Tab), the arrow keys choose another: Up and Down down
@@ -1099,22 +1225,39 @@ open tilesets too, and closing one with unsaved changes asks first.
   border, default and floor terrains, interior, height transitions, and
   grass.
 - **Terrains and Crossers:** the lists, and **Add Terrain** and **Add
-  Crosser** by name.
+  Crosser** by name. **Rename…** beside one renames it, and every place
+  the file names it follows: the tiles' corners (a crosser: their
+  edges), the general border, default and floor terrains and the
+  painting rules (one step to undo). A name another terrain or crosser
+  has, one with a space, or one longer than 16 characters (a palette
+  names it as a ResRef) is refused, saying why. Areas name tiles by
+  number, so they need nothing; when the file is saved, the palette
+  beside it (`<tileset>palstd.itp`) follows the names changed since the
+  last save, the rest of it as it was.
 - **Tiles:** every tile with its corners and edges; **Find** by model or
   terrain. Per tile: model, walkmesh, minimap picture, path node,
   orientation, corner terrains and heights, edge crossers, lights and
   animation loops. **Add Tile** and **Duplicate Tile** add at the end, and
   **Remove Last Tile** takes the last away: areas store tiles by number,
   so tiles in the middle stay where they are. **Preview** shows the
-  model when the game data has it.
+  model when the game data has it, and under the tile's fields are the
+  textures its model draws: each one's picture, file, where in the load
+  order it comes from, what draws it and the missing ones marked
+  ([A tile's textures](#a-tiles-textures)).
 - **Groups:** each group's name, size and tiles, the bottom row first.
 
 The toolbar also has:
 - **Make Palette** writes `<tileset>palstd.itp` beside the `.set`, the
   palette the painter offers: one-tile groups as Features, the others as
   Groups, the terrains and crossers, the eraser and (with height
-  transitions) raise and lower. For the game's own tilesets it holds
-  every group their palettes place. `mg tileset-palette` does the same.
+  transitions) raise and lower. Features and Groups are in a folder a
+  terrain, as hand-made palettes keep them (Grass, Water, Castle…): the
+  terrain most of a group's tile corners have, named as the terrain is;
+  one whose corners name no terrain of the set goes in Special, and a
+  category all of one terrain stays flat. For the game's own tilesets it
+  holds every group their palettes place (theirs are arranged by hand,
+  some in folders of their own: City, Cliff). `mg tileset-palette` does
+  the same.
 - **Check** runs Verify's tileset checks: counts that disagree with the
   sections, tiles whose models are missing, groups that won't paint.
 - **Render Minimap Pictures** draws each tile from above with Moonglow's

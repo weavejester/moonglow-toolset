@@ -13,8 +13,9 @@
 //! go); triggers and encounters are drawn point by point, a double click
 //! closing the outline. Also: a middle drag turns the camera (Shift:
 //! moves it), the arrow keys move it, Z and C (or Ctrl + Shift + the wheel
-//! or a middle drag) move it up and down, Ctrl + click adds to the selection
-//! and Delete deletes it.
+//! or a middle drag) move it up and down, Alt + middle click (Blender's)
+//! puts its focus on the ground clicked, Ctrl + click adds to the
+//! selection and Delete deletes it.
 
 use std::f32::consts::FRAC_PI_2;
 
@@ -389,6 +390,17 @@ pub struct AreaView {
     pub fade: Fade,
     /// Lit by the area's lighting (off: an even working light).
     pub lit: bool,
+    /// The sun's or moon's shadows, where the area has them: cast by the
+    /// tiles and static placeables.
+    pub shadows: bool,
+    /// Creatures, dynamic placeables and doors cast the sun's or moon's
+    /// shadows too.
+    pub creature_shadows: bool,
+    /// Point lights flagged `shadow` cast shadows.
+    pub light_shadows: bool,
+    /// The kinds of shadow the Shadows button turned off (sun and moon,
+    /// creatures, lights), which a click turns on again.
+    shadows_before: Option<[bool; 3]>,
     /// Circles where each placed sound is heard at full volume and where
     /// it stops.
     pub sound_ranges: bool,
@@ -480,6 +492,8 @@ pub struct AreaView {
     drawn: Option<(Drawn, f32)>,
     /// How many times the picture has been drawn.
     pub pictures: u64,
+    /// The watch on what the GPU draws of it ([`mg_render::watch`]).
+    pub watching: Watching,
     /// How many textures read apart the picture was drawn with
     /// ([`mg_render::Renderer::textures_read`]).
     textures_drawn: u64,
@@ -518,6 +532,232 @@ struct Drawn {
 /// frame is drawn for every move of the pointer over a menu or key typed
 /// in a window in front of the area.
 const ANIMATION_STEP: f32 = 0.04;
+
+/// The area view's watch on what the GPU draws ([`mg_render::watch`]):
+/// every [`mg_render::watch::EVERY`] seconds a picture drawn is looked at,
+/// the look read when the GPU is done, and judged. What it sees goes to
+/// the debug log, sparingly ([`Watching::note`]): the first look judged,
+/// a wait on frames not ready every [`WAIT_NOTED`] seconds, a collapse as
+/// it begins and ends, a look lost, the verdict.
+#[derive(Debug, Default)]
+pub struct Watching {
+    pub watch: mg_render::watch::Watch,
+    sampler: Option<mg_render::watch::Sampler>,
+    /// The look under way ([`Taken`]).
+    pending: Option<Taken>,
+    last: Option<f64>,
+    /// The last look's numbers and verdict, and how many there have been.
+    pub seen: Option<(mg_render::watch::Observation, mg_render::watch::Verdict)>,
+    pub looks: u64,
+    /// The last look's points expected, drawn and in a color other than
+    /// the background's.
+    pub colored: usize,
+    /// What the debug log has been told.
+    noted: Noted,
+}
+
+/// How often a wait on frames not ready is noted in the debug log,
+/// seconds.
+const WAIT_NOTED: f64 = 10.0;
+
+/// What a look under way was taken from: whether its frame was ready
+/// (and if not, what it waited for: textures, the game's programs), the
+/// renderer's progress, the points of tiles that failed, the frame's
+/// background, and when (the window's clock, seconds).
+#[derive(Debug, Clone)]
+struct Taken {
+    ready: bool,
+    textures: usize,
+    programs: usize,
+    progress: u64,
+    failed: mg_render::watch::Expected,
+    background: [f32; 3],
+    at: f64,
+}
+
+/// What the debug log has been told of the watch.
+#[derive(Debug, Default)]
+struct Noted {
+    judged: bool,
+    /// The last wait noted, when.
+    waiting: Option<f64>,
+    collapse: bool,
+    lost: bool,
+    failed: bool,
+}
+
+impl Watching {
+    /// After a picture is drawn (`frame`, by `camera`, into `targets`, at
+    /// `now`): a look at it, if one is due. The tiles expected are the
+    /// frame's drawn whole (not a brush's see-through preview), and those
+    /// that would be drawn but failed (`failed`: their middles).
+    fn after_drawing(
+        &mut self,
+        vp: &crate::model_view::Viewport3d,
+        frame: &mg_render::Scene,
+        failed: &[glam::Vec3],
+        camera: &mg_render::Camera,
+        targets: &mg_render::Targets,
+        now: f64,
+    ) {
+        use mg_render::watch;
+        // (A look the GPU never gave back: given up, and the next taken.)
+        if let Some(s) = self.sampler.as_mut()
+            && s.give_up(now)
+        {
+            self.pending = None;
+            if !std::mem::replace(&mut self.noted.lost, true) {
+                crate::trace::note(format!(
+                    "graphics watch: a look at the area view was lost (the GPU didn't give it \
+                     back in {} s)",
+                    watch::LOST
+                ));
+            }
+        }
+        let busy = self.sampler.as_ref().is_some_and(watch::Sampler::busy);
+        if busy || self.last.is_some_and(|t| now - t < watch::EVERY) {
+            return;
+        }
+        let samples = crate::model_view::SAMPLES;
+        let sampler = self.sampler.get_or_insert_with(|| watch::Sampler::new(&vp.gpu, samples));
+        let mut tiles: Vec<glam::Vec3> = frame
+            .instances
+            .iter()
+            .filter(|i| i.tile && !i.grass && i.opacity >= 1.0 && !i.model.meshes.is_empty())
+            .map(|i| i.transform.w_axis.truncate())
+            .collect();
+        tiles.extend_from_slice(failed);
+        let (w, h) = targets.size;
+        let aspect = w as f32 / h.max(1) as f32;
+        let expected = watch::expected(&tiles, camera, aspect);
+        let failed = if failed.is_empty() {
+            watch::Expected(Vec::new())
+        } else {
+            watch::expected(failed, camera, aspect)
+        };
+        let drawn = &vp.renderer.drawn;
+        let ready = drawn.game_pending == 0 && drawn.textures_pending == 0;
+        sampler.look(&vp.gpu, targets, expected, now);
+        self.pending = Some(Taken {
+            ready,
+            textures: drawn.textures_pending,
+            programs: drawn.game_pending,
+            progress: vp.renderer.progress(),
+            failed,
+            background: frame.background,
+            at: now,
+        });
+        self.last = Some(now);
+    }
+
+    /// The look under way, if the GPU is done with it: judged (and told
+    /// the debug log, as [`Watching`] says; `area` names the view). The
+    /// failure, the first time there is one.
+    fn read(
+        &mut self,
+        vp: &crate::model_view::Viewport3d,
+        area: &str,
+    ) -> Option<mg_render::watch::Failure> {
+        use mg_render::watch::{Observation, Verdict};
+        let look = self.sampler.as_mut()?.take(&vp.gpu)?;
+        let taken = self.pending.take()?;
+        let (expected, drawn) = look.counted();
+        let failed = taken.failed.0.iter().filter(|&&f| f).count();
+        let o = Observation {
+            expected,
+            drawn,
+            ready: taken.ready,
+            progress: taken.progress,
+            failed,
+            at: taken.at,
+        };
+        let before = self.watch.failure();
+        let verdict = self.watch.judge(o);
+        self.colored = look.colored(taken.background);
+        self.seen = Some((o, verdict));
+        self.looks += 1;
+        self.note(area, &taken, o, verdict);
+        match verdict {
+            Verdict::Failed(f) if before.is_none() => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Tells the debug log what a look found, where it is news.
+    fn note(
+        &mut self,
+        area: &str,
+        taken: &Taken,
+        o: mg_render::watch::Observation,
+        verdict: mg_render::watch::Verdict,
+    ) {
+        use mg_render::watch::{COLUMNS, Quiet, ROWS, Verdict};
+        let colored = self.colored;
+        let numbers = || {
+            let mut s = format!(
+                "{} of {} points of the ground expected, {} drawn, {colored} of them in a color \
+                 other than the background's",
+                o.expected,
+                COLUMNS * ROWS,
+                o.drawn,
+            );
+            if o.failed > 0 {
+                s += &format!(", {} expected of tiles that failed", o.failed);
+            }
+            if !o.ready {
+                s += &format!(
+                    "; not ready: {} instances waiting for textures, {} of the game's programs \
+                     being made",
+                    taken.textures, taken.programs
+                );
+            }
+            s
+        };
+        let noted = &mut self.noted;
+        match verdict {
+            Verdict::Quiet(Quiet::NotReady) => {
+                let since = *noted.waiting.get_or_insert(o.at);
+                if o.at - since >= WAIT_NOTED {
+                    noted.waiting = Some(o.at);
+                    crate::trace::note(format!("graphics watch: area {area} waits: {}", numbers()));
+                }
+                return;
+            }
+            Verdict::Quiet(Quiet::WarmingUp) => return,
+            _ => {}
+        }
+        noted.waiting = None;
+        if !std::mem::replace(&mut noted.judged, true) {
+            crate::trace::note(format!(
+                "graphics watch: area {area}, the first look judged ({verdict:?}): {}",
+                numbers()
+            ));
+        }
+        match verdict {
+            Verdict::Doubt { .. } if !noted.collapse => {
+                noted.collapse = true;
+                crate::trace::note(format!(
+                    "graphics watch: area {area}, too little drawn: {}",
+                    numbers()
+                ));
+            }
+            Verdict::Quiet(_) if noted.collapse => {
+                noted.collapse = false;
+                crate::trace::note(format!(
+                    "graphics watch: area {area} is drawn again: {}",
+                    numbers()
+                ));
+            }
+            Verdict::Failed(_) if !std::mem::replace(&mut noted.failed, true) => {
+                crate::trace::note(format!(
+                    "graphics watch: area {area}, at the verdict: {}",
+                    numbers()
+                ));
+            }
+            _ => {}
+        }
+    }
+}
 
 impl AreaView {
     /// Reads the area's tiles and objects again from the game data (after
@@ -595,6 +835,10 @@ impl AreaView {
             fog: false,
             fade: Fade::Never,
             lit: true,
+            shadows: true,
+            creature_shadows: true,
+            light_shadows: true,
+            shadows_before: None,
             sound_ranges: false,
             grid: true,
             show: [true; 9],
@@ -632,6 +876,7 @@ impl AreaView {
             targets: None,
             drawn: None,
             pictures: 0,
+            watching: Watching::default(),
             time: 0.0,
             last_frame: None,
             rect: Rect::NOTHING,
@@ -814,6 +1059,28 @@ impl AreaView {
         self.ground.as_ref().and_then(|g| g.hit(&ray)).or_else(|| ray.at_height(z))
     }
 
+    /// The point Alt + middle click puts the camera's focus on: where the ray
+    /// under `pos` meets the walkmesh, else the floor of the tile it meets
+    /// (at the tile's height), nearest the eye. `None` on the sky and off
+    /// the area.
+    pub fn focus_at(&self, pos: Pos2) -> Option<Vec3> {
+        let ray = self.ray(pos)?;
+        if let Some(p) = self.ground.as_ref().and_then(|g| g.hit(&ray)) {
+            return Some(p);
+        }
+        let model = self.model.as_ref()?;
+        let half = TILE_SIZE / 2.0;
+        model
+            .tiles
+            .iter()
+            .filter_map(|t| {
+                let p = ray.at_height(t.position.z)?;
+                let d = (p - t.position).truncate().abs();
+                (d.x <= half && d.y <= half).then_some(p)
+            })
+            .min_by(|a, b| (*a - ray.origin).length().total_cmp(&(*b - ray.origin).length()))
+    }
+
     /// The ground's height at `p` (on its walkmesh, nearest the level of
     /// the tile `p` is in), else `p`'s own: where the brushes' cursors are
     /// drawn, so that they lie on the ground the pointer picks.
@@ -841,6 +1108,37 @@ impl AreaView {
         (screen.len() == 4).then_some(screen)
     }
 
+    /// A tile-sized square's outline laid along the ground the pointer
+    /// picks, on screen: each edge in steps of half a metre, each step on
+    /// the ground a little inside the square, so that over a cliff or a
+    /// slope the outline follows the tile's own ground rather than cutting
+    /// straight across from corner to corner (on a cliff's corner turned
+    /// away from the view, a thin strip). `None` where a point is out of
+    /// view. A tile whose corners and middle are level is its four corners
+    /// (a large selection of flat tiles asks the ground no more than that).
+    pub(crate) fn square_along_ground(&self, x: f32, y: f32, z: f32) -> Option<Vec<Pos2>> {
+        self.tile_outline(x, y, z).into_iter().map(|p| self.screen_pos(p)).collect()
+    }
+
+    /// [`square_along_ground`](Self::square_along_ground)'s points in the
+    /// area, before they are put on screen.
+    pub fn tile_outline(&self, x: f32, y: f32, z: f32) -> Vec<Vec3> {
+        const STEPS: usize = 20;
+        let corners = tile_square(x, y, z);
+        let middle = corners.iter().copied().sum::<Vec3>() / 4.0;
+        let on = |p: Vec3| p.truncate().extend(self.ground_height(p.lerp(middle, 0.02)) + 0.05);
+        let laid = corners.map(on);
+        let level = on(middle).z;
+        let steps = if laid.iter().all(|p| (p.z - level).abs() < 0.1) { 1 } else { STEPS };
+        let mut out = Vec::with_capacity(4 * steps);
+        for k in 0..4 {
+            out.push(laid[k]);
+            let (a, b) = (corners[k], corners[(k + 1) % 4]);
+            out.extend((1..steps).map(|i| on(a.lerp(b, i as f32 / steps as f32))));
+        }
+        out
+    }
+
     pub(crate) fn on_ground(&self, points: &[Vec3]) -> Vec<Vec3> {
         let middle = points.iter().copied().sum::<Vec3>() / points.len().max(1) as f32;
         points
@@ -854,12 +1152,7 @@ impl AreaView {
     /// stand on the ground, and so does anything where the view has no
     /// ground yet.
     pub(crate) fn lift_of(&self, o: &mg_area::AreaObject) -> f32 {
-        let ground =
-            self.ground.as_ref().and_then(|g| g.height(o.position.truncate(), o.position.z));
-        match o.kind {
-            ObjectKind::Creature => 0.0,
-            _ => ground.map_or(0.0, |z| o.position.z - z),
-        }
+        lift_on(self.ground.as_ref(), o)
     }
 
     /// Where an object moved by `offset` stands: at the same height above
@@ -1767,6 +2060,9 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
         let mut view = AreaView::new(area);
         (view.show, view.show_start) = shown_of(&app.settings.hidden_in_areas);
         view.lit = !app.settings.unlit_areas;
+        view.shadows = !app.settings.no_shadows;
+        view.creature_shadows = !app.settings.no_creature_shadows;
+        view.light_shadows = !app.settings.no_light_shadows;
         view.sound_ranges = app.settings.sound_ranges;
         view.fade = Fade::of(app.settings.fade_geometry);
         // (Where its camera was, if a module's kept tabs opened it again.)
@@ -1817,6 +2113,14 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
             orbit.distance = orbit.distance.min(25.0);
         }
         app.area_focus = None;
+    }
+    // Objects to select (the module tree's Go To on several).
+    if let Some((a, objects)) = &app.area_select
+        && *a == area
+        && view.model.is_some()
+    {
+        view.selection = objects.clone();
+        app.area_select = None;
     }
     // The start location to go to (Go to Start Location).
     if app.start_focus == Some(area) && view.orbit.is_some() {
@@ -1879,18 +2183,21 @@ fn share_shown(app: &mut Moonglow, view: &AreaView) {
 
 fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
     let was = (view.show, view.show_start);
+    // (Icons only: each glyph alone, its name in its tip.)
+    let tools = crate::icons::Tools::of(&app.settings);
     ui.horizontal_wrapped(|ui| {
-        use crate::icons::{self, labelled};
+        use crate::icons;
         for kind in ObjectKind::ALL {
-            ui.toggle_value(
-                &mut view.show[kind.index()],
-                labelled(icons::object(kind), kind.label()),
-            )
-            .on_hover_text(format!("Show {}", kind.label()));
+            let (on, name) = (&mut view.show[kind.index()], kind.label());
+            tools.toggle(ui, on, icons::object(kind), name, &format!("Show {name}"));
         }
-        ui.toggle_value(&mut view.show_start, labelled(icons::START, "Start")).on_hover_text(
+        tools.toggle(
+            ui,
+            &mut view.show_start,
+            icons::START,
+            "Start",
             "Show the start location's marker (a blue ring with a red arrow). To set it: \
-                 right-click the ground, Set Start Location Here",
+             right-click the ground, Set Start Location Here",
         );
         if ui.button("All").on_hover_text("Show All").clicked() {
             view.show = [true; 9];
@@ -1907,11 +2214,13 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         let show = view.show;
         view.selection.retain(|(k, _)| show[k.index()]);
         ui.separator();
-        ui.toggle_value(&mut view.night, labelled(icons::NIGHT, "Night"))
-            .on_hover_text("Show the area at night");
-        if ui
-            .toggle_value(&mut view.lit, "💡 Lighting")
-            .on_hover_text(
+        tools.toggle(ui, &mut view.night, icons::NIGHT, "Night", "Show the area at night");
+        if tools
+            .toggle(
+                ui,
+                &mut view.lit,
+                icons::LIGHTING,
+                "Lighting",
                 "Use the area's lighting; off, everything is evenly lit (for working in dark \
                  areas)",
             )
@@ -1919,7 +2228,14 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         {
             app.settings.unlit_areas = !view.lit;
         }
-        ui.toggle_value(&mut view.fog, labelled(icons::FOG, "Fog"));
+        shadows_button(ui, view, tools);
+        let kinds = (view.shadows, view.creature_shadows, view.light_shadows);
+        let s = &mut app.settings;
+        if kinds != (!s.no_shadows, !s.no_creature_shadows, !s.no_light_shadows) {
+            (s.no_shadows, s.no_creature_shadows, s.no_light_shadows) =
+                (!kinds.0, !kinds.1, !kinds.2);
+        }
+        tools.toggle(ui, &mut view.fog, icons::FOG, "Fog", "");
         let before = view.fade;
         let fits =
             Fits::before(ui, "fade-geometry", &format!("Fade Geometry: {}", view.fade.name()));
@@ -1938,9 +2254,12 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             app.settings.fade_geometry = view.fade as u8;
         }
         let mut animated = !app.settings.still_objects;
-        if ui
-            .toggle_value(&mut animated, "▶ Animations")
-            .on_hover_text(
+        if tools
+            .toggle(
+                ui,
+                &mut animated,
+                icons::ANIMATIONS,
+                "Animations",
                 "Creatures and other placed objects play their animations; off, they hold \
                  still (in every area view)",
             )
@@ -1949,9 +2268,12 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             app.settings.still_objects = !animated;
         }
         let mut grass = !app.settings.no_grass;
-        if ui
-            .toggle_value(&mut grass, labelled(icons::GRASS, "Grass"))
-            .on_hover_text(
+        if tools
+            .toggle(
+                ui,
+                &mut grass,
+                icons::GRASS,
+                "Grass",
                 "Grass wherever the view shows grass ground, thinned far off (the game grows \
                  it near the camera alone): the tileset's, and the area's own (Area Properties \
                  › Grass); in every area view",
@@ -1960,33 +2282,37 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         {
             app.settings.no_grass = !grass;
         }
-        let mut shaders = app.settings.game_shaders();
-        if ui
-            .toggle_value(&mut shaders, labelled(icons::SHADERS, "Shaders"))
-            .on_hover_text(
+        let mut shaders = app.game_shaders();
+        if tools
+            .toggle(
+                ui,
+                &mut shaders,
+                icons::SHADERS,
+                "Shaders",
                 "Draw with the game's own shaders, compiled from the game and the module's haks: \
                  a material's custom shaders (swaying grass and leaves, flowing water) and the \
                  game's lit shaders; off, with Moonglow's own (in every 3D view)",
             )
             .changed()
         {
-            app.settings.game_shaders = Some(shaders);
+            app.set_game_shaders(shaders);
         }
-        ui.toggle_value(&mut view.grid, labelled(icons::GRID, "Grid"))
-            .on_hover_text("Display Grid");
+        tools.toggle(ui, &mut view.grid, icons::GRID, "Grid", "Display Grid");
         // Aurora's Play Placed Sounds, Play Ambient Sound, Play Ambient
         // Music (the Options › Sounds settings).
         let mut placed = !app.settings.no_placed_sounds;
-        if ui
-            .toggle_value(&mut placed, "🔊 Sounds")
-            .on_hover_text("Play placed sound objects in area")
+        if tools
+            .toggle(ui, &mut placed, icons::SOUNDS, "Sounds", "Play placed sound objects in area")
             .changed()
         {
             app.settings.no_placed_sounds = !placed;
         }
-        if ui
-            .toggle_value(&mut view.sound_ranges, "◎ Sound Ranges")
-            .on_hover_text(
+        if tools
+            .toggle(
+                ui,
+                &mut view.sound_ranges,
+                icons::SOUND_RANGES,
+                "Sound Ranges",
                 "Where each placed sound is heard: at full volume inside the inner circle, not \
                  at all outside the outer one",
             )
@@ -1994,10 +2320,10 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         {
             app.settings.sound_ranges = view.sound_ranges;
         }
-        ui.toggle_value(&mut app.settings.ambient_sound, labelled(icons::AMBIENT, "Ambient"))
-            .on_hover_text("Play ambient sound in area");
-        ui.toggle_value(&mut app.settings.ambient_music, labelled(icons::MUSIC, "Music"))
-            .on_hover_text("Play ambient music in area");
+        let ambient = &mut app.settings.ambient_sound;
+        tools.toggle(ui, ambient, icons::AMBIENT, "Ambient", "Play ambient sound in area");
+        let music = &mut app.settings.ambient_music;
+        tools.toggle(ui, music, icons::MUSIC, "Music", "Play ambient music in area");
         ui.separator();
         let grid = |v: Option<u16>| {
             v.map_or("Snap: off".to_string(), |cm| format!("Snap: {} m", f32::from(cm) / 100.0))
@@ -2039,14 +2365,14 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             "Several objects selected turn about their middle as one, keeping their places \
              among themselves; off, each turns where it stands",
         );
-        walkmesh_button(ui, view);
-        if ui
-            .toggle_value(&mut view.tile_mode, labelled(icons::SELECT_TILES, "Select Tiles"))
-            .on_hover_text(app.keymap.titled(
-                "Select tiles rather than objects (Aurora's Select Terrain)",
-                crate::keys::Cmd::SelectTiles,
-                ui.ctx(),
-            ))
+        walkmesh_button(ui, view, tools);
+        let tip = app.keymap.titled(
+            "Select tiles rather than objects (Aurora's Select Terrain)",
+            crate::keys::Cmd::SelectTiles,
+            ui.ctx(),
+        );
+        if tools
+            .toggle(ui, &mut view.tile_mode, icons::SELECT_TILES, "Select Tiles", &tip)
             .changed()
         {
             view.selection.clear();
@@ -2056,29 +2382,25 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
                 app.palette.tile_brush = None;
             }
         }
-        if ui
-            .toggle_value(&mut app.paint, labelled(icons::PAINT, "Paint"))
-            .on_hover_text(app.keymap.titled(
-                "Paint the placeables chosen in the palette (Ctrl + click for several) onto the \
-                 ground: scattered in a circle, or in a row",
-                crate::keys::Cmd::PaintPlaceables,
-                ui.ctx(),
-            ))
-            .changed()
-            && app.paint
-        {
+        let tip = app.keymap.titled(
+            "Paint the placeables chosen in the palette (Ctrl + click for several) onto the \
+             ground: scattered in a circle, or in a row",
+            crate::keys::Cmd::PaintPlaceables,
+            ui.ctx(),
+        );
+        if tools.toggle(ui, &mut app.paint, icons::PAINT, "Paint", &tip).changed() && app.paint {
             view.tile_mode = false;
             app.palette.tile_brush = None;
         }
-        if ui.button(labelled(icons::PROPERTIES, "Area Properties")).clicked() {
+        if tools.button(ui, icons::PROPERTIES, "Area Properties", "").clicked() {
             app.actions.push(Action::OpenTab(crate::Tab::AreaProperties(view.area)));
         }
-        if ui.button(labelled(icons::CAMERA, "Reorient Camera")).clicked()
+        if tools.button(ui, icons::CAMERA, "Reorient Camera", "").clicked()
             && let Some(o) = &mut view.orbit
         {
             o.yaw = -FRAC_PI_2;
         }
-        if ui.button(labelled(icons::GO_TO_START, "Go to Start Location")).clicked() {
+        if tools.button(ui, icons::GO_TO_START, "Go to Start Location", "").clicked() {
             // In another area: that area's view is opened at it, as Aurora does.
             if !look_at_start(app, view) {
                 go_to_start(app);
@@ -2086,12 +2408,13 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         }
         let tip = crate::transfer::scratch_tip(
             app.settings.scratch_dir.as_deref(),
-            "the area as it is now (its .are, .git and .gic)",
+            "the area as it is now (its .are, .git and .gic), with the module's blueprints, \
+             scripts and conversations it uses",
         );
         if ui.button("To Scratch").on_hover_text(tip).clicked() {
             app.actions.push(Action::ExportFiles {
                 keys: vec![ResKey::new(view.area, ResType::ARE)],
-                dependencies: false,
+                dependencies: true,
                 scratch: true,
             });
         }
@@ -2193,11 +2516,12 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
          wheel zooms slowly meanwhile.)"
             .to_string()
     } else if view.tile_mode {
-        // (And why a step was refused, as a brush's line says it.)
+        // (And why a step was refused, as a brush's line says it: first,
+        // where a narrow view doesn't cut it short.)
         let how = "Select Tiles: click a tile (Ctrl + click: add one), drag a box; Shift + right \
                    click: its next tile; right click: the tile menu";
         match &view.notice {
-            Some(n) => format!("{how} · {n}"),
+            Some(n) => format!("{n} · {how}"),
             None => how.to_string(),
         }
     } else if let ([(kind, index)], Some(m)) = (view.selection.as_slice(), &view.model)
@@ -2300,6 +2624,9 @@ fn viewport(
         night: view.night,
         fog: view.fog,
         lit: view.lit,
+        shadows: view.shadows,
+        creature_shadows: view.creature_shadows,
+        light_shadows: view.light_shadows,
         show: view.show,
         animate: !app.settings.still_objects,
         fade: view.fade.now(view.tile_mode || crate::terrain_mode::active(app, view).is_some()),
@@ -2400,6 +2727,7 @@ fn viewport(
         || !hidden.is_empty();
     let clock = module_clock(app);
     let background = app.background_jobs;
+    let shaders = app.game_shaders();
     let game_arc = app.game.clone();
     let (Some(model), Some(scene), Some(orbit), Some(vp), Some(game)) =
         (&view.model, &view.scene, view.orbit, app.viewport.as_mut(), app.game.as_deref())
@@ -2427,7 +2755,7 @@ fn viewport(
         merchant_signs: scene.merchant_signs,
         spawn_markers: scene.spawn_markers,
         follows,
-        shaders: app.settings.game_shaders(),
+        shaders,
     };
     let since = view.drawn.as_ref().map(|(_, at)| view.time - at);
     let kept = !follows
@@ -2520,17 +2848,24 @@ fn viewport(
         // (With the targets' framebuffer copies: shiny water by the
         // game's `fswater`.)
         vp.renderer.render_targets(&vp.gpu, &game.resman, &frame, &camera, targets);
+        // (The watch: a look at what was drawn, now and then.)
+        let failed = scene.failed_tiles(&shown, &hidden);
+        view.watching.after_drawing(vp, &frame, &failed, &camera, targets, now);
         vp.renderer.game_background = false;
         vp.renderer.textures_apart = false;
         view.textures_drawn = vp.renderer.textures_read();
         view.drawn = Some((from, view.time));
         view.pictures += 1;
     }
+    let watch_failed = view.watching.read(vp, &view.area.to_string());
     let response = ui.add(
         egui::Image::new(egui::load::SizedTexture::new(*id, size))
             .sense(egui::Sense::click_and_drag()),
     );
     view.rect = response.rect;
+    if let Some(f) = watch_failed {
+        crate::renderer_check::watch_failed(app, f);
+    }
     // Placing a door, with a click or by dragging one: the hooks show.
     let dragged = egui::DragAndDrop::payload::<crate::palette_view::Dragged>(ui.ctx());
     let door_brush =
@@ -2780,14 +3115,35 @@ impl Fits {
 /// The toolbar's one button for the walkmeshes: a click shows or hides
 /// the ground's (or hides whichever are shown); held, or right-clicked,
 /// it opens the two to choose from, the ground's and the objects'.
-fn walkmesh_button(ui: &mut egui::Ui, view: &mut AreaView) {
-    use crate::icons::{self, labelled};
+fn walkmesh_button(ui: &mut egui::Ui, view: &mut AreaView, tools: crate::icons::Tools) {
     let on = view.walkmesh || view.object_walkmesh;
-    let label = labelled(icons::WALKMESH, "Walkmesh…");
-    let r = ui.add(egui::Button::selectable(on, label)).on_hover_text(
+    let label = tools.label(crate::icons::WALKMESH, "Walkmesh…");
+    let r = tools.add(
+        ui,
+        egui::Button::selectable(on, label),
+        "Walkmesh…",
         "Click: the ground's walkmesh (Render AABB Nodes), walkable faces green. Hold, or \
          right-click: the ground's and the objects' to choose from",
     );
+    let (clicked, menu) = held_menu(ui, &r);
+    if clicked {
+        (view.walkmesh, view.object_walkmesh) = (!on, false);
+    }
+    menu.show(|ui| {
+        ui.checkbox(&mut view.walkmesh, "Ground Walkmesh")
+            .on_hover_text("Render AABB Nodes: the ground's walkmesh, walkable faces green");
+        ui.checkbox(&mut view.object_walkmesh, "Object Walkmeshes").on_hover_text(
+            "Where placeables (.pwk) and doors (.dwk) keep creatures out: placeables \
+             orange, doors blue (in their open or closed state)",
+        );
+    });
+}
+
+/// A toolbar button with a menu behind it (Walkmesh…, Shadows): a click
+/// is the button's own (`true` the first of the two returned), and
+/// holding it a moment (0.35 s) or a right-click opens the menu, whose
+/// release is no click; the menu, to show its choices in.
+fn held_menu<'r>(ui: &egui::Ui, r: &'r egui::Response) -> (bool, egui::Popup<'r>) {
     // Held a moment: the choice opens, and the release is no click.
     let held_id = r.id.with("held-open");
     let was_held = ui.data(|d| d.get_temp::<bool>(held_id)).unwrap_or(false);
@@ -2801,23 +3157,62 @@ fn walkmesh_button(ui: &mut egui::Ui, view: &mut AreaView) {
     if open {
         ui.data_mut(|d| d.insert_temp(held_id, true));
     }
-    if r.clicked() && !was_held && !open {
-        (view.walkmesh, view.object_walkmesh) = (!on, false);
-    }
-    if !down && was_held {
+    let clicked = r.clicked() && !was_held && !open;
+    // (The hold's release is a click outside the menu, which would close
+    // it: kept open through it.)
+    let released = !down && was_held;
+    if released {
         ui.data_mut(|d| d.insert_temp(held_id, false));
     }
-    egui::Popup::from_response(&r)
+    let close = if released {
+        egui::PopupCloseBehavior::IgnoreClicks
+    } else {
+        egui::PopupCloseBehavior::CloseOnClickOutside
+    };
+    let menu = egui::Popup::from_response(r)
         .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show(|ui| {
-            ui.checkbox(&mut view.walkmesh, "Ground Walkmesh")
-                .on_hover_text("Render AABB Nodes: the ground's walkmesh, walkable faces green");
-            ui.checkbox(&mut view.object_walkmesh, "Object Walkmeshes").on_hover_text(
-                "Where placeables (.pwk) and doors (.dwk) keep creatures out: placeables \
-                 orange, doors blue (in their open or closed state)",
-            );
-        });
+        .close_behavior(close);
+    (clicked, menu)
+}
+
+/// The Shadows button: down while any kind of shadow is drawn; a click
+/// turns them all off, or on again as they were (all at first); held or
+/// right-clicked, the kinds to choose from.
+fn shadows_button(ui: &mut egui::Ui, view: &mut AreaView, tools: crate::icons::Tools) {
+    let kinds = [view.shadows, view.creature_shadows, view.light_shadows];
+    let on = kinds.iter().any(|&k| k);
+    let r = tools.add(
+        ui,
+        egui::Button::selectable(on, tools.label(crate::icons::SHADOWS, "Shadows")),
+        "Shadows",
+        "Click: the shadows the game draws, where the area has them (Area Properties › Sun and \
+         Moon Shadows, as dark as its Shadow Opacity), or none. Hold, or right-click: which \
+         to draw (the sun's and moon's, creatures', lights')",
+    );
+    let (clicked, menu) = held_menu(ui, &r);
+    if clicked {
+        let again = view.shadows_before.take().unwrap_or([true; 3]);
+        if on {
+            view.shadows_before = Some(kinds);
+        }
+        [view.shadows, view.creature_shadows, view.light_shadows] =
+            if on { [false; 3] } else { again };
+    }
+    menu.show(|ui| {
+        ui.checkbox(&mut view.shadows, "Sun and Moon Shadows").on_hover_text(
+            "The sun's by day and the moon's at night, where the area has them: cast by the \
+             tiles and static placeables, falling on the tiles and static placeables",
+        );
+        ui.checkbox(&mut view.creature_shadows, "Creature Shadows").on_hover_text(
+            "Creatures, dynamic placeables and doors cast the sun's and moon's shadows too, as \
+             the game's Creature Shadow Detail at Best has them (at Fast or Off they cast none)",
+        );
+        ui.checkbox(&mut view.light_shadows, "Light Shadows").on_hover_text(
+            "Where the area has no sun's or moon's shadows at the time, each creature casts one \
+             from the nearest light that casts them (a light node with `shadow 1` and a radius \
+             of 10 m or more: a placeable's light), as in the game",
+        );
+    });
 }
 
 /// The corners of the tile-sized square whose low corner is at tile
@@ -3411,6 +3806,12 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
             app.palette.tile_brush = None;
         }
     }
+    // The tile tools' keys: on the tiles selected, or the tool chosen.
+    // (Not while a tree goes to its lines by letters, as the camera's.)
+    if !typing && response.hovered() && !app.paint && !crate::palette_view::letters_taken(ui.ctx())
+    {
+        crate::terrain_mode::tool_keys(app, ui, view);
+    }
     if crate::terrain_mode::input(app, ui, view, response) {
         // A right click with a brush that has none of its own: the tile
         // menu, the brush kept (Aurora's right click puts it down; here
@@ -3763,8 +4164,7 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
         }
         Some(Drag::Pan) if held.by(button) => {
             if let Some(o) = view.orbit.as_mut() {
-                let per_pixel = 2.0 * o.distance * (o.camera().fov_y / 2.0).tan()
-                    / response.rect.height().max(1.0);
+                let per_pixel = o.camera().per_point(response.rect.height());
                 pan(o, Vec2::new(-held.delta.x, held.delta.y) * per_pixel);
             }
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -3979,8 +4379,10 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
 
 /// The camera: Ctrl + drag moves it, Ctrl + right or middle drag (or a
 /// middle drag) turns it, Alt + middle drag moves it, the wheel zooms,
-/// Ctrl + Shift + the wheel or a middle drag moves it up and down;
-/// the keys of Options › Keyboard (WASD, the arrows and the number keys).
+/// Ctrl + Shift + the wheel or a middle drag moves it up and down,
+/// Alt + middle click (as in Blender) puts its focus on the ground
+/// clicked; the keys of Options › Keyboard (WASD, the arrows
+/// and the number keys).
 fn camera_input(
     ui: &egui::Ui,
     view: &mut AreaView,
@@ -4001,8 +4403,28 @@ fn camera_input(
         crate::palette_view::give_arrows(ui.ctx(), false);
     }
     let active = ui.data(|d| d.get_temp::<ResRef>(last)) == Some(view.area);
+    // Alt + middle click, as in Blender: the focus on the ground clicked,
+    // at its height, the distance and the turn kept. Alt alone (a plain
+    // middle click does nothing, so a short middle drag never jumps the
+    // view), and not with another button down (the middle button
+    // swinging the view in a drag of the selection).
+    let others = ui.input(|i| {
+        i.pointer.button_down(egui::PointerButton::Primary)
+            || i.pointer.button_down(egui::PointerButton::Secondary)
+    });
+    let focus =
+        (response.clicked_by(egui::PointerButton::Middle) && alt && !command && !shift && !others)
+            .then(|| response.interact_pointer_pos())
+            .flatten()
+            .and_then(|pos| view.focus_at(pos));
     let held = view.held;
     let Some(o) = &mut view.orbit else { return };
+    if let Some(p) = focus {
+        o.target = p.clamp(
+            Vec3::new(f32::MIN, f32::MIN, TARGET_HEIGHTS.0),
+            Vec3::new(f32::MAX, f32::MAX, TARGET_HEIGHTS.1),
+        );
+    }
     let d = held.delta;
     // A right drag turns it too, as in most 3D views (Alt + right drag
     // turns the selection; a right click is still the menu). With Shift
@@ -4011,7 +4433,7 @@ fn camera_input(
     let turning = (held.by(egui::PointerButton::Middle) && !alt)
         || (!alt && held.by(egui::PointerButton::Secondary));
     // What a pixel is on the ground at the target.
-    let per_pixel = 2.0 * o.distance * (o.camera().fov_y / 2.0).tan() / rect.height().max(1.0);
+    let per_pixel = o.camera().per_point(rect.height());
     if command && shift && held.by(egui::PointerButton::Middle) {
         // Ctrl + Shift + middle drag: up and down, the view following the
         // pointer.
@@ -4615,11 +5037,12 @@ fn delete(app: &mut Moonglow, view: &mut AreaView) {
 /// Instances makes one again ([`mg_module::instances::replaced`]): where
 /// it stands, facing as it faces, with its outline (a trigger's or an
 /// encounter's), its visual transform and an encounter's spawn points;
-/// its tag, name, scripts and variables become the blueprint's. One
-/// command; objects of other types and locked ones are left. How many
+/// its tag, name, scripts and variables become the blueprint's, or, with
+/// `own`, stay its own ([`mg_module::instances::replaced_keeping_own`]).
+/// One command; objects of other types and locked ones are left. How many
 /// were replaced.
-pub(crate) fn replace_selected(app: &mut Moonglow, area: ResRef, key: ResKey) -> usize {
-    use mg_module::instances::{Placing, replaced};
+pub(crate) fn replace_selected(app: &mut Moonglow, area: ResRef, key: ResKey, own: bool) -> usize {
+    use mg_module::instances::{Placing, replaced, replaced_keeping_own};
     let Some(kind) = ObjectKind::from_restype(key.restype) else { return 0 };
     let Some(view) = app.area_views.get(&area) else { return 0 };
     let git = view.git();
@@ -4650,7 +5073,12 @@ pub(crate) fn replace_selected(app: &mut Moonglow, area: ResRef, key: ResKey) ->
     let placing = Placing { game, item: &items };
     let mut edits = Vec::new();
     for (index, old) in &olds {
-        let Some(item) = replaced(&placing, key.restype, old, &blueprint) else { continue };
+        let made = if own {
+            replaced_keeping_own(&placing, key.restype, old, &blueprint)
+        } else {
+            replaced(&placing, key.restype, old, &blueprint)
+        };
+        let Some(item) = made else { continue };
         let (path, list) = (mg_edit::GffPath::root(), kind.list().to_string());
         edits.push(mg_edit::Edit::remove_item(git, path.clone(), list.clone(), *index));
         edits.push(mg_edit::Edit::insert_item(git, path, list, *index, item));
@@ -5303,6 +5731,18 @@ fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
         add_to_palette(app, view, kind, index);
         ui.close();
     }
+    if let Some((kind, index)) = single
+        && ui
+            .button("Export as Blueprint…")
+            .on_hover_text(
+                "Write it into an archive (.erf) as a blueprint of its own, with the items it \
+                 holds, as Add to Palette makes one: for another module's Import",
+            )
+            .clicked()
+    {
+        app.actions.push(Action::ExportObject { area: view.area, kind, index });
+        ui.close();
+    }
     if let Some((ObjectKind::Creature, index)) = single
         && let Some(at) = view.menu_at
         && ui.button("Create Waypoint").clicked()
@@ -5326,12 +5766,7 @@ fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
     if let Some((ObjectKind::Placeable, index)) = single
         && ui.button("Add Popup Text…").clicked()
     {
-        app.popup_text = Some(crate::store_wizard::PopupText {
-            area: view.area,
-            placeable: index,
-            text: String::new(),
-            name: String::new(),
-        });
+        app.popup_text = Some(crate::store_wizard::PopupText::of(app, view.area, index));
         ui.close();
     }
     if all(ObjectKind::Waypoint) && ui.button("Create Set…").clicked() {
@@ -5730,6 +6165,32 @@ fn set_window(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView) {
     }
 }
 
+/// How high above `ground` an object stands (a creature always on it;
+/// on it where the ground isn't known).
+pub(crate) fn lift_on(ground: Option<&Ground>, o: &mg_area::AreaObject) -> f32 {
+    let at = ground.and_then(|g| g.height(o.position.truncate(), o.position.z));
+    match o.kind {
+        ObjectKind::Creature => 0.0,
+        _ => at.map_or(0.0, |z| o.position.z - z),
+    }
+}
+
+/// An area's ground, read for an area whose view isn't open (the module
+/// tree's Copy, which carries an object's height above it): its tiles'
+/// walkmeshes, as the view reads them.
+pub(crate) fn ground_of(
+    game: &mg_rules::GameData,
+    ws: &mut mg_edit::Workspace,
+    area: ResRef,
+) -> Option<Ground> {
+    let are = ws.doc(&ResKey::new(area, ResType::ARE)).ok()?.root.clone();
+    let git = ws.doc(&ResKey::new(area, ResType::GIT)).ok()?.root.clone();
+    let tileset = are.resref("Tileset")?;
+    let set = mg_area::tileset(game, tileset).ok();
+    let model = AreaModel::read(game, &are, &git, set.as_ref());
+    Some(Ground::new(game, &model))
+}
+
 /// Aurora's Add to Palette: the object made into a new custom blueprint
 /// (with the items it holds), the object naming it; its editor opens.
 fn add_to_palette(app: &mut Moonglow, view: &AreaView, kind: ObjectKind, index: usize) {
@@ -5746,7 +6207,7 @@ fn add_to_palette(app: &mut Moonglow, view: &AreaView, kind: ObjectKind, index: 
     let original = |k: ResKey| mg_module::gff_root(Some(module), game, &k);
     let taken = |k: &ResKey| module.contains(k) || game.resman.get(k).is_ok();
     // (By the builder's code, in a project with one.)
-    let naming = module.project_file.naming();
+    let naming = module.project_file.naming_for(kind.restype());
     let Some(added) = mg_module::palette_add::add_to_palette(
         game,
         kind.restype(),

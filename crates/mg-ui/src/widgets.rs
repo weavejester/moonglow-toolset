@@ -14,7 +14,7 @@ use mg_module::vars::VarType;
 use mg_resman::ResKey;
 
 use crate::text::{decode, encode, to_editor, with_line_ends, with_loc_line_ends};
-use crate::{Action, Moonglow};
+use crate::{Action, FileKind, Moonglow};
 
 /// A field of a GFF resource that an editor window writes back to.
 #[derive(Debug, Clone, PartialEq)]
@@ -189,9 +189,22 @@ pub struct VarTableEdit {
     pub rows: Vec<VarRow>,
     /// Save Set's name, while it's being typed.
     pub set_name: Option<String>,
+    /// The Variable Sets window (Add Set › Manage Sets…), while it's open.
+    pub sets: Option<SetsWindow>,
     /// The project's described variables (`variables.toml`), as the
     /// window offers and checks them: read when it first shows.
     pub described: Option<VarHelp>,
+}
+
+/// The Variable Sets window (Add Set › Manage Sets… in the Variables
+/// window): the sets saved in Moonglow's data folder, renamed and deleted.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SetsWindow {
+    /// The set Rename… was chosen for, and the name typed so far.
+    pub renaming: Option<(String, String)>,
+    /// The set deleted last and its text, for Undo Delete (the file is
+    /// Moonglow's, not the module's: Edit › Undo doesn't know it).
+    pub deleted: Option<(String, String)>,
 }
 
 /// What the Variables window knows of the project's described variables
@@ -209,6 +222,24 @@ pub struct VarHelp {
     names: Vec<String>,
     /// The row whose name is being typed: the names offered under it.
     pub completing: Option<usize>,
+    /// The offer's row Up and Down move to, which Enter takes.
+    pub highlighted: usize,
+    /// How many were offered at the frame before (the keys are the
+    /// offer's only while there is one).
+    offered_before: usize,
+    /// The row and name Escape closed the offer at: not offered again
+    /// until the name changes.
+    dismissed: Option<(usize, String)>,
+}
+
+/// A name the Variables window offers as one is typed: a described
+/// variable's, or the beginning of a pattern's names (`tdod_rental_` of
+/// `tdod_rental_*`), typed on from there.
+#[derive(Debug, Clone)]
+struct Offer<'a> {
+    /// What the name becomes when it is taken.
+    name: String,
+    described: &'a Described,
 }
 
 impl VarHelp {
@@ -247,7 +278,7 @@ impl VarHelp {
     /// What is wrong with a row by the descriptions, for the note under
     /// the list (none where nothing is, or nothing is described).
     fn note(&self, r: &VarRow) -> Option<String> {
-        let file = mg_module::var_desc::FILE_NAME;
+        let file = self.variables.file();
         let name = r.name.trim();
         if name.is_empty() {
             return None;
@@ -303,26 +334,37 @@ impl VarHelp {
 
     /// The described names to offer for a name being typed: those that
     /// go on this object, begin with (or hold) what is typed, and no other
-    /// row has.
-    fn offered(&self, typed: &str, rows: &[VarRow], row: usize) -> Vec<&Described> {
-        let typed = typed.trim().to_ascii_lowercase();
+    /// row has; then the patterns' beginnings so (not where what is typed
+    /// is already a name the pattern takes).
+    fn offered(&self, typed: &str, rows: &[VarRow], row: usize) -> Vec<Offer<'_>> {
+        let raw = typed.trim();
+        let typed = raw.to_ascii_lowercase();
         let taken = |n: &str| rows.iter().enumerate().any(|(i, r)| i != row && r.name == n);
-        let mut first: Vec<&Described> = Vec::new();
-        let mut then: Vec<&Described> = Vec::new();
-        for d in self.variables.names_for(self.owner) {
-            let lower = d.name.to_ascii_lowercase();
-            if taken(&d.name) || d.name == typed {
-                continue;
-            }
-            if lower.starts_with(&typed) {
-                first.push(d);
-            } else if !typed.is_empty() && lower.contains(&typed) {
-                then.push(d);
-            }
+        // Those that begin with what is typed, then those that hold it.
+        fn ranked<'a>(
+            all: Vec<Offer<'a>>,
+            typed: &str,
+            taken: &dyn Fn(&str) -> bool,
+        ) -> Vec<Offer<'a>> {
+            let kept = all.into_iter().filter(|o| {
+                let lower = o.name.to_ascii_lowercase();
+                !taken(&o.name) && lower != typed && (typed.is_empty() || lower.contains(typed))
+            });
+            let (first, then): (Vec<_>, Vec<_>) =
+                kept.partition(|o| o.name.to_ascii_lowercase().starts_with(typed));
+            first.into_iter().chain(then).collect()
         }
-        first.extend(then);
-        first.truncate(12);
-        first
+        let names = self
+            .variables
+            .names_for(self.owner)
+            .map(|d| Offer { name: d.name.clone(), described: d });
+        let patterns = (self.variables.patterns_for(self.owner))
+            .filter(|d| raw.is_empty() || !d.matches(raw))
+            .flat_map(|d| d.beginnings().into_iter().map(move |name| Offer { name, described: d }));
+        let mut out = ranked(names.collect(), &typed, &taken);
+        out.extend(ranked(patterns.collect(), &typed, &taken));
+        out.truncate(12);
+        out
     }
 }
 
@@ -351,7 +393,14 @@ impl VarTableEdit {
             })
             .collect();
         rows.sort_by_cached_key(|r| r.name.to_lowercase());
-        VarTableEdit { target, original: list.to_vec(), rows, set_name: None, described: None }
+        VarTableEdit {
+            target,
+            original: list.to_vec(),
+            rows,
+            set_name: None,
+            sets: None,
+            described: None,
+        }
     }
 
     /// For several objects edited together: the command that sets what
@@ -459,14 +508,16 @@ fn take_described_type(variables: &Variables, r: &mut VarRow) {
     }
 }
 
-/// The described names offered under a name being typed: the one
-/// clicked is `picked` (its row and name). Whether the pointer is over
-/// the list.
+/// The described names offered under a name being typed, the one
+/// `highlighted` (Up and Down move it) marked: the one clicked is
+/// `picked` (its row and name). Whether the pointer is over the list. A
+/// pattern's beginning is shown with the pattern.
 fn completion(
     ui: &Ui,
     row: usize,
     field: &egui::Response,
-    offered: &[&Described],
+    offered: &[Offer<'_>],
+    highlighted: usize,
     picked: &mut Option<(usize, String)>,
 ) -> bool {
     if offered.is_empty() {
@@ -478,18 +529,47 @@ fn completion(
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_min_width(field.rect.width());
-                for d in offered {
-                    let what = d.words();
-                    let item =
-                        ui.selectable_label(false, &d.name).on_hover_text(description_tip(d));
-                    ui.weak(what);
+                for (i, o) in offered.iter().enumerate() {
+                    let d = o.described;
+                    let item = ui
+                        .selectable_label(i == highlighted, &o.name)
+                        .on_hover_text(description_tip(d));
+                    if d.is_pattern() {
+                        ui.weak(format!("{}: {}", d.name, d.words()));
+                    } else {
+                        ui.weak(d.words());
+                    }
                     if item.clicked() {
-                        *picked = Some((row, d.name.clone()));
+                        *picked = Some((row, o.name.clone()));
                     }
                 }
             });
         });
     area.response.hovered() || area.response.contains_pointer()
+}
+
+/// The keys an offer of names takes from the name field under it while
+/// it shows (`count` names): Up and Down move `highlighted`, Enter takes
+/// that name (not the window's OK), Escape closes the offer (not the
+/// window). Taken before the field is drawn, so the field and the window
+/// don't see them. Whether Escape closed it, and the name Enter took.
+fn offer_keys(ui: &Ui, count: usize, highlighted: &mut usize) -> (bool, bool) {
+    if count == 0 {
+        return (false, false);
+    }
+    let key = |k| ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, k));
+    if key(egui::Key::ArrowDown) {
+        *highlighted = (*highlighted + 1) % count;
+    }
+    if key(egui::Key::ArrowUp) {
+        *highlighted = (*highlighted + count - 1) % count;
+    }
+    let taken = key(egui::Key::Enter);
+    let closed = key(egui::Key::Escape);
+    if closed {
+        keep_escape(ui.ctx());
+    }
+    (closed, taken)
 }
 
 /// A described variable's value, chosen from its values (and typed, where
@@ -594,6 +674,140 @@ const VAR_FOOT: f32 = 96.0;
 const VAR_NOTES: usize = 4;
 
 /// A window in the middle of the app's, of a size its content gives it.
+/// The Variable Sets window: the saved sets, each renamed or deleted (the
+/// one deleted last put back), and their folder opened.
+fn sets_window(app: &mut Moonglow, ctx: &egui::Context, sets: &mut Option<SetsWindow>) {
+    let (Some(w), Some(dir)) = (sets.as_mut(), app.var_set_dir.clone()) else {
+        *sets = None;
+        return;
+    };
+    let names = crate::var_sets::list(Some(&dir));
+    let mut open = true;
+    let mut close = false;
+    let window = dialog(ctx, "Variable Sets", &mut open).collapsible(false).resizable(false);
+    // (As wide as a long folder's path needs, no wider: the path is cut.)
+    window.max_width(460.0).show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            field_label(ui, "Folder");
+            let path = dir.display().to_string();
+            ui.add(egui::Label::new(&path).truncate()).on_hover_text(&path);
+        });
+        if ui
+            .button("Open Folder")
+            .on_hover_text(
+                "Open the folder in the file manager (it is made if it is not there): sets \
+                 are JSON files, NAME.vars.json, to copy in or out or edit by hand",
+            )
+            .clicked()
+        {
+            open_folder(ui.ctx(), &dir, &mut app.log);
+        }
+        ui.separator();
+        if let Some((name, text)) = w.deleted.clone() {
+            let mut keep = true;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Set '{name}' deleted."));
+                if ui.button("Undo Delete").on_hover_text("Put the set back").clicked() {
+                    match crate::var_sets::restore(&dir, &name, &text) {
+                        Ok(()) => app.log.info(format!("Variable set '{name}' put back")),
+                        Err(e) => app.log.error(format!("Undo Delete: {e}")),
+                    }
+                    keep = false;
+                }
+                if ui.small_button("✖").on_hover_text("Forget it").clicked() {
+                    keep = false;
+                }
+            });
+            if !keep {
+                w.deleted = None;
+            }
+            ui.separator();
+        }
+        // The name being typed for the set Rename… was chosen for.
+        if let Some((name, to)) = w.renaming.as_mut().filter(|(n, _)| names.contains(n)) {
+            let mut done = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Rename '{name}' to"));
+                let r = ui.add(egui::TextEdit::singleline(to).desired_width(160.0));
+                autofocus(ui, &r);
+                let taken = names.iter().any(|n| n != name && n.eq_ignore_ascii_case(to.trim()));
+                let ok = crate::saved::valid_name(to) && !taken;
+                // (Enter in the name is the name's, not the Variables window's OK.)
+                let entered = r.lost_focus()
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                if ui.add_enabled(ok, egui::Button::new("Rename")).clicked() || (ok && entered) {
+                    if to.trim() != name {
+                        match crate::var_sets::rename(&dir, name, to) {
+                            Ok(()) => app
+                                .log
+                                .info(format!("Variable set '{name}' renamed to '{}'", to.trim())),
+                            Err(e) => app.log.error(format!("Rename set: {e}")),
+                        }
+                    }
+                    done = true;
+                } else if ui.button("Cancel").clicked() {
+                    done = true;
+                }
+                if taken {
+                    ui.colored_label(ui.visuals().warn_fg_color, "Another set has that name");
+                } else if !ok && !to.trim().is_empty() {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Letters, digits, spaces, -, _ and . only (64 at most)",
+                    );
+                }
+            });
+            if done {
+                w.renaming = None;
+            }
+            ui.separator();
+        } else {
+            w.renaming = None;
+        }
+        if names.is_empty() {
+            ui.weak("No variable sets saved yet: Save Set… in the Variables window keeps one.");
+        }
+        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            egui::Grid::new("variable-sets").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                for name in &names {
+                    ui.label(name);
+                    if ui.small_button("Rename…").clicked() {
+                        w.renaming = Some((name.clone(), name.clone()));
+                    }
+                    if ui
+                        .small_button("Delete")
+                        .on_hover_text("Delete the set's file (Undo Delete, above, puts it back)")
+                        .clicked()
+                    {
+                        match crate::var_sets::delete(&dir, name) {
+                            Ok(text) => {
+                                app.log.info(format!("Variable set '{name}' deleted"));
+                                w.deleted = Some((name.clone(), text));
+                            }
+                            Err(e) => app.log.error(format!("Delete set: {e}")),
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        ui.separator();
+        close = ui.button("Close").clicked();
+    });
+    if !open || close {
+        *sets = None;
+    }
+}
+
+/// Opens `dir` in the system's file manager, made first if it isn't there.
+pub(crate) fn open_folder(ctx: &egui::Context, dir: &std::path::Path, log: &mut crate::Log) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        log.error(format!("{}: {e}", dir.display()));
+        return;
+    }
+    ctx.open_url(egui::OpenUrl::new_tab(crate::script_view::file_url(dir)));
+}
+
 pub(crate) fn window(title: &str) -> egui::Window<'_> {
     egui::Window::new(title)
         .collapsible(false)
@@ -803,6 +1017,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                             ui.end_row();
                             let mut remove = None;
                             let mut picked = None;
+                            let mut picked_field: Option<egui::Id> = None;
                             for i in 0..edit.rows.len() {
                                 // (A minimum: a new window offers the fields no width yet,
                                 // and they would keep to it.)
@@ -811,6 +1026,10 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                         .desired_width(width)
                                         .min_size(egui::vec2(width, 0.0))
                                 }
+                                // The offer's keys, before the field takes them.
+                                let offering = described && help.completing == Some(i);
+                                let count = if offering { help.offered_before } else { 0 };
+                                let (closed, taken) = offer_keys(ui, count, &mut help.highlighted);
                                 let field = wide(&mut edit.rows[i].name, name_width);
                                 let name = ui.add(field.hint_text("Name"));
                                 let r = &edit.rows[i];
@@ -821,20 +1040,53 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                 };
                                 // The described names, offered as one is typed.
                                 if described {
-                                    if name.has_focus() || name.gained_focus() {
+                                    // (Escape closes the offer, until the name
+                                    // changes; the name is still being typed.)
+                                    let dismissed =
+                                        help.dismissed.as_ref() == Some(&(i, r.name.clone()));
+                                    if closed {
+                                        help.completing = None;
+                                        help.dismissed = Some((i, r.name.clone()));
+                                        name.request_focus();
+                                    } else if (name.has_focus() || name.gained_focus())
+                                        && !dismissed
+                                    {
                                         help.completing = Some(i);
+                                        help.dismissed = None;
                                     }
                                     if help.completing == Some(i) {
                                         let offered = help.offered(&r.name, &edit.rows, i);
-                                        let over = completion(ui, i, &name, &offered, &mut picked);
+                                        // (Typing anew: the first again.)
+                                        let retyped =
+                                            help.names.get(i).is_some_and(|n| *n != r.name);
+                                        let h = if retyped || help.highlighted >= offered.len() {
+                                            0
+                                        } else {
+                                            help.highlighted
+                                        };
+                                        if taken && let Some(o) = offered.get(h) {
+                                            picked = Some((i, o.name.clone()));
+                                        }
+                                        let over =
+                                            completion(ui, i, &name, &offered, h, &mut picked);
                                         let pressed = ui.input(|i| i.pointer.any_pressed());
-                                        if offered.is_empty()
+                                        let count = offered.len();
+                                        help.highlighted = h;
+                                        help.offered_before = count;
+                                        if picked.is_some() {
+                                            // (Typed on from there, from its end.)
+                                            picked_field = Some(name.id);
+                                        }
+                                        if count == 0
                                             || picked.is_some()
                                             || (!name.has_focus() && !over && pressed)
                                             || (name.lost_focus() && !over)
                                         {
                                             help.completing = None;
                                         }
+                                    }
+                                    if help.completing.is_none() {
+                                        help.offered_before = 0;
                                     }
                                 }
                                 let r = &mut edit.rows[i];
@@ -866,6 +1118,19 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                 ui.end_row();
                             }
                             if let Some((i, name)) = picked {
+                                // The field keeps the keyboard, its cursor at the
+                                // end: a pattern's beginning is typed on from.
+                                if let Some(id) = picked_field {
+                                    let end = egui::text::CCursor::new(name.chars().count());
+                                    let mut state =
+                                        egui::text_edit::TextEditState::load(ui.ctx(), id)
+                                            .unwrap_or_default();
+                                    state
+                                        .cursor
+                                        .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                                    state.store(ui.ctx(), id);
+                                    ui.memory_mut(|m| m.request_focus(id));
+                                }
                                 edit.rows[i].name = name;
                             }
                             if let Some(i) = remove {
@@ -886,44 +1151,101 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                         });
                     },
                 );
+                let mut add_file = false;
+                let mut save_file = false;
                 ui.horizontal(|ui| {
                     if ui.button("Add").clicked() {
                         edit.rows.push(VarRow::new("", 1, "0"));
                     }
                     ui.separator();
-                    // Variable sets, kept in Moonglow's data folder.
+                    // Variable sets, kept in Moonglow's data folder, and in
+                    // files anywhere.
                     let dir = app.var_set_dir.clone();
                     let names = crate::var_sets::list(dir.as_deref());
-                    ui.add_enabled_ui(dir.is_some(), |ui| {
-                        ui.menu_button("Add Set", |ui| {
-                            if names.is_empty() {
-                                ui.weak("No variable sets saved yet");
-                            }
-                            for n in &names {
-                                if ui.button(n).clicked() {
-                                    let dir = dir.as_deref().expect("enabled");
-                                    match crate::var_sets::load(dir, n) {
-                                        Ok(set) => crate::var_sets::merge(&mut edit.rows, set),
-                                        Err(e) => app.log.error(format!("Add Set: {e}")),
-                                    }
-                                    ui.close();
+                    ui.menu_button("Add Set", |ui| {
+                        if dir.is_none() {
+                            ui.weak("Moonglow has no data folder to keep sets in");
+                        } else if names.is_empty() {
+                            ui.weak("No variable sets saved yet");
+                        }
+                        for n in &names {
+                            if ui.button(n).clicked() {
+                                let dir = dir.as_deref().expect("listed");
+                                match crate::var_sets::load(dir, n) {
+                                    Ok(set) => crate::var_sets::merge(&mut edit.rows, set),
+                                    Err(e) => app.log.error(format!("Add Set: {e}")),
                                 }
+                                ui.close();
                             }
-                        })
-                        .response
-                        .on_hover_text("Add a saved set's variables (same names take its values)");
-                        if edit.set_name.is_none()
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Add from File…")
+                            .on_hover_text("Add the variables of a set file (.vars.json) anywhere")
+                            .clicked()
+                        {
+                            add_file = true;
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(dir.is_some(), egui::Button::new("Manage Sets…"))
+                            .on_hover_text("Rename or delete the saved sets")
+                            .clicked()
+                        {
+                            edit.sets.get_or_insert_default();
+                            ui.close();
+                        }
+                        if let Some(dir) = &dir
                             && ui
-                                .add_enabled(!edit.rows.is_empty(), egui::Button::new("Save Set…"))
+                                .button("Open Sets Folder")
                                 .on_hover_text(
-                                    "Keep these variables under a name, to add elsewhere",
+                                    "Open the folder the sets are kept in, to copy them in or out \
+                                     or edit them by hand",
                                 )
                                 .clicked()
                         {
-                            edit.set_name = Some(String::new());
+                            open_folder(ui.ctx(), dir, &mut app.log);
+                            ui.close();
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("Add a saved set's variables (same names take its values)");
+                    if edit.set_name.is_none()
+                        && ui
+                            .add_enabled(
+                                dir.is_some() && !edit.rows.is_empty(),
+                                egui::Button::new("Save Set…"),
+                            )
+                            .on_hover_text("Keep these variables under a name, to add elsewhere")
+                            .clicked()
+                    {
+                        edit.set_name = Some(String::new());
+                    }
+                    save_file = ui
+                        .add_enabled(!edit.rows.is_empty(), egui::Button::new("Save to File…"))
+                        .on_hover_text(
+                            "Save these variables as a set file (.vars.json) where you choose: \
+                             to share, or to keep with a module",
+                        )
+                        .clicked();
                 });
+                if add_file && let Some(path) = app.dialogs.open_file(FileKind::VariableSet, None) {
+                    match crate::var_sets::load_file(&path) {
+                        Ok(set) => crate::var_sets::merge(&mut edit.rows, set),
+                        Err(e) => app.log.error(format!("Add from File: {e}")),
+                    }
+                }
+                if save_file
+                    && let Some(path) = app.dialogs.save_file(
+                        FileKind::VariableSet,
+                        Some(std::path::Path::new("variables.vars.json")),
+                    )
+                {
+                    match crate::var_sets::save_file(&path, &edit.rows) {
+                        Ok(p) => app.log.info(format!("Variable set saved: {}", p.display())),
+                        Err(e) => app.log.error(format!("Save to File: {e}")),
+                    }
+                }
                 if let Some(name) = edit.set_name.as_mut() {
                     let mut save = false;
                     let mut cancel = false;
@@ -931,7 +1253,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                         ui.label("Set name");
                         let r = ui.add(egui::TextEdit::singleline(name).desired_width(180.0));
                         crate::widgets::autofocus(ui, &r);
-                        let ok = crate::prefabs::valid_name(name);
+                        let ok = crate::saved::valid_name(name);
                         // (Enter in the name is the name's, not the window's OK.)
                         let entered = r.lost_focus()
                             && ui.input_mut(|i| {
@@ -989,6 +1311,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                     }
                 });
             });
+        sets_window(app, &ctx, &mut edit.sets);
         edit.described = Some(help);
         app.var_edit = if close { None } else { Some(edit) };
     }
@@ -1275,7 +1598,23 @@ pub(crate) fn commit_text_in(
     width: f32,
     limit: Option<usize>,
 ) -> Option<String> {
-    let typed = commit_typed(buffers, ui, id, &to_editor(current).0, rows, width, limit);
+    commit_text_hinted(buffers, ui, id, current, rows, width, limit, "")
+}
+
+/// [`commit_text_in`] with `hint` shown in the field while it is empty.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_text_hinted(
+    buffers: &mut std::collections::HashMap<egui::Id, String>,
+    ui: &mut Ui,
+    id: egui::Id,
+    current: &str,
+    rows: Option<usize>,
+    width: f32,
+    limit: Option<usize>,
+    hint: &str,
+) -> Option<String> {
+    let shown = to_editor(current).0;
+    let typed = commit_typed(buffers, ui, id, &shown, rows, width, limit, hint);
     typed.map(|text| with_line_ends(&text, current))
 }
 
@@ -1290,13 +1629,14 @@ pub(crate) fn commit_loc_text_in(
     width: f32,
     limit: Option<usize>,
 ) -> Option<String> {
-    let typed = commit_typed(buffers, ui, id, &to_editor(current).0, rows, width, limit);
+    let typed = commit_typed(buffers, ui, id, &to_editor(current).0, rows, width, limit, "");
     typed.map(|text| with_loc_line_ends(&text, current))
 }
 
 /// The field of [`commit_text_in`], `shown` its value as the field shows
-/// it ([`to_editor`]): what was typed (with plain line ends) when the
-/// keyboard leaves it changed.
+/// it ([`to_editor`]), `hint` shown while it is empty: what was typed
+/// (with plain line ends) when the keyboard leaves it changed.
+#[allow(clippy::too_many_arguments)]
 fn commit_typed(
     buffers: &mut std::collections::HashMap<egui::Id, String>,
     ui: &mut Ui,
@@ -1305,12 +1645,14 @@ fn commit_typed(
     rows: Option<usize>,
     width: f32,
     limit: Option<usize>,
+    hint: &str,
 ) -> Option<String> {
     let buf = buffers.entry(id).or_insert_with(|| shown.to_owned());
     let edit = match rows {
         Some(rows) => egui::TextEdit::multiline(buf).desired_rows(rows),
         None => egui::TextEdit::singleline(buf),
     };
+    let edit = if hint.is_empty() { edit } else { edit.hint_text(hint) };
     let edit = match limit {
         Some(n) => edit.char_limit(n),
         None => edit,
@@ -1679,6 +2021,13 @@ pub(crate) struct SearchField<'a> {
     width: Option<f32>,
 }
 
+/// Whether the widget `id` is the text field of a [`SearchField`] shown
+/// this frame so far ([`search_field_shown`]): what is typed there finds,
+/// and changes nothing.
+pub(crate) fn is_search_field(ctx: &egui::Context, id: egui::Id) -> bool {
+    ctx.data(|x| x.get_temp::<Dialogs>(dialogs_id())).is_some_and(|d| d.searches.contains(&id))
+}
+
 /// What a [`SearchField`] did: the field's response, and how its keys
 /// left it, if they did.
 pub(crate) struct Searched {
@@ -1743,6 +2092,7 @@ impl<'a> SearchField<'a> {
         let here = find.unwrap_or(false) || (find_over && ui.rect_contains_pointer(ui.clip_rect()));
         let find = find_here(ui, here);
         let left = field_keys(ui, id, text, find, down);
+        search_field_shown(ui.ctx(), id);
         let response = ui
             .horizontal(|ui| {
                 let clear = !text.is_empty();
@@ -1807,11 +2157,13 @@ struct Dialogs {
     open: Vec<egui::LayerId>,
     seen: Vec<egui::LayerId>,
     escape: bool,
-    /// Whether a text field (a number's too) had the keyboard as the last
-    /// frame ended ([`dialogs_end`]), and so whether this frame's Escape
-    /// only leaves it.
-    typing: bool,
-    leaves_text: bool,
+    /// The search fields shown this frame ([`search_field_shown`]).
+    searches: Vec<egui::Id>,
+    /// Whether a search field had the keyboard as the last frame ended
+    /// ([`dialogs_end`]), and so whether this frame's Escape is the
+    /// field's (it clears what is typed, then leaves it).
+    searching: bool,
+    leaves_search: bool,
 }
 
 fn dialogs_id() -> egui::Id {
@@ -1841,22 +2193,45 @@ pub(crate) fn dialogs_begin(ctx: &egui::Context) {
     }
     d.escape = ctx.input(|i| i.key_pressed(egui::Key::Escape) && i.modifiers.is_none())
         && !egui::Popup::is_any_open(ctx);
-    d.leaves_text = d.escape && d.typing;
+    d.leaves_search = d.escape && d.searching;
     ctx.data_mut(|x| x.insert_temp(dialogs_id(), d));
 }
 
-/// Once a frame, after everything is drawn: whether a text field has the
-/// keyboard. (egui gives the keyboard up at an Escape before anything of
-/// the frame is drawn, so a window can't tell then that it was typed in.)
-pub(crate) fn dialogs_end(ctx: &egui::Context) {
-    let typing = ctx.text_edit_focused();
-    ctx.data_mut(|x| x.get_temp_mut_or_default::<Dialogs>(dialogs_id()).typing = typing);
+/// This frame's Escape was something's in a dialog (it closed the names
+/// a field offers): the dialog stays open.
+pub(crate) fn keep_escape(ctx: &egui::Context) {
+    ctx.data_mut(|x| {
+        let d = x.get_temp_mut_or_default::<Dialogs>(dialogs_id());
+        d.escape = false;
+        d.leaves_search = false;
+    });
 }
 
-/// Whether this frame's Escape left a text field (a number's too), which
-/// is all it does then: a Properties window stays open.
-pub(crate) fn escape_left_text(ctx: &egui::Context) -> bool {
-    ctx.data(|x| x.get_temp::<Dialogs>(dialogs_id())).is_some_and(|d| d.leaves_text)
+/// Once a frame, after everything is drawn: whether a search field has
+/// the keyboard. (egui gives the keyboard up at an Escape before anything
+/// of the frame is drawn, so a window can't tell then that it was typed
+/// in.)
+pub(crate) fn dialogs_end(ctx: &egui::Context) {
+    let focused = ctx.memory(|m| m.focused());
+    ctx.data_mut(|x| {
+        let d = x.get_temp_mut_or_default::<Dialogs>(dialogs_id());
+        let searches = std::mem::take(&mut d.searches);
+        d.searching = focused.is_some_and(|f| searches.contains(&f));
+    });
+}
+
+/// A search field (`id`, its text field's) shown this frame: Escape in it
+/// is its own ([`escape_left_search`]).
+fn search_field_shown(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|x| x.get_temp_mut_or_default::<Dialogs>(dialogs_id()).searches.push(id));
+}
+
+/// Whether this frame's Escape was in a search field (a list's filter, an
+/// inventory's Find), whose Escape clears what is typed and then leaves
+/// it: a Properties window stays open. In any other field Escape is the
+/// window's Cancel at once, as Aurora's is.
+pub(crate) fn escape_left_search(ctx: &egui::Context) -> bool {
+    ctx.data(|x| x.get_temp::<Dialogs>(dialogs_id())).is_some_and(|d| d.leaves_search)
 }
 
 /// Escape for the dialog on `layer`: true when it was pressed and this is
@@ -1966,9 +2341,37 @@ pub(crate) fn copy_cut_paste(ui: &egui::Ui) -> (bool, bool, bool) {
     })
 }
 
+/// What the name of a new resource of type `t` starts with, where it is
+/// typed (New Script…, New Conversation…): the builder's code where the
+/// team's pattern puts it (`ab_`; `_ab` with `{name}_{code}`), the
+/// team's prefix without one, nothing in a module with neither (The
+/// Domains of Dread's builder proposal, C1).
+pub(crate) fn code_start(app: &crate::Moonglow, t: mg_core::ResType) -> String {
+    app.ws.as_ref().map(|ws| ws.module.project_file.naming_for(t).fit("", "")).unwrap_or_default()
+}
+
+/// Puts a text field's cursor at `at` (characters), from the next frame.
+pub(crate) fn place_cursor(ui: &egui::Ui, field: &egui::Response, at: usize) {
+    let mut state = egui::TextEdit::load_state(ui.ctx(), field.id).unwrap_or_default();
+    let at = egui::text::CCursor::new(at);
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(at)));
+    state.store(ui.ctx(), field.id);
+}
+
+/// Whether a field is shown for the first time (since it was last away):
+/// [`autofocus`] focuses it then.
+fn first_shown(ui: &egui::Ui, field: &egui::Response) -> bool {
+    let seen = field.id.with("autofocus");
+    let last: Option<u64> = ui.data(|d| d.get_temp(seen));
+    last.is_none_or(|l| l + 1 < ui.ctx().cumulative_pass_nr())
+}
+
 /// A window that asks for a new resource's name (New Script, New
 /// Conversation, Save Script As).
 pub(crate) struct NameWindow<'a> {
+    /// It names a new resource, whose name starts with the builder's code
+    /// ([`code_start`]): the cursor is put where the name goes.
+    pub new: bool,
     pub title: &'a str,
     pub label: &'a str,
     pub restype: mg_core::ResType,
@@ -2005,6 +2408,17 @@ impl NameWindow<'_> {
             .show(ctx, |ui| {
                 ui.label(self.label);
                 let field = ui.add(egui::TextEdit::singleline(name).char_limit(16));
+                // (Where the name goes: after `ab_`, before a code that goes after
+                // it, `{name}_ab`.)
+                if self.new
+                    && first_shown(ui, &field)
+                    && let Some(m) = module
+                {
+                    let naming = m.project_file.naming_for(self.restype);
+                    if !naming.is_plain() && *name == naming.fit("", "") {
+                        place_cursor(ui, &field, naming.before().chars().count());
+                    }
+                }
                 autofocus(ui, &field);
                 let key = mg_core::ResRef::from_str(name.trim())
                     .ok()
@@ -2135,6 +2549,9 @@ type About<'a> = &'a mut dyn FnMut(&mut Ui, usize);
 
 /// Lists of more than this many rows have a Filter field.
 pub(crate) const FILTERED_CHOICES: usize = 30;
+
+/// The greatest height of a filtered list's rows, under its Filter field.
+const ROWS_HEIGHT: f32 = 170.0;
 
 /// A list of `choices` with `current` chosen (`None`: no row), its box
 /// `id`: see [`RowChoice`].
@@ -2294,15 +2711,53 @@ impl<'a> RowChoice<'a> {
         if let Some(width) = width {
             combo = combo.width(width);
         }
+        if long {
+            // (Room for the Filter field over the rows' own scroll area,
+            // with no scroll bar of egui's around both.)
+            let line = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().interact_size.y;
+            combo = combo.height(ROWS_HEIGHT + 2.0 * line);
+        }
         // Just opened: the list is whole and begins at the one chosen, not
         // at its top (a long list was searched for it every time).
         let opened = !ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
         let list = combo.show_ui(ui, |ui| {
+            let width_id = open_id.with("width");
             if opened {
                 ui.data_mut(|d| {
                     d.remove_temp::<String>(filter_id);
                     d.insert_temp(open_id.with("go"), true);
                 });
+            }
+            if opened && long {
+                // A long list's width, set once while open: the box's, or
+                // the widest row's and its scroll bar's if wider. egui's
+                // popup takes the width its contents had the frame before;
+                // with the rows filling it, and a scroll area that follows
+                // its rows, any part of a point more there grew the list
+                // every frame, until it reached the window's edge (a
+                // builder's report). (A short list is egui's own.)
+                let pad = 2.0 * ui.spacing().button_padding.x;
+                let bar = ui.spacing().scroll.allocated_width();
+                let widest = (none.map(std::borrow::Cow::from).into_iter())
+                    .chain(in_order().iter().map(|c| text(c, numbered)))
+                    .map(|t| {
+                        egui::WidgetText::from(t.as_ref())
+                            .into_galley(
+                                ui,
+                                Some(egui::TextWrapMode::Extend),
+                                f32::INFINITY,
+                                egui::TextStyle::Button,
+                            )
+                            .size()
+                            .x
+                    })
+                    .fold(0.0, f32::max);
+                let most = ui.ctx().content_rect().width() - 40.0;
+                let width = ui.available_width().max((widest + pad + bar).min(most));
+                ui.data_mut(|d| d.insert_temp(width_id, width));
+            }
+            if let Some(width) = ui.data(|d| d.get_temp::<f32>(width_id)).filter(|_| long) {
+                ui.set_width(width);
             }
             // (A popup's first pass only measures it: the list is brought
             // to the chosen row in the first pass that draws it.)
@@ -2350,7 +2805,7 @@ impl<'a> RowChoice<'a> {
                 }
             };
             if long {
-                let mut area = egui::ScrollArea::vertical().max_height(170.0);
+                let mut area = egui::ScrollArea::vertical().max_height(ROWS_HEIGHT);
                 if narrowed {
                     area = area.vertical_scroll_offset(0.0);
                 }
@@ -2633,6 +3088,21 @@ pub(crate) fn tile_label_height(ui: &Ui) -> f32 {
 /// name under it, on up to two lines. `made`: the picture (`Some(None)`: there
 /// is nothing to draw; `None`: not made yet). Its response, and whether
 /// it is in sight (to have its picture made).
+/// Where a picture of texture `id` is drawn in `room`: as large as fits,
+/// in its own shape (a texture twice as wide as tall isn't stretched to a
+/// square), centered. The whole room where its size isn't known.
+pub(crate) fn letterboxed(
+    ctx: &egui::Context,
+    id: egui::TextureId,
+    room: egui::Rect,
+) -> egui::Rect {
+    let size = ctx.tex_manager().read().meta(id).map(|m| m.size);
+    let Some([w, h]) = size.filter(|[w, h]| *w > 0 && *h > 0) else { return room };
+    let (w, h) = (w as f32, h as f32);
+    let scale = (room.width() / w).min(room.height() / h);
+    egui::Rect::from_center_size(room.center(), egui::vec2(w * scale, h * scale))
+}
+
 pub(crate) fn picture_tile(
     ui: &mut Ui,
     side: f32,
@@ -2661,7 +3131,8 @@ pub(crate) fn picture_tile(
     match made {
         Some(Some(id)) => {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            ui.painter().image(id, picture, uv, egui::Color32::WHITE);
+            let at = letterboxed(ui.ctx(), id, picture);
+            ui.painter().image(id, at, uv, egui::Color32::WHITE);
         }
         _ => {
             let mark = if made.is_none() { "…" } else { "(no picture)" };
@@ -3212,5 +3683,80 @@ mod token_tests {
         state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(40))));
         state.store(&ctx, id);
         assert_eq!(with_token(&ctx, id, "ab", "<x>"), "ab<x>");
+    }
+}
+
+#[cfg(test)]
+mod row_choice_tests {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    /// The list of a dropdown of `count` rows (one of them long) open:
+    /// where its box is, and where its list is on each of the first 60
+    /// frames it is drawn.
+    fn open_list(count: usize, long_row: bool) -> (egui::Rect, Vec<egui::Rect>) {
+        struct State {
+            choices: Vec<mg_rules::Choice>,
+        }
+        let mut choices: Vec<_> = (0..count)
+            .map(|row| mg_rules::Choice { row, text: format!("Choice {row:03}") })
+            .collect();
+        if long_row {
+            choices[count / 2].text = "A choice with a name far longer than its box".into();
+        }
+        let state = State { choices };
+        let mut h = Harness::builder().with_size(egui::vec2(800.0, 600.0)).build_ui_state(
+            |ui, s: &mut State| {
+                // (The application's scroll bars: room of their own.)
+                let bars = egui::style::ScrollStyle::solid();
+                if ui.ctx().global_style().spacing.scroll != bars {
+                    ui.ctx().all_styles_mut(|s| s.spacing.scroll = bars);
+                }
+                let id = egui::Id::new("list");
+                ui.horizontal(|ui| {
+                    ui.add_space(100.0);
+                    super::row_choice(id, &s.choices, 3).width(160.0).show(ui);
+                });
+            },
+            state,
+        );
+        h.run();
+        let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+        let at = h.get(combo).rect();
+        h.get(egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox)).click();
+        // (Its first pass measures it, unseen.)
+        h.step();
+        let mut lists = Vec::new();
+        for _ in 0..60 {
+            h.step();
+            let list = h.ctx.memory(|m| {
+                let top = m.areas().top_layer_id(egui::Order::Foreground)?;
+                m.area_rect(top.id)
+            });
+            lists.push(list.expect("the list, open"));
+        }
+        (at, lists)
+    }
+
+    /// An open list keeps one width from the first frame it is drawn (a
+    /// long one grew to the window's edge under Windows: a builder's
+    /// report): the box's, short or long, or its widest row's.
+    #[test]
+    fn an_open_list_keeps_its_width() {
+        // A long list with a Filter field, and a short one taller than
+        // egui's list (with egui's scroll bar).
+        for count in [200, 20] {
+            let (at, lists) = open_list(count, false);
+            assert!(lists.iter().all(|l| *l == lists[0]), "{count} rows: {lists:?}");
+            let list = lists[0];
+            assert!(
+                (list.left() - at.left()).abs() < 1.0 && (list.right() - at.right()).abs() < 1.0,
+                "{count} rows: the list {list:?} under the box {at:?}"
+            );
+        }
+        // A long list with a row wider than its box: as wide as that row.
+        let (at, lists) = open_list(200, true);
+        assert!(lists.iter().all(|l| *l == lists[0]), "{lists:?}");
+        assert!(lists[0].width() > at.width() + 50.0, "{lists:?} beside {at:?}");
     }
 }

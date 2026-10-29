@@ -9,10 +9,14 @@ mod area_common;
 
 #[path = "../areas.rs"]
 mod areas;
+#[path = "../hlsl.rs"]
+mod hlsl;
 #[path = "../minimaps.rs"]
 mod minimaps;
 #[path = "../object_walkmeshes.rs"]
 mod object_walkmeshes;
+#[path = "../tile_textures.rs"]
+mod tile_textures;
 #[path = "../tiles.rs"]
 mod tiles;
 #[path = "../tileset_authoring.rs"]

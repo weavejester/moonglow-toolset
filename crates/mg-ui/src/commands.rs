@@ -103,6 +103,10 @@ pub enum Id {
     ViewTree,
     ViewPalettes,
     ViewLog,
+    /// View › Copy Log and Save Log…: the whole log, each line with its
+    /// time, to the clipboard or into a text file (Jasperre's report).
+    CopyLog,
+    SaveLog,
     /// View › Clear Log: the log emptied.
     ClearLog,
     HidePanels,
@@ -181,6 +185,8 @@ pub const MENUS: [(&str, &[Item]); 8] = [
             Do(Id::ViewTree),
             Do(Id::ViewPalettes),
             Do(Id::ViewLog),
+            Do(Id::CopyLog),
+            Do(Id::SaveLog),
             Do(Id::ClearLog),
             Separator,
             Do(Id::GoToStart),
@@ -233,33 +239,35 @@ pub const MENUS: [(&str, &[Item]); 8] = [
     ),
 ];
 
-/// The toolbar: each command with its button's text and its tip (`None`:
-/// a gap).
-pub const TOOLBAR: [Option<(Id, &str, &str)>; 16] = [
-    Some((Id::NewModule, "🗋 New", "New module")),
-    Some((Id::OpenModule, "🗁 Open", "Open module")),
-    Some((Id::Save, "💾 Save", "Save module")),
+/// The toolbar: each command with its button's glyph, its name and its tip
+/// (`None`: a gap).
+pub const TOOLBAR: [Option<(Id, &str, &str, &str)>; 16] = [
+    Some((Id::NewModule, "🗋", "New", "New module")),
+    Some((Id::OpenModule, "🗁", "Open", "Open module")),
+    Some((Id::Save, "💾", "Save", "Save module")),
     None,
-    Some((Id::Undo, "⟲ Undo", "Undo")),
-    Some((Id::Redo, "⟳ Redo", "Redo")),
+    Some((Id::Undo, "⟲", "Undo", "Undo")),
+    Some((Id::Redo, "⟳", "Redo", "Redo")),
     None,
-    Some((Id::ModuleProperties, "ℹ Properties", "Module properties")),
-    Some((Id::AreaWizard, "🗺 New Area", "Area Wizard")),
+    Some((Id::ModuleProperties, "ℹ", "Properties", "Module properties")),
+    Some((Id::AreaWizard, "🗺", "New Area", "Area Wizard")),
     Some((
         Id::GoToStart,
-        "🏃 Start",
+        "🏃",
+        "Start",
         "Go to Start Location: opens the area the module starts in, at the start location",
     )),
-    Some((Id::Resources, "🔍 Resources", "Resource browser")),
-    Some((Id::Palettes, "📦 Palettes", "Blueprint palettes")),
+    Some((Id::Resources, "🔍", "Resources", "Resource browser")),
+    Some((Id::Palettes, "📦", "Palettes", "Blueprint palettes")),
     Some((
         Id::PreviewWindow,
-        "👁 Preview",
+        "👁",
+        "Preview",
         "Show Preview Window: the blueprint chosen in the palette",
     )),
     None,
-    Some((Id::CompileAll, "⚙ Compile", "Compile all scripts")),
-    Some((Id::Verify, "✔ Verify", "Verify the module")),
+    Some((Id::CompileAll, "⚙", "Compile", "Compile all scripts")),
+    Some((Id::Verify, "✔", "Verify", "Verify the module")),
 ];
 
 impl Id {
@@ -487,6 +495,10 @@ impl Id {
                 ("view-palettes", "Palettes Panel", "Show the palettes, or fold them away")
             }
             Id::ViewLog => ("view-log", "Log", "Show the log, or fold it away"),
+            Id::CopyLog => {
+                ("copy-log", "Copy Log", "The whole log to the clipboard, each line with its time")
+            }
+            Id::SaveLog => ("save-log", "Save Log…", "The whole log into a text file"),
             Id::ClearLog => ("clear-log", "Clear Log", "Empty the log"),
             Id::HidePanels => (
                 "hide-panels",
@@ -633,7 +645,7 @@ impl Id {
             | Id::PreviousTab => true,
             Id::NextPane | Id::PreviousPane => open,
             Id::ViewLog | Id::ResetLayout => true,
-            Id::ClearLog => !app.log.entries.is_empty(),
+            Id::CopyLog | Id::SaveLog | Id::ClearLog => !app.log.entries.is_empty(),
             Id::ViewTree | Id::HidePanels => open,
             Id::ViewPalettes => open && app.game.is_some(),
             Id::CloseTab => app.front_tab().is_some(),
@@ -778,16 +790,17 @@ impl Id {
                 app.blueprint_wizard = Some(crate::blueprint_wizard::BlueprintWizard::new(kind));
                 return;
             }
+            // (Their names start with the builder's code.)
             Id::NewConversation => {
-                app.new_dialog = Some(String::new());
+                app.new_dialog = Some(crate::widgets::code_start(app, mg_core::ResType::DLG));
                 return;
             }
             Id::NewScript => {
-                app.new_script = Some(String::new());
+                app.new_script = Some(crate::widgets::code_start(app, mg_core::ResType::NSS));
                 return;
             }
             Id::NewNui => {
-                app.new_nui = Some(String::new());
+                app.new_nui = Some(crate::widgets::code_start(app, mg_core::ResType::JUI));
                 return;
             }
             Id::NewTileset => return crate::tileset_view::new_tileset(app),
@@ -853,6 +866,8 @@ impl Id {
                 return;
             }
             Id::ResetLayout => return app.reset_layout(ctx),
+            Id::CopyLog => return app.copy_log(ctx),
+            Id::SaveLog => return app.save_log(),
             Id::ClearLog => return app.log.clear(),
         };
         app.actions.push(action);
@@ -964,6 +979,15 @@ pub(crate) fn keys_pressed(app: &mut Moonglow, ui: &Ui) {
         let pressed = ui.input_mut(|i| app.keymap.consume_outside_text(i, &c.key_id, typing));
         if pressed && app.ws.is_some() {
             app.run_plugin_command(&c.plugin, &c.command);
+        }
+    }
+    // And the project's.
+    let project = crate::project_commands::commands(app).map(|(_, c)| c).unwrap_or_default();
+    for c in project {
+        let id = crate::project_commands::key_id(&c.name);
+        let pressed = ui.input_mut(|i| app.keymap.consume_outside_text(i, &id, typing));
+        if pressed && c.run.is_some() {
+            app.actions.push(Action::ProjectCommand(c.name));
         }
     }
 }
@@ -1380,8 +1404,13 @@ fn menu(app: &mut Moonglow, ui: &mut Ui, items: &[Item], level: usize) {
                     for c in commands {
                         let name = format!("{}…", c.label);
                         let can = c.run.is_some();
-                        let (entry, chosen) =
-                            row(app, level + 1, &name, egui::Button::new(&name), can);
+                        let mut entry = egui::Button::new(&name);
+                        let id = crate::project_commands::key_id(&c.name);
+                        let key = app.keymap.label_of(&id, ui.ctx());
+                        if !key.is_empty() {
+                            entry = entry.shortcut_text(key);
+                        }
+                        let (entry, chosen) = row(app, level + 1, &name, entry, can);
                         let tip = crate::project_commands::tip(&c);
                         let r = ui.add_enabled(can, entry);
                         let r = r.on_hover_text(&tip).on_disabled_hover_text(&tip);
@@ -1487,6 +1516,8 @@ pub(crate) enum Choice {
     Window(Id),
     /// A plugin's command: the plugin's id and the command's.
     Plugin(String, String),
+    /// A project's command (`[commands]`), by its name.
+    Project(String),
 }
 
 /// A command as the palette lists it.
@@ -1526,8 +1557,18 @@ pub(crate) fn found(app: &Moonglow, filter: &str) -> Vec<Row> {
         key_id: c.key_id,
         enabled: app.ws.is_some(),
     });
+    // (The project's commands, as File › Project has them.)
+    let project = crate::project_commands::commands(app).map(|(_, c)| c).unwrap_or_default();
+    let project = project.into_iter().map(|c| Row {
+        key_id: crate::project_commands::key_id(&c.name),
+        label: format!("{}…", c.label),
+        menu: "Project".to_string(),
+        enabled: c.run.is_some(),
+        choice: Choice::Project(c.name),
+    });
     let mut found: Vec<(bool, Row)> = window
         .chain(plugins)
+        .chain(project)
         .filter_map(|row| {
             let name = row.label.to_lowercase();
             let with_menu = format!("{} {name}", row.menu.to_lowercase());
@@ -1614,17 +1655,20 @@ pub(crate) fn palette_window(app: &mut Moonglow, ctx: &egui::Context) {
     match run {
         Some(Choice::Window(id)) => id.run(app, ctx),
         Some(Choice::Plugin(plugin, command)) => app.run_plugin_command(&plugin, &command),
+        // (Saved first, asked as from File › Project.)
+        Some(Choice::Project(name)) => app.actions.push(Action::ProjectCommand(name)),
         None if modal.should_close() => {}
         None => app.command_palette = Some(finder),
     }
 }
 
 /// The toolbar, from [`TOOLBAR`]: each command's button, its key in its
-/// tip.
+/// tip (with Icons only, its glyph alone: [`crate::icons::Tools`]).
 pub(crate) fn toolbar(app: &mut Moonglow, ui: &mut Ui) {
+    let tools = crate::icons::Tools::of(&app.settings);
     ui.horizontal(|ui| {
         for tool in TOOLBAR {
-            let Some((id, text, tip)) = tool else {
+            let Some((id, glyph, name, tip)) = tool else {
                 ui.separator();
                 continue;
             };
@@ -1635,12 +1679,12 @@ pub(crate) fn toolbar(app: &mut Moonglow, ui: &mut Ui) {
             let clicked = if id == Id::PreviewWindow {
                 // A window that is shown or not: its button stays down.
                 let mut on = app.preview_window;
-                ui.toggle_value(&mut on, text).on_hover_text(tip);
+                tools.toggle(ui, &mut on, glyph, name, &tip);
                 on != app.preview_window
             } else {
-                ui.add_enabled(id.enabled(app), egui::Button::new(text).small())
-                    .on_hover_text(tip)
-                    .clicked()
+                let button = egui::Button::new(tools.label(glyph, name)).small();
+                let enabled = id.enabled(app);
+                ui.add_enabled_ui(enabled, |ui| tools.add(ui, button, name, &tip)).inner.clicked()
             };
             if clicked {
                 id.run(app, ui.ctx());

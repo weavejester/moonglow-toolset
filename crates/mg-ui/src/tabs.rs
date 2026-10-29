@@ -228,6 +228,19 @@ impl Tab {
         }
     }
 
+    /// The resources the tab shows that the module tree lists:
+    /// [`Tab::tree_key`]'s, or each of a tab of several (Properties of
+    /// several blueprints or areas).
+    pub fn tree_keys(&self) -> Vec<ResKey> {
+        match self {
+            Tab::Blueprints(keys) => keys.clone(),
+            Tab::AreasProperties(areas) => {
+                areas.iter().map(|a| ResKey::new(*a, ResType::ARE)).collect()
+            }
+            _ => self.tree_key().into_iter().collect(),
+        }
+    }
+
     pub fn renamable(&self) -> Option<ResKey> {
         match self {
             Tab::Script(k) | Tab::Dialog(k) | Tab::Blueprint(k) | Tab::Gff(k) | Tab::Nui(k) => {
@@ -269,10 +282,12 @@ impl Viewer<'_> {
         // Cancel does (Aurora's Escape is its Cancel: what the window
         // changed is set back). Dialogs over it close first.
         // (Not during a drag, which Escape drops.)
-        // (Escape in a text field leaves the field, and no more: egui has
-        // taken the keyboard from it by now, `escape_left_text`.)
+        // (Escape in a text or number field is Cancel too, as in Aurora;
+        // in a search field (an inventory's Find) it is the field's, which
+        // clears what is typed: egui has taken the keyboard from it by
+        // now, `escape_left_search`.)
         let escape = crate::widgets::escape_past_dialogs(ui.ctx())
-            && !crate::widgets::escape_left_text(ui.ctx())
+            && !crate::widgets::escape_left_search(ui.ctx())
             && ui.memory(|m| m.focused().is_none())
             && !ui.input(|i| i.pointer.any_down());
         let model = matches!(tab, Tab::Model(_) | Tab::InstanceModel { .. } | Tab::Tile { .. })
@@ -703,6 +718,38 @@ fn no_area(app: &mut Moonglow, ui: &mut Ui) {
     });
 }
 
+/// A recent module as the welcome page lists it: its name, a folder's
+/// (a module folder, a nasher project) with a `/` after it, and, grayed
+/// after it, the folder it is in. A module folder
+/// beside its `.mod` (GitHub issue 30) was `castle` beside `castle.mod`.
+fn recent_entry(ui: &Ui, path: &std::path::Path) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // (Told by its name, not the disk: recent modules are `.mod` files,
+    // and folders.)
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mod")) {
+        name.push('/');
+    }
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let mut job = LayoutJob::default();
+    let own = TextFormat {
+        font_id: font.clone(),
+        color: egui::Color32::PLACEHOLDER,
+        ..Default::default()
+    };
+    job.append(&name, 0.0, own);
+    // (The folder's name alone, `in modules`: the whole path is on hover.)
+    if let Some(place) = path.parent().and_then(|p| p.file_name()) {
+        let weak = TextFormat {
+            font_id: font,
+            color: ui.visuals().weak_text_color(),
+            ..Default::default()
+        };
+        job.append(&format!("  in {}", place.to_string_lossy()), 0.0, weak);
+    }
+    job
+}
+
 fn welcome(app: &mut Moonglow, ui: &mut Ui) {
     ui.vertical_centered(|ui| {
         ui.add_space(40.0);
@@ -724,9 +771,7 @@ fn welcome(app: &mut Moonglow, ui: &mut Ui) {
             ui.add_space(20.0);
             ui.strong("Recent modules");
             for p in app.settings.recent.clone() {
-                let name =
-                    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                if ui.link(name).on_hover_text(p.display().to_string()).clicked() {
+                if ui.link(recent_entry(ui, &p)).on_hover_text(p.display().to_string()).clicked() {
                     app.actions.push(Action::OpenModule(p));
                 }
             }

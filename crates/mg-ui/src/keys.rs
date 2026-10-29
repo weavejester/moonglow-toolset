@@ -29,6 +29,9 @@ pub enum Group {
     Nui,
     /// The enabled plugins' commands (anywhere in the window).
     Plugins,
+    /// The open project's commands (`[commands]`, anywhere in the
+    /// window).
+    Project,
 }
 
 impl Group {
@@ -40,13 +43,14 @@ impl Group {
             Group::Conversation => "Conversation Editor",
             Group::Nui => "NUI Creator",
             Group::Plugins => "Plugins",
+            Group::Project => "Project Commands",
         }
     }
 
     /// Whether keys in both groups can be pressed at the same moment (the
     /// general keys work everywhere).
     fn overlaps(self, other: Group) -> bool {
-        let anywhere = |g: Group| matches!(g, Group::General | Group::Plugins);
+        let anywhere = |g: Group| matches!(g, Group::General | Group::Plugins | Group::Project);
         self == other || anywhere(self) || anywhere(other)
     }
 }
@@ -78,6 +82,15 @@ pub enum Cmd {
     SelectTiles,
     /// The area view's placeable brush, on or off (its toolbar's Paint).
     PaintPlaceables,
+    /// The tiles palette's tile tools: chosen as brushes, or with tiles
+    /// selected in Select Tiles, at once on them
+    /// (`terrain_mode::tool_keys`).
+    Eraser,
+    RefineTile,
+    NextTileAppearance,
+    PreviousTileAppearance,
+    RotateTile,
+    RotateTileClockwise,
     TurnLeft,
     TurnRight,
     TurnLeft90,
@@ -129,6 +142,8 @@ pub enum Cmd {
     NuiMoveDown,
     NuiPrevious,
     NuiNext,
+    NuiFold,
+    NuiUnfold,
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
@@ -136,7 +151,7 @@ const SHIFT: Modifiers = Modifiers::SHIFT;
 const NONE: Modifiers = Modifiers::NONE;
 
 impl Cmd {
-    pub const ALL: [Cmd; 67] = [
+    pub const ALL: [Cmd; 75] = [
         Cmd::NewModule,
         Cmd::OpenModule,
         Cmd::Save,
@@ -158,6 +173,12 @@ impl Cmd {
         Cmd::CommandPalette,
         Cmd::SelectTiles,
         Cmd::PaintPlaceables,
+        Cmd::Eraser,
+        Cmd::RefineTile,
+        Cmd::NextTileAppearance,
+        Cmd::PreviousTileAppearance,
+        Cmd::RotateTile,
+        Cmd::RotateTileClockwise,
         Cmd::TurnLeft,
         Cmd::TurnRight,
         Cmd::TurnLeft90,
@@ -204,6 +225,8 @@ impl Cmd {
         Cmd::NuiMoveDown,
         Cmd::NuiPrevious,
         Cmd::NuiNext,
+        Cmd::NuiFold,
+        Cmd::NuiUnfold,
     ];
 
     /// The id the settings keep it by, its name and where it works.
@@ -231,6 +254,14 @@ impl Cmd {
             Cmd::CommandPalette => ("command-palette", "Command Palette", General),
             Cmd::SelectTiles => ("select-tiles", "Select Tiles or Objects", Area),
             Cmd::PaintPlaceables => ("paint-placeables", "Paint Placeables", Area),
+            Cmd::Eraser => ("tile-eraser", "Eraser (Tiles)", Area),
+            Cmd::RefineTile => ("refine-tile", "Refine Tile", Area),
+            Cmd::NextTileAppearance => ("next-tile-appearance", "Next Tile Appearance", Area),
+            Cmd::PreviousTileAppearance => {
+                ("previous-tile-appearance", "Previous Tile Appearance", Area)
+            }
+            Cmd::RotateTile => ("rotate-tile", "Rotate Tile", Area),
+            Cmd::RotateTileClockwise => ("rotate-tile-clockwise", "Rotate Tile Clockwise", Area),
             Cmd::TurnLeft => ("turn-left", "Turn Anticlockwise", Area),
             Cmd::TurnRight => ("turn-right", "Turn Clockwise", Area),
             Cmd::TurnLeft90 => ("turn-left-90", "Turn Anticlockwise 90°", Area),
@@ -277,6 +308,8 @@ impl Cmd {
             Cmd::NuiMoveDown => ("nui-move-down", "Move Element Down", Nui),
             Cmd::NuiPrevious => ("nui-previous", "Select Previous Element", Nui),
             Cmd::NuiNext => ("nui-next", "Select Next Element", Nui),
+            Cmd::NuiFold => ("nui-fold", "Fold Element or Select Its Parent", Nui),
+            Cmd::NuiUnfold => ("nui-unfold", "Unfold Element or Select Its First Child", Nui),
         }
     }
 
@@ -318,6 +351,14 @@ impl Cmd {
             Cmd::CommandPalette => vec![k(CTRL | SHIFT, Key::P)],
             Cmd::SelectTiles => vec![k(NONE, Key::F10)],
             Cmd::PaintPlaceables => vec![k(NONE, Key::B)],
+            // (Moonglow's tools: Aurora has none of them but the Eraser,
+            // which has no key there.)
+            Cmd::Eraser => vec![k(NONE, Key::X)],
+            Cmd::RefineTile => vec![k(NONE, Key::T)],
+            Cmd::NextTileAppearance => vec![k(NONE, Key::N)],
+            Cmd::PreviousTileAppearance => vec![k(SHIFT, Key::N)],
+            Cmd::RotateTile => vec![k(NONE, Key::R)],
+            Cmd::RotateTileClockwise => vec![k(SHIFT, Key::R)],
             Cmd::TurnLeft => vec![k(NONE, Key::Q)],
             Cmd::TurnRight => vec![k(NONE, Key::E)],
             Cmd::TurnLeft90 => vec![k(SHIFT, Key::Q)],
@@ -377,6 +418,8 @@ impl Cmd {
             Cmd::NuiMoveDown => vec![k(Modifiers::ALT, Key::ArrowDown)],
             Cmd::NuiPrevious => vec![k(NONE, Key::ArrowUp)],
             Cmd::NuiNext => vec![k(NONE, Key::ArrowDown)],
+            Cmd::NuiFold => vec![k(NONE, Key::ArrowLeft)],
+            Cmd::NuiUnfold => vec![k(NONE, Key::ArrowRight)],
         }
     }
 

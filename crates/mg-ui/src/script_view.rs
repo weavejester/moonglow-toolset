@@ -1691,8 +1691,12 @@ pub(crate) fn compile_source(
 ) -> Result<Vec<u8>, mg_script::compiler::CompileError> {
     // (What Moonglow writes itself, a wizard's script: by the built-in
     // compiler.)
-    compile_with_debug(app, key, text, false, None).map(|(ncs, _)| ncs)
+    compile_with_debug(app, key, text, false, None).map(|(ncs, ..)| ncs)
 }
+
+/// A compiled script, its debug information if made, and what the compile
+/// warned of (the built-in compiler's).
+type Made = (Vec<u8>, Option<Vec<u8>>, Vec<mg_script::CompileWarning>);
 
 /// [`compile_source`], with the debug information (`.ndb`) if `debug`.
 fn compile_with_debug(
@@ -1701,7 +1705,7 @@ fn compile_with_debug(
     text: &str,
     debug: bool,
     external: Option<&mg_module::external_compiler::ExternalCompiler>,
-) -> Result<(Vec<u8>, Option<Vec<u8>>), mg_script::compiler::CompileError> {
+) -> Result<Made, mg_script::compiler::CompileError> {
     // (An editor's text in the codepage it was read in; other text in the
     // script codepage. A string's bytes go into the compiled script as
     // they are.)
@@ -1712,14 +1716,14 @@ fn compile_with_debug(
     let resman = app.game.as_deref().map(|g| &g.resman);
     let name = key.resref.to_lowercase().to_string();
     // By the external compiler, when one is chosen (Options › Script
-    // Editor): the module's scripts as they are, this one as in the editor.
+    // Editor): this script as in the editor, and the module's scripts it
+    // includes (however indirectly) as they are; not the others.
     if let (Some(external), Some(module)) = (external, module) {
-        let mut sources: Vec<(String, &[u8])> = module
-            .keys_of(ResType::NSS)
-            .filter(|k| **k != key)
-            .filter_map(|k| Some((k.resref.to_lowercase().to_string(), module.get(k)?)))
-            .collect();
-        sources.push((name.clone(), &source));
+        // (The game's includes are followed to the module's they include.)
+        let no_game = mg_resman::ResMan::new();
+        let game = resman.unwrap_or(&no_game);
+        let sources =
+            mg_module::build::external_sources(module, game, &[key], Some((key, &source)));
         let failed = |message: String| mg_script::compiler::CompileError { code: -1, message };
         let made = external
             .compile(&sources, std::slice::from_ref(&name))
@@ -1728,7 +1732,7 @@ fn compile_with_debug(
             return Err(failed(format!("{name}.nss: the external compiler made nothing")));
         };
         return match made.ncs {
-            Some(ncs) => Ok((ncs, made.ndb.filter(|_| debug))),
+            Some(ncs) => Ok((ncs, made.ndb.filter(|_| debug), Vec::new())),
             None => Err(failed(made.message)),
         };
     }
@@ -1743,7 +1747,7 @@ fn compile_with_debug(
             .or_else(|| resman?.get(&k).ok().map(|d| d.into_owned()))
     });
     c.set_debug_output(debug);
-    c.compile(&name).map(|out| (out.ncs, out.ndb))
+    c.compile(&name).map(|out| (out.ncs, out.ndb, out.warnings))
 }
 
 /// Compiles again, into the module, those of `scripts` whose compiled
@@ -1754,19 +1758,42 @@ fn compile_with_debug(
 /// source). Without the game's data nothing can be compiled, and nothing
 /// is said.
 pub(crate) fn compile_stale(app: &mut Moonglow, scripts: &[ResKey]) -> (Vec<String>, Vec<String>) {
+    compile_stale_into(app, scripts, false)
+}
+
+/// [`compile_stale`], the compiled scripts put in as what is made from the
+/// module (`made`: outside the edit history, not unsaved work, as
+/// [`mg_edit::Workspace::derive`] puts them) or as a command.
+pub(crate) fn compile_stale_into(
+    app: &mut Moonglow,
+    scripts: &[ResKey],
+    derived: bool,
+) -> (Vec<String>, Vec<String>) {
     let (mut compiled, mut broken) = (Vec::new(), Vec::new());
     if app.game.is_none() {
         return (compiled, broken);
     }
-    let mut edits = Vec::new();
+    let (mut edits, mut made) = (Vec::new(), Vec::new());
+    let mut warned: Vec<String> = Vec::new();
     let external = app.external_compiler();
     for &key in scripts {
         let Some(ws) = app.ws.as_ref() else { break };
         let Some(text) = ws.module.get(&key).map(decode) else { continue };
         let ncs = ResKey::new(key.resref, ResType::NCS);
         let old = ws.module.get(&ncs).map(<[u8]>::to_vec);
-        match compile_with_debug(app, key, &text, app.settings.debug_info, external.as_ref()) {
-            Ok((new, ndb)) if old.as_deref() != Some(&new[..]) => {
+        let result =
+            compile_with_debug(app, key, &text, app.settings.debug_info, external.as_ref());
+        // (Each warning once: an include's is said by all its includers.)
+        if let Ok((.., said)) = &result {
+            for w in said {
+                if !warned.contains(&w.message) {
+                    warned.push(w.message.clone());
+                }
+            }
+        }
+        match result {
+            Ok((new, ndb, _)) if old.as_deref() != Some(&new[..]) => {
+                made.push((key, new.clone()));
                 edits.push(Edit::SetResource { key: ncs, data: Some(new) });
                 if let Some(ndb) = ndb {
                     let key = ResKey::new(key.resref, ResType::NDB);
@@ -1774,17 +1801,33 @@ pub(crate) fn compile_stale(app: &mut Moonglow, scripts: &[ResKey]) -> (Vec<Stri
                 }
                 compiled.push(key.resref.to_string());
             }
-            Ok(_) => {}
+            Ok((same, ..)) => made.push((key, same)),
             // (One without a compiled script is an include, or is named
             // by the caller as not compiled.)
             Err(_) if old.is_some() => broken.push(key.resref.to_string()),
             Err(_) => {}
         }
     }
-    if !edits.is_empty()
+    if derived && !edits.is_empty() {
+        let set = |m: &mut mg_module::Module| {
+            for e in edits {
+                if let Edit::SetResource { key, data: Some(data) } = e {
+                    m.set(key, data);
+                }
+            }
+        };
+        if let Some(Err(e)) = app.ws.as_mut().map(|ws| ws.derive(set)) {
+            app.log.error(e.to_string());
+        }
+    } else if !edits.is_empty()
         && let Err(e) = app.apply(Command::new("Compile", edits))
     {
         app.log.error(e.to_string());
+    }
+    // (For Compile All to pass over.)
+    app.note_compiled(&made);
+    for w in warned {
+        app.log.warn(w);
     }
     (compiled, broken)
 }
@@ -1809,8 +1852,8 @@ impl Moonglow {
         let mut all = scripts.to_vec();
         all.extend(mg_module::refs::includers(&ws.module, scripts));
         // (An external compiler is run once for each script compiled
-        // here, with the module's scripts written out for it each time:
-        // more than one go to the job, which runs it once for them all.)
+        // here, with what it includes written out for it each time: more
+        // than one go to the job, which runs it once for them all.)
         let slow = self.settings.external_compiler.is_some() && all.len() > 1;
         if all.len() > COMPILED_AT_ONCE || slow {
             self.log.info(format!(
@@ -1891,8 +1934,9 @@ fn compile_one(app: &mut Moonglow, key: ResKey, text: &str) -> bool {
     let external = app.external_compiler();
     let result = compile_with_debug(app, key, text, app.settings.debug_info, external.as_ref());
     match result {
-        Ok((out, ndb)) => {
+        Ok((out, ndb, warnings)) => {
             let ncs = ResKey::new(key.resref, ResType::NCS);
+            let made = vec![(key, out.clone())];
             let mut edits = vec![Edit::SetResource { key: ncs, data: Some(out) }];
             if let Some(ndb) = ndb {
                 edits.push(Edit::SetResource {
@@ -1901,9 +1945,16 @@ fn compile_one(app: &mut Moonglow, key: ResKey, text: &str) -> bool {
                 });
             }
             app.actions.push(Action::Apply(Command::new(format!("Compile {key}"), edits)));
+            // (Once its text and compiled script are the module's.)
+            app.actions.push(Action::NoteCompiled(made));
             app.log.info(format!("{key}: compiled"));
             let said = format!("{key}: compiled");
             app.script_tools.messages.push(Message::new(key, said, None, false));
+            for w in warnings {
+                app.log.warn(w.message.clone());
+                let location = Some((w.file, w.line));
+                app.script_tools.messages.push(Message::new(key, w.message, location, false));
+            }
             true
         }
         Err(e) => {
@@ -2397,6 +2448,7 @@ pub(crate) fn windows(app: &mut Moonglow, ui: &mut Ui) {
     use crate::widgets::{NameWindow, Named};
     if let Some((from, mut name)) = app.script_save_as.clone() {
         let window = NameWindow {
+            new: false,
             title: "Save Script As",
             label: "New name (up to 16 characters)",
             restype: ResType::NSS,
@@ -2428,6 +2480,7 @@ pub(crate) fn windows(app: &mut Moonglow, ui: &mut Ui) {
 
     if let Some(mut name) = app.new_script.clone() {
         let window = NameWindow {
+            new: true,
             title: "New Script",
             label: "Name (up to 16 characters)",
             restype: ResType::NSS,

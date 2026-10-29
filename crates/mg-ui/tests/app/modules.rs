@@ -283,7 +283,9 @@ fn recent_modules_reopen_from_the_welcome_page() {
     app.close();
     let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
     h.run();
-    h.get_by_label("sample.mod").click();
+    // (Its name, and the folder it is in.)
+    let place = dir.file_name().unwrap().to_string_lossy().into_owned();
+    h.get_by_label(&format!("sample.mod  in {place}")).click();
     h.run();
     assert_eq!(h.state().module_path().as_deref(), Some(path.as_path()));
 }
@@ -376,6 +378,40 @@ fn export_then_import_into_another_module() {
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
     h.run();
     assert!(!h.state().ws.as_ref().unwrap().module.contains(&area));
+}
+
+/// An area's `.are` exported without the resources it uses still takes
+/// its `.git` and `.gic` (the builders' reports on 1.25.1: the window
+/// lists the three apart, and the archive held the `.are` alone, which
+/// imports as an area with nothing placed in it), as Export as Files does.
+#[test]
+fn an_area_exported_alone_takes_its_git_and_gic() {
+    let dir = mg_testkit::scratch_dir("ui-export-area-alone");
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    for (t, kind) in [(ResType::GIT, *b"GIT "), (ResType::GIC, *b"GIC ")] {
+        m.set(ResKey::parse("start", t).unwrap(), Gff::new(kind).to_bytes().unwrap());
+    }
+    m.set(ResKey::parse("hello", ResType::NSS).unwrap(), b"void main() {}\n".to_vec());
+    m.save().unwrap();
+    let erf = dir.join("start.erf");
+    let dialogs = NoDialogs { save: vec![erf.clone()], ..Default::default() };
+    let mut app = Moonglow::new(None, Box::new(dialogs));
+    app.open_module(&path);
+    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let area = ResKey::parse("start", ResType::ARE).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::ExportDialog(vec![area]));
+    h.run();
+    h.state_mut().export.as_mut().unwrap().dependencies = false;
+    h.run();
+    h.get_by_label("Export 1…").click();
+    h.run();
+    let bytes = std::fs::read(&erf).unwrap();
+    let archive = mg_erf::Erf::read(&bytes).unwrap();
+    let mut names: Vec<String> =
+        archive.entries.iter().map(|e| ResKey::new(e.resref, e.restype).to_string()).collect();
+    names.sort();
+    assert_eq!(names, ["start.are", "start.gic", "start.git"]);
 }
 
 /// A module that is a folder is written as a `.mod` beside the folder too
@@ -488,6 +524,57 @@ fn a_mod_with_its_folder_beside_it_asks_which_to_open() {
     h.run();
     assert!(h.state().module_folder.is_none());
     assert_eq!(location(&h), Some(ModuleLocation::Archive(path)));
+}
+
+/// The welcome page's Recent modules tell a module folder from the `.mod`
+/// beside it (GitHub issue 30: both showed as their names alone): a
+/// folder's name ends in `/`, and the folder each is in follows it.
+#[test]
+fn the_welcome_page_tells_a_folder_from_its_mod() {
+    let dir = mg_testkit::scratch_dir("ui-welcome-recent");
+    let path = sample_module(&dir);
+    let folder = dir.join("sample");
+    Module::open(&path).unwrap().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
+    let mut app = app_with(Vec::new());
+    app.settings.recent = vec![folder.clone(), path.clone()];
+    app.settings.module_folders = mg_ui::settings::ModuleFolders::Folder;
+    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    h.run();
+    let place = dir.file_name().unwrap().to_string_lossy().into_owned();
+    h.get_by_label(&format!("sample.mod  in {place}"));
+    h.get_by_label(&format!("sample/  in {place}")).click();
+    h.run();
+    let location = h.state().ws.as_ref().unwrap().module.location.clone();
+    assert_eq!(location, Some(ModuleLocation::Folder(folder)));
+}
+
+/// The folder beside a `.mod` is found by its name in any case, as Aurora
+/// on Windows finds it (`Sample/` beside `sample.mod`, on Linux): asked
+/// about, opened, and saved as that `.mod`, not a second one.
+#[test]
+fn a_mod_s_folder_in_another_case_is_found() {
+    let dir = mg_testkit::scratch_dir("ui-mod-folder-case");
+    let path = sample_module(&dir);
+    let folder = dir.join("Sample");
+    Module::open(&path).unwrap().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
+    let mut h =
+        Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app_with(vec![path.clone()]));
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenModule(path.clone()));
+    h.run();
+    assert_eq!(h.state().module_folder.as_deref(), Some(path.as_path()), "asked");
+    h.get_by_label(&folder.display().to_string());
+    h.get_by_label("Open Directory").click();
+    h.run();
+    let location = h.state().ws.as_ref().unwrap().module.location.clone();
+    assert_eq!(location, Some(ModuleLocation::Folder(folder.clone())));
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    h.run();
+    let mods: Vec<String> = (std::fs::read_dir(&dir).unwrap().flatten())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.to_ascii_lowercase().ends_with(".mod"))
+        .collect();
+    assert_eq!(mods, ["sample.mod"], "the .mod beside it, not a second one");
 }
 
 #[test]
@@ -864,6 +951,65 @@ fn build_module_compiles_and_reports() {
     let enc = ws.doc(&ResKey::parse("mg_enc", ResType::UTE).unwrap()).unwrap();
     let cr = enc.root.list("CreatureList").unwrap()[0].float("CR").unwrap();
     assert!(cr < 99.0, "CR {cr}");
+}
+
+/// Build Module's Unused says a script once, with its files; Mark as Used
+/// writes its name into the project file's `[used]`, which Counted as
+/// Used lists and takes out again.
+#[test]
+fn build_module_marks_an_unused_script_as_used() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = project_folder("ui-build-used", &[("moonglow.toml", "# the team's\n")]);
+    let mut app = game_app(&root, None);
+    app.settings.no_last_area = true;
+    app.open_module(&dir);
+    let mut w = mg_ui::build_view::BuildWindow::default();
+    w.unused = true;
+    app.build = Some(w);
+    let mut h = Harness::builder()
+        .with_size([900.0, 900.0])
+        .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    h.run_steps(2);
+    h.get_all_by_label("Build").last().unwrap().click();
+    h.run_steps(3);
+    let results = |h: &Harness<'_, Moonglow>| -> Vec<String> {
+        h.state().build.as_ref().unwrap().results.iter().map(|f| f.text.clone()).collect()
+    };
+    let line = "Unused: hello.nss (source and compiled)";
+    assert!(results(&h).iter().any(|r| r == line), "{:?}", results(&h));
+    assert!(!results(&h).iter().any(|r| r.contains("hello.ncs")), "once: {:?}", results(&h));
+    h.get_by_label(line).click();
+    h.run();
+    h.get_by_label("Mark as Used").click();
+    h.run_steps(2);
+    let toml = std::fs::read_to_string(dir.join("moonglow.toml")).unwrap();
+    assert!(toml.starts_with("# the team's\n"), "{toml}");
+    assert!(toml.contains("[used]\nscripts = [\"hello\"]"), "{toml}");
+    assert!(!results(&h).iter().any(|r| r == line), "no longer said: {:?}", results(&h));
+    let used = &h.state().ws.as_ref().unwrap().module.project_file.used;
+    assert_eq!(used.scripts.globs, ["hello"]);
+    // Built again: still not said.
+    h.get_all_by_label("Build").last().unwrap().click();
+    h.run_steps(3);
+    assert!(!results(&h).is_empty() && !results(&h).iter().any(|r| r.contains("hello")));
+    // Counted as Used lists it, and takes it out.
+    h.get_by_label("Counted as Used").click();
+    h.run();
+    h.get_by_label("Script: hello");
+    h.get_by_label("Remove").click();
+    h.run_steps(2);
+    let toml = std::fs::read_to_string(dir.join("moonglow.toml")).unwrap();
+    assert!(!toml.contains("\"hello\""), "{toml}");
+    assert!(h.state().ws.as_ref().unwrap().module.project_file.used.is_empty());
+    // And one typed: a glob.
+    type_into_hint(&mut h, "name or glob (ai_*)", "ai_*");
+    h.get_by_label("Add").click();
+    h.run_steps(2);
+    let toml = std::fs::read_to_string(dir.join("moonglow.toml")).unwrap();
+    assert!(toml.contains("scripts = [\"ai_*\"]"), "{toml}");
 }
 
 #[test]
@@ -1252,10 +1398,23 @@ fn a_stale_compiled_script_is_compiled_before_it_goes_out() {
 }
 
 /// The area view's To Scratch: the area as it is now (its .are, .git and
-/// .gic) copied into the scratch folder.
+/// .gic) copied into the scratch folder, with what of the module's it
+/// uses (its OnEnter script, compiled), not only the area.
 #[test]
 fn an_area_goes_to_the_scratch_folder() {
-    let Some((mut h, area)) = area_harness("area-scratch") else { return };
+    let enter = |m: &mut Module, _: &mg_rules::GameData, area: ResRef| {
+        let key = ResKey::new(area, ResType::ARE);
+        let mut are = Gff::read(m.get(&key).unwrap()).unwrap();
+        are.root.set("OnEnter", mg_gff::Value::ResRef(b"mg_enter".to_vec()));
+        m.set(key, are.to_bytes().unwrap());
+        m.set(ResKey::parse("mg_enter", ResType::NSS).unwrap(), b"void main() {}\n".to_vec());
+        // (One the area doesn't use stays behind.)
+        m.set(ResKey::parse("mg_other", ResType::NSS).unwrap(), b"void main() {}\n".to_vec());
+    };
+    let Some((mut h, area)) = area_harness_with("area-scratch", "ttr01", None, 4, None, &enter)
+    else {
+        return;
+    };
     // No scratch folder yet, and none chosen when asked: nothing is copied.
     h.get_by_label("To Scratch").click();
     h.run_steps(2);
@@ -1270,7 +1429,10 @@ fn an_area_goes_to_the_scratch_folder() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, ["are", "gic", "git"].map(|e| format!("{area}.{e}")));
+    let mut wanted: Vec<String> = ["are", "gic", "git"].map(|e| format!("{area}.{e}")).into();
+    wanted.extend(["mg_enter.ncs".to_string(), "mg_enter.nss".to_string()]);
+    wanted.sort();
+    assert_eq!(names, wanted);
     let ws = h.state_mut().ws.as_mut().unwrap();
     let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap().to_bytes().unwrap();
     assert_eq!(std::fs::read(scratch.join(format!("{area}.are"))).unwrap(), are);

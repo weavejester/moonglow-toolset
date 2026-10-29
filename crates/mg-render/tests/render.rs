@@ -544,6 +544,7 @@ fn a_model_is_drawn_once_its_textures_are_read_apart() {
     let first = r.render_image(&gpu, &NoAssets, &scene, &camera, 64, 64);
     assert_eq!(r.drawn.textures_pending, 1, "left out while its texture is read");
     assert!(first.data.chunks(4).all(|p| p[..3] == [0, 0, 0]), "nothing drawn yet");
+    assert_eq!(r.progress(), 0, "nothing finished yet (the area view's watch waits on it)");
     let started = std::time::Instant::now();
     while woken.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "never read");
@@ -558,7 +559,102 @@ fn a_model_is_drawn_once_its_textures_are_read_apart() {
         read = r.render_image(&gpu, &NoAssets, &scene, &camera, 64, 64);
     }
     assert!(r.textures_read() >= 1);
+    assert_eq!(r.progress(), r.textures_read(), "each texture read is progress");
     assert_eq!(read.data, here.data, "as read in the frame");
+}
+
+/// A model of several meshes, each with a texture of its own, read
+/// apart: the first frame asks for every mesh's texture, and the frame
+/// after they are read draws the model whole, every mesh in its colour.
+/// (Asked for a mesh at a time, as they once were, the second frame
+/// asked for the second mesh's and left the model out again: a tile of
+/// the rural tileset with a rock on it stayed black for six rounds of
+/// reads, and was in the lit check's picture.)
+#[test]
+fn a_model_s_meshes_ask_for_their_textures_together() {
+    let Some(gpu) = gpu() else { return };
+    let colors =
+        [("red", [230, 20, 20, 255]), ("green", [20, 230, 20, 255]), ("blue", [20, 20, 230, 255])];
+    let assets = || {
+        let mut a = TestAssets::default();
+        for (name, rgba) in colors {
+            a.solid(name, rgba);
+        }
+        a
+    };
+    // Three quads side by side, each a mesh with its own texture.
+    let one = quad();
+    let mut m = one.clone();
+    m.nodes.truncate(1);
+    m.nodes[0].children.clear();
+    for (i, (name, _)) in colors.iter().enumerate() {
+        let mut node = one.nodes[1].clone();
+        node.name = format!("plane{i}");
+        let NodeKind::Mesh(mesh) = &mut node.kind else { unreachable!() };
+        let x = (i as f32 - 1.0) * 2.2;
+        for v in &mut mesh.vertices {
+            v[0] += x;
+        }
+        mesh.textures[0] = Some((*name).into());
+        let index = m.nodes.len();
+        m.nodes[0].children.push(index);
+        m.nodes.push(node);
+    }
+    let model = Arc::new(GpuModel::new(&gpu, Arc::new(m)));
+    let scene = Scene {
+        instances: vec![Instance::new(model, Mat4::IDENTITY)],
+        background: [0.0, 0.0, 0.0],
+        ..Default::default()
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.5, 9.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let (w, h) = (96, 48);
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    let here = r.render_image(&gpu, &assets(), &scene, &camera, w, h);
+    // Each mesh drawn in its colour, at its quad's middle.
+    let at = |img: &mg_image::Rgba, x: u32| {
+        let i = ((h / 2 * w + x) * 4) as usize;
+        [img.data[i], img.data[i + 1], img.data[i + 2]]
+    };
+    let middles = [w / 2 - 14, w / 2, w / 2 + 14];
+    for (x, (name, rgba)) in middles.iter().zip(colors) {
+        let p = at(&here, *x);
+        let strongest = (0..3).max_by_key(|&c| p[c]).unwrap();
+        let wanted = (0..3).max_by_key(|&c| rgba[c]).unwrap();
+        assert!(strongest == wanted && p[wanted] > 60, "the {name} mesh is {p:?}");
+    }
+
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wk = woken.clone();
+    r.set_game_waker(move || {
+        wk.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    let apart: Arc<dyn mg_render::Assets + Send + Sync> = Arc::new(assets());
+    r.read_textures_apart(&gpu, Some(apart));
+    r.textures_apart = true;
+    r.render_image(&gpu, &NoAssets, &scene, &camera, w, h);
+    assert_eq!(r.drawn.textures_pending, 1, "left out while its textures are read");
+    // The three textures and the environment map, all asked for in the
+    // first frame.
+    let started = std::time::Instant::now();
+    while woken.load(std::sync::atomic::Ordering::Relaxed) < colors.len() + 1 {
+        let read = woken.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{read} read: the first frame asked for one mesh's texture alone"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let read = r.render_image(&gpu, &NoAssets, &scene, &camera, w, h);
+    assert_eq!(r.drawn.textures_pending, 0, "drawn in the frame after they are read");
+    assert_eq!(r.textures_read(), colors.len() as u64 + 1);
+    assert_eq!(read.data, here.data, "every mesh as read in the frame");
 }
 
 /// Material maps, as the game's normal-mapped shaders read them: a flat
@@ -1820,6 +1916,8 @@ void main ()
         cutoff: 1.0,
         ambient_only: false,
         priority: 1,
+        casts_shadows: false,
+        shadow_lift: 0.0,
     };
     let scene = Scene {
         instances: vec![beside(-3.0), quad.clone(), beside(3.0)],
@@ -2545,6 +2643,113 @@ fn the_game_s_programs_are_made_while_frames_go_on() {
     let stats = again.game_shader_stats();
     assert_eq!((stats.compiled, stats.cached), (0, 2), "{stats:?}");
     assert_eq!(img.data, then.data);
+}
+
+/// What `log` is told in this test binary, kept ([`logged`]).
+struct Kept(std::sync::Mutex<Vec<String>>);
+
+impl log::Log for Kept {
+    fn enabled(&self, m: &log::Metadata<'_>) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record<'_>) {
+        if self.enabled(r.metadata())
+            && let Ok(mut kept) = self.0.lock()
+        {
+            kept.push(r.args().to_string());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static KEPT: Kept = Kept(std::sync::Mutex::new(Vec::new()));
+
+/// The warnings logged so far in this test binary.
+fn logged() -> Vec<String> {
+    let _ = log::set_logger(&KEPT).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    KEPT.0.lock().map(|k| k.clone()).unwrap_or_default()
+}
+
+/// A pipeline of the game's programs that the backend refuses (made to
+/// fail as wgpu fails it, as Direct3D 12 fails one FXC can't compile):
+/// the mesh is drawn with Moonglow's own shader instead, made while the
+/// frames go on (the area view's) or waited for (a picture drawn once),
+/// the failure told once, by `game_shader_failures` and in the log (the
+/// debug log, in the window).
+#[test]
+fn a_game_pipeline_the_backend_refuses_falls_back_to_moonglow_s_own() {
+    struct Unfail;
+    impl Drop for Unfail {
+        fn drop(&mut self) {
+            mg_render::guard::fail_program(None);
+        }
+    }
+    let Some(gpu) = gpu() else { return };
+    logged();
+    let mut assets = clip_space_assets();
+    authored_custom_pair(&mut assets);
+    // (A program of its own: no other test's pipeline is made to fail.)
+    let fs = assets.shaders["fs_tint"].clone();
+    assets.shaders.insert("fs_refused".into(), fs);
+    assets.opaque("refused", [255, 0, 0]);
+    let mtr = "customshadervs vs_sway\ncustomshaderfs fs_refused\n\
+        parameter float vOverrideColor 0.0 1.0 0.0 1.0\nparameter int iForceOverrideColor 1\n";
+    assets.materials.insert("refused".into(), mg_image::mtr::Mtr::parse(mtr.as_bytes()));
+    let camera = Camera {
+        eye: Vec3::new(0.0, -10.0, 1.0),
+        target: Vec3::new(0.0, 0.0, 1.0),
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let scene = Scene {
+        instances: vec![standing_quad(&gpu, "refused", Vec3::new(0.0, 0.0, 1.0), 1.0)],
+        background: [0.0, 0.0, 0.0],
+        ..Default::default()
+    };
+    let _unfail = Unfail;
+    mg_render::guard::fail_program(Some("fs_refused"));
+    // While the frames go on.
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    r.game_shaders = true;
+    r.game_background = true;
+    let first = r.render_image(&gpu, &assets, &scene, &camera, 64, 64);
+    assert_eq!((r.drawn.game, r.drawn.game_pending), (0, 1), "{:?}", r.drawn);
+    let start = std::time::Instant::now();
+    while r.game_shader_failures().is_empty() {
+        assert!(start.elapsed().as_secs() < 60, "never made");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        r.render_image(&gpu, &assets, &scene, &camera, 64, 64);
+    }
+    let then = r.render_image(&gpu, &assets, &scene, &camera, 64, 64);
+    assert_eq!((r.drawn.game, r.drawn.game_pending), (0, 0), "{:?}", r.drawn);
+    // (Moonglow's own: the texture's red, not the programs' green.)
+    let p = then.pixel(32, 32);
+    assert!(p[0] > 60 && p[1] < 40, "{p:?}");
+    assert_eq!(then.data, first.data);
+    let failures = r.game_shader_failures().to_vec();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].0, "vs_sway/fs_refused");
+    assert!(failures[0].1.contains("made_to_fail"), "{failures:?}");
+    let stats = r.game_shader_stats();
+    assert_eq!((stats.pipelines, stats.failed), (0, 1), "{stats:?}");
+    assert_eq!(r.progress(), 1, "a pipeline that can't be made is progress all the same");
+    // Told once, however many frames draw it.
+    let told = |log: &[String]| {
+        log.iter()
+            .filter(|l| l.contains("vs_sway/fs_refused") && l.contains("made_to_fail"))
+            .count()
+    };
+    r.render_image(&gpu, &assets, &scene, &camera, 64, 64);
+    assert_eq!(told(&logged()), 1, "{:?}", logged());
+    // Waited for: the same, at once.
+    let mut once = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    once.game_shaders = true;
+    let img = once.render_image(&gpu, &assets, &scene, &camera, 64, 64);
+    assert_eq!((once.drawn.game, once.drawn.game_pending), (0, 0));
+    assert_eq!(img.data, first.data);
+    assert_eq!(once.game_shader_failures().len(), 1);
+    assert_eq!(told(&logged()), 2, "each renderer tells its own");
 }
 
 /// A material that names one program alone is drawn with the stock pair
@@ -3537,6 +3742,889 @@ void main ()
         } else {
             // (Its foot white; above it, the background's black.)
             assert!(foot == 255 && c.iter().all(|&r| r == 255 || r == 0), "no fade: {c:?}");
+        }
+    }
+}
+
+/// [`quad`] as a mesh that only casts shadows (`render 0`, `shadow 1`).
+fn shadow_plate() -> Model {
+    let mut m = quad();
+    if let NodeKind::Mesh(mesh) = &mut m.nodes[1].kind {
+        mesh.render = false;
+        mesh.shadow = true;
+    }
+    m
+}
+
+/// The sun's shadows: a plate that only casts (`render 0`, `shadow 1`)
+/// a metre over a ground that receives, the sun straight above, seen
+/// from straight above (where the game's shadow plane fades nothing): the
+/// ground under the plate darkened by the opacity (black laid over it so
+/// opaque), the ground beside it not; none without shadows, nor on a
+/// ground that doesn't receive them; with one sample a pixel and four,
+/// Moonglow's shader and (with the game installed) the game's.
+#[test]
+fn shadows_darken_what_receives_them_by_the_opacity() {
+    let Some(gpu) = gpu() else { return };
+    let dir = mg_testkit::output_dir("render");
+    let ground = Arc::new(GpuModel::new(&gpu, Arc::new(quad())));
+    let plate = Arc::new(GpuModel::new(&gpu, Arc::new(shadow_plate())));
+    assert!(plate.meshes.is_empty() && plate.shadow_only.len() == 1);
+    let scene = |receives: bool, shadows: Option<f32>| Scene {
+        instances: vec![
+            Instance {
+                receives_shadows: receives,
+                ..Instance::new(ground.clone(), Mat4::from_scale(Vec3::splat(5.0)))
+            },
+            Instance::new(
+                plate.clone(),
+                Mat4::from_scale_rotation_translation(
+                    Vec3::splat(0.5),
+                    glam::Quat::IDENTITY,
+                    Vec3::new(0.0, 0.0, 1.0),
+                ),
+            ),
+        ],
+        area: AreaLight {
+            ambient: Vec3::splat(0.2),
+            diffuse: Vec3::splat(0.6),
+            direction: Vec3::Z,
+        },
+        shadows: shadows.map(|opacity| mg_render::SunShadows { opacity, fade_limit: 45.0 }),
+        ..Default::default()
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.01, 12.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let game = mg_testkit::nwn_root().and_then(|root| {
+        mg_resman::ResMan::for_game(&mg_resman::GameInstall::new(&root, None, "en")).ok()
+    });
+    let grey = |p: [u8; 4]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
+    for samples in [1, 4] {
+        for shaders in [false, true] {
+            let assets: &dyn mg_render::Assets = match (&game, shaders) {
+                (Some(rm), true) => rm,
+                (None, true) => continue,
+                _ => &NoAssets,
+            };
+            let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, samples);
+            r.game_shaders = shaders;
+            let mut draw = |s: &Scene| r.render_image(&gpu, assets, s, &camera, 64, 64);
+            let bare = draw(&scene(true, None));
+            let half = draw(&scene(true, Some(0.5)));
+            let whole = draw(&scene(true, Some(1.0)));
+            let elsewhere = draw(&scene(false, Some(0.5)));
+            // (With the switch on, the ground by the game's programs.)
+            assert_eq!(r.drawn.game > 0, shaders, "{samples} samples");
+            save(&half, &dir.join(format!("shadows_{samples}_{shaders}.png")));
+            // (The plate's shadow is the middle of the picture; the ground
+            // reaches past it.)
+            let (under, beside) = ((32, 32), (32, 6));
+            let lit = grey(bare.pixel(under.0, under.1));
+            assert!(lit > 40.0, "the ground is lit: {lit}");
+            let at = |img: &mg_image::Rgba, (x, y): (u32, u32)| grey(img.pixel(x, y));
+            let context = format!("{samples} samples, game shaders {shaders}");
+            assert!(
+                (at(&half, under) - lit * 0.5).abs() <= 2.0,
+                "{context}: {} of {lit}",
+                at(&half, under)
+            );
+            assert!(at(&whole, under) <= 1.0, "{context}: {}", at(&whole, under));
+            assert!((at(&half, beside) - at(&bare, beside)).abs() <= 1.0, "{context}: beside");
+            assert!((at(&elsewhere, under) - lit).abs() <= 1.0, "{context}: not received");
+        }
+    }
+}
+
+/// Creature shadows: a skinned plate that only casts, a metre over a
+/// ground that receives, its one bone posed 3 m east: its shadow falls
+/// where the bone has taken it (as it is drawn), not where it was bound;
+/// and none where the instance doesn't cast.
+#[test]
+fn a_skinned_mesh_casts_as_its_bones_pose_it() {
+    let Some(gpu) = gpu() else { return };
+    let ground = Arc::new(GpuModel::new(&gpu, Arc::new(quad())));
+    let plate = {
+        let mesh = Mesh {
+            diffuse: [1.0; 3],
+            ambient: [1.0; 3],
+            render: false,
+            shadow: true,
+            vertices: vec![[-0.5, -0.5, 1.0], [0.5, -0.5, 1.0], [0.5, 0.5, 1.0], [-0.5, 0.5, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+            uvs: [vec![[0.0, 0.0]; 4], vec![], vec![], vec![]],
+            faces: vec![
+                Face { vertices: [0, 1, 2], material: 0 },
+                Face { vertices: [0, 2, 3], material: 0 },
+            ],
+            source: vec![0, 1, 2, 3],
+            extra: mg_mdl::MeshExtra::Skin(mg_mdl::Skin {
+                bones: vec![1],
+                weights: vec![[(0, 1.0), (0, 0.0), (0, 0.0), (0, 0.0)]; 4],
+                inverse_bind: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let mut root = Node::new("plate", NodeKind::Dummy);
+        root.children = vec![1, 2];
+        let mut bone = Node::new("bone", NodeKind::Dummy);
+        bone.parent = Some(0);
+        let mut skin = Node::new("skin", NodeKind::Mesh(Box::new(mesh)));
+        skin.parent = Some(0);
+        let model = Model {
+            name: "plate".into(),
+            animation_scale: 1.0,
+            nodes: vec![root, bone, skin],
+            ..Default::default()
+        };
+        Arc::new(GpuModel::new(&gpu, Arc::new(model)))
+    };
+    assert!(plate.shadow_only.first().is_some_and(|m| m.skin.is_some()));
+    let pose = Arc::new(vec![
+        Mat4::IDENTITY,
+        Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0)),
+        Mat4::IDENTITY,
+    ]);
+    let scene = |casts: bool| Scene {
+        instances: vec![
+            Instance {
+                receives_shadows: true,
+                ..Instance::new(ground.clone(), Mat4::from_scale(Vec3::splat(6.0)))
+            },
+            Instance {
+                pose: Some(pose.clone()),
+                casts_shadows: casts,
+                ..Instance::new(plate.clone(), Mat4::IDENTITY)
+            },
+        ],
+        area: AreaLight {
+            ambient: Vec3::splat(0.2),
+            diffuse: Vec3::splat(0.6),
+            direction: Vec3::Z,
+        },
+        shadows: Some(mg_render::SunShadows { opacity: 1.0, fade_limit: 45.0 }),
+        ..Default::default()
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.01, 12.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let grey = |p: [u8; 4]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+    let cast = r.render_image(&gpu, &NoAssets, &scene(true), &camera, 64, 64);
+    let none = r.render_image(&gpu, &NoAssets, &scene(false), &camera, 64, 64);
+    save(&cast, &mg_testkit::output_dir("render").join("shadows_skinned.png"));
+    // (3 m east: 19 pixels right of the middle, 12 m up seeing 10 m across.)
+    let (posed, bound) = ((51, 32), (32, 32));
+    let lit = grey(none.pixel(posed.0, posed.1));
+    assert!(lit > 40.0, "{lit}");
+    assert!(grey(cast.pixel(posed.0, posed.1)) <= 1.0, "{:?}", cast.pixel(posed.0, posed.1));
+    assert!((grey(cast.pixel(bound.0, bound.1)) - grey(none.pixel(bound.0, bound.1))).abs() <= 1.0);
+}
+
+/// Light shadows: a plate that casts (as a creature does) a metre over a
+/// ground that receives, a lamp that casts shadows 3 m to its west and 2 m
+/// up (lifted 2 m more): the plate's shadow falls east of it, away from the
+/// lamp, as dark as the opacity; none without the lights' shadows, nor
+/// from a light that casts none.
+#[test]
+fn a_creature_s_shadow_falls_away_from_its_light() {
+    let Some(gpu) = gpu() else { return };
+    let ground = Arc::new(GpuModel::new(&gpu, Arc::new(quad())));
+    let plate = Arc::new(GpuModel::new(&gpu, Arc::new(shadow_plate())));
+    let lamp = |casts: bool| {
+        mg_render::PointLight::new(Vec3::new(-3.0, 0.0, 2.0), Vec3::ONE, 10.0, false, 4)
+            .casting(casts, 10.0, 2.0)
+    };
+    let scene = |shadows: bool, casts: bool| Scene {
+        instances: vec![
+            Instance {
+                receives_shadows: true,
+                ..Instance::new(ground.clone(), Mat4::from_scale(Vec3::splat(6.0)))
+            },
+            Instance {
+                casts_light_shadows: true,
+                ..Instance::new(
+                    plate.clone(),
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::splat(0.5),
+                        glam::Quat::IDENTITY,
+                        Vec3::new(0.0, 0.0, 1.0),
+                    ),
+                )
+            },
+        ],
+        lights: vec![lamp(casts)],
+        area: AreaLight {
+            ambient: Vec3::splat(0.2),
+            diffuse: Vec3::splat(0.6),
+            direction: Vec3::Z,
+        },
+        light_shadows: shadows.then_some(mg_render::SunShadows { opacity: 0.5, fade_limit: 45.0 }),
+        ..Default::default()
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.01, 12.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let grey = |p: [u8; 4]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+    let mut draw = |s: &Scene| r.render_image(&gpu, &NoAssets, s, &camera, 64, 64);
+    let (cast, off, unflagged) =
+        (draw(&scene(true, true)), draw(&scene(false, true)), draw(&scene(true, false)));
+    save(&cast, &mg_testkit::output_dir("render").join("shadows_light.png"));
+    // From 4 m up and 3 m west, the plate (a metre across, 1 m up) throws
+    // its shadow from 0.33 m to 1.67 m east of its middle; at 6.3 pixels a
+    // metre, the pixel 3 east of the middle is in it, the one 3 west lit.
+    let (east, west) = ((35, 32), (29, 32));
+    let lit = grey(off.pixel(east.0, east.1));
+    assert!(lit > 40.0, "{lit}");
+    let at = |img: &mg_image::Rgba, (x, y): (u32, u32)| grey(img.pixel(x, y));
+    assert!((at(&cast, east) - lit * 0.5).abs() <= 2.0, "{} of {lit}", at(&cast, east));
+    assert!((at(&cast, west) - at(&off, west)).abs() <= 1.0, "west");
+    assert!((at(&unflagged, east) - lit).abs() <= 1.0, "a light that casts none");
+}
+
+/// What the lights' shadows cost at their most: as many creatures as cast
+/// them at once ([`mg_render`]'s 16), each with a light, over a ground
+/// that receives, at the development machine's screen (3440×1440, 4×
+/// MSAA): the frame's time with them and without, printed. Run by hand:
+/// `cargo test --release -p mg-render --test render light_shadows_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn light_shadows_cost() {
+    let Some(gpu) = gpu() else { return };
+    let ground = Arc::new(GpuModel::new(&gpu, Arc::new(quad())));
+    let plate = Arc::new(GpuModel::new(&gpu, Arc::new(shadow_plate())));
+    let mut instances = vec![Instance {
+        receives_shadows: true,
+        ..Instance::new(ground.clone(), Mat4::from_scale(Vec3::splat(20.0)))
+    }];
+    let mut lights = Vec::new();
+    for k in 0..16 {
+        let at = Vec3::new((k % 4) as f32 * 8.0 - 12.0, (k / 4) as f32 * 8.0 - 12.0, 1.0);
+        instances.push(Instance {
+            casts_light_shadows: true,
+            ..Instance::new(
+                plate.clone(),
+                Mat4::from_scale_rotation_translation(Vec3::splat(0.5), glam::Quat::IDENTITY, at),
+            )
+        });
+        lights.push(
+            mg_render::PointLight::new(at + Vec3::new(-3.0, 0.0, 1.0), Vec3::ONE, 10.0, false, 4)
+                .casting(true, 10.0, 3.0),
+        );
+    }
+    let scene = |on: bool| Scene {
+        instances: instances.clone(),
+        lights: lights.clone(),
+        area: AreaLight {
+            ambient: Vec3::splat(0.2),
+            diffuse: Vec3::splat(0.6),
+            direction: Vec3::Z,
+        },
+        light_shadows: on.then_some(mg_render::SunShadows { opacity: 0.5, fade_limit: 45.0 }),
+        ..Default::default()
+    };
+    let camera = Camera::orbit(Vec3::ZERO, 45.0, -1.2, 0.9);
+    let (w, h) = (3440, 1440);
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+    let targets = Targets::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4, w, h);
+    let wait = || {
+        let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    };
+    for on in [false, true, false, true] {
+        let s = scene(on);
+        let mut times = Vec::new();
+        for _ in 0..40 {
+            wait();
+            let t = std::time::Instant::now();
+            r.render_targets(&gpu, &NoAssets, &s, &camera, &targets);
+            wait();
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "lights' shadows {on}: {} creatures, frame {:.2} ms (median), {:.2} (quickest tenth)",
+            r.drawn.light_shadows, times[20], times[4]
+        );
+    }
+}
+
+/// Puts the draws back as they were when a test that blanked them ends,
+/// even by a panic.
+struct Unblank;
+
+impl Drop for Unblank {
+    fn drop(&mut self) {
+        mg_render::guard::blank_draws(false);
+    }
+}
+
+/// The startup check on whatever GPU the platform has (CI's Windows runner
+/// checks Direct3D 12 through Microsoft's Basic Render Driver, its macOS
+/// one Metal on Apple's Paravirtual device): it passes, and fails where
+/// the draws are made to draw nothing (as Heed's Radeon drew through
+/// Direct3D 12), saying what was drawn wrong. Prints its verdicts and
+/// times to the test's output whether or not output is captured. A device
+/// is opened on the adapter after (the window's, after the check's).
+#[test]
+fn the_startup_check_passes_and_fails_where_nothing_is_drawn() {
+    use std::io::Write;
+    // (Blanking every draw: no other test renders meanwhile.)
+    mg_testkit::gpu::alone();
+    let Some(adapter) = mg_render::headless_adapter() else {
+        let _ = writeln!(std::io::stdout(), "startup check: skipped, no GPU adapter");
+        return;
+    };
+    let first = mg_render::probe::probe(&adapter);
+    let again = mg_render::probe::probe(&adapter);
+    let _ = writeln!(std::io::stdout(), "startup check: {first}");
+    let _ = writeln!(std::io::stdout(), "startup check (again): {again}");
+    assert!(first.passed(), "{first}");
+    assert!(again.passed(), "{again}");
+    let blanked = {
+        let _unblank = Unblank;
+        mg_render::guard::blank_draws(true);
+        mg_render::probe::probe(&adapter)
+    };
+    let _ = writeln!(std::io::stdout(), "startup check (draws blanked): {blanked}");
+    assert!(!blanked.passed(), "{blanked}");
+    let why = blanked.outcome.clone().unwrap_err();
+    assert!(why.contains("the solid mesh is") && why.contains("the skinned mesh"), "{why}");
+    assert!(!why.contains("the background"), "the background is drawn right: {why}");
+    // The window's device, on the adapter checked.
+    let features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
+    let opened = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: features,
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }));
+    assert!(opened.is_ok(), "{:?}", opened.err());
+}
+
+/// The watch's look at a target's depth (four samples a pixel, as the area
+/// view's): the points of a ground seen are drawn, the sky's are not, and
+/// the expectation of the same camera says the same points; with the
+/// draws blanked, none is drawn. Prints what a look costs.
+#[test]
+fn the_watch_reads_what_the_gpu_drew_where_it_was_expected() {
+    use mg_render::watch::{self, COLUMNS, ROWS, Sampler};
+    use std::io::Write;
+    mg_testkit::gpu::alone();
+    let Some(gpu) = Gpu::headless() else { return };
+    // A 40 m ground, as four 10 m tiles a side, seen from its south edge,
+    // low: the sky above.
+    let ground = Arc::new(GpuModel::new(&gpu, Arc::new(quad())));
+    let tiles: Vec<Vec3> = (0..16)
+        .map(|i| Vec3::new((i % 4) as f32 * 10.0 + 5.0, (i / 4) as f32 * 10.0 + 5.0, 0.0))
+        .collect();
+    let tile = |t: &Vec3| {
+        let to = Mat4::from_scale_rotation_translation(
+            Vec3::new(5.0, 5.0, 1.0),
+            glam::Quat::IDENTITY,
+            *t,
+        );
+        Instance::new(ground.clone(), to)
+    };
+    let scene = Scene { instances: tiles.iter().map(tile).collect(), ..Default::default() };
+    let camera = Camera {
+        eye: Vec3::new(20.0, -8.0, 6.0),
+        target: Vec3::new(20.0, 20.0, 2.0),
+        fov_y: 40f32.to_radians(),
+        near: 0.1,
+        far: 500.0,
+    };
+    let (w, h) = (640, 360);
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+    let targets = Targets::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4, w, h);
+    let mut sampler = Sampler::new(&gpu, 4);
+    let mut look = |sampler: &mut Sampler| {
+        r.render_targets(&gpu, &NoAssets, &scene, &camera, &targets);
+        let started = std::time::Instant::now();
+        let expected = watch::expected(&tiles, &camera, w as f32 / h as f32);
+        let expecting = started.elapsed();
+        sampler.look(&gpu, &targets, expected, 0.0);
+        let looking = started.elapsed() - expecting;
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        let taking = std::time::Instant::now();
+        let got = sampler.take(&gpu).expect("the look, once the GPU is done");
+        (got, [expecting, looking, taking.elapsed()])
+    };
+    // (What a look costs the frame that takes it, and the one that reads
+    // it: the medians of 21.)
+    let mut times: Vec<[std::time::Duration; 3]> = Vec::new();
+    let mut last = None;
+    for _ in 0..21 {
+        let (got, t) = look(&mut sampler);
+        times.push(t);
+        last = Some(got);
+    }
+    let seen = last.unwrap();
+    let (expected, drawn) = (seen.expected.clone(), seen.drawn.clone());
+    let median = |k: usize| {
+        let mut each: Vec<f64> = times.iter().map(|t| t[k].as_secs_f64() * 1000.0).collect();
+        each.sort_by(f64::total_cmp);
+        each[each.len() / 2]
+    };
+    let picture = mg_testkit::output_dir("render").join("watch_ground.png");
+    save(&gpu.read_rgba(&targets.color), &picture);
+    let (count, of) = watch::counted(&expected, &drawn);
+    let _ = writeln!(
+        std::io::stdout(),
+        "watch: {of} of {count} expected points drawn (of {}); expectation {:.3} ms, look {:.3} \
+         ms, read {:.3} ms (medians; the first look {:.3} ms)",
+        COLUMNS * ROWS,
+        median(0),
+        median(1),
+        median(2),
+        times[0][1].as_secs_f64() * 1000.0,
+    );
+    let grid = (COLUMNS * ROWS) as usize;
+    assert!(count > grid / 4 && count < grid, "{count}");
+    assert!(of as f32 >= 0.97 * count as f32, "{of} of {count}");
+    // (The sky: the top row neither expected nor drawn.)
+    assert!(drawn[..COLUMNS as usize].iter().all(|d| !d));
+    assert!(expected.0[..COLUMNS as usize].iter().all(|e| !e));
+    let blanked = {
+        let _unblank = Unblank;
+        mg_render::guard::blank_draws(true);
+        look(&mut sampler).0
+    };
+    let (count, of) = blanked.counted();
+    assert_eq!((of, count > 0), (0, true), "nothing drawn where the draws are blanked");
+    // The picture's colour at the points: the ground's (white, lit) where
+    // it is drawn, the background's (black) elsewhere.
+    let colored = seen.colored(scene.background);
+    assert!(colored as f32 >= 0.97 * of as f32, "{colored} of {of} drawn points colored");
+    assert_eq!(seen.colors[0], [0.0; 3], "the sky's corner: the background");
+    assert_eq!(blanked.colored(scene.background), 0);
+    // A look the GPU never gives back is given up after a while, and the
+    // next is taken.
+    sampler.look(&gpu, &targets, seen.expected.clone(), 100.0);
+    assert!(sampler.busy());
+    assert!(!sampler.give_up(100.0 + watch::LOST - 0.5));
+    assert!(sampler.give_up(100.0 + watch::LOST));
+    assert!(!sampler.busy());
+}
+
+/// Moonglow's own shaders (each WGSL source the renderer makes, at one
+/// sample a pixel and the area view's four) written in HLSL as wgpu's
+/// Direct3D 12 backend writes them for FXC (shader model 5.1, its binding
+/// map), every entry point, a vertex stage with each fragment stage of
+/// its module: what naga can't write, Direct3D 12 can't draw, and this
+/// shows on every platform. Where `MOONGLOW_D3DCOMPILER` names Microsoft's
+/// `d3dcompiler_47.dll`, FXC compiles them too, under Wine
+/// (`tools/dx12/fxc.sh`). In `target/test-output/hlsl/own/`.
+#[test]
+fn moonglow_s_own_shaders_are_written_in_hlsl_as_direct3d_12_writes_them() {
+    use mg_testkit::hlsl;
+    use naga::ShaderStage;
+    let dir = mg_testkit::output_dir("hlsl/own");
+    let mut failures = Vec::new();
+    let mut written = Vec::new();
+    for (name, source) in mg_render::wgsl_sources() {
+        let module =
+            naga::front::wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let options = hlsl::options(&hlsl::groups_of(&module));
+        let entries: Vec<(ShaderStage, String)> =
+            module.entry_points.iter().map(|e| (e.stage, e.name.clone())).collect();
+        let fragments: Vec<&String> =
+            entries.iter().filter(|(s, _)| *s == ShaderStage::Fragment).map(|(_, n)| n).collect();
+        for (stage, entry) in &entries {
+            // (A vertex stage with each fragment stage it may be paired with.)
+            let with: Vec<Option<&String>> = match stage {
+                ShaderStage::Vertex if !fragments.is_empty() => {
+                    fragments.iter().map(|f| Some(*f)).collect()
+                }
+                _ => vec![None],
+            };
+            for fs in with {
+                let label = match fs {
+                    Some(f) => format!("{name}.{entry}.{f}"),
+                    None => format!("{name}.{entry}"),
+                };
+                let fragment = fs.map(|f| (&module, f.as_str()));
+                match hlsl::write(&module, *stage, entry, fragment, &options) {
+                    Ok((text, ep)) => {
+                        let file = dir.join(format!("{label}.hlsl"));
+                        std::fs::write(&file, text).unwrap();
+                        written.push((file, ep, hlsl::profile(*stage).to_string()));
+                    }
+                    Err(e) => failures.push(format!("{label}: {e}")),
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "not written in HLSL: {failures:#?}");
+    assert!(written.len() >= 20, "{} written", written.len());
+    eprintln!("{} stages written in HLSL, in {}", written.len(), dir.display());
+    let Some(dll) = hlsl::d3dcompiler() else {
+        eprintln!("not compiled: MOONGLOW_D3DCOMPILER names no d3dcompiler_47.dll");
+        return;
+    };
+    let compiled = hlsl::fxc(&dll, &dir, &written).unwrap();
+    for c in &compiled {
+        eprintln!("{} {} ms {}", if c.ok { "OK  " } else { "FAIL" }, c.ms, c.file.display());
+    }
+    let failed: Vec<String> = compiled
+        .iter()
+        .filter(|c| !c.ok)
+        .map(|c| format!("{}: {}", c.file.display(), c.message))
+        .collect();
+    assert!(failed.is_empty(), "FXC failed: {failed:#?}");
+}
+
+/// The lit check (a lit, textured quad as a tile is drawn, by Moonglow's
+/// own shader and by the game's `vslit`/`fslit`: here the ones this test
+/// writes): it passes; a game's program that draws nothing (black) fails
+/// the game's part alone; one whose pipeline the backend refuses falls
+/// back, said as such; and with every draw blanked, Moonglow's own part
+/// fails. Prints its verdicts and times.
+#[test]
+fn the_lit_check_draws_a_lit_mesh_both_ways() {
+    use std::io::Write;
+    struct Unfail;
+    impl Drop for Unfail {
+        fn drop(&mut self) {
+            mg_render::guard::fail_program(None);
+            mg_render::guard::blank_draws(false);
+        }
+    }
+    // (Programs made to fail, draws blanked: no other test renders.)
+    mg_testkit::gpu::alone();
+    let Some(gpu) = Gpu::headless() else { return };
+    let mut assets = TestAssets::default();
+    authored_lit_pair(&mut assets);
+    let lit = mg_render::probe::probe_lit(&gpu, &assets, None);
+    let _ = writeln!(std::io::stdout(), "lit check: {lit}");
+    assert_eq!(lit.own, Ok(()), "{lit}");
+    assert_eq!(lit.game, Some(Ok(())), "{lit}");
+    assert!(!lit.game_fails());
+    assert!(lit.own_color.is_some() && lit.game_color.is_some(), "{lit}");
+    assert!(lit.overridden.is_empty(), "{lit}");
+    // The game's program drawing black: the game's part fails.
+    let mut black = TestAssets::default();
+    authored_lit_pair(&mut black);
+    let fs =
+        "#define SHADER_TYPE 2\nvoid main ()\n{\n    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n}\n";
+    black.shaders.insert("fslit".into(), fs.into());
+    let wrong = mg_render::probe::probe_lit(&gpu, &black, None);
+    let _ = writeln!(std::io::stdout(), "lit check (the game's drawing black): {wrong}");
+    assert_eq!(wrong.own, Ok(()));
+    assert!(matches!(&wrong.game, Some(Err(e)) if e.contains("not red")), "{wrong}");
+    assert!(wrong.game_fails());
+    assert!(mg_render::probe::Lit::drew_nothing(wrong.game_color), "{wrong}");
+    assert!(!mg_render::probe::Lit::drew_nothing(wrong.own_color), "{wrong}");
+    let _unfail = Unfail;
+    // Its pipeline refused: Moonglow's own draws the mesh.
+    mg_render::guard::fail_program(Some("fslit"));
+    let refused = mg_render::probe::probe_lit(&gpu, &assets, None);
+    let _ = writeln!(std::io::stdout(), "lit check (the game's refused): {refused}");
+    assert_eq!((&refused.own, &refused.game), (&Ok(()), &None));
+    assert!(refused.fell_back.as_ref().is_some_and(|w| w.contains("made_to_fail")), "{refused}");
+    assert!(!refused.game_fails());
+    mg_render::guard::fail_program(None);
+    // Nothing drawn at all.
+    mg_render::guard::blank_draws(true);
+    let blanked = mg_render::probe::probe_lit(&gpu, &assets, None);
+    let _ = writeln!(std::io::stdout(), "lit check (draws blanked): {blanked}");
+    assert!(blanked.own.as_ref().is_err_and(|e| e.contains("not red")), "{blanked}");
+    assert!(!blanked.game_fails(), "Moonglow's own fails too: not the game's to blame");
+}
+
+/// A texture read with derivatives (`textureSample`) in a loop whose count
+/// varies from pixel to pixel: the construct of the game's `fslit_nm` and
+/// `fslit_sm_nm`, which read their height map step by step, as many steps
+/// as the view's angle and distance ask (`inc_displacement`'s
+/// `fIterations`). FXC must unroll such a loop and can't (X3570, then
+/// X3511); DXC compiles it. (A count that is a uniform alone FXC compiles:
+/// tried, 2026-10-28.) The count is a uniform (4) times the texture
+/// coordinate across the target: 2 in the middle, where two reads of a
+/// texture of one color, added and quartered, give half the color.
+const DERIVATIVE_LOOP: &str = r#"
+struct Steps { count: u32, step: f32, unused: vec2<u32> }
+@group(0) @binding(0) var<uniform> steps: Steps;
+@group(0) @binding(1) var image: texture_2d<f32>;
+@group(0) @binding(2) var linear: sampler;
+
+struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> Out {
+    let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    var out: Out;
+    out.position = vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = xy;
+    return out;
+}
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    var sum = vec4<f32>(0.0);
+    var uv = in.uv;
+    let count = u32(in.uv.x * f32(steps.count));
+    for (var i = 0u; i < count; i++) {
+        sum += textureSample(image, linear, uv);
+        uv += vec2<f32>(steps.step, 0.0);
+    }
+    return sum * 0.25;
+}
+"#;
+
+/// The texture's one color, and what [`DERIVATIVE_LOOP`] draws of it (two
+/// reads, quartered).
+const LOOP_TEXEL: [u8; 4] = [204, 102, 254, 254];
+const LOOP_DRAWN: [u8; 4] = [102, 51, 127, 127];
+
+/// [`DERIVATIVE_LOOP`] made into a pipeline and drawn on `gpu`: the color
+/// in the middle of what was drawn, or what the backend said making the
+/// pipeline (Direct3D 12 with FXC: an internal error, X3511).
+fn derivative_loop_drawn(gpu: &Gpu) -> Result<[u8; 4], String> {
+    let device = &gpu.device;
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("derivative_loop"),
+        source: wgpu::ShaderSource::Wgsl(DERIVATIVE_LOOP.into()),
+    });
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("derivative_loop"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(format.into())],
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let said: Vec<String> = [internal, validation]
+        .into_iter()
+        .filter_map(|scope| pollster::block_on(scope.pop()))
+        .map(|e| e.to_string())
+        .collect();
+    if !said.is_empty() {
+        return Err(said.join("; "));
+    }
+    let size = |side| wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 };
+    let image = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("derivative_loop image"),
+        size: size(4),
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    gpu.queue.write_texture(
+        image.as_image_copy(),
+        &LOOP_TEXEL.repeat(16),
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(16), rows_per_image: None },
+        size(4),
+    );
+    let mut steps = [0u8; 16];
+    steps[..4].copy_from_slice(&4u32.to_le_bytes());
+    steps[4..8].copy_from_slice(&0.05f32.to_le_bytes());
+    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("derivative_loop steps"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    gpu.queue.write_buffer(&uniform, 0, &steps);
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let image_view = image.create_view(&Default::default());
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("derivative_loop"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&image_view),
+            },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+        ],
+    });
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("derivative_loop target"),
+        size: size(8),
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("derivative_loop"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    gpu.queue.submit([encoder.finish()]);
+    let read = gpu.try_read_rgba(&target)?;
+    let at = (4 * 8 + 4) * 4;
+    Ok(read.data[at..at + 4].try_into().unwrap())
+}
+
+/// The construct FXC can't compile ([`DERIVATIVE_LOOP`]) on whatever GPU
+/// the platform has: where Direct3D 12 compiles with DXC (the
+/// `dxcompiler.dll` beside the program: on CI's Windows runner, the
+/// pinned release put beside the test binaries, `MOONGLOW_REQUIRE_DXC=1`),
+/// and on Vulkan and Metal, it compiles and draws right; where Direct3D 12
+/// compiles with FXC (no `dxcompiler.dll`), its pipeline is refused with
+/// X3511. Which compiler and what came of it is printed to the test's
+/// output whether or not output is captured.
+#[test]
+fn a_texture_read_in_a_loop_of_a_varying_count_compiles_and_draws() {
+    use std::io::Write;
+    mg_testkit::gpu::hold();
+    let compiler = mg_render::dx12::compiler();
+    let require_dxc = std::env::var_os("MOONGLOW_REQUIRE_DXC").is_some_and(|v| v == "1");
+    let Some(adapter) = mg_render::headless_adapter() else {
+        let _ = writeln!(std::io::stdout(), "compiler check: skipped, no GPU adapter");
+        assert!(!require_dxc, "MOONGLOW_REQUIRE_DXC=1 but no GPU adapter ({compiler})");
+        return;
+    };
+    let info = adapter.get_info();
+    let backend = mg_render::backend::backend_name(info.backend);
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default()))
+        .expect("a device on the headless adapter");
+    let gpu = Gpu::new(device, queue);
+    let drawn = derivative_loop_drawn(&gpu);
+    let what = match &drawn {
+        Ok(c) => format!("compiled and drawn {c:?} (right: {LOOP_DRAWN:?})"),
+        Err(e) => format!("refused: {e}"),
+    };
+    let _ = writeln!(
+        std::io::stdout(),
+        "compiler check: {backend} on {}; {compiler}; {what}",
+        info.name
+    );
+    if require_dxc {
+        assert_eq!(info.backend, wgpu::Backend::Dx12, "MOONGLOW_REQUIRE_DXC=1: {backend}");
+        assert!(compiler.is_dxc(), "MOONGLOW_REQUIRE_DXC=1: {compiler}");
+    }
+    let fxc = info.backend == wgpu::Backend::Dx12
+        && matches!(compiler, mg_render::dx12::ShaderCompiler::Fxc(_))
+        || matches!(compiler, mg_render::dx12::ShaderCompiler::Environment(v)
+            if v.eq_ignore_ascii_case("fxc"));
+    if fxc && info.backend == wgpu::Backend::Dx12 {
+        let why = drawn.expect_err("FXC compiled the loop");
+        assert!(why.contains("X3511"), "{why}");
+        return;
+    }
+    let color = drawn.unwrap_or_else(|e| panic!("{backend}, {compiler}: {e}"));
+    for (got, want) in color.iter().zip(LOOP_DRAWN) {
+        assert!(got.abs_diff(want) <= 2, "drawn {color:?}, not {LOOP_DRAWN:?}");
+    }
+}
+
+/// [`DERIVATIVE_LOOP`] written in HLSL as Direct3D 12 writes it: at shader
+/// model 5.1, where `MOONGLOW_D3DCOMPILER` names Microsoft's
+/// `d3dcompiler_47.dll`, FXC refuses its fragment stage (X3511); at 6.0
+/// and the later models DXC is given, where `MOONGLOW_DXC` names a DXC
+/// release's `bin/x64`, `dxcompiler.dll` alone (no `dxil.dll`) compiles
+/// and signs both stages. Both under Wine (`tools/dx12`). In
+/// `target/test-output/hlsl/loop/`.
+#[test]
+fn fxc_refuses_the_loop_and_dxc_compiles_it() {
+    use mg_testkit::hlsl;
+    use naga::ShaderStage;
+    let dir = mg_testkit::output_dir("hlsl/loop");
+    let module = naga::front::wgsl::parse_str(DERIVATIVE_LOOP).unwrap();
+    let groups = hlsl::groups_of(&module);
+    let write = |model: naga::back::hlsl::ShaderModel| {
+        let options = hlsl::options_at(&groups, model);
+        let mut written = Vec::new();
+        for (stage, entry, fragment) in [
+            (ShaderStage::Vertex, "vs", Some((&module, "fs"))),
+            (ShaderStage::Fragment, "fs", None),
+        ] {
+            let (text, ep) = hlsl::write(&module, stage, entry, fragment, &options).unwrap();
+            let file = dir.join(format!("{entry}.{}.hlsl", model.to_str()));
+            std::fs::write(&file, text).unwrap();
+            written.push((file, ep, hlsl::profile_at(stage, model)));
+        }
+        written
+    };
+    let fxc_written = write(naga::back::hlsl::ShaderModel::V5_1);
+    let dxc_written: Vec<_> = hlsl::DXC_SHADER_MODELS.iter().flat_map(|&m| write(m)).collect();
+    match hlsl::d3dcompiler() {
+        Some(dll) => {
+            let compiled = hlsl::fxc(&dll, &dir, &fxc_written).unwrap();
+            for c in &compiled {
+                eprintln!(
+                    "FXC {} {}: {}",
+                    if c.ok { "OK  " } else { "FAIL" },
+                    c.file.display(),
+                    c.message
+                );
+            }
+            assert!(compiled[0].ok, "FXC: the vertex stage: {}", compiled[0].message);
+            assert!(!compiled[1].ok, "FXC compiled the loop");
+            assert!(compiled[1].message.contains("X3511"), "{}", compiled[1].message);
+        }
+        None => eprintln!("FXC not run: MOONGLOW_D3DCOMPILER names no d3dcompiler_47.dll"),
+    }
+    match hlsl::dxc_dir() {
+        Some(dxc) => {
+            let compiled = hlsl::dxc(&dxc, &dir, &dxc_written).unwrap();
+            for c in &compiled {
+                eprintln!(
+                    "DXC {} {}: {}",
+                    if c.ok { "OK  " } else { "FAIL" },
+                    c.file.display(),
+                    c.message
+                );
+            }
+            let failed: Vec<_> = compiled.iter().filter(|c| !c.ok).collect();
+            assert!(failed.is_empty(), "DXC: {failed:#?}");
+        }
+        None => {
+            eprintln!("DXC not run: MOONGLOW_DXC names no folder of dxc.exe and dxcompiler.dll")
         }
     }
 }

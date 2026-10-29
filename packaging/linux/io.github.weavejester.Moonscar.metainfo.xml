@@ -45,6 +45,49 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.13.3" date="2026-10-29">
+      <description>
+        <p>A model with several textured meshes is drawn as soon as its
+        textures are read, not one mesh's textures at a time. mg watch
+        takes the server's player, DM and admin passwords with --serve.</p>
+      </description>
+    </release>
+    <release version="2.13.2" date="2026-10-29">
+      <description>
+        <p>A module's haks are loaded again: 2.13.1 opened every module
+        without them. The lit check draws the game's own shader files and
+        says when they draw its test mesh in the wrong colors.</p>
+      </description>
+    </release>
+    <release version="2.13.1" date="2026-10-29">
+      <description>
+        <p>Moonglow catches more ways a graphics driver can fail to draw an
+        area, and Direct3D 12 compiles the game's normal-mapped shaders
+        with DXC; scripts including the base game's x2_inc_cutscene compile
+        as in Aurora; the unused-scripts report gives one line a script and
+        knows scripts run from 2DAs; a tile's textures can be inspected;
+        Alt + middle click focuses the area view's camera.</p>
+      </description>
+    </release>
+    <release version="2.13.0" date="2026-10-28">
+      <description>
+        <p>Moonglow checks what the GPU draws, at startup and while an
+        area is open, and changes backend where a driver draws nothing;
+        a sprint through the deferred list fixes the tile tools, objects
+        edited together, the module tree, the NUI Creator, nasher
+        projects' talk tables, mg test's stale scripts and more.</p>
+      </description>
+    </release>
+    <release version="2.12.0" date="2026-10-28">
+      <description>
+        <p>The area view draws shadows as the game does: the sun's and
+        moon's, creatures', and lamps', each chosen from the Shadows
+        button's menu, as dark as the area's Shadow Opacity; variable sets
+        are renamed, deleted, and saved to and added from files; the
+        toolbars can show icons only; a long dropdown no longer widens
+        while open.</p>
+      </description>
+    </release>
     <release version="2.11.0" date="2026-10-28">
       <description>
         <p>A graphics backend in Options (Automatic, Vulkan, Direct3D 12,
