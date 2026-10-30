@@ -1,9 +1,9 @@
 ---
 type: Manual Page
 title: Options
-description: The Options dialog page by page (folders, area, general with the graphics backend and the toolbar buttons, script editor, conversation editor, sounds, verify, language, keyboard, updates) and where the settings are kept.
+description: The Options dialog page by page (folders and the NWSync upload command, area, general with the graphics backend and the toolbar buttons, script editor, conversation editor, sounds, verify, language, keyboard, updates) and where the settings are kept.
 tags: [manual, options]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T12:16:26Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T13:45:00Z }
 ---
 
 # Options
@@ -28,6 +28,13 @@ the module is opened again from its file.
   view) and **Copy to Scratch Folder** (the module tree) copy a script
   with its compiled script, or an area, as loose files. Empty: asked for
   the first time. See [Modules](03-modules.md).
+- **NWSync upload command**: what **Upload** in Build › Publish to
+  NWSync runs to send the repository to your web server, once for each
+  part (`{part}`: `data`, then `manifests`, then `latest`), in the
+  repository's folder (`{folder}`); **It reads what I type** gives it a
+  line under its output, as a project's command with `input = true`.
+  A project's `[nwsync] upload` is used in its place. See [Uploading to
+  the web server](09-build-and-test.md#uploading-to-the-web-server).
 
 ## Area
 
@@ -37,12 +44,34 @@ the module is opened again from its file.
   of that size, and an arrow the way what spawns there faces.
 - **Show stores as $ signs**: the game's marker for a store, rather
   than an arrow along its facing.
+- **Shadows quality**: how the area view draws the game's shadows (its
+  **◑ Shadows**; also chosen in that button's menu, see
+  [Areas](04-areas.md)). **Fast** (the default): a shadow map stands in
+  for the game's shadows, cheap in every area; in a large area seen out
+  to its far side, its edges up close are a little soft and stepped.
+  **High**: stencil shadow volumes, the game's own kind: each mesh
+  flagged `shadow` extruded away from the sun (or a creature's light),
+  edges as sharp as the picture's and smoothed with it, as the game
+  draws them at its highest shadow setting. High costs more where many
+  tiles cast at once (the largest areas seen whole) and keeps a depth
+  and stencil buffer of the view's size (about 160 MB at 3440×1440 with
+  four samples a pixel). Skins (a robe's or a dragon's wings' skinned
+  meshes) cast none with High, as the wiki says of the game, where Fast casts them.
 - **Show the turning and tilt rings around selected objects**: the ring
   that turns the selection when dragged round, and the two that tilt
   its models, with the arrows that move it along one axis, while Shift
   is held (see [Areas](04-areas.md)). On by
   default.
 - **Show Door Orientation Arrows**.
+- **Lights of any color and reach, written into a hak** (off by
+  default): Moonglow's own. On, the area's **Add Light Here** and the
+  palette's **☀ Lights** offer **Custom Light…** (see
+  [Areas](04-areas.md#lights-of-any-color-and-reach)), which writes a
+  light's model and a placeables.2da row into a hak you choose, one
+  the module's players must have. Off, nothing is ever written into a
+  hak for a light, and nothing of it shows but this option. A project's
+  `moonglow.toml` can say it for the team (`[lights] generated`), which
+  wins over this.
 - **Allow editing tiles of groups and features** (off by default):
   Moonglow's own. Off, a group or feature (a barn, a gate, a statue) is
   one thing: Next and Previous Tile Appearance, Rotate Tile, Refine
@@ -84,13 +113,18 @@ the module is opened again from its file.
   of its usual size.
 - **Light theme**: dark text on light, rather than the dark theme.
 - **Toolbar buttons** (Icons and text): **Icons only** shows the
-  buttons of the main toolbar and of the area view's toolbar as their
-  icons alone, as Aurora's toolbars are, to save room: the area view's
-  toolbar takes about half the rows it took. Rest the pointer on an
-  icon and its tip names it, with its key and what it does. Buttons
-  without an icon (All, None, Together, To Scratch) and the dropdowns
-  (Fade Geometry, Snap, Turn) keep their words. It takes effect at once,
-  when you choose OK.
+  buttons of the main toolbar, of the area view's toolbar and of the
+  editors' toolbars (the script editor's, the conversation editor's, a
+  model's view and the NUI Creator's) as their icons alone, as Aurora's
+  toolbars are, to save room: the area view's toolbar takes about half
+  the rows it took. Rest the pointer on an icon and its tip names it,
+  with its key and what it does; a screen reader reads the button's
+  name, not its icon. The area view's dropdowns show an icon for what
+  they set (🏠 Fade Geometry, 📐 Snap, ↻ Turn) before their choice. The
+  editors' buttons show their words alone with Icons and text, as they
+  always have; the palette's tile tools (Select Tiles, Eraser, Refine
+  Tile…) are rows of its list, named as in Aurora's palette, and keep
+  their names. It takes effect at once, when you choose OK.
 - **Graphics backend** (Automatic): what the window, the area view and
   the previews draw with. **Automatic** is the graphics library's
   (wgpu's) choice, except that an AMD GPU on Windows draws through
@@ -122,8 +156,10 @@ the module is opened again from its file.
   (a hak, a 2DA, a tileset) and tools open when a module was closed open
   again with it, in their order and places (windows split and where
   they were), the one in front in front, each view as it was left (an
-  area's camera, a script's scroll and cursor, a conversation's
-  selection, bookmarks and folds, a Properties window's page); kept in
+  area's camera, a model view's, a script's scroll, cursor and
+  bookmarks, a conversation's selection, bookmarks and folds, the talk
+  table's line, a Properties window's page, a hak's selection, a 2DA's
+  cell, a tileset's page and tile, Advanced Search's conditions); kept in
   Moonglow's data folder, not in the module (see
   [Modules](03-modules.md)). With none kept, the module opens
   on the area opened last, as above. Off, a module's tabs are neither
@@ -177,30 +213,47 @@ the module is opened again from its file.
   shows it (`ipf_` parts; a cloak's is the man's, the game having no
   other), in inventories, a store's pages, the palette's pictures and
   Preview and the item's Properties, whose Appearance page's **Shown
-  on** changes it too. Off by default: a man's.
+  on** changes it too. Off by default: a man's. A creature's own
+  Inventory page shows the icons of its Gender, as the game does.
 - **Read Steam Workshop content**: off by default, as in Aurora: an item
   you subscribed to for play is not your module's, and a module that
   needs it works only for players who have it too. On, the Steam
   Workshop items you are subscribed to are read with the game's data, as
   the game started through Steam reads them: each item's `override`
-  under your own, its haks and talk tables found by name. Changing it
-  reads the game's data again.
+  under your own, its haks and talk tables found by name, its
+  `portraits`, `ambient` and `music` under your own and over the
+  game's (an item's module is opened as any module, by File › Open).
+  Changing it reads the game's data again. `mg --workshop` reads them
+  too.
 - **Read userpatch.ini's haks**: off by default, as in Aurora, for the
   same reason. On, the haks your
   `userpatch.ini` names (`PatchFile000=…` and on, the highest number
   winning), from the `patch` folder in your user folder (or the folder
   `nwn.ini` names as `PATCH`), are read under the module and its haks
-  and over `override`, as the game reads them: the HD Pack and the like
-  show in the area view and the previews. Aurora doesn't read them. A
-  module that needs what only they provide works only for players who
-  have them too, so Verify warns of each such reference ("only in
-  userpatch.ini's haks"). Their own files are not checked as the
-  module's custom content. Changing it reads the game's data again.
+  and over `override`, as the game reads them (measured in the game's
+  server): the HD Pack and the like show in the area view and the
+  previews. Aurora doesn't read them; `mg --userpatch` does. Their own
+  files are not checked as the module's custom content. Changing it
+  reads the game's data again.
+
+  What only your own content provides, a player has only if they have
+  the same: so Verify warns of each reference only userpatch.ini's
+  haks, your `override` folder or a Workshop item satisfies ("only in
+  userpatch.ini's haks", "only in your override folder", "only in a
+  Steam Workshop item"), and of a custom talk table found first there
+  (the game reads one from there too, and a player without it can't
+  load the module). Content you keep in `override` on purpose need not
+  fill Verify's report: Options › Verify's **Also leave out** takes
+  `references:override` (or `references:userpatch`,
+  `references:workshop`, all three as `references:local`), as `mg verify
+  --skip` does. Music and ambient sounds in these haks are read as any of
+  their resources, as the game reads them.
 - **Reload haks, override and development when they change**: on by
-  default. Moonglow checks every few seconds and rereads what changed
+  default. Moonglow is told by the system when they change (it checks
+  every few seconds where it can't be) and rereads what changed
   (see [Build, verify and test](09-build-and-test.md)). The same switch
-  has a nasher project's own files read again when another program
-  changes them (see [Modules](03-modules.md)).
+  has a nasher project's own files, a module folder's and a `.mod` read
+  again when another program changes them (see [Modules](03-modules.md)).
 - **Keep a recovery copy of unsaved work every … minutes** (5 by
   default; see [Modules](03-modules.md)).
 - Warnings: **Show reserved Blueprint ResRef namespace warning** (a
@@ -241,15 +294,21 @@ the module is opened again from its file.
 - **External Script Editor**: the program the External Editor button
   opens scripts in.
 - **Open scripts in the external editor**: a script opened from the
-  module tree opens there as well; what it saves comes back into
-  Moonglow's editor. In a nasher project the external editor gets the
-  project's own file (see [Scripts](07-scripts.md)).
+  module tree opens there as well, and so does one opened by the script
+  editor's Open…, made by New Script or Save As, opened by the Script
+  Wizard or by the NUI Creator's handlers and opener script, or by Edit
+  beside a script's name; what it saves comes back into Moonglow's
+  editor. Going to a line (a compiler message, Definition, References,
+  a search result) stays in Moonglow's editor. In a nasher project the
+  external editor gets the project's own file (see
+  [Scripts](07-scripts.md)).
 - **…and not in Moonglow's editor**: with the option above, only the
   external editor opens, for a script kept as a file of its own (a
   nasher project's, a module folder's): what it saves is read as files
   changed outside are (General). A script in a `.mod` file still opens
   in Moonglow's editor too, which is how the external editor's saves
-  come back; so does one Moonglow holds unsaved text of.
+  come back; so does one Moonglow holds unsaved text of, and a new one
+  (New Script, Save As) until File › Save writes its file.
 - **External Script Compiler**: a compiler program to use in place of the
   built-in one (empty: the built-in one, which is the game's and
   Aurora's own). Compile in the script editor, Compile All Scripts, the
@@ -279,7 +338,9 @@ the module is opened again from its file.
   conversation opens as a tab of the window one is open in already; off,
   each in a window of its own.
 - **Show speaker name before text**, and the **NPC** and **Player** text
-  colors.
+  colors (by default red and blue, darker in the light theme, where a
+  link's lines are a darker gray too, so that they stand out against
+  white as they do against the dark theme's black).
 - **Font size**: the size of the conversation editor's text (its lines,
   its buttons, the fields under them, and the lists and right-click
   menus opened from it), apart from the rest of the window; **Default**
@@ -302,11 +363,20 @@ tileset errors you are not going to fix, say, that hide the rest):
 **Missing references**, **Tilesets**, **Models and materials**,
 **2DAs**, **Objects' and areas' 2DA rows and variables**, **Talk table
 and archives** and **Plugins' checks**. Hover over one for the checks it
-holds. A group left out isn't checked at all, so leaving out the
-tilesets and models of a module with many haks makes Verify much
-quicker. The log's summary line after a Verify names what it left out,
-not checked, so a module isn't taken to be clean for what wasn't
-looked at. `mg verify --skip` does the same from a terminal.
+holds; the arrow beside it lists them, each to leave out alone (by the
+id `mg checks` gives it: hover over one for what it holds to be true).
+Under **Missing references** are the categories of Build Module's
+Missing Resources (the references the module's creatures make, its
+doors'…), and under **Plugins' checks** each enabled plugin's checks.
+**Also leave out** takes haks (`tdod_tiles01.hak`), the `override` or
+`development` folder, and resources: a tileset (`ttr01.set`, with its
+tiles' models), a 2DA or a model, separated by commas; a word that is
+none of these is said under the field and not kept. What is left out
+isn't checked at all, so leaving out the tilesets and models of a
+module with many haks makes Verify much quicker. The log's summary line
+after a Verify names what it left out, not checked, so a module isn't
+taken to be clean for what wasn't looked at. `mg verify --skip` does
+the same from a terminal.
 
 ## Language
 
@@ -337,7 +407,8 @@ changes).
 ## Keyboard
 
 Every command and its keys, by where it works (anywhere, the area view,
-the script editor, the conversation editor, the NUI Creator). Every command of the menus
+the script editor, the conversation editor, the NUI Creator, the module
+tree and the palettes). Every command of the menus
 is listed, in the menus' order, whether it has a key or not: give Build
 Module or Verify Module one here. **Find a command** narrows the list to
 what you type (a command's name, or its group's).
@@ -345,7 +416,8 @@ what you type (a command's name, or its group's).
   it. A command can have several keys, or none.
 - **Reset** gives a command Moonglow's keys back, **Reset All** every
   command.
-- **Export…** writes the keys you chose as a file, to keep or to hand to
+- **Export…** writes the keys you chose as a file (a `.json`, named
+  `moonglow-keys.json` unless you name it otherwise), to keep or to hand to
   someone; **Import…** takes such a file's keys in place of yours (every
   command the file doesn't name goes back to Moonglow's keys). As with
   the rest of Options, OK keeps them.
@@ -355,6 +427,9 @@ what you type (a command's name, or its group's).
   (Delete), Duplicate Element (Ctrl+D), Move Element Up and Down
   (Alt+Up, Alt+Down), Select Previous and Next Element (Up, Down). See
   [NUI Creator](18-nui-creator.md).
+- **Module Tree and Palettes** holds Expand All (Ctrl+Shift+Right) and
+  Collapse All (Ctrl+Shift+Left), while the module tree or a palette has
+  the keys.
 - The commands of enabled [plugins](15-plugins.md) are listed under
   **Plugins**, with the key each plugin suggests; they take keys like
   any other.

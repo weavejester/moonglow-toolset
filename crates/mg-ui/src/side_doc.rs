@@ -25,6 +25,11 @@ pub(crate) trait SideDoc {
     }
     /// Whether it has a step to undo (or, `redo`, to redo).
     fn can_undo(&self, redo: bool) -> bool;
+    /// The name of the step Undo (or, `redo`, Redo) would take, where its
+    /// editor names its steps: Edit › Undo says it ("Undo Add Files").
+    fn step_name(&self, _redo: bool) -> Option<String> {
+        None
+    }
     /// Undoes (or redoes) its last step.
     fn undo(&mut self, redo: bool);
     /// Saves it where it lives (asking where, if it must): whether it was.
@@ -48,7 +53,10 @@ impl SideDoc for hak_view::HakDoc {
         self.hak.path.as_ref().is_some_and(|p| root.is_none_or(|r| !p.starts_with(r)))
     }
     fn can_undo(&self, redo: bool) -> bool {
-        (if redo { self.hak.redo_label() } else { self.hak.undo_label() }).is_some()
+        self.step_name(redo).is_some()
+    }
+    fn step_name(&self, redo: bool) -> Option<String> {
+        (if redo { self.hak.redo_label() } else { self.hak.undo_label() }).map(str::to_string)
     }
     fn undo(&mut self, redo: bool) {
         if redo {
@@ -75,8 +83,14 @@ impl SideDoc for table_view::TableDoc {
         self.has_unsaved()
     }
     fn can_undo(&self, redo: bool) -> bool {
-        self.typing.is_none()
-            && (if redo { self.edit.redo_label() } else { self.edit.undo_label() }).is_some()
+        self.step_name(redo).is_some()
+    }
+    /// (None while a cell is being typed: the typing is the cell's own.)
+    fn step_name(&self, redo: bool) -> Option<String> {
+        if self.typing.is_some() {
+            return None;
+        }
+        (if redo { self.edit.redo_label() } else { self.edit.undo_label() }).map(str::to_string)
     }
     /// (Not while a cell is being typed: the typing is the cell's own.)
     fn undo(&mut self, redo: bool) {
@@ -131,6 +145,50 @@ impl SideDoc for tileset_view::TilesetDoc {
     }
 }
 
+/// OK and Cancel under the window of an editor of a file that is saved
+/// when asked (a hak, a 2DA, a tileset, the talk table, a script), as the
+/// other editors have them: OK saves it and closes the window; Cancel
+/// closes it as last saved, asking first about unsaved changes
+/// ([`Moonglow::may_cancel`]). One only looked at (`read_only`) has
+/// Close. Drawn before the window's pages, of whose room it takes the
+/// foot; `before` is run once a button is pressed (a cell being typed
+/// set). Whether the window is closing: nothing more is drawn of it.
+pub(crate) fn ok_cancel(
+    app: &mut Moonglow,
+    ui: &mut egui::Ui,
+    tab: &Tab,
+    read_only: bool,
+    before: impl FnOnce(&mut Moonglow),
+) -> bool {
+    use crate::blueprint::Pressed;
+    let tips = [
+        "Save and close the window",
+        "Close the window without saving (unsaved changes are asked about first)",
+    ];
+    let id = egui::Id::new(("side-ok-cancel", tab));
+    let Some(pressed) = crate::blueprint::ok_cancel_saying(ui, id, read_only, tips) else {
+        return false;
+    };
+    before(app);
+    let close = match pressed {
+        // (Close: as its ×.)
+        Pressed::Ok if read_only => app.may_close(tab),
+        Pressed::Ok => {
+            let unsaved = app.asked_about(tab).is_some_and(|(_, unsaved)| unsaved);
+            let saved = !unsaved || app.save_side(tab);
+            if saved {
+                app.forget_side(tab);
+            }
+            saved
+        }
+        Pressed::Cancel => app.may_cancel(tab),
+    };
+    if close {
+        app.actions.push(crate::Action::CloseTab(tab.clone()));
+    }
+    close
+}
+
 /// Whether a tab is a side editor's (whether or not its document is still
 /// open).
 pub(crate) fn is_side(tab: &Tab) -> bool {
@@ -174,23 +232,77 @@ impl Moonglow {
         }
     }
 
-    /// Saves a side editor's document: whether it was.
+    /// Saves a side editor's document (or the talk table, a script):
+    /// whether it was.
     fn save_side(&mut self, tab: &Tab) -> bool {
         match *tab {
             Tab::Hak(id) => <hak_view::HakDoc as SideDoc>::save(self, id),
             Tab::Table(id) => <table_view::TableDoc as SideDoc>::save(self, id),
             Tab::Tileset(id) => <tileset_view::TilesetDoc as SideDoc>::save(self, id),
+            Tab::TalkTable => crate::talk_view::save(self),
+            Tab::Script(key) => {
+                crate::script_view::save_script(self, key, crate::script_view::ScriptSave::Save);
+                true
+            }
             _ => false,
         }
     }
 
-    /// Lets a side editor's document go (its changes with it).
+    /// Lets a side editor's document go (its changes with it), or the
+    /// talk table's and a script's unsaved changes (a Cancel's Don't
+    /// Save: the table is read again from its file, the script from the
+    /// module, when next shown).
     pub(crate) fn forget_side(&mut self, tab: &Tab) {
         match *tab {
             Tab::Hak(id) => self.haks.retain(|d| d.id != id),
             Tab::Table(id) => self.tables.retain(|d| d.id != id),
             Tab::Tileset(id) => self.tilesets.retain(|d| d.id != id),
+            Tab::TalkTable if self.talk.as_ref().is_some_and(|t| t.is_dirty()) => {
+                self.talk = None;
+                self.talk_view = Default::default();
+            }
+            Tab::Script(key) => {
+                self.scripts.remove(&key);
+            }
             _ => {}
+        }
+    }
+
+    /// What the closing question asks about a tab: its document's name
+    /// and whether it has unsaved changes. A side editor's, or (for its
+    /// Cancel: their tabs' close keeps what is unsaved, for the module's
+    /// Save) the talk table's and a script's.
+    fn asked_about(&self, tab: &Tab) -> Option<(String, bool)> {
+        match tab {
+            Tab::TalkTable => {
+                let t = self.talk.as_ref()?;
+                Some((format!("the talk table {}", t.name), t.is_dirty() && t.editable()))
+            }
+            Tab::Script(key) => {
+                let dirty = self.scripts.get(key).is_some_and(|b| b.is_dirty());
+                Some((key.to_string(), dirty))
+            }
+            _ => self.side_doc(tab).map(|d| (d.title(), d.has_unsaved())),
+        }
+    }
+
+    /// A window's Cancel, for an editor of a file that is saved when asked
+    /// (a hak, a 2DA, a tileset, the talk table, a script): with unsaved
+    /// changes, Save, Don't Save or Cancel is asked first ([`closing_window`],
+    /// which closes it), and it stays; without, it may close now.
+    pub(crate) fn may_cancel(&mut self, tab: &Tab) -> bool {
+        match self.asked_about(tab) {
+            Some((_, true)) => {
+                if !self.side_closing.contains(tab) {
+                    self.side_closing.push_back(tab.clone());
+                }
+                false
+            }
+            Some(_) => {
+                self.forget_side(tab);
+                true
+            }
+            None => true,
         }
     }
 
@@ -231,9 +343,14 @@ impl Moonglow {
     }
 
     /// The side editor Undo and Redo are for, if one: the one under the
-    /// pointer, else the 2DA grid that has the keys.
+    /// pointer, else the 2DA grid that has the keys, else, with the
+    /// pointer on the menu bar or the toolbar (or a menu open), the one it
+    /// was over before (Edit › Undo and the toolbar's Undo are its).
     fn local_undo_target(&self) -> Option<Tab> {
-        self.undo_under_pointer.clone().or_else(|| self.undo_keys.clone())
+        self.undo_under_pointer
+            .clone()
+            .or_else(|| self.undo_keys.clone())
+            .or_else(|| self.undo_before_bars.clone().filter(|_| self.pointer_on_bars))
     }
 
     /// Whether Undo (or, `redo`, Redo) is a side editor's or the talk
@@ -246,6 +363,14 @@ impl Moonglow {
             return Some(if redo { t.can_redo() } else { t.can_undo() });
         }
         self.side_doc(&tab).map(|d| d.can_undo(redo))
+    }
+
+    /// The name of the step a side editor's Undo (or, `redo`, Redo) would
+    /// take, when Undo is that editor's and it names its steps (a hak's,
+    /// a 2DA's; a tileset's and the talk table's name none).
+    pub(crate) fn local_step_name(&self, redo: bool) -> Option<String> {
+        let tab = self.local_undo_target()?;
+        self.side_doc(&tab)?.step_name(redo)
     }
 
     /// Undo (or, `redo`, Redo) in the editor of a file outside the module
@@ -282,15 +407,15 @@ pub(crate) fn closing_window(app: &mut Moonglow, ctx: &egui::Context) {
     // (A document let go meanwhile is not asked about; one saved meanwhile
     // closes, as was asked.)
     while let Some(tab) = app.side_closing.front().cloned() {
-        match app.side_doc(&tab) {
+        match app.asked_about(&tab) {
             None => {}
-            Some(d) if !d.has_unsaved() => close(app, &tab),
+            Some((_, false)) => close(app, &tab),
             Some(_) => break,
         }
         app.side_closing.pop_front();
     }
     let Some(tab) = app.side_closing.front().cloned() else { return };
-    let Some(title) = app.side_doc(&tab).map(|d| d.title()) else { return };
+    let Some((title, _)) = app.asked_about(&tab) else { return };
     let more = app.side_closing.len() - 1;
     enum Answer {
         Save,
@@ -298,7 +423,7 @@ pub(crate) fn closing_window(app: &mut Moonglow, ctx: &egui::Context) {
         Cancel,
     }
     let mut answer = None;
-    widgets::window("Unsaved Changes").id(egui::Id::new("side-doc-closing")).show(ctx, |ui| {
+    widgets::modal(ctx, "Unsaved Changes").id(egui::Id::new("side-doc-closing")).show(ctx, |ui| {
         ui.label(format!("Save changes to {title}?"));
         if more > 0 {
             ui.weak(format!(

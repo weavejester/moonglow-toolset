@@ -35,8 +35,19 @@ pub enum FileKind {
     Tileset,
     /// A plugin's archive: `.zip`.
     Plugin,
+    /// NUI windows to import: `.jui` files (with what is beside them) and
+    /// archives of them.
+    NuiWindows,
     /// The log, as text: `.txt`.
     Log,
+    /// A 2DA table: `.2da`.
+    Table,
+    /// A talk table: `.tlk`.
+    TalkTable,
+    /// A talk table's lines, as CSV or (`json`) as `nwn_tlk`'s JSON.
+    TalkLines { json: bool },
+    /// The keys chosen in Options › Keyboard, as a file: `.json`.
+    Keys,
 }
 
 impl FileKind {
@@ -67,7 +78,16 @@ impl FileKind {
             (FileKind::Tileset, false) => "Open Tileset",
             (FileKind::Tileset, true) => "New Tileset",
             (FileKind::Plugin, _) => "Install Plugin from File",
+            (FileKind::NuiWindows, _) => "Import NUI Windows",
             (FileKind::Log, _) => "Save Log",
+            (FileKind::Table, false) => "Open 2DA",
+            (FileKind::Table, true) => "Save 2DA As",
+            (FileKind::TalkTable, false) => "Open Talk Table",
+            (FileKind::TalkTable, true) => "New Talk Table",
+            (FileKind::TalkLines { .. }, false) => "Import Lines",
+            (FileKind::TalkLines { .. }, true) => "Export Lines",
+            (FileKind::Keys, false) => "Import Keys",
+            (FileKind::Keys, true) => "Export Keys",
         }
     }
 
@@ -86,13 +106,25 @@ impl FileKind {
             (FileKind::Story, _) => Some(("Twine or Ink stories", &["twee", "tw", "ink"])),
             (FileKind::Hak, false) => Some(("Haks and archives", &["hak", "erf"])),
             (FileKind::Hak, true) => Some(("Hak", &["hak"])),
-            (FileKind::Content, _) => Some(("Haks and talk tables", &["hak", "tlk"])),
+            (FileKind::Content, _) => Some((
+                "Haks, talk tables and archives of them",
+                &["hak", "tlk", "zip", "7z", "rar"],
+            )),
             (FileKind::HakFiles, _) => None,
             (FileKind::Png, _) => Some(("PNG picture", &["png"])),
             (FileKind::Images, _) => Some(("Pictures", &["png", "tga", "dds", "jpg", "bmp"])),
             (FileKind::Tileset, _) => Some(("Tileset", &["set"])),
             (FileKind::Plugin, _) => Some(("Plugin archives", &["zip"])),
+            (FileKind::NuiWindows, _) => Some((
+                "NUI windows and archives of them",
+                &["jui", "erf", "hak", "mod", "nwm", "zip"],
+            )),
             (FileKind::Log, _) => Some(("Text", &["txt", "log"])),
+            (FileKind::Table, _) => Some(("2DA tables", &["2da"])),
+            (FileKind::TalkTable, _) => Some(("Talk tables", &["tlk"])),
+            (FileKind::TalkLines { json: false }, _) => Some(("CSV", &["csv"])),
+            (FileKind::TalkLines { json: true }, _) => Some(("JSON", &["json"])),
+            (FileKind::Keys, _) => Some(("Key sets", &["json"])),
         }
     }
 }

@@ -23,7 +23,7 @@ New-Item -ItemType Directory -Path $portable | Out-Null
 Copy-Item target\dist\moonscar.exe, target\dist\ms.exe, target\dist\dxcompiler.dll, target\dist\THIRD-PARTY-LICENSES.txt $portable
 Copy-Item LICENSE (Join-Path $portable "LICENSE.txt")
 Copy-Item -Recurse docs\manual (Join-Path $portable "manual")
-$zip = "target\dist\Moonglow-$version-windows-x64.zip"
+$zip = "target\dist\Moonscar-$version-windows-x64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "$portable\*" -DestinationPath $zip
 Remove-Item -Recurse -Force $portable

@@ -3,7 +3,7 @@ type: Manual Page
 title: Plugin API reference
 description: Reference of the plugin API - mg, findings and their fixes (ctx.fix), ctx.selection and ctx.open, ctx.event (the events, a resource's own around a save, objects placed or pasted, resources made, and what a handler may edit), ctx.module, ctx.game, ctx.edit, ctx.hak, ctx.terrain, logging, progress and UI (files and folders the user chooses), pictures, ctx.plugin, ctx.settings, Luau, limits and what the API doesn't have yet.
 tags: [manual, plugins, api]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T23:49:22Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T03:31:49Z }
 ---
 
 # Plugin API reference
@@ -77,6 +77,8 @@ file's order. A description is a table:
 | `other` | A value of the builder's own is right too. |
 | `min`, `max` | Its bounds, or nil. |
 | `runtime` | The scripts set it while the server runs: never kept in a file. |
+| `requires` | The variables it needs beside it on the same object: a list of names, empty for none. |
+| `default` | The value the scripts take where it isn't set, as text, or nil. |
 
 ### `ctx.fix`
 
@@ -139,7 +141,7 @@ whole module anyway.
 | | |
 | --- | --- |
 | `ctx.selection` | What the command is run on: a list of entries (below), from 1. From a right-click menu (a command whose manifest says what it is `for`), what the menu was opened on: the objects selected in the area view (a right-click on an object selects it, as for every command of that menu), the blueprints chosen in a palette (Ctrl+click chooses several), the object or blueprint of a row of the module tree, or an area. From the Plugins menu, the Command Palette or a key: the objects selected in the area view in front, else the blueprints selected in the palette, else none. Empty in a check and in an event's handler. |
-| `ctx.open` | The area or editor in front (of the middle of the window, or of the pane with the focus), as an entry; nil if there is none. An area's view and its Properties are the area; an object's or a blueprint's Properties the object or the blueprint; another editor its resource, with its type as `kind` (`"nss"`, `"dlg"`). |
+| `ctx.open` | The area or editor in front (of the middle of the window, or of the pane with the focus), as an entry; nil if there is none. An area's view and its Properties are the area; an object's or a blueprint's Properties the object or the blueprint; another editor its resource, with its type as `kind` (`"nss"`, `"dlg"`); a copy the resource browser opened as one layer has it (an overridden copy, read-only), that resource with its type as `kind` and its `layer`. |
 
 An entry:
 
@@ -154,6 +156,7 @@ An entry:
 | `selected.index` | A placed object's place in its list, from 0 as in its path; else nil. |
 | `selected.tag` | Its tag, as the job's copy of the module has it (nil if it has none). |
 | `selected.resref` | A blueprint's or an area's resref; for a placed object the blueprint it was made from (its `TemplateResRef`). |
+| `selected.layer` | For a layer's copy (`ctx.open` only), the layer's label, which `ctx.game:bytes(s.resource, s.layer)` reads it by; else nil. Its `module` is false, and its `tag` is that copy's. |
 
 The entries are what was selected when the job began; its own edits
 don't change them (a placed object deleted by `ctx.edit:remove_item`
@@ -287,10 +290,10 @@ the module's haks over them and its custom talk table.
 | --- | --- |
 | `ctx.game:resources(kind?)` | The names of everything the game can load (there are tens of thousands: give a `kind`). |
 | `ctx.game:has(name)` | Whether the game has the resource. |
-| `ctx.game:gff(name)` | As `ctx.module:gff`, of the game's resource (a stock blueprint, say). |
+| `ctx.game:gff(name, layer?)` | As `ctx.module:gff`, of the game's resource (a stock blueprint, say). With a `layer` (a layer's label, as `selected.layer` and `mg layers` give it: `"key:nwn_base"`, `"hak:castle"`), that layer's copy, though a higher layer's overrides it. |
 | `ctx.game:raw(name, path?)` | As `ctx.module:raw`. |
-| `ctx.game:text(name)` | As `ctx.module:text` (`nwscript.nss`, say). |
-| `ctx.game:bytes(name)` | As `ctx.module:bytes`. |
+| `ctx.game:text(name, layer?)` | As `ctx.module:text` (`nwscript.nss`, say); a `layer`'s copy, as for `gff`. |
+| `ctx.game:bytes(name, layer?)` | As `ctx.module:bytes`; a `layer`'s copy, as for `gff`. |
 | `ctx.game:table(name)` | A 2DA by its name without extension (`"classes"`), as a `twoda` (below). |
 | `ctx.game:string(strref)` | A talk-table string, from the custom talk table for a reference with the custom flag; nil if there is none. |
 
@@ -374,7 +377,7 @@ another `tlk`.
 | `tlk.language` | Its language's two-letter code (`"en"`, `"fr"`, `"de"`, `"it"`, `"es"`, `"pl"`), as its file says (since Moonglow 2.13.0). |
 | `tlk:set_language(code)` | Makes it a table of another language (since Moonglow 2.13.0). |
 | `tlk:get(line)` | A line as `{ text, sound, sound_length }`; nil for none. |
-| `tlk:set(line, value)` | Sets a line (the table grows to hold it): its text, or a table with `text`, `sound` and `sound_length`; nil empties it. |
+| `tlk:set(line, value)` | Sets a line (the table grows to hold it): its text, or a table with `text`, `sound` (1 to 16 letters, digits, `_` and `-`, as the talk-table editor takes one; kept in lower case) and `sound_length`; nil empties it. |
 | `tlk:add(value)` | Adds a line at the end and returns its number. |
 | `tlk:write()` | The table as a file's bytes. |
 
@@ -529,7 +532,7 @@ An `image`, from `mg.image`:
 | | |
 | --- | --- |
 | `image.width`, `image.height` | Its size in pixels. |
-| `image:pixel(x, y)` | A pixel's red, green, blue and alpha, each 0 to 255: four values. Pixels count from 0, from the top left. A gray picture has the same red, green and blue; 16 bits a channel are read as 8. |
+| `image:pixel(x, y)` | A pixel's red, green, blue and alpha, each 0 to 255: four values. Pixels count from 0, from the top left. A gray picture has the same red, green and blue; 16 bits a channel are rounded to the nearest of 8 bits, as a NUI window's picture is read. |
 
 Where there is nobody to ask (a check; `mg plugin run`): a message is
 logged, `confirm` is false (true with `--yes`), and a form is nil in a
@@ -539,7 +542,8 @@ Writing a hak is refused in a check, and with `mg` unless `--yes` is
 given (the haks go to `--hak-dir`, or the user folder's `hak`). With
 `mg`, `ctx.selection` is what `--select` names (each
 `tavern.git/Placeable List[3]`, `guard.utc` or `tavern.are`) and
-`ctx.open` what `--open` names; else nothing.
+`ctx.open` what `--open` names (a layer's copy as its name and the
+layer's label, `nw_chest.utp@key:nwn_base`); else nothing.
 
 ## `ctx.plugin`
 

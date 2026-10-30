@@ -8,7 +8,7 @@ fn filtering_the_tree_opens_its_groups() {
     let path = sample_module(&dir);
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // Scripts start closed.
     assert!(h.query_by_label("hello").is_none());
@@ -62,7 +62,7 @@ fn a_tree_row_s_menu_opens_it_in_its_editor() {
     let path = sample_module(&dir);
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let script = ResKey::parse("hello", ResType::NSS).unwrap();
     assert!(h.state().dock.find_tab(&Tab::Script(script)).is_none());
@@ -82,7 +82,7 @@ fn resources_open_in_their_editors() {
     let path = sample_module(&dir);
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let script = ResKey::parse("hello", ResType::NSS).unwrap();
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::for_resource(script).unwrap()));
@@ -97,6 +97,77 @@ fn resources_open_in_their_editors() {
     // The area viewer, with its object filters.
     assert!(h.state().dock.find_tab(&Tab::Area(area.resref)).is_some());
     h.get_by_label("⛲ Placeables");
+}
+
+/// The log is among Next Pane's panes (the module tree and the palettes'
+/// entry, its first item): F6 or a click in it gives it the keys, which
+/// scroll it, a line, a page, to its ends; Escape hands them back. A thin
+/// outline shows it has them (`target/test-output/ui-log-keys/`).
+#[test]
+fn the_log_by_the_keyboard() {
+    // (The pictures are to look at, taken where there is a GPU.)
+    let picture = |h: &mut Harness<'_, Moonglow>, dir: &std::path::Path, name: &str| {
+        if adapter() {
+            mg_testkit::gpu::hold();
+            h.render().expect("render").save(dir.join(name)).unwrap();
+        }
+    };
+    let dir = mg_testkit::scratch_dir("ui-log-keys");
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&sample_module(&dir));
+    app.log.clear();
+    for i in 0..200 {
+        app.log.info(format!("Line {i:03} of the log"));
+    }
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run_steps(3);
+    let key = |h: &mut Harness<'_, Moonglow>, key: egui::Key| {
+        h.key_press(key);
+        h.run_steps(2);
+    };
+    let shown = |h: &Harness<'_, Moonglow>, i: usize| {
+        h.query_by_label_contains(&format!("Line {i:03} of the log")).is_some()
+    };
+    assert!(shown(&h, 199) && !shown(&h, 0), "at its end");
+    key(&mut h, egui::Key::Home);
+    assert!(!shown(&h, 0), "not the log's yet");
+    // (From the middle's: the palettes' where their pane is, then the
+    // log's.)
+    key(&mut h, egui::Key::F6);
+    if h.state().dock.find_tab(&Tab::Palette).is_some() {
+        key(&mut h, egui::Key::F6);
+    }
+    picture(&mut h, &dir, "log-keys.png");
+    key(&mut h, egui::Key::Home);
+    assert!(shown(&h, 0) && !shown(&h, 199), "at its start");
+    let first_shown = |h: &Harness<'_, Moonglow>| (0..200).find(|&i| shown(h, i)).unwrap();
+    let mut at = Vec::new();
+    for _ in 0..6 {
+        key(&mut h, egui::Key::ArrowDown);
+        at.push(first_shown(&h));
+    }
+    assert!(at.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 1), "a line at a time: {at:?}");
+    picture(&mut h, &dir, "log-keys-lines.png");
+    assert!(at[5] >= 4, "{at:?}");
+    let lines = at[5];
+    key(&mut h, egui::Key::PageDown);
+    let page = first_shown(&h);
+    assert!(page > lines + 3, "a page: {page}");
+    picture(&mut h, &dir, "log-keys-page.png");
+    key(&mut h, egui::Key::PageUp);
+    assert_eq!(first_shown(&h), lines);
+    key(&mut h, egui::Key::End);
+    assert!(shown(&h, 199), "at its end again");
+    // Escape hands the keys back; a click in it gives them again.
+    key(&mut h, egui::Key::Escape);
+    key(&mut h, egui::Key::Home);
+    assert!(!shown(&h, 0), "the keys aren't the log's");
+    h.get_by_label_contains("Line 199 of the log").click();
+    h.run_steps(2);
+    key(&mut h, egui::Key::Home);
+    assert!(shown(&h, 0), "the log's from the click");
+    picture(&mut h, &dir, "log-keys-clicked.png");
 }
 
 /// GitHub issue 12: the module tree by the keyboard. A click in it gives
@@ -123,8 +194,11 @@ fn the_module_tree_by_the_keyboard() {
     h.get_by_label("start").hover();
     key(&mut h, egui::Key::ArrowDown);
     assert_eq!(at(&h), None);
-    // F6 gives them to the tree without one, at its first row; again, on
-    // to the middle (no palettes here), and Shift+F6 back.
+    // F6 gives them to the next pane from the middle's: the log (no
+    // palettes here), then the tree without one, at its first row; again,
+    // on to the middle, and Shift+F6 back.
+    key(&mut h, egui::Key::F6);
+    assert_eq!(at(&h), None, "the log's");
     key(&mut h, egui::Key::F6);
     assert_eq!(at(&h), Some(TreeAt::Group("Areas")));
     key(&mut h, egui::Key::ArrowDown);
@@ -176,7 +250,7 @@ fn the_module_tree_by_the_keyboard() {
     h.state_mut().rename = None;
     h.run();
     key(&mut h, egui::Key::Delete);
-    assert_eq!(h.state().confirm_delete, Some(start));
+    assert_eq!(h.state().confirm_delete, Some(vec![start]));
     h.state_mut().confirm_delete = None;
     h.run();
     // Ctrl+F goes to the Filter, and Down from it into the rows.
@@ -245,6 +319,23 @@ fn the_module_tree_s_groups_open_and_close_together() {
     h.get_all_by_label("⏷").next().unwrap().click();
     h.run_steps(4);
     assert_eq!(listed(&h), before, "and back");
+    // By their keys (Options › Keyboard), once the tree has the keys:
+    // Collapse All closes an area opened out to its objects too.
+    let ctrl_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    let arrows = |h: &Harness<'_, Moonglow>| h.query_all_by_label("⏷").count();
+    let closed = arrows(&h);
+    h.get_all_by_label(&area.to_string()).next().unwrap().click();
+    h.run_steps(2);
+    h.key_press(egui::Key::ArrowRight);
+    h.run_steps(3);
+    assert_eq!(arrows(&h), closed + 1, "the area opened out");
+    h.key_press_modifiers(ctrl_shift, egui::Key::ArrowLeft);
+    h.run_steps(4);
+    assert_eq!(listed(&h), before - 1, "every group closed by Collapse All's key");
+    h.key_press_modifiers(ctrl_shift, egui::Key::ArrowRight);
+    h.run_steps(4);
+    assert_eq!(listed(&h), before, "opened by Expand All's");
+    assert_eq!(arrows(&h), closed, "the area closed with the rest, and not opened out again");
 }
 
 /// The module tree's Delete… takes an area out of the module with its
@@ -288,6 +379,100 @@ fn an_area_is_deleted_from_the_module_tree() {
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
     h.run_steps(2);
     assert_eq!(listed(&mut h), (true, 1), "one undo");
+}
+
+/// The Delete window says what in the module names what it deletes, left
+/// as it is: a creature's script, a string in another script, another
+/// area's door leading into an area; what goes with them is not said.
+/// Those chosen in the tree are deleted together, as one step, but the
+/// start area.
+#[test]
+fn deleting_says_what_names_it_and_takes_those_chosen_together() {
+    let dir = mg_testkit::scratch_dir("ui-delete-named");
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let key = |name: &str, t| ResKey::parse(name, t).unwrap();
+    let mut info = m.gff(&key("module", ResType::IFO)).unwrap().unwrap();
+    let mut listed = mg_schema::ifo::MOD_AREA_LIST.new_item();
+    listed.write(&mg_schema::ifo::mod_area_list::AREA_NAME, ResRef::from_str("yard").unwrap());
+    info.root.items_mut(&mg_schema::ifo::MOD_AREA_LIST).push(listed);
+    info.root.write(&mg_schema::ifo::MOD_ENTRY_AREA, ResRef::from_str("start").unwrap());
+    m.set_info(&info).unwrap();
+    // start: a creature that spawns with `hello`, and a door to the
+    // yard's gate.
+    let mut git = Gff::new(*b"GIT ");
+    let mut c = mg_schema::git::CREATURE_LIST.new_item();
+    c.write(&mg_schema::git::creature_list::SCRIPT_SPAWN, ResRef::from_str("hello").unwrap());
+    c.set("Tag", mg_gff::Value::String(b"GREETER".to_vec()));
+    git.root.items_mut(&mg_schema::git::CREATURE_LIST).push(c);
+    let mut door = mg_gff::Struct::new(8);
+    door.set("Tag", mg_gff::Value::String(b"TO_YARD".to_vec()));
+    door.set("LinkedTo", mg_gff::Value::String(b"YARD_GATE".to_vec()));
+    git.root.set("Door List", mg_gff::Value::List(vec![door]));
+    m.set_gff(key("start", ResType::GIT), &git).unwrap();
+    // yard: its gate, and a waypoint its own door leads to.
+    m.set(key("yard", ResType::ARE), Gff::new(*b"ARE ").to_bytes().unwrap());
+    let mut yard = Gff::new(*b"GIT ");
+    let mut gate = mg_gff::Struct::new(8);
+    gate.set("Tag", mg_gff::Value::String(b"YARD_GATE".to_vec()));
+    gate.set("LinkedTo", mg_gff::Value::String(b"YARD_SPOT".to_vec()));
+    yard.root.set("Door List", mg_gff::Value::List(vec![gate]));
+    let mut spot = mg_gff::Struct::new(5);
+    spot.set("Tag", mg_gff::Value::String(b"YARD_SPOT".to_vec()));
+    yard.root.set("WaypointList", mg_gff::Value::List(vec![spot]));
+    m.set_gff(key("yard", ResType::GIT), &yard).unwrap();
+    let caller = key("caller", ResType::NSS);
+    m.set(caller, b"void main() {\n  ExecuteScript(\"hello\", OBJECT_SELF);\n}\n".to_vec());
+    m.set(key("hello", ResType::NCS), b"NCS V1.0".to_vec());
+    m.save().unwrap();
+
+    let mut app = app_with(Vec::new());
+    app.open_module(&path);
+    let mut h = harness(app, 1280.0, 800.0);
+    h.run();
+    let hello = key("hello", ResType::NSS);
+    h.state_mut().actions.push(mg_ui::Action::DeleteDialog(hello));
+    h.run_steps(3);
+    h.get_by_label("Delete hello.nss and its compiled script?");
+    h.get_by_label("1 place in the module names it, left as they are:");
+    h.get_by_label("  start › creature GREETER › OnSpawn");
+    h.get_by_label("Spelled out in scripts (1), which may mean it:");
+    h.get_by_label_contains("caller.nss line 2: ExecuteScript(\"hello\", OBJECT_SELF);");
+    // Find References from it: the window gives way to the tab.
+    h.get_by_label("Find References").click();
+    h.run_steps(2);
+    assert_eq!(h.state().confirm_delete, None);
+    assert!(h.state().dock.find_tab(&Tab::References).is_some());
+    // The yard: the door into it from the start, not its own door to
+    // its own waypoint, nor its entry in the module's area list.
+    let yard_are = key("yard", ResType::ARE);
+    h.state_mut().actions.push(mg_ui::Action::DeleteDialog(yard_are));
+    h.run_steps(3);
+    h.get_by_label("Delete the area yard and everything placed in it?");
+    h.get_by_label("1 place in the module names it, left as they are:");
+    h.get_by_label("  start › door TO_YARD › LinkedTo");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    // Several chosen: the start area stays; what names the script from
+    // the caller, deleted with it, is not said.
+    let chosen = vec![key("start", ResType::ARE), hello, caller];
+    h.state_mut().actions.push(mg_ui::Action::DeleteChosenDialog(chosen));
+    h.run_steps(3);
+    h.get_by_label_contains("Delete these 2 resources");
+    h.get_by_label("Not deleted: start.are: the module's start location is in it.");
+    h.get_by_label("  start › creature GREETER › OnSpawn");
+    // (The References tab, opened above, says its own.)
+    assert!(h.query_by_label_contains("which may mean").is_none());
+    h.get_by_label("Delete").click();
+    h.run_steps(3);
+    let module = |h: &Harness<'_, Moonglow>| h.state().ws.as_ref().unwrap().module.clone();
+    let gone = [hello, key("hello", ResType::NCS), caller];
+    assert!(gone.iter().all(|k| !module(&h).contains(k)), "{:?}", h.state().log.entries);
+    assert!(module(&h).contains(&key("start", ResType::ARE)));
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Delete 2 resources"));
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    assert!(gone.iter().all(|k| module(&h).contains(k)), "one undo brings them back");
 }
 
 /// An area opens out, in the module tree, to what is placed in it, kind
@@ -409,7 +594,7 @@ fn areas_are_listed_by_name_when_asked() {
     m.save().unwrap();
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // By ResRef, as Aurora lists them.
     h.get_by_label("area467");
@@ -459,7 +644,7 @@ fn the_tree_s_filter_ignores_the_case_of_any_letter() {
     m.save().unwrap();
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.state_mut().settings.area_names = true;
     h.run();
@@ -497,7 +682,7 @@ fn blueprints_are_listed_by_name_when_asked() {
     m.save().unwrap();
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // Open the groups (the filter opens every group with a match).
     h.get_all_by_role(egui::accesskit::Role::TextInput).next().unwrap().click();
@@ -1310,4 +1495,33 @@ fn a_placed_object_is_exported_as_a_blueprint() {
     let said = &h.state().log.entries.last().unwrap().1;
     assert!(said.starts_with(&format!("Exported {key}")), "{said}");
     let _ = area;
+}
+
+/// An ARE the module's area list leaves out (the game doesn't load it) is
+/// marked in the tree, and its menu's Add to the Module's Area List lists
+/// it, one undoable step, after which the mark is gone.
+#[test]
+fn an_area_its_list_leaves_out_is_marked_and_listed_from_its_menu() {
+    let dir = mg_testkit::scratch_dir("ui-tree-unlisted-area");
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    m.set(ResKey::parse("lost", ResType::ARE).unwrap(), Gff::new(*b"ARE ").to_bytes().unwrap());
+    m.save().unwrap();
+    let mut app = app_with(Vec::new());
+    app.open_module(&path);
+    let mut h = window_harness(app);
+    h.run();
+    assert_eq!(h.get_all_by_label("(not in the area list)").count(), 1);
+    h.get_by_label("lost").click_secondary();
+    h.run();
+    h.get_by_label("Add to the Module's Area List").click();
+    h.run();
+    assert!(h.query_by_label("(not in the area list)").is_none());
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    ws.flush().unwrap();
+    let listed: Vec<String> = ws.module.areas().unwrap().iter().map(|a| a.to_string()).collect();
+    assert_eq!(listed, ["start", "lost"]);
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run();
+    assert_eq!(h.get_all_by_label("(not in the area list)").count(), 1);
 }

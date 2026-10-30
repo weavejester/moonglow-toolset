@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::ctrl::flags;
-use crate::{AabbEntry, Mesh, MeshExtra, Model, NodeKind, Vec3};
+use crate::{AabbEntry, Mesh, MeshExtra, Model, NodeKind, Vec3, dot, sub};
 use thiserror::Error;
 
 use crate::binary_write::{self as binary, PartNumbers};
@@ -35,7 +35,8 @@ pub enum CompileError {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sources<'a> {
     /// Its supermodel and that one's part numbers
-    /// ([`PartNumbers::read`] of its compiled file, where it has one).
+    /// ([`PartNumbers::of`] a compiled one, [`PartNumbers::read`] of its
+    /// file).
     pub supermodel: Option<(&'a Model, &'a PartNumbers)>,
     /// The compiled model of its own name, where it was compiled before:
     /// its nodes keep the numbers they have there.
@@ -71,65 +72,6 @@ pub struct Compiled {
     /// What was left out or made up, with the text's line where it has one
     /// (0: none).
     pub notes: Vec<(usize, String)>,
-}
-
-fn sub(a: Vec3, b: Vec3) -> Vec3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn dot(a: Vec3, b: Vec3) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn cross(u: Vec3, v: Vec3) -> Vec3 {
-    [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
-}
-fn normalized(v: Vec3) -> Vec3 {
-    let len = dot(v, v).sqrt();
-    if len > 1e-20 { v.map(|x| x / len) } else { [0.0; 3] }
-}
-
-/// Tangents for a mesh's vertices from its first texture coordinates: per
-/// vertex the direction texture `u` grows in, at right angles to the
-/// normal, and the bitangent's sign.
-pub fn tangents(mesh: &Mesh) -> Vec<[f32; 4]> {
-    let count = mesh.vertices.len();
-    let uv = &mesh.uvs[0];
-    if uv.len() != count || mesh.normals.len() != count {
-        return Vec::new();
-    }
-    let (mut tan, mut bitan) = (vec![[0.0f32; 3]; count], vec![[0.0f32; 3]; count]);
-    for [a, b, c] in mesh.triangles().map(|t| t.map(|v| v as usize)) {
-        if a >= count || b >= count || c >= count {
-            continue;
-        }
-        let (e1, e2) =
-            (sub(mesh.vertices[b], mesh.vertices[a]), sub(mesh.vertices[c], mesh.vertices[a]));
-        let (du1, dv1) = (uv[b][0] - uv[a][0], uv[b][1] - uv[a][1]);
-        let (du2, dv2) = (uv[c][0] - uv[a][0], uv[c][1] - uv[a][1]);
-        let det = du1 * dv2 - du2 * dv1;
-        if det.abs() < 1e-20 {
-            continue;
-        }
-        let r = 1.0 / det;
-        let t: Vec3 = std::array::from_fn(|k| (e1[k] * dv2 - e2[k] * dv1) * r);
-        let s: Vec3 = std::array::from_fn(|k| (e2[k] * du1 - e1[k] * du2) * r);
-        for v in [a, b, c] {
-            for k in 0..3 {
-                tan[v][k] += t[k];
-                bitan[v][k] += s[k];
-            }
-        }
-    }
-    (0..count)
-        .map(|v| {
-            let n = mesh.normals[v];
-            // At right angles to the normal (Gram–Schmidt).
-            let d = dot(n, tan[v]);
-            let t = normalized(std::array::from_fn(|k| tan[v][k] - n[k] * d));
-            let t = if t == [0.0; 3] { [1.0, 0.0, 0.0] } else { t };
-            let sign = if dot(cross(n, t), bitan[v]) < 0.0 { -1.0 } else { 1.0 };
-            [t[0], t[1], t[2], sign]
-        })
-        .collect()
 }
 
 /// A mesh's tangents as the game's compiler makes them (nwn-mdl-spec
@@ -524,11 +466,21 @@ pub fn compile(text: &[u8], sources: &Sources<'_>) -> Result<Compiled, CompileEr
     let was = in_tree_order(&mut model);
 
     // Numbered in the order of the text.
-    let mut order: Vec<usize> = (0..model.nodes.len()).collect();
-    order.sort_by_key(|&i| (line(was[i]) == 0, line(was[i]), was[i]));
+    // (Those of its nodes left out of the tree among them: each takes a
+    // number, past the model's nodes in `order`.)
+    let count = model.nodes.len();
+    let mut order: Vec<usize> = (0..count + map.left_out.len()).collect();
+    let line_of = |i: usize| match i.checked_sub(count) {
+        Some(k) => map.left_out[k].start,
+        None => line(was[i]),
+    };
+    order.sort_by_key(|&i| (line_of(i) == 0, line_of(i), i));
     let parts = binary::number_nodes(&model, &order, sources.supermodel, sources.existing);
     notes.sort();
-    Ok(Compiled { binary: binary::write(&model, &parts)?, notes })
+    // (Each mesh's bounds and face records from its text's vertices and
+    // faces, as the game's compiler computes them.)
+    let meshes: Vec<_> = was.iter().map(|&w| map.meshes.get(w).and_then(Option::as_ref)).collect();
+    Ok(Compiled { binary: binary::write_from(&model, &parts, &meshes)?, notes })
 }
 
 /// Puts a model's nodes in the order of a depth-first walk of its tree,
@@ -577,6 +529,13 @@ fn in_tree_order(model: &mut Model) -> Vec<usize> {
     order
 }
 
+/// A compiled model and its part numbers, read once.
+fn with_numbers(data: &[u8]) -> Option<(Model, PartNumbers)> {
+    let model = Model::read(data).ok()?;
+    let parts = PartNumbers::of(&model)?;
+    Some((model, parts))
+}
+
 /// A model by name as a compiler needs it: the model and its part numbers.
 /// A compiled one's are read from it; a text is compiled first (or, where
 /// that fails, numbered in its tree's order).
@@ -588,13 +547,13 @@ fn numbered(
     let data = lookup(name)?;
     if !crate::is_binary(&data) && depth < 16 {
         if let Ok(c) = compile_named_at(&data, name, lookup, &|_| None, None, depth + 1) {
-            return Some((Model::read(&c.binary).ok()?, PartNumbers::read(&c.binary)?));
+            return with_numbers(&c.binary);
         }
         let model = Model::read(&data).ok()?;
         let parts = binary::part_numbers(&model, None);
         return Some((model, parts));
     }
-    Some((Model::read(&data).ok()?, PartNumbers::read(&data)?))
+    with_numbers(&data)
 }
 
 fn compile_named_at(
@@ -612,9 +571,8 @@ fn compile_named_at(
         .supermodel
         .filter(|s| !s.eq_ignore_ascii_case(name))
         .and_then(|s| numbered(&s, lookup, depth));
-    let existing = compiled_before(name)
-        .filter(|d| crate::is_binary(d))
-        .and_then(|d| Some((Model::read(&d).ok()?, PartNumbers::read(&d)?)));
+    let existing =
+        compiled_before(name).filter(|d| crate::is_binary(d)).and_then(|d| with_numbers(&d));
     let sources = Sources {
         supermodel: supermodel.as_ref().map(|(m, p)| (m, p)),
         existing: existing.as_ref().map(|(m, p)| (m, p)),
@@ -771,6 +729,29 @@ endmodelgeom m\ndonemodel m\n";
             assert_eq!(of(name), old_of(name), "{name}");
         }
         assert_eq!(parts.count, 12);
+    }
+
+    /// A node with no `parent` line is in no tree: the game's compiler
+    /// leaves it out, and its number goes unused (nwn-mdl-spec
+    /// MDL-ASCII-031, MDL-NODE-010; zspec_numbers' `n_caps`).
+    #[test]
+    fn a_node_left_out_keeps_its_number() {
+        let text = MODEL.replace(
+            "node dummy a\n  parent m\nendnode\n",
+            "node dummy loose\n  PARENT m\nendnode\nnode dummy a\n  parent m\nendnode\n",
+        );
+        let out = compile(text.as_bytes(), &Sources::default()).unwrap();
+        let back = Model::read(&out.binary).unwrap();
+        assert_eq!(back.node("loose"), None);
+        let parts = PartNumbers::read(&out.binary).unwrap();
+        let alone = compile(MODEL.as_bytes(), &Sources::default()).unwrap();
+        let before = PartNumbers::read(&alone.binary).unwrap();
+        assert_eq!(parts.count, before.count + 1);
+        let numbered = |m: &Model, p: &PartNumbers, name: &str| p.numbers[m.node(name).unwrap()];
+        let first = Model::read(&alone.binary).unwrap();
+        // (`a` came after it in the text: one past where it was.)
+        assert_eq!(numbered(&back, &parts, "a"), numbered(&first, &before, "a") + 1);
+        assert!(out.notes.iter().any(|(_, n)| n.contains("loose: has no parent line")));
     }
 
     #[test]

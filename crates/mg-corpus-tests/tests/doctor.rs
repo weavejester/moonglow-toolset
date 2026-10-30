@@ -8,7 +8,7 @@
 
 use mg_module::Module;
 use mg_module::doctor::{Severity, TalkTables, examine};
-use mg_resman::{ErfContainer, GameInstall, LayerClass, ResMan, priority};
+use mg_resman::{GameInstall, ResMan};
 use mg_testkit::{bundled_modules, corpus};
 
 /// Findings in shipped content, checked by hand and real, counted by
@@ -31,8 +31,9 @@ const KNOWN: &[(&str, &str, &str, usize)] = &[
     // A placeable on a reserved placeables.2da row (model USER), placed twice
     // in two areas.
     ("Neverwinter Nights - Doom of Icewind Dale", "object-row", "module", 4),
-    // A blueprint for appearance 15028, past the hak's appearance.2da.
-    ("Neverwinter Nights - Tyrants of the Moonsea", "object-row", "module", 1),
+    // A blueprint for appearance 15028, past the hak's appearance.2da; three
+    // armors of robes 12 and 16, which no body has (the parts' models).
+    ("Neverwinter Nights - Tyrants of the Moonsea", "object-row", "module", 4),
     ("Neverwinter Nights - Tyrants of the Moonsea", "set-data", "hak:tm_race_2da", 2),
     // Placed trees, benches and braziers on placeables.2da rows (500 to 700)
     // that the hak's copy leaves empty, hiding the game's.
@@ -46,6 +47,10 @@ const KNOWN: &[(&str, &str, &str, usize)] = &[
     ("Neverwinter Nights - Doom of Icewind Dale", "mdl-text", "hak:doiwd", 1),
     ("Neverwinter Nights - Pirates of the Sword Coast", "mdl-text", "hak:potsc_resources", 5),
     ("Neverwinter Nights - Tyrants of the Moonsea", "mdl-text", "hak:tm_race_2da", 1),
+    // Two doors of area051 whose HF_TRANSITION_DOOR is an Int, which
+    // ptc_tm_transall reads with GetLocalString (the tag of a door to
+    // open): it reads "", and opens none (`var-script`).
+    ("Neverwinter Nights - Tyrants of the Moonsea", "var-script", "module", 2),
     // Two spells (rows 807 and 809) whose FeatID names feats 3000 and
     // 2589 of a feat.2da of 1607 rows.
     ("Neverwinter Nights - Wyvern Crown of Cormyr", "2da-ref", "hak:wc_2da_shared", 2),
@@ -55,21 +60,17 @@ const KNOWN: &[(&str, &str, &str, usize)] = &[
 fn shipped_modules_have_only_known_findings() {
     let root = corpus!();
     let gi = GameInstall::new(&root, None, "en");
-    let base =
-        mg_tlk::Tlk::read(&std::fs::read(gi.talk_table(false)).unwrap()).unwrap().entries.len();
+    let base = mg_tlk::Tlk::read(&std::fs::read(gi.talk_table()).unwrap()).unwrap().entries.len();
     let mut unexpected = Vec::new();
     let mut total = 0;
     for path in bundled_modules(&root) {
         let m = Module::open(&path).unwrap();
         let mut rm = ResMan::for_game(&gi).unwrap();
-        for hak in m.haks().unwrap() {
-            let p = root.join("data/hk").join(format!("{hak}.hak"));
-            match ErfContainer::open(&p) {
-                Ok(c) => rm.add(priority::HAK_USER, format!("hak:{hak}"), LayerClass::Erf, c),
-                Err(_) => eprintln!("{}: hak {hak} not found", path.display()),
-            }
+        let (missing, wrong) = m.stack_onto(&mut rm, &gi);
+        for hak in missing {
+            eprintln!("{}: hak {hak} not found", path.display());
         }
-        rm.add(priority::MODULE, "module", LayerClass::Erf, m.container());
+        assert!(wrong.is_none(), "{}: {wrong:?}", path.display());
         let custom = m.custom_tlk().ok().flatten().and_then(|name| {
             gi.tlk_dirs().iter().find_map(|d| {
                 let data = std::fs::read(d.join(format!("{name}.tlk"))).ok()?;
@@ -292,8 +293,7 @@ fn the_game_s_own_tables_have_only_their_known_cell_faults() {
     let root = corpus!();
     let gi = GameInstall::new(&root, None, "en");
     let rm = ResMan::for_game(&gi).unwrap();
-    let base =
-        mg_tlk::Tlk::read(&std::fs::read(gi.talk_table(false)).unwrap()).unwrap().entries.len();
+    let base = mg_tlk::Tlk::read(&std::fs::read(gi.talk_table()).unwrap()).unwrap().entries.len();
     let read = |name: &str| {
         let key = mg_resman::ResKey::parse(name, mg_core::ResType::TWODA)?;
         let t = mg_2da::TwoDa::parse(&rm.get(&key).ok()?, mg_core::Codepage::default()).ok()?;

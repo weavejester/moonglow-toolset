@@ -72,7 +72,7 @@ fn a_project_s_script_edited_and_saved_changes_only_its_edited_line() {
     let mut app = app_with(Vec::new());
     app.open_module(&project);
     app.actions.push(mg_ui::Action::OpenTab(Tab::Script(key)));
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let text = h.state().script_text(key).unwrap();
     let at = text[..text.find("1;").unwrap()].chars().count();
@@ -161,7 +161,7 @@ fn nasher_projects_save_in_place_and_never_overwrite_other_changes() {
             ..Default::default()
         }),
     );
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.state_mut().open_module(&path);
     h.run();
 
@@ -220,6 +220,37 @@ fn nasher_projects_save_in_place_and_never_overwrite_other_changes() {
     assert!(h.state().log.entries.iter().any(|(_, m)| m.contains("Opened nasher project")));
 }
 
+/// Build › Pack compiles a nasher project's models kept as text where its
+/// project file says `[pack] compile_models = true`, and the log says so;
+/// the source stays text.
+#[test]
+fn pack_compiles_a_project_s_models_where_its_project_file_says() {
+    let dir = mg_testkit::scratch_dir("ui-pack-models");
+    let mut m = Module::open(&sample_module(&dir)).unwrap();
+    let text = "newmodel lamp\nsetsupermodel lamp NULL\nbeginmodelgeom lamp\n\
+        node dummy lamp\n  parent NULL\nendnode\nendmodelgeom lamp\ndonemodel lamp\n";
+    m.set(ResKey::parse("lamp", ResType::MDL).unwrap(), text.as_bytes().to_vec());
+    let project = dir.join("project");
+    m.save_as(&ModuleLocation::Project { root: project.clone(), target: "default".into() })
+        .unwrap();
+    std::fs::write(project.join("moonglow.toml"), "[pack]\ncompile_models = true\n").unwrap();
+    let mut h = window_harness(app_with(vec![]));
+    h.state_mut().open_module(&project);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::PackTarget);
+    h.run();
+    let ws = h.state().ws.as_ref().expect("the project");
+    let target = ws.module.project.as_ref().unwrap().target_path();
+    let bytes = std::fs::read(&target).unwrap();
+    let erf = mg_erf::Erf::read(&bytes).unwrap();
+    let entry = erf.entries.iter().find(|e| e.restype == ResType::MDL).expect("the model");
+    assert!(mg_mdl::is_binary(&erf.data(entry).unwrap()), "packed compiled");
+    assert!(logged(&h, "Compile Models: 1 compiled"), "{:?}", h.state().log.entries);
+    let source = std::fs::read_dir(project.join("src")).unwrap().flatten().map(|e| e.path());
+    let source = { source }.find(|p| p.extension().is_some_and(|e| e == "mdl")).unwrap();
+    assert_eq!(std::fs::read(source).unwrap(), text.as_bytes(), "the source stays text");
+}
+
 /// A nasher project that keeps its talk table as JSON (a tlk target of its
 /// own, in two languages): opened, the table is the project's (not the tlk
 /// folder's copy), edited, and saved with the module as nwn_tlk writes it;
@@ -228,8 +259,7 @@ fn nasher_projects_save_in_place_and_never_overwrite_other_changes() {
 fn a_new_talk_table_of_a_project_is_made_in_it() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-talk-project-new");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("tlk")).unwrap();
+    let user = user_folder(&dir, &["tlk"]);
     let m = mg_module::Module::open(&sample_module(&dir)).unwrap();
     let project = dir.join("project");
     let mut m = m;
@@ -242,9 +272,14 @@ fn a_new_talk_table_of_a_project_is_made_in_it() {
     let mut h = harness(app, 1000.0, 800.0);
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::TalkTable));
     h.run();
-    h.state_mut().talk_view.new_name = "mg_new".into();
+    // (A name by the rule of the names Moonglow makes, `ResRef::new_name`:
+    // a space refused, capitals lowered.)
+    h.state_mut().talk_view.new_name = "mg new".into();
     h.run();
-    h.get_by_label_contains("Made in the project as");
+    h.get_by_label_contains("Not a name: ' '");
+    h.state_mut().talk_view.new_name = "MG_New".into();
+    h.run();
+    h.get_by_label_contains("Made in the project as src/mg_new.tlk.json");
     h.get_by_label("Create").click();
     h.run();
     h.run();
@@ -270,8 +305,7 @@ fn a_new_talk_table_of_a_project_is_made_in_it() {
 fn a_projects_talk_table_kept_as_json_is_edited_there() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-talk-project");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("tlk")).unwrap();
+    let user = user_folder(&dir, &["tlk"]);
     let mut m = mg_module::Module::open(&sample_module(&dir)).unwrap();
     let mut info = m.info().unwrap();
     info.root.set("Mod_CustomTlk", mg_gff::Value::String(b"mg_proj".to_vec()));
@@ -355,20 +389,20 @@ fn a_projects_talk_table_kept_as_json_is_edited_there() {
     assert!(h.state().log.entries.iter().any(|(_, m)| m.contains("while it has unsaved changes")));
 }
 
-/// Setup Store in a project whose moonglow.toml has `[store]`: the
-/// project's script opens it (none is written), its tag follows the
-/// pattern and is the only one, its blueprint is offered first, and the
-/// shopkeeper keeps its tag in the project's variable.
-#[test]
-fn setup_store_follows_the_project_file() {
+/// A module folder with a shopkeeper in an area and a store of the
+/// area's tagged as `[store]`'s pattern's first, another area's store with
+/// its second, and the project file with `[store]` and the pattern
+/// `unique_in_area`: the install, the folder, the area and its tag.
+fn store_project(
+    name: &str,
+) -> Option<(mg_resman::GameInstall, std::path::PathBuf, ResRef, String, ResKey)> {
     use mg_module::instances::{Placement, Placing, instance};
     use mg_module::new::{AreaSpec, add_area, new_module};
     let Some(root) = mg_testkit::nwn_root() else {
         eprintln!("skipped: no game install");
-        return;
+        return None;
     };
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut rng = fastrand::Rng::with_seed(5);
     let mut m = new_module(&game, "Shop", &mut rng).unwrap();
     let spec = AreaSpec {
@@ -397,17 +431,65 @@ fn setup_store_follows_the_project_file() {
     let git = ResKey::new(area, ResType::GIT);
     let mut g = m.gff(&git).unwrap().unwrap();
     g.root.set("Creature List", mg_gff::Value::List(vec![keeper.unwrap()]));
-    g.root.set("StoreList", mg_gff::Value::List(vec![first]));
+    g.root.set("StoreList", mg_gff::Value::List(vec![first.clone()]));
     m.set_gff(git, &g).unwrap();
-    let dir = mg_testkit::scratch_dir("ui-setup-store-project").join("shop");
+    // Another area with the pattern's second number: wanted unique in each
+    // area (`unique_in_area`), it is free in this one.
+    let spec = AreaSpec { name: "Mill".into(), ..spec };
+    let mill = add_area(&mut m, &game, &spec, &mut rng).unwrap();
+    let mut other = first;
+    other.set("Tag", mg_gff::Value::String(format!("{area_tag}_STORE_2").into_bytes()));
+    let mills = ResKey::new(mill, ResType::GIT);
+    let mut g = m.gff(&mills).unwrap().unwrap();
+    g.root.set("StoreList", mg_gff::Value::List(vec![other]));
+    m.set_gff(mills, &g).unwrap();
+    let dir = mg_testkit::scratch_dir(name).join("shop");
     m.save_as(&ModuleLocation::Folder(dir.clone())).unwrap();
     std::fs::write(
         dir.join("moonglow.toml"),
-        "[store]\nopen_script = \"tdod_vendor_open\"\ntag = \"{area}_STORE_{n}\"\n\
+        "[tags]\nunique_in_area = [\"*_STORE_*\"]\n\n\
+         [store]\nopen_script = \"tdod_vendor_open\"\ntag = \"{area}_STORE_{n}\"\n\
          blueprint = \"nw_storethief001\"\nkeeper_variable = \"tdod_store\"\n",
     )
     .unwrap();
+    Some((mg_resman::GameInstall::new(&root, None, "en"), dir, area, area_tag, git))
+}
 
+/// The project file is read again when it changes with Options ›
+/// General's reloading off too, and Setup Store, open then, follows the
+/// rules as they are now.
+#[test]
+fn the_project_file_is_read_again_with_reloading_off() {
+    let Some((install, dir, area, _, _)) = store_project("ui-project-file-again") else { return };
+    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    app.settings.no_auto_reload = true;
+    app.open_module(&dir);
+    app.open_palette = false;
+    mg_ui::store_wizard::open(&mut app, area, "Creature List", 0);
+    // (Changed before the window's first frame, which looks at it.)
+    std::fs::write(
+        dir.join("moonglow.toml"),
+        "[store]\nopen_script = \"tdod_vendor_two\"\nblueprint = \"nw_storethief001\"\n",
+    )
+    .unwrap();
+    let mut h = harness(app, 1000.0, 800.0);
+    h.run_steps(3);
+    let said = |s: &str| h.state().log.entries.iter().any(|e| e.1.contains(s));
+    assert!(said("moonglow.toml changed: its rules are read again"), "{:?}", h.state().log.entries);
+    assert!(h.query_by_label_contains("the project's script tdod_vendor_two").is_some());
+    assert!(h.query_by_label_contains("tdod_vendor_open").is_none());
+}
+
+/// Setup Store in a project whose moonglow.toml has `[store]`: the
+/// project's script opens it (none is written), its tag follows the
+/// pattern and is the only one (of its area, as `unique_in_area` wants
+/// it), its blueprint is offered first, and the shopkeeper keeps its tag
+/// in the project's variable.
+#[test]
+fn setup_store_follows_the_project_file() {
+    let Some((install, dir, area, area_tag, git)) = store_project("ui-setup-store-project") else {
+        return;
+    };
     let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
     app.open_module(&dir);
     app.open_palette = false;
@@ -447,6 +529,75 @@ fn setup_store_follows_the_project_file() {
     assert_eq!((var.dword("Type"), var.string("Value")), (Some(3), Some(tag.as_bytes())));
 }
 
+/// Setup Store's list of stores opens scrolled to the project's
+/// blueprint, chosen at first, though it is the last of the game's.
+#[test]
+fn setup_store_s_list_shows_the_project_s_blueprint_far_down() {
+    use mg_module::instances::{Placement, Placing, instance};
+    use mg_module::new::{AreaSpec, add_area, new_module};
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let game = game_data(&root);
+    // The store the list shows last: by name, then ResRef, as it sorts.
+    let mut stores: Vec<(String, ResRef)> = game
+        .resman
+        .list(ResType::UTM)
+        .into_iter()
+        .map(|r| {
+            let data = game.resman.get(&ResKey::new(r, ResType::UTM)).unwrap();
+            let g = Gff::read(&data).unwrap();
+            let name = g.root.locstring("LocName").and_then(|l| game.locstring(l));
+            (name.unwrap_or_default(), r)
+        })
+        .collect();
+    stores.sort();
+    let (name, last) = stores.last().cloned().unwrap();
+    assert!(stores.len() > 20, "a list longer than the window shows");
+    let mut rng = fastrand::Rng::with_seed(5);
+    let mut m = new_module(&game, "Shop", &mut rng).unwrap();
+    let spec = AreaSpec {
+        name: "Field".into(),
+        tileset: ResRef::from_str("ttr01").unwrap(),
+        width: 2,
+        height: 2,
+    };
+    let area = add_area(&mut m, &game, &spec, &mut rng).unwrap();
+    let blueprint = game.resman.get(&ResKey::parse("nw_bandit001", ResType::UTC).unwrap()).unwrap();
+    let none = |_: ResRef| None;
+    let placing = Placing { game: &game, item: &none };
+    let at = Placement { position: [5.0, 5.0, 0.0], rotation: 0.0 };
+    let keeper = instance(&placing, ResType::UTC, &Gff::read(&blueprint).unwrap().root, at, &[]);
+    let key = ResKey::new(area, ResType::GIT);
+    let mut g = m.gff(&key).unwrap().unwrap();
+    g.root.set("Creature List", mg_gff::Value::List(vec![keeper.unwrap()]));
+    m.set_gff(key, &g).unwrap();
+    let dir = mg_testkit::scratch_dir("ui-setup-store-far-down").join("shop");
+    m.save_as(&ModuleLocation::Folder(dir.clone())).unwrap();
+    std::fs::write(dir.join("moonglow.toml"), format!("[store]\nblueprint = \"{last}\"\n"))
+        .unwrap();
+    let mut app = game_app(&root, None);
+    app.open_module(&dir);
+    app.open_palette = false;
+    mg_ui::store_wizard::open(&mut app, area, "Creature List", 0);
+    let mut h = harness(app, 1000.0, 800.0);
+    h.run();
+    h.get_by_label("Next >").click();
+    h.run();
+    h.run();
+    // The row is drawn inside the list, above the buttons under it.
+    let row = h.get_by_label(&format!("{name} ({last})")).rect();
+    let top = h.get_by_label("Choose the store to use.").rect().bottom();
+    let bottom = h.get_by_label("Next >").rect().top();
+    assert!(row.top() > top && row.bottom() < bottom, "{row:?} between {top} and {bottom}");
+    // Chosen once: the list is the builder's to scroll after.
+    let first = format!("{} ({})", stores[0].0, stores[0].1);
+    h.get_by_label(&format!("{name} ({last})")).click();
+    h.run();
+    assert!(h.get_by_label(&first).rect().bottom() < top, "not scrolled back");
+}
+
 /// A nasher project's files changed by another program are read again
 /// while the project is open; where Moonglow has unsaved changes to one,
 /// its own is kept and the window asks.
@@ -455,8 +606,7 @@ fn a_project_s_files_changed_outside_are_read_again() {
     use mg_module::ModuleLocation;
     use mg_module::new::{AreaSpec, add_area, new_module};
     let Some(root) = mg_testkit::nwn_root() else { return };
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut rng = fastrand::Rng::with_seed(7);
     let mut m = new_module(&game, "Outside", &mut rng).unwrap();
     let spec = AreaSpec {
@@ -469,7 +619,7 @@ fn a_project_s_files_changed_outside_are_read_again() {
     m.set(ResKey::parse("hello", ResType::NSS).unwrap(), b"void main() {}\n".to_vec());
     let dir = mg_testkit::scratch_dir("ui-project-outside").join("project");
     m.save_as(&ModuleLocation::Project { root: dir.clone(), target: "default".into() }).unwrap();
-    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    let mut app = game_app(&root, None);
     app.settings.no_last_area = true;
     app.open_module(&dir);
     let mut h = harness(app, 1100.0, 800.0);
@@ -510,6 +660,26 @@ fn a_project_s_files_changed_outside_are_read_again() {
     }
     assert!(said(&h, "Read again from the module's files"));
     assert!(h.state().outside_conflicts().is_empty());
+
+    // An area added outside (a pull's, its module.ifo not listing it yet)
+    // joins the area list, as when the project is opened: not unsaved
+    // work, and not written until module.ifo changes here.
+    let ifo_file = dir.join("src/module.ifo.json");
+    let ifo_text = std::fs::read_to_string(&ifo_file).unwrap();
+    for ext in ["are", "git", "gic"] {
+        let from = dir.join(format!("src/{area}.{ext}.json"));
+        std::fs::copy(&from, dir.join(format!("src/mg_pulled.{ext}.json"))).unwrap();
+    }
+    h.state_mut().reload_project_files();
+    h.run_steps(2);
+    {
+        let ws = h.state().ws.as_ref().unwrap();
+        let pulled = ResRef::from_str("mg_pulled").unwrap();
+        assert!(ws.module.areas().unwrap().contains(&pulled), "listed");
+        assert!(!ws.is_modified(), "read again is not unsaved work");
+    }
+    assert!(said(&h, "areas added to the area list: mg_pulled"));
+    assert_eq!(std::fs::read_to_string(&ifo_file).unwrap(), ifo_text, "not written");
 
     // Changed here (unsaved) and outside both: Moonglow's is kept, and asked.
     let set_tag = |h: &mut Harness<'_, Moonglow>, to: &str| {
@@ -561,8 +731,7 @@ fn a_project_s_files_changed_outside_are_read_again() {
 fn a_pull_s_burst_of_changes_is_read_off_the_window_s_thread() {
     use mg_module::new::{AreaSpec, add_area, new_module};
     let Some(root) = mg_testkit::nwn_root() else { return };
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut rng = fastrand::Rng::with_seed(7);
     let mut m = new_module(&game, "Pull", &mut rng).unwrap();
     let spec = AreaSpec {
@@ -579,7 +748,7 @@ fn a_pull_s_burst_of_changes_is_read_off_the_window_s_thread() {
     }
     let dir = mg_testkit::scratch_dir("ui-project-pull").join("project");
     m.save_as(&ModuleLocation::Project { root: dir.clone(), target: "default".into() }).unwrap();
-    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    let mut app = game_app(&root, None);
     app.settings.no_last_area = true;
     app.open_module(&dir);
     let mut h = harness(app, 1100.0, 800.0);
@@ -675,6 +844,79 @@ fn a_pull_s_burst_of_changes_is_read_off_the_window_s_thread() {
     }
 }
 
+/// A module kept in one file (a `.mod`) that another program saves while
+/// it is open: the watch hears it at once, without the window being asked,
+/// and what changed in it is read again, resource by resource; one with
+/// unsaved changes here too is asked about, and Save doesn't write over
+/// it until it is answered.
+#[test]
+fn a_mod_saved_by_another_program_is_read_again() {
+    use mg_module::new::new_module;
+    let Some(root) = mg_testkit::nwn_root() else { return };
+    let game = game_data(&root);
+    let mut m = new_module(&game, "Castle", &mut fastrand::Rng::with_seed(7)).unwrap();
+    let (a, b) = (
+        ResKey::parse("castle_a", ResType::NSS).unwrap(),
+        ResKey::parse("castle_b", ResType::NSS).unwrap(),
+    );
+    m.set(a, b"void main() { int a; }\n".to_vec());
+    m.set(b, b"void main() { int b; }\n".to_vec());
+    let path = mg_testkit::scratch_dir("ui-mod-outside").join("castle.mod");
+    m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let mut app = game_app(&root, None);
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = harness(app, 1100.0, 800.0);
+    // (The watch begins, and its first look finds nothing.)
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(600) {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let in_module = |h: &Harness<'_, Moonglow>, k: &ResKey| {
+        h.state().ws.as_ref().unwrap().module.get(k).map(<[u8]>::to_vec)
+    };
+    // Another program saves it: read again within a second or two.
+    let mut theirs = Module::open(&path).unwrap();
+    theirs.set(a, b"void main() { int theirs; }\n".to_vec());
+    theirs.save().unwrap();
+    let started = std::time::Instant::now();
+    while in_module(&h, &a).unwrap() != b"void main() { int theirs; }\n" {
+        assert!(started.elapsed().as_secs() < 10, "the watch hears it");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(started.elapsed().as_secs() < 3, "{:?} after the save", started.elapsed());
+    assert!(!h.state().ws.as_ref().unwrap().is_modified(), "read, not an unsaved change");
+    // Changed here and there: asked about, and not written over.
+    let edit =
+        mg_edit::Edit::SetResource { key: b, data: Some(b"void main() { int ours; }\n".to_vec()) };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Ours", vec![edit])));
+    h.run_steps(2);
+    let mut theirs = Module::open(&path).unwrap();
+    theirs.set(b, b"void main() { int theirs, too; }\n".to_vec());
+    theirs.save().unwrap();
+    let started = std::time::Instant::now();
+    while h.state().outside_conflicts().is_empty() {
+        assert!(started.elapsed().as_secs() < 10, "the watch hears it");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(h.state().outside_conflicts(), [path.join("castle_b.nss")]);
+    assert_eq!(in_module(&h, &b).unwrap(), b"void main() { int ours; }\n");
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    h.run_steps(3);
+    let on_disk = Module::open(&path).unwrap();
+    assert_eq!(on_disk.get(&b).unwrap(), b"void main() { int theirs, too; }\n", "not written over");
+    // Kept as Moonglow has it: then saved.
+    h.get_by_label("Keep Moonglow's").click();
+    h.run_steps(2);
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    h.run_steps(3);
+    let on_disk = Module::open(&path).unwrap();
+    assert_eq!(on_disk.get(&b).unwrap(), b"void main() { int ours; }\n");
+}
+
 /// A nasher project's locks stay out of its files: Lock and Save leave the
 /// area's JSON as it was and keep the lock in Moonglow's folder; the area
 /// changed outside is read again (no conflict) with the lock still on; and
@@ -685,8 +927,7 @@ fn a_project_s_locks_stay_out_of_its_files() {
     use mg_module::new::{AreaSpec, add_area, new_module};
     use mg_schema::git;
     let Some(root) = mg_testkit::nwn_root() else { return };
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut rng = fastrand::Rng::with_seed(7);
     let mut m = new_module(&game, "Locks", &mut rng).unwrap();
     let spec = AreaSpec {
@@ -713,7 +954,7 @@ fn a_project_s_locks_stay_out_of_its_files() {
     let file = dir.join(format!("src/{area}.git.json"));
     let read = || std::fs::read_to_string(&file).unwrap();
     let start = |dir: &std::path::Path| {
-        let mut app = Moonglow::new(Some(install.clone()), Box::new(NoDialogs::default()));
+        let mut app = game_app(&root, None);
         app.settings.no_last_area = true;
         app.locks_dir = Some(scratch.join("locks"));
         app.open_module(dir);
@@ -770,15 +1011,14 @@ fn a_project_s_script_opens_in_place_in_the_external_editor() {
     use mg_module::ModuleLocation;
     use mg_module::new::new_module;
     let Some(root) = mg_testkit::nwn_root() else { return };
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut m = new_module(&game, "InPlace", &mut fastrand::Rng::with_seed(7)).unwrap();
     let key = ResKey::parse("hello", ResType::NSS).unwrap();
     m.set(key, b"void main()\n{\n}\n".to_vec());
     let dir = mg_testkit::scratch_dir("ui-project-external").join("project");
     m.save_as(&ModuleLocation::Project { root: dir.clone(), target: "default".into() }).unwrap();
     let Some(editor) = true_program() else { return };
-    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    let mut app = game_app(&root, None);
     app.settings.no_last_area = true;
     app.settings.external_editor = Some(editor.clone().into());
     app.settings.scripts_external = true;
@@ -794,10 +1034,19 @@ fn a_project_s_script_opens_in_place_in_the_external_editor() {
     assert!(file.is_file(), "the project's own file");
     assert_eq!(said(&h, &format!("editing {} in {editor}", file.display())), 1);
     // Saved there by the editor: read again as a file changed outside is.
+    // Written in place, as VS Code saves (VSCodium 1.143: its writes are
+    // atomic only for its own settings files)...
     std::fs::write(&file, "void main()\n{\n    int n = 1;\n}\n").unwrap();
     h.state_mut().reload_project_files();
     h.run_steps(3);
     assert!(h.state().script_text(key).unwrap().contains("int n = 1;"));
+    // ...and written beside it and renamed over it, as Vim and Helix save.
+    let beside = dir.join("src/.hello.nss.swp");
+    std::fs::write(&beside, "void main()\n{\n    int n = 2;\n}\n").unwrap();
+    std::fs::rename(&beside, &file).unwrap();
+    h.state_mut().reload_project_files();
+    h.run_steps(3);
+    assert!(h.state().script_text(key).unwrap().contains("int n = 2;"));
     // With text typed here and not saved: a copy, and why.
     h.state_mut().script_tools.jump = Some((key, 0));
     h.run_steps(2);
@@ -953,8 +1202,7 @@ fn a_project_s_script_opens_in_the_external_editor_alone() {
     use mg_module::new::new_module;
     let Some(root) = mg_testkit::nwn_root() else { return };
     let Some(editor) = true_program() else { return };
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut m = new_module(&game, "Alone", &mut fastrand::Rng::with_seed(7)).unwrap();
     let key = ResKey::parse("hello", ResType::NSS).unwrap();
     m.set(key, b"void main()\n{\n}\n".to_vec());
@@ -967,7 +1215,7 @@ fn a_project_s_script_opens_in_the_external_editor_alone() {
             let mut m = Module::open(&project).unwrap();
             m.save_as(&ModuleLocation::Archive(archive.clone())).unwrap();
         }
-        let mut app = Moonglow::new(Some(install.clone()), Box::new(NoDialogs::default()));
+        let mut app = game_app(&root, None);
         app.settings.no_last_area = true;
         app.settings.external_editor = Some(editor.clone().into());
         app.settings.scripts_external = true;
@@ -986,6 +1234,20 @@ fn a_project_s_script_opens_in_the_external_editor_alone() {
             .count();
         assert_eq!(said, 1, "{:?}", h.state().log.entries);
         assert_eq!(h.state().dock.find_tab(&Tab::Script(key)).is_some(), tab_opens, "{module:?}");
+        if tab_opens {
+            continue;
+        }
+        // A new script has no file yet (File › Save writes it): it opens
+        // in Moonglow's editor, and the external editor gets a copy.
+        h.state_mut().new_script = Some("fresh".into());
+        h.run_steps(2);
+        h.get_by_label("Create").click();
+        h.run_steps(4);
+        let fresh = ResKey::parse("fresh", ResType::NSS).unwrap();
+        assert!(h.state().dock.find_tab(&Tab::Script(fresh)).is_some());
+        let copy = format!("fresh.nss: editing in {editor}");
+        let log = &h.state().log.entries;
+        assert!(log.iter().any(|(_, m)| *m == copy), "{log:?}");
     }
 }
 
@@ -1079,14 +1341,6 @@ fn a_builder_code_set_in_its_window_begins_the_resrefs_proposed() {
     let user = std::fs::read_to_string(dir.join(".moonglow/user.toml")).unwrap();
     assert_eq!(user, "# mine\n[builder]\n");
     assert_eq!(h.state().ws.as_ref().unwrap().module.project_file.naming(), Default::default());
-}
-
-/// The text field holding `value`, of a window that asks for a name.
-fn typed_name<'h>(h: &'h Harness<'_, Moonglow>, value: &'h str) -> egui_kittest::Node<'h> {
-    let field = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
-        n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some(value)
-    };
-    h.get(egui_kittest::kittest::by().predicate(field))
 }
 
 /// The builder code where a new resource's name is typed (The Domains of
@@ -1304,7 +1558,7 @@ fn a_mod_s_own_project_file_is_read_and_read_again() {
     std::fs::write(dir.join("krezk.moonglow.toml"), "[resrefs]\npattern = \"krezk_{name}\"\n")
         .unwrap();
     h.state_mut().reload_changed_files();
-    h.run();
+    settle(&mut h);
     assert!(logged(&h, "krezk.moonglow.toml changed: its rules are read again"));
     assert_eq!(naming(&h), "krezk_market");
 }
@@ -1316,7 +1570,7 @@ fn a_module_in_one_file_has_no_builder_code() {
     let dir = mg_testkit::scratch_dir("ui-builder-code-mod");
     let mut app = app_with(Vec::new());
     app.open_module(&sample_module(&dir));
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.get_by_label("Edit").click();
     h.run();
@@ -1423,6 +1677,62 @@ fn the_variables_window_offers_the_project_s_described_variables() {
     let vars = doc.root.list("Placeable List").unwrap()[0].list("VarTable").unwrap();
     assert_eq!(vars.len(), 2);
     assert_eq!(vars[0].string("Value"), Some(&b"forge"[..]));
+}
+
+/// The Variables window says what a variable needs beside it and the
+/// object lacks (`requires`, `[[rules]]`), until it is added; a name typed
+/// as one with a default takes it as its value.
+#[test]
+fn the_variables_window_says_what_a_variable_needs_and_gives_defaults() {
+    use mg_ui::widgets::{FieldTarget, VarTableEdit};
+    let described = "[tdod_rental]\ntype = \"string\"\nrequires = [\"tdod_rental_door\"]\n\n\
+        [tdod_rental_door]\ntype = \"string\"\n\n\
+        [tdod_climb_dc]\ntype = \"int\"\ndefault = 15\n\n\
+        [[rules]]\nvariable = \"tdod_kind\"\nis = \"merchant\"\nrequire = \"tdod_store\"\n";
+    let dir = project_folder("ui-variables-needed", &[("variables.toml", described)]);
+    let git = ResKey::parse("start", ResType::GIT).unwrap();
+    {
+        let mut m = Module::open(&dir).unwrap();
+        let mut g = Gff::new(*b"GIT ");
+        g.root.set("Creature List", mg_gff::Value::List(vec![mg_gff::Struct::new(4)]));
+        m.set_gff(git, &g).unwrap();
+        m.save().unwrap();
+    }
+    let mut app = app_with(Vec::new());
+    app.open_module(&dir);
+    let path = mg_edit::GffPath::root().item("Creature List", 0);
+    app.var_edit = Some(VarTableEdit::new(FieldTarget::new(git, path, "VarTable"), &[]));
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    let add = |h: &mut Harness<'_, Moonglow>, name: &str, value: Option<&str>| {
+        h.get_by_label("Add").click();
+        h.run();
+        let rows = &mut h.state_mut().var_edit.as_mut().unwrap().rows;
+        let i = rows.len() - 1;
+        rows[i].name = name.into();
+        if let Some(v) = value {
+            rows[i].value = v.into();
+        }
+        h.run();
+        h.run();
+    };
+    add(&mut h, "tdod_rental", Some("smithy"));
+    let note = "tdod_rental needs tdod_rental_door beside it (variables.toml:1)";
+    assert!(h.query_by_label(note).is_some());
+    add(&mut h, "tdod_rental_door", Some("D_SMITHY"));
+    assert!(h.query_by_label(note).is_none(), "said until it is added");
+    add(&mut h, "tdod_kind", Some("merchant"));
+    assert!(
+        h.query_by_label(
+            "tdod_kind is merchant: tdod_store is needed beside it (variables.toml:12)"
+        )
+        .is_some()
+    );
+    // A default, taken as the value of a row named so.
+    add(&mut h, "tdod_climb_dc", None);
+    let rows = &h.state().var_edit.as_ref().unwrap().rows;
+    let dc = rows.iter().find(|r| r.name == "tdod_climb_dc").unwrap();
+    assert_eq!((dc.kind, dc.value.as_str()), (1, "15"));
 }
 
 /// The Variables window's offer by the keys: Down and Up move in it,
@@ -1535,7 +1845,7 @@ fn verify_holds_variables_to_their_descriptions() {
     }
     let mut app = game_app(&root, None);
     app.open_module(&dir);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.state_mut().actions.push(mg_ui::Action::Verify);
     h.run();
@@ -1642,6 +1952,125 @@ fn an_area_another_builder_claimed_is_read_only_or_asked_about_before_a_save() {
     h.state_mut().actions.push(mg_ui::Action::Save);
     h.run();
     assert!(h.query_by_label("Areas Not Yours").is_none());
+    // The table changed while the save waits (a pull, read again by the
+    // folder's watch): the window's list follows it, and with none left
+    // the save goes on.
+    h.state_mut().actions.push(rename_start("Square"));
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    h.run();
+    h.run();
+    h.get_by_label("  •  start is claimed by cd since 2026-10-20");
+    std::fs::write(dir.join("claims.2da"), claims_table("ef", "claimed")).unwrap();
+    h.state_mut().reload_project_files();
+    h.run();
+    h.get_by_label("  •  start is claimed by ef since 2026-10-20");
+    assert!(h.state().has_unsaved_work());
+    std::fs::write(dir.join("claims.2da"), claims_table("ab", "claimed")).unwrap();
+    h.state_mut().reload_project_files();
+    h.run();
+    h.run();
+    assert!(h.query_by_label("Areas Not Yours").is_none());
+    assert!(logged(&h, "The claims table changed: the save writes no area not yours now"));
+    assert!(!h.state().has_unsaved_work(), "saved");
+}
+
+/// A builder code chosen that holds another's claims in the team's table
+/// is said in the Builder Code window, and in the log once set; the
+/// builder's own code, or a free one, isn't.
+#[test]
+fn a_builder_code_that_holds_claims_is_said_in_its_window() {
+    let (dir, app) = claimed_project(
+        "ui-claims-code",
+        "[claims]\nfile = \"claims.2da\"\n",
+        &claims_table("cd", "claimed"),
+    );
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    let said = "cd holds claims in claims.2da (start): if that is another builder's code, choose \
+                your own, or the two of you share those areas and the names of new resources";
+    let draft = |code: &str| mg_ui::builder_code::Draft { code: code.into(), root: dir.clone() };
+    for free in ["ab", "ef"] {
+        h.state_mut().builder_code = Some(draft(free));
+        h.run();
+        assert!(h.query_by_label_contains("holds claims").is_none(), "{free}");
+    }
+    h.state_mut().builder_code = Some(draft("CD"));
+    h.run();
+    h.get_by_label(said);
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert!(logged(&h, said));
+    assert!(logged(&h, "Your builder code is cd"));
+}
+
+/// C6: Edit › Claims Table… shows the table whole (every area of it and
+/// the module, whose each is), and takes another builder's claim over
+/// (asked first), hands this builder's on, releases and claims.
+#[test]
+fn the_claims_table_window_shows_every_area_and_hands_claims_on() {
+    let table = format!(
+        "{}1   kz_gone          ****     merged   2026-10-01  KZ_GONE\n",
+        claims_table("cd", "claimed")
+    );
+    let (dir, app) =
+        claimed_project("ui-claims-table", "[claims]\nfile = \"claims.2da\"\n", &table);
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    h.get_by_label("Edit").click();
+    h.run();
+    h.get_by_label("Claims Table…").click();
+    h.run();
+    h.get_by_label("claims.2da: whose each area is. Your code is ab.");
+    h.get_by_label("cd since 2026-10-20");
+    h.get_by_label("kz_gone");
+    h.get_by_label("merged, not in the module");
+    let row = |dir: &std::path::Path| {
+        let text = std::fs::read_to_string(dir.join("claims.2da")).unwrap();
+        text.lines().nth(3).unwrap().split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+    };
+    // A free one: claimed, and released, from the window.
+    h.get_by_label("Claim").click();
+    h.run();
+    let gone = |dir: &std::path::Path| std::fs::read_to_string(dir.join("claims.2da")).unwrap();
+    assert!(gone(&dir).lines().nth(4).unwrap().starts_with("1   kz_gone          ab "));
+    h.get_by_label("Release").click();
+    h.run();
+    assert!(gone(&dir).lines().nth(4).unwrap().starts_with("1   kz_gone          **** "));
+    // Another's: taken over once asked.
+    h.get_by_label("Take Over…").click();
+    h.run();
+    h.get_by_label_contains("start is claimed by cd since 2026-10-20. Taken over");
+    h.get_by_label("Don't Take It").click();
+    h.run();
+    assert_eq!(row(&dir), "0 start cd");
+    h.get_by_label("Take Over…").click();
+    h.run();
+    h.get_by_label("Take It Over").click();
+    h.run();
+    assert_eq!(row(&dir), "0 start ab");
+    assert!(logged(&h, "start taken over from cd by ab, in claims.2da: commit it, and tell them"));
+    h.get_by_label_contains("yours: ab since");
+    // Handed on: not to one's own code.
+    h.get_by_label("Hand To…").click();
+    h.run();
+    type_into_hint(&mut h, "their code", "AB");
+    h.get_by_label("That is your own code.");
+    assert!(h.get_by_label("Hand Over").accesskit_node().is_disabled());
+    h.key_press(egui::Key::Backspace);
+    h.key_press(egui::Key::Backspace);
+    h.run();
+    type_into_hint(&mut h, "their code", "ef");
+    h.get_by_label("Hand Over").click();
+    h.run();
+    assert_eq!(row(&dir), "0 start ef");
+    assert!(logged(&h, "start handed to ef by ab, in claims.2da: commit it, and tell them"));
+    // The window follows the table: another's again.
+    h.get_by_label_contains("ef since");
+    assert!(h.query_by_label("Hand To…").is_none());
+    h.get_by_label("Close").click();
+    h.run();
+    assert!(h.query_by_label("Claims Table").is_none());
 }
 
 /// C6: Claim This Area (the module tree's menu) writes the builder's row
@@ -1776,6 +2205,60 @@ fn a_merged_area_s_tag_and_resref_are_asked_about_before_they_change() {
     h.run();
     h.run();
     assert!(h.state().rename.is_some(), "the Rename window, once said");
+    // The pass is the rename's: a change of the Tag meanwhile is asked.
+    h.state_mut().actions.push(retag("START_3"));
+    h.run();
+    h.run();
+    h.get_by_label("Protected Area");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    assert_eq!(tag(&mut h), "START_2");
+    // The Rename window closed without renaming: the next Rename… asks
+    // again, and so does a change of the Tag.
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    h.run();
+    assert!(h.state().rename.is_none());
+    h.state_mut().actions.push(mg_ui::Action::RenameDialog(key));
+    h.run();
+    h.run();
+    h.get_by_label("Protected Area");
+    assert!(h.state().rename.is_none(), "asked again");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    h.state_mut().actions.push(retag("START_3"));
+    h.run();
+    h.run();
+    h.get_by_label("Protected Area");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    // Delete It Anyway, and its window canceled: the next Delete… asks
+    // again.
+    h.state_mut().actions.push(mg_ui::Action::DeleteDialog(key));
+    h.run();
+    h.run();
+    h.get_by_label("Delete It Anyway").click();
+    h.run();
+    h.run();
+    assert_eq!(h.state().confirm_delete, Some(vec![key]));
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    h.run();
+    assert_eq!(h.state().confirm_delete, None);
+    h.state_mut().actions.push(mg_ui::Action::DeleteDialog(key));
+    h.run();
+    h.run();
+    h.get_by_label("Protected Area");
+    assert_eq!(h.state().confirm_delete, None, "asked again");
+    // Deleted anyway: the pass lasts until the window's Delete is done.
+    h.get_by_label("Delete It Anyway").click();
+    h.run();
+    h.run();
+    h.get_by_label("Delete").click();
+    h.run();
+    h.run();
+    assert!(h.query_by_label("Protected Area").is_none());
+    assert!(!h.state().ws.as_ref().unwrap().module.contains(&key), "deleted");
 }
 
 /// The project's commands (C8): File › Project › Update… saves the
@@ -2040,15 +2523,362 @@ fn a_project_s_command_that_writes_nothing_keeps_the_haks_open() {
     assert_eq!(ws.module.haks().unwrap(), ["mg_cmd_writes"]);
 }
 
+/// Frames until the job running is over (or a test has hung). (Its
+/// tests run commands through `sh`.)
+#[cfg(unix)]
+fn until_idle(h: &mut Harness<'_, Moonglow>) {
+    let started = std::time::Instant::now();
+    while h.state().busy() {
+        assert!(started.elapsed().as_secs() < 60, "the command never ended");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.step();
+    }
+    h.run_steps(2);
+}
+
+/// A project's command's output is in a window of its own, as it comes
+/// and after (File › Project › Command Output), not the log only; one that
+/// reads what is typed (`input = true`) is given it from the line under
+/// its output, its question shown before its line ends, a hidden line
+/// kept out of the output. A command that doesn't has its input closed:
+/// its question is answered with nothing at once, as before. (By `sh`:
+/// `cmd /C` expands `%name%` as it reads the line, before `set /p` has
+/// set it, so the same on Windows needs a script of its own.)
+#[cfg(unix)]
+#[test]
+fn a_project_s_command_shows_its_output_and_takes_what_is_typed() {
+    let ask = "printf 'Name: '; read name; printf 'Secret: '; read secret; echo \"got:$name\"; \
+               echo \"kept:$secret\"";
+    let closed = "read x; echo \"empty:$x\"; echo \"warned\" 1>&2; exit 2";
+    let rules =
+        format!("[commands]\nask = {{ run = {ask:?}, input = true }}\nclosed = {closed:?}\n");
+    let dir = project_folder("ui-project-commands-input", &[("moonglow.toml", &rules)]);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.background_jobs = true;
+    let project = std::fs::canonicalize(&dir).unwrap().display().to_string();
+    for (name, text) in [("ask", ask), ("closed", closed)] {
+        app.settings.allowed_commands.push((project.clone(), name.into(), text.into()));
+    }
+    app.open_module(&dir);
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::ProjectCommand("ask".into()));
+    h.run_steps(2);
+    assert!(h.state().busy(), "running, waiting for its answer");
+    // Its question shows before its line ends. (Waited for as the
+    // command gets to it, however busy the machine: a minute at most.)
+    let shows = |h: &mut Harness<'_, Moonglow>, line: &str| {
+        let started = std::time::Instant::now();
+        while h.query_by_label(line).is_none() {
+            assert!(started.elapsed().as_secs() < 60, "{line:?} never showed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            h.step();
+        }
+    };
+    shows(&mut h, "Name: ");
+    h.get_by_label("Send");
+    h.get_by_label("End Input");
+    // The line has the keys: typed, and Enter sends it.
+    h.event(egui::Event::Text("Hipólito".into()));
+    h.step();
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.step();
+    h.get_by_label("> Hipólito");
+    // A hidden line, by Send.
+    shows(&mut h, "Secret: ");
+    h.get_by_label("Name: ");
+    h.get_by_label("Hide").click();
+    h.step();
+    h.event(egui::Event::Text("swordfish".into()));
+    h.step();
+    h.get_by_label("Send").click();
+    h.step();
+    h.step();
+    h.get_by_label("> (hidden)");
+    until_idle(&mut h);
+    assert!(logged(&h, "  got:Hipólito"), "{:?}", h.state().log.entries);
+    assert!(logged(&h, "  kept:swordfish"), "the command had it");
+    assert!(
+        !logged(&h, "> Hipólito") && !logged(&h, "(hidden)"),
+        "what was typed is not in the log: {:?}",
+        h.state().log.entries
+    );
+    // Its output, after: File › Project › Command Output.
+    h.get_by_label("File").click();
+    h.run();
+    h.get_by_label("Project").click();
+    h.run();
+    h.get_by_label("Command Output").click();
+    h.run_steps(2);
+    h.get_by_label("Done.");
+    h.get_by_label("got:Hipólito");
+    assert!(h.query_by_label("swordfish").is_none(), "a hidden line is not shown");
+    // Its input closed: the question has its answer, empty, at once; its
+    // errors and how it ended in the window.
+    h.state_mut().actions.push(mg_ui::Action::ProjectCommand("closed".into()));
+    h.run_steps(2);
+    until_idle(&mut h);
+    assert!(logged(&h, "  empty:"), "{:?}", h.state().log.entries);
+    assert!(logged(&h, "Closed failed: it ended with exit code 2 (all it said: File › Project"));
+    h.get_by_label("Failed: it ended with exit code 2.");
+    h.get_by_label("empty:");
+    h.get_by_label("warned");
+    assert!(h.query_by_label("got:Hipólito").is_none(), "the last command's alone");
+    h.get_by_label("Close").click();
+    h.run();
+    assert!(h.query_by_label("Command Output").is_none(), "closed");
+}
+
+/// A project's command canceled gives back what it let go: the project's
+/// files are looked at again (what it wrote before it was stopped comes
+/// into the module) and its haks opened again, as after one that ends.
+/// (A canceled job hands nothing over: they stayed let go.)
+#[cfg(unix)]
+#[test]
+fn a_project_s_command_canceled_reads_the_project_s_files_again() {
+    let slow = "printf 'void main() {}\\n' > made.nss; sleep 300";
+    let rules = format!("[commands]\nslow = {slow:?}\n");
+    let dir = project_folder("ui-project-commands-cancel", &[("moonglow.toml", &rules)]);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.background_jobs = true;
+    let project = std::fs::canonicalize(&dir).unwrap().display().to_string();
+    app.settings.allowed_commands.push((project, "slow".into(), slow.into()));
+    app.open_module(&dir);
+    let mut h = harness(app, 1000.0, 700.0);
+    // (The area read first, a job of its own.)
+    until_idle(&mut h);
+    h.state_mut().actions.push(mg_ui::Action::ProjectCommand("slow".into()));
+    h.step();
+    let started = std::time::Instant::now();
+    while !dir.join("made.nss").exists() {
+        assert!(started.elapsed().as_secs() < 60, "the command never wrote");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.step();
+    }
+    assert!(h.state().busy());
+    // (The job's window shown, its fade in over.)
+    h.run_steps(20);
+    h.get_by_label("Slow");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run_steps(2);
+    until_idle(&mut h);
+    assert!(started.elapsed().as_secs() < 120, "stopped, not waited for");
+    let made = ResKey::parse("made", ResType::NSS).unwrap();
+    while !h.state().ws.as_ref().unwrap().module.contains(&made) {
+        assert!(started.elapsed().as_secs() < 150, "the project's files never read again");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        h.step();
+    }
+    h.get_by_label("File").click();
+    h.run();
+    h.get_by_label("Project").click();
+    h.run();
+    h.get_by_label("Command Output").click();
+    h.run_steps(2);
+    h.get_by_label("Canceled (stopped).");
+}
+
 /// File › Project is there and off for a project that names no commands.
 #[test]
 fn file_project_is_off_without_the_project_s_commands() {
     let dir = mg_testkit::scratch_dir("ui-project-commands-none");
     let mut app = app_with(Vec::new());
     app.open_module(&sample_module(&dir));
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.get_by_label("File").click();
     h.run();
     assert!(h.get_by_label("Project").accesskit_node().is_disabled());
+}
+
+/// An NWSync repository of one resource, published in `dir/repo`; the
+/// manifest's hash.
+fn nwsync_repository(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    use mg_module::nwsync::{Options, Source, write};
+    let repo = dir.join("repo");
+    let _ = std::fs::remove_dir_all(&repo);
+    let contents =
+        vec![(ResKey::parse("mg_up", ResType::TXT).unwrap(), Source::Bytes(b"sent"[..].into()))];
+    let w =
+        write(&repo, &contents, &Options { latest: true, ..Default::default() }, &mut |_, _| {})
+            .unwrap();
+    (repo, w.sha1)
+}
+
+/// A stand-in for an upload command (nothing goes anywhere but `dir`):
+/// each part's name written to `dir/order.txt` as it is sent; on Linux
+/// and macOS the part copied into `dir/served` too, as rsync would to a
+/// web server's folder. With `fail`, the part so named fails (exit 1).
+fn stand_in_upload(dir: &std::path::Path, fail: Option<&str>) -> String {
+    let log = mg_module::nwsync::shell_quoted(&dir.join("order.txt"));
+    if cfg!(windows) {
+        let fail = fail.map_or(String::new(), |f| format!(" && if {{part}}=={f} exit 1"));
+        format!("echo {{part}}>> {log}{fail}")
+    } else {
+        let served = dir.join("served");
+        std::fs::create_dir_all(&served).unwrap();
+        let served = mg_module::nwsync::shell_quoted(&served);
+        let fail = fail.map_or(String::new(), |f| format!(" && test {{part}} != {f}"));
+        format!("printf '%s\\n' {{part}} >> {log}{fail} && cp -R {{part}} {served}/")
+    }
+}
+
+/// The parts the stand-in sent, in turn.
+fn sent_order(dir: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(dir.join("order.txt")).unwrap_or_default();
+    text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+}
+
+/// Opens Build › Publish to NWSync… on `repo`.
+fn publish_window(h: &mut Harness<'_, Moonglow>, repo: &std::path::Path) {
+    h.get_by_label("Build").click();
+    h.run();
+    h.get_by_label("Publish to NWSync…").click();
+    h.run();
+    h.state_mut().publish.as_mut().unwrap().folder = repo.display().to_string();
+    h.run();
+}
+
+/// The entry "No upload" of the deferred list: Publish to NWSync's Upload
+/// runs the builder's own command (Options › Folders) once for each part
+/// of the repository, in the repository's folder: the data, then the
+/// manifests, then `latest`, each only after the one before succeeded, so
+/// that a failure never leaves the server a `latest` naming a manifest it
+/// doesn't have. Nothing goes anywhere but the test's own folder.
+#[test]
+fn the_nwsync_repository_is_uploaded_part_by_part() {
+    let dir = mg_testkit::scratch_dir("ui-nwsync-upload");
+    let (repo, sha1) = nwsync_repository(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.settings.nwsync_upload = Some(stand_in_upload(&dir, None));
+    app.open_module(&sample_module(&dir));
+    let mut h = harness(app, 1100.0, 800.0);
+    h.run();
+    publish_window(&mut h, &repo);
+    h.get_by_label("Set in Options › Folders.");
+    h.get_by_label("Upload").click();
+    h.run();
+    h.run();
+    assert_eq!(sent_order(&dir), ["data", "manifests", "latest"], "{:?}", h.state().log.entries);
+    assert!(logged(&h, "Uploaded to NWSync: data, manifests, latest sent"));
+    assert!(logged(&h, "Sending manifests: "), "each part's command in the log");
+    h.get_by_label("Done.");
+    if cfg!(unix) {
+        let served = dir.join("served");
+        assert_eq!(std::fs::read_to_string(served.join("latest")).unwrap(), sha1);
+        assert!(served.join("manifests").join(&sha1).is_file());
+        assert!(served.join("manifests").join(format!("{sha1}.json")).is_file());
+        let h1 = mg_core::sha1::hex(&mg_core::sha1::sha1(b"sent"));
+        assert!(served.join("data/sha1").join(&h1[..2]).join(&h1[2..4]).join(&h1).is_file());
+    }
+    // Show Output: what each part's command said.
+    h.get_by_label("Show Output").click();
+    h.run();
+    h.get_by_label("Command Output");
+    assert!(h.query_all_by_label_contains("Sending latest: ").count() >= 1);
+    h.get_all_by_label("Close").last().unwrap().click();
+    h.run();
+
+    // A part that fails: nothing after it is sent.
+    std::fs::remove_file(dir.join("order.txt")).unwrap();
+    h.state_mut().settings.nwsync_upload = Some(stand_in_upload(&dir, Some("manifests")));
+    h.run();
+    h.get_by_label("Upload").click();
+    h.run();
+    h.run();
+    assert_eq!(sent_order(&dir), ["data", "manifests"], "latest never sent");
+    assert!(logged(
+        &h,
+        "NWSync upload: stopped sending manifests; data sent before it, nothing after"
+    ));
+    assert!(h.get_all_by_label("Failed: it ended with exit code 1.").count() >= 1);
+
+    // `latest` naming a manifest that isn't there: nothing is sent.
+    std::fs::remove_file(dir.join("order.txt")).unwrap();
+    std::fs::write(repo.join("latest"), "0".repeat(40)).unwrap();
+    h.get_by_label("Upload").click();
+    h.run();
+    assert!(sent_order(&dir).is_empty());
+    let error = h.state().publish.as_ref().unwrap().error.clone().unwrap_or_default();
+    assert!(error.contains("isn't in manifests/"), "{error}");
+}
+
+/// A project's own upload command (`[nwsync] upload` in moonglow.toml)
+/// is used in place of the one in Options, and is a program the builder
+/// did not choose: asked about first, as the project's commands are, and
+/// allowed by its text in Moonglow's own settings.
+#[test]
+fn a_project_s_nwsync_upload_is_asked_about_first() {
+    let scratch = mg_testkit::scratch_dir("ui-nwsync-upload-project");
+    let command = stand_in_upload(&scratch, None);
+    let rules = format!("[nwsync]\nupload = {command:?}\n");
+    let dir = project_folder("ui-nwsync-upload-project-folder", &[("moonglow.toml", &rules)]);
+    let (repo, _) = nwsync_repository(&scratch);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.settings.nwsync_upload = Some("exit 9".into());
+    app.open_module(&dir);
+    let mut h = harness(app, 1100.0, 800.0);
+    h.run();
+    publish_window(&mut h, &repo);
+    h.get_by_label("Set in the project's moonglow.toml.");
+    h.get_by_label("Upload").click();
+    h.run();
+    h.run();
+    h.get_by_label("Run a Project Command?");
+    assert!(sent_order(&scratch).is_empty(), "not run before it is allowed");
+    h.get_by_label("Allow and Run").click();
+    h.run();
+    h.run();
+    assert_eq!(sent_order(&scratch), ["data", "manifests", "latest"]);
+    let project = std::fs::canonicalize(&dir).unwrap().display().to_string();
+    assert_eq!(
+        h.state().settings.allowed_commands,
+        [(project, "[nwsync] upload".to_string(), command.clone())]
+    );
+    // Allowed: it runs again without asking.
+    std::fs::remove_file(scratch.join("order.txt")).unwrap();
+    h.get_by_label("Upload").click();
+    h.run();
+    h.run();
+    assert!(h.query_by_label("Run a Project Command?").is_none());
+    assert_eq!(sent_order(&scratch), ["data", "manifests", "latest"]);
+}
+
+/// An upload is a job: Cancel stops its command (and what it started),
+/// and nothing after it is sent.
+#[cfg(unix)]
+#[test]
+fn an_nwsync_upload_canceled_sends_nothing_more() {
+    let dir = mg_testkit::scratch_dir("ui-nwsync-upload-cancel");
+    let (repo, _) = nwsync_repository(&dir);
+    let log = mg_module::nwsync::shell_quoted(&dir.join("order.txt"));
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.background_jobs = true;
+    app.settings.nwsync_upload = Some(format!("printf '%s\\n' {{part}} >> {log}; sleep 30"));
+    app.open_module(&sample_module(&dir));
+    let mut h = harness(app, 1100.0, 800.0);
+    until_idle(&mut h);
+    publish_window(&mut h, &repo);
+    h.get_by_label("Upload").click();
+    h.step();
+    let started = std::time::Instant::now();
+    while sent_order(&dir).is_empty() {
+        assert!(started.elapsed().as_secs() < 20, "the command never ran");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.step();
+    }
+    h.run_steps(20);
+    h.get_by_label("Uploading to NWSync");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run_steps(2);
+    until_idle(&mut h);
+    assert!(started.elapsed().as_secs() < 20, "stopped, not waited for");
+    assert_eq!(sent_order(&dir), ["data"], "nothing after it");
+    h.get_by_label("Canceled (stopped).");
 }

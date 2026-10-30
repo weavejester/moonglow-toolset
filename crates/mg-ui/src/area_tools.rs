@@ -12,6 +12,10 @@ use mg_resman::ResKey;
 
 use crate::{Action, Moonglow, Tab};
 
+/// The range of Adjust Location's fields that have none of their own (a
+/// position, a turn, a translation): any number.
+const FAR: std::ops::RangeInclusive<f32> = f32::MIN..=f32::MAX;
+
 /// The Adjust Location window's values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdjustLocation {
@@ -27,6 +31,14 @@ pub struct AdjustLocation {
     /// The visual transform (EE), and whether it was changed.
     pub visual: mg_area::VisualTransform,
     pub visual_changed: bool,
+    /// How fast the model's animations play (the visual transform's
+    /// `AnimationSpeed`, 1 as made), and whether it was changed.
+    pub speed: f32,
+    pub speed_changed: bool,
+    /// What the first object's visual transforms have that the window
+    /// doesn't set ([`kept_notes`]): its parts' own (a creature's head…)
+    /// and lerps in progress.
+    pub kept: Vec<String>,
     /// Some object chosen takes a visual transform (creatures, items,
     /// doors and placeables that aren't static): else it isn't offered, as
     /// in Aurora.
@@ -41,6 +53,34 @@ pub struct AdjustLocation {
     /// one the game scales by): kept until Scale is changed (the window
     /// says so).
     pub uneven: usize,
+    /// It is the module's start location (`Mod_Entry_*` in module.ifo),
+    /// selected in the area's view, rather than objects.
+    pub start: bool,
+}
+
+/// Adjust Location for the module's start location in `area`, at
+/// `(position, facing)` (radians anticlockwise from east, the way its
+/// arrow points): its position and bearing, as an object's.
+pub(crate) fn adjust_start(area: ResRef, (position, facing): (Vec3, f32)) -> AdjustLocation {
+    AdjustLocation {
+        area,
+        objects: Vec::new(),
+        position,
+        // (An object's bearing faces north at 0, as the start location's
+        // arrow at a quarter turn from east.)
+        bearing: (facing - std::f32::consts::FRAC_PI_2).to_degrees().rem_euclid(360.0),
+        changed: [false; 4],
+        visual: mg_area::VisualTransform::default(),
+        visual_changed: false,
+        speed: 1.0,
+        speed_changed: false,
+        kept: Vec::new(),
+        shaped: false,
+        fixed: 0,
+        fixed_shaped: 0,
+        uneven: 0,
+        start: true,
+    }
 }
 
 /// Adjust Location for the selection of an area's view (showing the first
@@ -64,6 +104,9 @@ pub(crate) fn adjust(view: &crate::area_view::AreaView) -> Option<AdjustLocation
         changed: [false; 4],
         visual: first.visual.unwrap_or_default(),
         visual_changed: false,
+        speed: first.scopes.iter().find(|s| s.scope == 0).map_or(1.0, |s| s.speed),
+        speed_changed: false,
+        kept: kept_notes(first.kind, &first.scopes),
         uneven: view
             .selection
             .iter()
@@ -77,6 +120,7 @@ pub(crate) fn adjust(view: &crate::area_view::AreaView) -> Option<AdjustLocation
             .iter()
             .filter_map(|&(k, i)| model.object(k, i))
             .any(|o| o.takes_visual_transform()),
+        start: false,
     })
 }
 
@@ -91,32 +135,31 @@ fn adjust_window(app: &mut Moonglow, ui: &mut Ui) {
     let mut open = true;
     let mut cancel = false;
     let mut done = None;
-    egui::Window::new("Adjust Location")
-        .open(crate::widgets::open_unless_escape(ui.ctx(), "Adjust Location", &mut open))
-        .pivot(egui::Align2::CENTER_CENTER)
-        .default_pos(ui.ctx().content_rect().center())
+    crate::widgets::dialog(ui.ctx(), "Adjust Location", &mut open)
         .resizable(false)
         .collapsible(false)
         .show(ui.ctx(), |ui| {
             if a.objects.len() > 1 {
                 ui.weak(format!("{} objects: what you change is set on each", a.objects.len()));
             }
+            if a.start {
+                ui.weak("The module's start location");
+            }
             egui::Grid::new("adjust").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 for (i, label) in ["X", "Y", "Z"].into_iter().enumerate() {
                     crate::widgets::field_label(ui, label);
-                    let r = ui
-                        .add(egui::DragValue::new(&mut a.position[i]).speed(0.05).max_decimals(3));
+                    // (A step of an arrow: a tenth of a meter.)
+                    let r = crate::widgets::spin_draft(ui, &mut a.position[i], FAR, 0.1, |d| {
+                        d.speed(0.05).max_decimals(3)
+                    });
                     a.changed[i] |= r.changed();
                     ui.end_row();
                 }
                 crate::widgets::field_label(ui, "Bearing (°)")
                     .on_hover_text("0 faces north, 90 west (as Aurora shows it)");
-                let r = ui.add(
-                    egui::DragValue::new(&mut a.bearing)
-                        .speed(1.0)
-                        .range(0.0..=360.0)
-                        .max_decimals(2),
-                );
+                let r = crate::widgets::spin_draft(ui, &mut a.bearing, 0.0..=360.0, 1.0, |d| {
+                    d.speed(1.0).max_decimals(2)
+                });
                 a.changed[3] |= r.changed();
                 ui.end_row();
             });
@@ -129,18 +172,23 @@ fn adjust_window(app: &mut Moonglow, ui: &mut Ui) {
                 visual.show(ui, |ui| {
                     crate::widgets::field_label(ui, "Scale");
                     let mut scale = a.visual.scale.x;
-                    let r = ui.add(
-                        egui::DragValue::new(&mut scale)
-                            .speed(0.01)
-                            .range(0.01..=100.0)
-                            .max_decimals(2),
-                    );
+                    let r = crate::widgets::spin_draft(ui, &mut scale, 0.01..=100.0, 0.1, |d| {
+                        d.speed(0.01).max_decimals(2)
+                    });
                     if r.changed() {
                         a.visual.scale = Vec3::splat(scale);
                         a.visual_changed = true;
                         // (Written alike from now on.)
                         a.uneven = 0;
                     }
+                    crate::widgets::field_label(ui, "Animation Speed").on_hover_text(
+                        "How fast the model's animations play: 1 as made, 2 twice as fast \
+                         (the script's OBJECT_VISUAL_TRANSFORM_ANIMATION_SPEED)",
+                    );
+                    let r = crate::widgets::spin_draft(ui, &mut a.speed, 0.0..=100.0, 0.1, |d| {
+                        d.speed(0.01).max_decimals(2)
+                    });
+                    a.speed_changed |= r.changed();
                     ui.end_row();
                     // What each turn does, as the game draws it
                     // (`mg_area::VisualTransform::matrix`).
@@ -154,20 +202,30 @@ fn adjust_window(app: &mut Moonglow, ui: &mut Ui) {
                     for (i, axis) in ["X", "Y", "Z"].into_iter().enumerate() {
                         crate::widgets::field_label(ui, format!("{axis} Rotation"))
                             .on_hover_text(turns[i]);
-                        let r = ui.add(
-                            egui::DragValue::new(&mut a.visual.rotate[i])
-                                .speed(1.0)
-                                .max_decimals(1),
-                        );
+                        let turn = &mut a.visual.rotate[i];
+                        let r = crate::widgets::spin_draft(ui, turn, FAR, 1.0, |d| {
+                            d.speed(1.0).max_decimals(1)
+                        });
                         a.visual_changed |= r.changed();
                         crate::widgets::field_label(ui, format!("{axis} Translation"));
-                        let r = ui.add(
-                            egui::DragValue::new(&mut a.visual.translate[i])
-                                .speed(0.01)
-                                .max_decimals(2),
-                        );
+                        let to = &mut a.visual.translate[i];
+                        let r = crate::widgets::spin_draft(ui, to, FAR, 0.1, |d| {
+                            d.speed(0.01).max_decimals(2)
+                        });
                         a.visual_changed |= r.changed();
                         ui.end_row();
+                    }
+                });
+            }
+            if a.shaped && !a.kept.is_empty() {
+                ui.add_space(crate::widgets::SECTION_GAP);
+                ui.scope(|ui| {
+                    ui.set_max_width(340.0);
+                    if a.objects.len() > 1 {
+                        ui.weak("The first of them:");
+                    }
+                    for note in &a.kept {
+                        ui.add(egui::Label::new(egui::RichText::new(note).weak()).wrap());
                     }
                 });
             }
@@ -203,6 +261,7 @@ fn adjust_window(app: &mut Moonglow, ui: &mut Ui) {
         apply_location(app, &a);
         a.changed = [false; 4];
         a.visual_changed = false;
+        a.speed_changed = false;
         if close {
             return;
         }
@@ -246,6 +305,84 @@ pub fn static_note(a: &AdjustLocation) -> Option<String> {
     ))
 }
 
+/// What Adjust Location says of what an object's visual transforms have
+/// that it doesn't set (`scopes`, its `VisTransformList`): a part's own
+/// transform (a creature's head, tail, wings or cloak, drawn on that part;
+/// an item's parts), and each lerp in progress (a script's, kept in a
+/// saved game: drawn at its end, ended by a value set here). Nothing for
+/// an object with neither.
+pub fn kept_notes(kind: ObjectKind, scopes: &[mg_module::placement::Scoped]) -> Vec<String> {
+    use mg_module::placement::scope_name;
+    let mut out = Vec::new();
+    for s in scopes {
+        let named = scope_name(kind, s.scope);
+        if s.scope != 0 {
+            let t = s.transform;
+            let mut parts = Vec::new();
+            if t.scale[0] != 1.0 {
+                parts.push(format!("scale {}", short(t.scale[0])));
+            }
+            if t.rotate != [0.0; 3] {
+                let [x, y, z] = t.rotate.map(short);
+                parts.push(format!("rotation {x}°, {y}°, {z}°"));
+            }
+            if t.translate != [0.0; 3] {
+                let [x, y, z] = t.translate.map(short);
+                parts.push(format!("translation {x}, {y}, {z}"));
+            }
+            if s.speed != 1.0 {
+                parts.push(format!("animation speed {}", short(s.speed)));
+            }
+            if parts.is_empty() {
+                parts.push("none that changes it".into());
+            }
+            let drawn = match (kind, s.scope) {
+                (ObjectKind::Creature, 254 | 253 | 252 | 243) => ", drawn on it",
+                _ => "",
+            };
+            let named = named.strip_prefix("its ").unwrap_or(&named).to_string();
+            out.push(format!(
+                "Its {named} has a visual transform of its own ({}){drawn}: kept as it is, set by \
+                 a script, not here.",
+                parts.join(", ")
+            ));
+        }
+        for l in &s.lerps {
+            let axis = match l.axis {
+                "AnimationSpeed" => "animation speed".to_string(),
+                a => {
+                    let (what, x) = a.split_at(a.len() - 1);
+                    let what = match what {
+                        "Scale" => "scale",
+                        "Rotate" => "rotation",
+                        _ => "translation",
+                    };
+                    format!("{x} {what}")
+                }
+            };
+            let whose = match s.scope {
+                0 => String::new(),
+                _ => format!(" of {named}"),
+            };
+            let along = (l.progress * 100.0).round().clamp(0.0, 100.0);
+            let again = match l.repeats {
+                0 => String::new(),
+                n if n < 0 => ", again and again".to_string(),
+                n => format!(", {n} times more"),
+            };
+            out.push(format!(
+                "Its {axis}{whose} is changing (a script's lerp, kept in a saved game): from {} \
+                 to {} over {} s, {along}% along{again}. Drawn at its end; set here, the lerp \
+                 ends.",
+                short(l.from),
+                short(l.to),
+                short(l.duration)
+            ));
+        }
+    }
+    out
+}
+
 /// What Adjust Location says when a file's `ScaleY` or `ScaleZ` differs
 /// from its `ScaleX` (set by hand, or by another tool): the game scales by
 /// `ScaleX` alone, which Scale shows; the other two are kept until Scale
@@ -276,6 +413,18 @@ pub fn scale_note(a: &AdjustLocation) -> Option<String> {
     ))
 }
 
+/// Sets the changed parts of the start location (a command each, as its
+/// marker's drag and turn are).
+fn apply_start(app: &mut Moonglow, a: &AdjustLocation) {
+    if a.changed[..3].iter().any(|c| *c) {
+        crate::area_view::move_start_location(app, a.position);
+    }
+    if a.changed[3] {
+        let facing = a.bearing.to_radians() + std::f32::consts::FRAC_PI_2;
+        crate::area_view::turn_start_location(app, facing);
+    }
+}
+
 /// A number as short as it reads (`0.5`, `1`, `1.25`).
 fn short(v: f32) -> String {
     let s = format!("{v:.3}");
@@ -284,6 +433,10 @@ fn short(v: f32) -> String {
 
 /// Sets the changed parts of the location on each object (one command).
 fn apply_location(app: &mut Moonglow, a: &AdjustLocation) {
+    if a.start {
+        apply_start(app, a);
+        return;
+    }
     let git = ResKey::new(a.area, ResType::GIT);
     let (Some(view), Some(ws)) = (app.area_views.get(&a.area), app.ws.as_mut()) else { return };
     let Some(model) = &view.model else { return };
@@ -303,8 +456,15 @@ fn apply_location(app: &mut Moonglow, a: &AdjustLocation) {
         }
         let rotation = if a.changed[3] { a.bearing.to_radians() } else { o.rotation };
         edits.extend(mg_area::edit::move_edits(git, o, s, p, rotation));
-        if a.visual_changed && o.takes_visual_transform() {
-            edits.extend(mg_area::edit::visual_transform_edits(git, o, s, a.visual));
+        if (a.visual_changed || a.speed_changed) && o.takes_visual_transform() {
+            // (What wasn't changed here, each its own: a speed alone
+            // changed leaves the object's transform as it was.)
+            let v = match a.visual_changed {
+                true => a.visual,
+                false => o.visual.unwrap_or_default(),
+            };
+            let speed = a.speed_changed.then_some(a.speed);
+            edits.extend(mg_area::edit::visual_transform_edits_with(git, o, s, v, speed));
         }
     }
     if !edits.is_empty() {

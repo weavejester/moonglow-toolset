@@ -9,9 +9,9 @@ use egui::Ui;
 use mg_core::{LocString, ResRef, ResType};
 use mg_edit::{Command, Edit, GffPath};
 use mg_gff::{FieldType, Struct, Value};
-use mg_module::palette::{BlueprintKind, Palette};
+use mg_module::palette::BlueprintKind;
 use mg_resman::ResKey;
-use mg_rules::{Choice, ChoiceColumns};
+use mg_rules::Choice;
 
 use crate::dialogs::FileKind;
 use crate::text::{decode, encode, with_english};
@@ -90,17 +90,47 @@ pub enum Was {
     Resource(ResKey, Option<Vec<u8>>),
 }
 
+/// A Properties window's text field that has the keyboard
+/// ([`Moonglow::held_text`]).
+#[derive(Debug, Clone)]
+pub(crate) struct HeldText {
+    /// The field.
+    pub id: egui::Id,
+    /// The frame it was last drawn in.
+    pub drawn: u64,
+    /// What it would set if left now (`None`: nothing typed).
+    pub command: Option<Command>,
+    /// The window it is in, for its Cancel: set once that is drawn.
+    pub window: Option<HeldIn>,
+}
+
+/// The window a [`HeldText`] is in: what its Cancel is given to note
+/// ([`window_drawn_but`]'s `tab`, `targets` and `kept`).
+#[derive(Debug, Clone)]
+pub(crate) struct HeldIn {
+    pub tab: Tab,
+    pub targets: Vec<(ResKey, GffPath)>,
+    pub kept: Vec<ResKey>,
+}
+
 /// The field of the object at `form` that an edit at `path` (the object's
-/// own, or further in: an item it holds) changes: `label` at the object
-/// itself, else the field the path goes into from it.
-fn field_changed(form: &GffPath, path: &GffPath, label: &str) -> Option<String> {
+/// own, or further in) changes, as its window's Cancel sets it back: the
+/// struct it is in and its label. In a struct of the object's (an area's
+/// sounds and music, its GIT's `AreaProperties`), the field itself: its
+/// others, changed elsewhere, are not set back with it. In a list (an
+/// item it holds), the list: its items may come and go meanwhile.
+fn field_changed(form: &GffPath, path: &GffPath, label: &str) -> Option<(GffPath, String)> {
     if !path.0.starts_with(&form.0) {
         return None;
     }
-    Some(match path.0.get(form.0.len()) {
-        Some(mg_edit::Step::Field(l) | mg_edit::Step::Item(l, _)) => l.clone(),
-        None => label.to_string(),
-    })
+    let mut at = form.clone();
+    for step in &path.0[form.0.len()..] {
+        match step {
+            mg_edit::Step::Field(l) => at = at.field(l),
+            mg_edit::Step::Item(l, _) => return Some((at, l.clone())),
+        }
+    }
+    Some((at, label.to_string()))
 }
 
 /// Whether a command reaches some of `targets` (each a document and the
@@ -158,19 +188,19 @@ pub(crate) fn note_command(
             .filter(|(k, form)| k == key && path.0.starts_with(&form.0))
             .max_by_key(|(_, form)| form.0.len());
         let Some((k, form)) = within else { continue };
-        let Some(field) = field_changed(form, path, label) else { continue };
+        let Some((at, field)) = field_changed(form, path, label) else { continue };
         let entry = app
             .properties_changed
             .entry(first.clone())
             .or_insert_with(|| WindowChanges { tab: tab.clone(), was: Vec::new() });
         let known = |w: &Was| match w {
-            Was::Field(wk, wp, wl, _) => wk == k && wp == form && *wl == field,
+            Was::Field(wk, wp, wl, _) => wk == k && *wp == at && *wl == field,
             // (Set back whole: its fields with it.)
             Was::Resource(wk, _) => wk == k,
         };
         if !entry.was.iter().any(known) {
-            let before = ws.doc(k).ok().and_then(|g| form.get(&g.root)?.get(&field).cloned());
-            entry.was.push(Was::Field(*k, form.clone(), field, before));
+            let before = ws.doc(k).ok().and_then(|g| at.get(&g.root)?.get(&field).cloned());
+            entry.was.push(Was::Field(*k, at, field, before));
         }
     }
 }
@@ -323,6 +353,14 @@ pub(crate) fn window_drawn_but(
     more: impl FnOnce(&mut Moonglow, &[Edit]) -> Vec<Edit>,
 ) {
     note_changes(app, pending, tab, targets, kept);
+    // (A text field of this window's, drawn just now with the keyboard:
+    // should it be gone before the keyboard leaves it, what it sets then,
+    // after the window is drawn, is this window's to set back. A window
+    // drawn after it this frame finds it claimed.)
+    if let Some(held) = app.held_text.as_mut().filter(|h| h.window.is_none()) {
+        let (tab, targets, kept) = (tab.clone(), targets.to_vec(), kept.to_vec());
+        held.window = Some(HeldIn { tab, targets, kept });
+    }
     // (Escape, for the window in front: its Cancel, `tabs.rs`.)
     let escaped = app.escape_cancel.as_ref() == Some(tab);
     if escaped {
@@ -344,11 +382,13 @@ pub(crate) fn window_drawn_but(
     app.actions.push(Action::CloseTab(tab.clone()));
 }
 
-/// A creature appearance's picture (a plain body of it), for the row the
-/// pointer rests on in the list.
-fn creature_picture(app: &mut Moonglow, ui: &mut Ui, row: usize) {
-    let look = mg_preview::CreatureLook::new(row as u16);
-    picture(ui, app.thumbnails.get(crate::model_view::Pictured::Look(look)));
+/// A creature appearance's picture, for the row the pointer rests on in
+/// the list: the creature as it is (`dressed`, its fields as
+/// [`Thumbnails::creature`](crate::model_view::Thumbnails::creature)
+/// keeps them: its head, colors, what it wears) in that appearance.
+fn creature_picture(app: &mut Moonglow, ui: &mut Ui, dressed: u64, row: usize) {
+    let key = crate::model_view::Pictured::Creature(dressed, row as u16);
+    picture(ui, app.thumbnails.get(key));
 }
 
 /// A placeable appearance's picture (its model).
@@ -358,8 +398,13 @@ fn placeable_picture(app: &mut Moonglow, ui: &mut Ui, row: usize) {
 
 /// A tileset door's picture (doortypes.2da's model; the generic door, row
 /// 0, has none of its own).
-pub(super) fn door_type_picture(app: &mut Moonglow, ui: &mut Ui, row: usize) {
-    model_picture(app, ui, ("doortypes", "Model"), row);
+/// (Row 0, a door of no tileset's, is drawn as the generic door `generic`
+/// chosen, as the game draws it.)
+pub(super) fn door_type_picture(app: &mut Moonglow, ui: &mut Ui, row: usize, generic: i64) {
+    match usize::try_from(generic) {
+        Ok(generic) if row == 0 => generic_door_picture(app, ui, generic),
+        _ => model_picture(app, ui, ("doortypes", "Model"), row),
+    }
 }
 
 /// A generic door's picture (genericdoors.2da's model).
@@ -385,15 +430,32 @@ fn model_picture(app: &mut Moonglow, ui: &mut Ui, (table, column): (&str, &str),
 /// look, on a woman where `female` (armor and cloaks). (The icon tells
 /// apart what the model may not: the game's rings and amulets have none of
 /// their own, and lie as a bag.)
-pub(super) fn item_picture(app: &mut Moonglow, ui: &mut Ui, item: &mg_gff::Struct, female: bool) {
+///
+/// For one of an armor's parts (`pieces`: its models' names,
+/// [`mg_preview::armor_part`]), that part alone beside it too: small in
+/// the picture of the whole body.
+pub(super) fn item_part_picture(
+    app: &mut Moonglow,
+    ui: &mut Ui,
+    item: &mg_gff::Struct,
+    female: bool,
+    pieces: Option<&'static [&'static str]>,
+) {
     let key = app.thumbnails.item(item, female);
     let made = app.thumbnails.get(key);
+    let alone = pieces.map(|p| {
+        let key = app.thumbnails.item_part(item, female, Some(p));
+        app.thumbnails.get(key)
+    });
     let icon = app.loader().map(|mut l| l.item_icon_on(ui.ctx(), item, female)).unwrap_or_default();
     ui.horizontal_top(|ui| {
         if !icon.is_empty() {
             crate::images::stacked_drawn(ui, &icon, (1.5, PICTURE_SIDE), "Icon");
         }
         picture(ui, made);
+        if let Some(alone) = alone {
+            picture(ui, alone);
+        }
     });
 }
 
@@ -417,7 +479,7 @@ fn picture(ui: &mut Ui, made: Option<Option<egui::TextureId>>) {
 }
 
 /// Shows something of a 2DA row (a picture) in a choice's list.
-pub(super) type Shown = fn(&mut Moonglow, &mut Ui, usize);
+pub(super) type Shown<'a> = &'a mut dyn FnMut(&mut Moonglow, &mut Ui, usize);
 
 /// A loading screen's picture (loadscreens.2da's `BMPResRef`), small; a
 /// line instead where the row has none (the first: a random one of the
@@ -511,9 +573,21 @@ impl Form<'_> {
         name: Option<&str>,
         label: Option<&str>,
     ) -> std::sync::Arc<Vec<Choice>> {
-        let game = self.app.game.as_ref();
-        game.and_then(|g| g.choice_list(table, ChoiceColumns { name, label }).ok())
-            .unwrap_or_default()
+        crate::widgets::table_choices(self.app.game.as_deref(), table, name, label)
+    }
+
+    /// An Appearance list's rows (`choices`, of an object of `kind`), each
+    /// with no model to draw marked so after its name
+    /// ([`mg_rules::GameData::appearance_choices`]).
+    pub(crate) fn appearance_rows(
+        &self,
+        kind: mg_rules::ObjectKind,
+        choices: &[Choice],
+    ) -> std::sync::Arc<Vec<Choice>> {
+        match self.app.game.as_deref() {
+            Some(game) => game.appearance_choices(kind, choices),
+            None => std::sync::Arc::new(choices.to_vec()),
+        }
     }
 
     /// A text field of a localized string, in the talk table's color where
@@ -576,16 +650,34 @@ impl Form<'_> {
     /// row the table lacks, one that names no model or is reserved
     /// (`USER`), or a model the module, its haks and the game lack, which
     /// Aurora's area view often crashes on.
+    ///
+    /// And past a row that has one, each model the object's parts name
+    /// that the module, its haks and the game lack ([`mg_rules::models`]):
+    /// an item's pieces (where it has a model of its own at all) and an
+    /// armor's parts, a body's skeleton, head and parts.
     pub(crate) fn model_warning(&self, ui: &mut Ui, kind: mg_rules::ObjectKind) {
         let Some(game) = self.app.game.as_deref() else { return };
-        let Some(problem) = game.appearance_problem(kind, &self.root) else { return };
-        crate::widgets::field_label(ui, "");
-        let text = egui::RichText::new(problem.to_string()).color(ui.visuals().error_fg_color);
-        ui.add(egui::Label::new(text).wrap()).on_hover_text(
-            "The game draws nothing for it, and Aurora's area view may crash on it: choose \
-             another appearance, or add the model to a hak",
-        );
-        ui.end_row();
+        for problem in game.appearance_problems(kind, &self.root) {
+            crate::widgets::field_label(ui, "");
+            let text = egui::RichText::new(problem.to_string()).color(ui.visuals().error_fg_color);
+            let why = match kind {
+                _ if problem.problem.is_part() => {
+                    "The game draws the rest without it: choose another number for the part, \
+                     or add the model to a hak"
+                }
+                // (The game draws no waypoint: its flag is the toolset's.)
+                mg_rules::ObjectKind::Waypoint => {
+                    "The area view draws no flag for it: choose another appearance, or add the \
+                     model to a hak"
+                }
+                _ => {
+                    "The game draws nothing for it, and Aurora's area view may crash on it: \
+                     choose another appearance, or add the model to a hak"
+                }
+            };
+            ui.add(egui::Label::new(text).wrap()).on_hover_text(why);
+            ui.end_row();
+        }
     }
 
     fn id(&self, name: &str) -> egui::Id {
@@ -756,7 +848,7 @@ impl Form<'_> {
     ) {
         let id = self.id(label);
         if !ui.memory(|m| m.has_focus(id)) {
-            if self.app.held_text.as_ref().is_some_and(|(held, ..)| *held == id) {
+            if self.app.held_text.as_ref().is_some_and(|held| held.id == id) {
                 self.app.held_text = None;
             }
             return;
@@ -767,7 +859,9 @@ impl Form<'_> {
         let typed =
             (self.app.buffers.get(&id)).filter(|buf| **buf != shown).map(|buf| ends(buf, stored));
         let command = typed.map(|text| self.setting(what, label, Some(value(text))));
-        self.app.held_text = Some((id, ui.ctx().cumulative_pass_nr(), command));
+        let drawn = ui.ctx().cumulative_pass_nr();
+        // (Its window says which it is once it is drawn: `window_drawn_but`.)
+        self.app.held_text = Some(HeldText { id, drawn, command, window: None });
     }
 
     /// Sets an integer field, keeping its stored type (for a field the
@@ -802,6 +896,12 @@ impl Form<'_> {
         self.hold_text(ui, what, label, &current, false, |text| Value::String(encode(&text)));
     }
 
+    /// A tag: a [`text`](Self::text) of at most the 32 characters the
+    /// game keeps (`mg_module::tags::MAX_TAG`), as every tag field is.
+    pub(crate) fn tag(&mut self, ui: &mut Ui, what: &str, label: &str) {
+        self.text(ui, what, label, mg_module::tags::MAX_TAG);
+    }
+
     /// A multi-line text field (`CExoString`), line ends kept.
     pub(crate) fn memo(&mut self, ui: &mut Ui, what: &str, label: &str) {
         self.mark_mixed(ui, label);
@@ -826,7 +926,7 @@ impl Form<'_> {
             self.hold_text(ui, what, label, &shown, true, move |text| {
                 Value::LocString(with_english(held.clone(), &text))
             });
-            if ui.small_button("…").on_hover_text("Edit text in multiple languages").clicked() {
+            if crate::widgets::languages_button(ui) {
                 self.app.loc_edit = Some(LocStringEdit::new(self.target(label), what, &current));
             }
         });
@@ -838,7 +938,7 @@ impl Form<'_> {
         ui.horizontal(|ui| {
             let language = crate::text::edit_language().name().unwrap_or("?");
             crate::widgets::field_label(ui, format!("{what} ({language})"));
-            if ui.small_button("…").on_hover_text("Edit text in multiple languages").clicked() {
+            if crate::widgets::languages_button(ui) {
                 self.app.loc_edit = Some(LocStringEdit::new(self.target(label), what, &current));
             }
         });
@@ -1065,12 +1165,12 @@ impl Form<'_> {
     }
 
     /// A PLT colour (0–175) picked from a palette's swatches (Aurora's
-    /// colour chooser; `palette` as `pal_cloth01`); the game is given where
-    /// the page has lent it out.
+    /// colour chooser; `palette` as `pal_cloth01`); the game is given, as
+    /// the pages that show one have lent it out.
     pub(crate) fn palette_color(
         &mut self,
         ui: &mut Ui,
-        game: Option<&mg_rules::GameData>,
+        game: &mg_rules::GameData,
         what: &str,
         label: &str,
         palette: &str,
@@ -1089,7 +1189,7 @@ impl Form<'_> {
     pub(crate) fn palette_pick(
         &mut self,
         ui: &mut Ui,
-        game: Option<&mg_rules::GameData>,
+        game: &mg_rules::GameData,
         what: &str,
         label: &str,
         palette: &str,
@@ -1098,80 +1198,16 @@ impl Form<'_> {
     ) -> Option<u8> {
         let pal = {
             let app = &mut *self.app;
-            let game = game.or(app.game.as_deref());
-            game.and_then(|game| {
-                let mut l = crate::images::Loader {
-                    pictures: &mut app.pictures,
-                    palettes: &mut app.palettes,
-                    ws: app.ws.as_ref(),
-                    game,
-                };
-                l.palette(palette)
-            })
+            let mut l = crate::images::Loader {
+                pictures: &mut app.pictures,
+                palettes: &mut app.palettes,
+                ws: app.ws.as_ref(),
+                game,
+            };
+            l.palette(palette)
         };
-        let mut pick = None;
-        ui.horizontal(|ui| {
-            if let Some(p) = &pal {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(28.0, 16.0), egui::Sense::hover());
-                crate::images::swatch(ui, rect, &crate::images::tones(p, current));
-            }
-            // (The arrow keys step through the colors in their order.)
-            let mut chosen = current;
-            crate::widgets::dropdown(("palette-color", self.key, label))
-                .selected_text(text.map_or_else(|| current.to_string(), str::to_string))
-                .width(56.0)
-                .height(11.0 * 16.0 + 24.0)
-                .show_with(
-                    ui,
-                    &mut chosen,
-                    || (0..176).collect(),
-                    |ui, chosen| {
-                        let Some(p) = &pal else {
-                            ui.weak("No palette");
-                            return;
-                        };
-                        ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-                        // 176 colours, 16 to a row.
-                        for row in 0..11u8 {
-                            ui.horizontal(|ui| {
-                                for i in row * 16..row * 16 + 16 {
-                                    let size = egui::vec2(16.0, 14.0);
-                                    let (rect, r) =
-                                        ui.allocate_exact_size(size, egui::Sense::click());
-                                    crate::images::swatch(ui, rect, &crate::images::tones(p, i));
-                                    if i == current && text.is_none() {
-                                        let stroke = ui.visuals().selection.stroke;
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            0.0,
-                                            stroke,
-                                            egui::StrokeKind::Outside,
-                                        );
-                                    }
-                                    let name = format!("{what} {i}");
-                                    r.widget_info(|| {
-                                        egui::WidgetInfo::labeled(
-                                            egui::WidgetType::Button,
-                                            true,
-                                            &name,
-                                        )
-                                    });
-                                    if r.on_hover_text(&name).clicked() {
-                                        *chosen = i;
-                                        pick = Some(i);
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        }
-                    },
-                );
-            if chosen != current {
-                pick = Some(chosen);
-            }
-        });
-        pick
+        let id = ("palette-color", self.key, label);
+        crate::widgets::palette_color(ui, id, pal.as_deref(), what, current, text)
     }
 
     /// A choice among 2DA rows (the field holds the row; `default` is its
@@ -1199,8 +1235,16 @@ impl Form<'_> {
         creature: bool,
     ) {
         self.mark_mixed(ui, label);
-        let show: Shown = if creature { creature_picture } else { placeable_picture };
-        self.choice_shown(ui, "Appearance", label, choices, default, Some(show));
+        if creature {
+            let dressed = self.app.thumbnails.creature(&self.root);
+            let mut show = move |app: &mut Moonglow, ui: &mut Ui, row| {
+                creature_picture(app, ui, dressed, row);
+            };
+            self.choice_shown(ui, "Appearance", label, choices, default, Some(&mut show));
+        } else {
+            let mut show = placeable_picture;
+            self.choice_shown(ui, "Appearance", label, choices, default, Some(&mut show));
+        }
     }
 
     /// [`choice`](Self::choice), with what `about` shows of a row (its
@@ -1211,7 +1255,7 @@ impl Form<'_> {
         (what, label): (&str, &str),
         choices: &[Choice],
         default: FieldType,
-        about: Shown,
+        about: Shown<'_>,
     ) {
         self.mark_mixed(ui, label);
         self.choice_shown(ui, what, label, choices, default, Some(about));
@@ -1222,14 +1266,13 @@ impl Form<'_> {
     pub(crate) fn load_screen(&mut self, ui: &mut Ui, choices: &[Choice]) {
         self.mark_mixed(ui, "LoadScreenID");
         ui.vertical(|ui| {
-            let show: Shown = load_screen_picture;
             self.choice_shown(
                 ui,
                 "Loading screen",
                 "LoadScreenID",
                 choices,
                 FieldType::Word,
-                Some(show),
+                Some(&mut load_screen_picture),
             );
             let row = self.int("LoadScreenID");
             if let Ok(row) = usize::try_from(row) {
@@ -1247,7 +1290,7 @@ impl Form<'_> {
         label: &str,
         choices: &[Choice],
         default: FieldType,
-        about: Option<Shown>,
+        about: Option<Shown<'_>>,
     ) {
         let current = self.int(label);
         let id = self.id(label);
@@ -1395,28 +1438,13 @@ impl Form<'_> {
             ui.weak("(placed in an area)");
             return;
         }
-        let Some(game) = self.app.game.as_deref() else { return };
+        if self.app.game.is_none() {
+            return;
+        }
         // The module's own categories (Palette › Categories…), else the
-        // game's.
-        let own = self.app.ws.as_mut().and_then(|ws| ws.doc(&kind.skeleton_key()).ok().cloned());
-        let skeleton = own.or_else(|| {
-            let data = game.resman.get(&kind.skeleton_key()).ok()?;
-            mg_gff::Gff::read(&data).ok()
-        });
-        let categories: Vec<Choice> = skeleton
-            .map(|g| Palette::read(&g).categories(game))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, text)| Choice { row: usize::from(id), text })
-            .collect();
-        // In the palette's order (its tree's, as Palette › Categories…
-        // sets it), or alphabetical (Options › General): group by group,
-        // case and accents aside.
-        let categories = if self.app.settings.categories_by_name {
-            mg_rules::by_path(categories, " / ")
-        } else {
-            categories
-        };
+        // game's; in the palette's order (its tree's, as Palette ›
+        // Categories… sets it), or alphabetical (Options › General).
+        let categories = crate::palette_view::categories(self.app, kind);
         let label = kind.palette_field();
         self.mark_mixed(ui, label);
         let current = self.int(label);
@@ -1427,12 +1455,11 @@ impl Form<'_> {
         }
     }
 
-    /// The Variables… button.
+    /// The Variables… button (off for an object of a read-only area).
     pub(crate) fn variables(&mut self, ui: &mut Ui) {
         let list = self.root.list("VarTable").unwrap_or(&[]).to_vec();
-        let label = format!("Variables ({})…", list.len());
         self.mark_mixed(ui, "VarTable");
-        if ui.button(label).on_hover_text("Edit scripting variables").clicked() {
+        if crate::claims::variables_button(self.app, ui, &self.key, list.len()) {
             self.app.var_edit = Some(VarTableEdit::new(self.target("VarTable"), &list));
         }
     }
@@ -1546,7 +1573,11 @@ pub(crate) struct Derived {
 pub(crate) fn derived_of(cmd: &Command) -> Derived {
     Derived {
         items: changed_objects(cmd, ResType::UTI, &["Cost"]),
-        creatures: changed_objects(cmd, ResType::UTC, &["MaxHitPoints", "ChallengeRating"]),
+        creatures: changed_objects(
+            cmd,
+            ResType::UTC,
+            &["MaxHitPoints", "ChallengeRating", "CurrentHitPoints"],
+        ),
     }
 }
 
@@ -1658,8 +1689,11 @@ pub(crate) fn edit_many(
             paths: targets.iter().map(|(_, p)| p.clone()).collect(),
         },
     };
+    // (A placed object of an area another builder holds, in a project
+    // that keeps those read-only: looked at, as the game's blueprints are.)
+    let held = crate::claims::area_of(&key).and_then(|a| crate::claims::read_only(app, a));
     let is_viewed = app.ws.as_ref().is_some_and(|ws| ws.is_viewed(&key));
-    let pressed = ok_cancel(ui, &targets[0], is_viewed);
+    let pressed = ok_cancel(ui, &targets[0], is_viewed || held.is_some());
     let all = if path.0.is_empty() { pages(restype).to_vec() } else { instance_pages(restype) };
     // Lists are edited one blueprint or object at a time.
     let pages: Vec<&str> =
@@ -1678,7 +1712,7 @@ pub(crate) fn edit_many(
     });
     app.blueprint_pages.insert(page_key, page);
     ui.separator();
-    let viewed = app.ws.as_ref().is_some_and(|ws| ws.is_viewed(&key));
+    let viewed = is_viewed || held.is_some();
     let refused_id = egui::Id::new(("view-refused", key));
     if viewed {
         ui.horizontal_wrapped(|ui| {
@@ -1687,20 +1721,30 @@ pub(crate) fn edit_many(
             let refused = ui
                 .data(|d| d.get_temp::<f64>(refused_id))
                 .is_some_and(|at| now - at < VIEW_REFUSED_SHOWN);
-            let text = if refused {
+            if refused {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-                egui::RichText::new(
-                    "Not changed: this is the game's blueprint, shown to look at. Edit Copy \
-                     makes one of the module's own.",
-                )
-                .strong()
-            } else {
-                egui::RichText::new(
-                    "This is the game's blueprint, shown to look at: it can't be changed here.",
-                )
+            }
+            let text = match (&held, refused) {
+                (Some(why), true) => {
+                    format!("Not changed: {why}, and the project keeps others' areas read-only.")
+                }
+                (Some(why), false) => format!("{why}: read-only here, shown to look at."),
+                (None, true) => "Not changed: this is the game's blueprint, shown to look at. \
+                                 Edit Copy makes one of the module's own."
+                    .into(),
+                (None, false) => {
+                    "This is the game's blueprint, shown to look at: it can't be changed here."
+                        .into()
+                }
             };
+            let text = egui::RichText::new(text);
+            let text = if refused { text.strong() } else { text };
             ui.colored_label(ui.visuals().warn_fg_color, text);
-            if ui.button("Edit Copy…").on_hover_text("A copy in the module, to change").clicked()
+            if held.is_none()
+                && ui
+                    .button("Edit Copy…")
+                    .on_hover_text("A copy in the module, to change")
+                    .clicked()
             {
                 app.actions.push(Action::CopyDialog(key));
             }
@@ -1744,40 +1788,12 @@ pub(crate) fn edit_many(
             _ => {}
         }
     });
-    // The game's blueprint takes no change: its fields don't keep the
-    // keyboard (nothing is typed into them, to be dropped when the field
-    // is left), and what a page asked for is dropped, the note above
-    // saying so. Its lists still scroll, its pages open and its lists'
-    // searches take what is typed.
-    if viewed {
-        let ctx = ui.ctx();
-        let layer = ui.layer_id();
-        let focused = ctx.memory(|m| m.focused()).and_then(|id| Some((id, ctx.read_response(id)?)));
-        if let Some((id, r)) = focused
-            && r.layer_id == layer
-            && shown.inner_rect.intersects(r.rect)
-            && !crate::widgets::is_search_field(ctx, id)
-        {
-            ctx.memory_mut(|m| m.surrender_focus(id));
-        }
-        let app = &mut *form.app;
-        let mut tried = false;
-        let mut i = pending;
-        while i < app.actions.len() {
-            let changes = matches!(&app.actions[i], Action::Apply(cmd)
-                if cmd.edits.iter().any(|e| *e.key() == key));
-            if changes {
-                app.actions.remove(i);
-                tried = true;
-            } else {
-                i += 1;
-            }
-        }
-        if tried {
-            let now = ui.input(|i| i.time);
-            ui.data_mut(|d| d.insert_temp(refused_id, now));
-            ui.ctx().request_repaint();
-        }
+    // The game's blueprint (or a read-only area's object) takes no
+    // change, the note above saying so when one is tried.
+    if viewed && look_only(form.app, ui, shown.inner_rect, pending, &|k| *k == key) {
+        let now = ui.input(|i| i.time);
+        ui.data_mut(|d| d.insert_temp(refused_id, now));
+        ui.ctx().request_repaint();
     }
     // A change only the first would take (a page's own list edits, an item
     // the first object holds) is dropped rather than made to one of several
@@ -1807,9 +1823,49 @@ pub(crate) fn edit_many(
     window_drawn(form.app, pending, &tab, &targets, pressed);
 }
 
+/// A form only looked at (the game's blueprint, opened by View; what an
+/// area another builder holds has, in a project that keeps those
+/// read-only), drawn in `shown` with [`read_only_look`]: its fields don't
+/// keep the keyboard (nothing is typed into them, to be dropped when the
+/// field is left), and the changes to what `changes` says that were asked
+/// for since `pending` are dropped. Its lists still scroll, its pages
+/// open and its lists' searches take what is typed. Whether a change was
+/// tried (for its note to say so).
+pub(crate) fn look_only(
+    app: &mut Moonglow,
+    ui: &Ui,
+    shown: egui::Rect,
+    pending: usize,
+    changes: &dyn Fn(&ResKey) -> bool,
+) -> bool {
+    let ctx = ui.ctx();
+    let layer = ui.layer_id();
+    let focused = ctx.memory(|m| m.focused()).and_then(|id| Some((id, ctx.read_response(id)?)));
+    if let Some((id, r)) = focused
+        && r.layer_id == layer
+        && shown.intersects(r.rect)
+        && !crate::widgets::is_search_field(ctx, id)
+    {
+        ctx.memory_mut(|m| m.surrender_focus(id));
+    }
+    let mut tried = false;
+    let mut i = pending;
+    while i < app.actions.len() {
+        let changing = matches!(&app.actions[i], Action::Apply(cmd)
+            if cmd.edits.iter().any(|e| changes(e.key())));
+        if changing {
+            app.actions.remove(i);
+            tried = true;
+        } else {
+            i += 1;
+        }
+    }
+    tried
+}
+
 /// How long the note of a blueprint only looked at says a change was
 /// refused, in seconds.
-const VIEW_REFUSED_SHOWN: f64 = 4.0;
+pub(crate) const VIEW_REFUSED_SHOWN: f64 = 4.0;
 
 /// The most objects edited together whose values are compared, field by
 /// field, to mark the fields that differ.
@@ -1826,7 +1882,7 @@ const MIXED_TIP: &str = "The objects edited together differ here: this shows the
 /// The look of a form that can't be changed (the game's blueprint, opened
 /// by View): its fields are flat and dim, and don't answer the pointer.
 /// It still scrolls, and its lists and pages can be looked through.
-fn read_only_look(ui: &mut Ui) {
+pub(crate) fn read_only_look(ui: &mut Ui) {
     let v = ui.visuals_mut();
     let quiet = v.widgets.noninteractive;
     let text = egui::Stroke::new(1.0, v.weak_text_color());
@@ -1911,14 +1967,19 @@ mod tests {
     #[test]
     fn a_window_s_change_is_noted_by_its_object_s_field() {
         let chest = GffPath::root().item("Placeable List", 2);
+        let noted = |form: &GffPath, path: &GffPath, label: &str| {
+            field_changed(form, path, label).map(|(at, l)| (at, l.to_string()))
+        };
         // The object's own field, and one further in: the list it is in.
-        assert_eq!(field_changed(&chest, &chest, "Tag").as_deref(), Some("Tag"));
+        assert_eq!(noted(&chest, &chest, "Tag"), Some((chest.clone(), "Tag".into())));
         let held = chest.item("ItemList", 0);
-        assert_eq!(field_changed(&chest, &held, "StackSize").as_deref(), Some("ItemList"));
-        assert_eq!(
-            field_changed(&GffPath::root(), &chest, "Tag").as_deref(),
-            Some("Placeable List")
-        );
+        assert_eq!(noted(&chest, &held, "StackSize"), Some((chest.clone(), "ItemList".into())));
+        let root = GffPath::root();
+        assert_eq!(noted(&root, &chest, "Tag"), Some((root.clone(), "Placeable List".into())));
+        // In a struct of the object's, the field itself: an area's music
+        // is not set back with its sounds.
+        let audio = root.field("AreaProperties");
+        assert_eq!(noted(&root, &audio, "MusicDay"), Some((audio.clone(), "MusicDay".into())));
         // Another object's is not this one's.
         let other = GffPath::root().item("Placeable List", 3);
         assert_eq!(field_changed(&chest, &other, "Tag"), None);

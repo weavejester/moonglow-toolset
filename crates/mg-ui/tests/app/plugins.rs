@@ -243,6 +243,9 @@ fn a_plugin_is_off_until_enabled_and_its_command_is_one_undoable_step() {
     h.run();
     type_into_hint(&mut h, "Type a command's name", "tag conv");
     h.get_by_label("Promote the Guards");
+    // (Escape clears the name typed, and closes the palette next.)
+    h.key_press(egui::Key::Escape);
+    h.run();
     h.key_press(egui::Key::Escape);
     h.run();
     // And it takes a key like any command: listed with the plugins'.
@@ -282,6 +285,40 @@ fn a_plugin_is_off_until_enabled_and_its_command_is_one_undoable_step() {
             .any(|(l, m)| { *l == mg_ui::Level::Error && m.contains("something went wrong") })
     );
     assert_eq!(tag_of(&mut h, &key), "GATE_GUARD");
+}
+
+/// A plugin's command by its key, with a field typed in and not left (one
+/// that sets its text when the keyboard leaves it), runs a frame on, on
+/// what was typed: run at once, it read the module without it (a
+/// builder's report, October 2026).
+#[test]
+fn a_plugin_s_command_by_its_key_waits_for_a_field_typed_in() {
+    let Some((mut h, key)) = plugin_harness("ui-plugin-key-typed", false) else { return };
+    h.state_mut().enable_plugin("example.tag-conventions", true);
+    let bind = ("example.tag-conventions/fix-tags".to_string(), vec!["F8".to_string()]);
+    h.state_mut().settings.key_bindings.insert(bind.0, bind.1);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Blueprint(key)));
+    h.run();
+    let is = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some("gate_guard")
+    };
+    let at = h.get(egui_kittest::kittest::by().predicate(is)).rect().center();
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text("_x".into()));
+    h.run_steps(2);
+    assert_eq!(tag_of(&mut h, &key), "gate_guard", "not set while typed");
+    h.key_press(egui::Key::F8);
+    h.run();
+    assert_eq!(tag_of(&mut h, &key), "GATE_GUARD_X", "set, then the plugin's command run on it");
+    let ws = h.state().ws.as_ref().unwrap();
+    assert_eq!(ws.can_undo(), Some("Upper-case creature tags"), "and not set again over it");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run();
+    assert_eq!(tag_of(&mut h, &key), "gate_guard_x", "what was typed, a step of its own");
 }
 
 /// The example plugins of `docs/plugins/examples`, installed.
@@ -572,6 +609,22 @@ fn a_plugin_s_checks_run_with_verify() {
             && m.ends_with("; left out, not checked (Options › Verify): Plugins' checks")),
         "{log:#?}"
     );
+    // One plugin's check left out, by its id: the other plugin's runs.
+    h.get_by_label("Clear Log").click();
+    h.run();
+    h.state_mut().settings.verify_skip = vec!["example.tag-conventions/tag-case".into()];
+    h.state_mut().actions.push(mg_ui::Action::Verify);
+    h.run();
+    let log = &h.state().log.entries;
+    assert!(!log.iter().any(|(_, m)| m.contains("gate_guard")), "{log:#?}");
+    assert!(log.iter().any(|(_, m)| m.contains("a check only reads")), "{log:#?}");
+    assert!(
+        log.iter().any(|(_, m)| m.starts_with("Verify: ")
+            && m.ends_with(
+                "; left out, not checked (Options › Verify): example.tag-conventions/tag-case"
+            )),
+        "{log:#?}"
+    );
 }
 
 /// A finding's fix is a button beside its line in Verify's report: made
@@ -789,8 +842,7 @@ fn a_plugin_reads_a_chosen_folder_and_writes_a_hak() {
     let Some(root) = mg_testkit::nwn_root() else { return };
     let dir = mg_testkit::scratch_dir("ui-plugin-outside");
     let path = sample_module(&dir);
-    let (user, export) = (dir.join("user"), dir.join("export"));
-    std::fs::create_dir_all(&user).unwrap();
+    let (user, export) = (user_folder(&dir, &[]), dir.join("export"));
     std::fs::create_dir_all(&export).unwrap();
     std::fs::write(export.join("note.txt"), "from the folder").unwrap();
     let dialogs = NoDialogs { folders: vec![export], ..Default::default() };

@@ -37,50 +37,248 @@ const AUDIO_FIELDS: [&str; 9] = [
     "MusicNight",
 ];
 
-/// What lists of areas show and filter by.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The 2DA whose row a field [`Change::Set`] sets stands for, if it is
+/// one (`MusicDay`, an ambientmusic.2da row; `LoadScreenID`): an audio
+/// field's of the GIT's `AreaProperties`, the others the ARE's.
+pub fn row_table(field: &str) -> Option<mg_rules::rows::RowTable> {
+    match AUDIO_FIELDS.contains(&field) {
+        true => mg_rules::rows::row_table("GIT ", &["AreaProperties"], field),
+        false => mg_rules::rows::row_table("ARE ", &[], field),
+    }
+}
+
+/// What lists of areas show and filter by: the module tree, Edit Areas
+/// Together, `mg areas`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AreaInfo {
     pub resref: ResRef,
-    /// Its name's English text, else its first text; empty when it has only
-    /// a talk-table string.
+    /// Its name as lists show it (`mg_rules::shown`: in the language asked
+    /// for, the talk table's string where there is a game, else another
+    /// language's); empty when it has none.
     pub name: String,
     pub tag: String,
     pub tileset: ResRef,
     /// `Flags`: [`INTERIOR`], [`UNDERGROUND`], [`NATURAL`], and shader flags.
     pub flags: u32,
+    /// Whether the module's area list (`Mod_Area_list`) names it: the game
+    /// loads only the areas it names (`engine_area_list.rs`), and an ARE
+    /// it leaves out is in the module and no area in the game.
+    pub listed: bool,
 }
 
-/// Every area the module has (each ARE), by ResRef.
+/// An area's [`AreaInfo`] from its ARE's root, its name read by `named`.
+pub fn info_of(
+    resref: ResRef,
+    are: &Struct,
+    named: crate::query::Namer<'_>,
+    listed: bool,
+) -> AreaInfo {
+    AreaInfo {
+        resref,
+        name: are.locstring("Name").map_or(String::new(), named),
+        tag: String::from_utf8_lossy(are.string("Tag").unwrap_or_default()).into(),
+        tileset: are.resref("Tileset").unwrap_or(ResRef::EMPTY),
+        flags: are.integer("Flags").unwrap_or(0) as u32,
+        listed,
+    }
+}
+
+/// Every area the module has (each ARE), by ResRef, those its area list
+/// leaves out too ([`AreaInfo::listed`]); names read without the game.
 pub fn list(m: &Module) -> Vec<AreaInfo> {
     list_in(m, mg_core::Codepage::WINDOWS_1252)
 }
 
 /// [`list`] with the game's codepage, where a module has its own table
-/// (`encoding.2da`).
+/// (`encoding.2da`): names in English, else another language's.
 pub fn list_in(m: &Module, game: mg_core::Codepage) -> Vec<AreaInfo> {
+    list_named(m, &|n| n.shown_in(Language::ENGLISH, game))
+}
+
+/// [`list`] with names read by `named` (`mg_rules::shown`, with the game's
+/// data: as the module tree shows them).
+pub fn list_named(m: &Module, named: crate::query::Namer<'_>) -> Vec<AreaInfo> {
+    let listed = listed_in(m);
+    let listed = |r: &ResRef| listed.as_ref().is_none_or(|l| l.contains(r));
     let mut out: Vec<AreaInfo> = m
         .keys_of(ResType::ARE)
         .filter_map(|k| {
             let are = m.gff(k)?.ok()?;
-            let name = are.root.locstring("Name").map_or(String::new(), |n| {
-                let english = n.text_in(Language::ENGLISH, mg_core::Gender::Male, game);
-                let any = || {
-                    (n.strings.first())
-                        .map(|(k, t)| game.for_language(k.language()).decode(t).into_owned())
-                };
-                english.map(|t| t.into_owned()).or_else(any).unwrap_or_default()
-            });
-            Some(AreaInfo {
-                resref: k.resref,
-                name,
-                tag: String::from_utf8_lossy(are.root.string("Tag").unwrap_or_default()).into(),
-                tileset: are.root.resref("Tileset").unwrap_or(ResRef::EMPTY),
-                flags: are.root.integer("Flags").unwrap_or(0) as u32,
-            })
+            Some(info_of(k.resref, &are.root, named, listed(&k.resref)))
         })
         .collect();
     out.sort_by_key(|a| a.resref);
     out
+}
+
+/// What a module's area list leaves out: the AREs it has that
+/// `Mod_Area_list` doesn't name (the game doesn't load them), by ResRef.
+pub fn unlisted(m: &Module) -> Vec<ResRef> {
+    let Some(listed) = listed_in(m) else { return Vec::new() };
+    let mut out: Vec<ResRef> =
+        m.keys_of(ResType::ARE).map(|k| k.resref).filter(|r| !listed.contains(r)).collect();
+    out.sort();
+    out
+}
+
+/// Every area the module has, as the tools that go through its areas
+/// take them (`mg search --placed`, `mg update-instances`, Edit Areas
+/// Together's every area): those its area list names, in its order, then
+/// the AREs it leaves out ([`unlisted`]). (A name the list has with no
+/// ARE stays, as the list has it: Verify says it is missing, and a tool
+/// reads what of it there is.)
+pub fn every(m: &Module) -> Vec<ResRef> {
+    let listed = m.areas().unwrap_or_default();
+    let mut out: Vec<ResRef> = Vec::new();
+    for a in listed {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out.extend(unlisted(m));
+    out
+}
+
+/// The areas the module's list names; `None` for a module with no
+/// `module.ifo` (nothing to leave out).
+fn listed_in(m: &Module) -> Option<std::collections::HashSet<ResRef>> {
+    m.contains(&Module::info_key()).then(|| m.areas().unwrap_or_default().into_iter().collect())
+}
+
+/// The said line for an area its list leaves out, as every tool says it.
+pub fn unlisted_warning(area: ResRef) -> String {
+    format!(
+        "area {area} is not in the module's area list (Mod_Area_list): the game doesn't load it"
+    )
+}
+
+/// What an area holds that it may be chosen by (Edit Areas Together's
+/// Holding, `mg areas --where`): its ARE's root fields and its GIT's
+/// `AreaProperties` (music, ambient sounds), each by label with its value
+/// as text (a number as written, a string or resref, a name's English);
+/// its variables (its GIT's, and those Moonglow wrote to its ARE before
+/// 1.34.3), by name with their values.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Holds {
+    pub fields: Vec<(String, String)>,
+    pub vars: Vec<(String, String)>,
+}
+
+/// An area's [`Holds`], from its ARE's root and its GIT's.
+pub fn holds(are: &Struct, git: Option<&Struct>, cp: Codepage) -> Holds {
+    let text = |v: &Value| match v {
+        Value::String(b) | Value::ResRef(b) => Some(cp.decode(b).into_owned()),
+        Value::List(_) | Value::Struct(_) => None,
+        v => crate::query::field_text(v),
+    };
+    let mut out = Holds::default();
+    let props = git.and_then(|g| g.child("AreaProperties"));
+    for s in std::iter::once(are).chain(props) {
+        for f in &s.fields {
+            if let Some(t) = text(&f.value) {
+                out.fields.push((f.label.to_string_lossy(), t));
+            }
+        }
+    }
+    for s in git.into_iter().chain(std::iter::once(are)) {
+        for v in s.list("VarTable").unwrap_or(&[]) {
+            let name = cp.decode(v.string("Name").unwrap_or_default()).into_owned();
+            let value = v.get("Value").and_then(text).unwrap_or_default();
+            out.vars.push((name, value));
+        }
+    }
+    out
+}
+
+/// A condition on what an area holds ([`Holds`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Has {
+    /// A field by label (`*` as in tags, case ignored) and, if given, its
+    /// value (the same).
+    Field { label: String, value: Option<String> },
+    /// A variable by name, and if given its value.
+    Var { name: String, value: Option<String> },
+    /// Music by day, by night or in battle: an ambientmusic.2da row.
+    Music(i64),
+}
+
+impl Has {
+    /// `LABEL` or `LABEL=VALUE`: a field (`MusicDay=57`, `*Fog*`).
+    pub fn parse_field(s: &str) -> Result<Has, String> {
+        let (label, value) = Self::split(s, "a field")?;
+        Ok(Has::Field { label, value })
+    }
+
+    /// `NAME` or `NAME=VALUE`: a variable (`tdod_rental`, `kz_*=1`).
+    pub fn parse_var(s: &str) -> Result<Has, String> {
+        let (name, value) = Self::split(s, "a variable")?;
+        Ok(Has::Var { name, value })
+    }
+
+    fn split(s: &str, what: &str) -> Result<(String, Option<String>), String> {
+        let (name, value) = match s.split_once('=') {
+            Some((n, v)) => (n.trim(), Some(v.trim().to_string())),
+            None => (s.trim(), None),
+        };
+        if name.is_empty() {
+            return Err(format!("{s:?}: name {what}, as NAME or NAME=VALUE"));
+        }
+        Ok((name.to_string(), value))
+    }
+
+    pub fn matches(&self, h: &Holds) -> bool {
+        use crate::query::glob;
+        let any = |list: &[(String, String)], name: &str, value: &Option<String>| {
+            list.iter().any(|(n, v)| glob(name, n) && value.as_ref().is_none_or(|p| glob(p, v)))
+        };
+        match self {
+            Has::Field { label, value } => any(&h.fields, label, value),
+            Has::Var { name, value } => any(&h.vars, name, value),
+            Has::Music(row) => {
+                let row = row.to_string();
+                (h.fields.iter()).any(|(l, v)| {
+                    matches!(l.as_str(), "MusicDay" | "MusicNight" | "MusicBattle") && *v == row
+                })
+            }
+        }
+    }
+}
+
+/// Each area's [`Holds`], kept by its ARE's and GIT's bytes: an area is
+/// read again only once they are set again, as `tags::TagCache` keeps
+/// tags (a chooser asked again as a builder types reads nothing anew).
+#[derive(Debug, Default)]
+pub struct HoldsCache {
+    parts: std::collections::HashMap<ResRef, (Bytes, Bytes, Holds)>,
+}
+
+type Bytes = Option<std::sync::Arc<[u8]>>;
+
+impl HoldsCache {
+    /// What `area` holds in the module as it is (its bytes: flush the
+    /// workspace's documents first), none for an area it lacks.
+    pub fn of(&mut self, m: &Module, area: ResRef, cp: Codepage) -> Option<&Holds> {
+        let (are_key, git_key) = (ResKey::new(area, ResType::ARE), ResKey::new(area, ResType::GIT));
+        let are = m.shared(&are_key).cloned()?;
+        let git = m.shared(&git_key).cloned();
+        let same = |a: &Bytes, b: &Bytes| match (a, b) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        let kept = self
+            .parts
+            .get(&area)
+            .is_some_and(|(a, g, _)| same(a, &Some(are.clone())) && same(g, &git));
+        if !kept {
+            let read = |b: &[u8]| mg_gff::Gff::read(b).ok();
+            let are_gff = read(&are)?;
+            let git_gff = git.as_deref().and_then(read);
+            let h = holds(&are_gff.root, git_gff.as_ref().map(|g| &g.root), cp);
+            self.parts.insert(area, (Some(are), git, h));
+        }
+        self.parts.get(&area).map(|(_, _, h)| h)
+    }
 }
 
 /// Which areas: all the conditions given must hold.
@@ -95,9 +293,17 @@ pub struct Filter {
     pub interior: Option<bool>,
     pub underground: Option<bool>,
     pub natural: Option<bool>,
+    /// What each must hold: fields' values, variables, music
+    /// ([`Filter::holds`]).
+    pub has: Vec<Has>,
 }
 
 impl Filter {
+    /// Whether what an area holds meets [`Filter::has`].
+    pub fn holds(&self, h: &Holds) -> bool {
+        self.has.iter().all(|c| c.matches(h))
+    }
+
     /// Whether it narrows the areas at all.
     pub fn is_empty(&self) -> bool {
         *self == Filter::default()
@@ -148,6 +354,11 @@ pub enum Change {
     /// and night and weather, and each tile's lights picked at random from
     /// the scheme's colors.
     LightingScheme(crate::new::Scheme),
+    /// Lighting kept under a name (Area Properties' Saved Lighting,
+    /// [`crate::lighting`]), by its name: its Visual page's fields, and
+    /// where asked (`true`) each tile's lights picked at random from the
+    /// colors kept with them.
+    Lighting(Box<crate::lighting::Saved>, String, bool),
 }
 
 impl Change {
@@ -204,6 +415,10 @@ pub struct StaticPlan {
     pub variables: usize,
     /// Left dynamic: the project's rules name its tag or its blueprint.
     pub project: usize,
+    /// Left dynamic: a script of the module names its tag (a string
+    /// literal of it: `GetObjectByTag("LAMP_01")`, a constant), which it
+    /// may destroy, animate or make usable.
+    pub scripted: usize,
     /// Each left dynamic, and why.
     pub kept: Vec<(usize, Kept)>,
 }
@@ -222,6 +437,8 @@ pub enum Kept {
     Tag(String),
     /// The project's `keep_resrefs` pattern its blueprint matches.
     ResRef(String),
+    /// A script names its tag: the first that does, and the line.
+    Script(ResRef, usize),
 }
 
 impl Kept {
@@ -234,6 +451,7 @@ impl Kept {
             Kept::Variable(name) => format!("it has the variable {name}"),
             Kept::Tag(p) => format!("the project keeps tags {p} dynamic"),
             Kept::ResRef(p) => format!("the project keeps blueprints {p} dynamic"),
+            Kept::Script(script, line) => format!("{script}.nss names its tag (line {line})"),
         }
     }
 }
@@ -248,6 +466,7 @@ impl StaticPlan {
             (self.active, "with a script, conversation, trap, inventory or animation"),
             (self.variables, "with variables"),
             (self.project, "kept by the project's rules"),
+            (self.scripted, "whose tags a script names"),
         ];
         let said: Vec<String> =
             parts.iter().filter(|(n, _)| *n > 0).map(|(n, what)| format!("{n} {what}")).collect();
@@ -262,23 +481,8 @@ impl StaticPlan {
         self.active += other.active;
         self.variables += other.variables;
         self.project += other.project;
+        self.scripted += other.scripted;
     }
-}
-
-/// Whether a placed object's visual transform (EE's `VisTransformList`,
-/// or the older `VisualTransform`) changes how its model shows.
-pub(crate) fn transforms(s: &Struct) -> bool {
-    const AXES: [(&str, f32); 3] = [("Scale", 1.0), ("Rotate", 0.0), ("Translate", 0.0)];
-    let changed = |get: &dyn Fn(&str) -> Option<f32>| {
-        AXES.iter().any(|(prefix, rest)| {
-            ["X", "Y", "Z"].iter().any(|a| get(&format!("{prefix}{a}")).unwrap_or(*rest) != *rest)
-        })
-    };
-    let listed =
-        s.list("VisTransformList").unwrap_or(&[]).iter().any(|entry| {
-            changed(&|label: &str| entry.child(label).and_then(|c| c.float("ValueTo")))
-        });
-    listed || s.child("VisualTransform").is_some_and(|v| changed(&|label: &str| v.float(label)))
 }
 
 /// Why a placeable that isn't static is to stay dynamic, if it is.
@@ -287,7 +491,7 @@ fn kept(p: &Struct, rules: &StaticRules) -> Option<Kept> {
     if on("Useable") {
         return Some(Kept::Useable);
     }
-    if transforms(p) {
+    if crate::placement::is_transformed(p) {
         return Some(Kept::Transformed);
     }
     let script = p.fields.iter().find(|f| {
@@ -320,7 +524,61 @@ fn kept(p: &Struct, rules: &StaticRules) -> Option<Kept> {
     if let Some(glob) = rules.keep_resrefs.matching(&resref).filter(|_| !resref.is_empty()) {
         return Some(Kept::ResRef(glob.into()));
     }
+    let tag = p.string("Tag").unwrap_or_default();
+    if let Some(&(script, line)) = rules.scripts.find(tag) {
+        return Some(Kept::Script(script, line));
+    }
     None
+}
+
+/// The string literals of a module's scripts (its `.nss`), each with the
+/// first script and line it is in: what Make Placeables Static looks a
+/// placeable's tag up in, as a script that destroys, animates or makes
+/// usable a placeable by its tag names it (`GetObjectByTag("LAMP_01")`,
+/// `GetNearestObjectByTag`, a constant of it). Compared exactly, as the
+/// game's tag lookups compare. A tag a script makes up as it runs
+/// (`"LAMP_" + IntToString(n)`) isn't seen, nor one in a script the
+/// module has only compiled (a hak's): `[make_static]` `keep_tags` names
+/// those.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScriptStrings(std::collections::HashMap<Vec<u8>, (ResRef, usize)>);
+
+impl ScriptStrings {
+    /// Of `module`'s scripts, in the order of their names.
+    pub fn of(module: &Module) -> ScriptStrings {
+        let mut keys: Vec<&ResKey> = module.keys_of(ResType::NSS).collect();
+        keys.sort();
+        ScriptStrings::of_sources(keys.into_iter().filter_map(|k| Some((k.resref, module.get(k)?))))
+    }
+
+    /// Of the sources `scripts` (each script's name and text).
+    pub fn of_sources<'a>(scripts: impl IntoIterator<Item = (ResRef, &'a [u8])>) -> ScriptStrings {
+        use mg_script::lex::{TokenKind, tokenize};
+        let mut out = std::collections::HashMap::new();
+        for (name, src) in scripts {
+            let mut line = 1;
+            let mut counted = 0;
+            for t in tokenize(src) {
+                if !matches!(t.kind, TokenKind::String { terminated: true }) {
+                    continue;
+                }
+                let text = &src[t.span.start + 1..t.span.end - 1];
+                if text.is_empty() {
+                    continue;
+                }
+                line += src[counted..t.span.start].iter().filter(|&&b| b == b'\n').count();
+                counted = t.span.start;
+                out.entry(text.to_vec()).or_insert((name, line));
+            }
+        }
+        ScriptStrings(out)
+    }
+
+    /// Where `text` is first a string literal (the script and its line),
+    /// if it is one; never for no text.
+    pub fn find(&self, text: &[u8]) -> Option<&(ResRef, usize)> {
+        self.0.get(text).filter(|_| !text.is_empty())
+    }
 }
 
 /// What making an area's placeables static would do (`git`: the area's
@@ -343,14 +601,14 @@ pub fn static_plan(git: &Struct, rules: &StaticRules) -> StaticPlan {
             Kept::Active(_) => plan.active += 1,
             Kept::Variable(_) => plan.variables += 1,
             Kept::Tag(_) | Kept::ResRef(_) => plan.project += 1,
+            Kept::Script(..) => plan.scripted += 1,
         }
         plan.kept.push((i, why));
     }
     plan
 }
 
-/// A placed object's visual transform: EE's list, and the older struct.
-pub const VISUAL_TRANSFORM_FIELDS: [&str; 2] = ["VisTransformList", "VisualTransform"];
+pub use crate::placement::VISUAL_TRANSFORM_FIELDS;
 
 /// The fields to change to make placeable `p` static: `Static` set, and
 /// its visual transform taken off (a static placeable has none; it would
@@ -382,17 +640,7 @@ fn shown(v: &Value, codepage: Codepage) -> String {
     match v {
         Value::String(b) => codepage.decode(b).into_owned(),
         Value::ResRef(b) => String::from_utf8_lossy(b).into_owned(),
-        Value::Byte(i) => i.to_string(),
-        Value::Char(i) => i.to_string(),
-        Value::Word(i) => i.to_string(),
-        Value::Short(i) => i.to_string(),
-        Value::Dword(i) => i.to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Dword64(i) => i.to_string(),
-        Value::Int64(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Double(f) => f.to_string(),
-        other => format!("{other:?}"),
+        other => other.number_text().unwrap_or_else(|| format!("{other:?}")),
     }
 }
 
@@ -484,7 +732,10 @@ pub fn apply(
 ) -> Result<Vec<Changed>, String> {
     let mut done = Vec::new();
     let mut write = Vec::new();
-    let rules = m.project_file.make_static.clone();
+    let mut rules = m.project_file.make_static.clone();
+    if changes.iter().any(|c| matches!(c, Change::StaticPlaceables)) {
+        rules = rules.with_scripts(m);
+    }
     let mut rng = fastrand::Rng::with_seed(seed);
     for &area in areas {
         let are_key = ResKey::new(area, ResType::ARE);
@@ -676,6 +927,20 @@ pub fn apply(
                         );
                     }
                 }
+                Change::Lighting(saved, name, relight) => {
+                    let (fields, lit) = (saved.give(&mut are.root, &mut rng, *relight))
+                        .map_err(|e| format!("{name}: {e}"))?;
+                    if fields {
+                        are_changed = true;
+                        note("lighting".into(), None, Some(name.clone()));
+                    }
+                    if lit > 0 {
+                        are_changed = true;
+                        let what =
+                            format!("lights of {lit} tile{}", if lit == 1 { "" } else { "s" });
+                        note(what, Some("their own".into()), Some(format!("{name}'s")));
+                    }
+                }
                 Change::RemoveVar(name) => {
                     let Some(git) = git.as_mut() else { continue };
                     let mut vars = git.root.list("VarTable").unwrap_or(&[]).to_vec();
@@ -709,7 +974,94 @@ mod tests {
     use mg_core::{Gender, LocString};
     use mg_gff::Gff;
 
+    /// Every ARE is an area to the tools, the module's area list first in
+    /// its order (a name it has with no ARE too); one it leaves out is said
+    /// ([`unlisted`]).
+    #[test]
+    fn areas_the_list_names_and_leaves_out() {
+        let r = |s: &str| ResRef::from_str(s).unwrap();
+        let mut m = Module::new();
+        let mut info = Gff::new(*b"IFO ");
+        let item = |a: &str| {
+            let mut s = Struct::new(6);
+            s.set("Area_Name", Value::resref(r(a)));
+            s
+        };
+        info.root
+            .set("Mod_Area_list", Value::List(vec![item("zeta"), item("gone"), item("alpha")]));
+        m.set_info(&info).unwrap();
+        for (a, name) in [("alpha", None), ("zeta", Some(Language::GERMAN)), ("lost", None)] {
+            let mut are = Gff::new(*b"ARE ");
+            if let Some(l) = name {
+                let mut n = LocString::default();
+                n.set(l, Gender::Male, b"Zwielicht".to_vec());
+                are.root.set("Name", Value::LocString(n));
+            }
+            m.set_gff(ResKey::new(r(a), ResType::ARE), &are).unwrap();
+        }
+        assert_eq!(every(&m), [r("zeta"), r("gone"), r("alpha"), r("lost")]);
+        assert_eq!(unlisted(&m), [r("lost")]);
+        let listed: Vec<(ResRef, bool)> = list(&m).iter().map(|a| (a.resref, a.listed)).collect();
+        assert_eq!(listed, [(r("alpha"), true), (r("lost"), false), (r("zeta"), true)]);
+        // A name in German alone shows by it.
+        assert_eq!(list(&m)[2].name, "Zwielicht");
+        assert!(unlisted_warning(r("lost")).contains("lost is not in the module's area list"));
+        // A module with no module.ifo leaves nothing out.
+        let mut bare = Module::new();
+        bare.set_gff(ResKey::new(r("alpha"), ResType::ARE), &Gff::new(*b"ARE ")).unwrap();
+        assert!(unlisted(&bare).is_empty() && list(&bare)[0].listed);
+    }
+
     const CP: Codepage = Codepage::WINDOWS_1252;
+
+    /// An area holds its ARE's fields, its GIT's music and sounds, and the
+    /// variables of both; conditions take `*` and ignore case; the cache
+    /// reads an area again only once its bytes change.
+    #[test]
+    fn areas_are_chosen_by_what_they_hold() {
+        let mut m = Module::new();
+        let mut are = Gff::new(*b"ARE ");
+        are.root.set("Tag", Value::String(b"KZ_SQUARE".to_vec()));
+        are.root.set("FogClipDist", Value::Float(45.0));
+        are.root.set("OnEnter", Value::resref(r("kz_enter")));
+        m.set_gff(ResKey::new(r("kz_square"), ResType::ARE), &are).unwrap();
+        let mut git = Gff::new(*b"GIT ");
+        let mut props = Struct::new(100);
+        props.set("MusicDay", Value::Int(57));
+        props.set("MusicNight", Value::Int(12));
+        git.root.set("AreaProperties", Value::Struct(props));
+        let mut var = Struct::new(0);
+        var.set("Name", Value::String(b"tdod_rental".to_vec()));
+        var.set("Type", Value::Dword(1));
+        var.set("Value", Value::Int(3));
+        git.root.set("VarTable", Value::List(vec![var]));
+        m.set_gff(ResKey::new(r("kz_square"), ResType::GIT), &git).unwrap();
+        let mut cache = HoldsCache::default();
+        let h = cache.of(&m, r("kz_square"), CP).unwrap().clone();
+        let yes = |c: Has| assert!(c.matches(&h), "{c:?}");
+        let no = |c: Has| assert!(!c.matches(&h), "{c:?}");
+        yes(Has::Music(57));
+        yes(Has::Music(12));
+        no(Has::Music(5));
+        yes(Has::parse_field("onenter=KZ_*").unwrap());
+        yes(Has::parse_field("Fog*=45").unwrap());
+        no(Has::parse_field("MusicDay=12").unwrap());
+        yes(Has::parse_field("MusicDay").unwrap());
+        yes(Has::parse_var("tdod_*=3").unwrap());
+        no(Has::parse_var("tdod_rental=4").unwrap());
+        no(Has::parse_var("kz_owner").unwrap());
+        assert!(Has::parse_var("=3").is_err());
+        let filter = Filter {
+            has: vec![Has::Music(57), Has::parse_var("tdod_rental").unwrap()],
+            ..Default::default()
+        };
+        assert!(filter.holds(&h) && !filter.is_empty());
+        // Kept until the bytes change.
+        assert!(cache.of(&m, r("nowhere"), CP).is_none());
+        git.root.set("VarTable", Value::List(Vec::new()));
+        m.set_gff(ResKey::new(r("kz_square"), ResType::GIT), &git).unwrap();
+        assert!(!filter.holds(cache.of(&m, r("kz_square"), CP).unwrap()), "read again");
+    }
 
     fn r(s: &str) -> ResRef {
         ResRef::from_str(s).unwrap()
@@ -895,6 +1247,7 @@ mod tests {
             keep_variables: p(&["tdod_*"]),
             keep_tags: p(&["LAMP_*"]),
             keep_resrefs: p(&["TDOD_*"]),
+            ..StaticRules::default()
         };
         let plan = static_plan(&git.root, &rules);
         assert_eq!(plan.convert, [0, 2, 5], "x_note is not the project's");
@@ -916,6 +1269,58 @@ mod tests {
         assert_eq!(
             what,
             ["placeable 0 ROCK Static", "placeable 2 CRATE Static", "placeable 5 TABLE Static"]
+        );
+    }
+
+    /// A placeable whose tag a script of the module names (a string
+    /// literal: what `GetObjectByTag` takes) stays dynamic, the script and
+    /// its line said; a tag only in a comment, or a part of a literal,
+    /// doesn't keep one; nor does no tag.
+    #[test]
+    fn a_placeable_a_script_names_by_its_tag_stays_dynamic() {
+        let mut m = module();
+        let key = ResKey::new(r("inn"), ResType::GIT);
+        let mut git = m.gff(&key).unwrap().unwrap();
+        git.root.set(
+            "Placeable List",
+            Value::List(vec![
+                placeable("ROCK", &[]),
+                placeable("GATE_LEVER", &[]),
+                placeable("LAMP_01", &[]),
+                placeable("", &[]),
+                placeable("BENCH", &[]),
+            ]),
+        );
+        m.set_gff(key, &git).unwrap();
+        let scripts = [
+            (
+                "inn_open",
+                "// BENCH is moved by hand\nvoid main()\n{\n    object o = \
+                 GetObjectByTag(\"GATE_LEVER\");\n    DestroyObject(o);\n}\n",
+            ),
+            ("inn_lamps", "const string LAMP = \"LAMP_01\";\nstring s = \"LAMP_01X\" + \"\";\n"),
+        ];
+        for (name, text) in scripts {
+            m.set(ResKey::new(r(name), ResType::NSS), text.as_bytes().to_vec());
+        }
+        let rules = StaticRules::default().with_scripts(&m);
+        let plan = static_plan(&git.root, &rules);
+        assert_eq!(plan.convert, [0, 3, 4], "the rock, the one of no tag and the bench");
+        assert_eq!(plan.scripted, 2);
+        let why: Vec<String> = plan.kept.iter().map(|(_, k)| k.describe()).collect();
+        assert_eq!(
+            why,
+            ["inn_open.nss names its tag (line 4)", "inn_lamps.nss names its tag (line 1)"]
+        );
+        assert_eq!(plan.left(), "2 whose tags a script names");
+        // Without the scripts read, they would be made static.
+        assert_eq!(static_plan(&git.root, &StaticRules::default()).convert, [0, 1, 2, 3, 4]);
+        // `mg areas --static-placeables` reads them.
+        let done = apply(&mut m, &[r("inn")], &[Change::StaticPlaceables], CP, 1).unwrap();
+        let what: Vec<&str> = done.iter().map(|c| c.what.as_str()).collect();
+        assert_eq!(
+            what,
+            ["placeable 0 ROCK Static", "placeable 3  Static", "placeable 4 BENCH Static"]
         );
     }
 
@@ -1058,6 +1463,44 @@ mod tests {
             assert!([8, 9].contains(&light("Tile_SrcLight1")), "{t:?}");
             assert_eq!(light("Tile_SrcLight2"), light("Tile_SrcLight1"));
             assert_eq!(t.integer("Tile_ID"), Some(3), "the tile itself stays");
+        }
+    }
+
+    /// Lighting kept under a name (`--lighting`) gives an area its fields
+    /// and picks each tile's lights from the colors kept with them.
+    #[test]
+    fn kept_lighting_lights_the_area_and_its_tiles() {
+        let mut m = module();
+        let key = ResKey::new(r("cave1"), ResType::ARE);
+        let mut cave = m.gff(&key).unwrap().unwrap();
+        let tile = || {
+            let mut t = Struct::new(1);
+            for label in crate::lighting::TILE_LIGHT_FIELDS {
+                t.set(label, Value::Byte(0));
+            }
+            t
+        };
+        cave.root.set("Tile_List", Value::List(vec![tile(), tile()]));
+        m.set_gff(key, &cave).unwrap();
+        let text = "{\"lighting\": {\"SunFogAmount\": 12}, \"tile_lights\": {\"main1\": [4, 4, 4, \
+                    4], \"main2\": [0, 0, 0, 0], \"source\": [7, 7, 7, 7]}}";
+        let saved = crate::lighting::Saved::parse(text).unwrap();
+        let change = Change::Lighting(Box::new(saved), "Crypt".into(), true);
+        let done = apply(&mut m, &[r("cave1")], &[change], CP, 1).unwrap();
+        let said: Vec<(&str, Option<&str>, Option<&str>)> =
+            done.iter().map(|c| (c.what.as_str(), c.from.as_deref(), c.to.as_deref())).collect();
+        assert_eq!(
+            said,
+            [
+                ("lighting", None, Some("Crypt")),
+                ("lights of 2 tiles", Some("their own"), Some("Crypt's"))
+            ]
+        );
+        let cave = are(&m, "cave1");
+        assert_eq!(cave.integer("SunFogAmount"), Some(12));
+        for t in cave.list("Tile_List").unwrap() {
+            assert_eq!(t.integer("Tile_MainLight1"), Some(4));
+            assert_eq!(t.integer("Tile_SrcLight2"), Some(7));
         }
     }
 }

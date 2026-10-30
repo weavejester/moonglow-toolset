@@ -22,6 +22,7 @@ pub mod creatures;
 pub mod item_wizard;
 pub mod items;
 pub mod levelup;
+pub mod models;
 pub mod names;
 pub mod objects;
 pub mod placeables;
@@ -57,8 +58,20 @@ pub struct Choice {
 /// name in the table's order): long lists are found by name, not by where
 /// the table has them.
 pub fn by_name(mut choices: Vec<Choice>) -> Vec<Choice> {
-    choices.sort_by_cached_key(|c| (mg_core::text::sort_key(&c.text), c.row));
+    choices.sort_by_cached_key(name_key);
     choices
+}
+
+/// Where each of `choices` comes in [`by_name`]'s order: the indexes of
+/// `choices`, sorted (a list kept as it is, shown sorted).
+pub fn name_order(choices: &[Choice]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..choices.len()).collect();
+    order.sort_by_cached_key(|&i| name_key(&choices[i]));
+    order
+}
+
+fn name_key(c: &Choice) -> ((String, String), usize) {
+    (mg_core::text::sort_key(&c.text), c.row)
 }
 
 /// [`by_name`] for choices named by a path of groups (`Oficios / Herrero`,
@@ -98,6 +111,9 @@ pub struct ChoiceColumns<'a> {
 
 type ChoiceKey = (ResRef, Option<usize>, Option<usize>);
 
+/// An appearance list's kind of object, its length and first row's name.
+type MarkedKey = (ObjectKind, usize, Option<String>);
+
 /// What looking up a 2DA found, kept until [`GameData::invalidate`]. (A
 /// read that failed on I/O is not kept: it may succeed next time.)
 #[derive(Debug, Clone)]
@@ -121,6 +137,14 @@ pub struct GameData {
     /// The choice lists made so far ([`choice_list`](Self::choice_list)),
     /// by table and the two columns' places in it.
     choices: RwLock<HashMap<ChoiceKey, Arc<Vec<Choice>>>>,
+    /// Appearance lists with their rows of no model marked
+    /// ([`appearance_choices`](Self::appearance_choices)), by the kind of
+    /// object and the list they were made from.
+    marked: RwLock<HashMap<MarkedKey, Arc<Vec<Choice>>>>,
+    /// Objects' appearances judged so far
+    /// ([`appearance_problems`](Self::appearance_problems)), by the kind
+    /// of object and the fields that bear on it.
+    judged: RwLock<HashMap<appearance::JudgedKey, Arc<Vec<appearance::ModelProblem>>>>,
     /// The codepage of the game's text, once worked out (see
     /// [`codepage`](Self::codepage)).
     codepage: RwLock<Option<Codepage>>,
@@ -165,6 +189,34 @@ pub fn encoding_of(resman: &ResMan, own: Codepage) -> Codepage {
         .unwrap_or(own)
 }
 
+/// The codepage of a module's text other than a localized string's (tags,
+/// comments, scripts, a conversation's lines as written): the table of an
+/// `encoding.2da` among `resman`'s layers, its missing rows the letters
+/// of the game's `language`; Windows-1252 without one. What every reader
+/// of a module's text goes by ([`GameData::codepage_of`] English is the
+/// same): `mg`, the toolset and plugins. (A Polish game keeps its own
+/// letters where a table has no row: `engine_encoding.rs`.)
+pub fn text_codepage(resman: &ResMan, language: Language) -> Codepage {
+    encoding_of(resman, language.codepage()).for_language(Language::ENGLISH)
+}
+
+/// A localized string's text as lists show it, with the game's data where
+/// there is a game ([`GameData::shown_in`]: its talk table) and without
+/// it where there is none ([`LocString::shown_in`], in `codepage`, the
+/// game's or the module's own table). Every list of names reads them so:
+/// `mg`, the module tree, the area lists.
+pub fn shown(
+    game: Option<&GameData>,
+    s: &LocString,
+    language: Language,
+    codepage: Codepage,
+) -> String {
+    match game {
+        Some(g) => g.shown_in(s, language),
+        None => s.shown_in(language, codepage),
+    }
+}
+
 /// The column of a name written out in a table, used where a row's
 /// talk-table string is blank: ambientmusic.2da has it for music a hak
 /// adds.
@@ -174,7 +226,7 @@ impl GameData {
     /// Opens the base stack of an install and its `dialog.tlk`.
     pub fn open(install: &GameInstall) -> Result<GameData, RulesError> {
         let resman = ResMan::for_game(install)?;
-        let path = install.talk_table(false);
+        let path = install.talk_table();
         let bytes = std::fs::read(&path).map_err(|e| RulesError::Tlk {
             path: path.display().to_string(),
             message: e.to_string(),
@@ -195,6 +247,8 @@ impl GameData {
             custom_tlk: None,
             tables: RwLock::new(HashMap::new()),
             choices: RwLock::new(HashMap::new()),
+            marked: RwLock::new(HashMap::new()),
+            judged: RwLock::new(HashMap::new()),
             codepage: RwLock::new(None),
         }
     }
@@ -204,6 +258,7 @@ impl GameData {
         self.custom_tlk = tlk;
         // (The lists name rows by its strings.)
         self.choices.get_mut().expect("choice cache poisoned").clear();
+        self.marked.get_mut().expect("marked cache poisoned").clear();
     }
 
     pub fn custom_tlk(&self) -> Option<&Tlk> {
@@ -228,6 +283,8 @@ impl GameData {
     pub fn invalidate(&self) {
         self.tables.write().expect("table cache poisoned").clear();
         self.choices.write().expect("choice cache poisoned").clear();
+        self.marked.write().expect("marked cache poisoned").clear();
+        self.judged.write().expect("judged cache poisoned").clear();
         *self.codepage.write().expect("codepage poisoned") = None;
     }
 
@@ -251,6 +308,12 @@ impl GameData {
     /// [`Codepage::for_language`]).
     pub fn codepage_of(&self, language: Language) -> Codepage {
         self.codepage().for_language(language)
+    }
+
+    /// The codepage of the module's text other than a localized string's
+    /// ([`text_codepage`]).
+    pub fn text_codepage(&self) -> Codepage {
+        self.codepage_of(Language::ENGLISH)
     }
 
     /// A 2DA by name (without extension), parsed once and cached (and a
@@ -299,13 +362,26 @@ impl GameData {
     /// Aurora shows a name written in English alone.
     pub fn locstring(&self, s: &LocString) -> Option<String> {
         let game = self.codepage();
-        s.text_in(self.language, Gender::Male, game)
-            .map(|t| t.into_owned())
+        let own = s.text_in(self.language, Gender::Male, game);
+        let has_own = own.is_some();
+        own.map(|t| t.into_owned())
             .filter(|t| !t.is_empty())
             .or_else(|| self.string(s.strref).filter(|t| !t.is_empty()))
-            .or_else(|| s.elsewhere_in(self.language, game).map(|(_, text)| text))
-            // (A variant that is there and empty is still its text.)
-            .or_else(|| s.text_in(self.language, Gender::Male, game).map(|t| t.into_owned()))
+            // (Then as without the game: another language's, or a variant
+            // that is there and empty, which is still its text.)
+            .or_else(|| Some(s.shown_in(self.language, game)).filter(|t| !t.is_empty() || has_own))
+    }
+
+    /// A localized string's text in `language` (the toolset's: the one
+    /// edited) where it has its own there, else as the game shows it
+    /// ([`locstring`](Self::locstring)), else in another language: what a
+    /// list, a tree or a title shows (empty where it has none).
+    pub fn shown_in(&self, s: &LocString, language: Language) -> String {
+        let game = self.codepage();
+        let own = s.text_in(language, Gender::Male, game).filter(|t| !t.is_empty());
+        own.map(|t| t.into_owned())
+            .or_else(|| self.locstring(s).filter(|t| !t.is_empty()))
+            .unwrap_or_else(|| s.shown_in(language, game))
     }
 
     /// [`locstring`](Self::locstring)'s text as the bytes it has in the
@@ -319,14 +395,8 @@ impl GameData {
             let tlk = if s.strref.is_custom() { self.custom_tlk.as_ref()? } else { &self.tlk };
             tlk.get(s.strref).map(|e| e.text.as_slice())
         };
-        // (As `elsewhere`: English first, else the first with text.)
-        let elsewhere = || {
-            let english = mg_core::LocStringKey::new(Language::ENGLISH, Gender::Male);
-            let mut others =
-                s.strings.iter().filter(|(k, b)| k.language() != self.language && !b.is_empty());
-            let first = others.clone().find(|(k, _)| *k == english).or_else(|| others.next());
-            first.map(|(_, b)| b.as_slice())
-        };
+        // (As `elsewhere`: English first, else the language first by number.)
+        let elsewhere = || s.elsewhere_bytes(self.language).map(|(_, b)| b);
         own()
             .filter(|b| !b.is_empty())
             .or_else(|| table().filter(|b| !b.is_empty()))
@@ -362,24 +432,12 @@ impl GameData {
         // A name written out in the table, for a row without a talk-table
         // string (ambientmusic.2da's `DisplayName`, for custom music).
         let display_col = t.column(DISPLAY_NAME);
-        let mut out = Vec::new();
-        for row in 0..t.len() {
-            let name = name_col
-                .and_then(|c| t.cell(row, c))
-                .and_then(mg_2da::parse_int)
-                .and_then(|v| self.string(StrRef(v as u32)))
-                .filter(|s| !s.is_empty());
-            let display = || {
-                let cell = display_col.and_then(|c| t.cell(row, c)).map(str::trim);
-                cell.filter(|v| !v.is_empty() && *v != "****").map(str::to_string)
-            };
-            let text = name
-                .or_else(display)
-                .or_else(|| label_col.and_then(|c| t.cell(row, c)).map(str::to_string));
-            if let Some(text) = text {
-                out.push(Choice { row, text });
-            }
-        }
+        let out: Vec<Choice> = (0..t.len())
+            .filter_map(|row| {
+                let text = self.named_row(&t, row, name_col, display_col, label_col)?;
+                Some(Choice { row, text })
+            })
+            .collect();
         let out = Arc::new(out);
         self.choices.write().expect("choice cache poisoned").insert(key, out.clone());
         Ok(out)
@@ -464,6 +522,30 @@ mod tests {
         let gd = encoded(Language::POLISH, true, false);
         assert_eq!(gd.string(StrRef(0)).as_deref(), Some("Dağł"));
         assert_eq!(gd.codepage_of(Language::ENGLISH), gd.codepage());
+        // The module's text by the one rule, with or without the game data
+        // (as `mg` reads it): in a Polish game the rows the table lacks
+        // keep Windows-1250's letters (ł), not Windows-1252's (³).
+        for (language, hak) in [(Language::ENGLISH, true), (Language::POLISH, true)]
+            .into_iter()
+            .chain([(Language::ENGLISH, false), (Language::POLISH, false)])
+        {
+            let gd = encoded(language, hak, false);
+            assert_eq!(text_codepage(&gd.resman, language), gd.text_codepage(), "{language:?}");
+        }
+        let text = text_codepage(&encoded(Language::POLISH, true, false).resman, Language::POLISH);
+        assert_eq!(text.decode(b"Da\xf0\xb3"), "Dağł");
+        // Without a table, a Polish game's tags are Windows-1252 too.
+        let gd = encoded(Language::POLISH, false, false);
+        assert_eq!(text_codepage(&gd.resman, Language::POLISH), Codepage::WINDOWS_1252);
+        // A table in `override` counts as one in a hak (as the game reads it).
+        let mut rm = ResMan::new();
+        let mut mem = MemContainer::new();
+        let more = "2DA V2.0\n\n  Codepoint\n".to_string()
+            + &(0..240).map(|r| format!("{r} ****\n")).collect::<String>()
+            + "240 0x11f\n";
+        mem.insert(ResKey::parse("encoding", ResType::TWODA).unwrap(), more.as_bytes());
+        rm.add(priority::OVERRIDE, "override", LayerClass::Directory, mem);
+        assert_eq!(text_codepage(&rm, Language::ENGLISH).decode(b"\xf0"), "ğ");
         // Looked up anew when the layers change.
         let mut gd = encoded(Language::ENGLISH, true, false);
         assert!(gd.codepage().is_table());
@@ -539,6 +621,9 @@ mod tests {
         let sorted =
             by_name(vec![c(0, "zarza"), c(1, "Árboles"), c(2, "arbustos"), c(3, "Bosque")]);
         assert_eq!(sorted, [c(1, "Árboles"), c(2, "arbustos"), c(3, "Bosque"), c(0, "zarza")]);
+        // The same order as indexes, the list left as it is.
+        let kept = vec![c(0, "zarza"), c(1, "Árboles"), c(2, "arbustos"), c(3, "Bosque")];
+        assert_eq!(name_order(&kept), [1, 2, 3, 0]);
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub enum Tab {
     /// table that a higher hak's overrides), read-only: by the layer's
     /// label.
     ResourceCopy { key: ResKey, layer: String },
+    /// The model viewer on a layer's copy of a model or blueprint, which a
+    /// higher layer overrides (the resource browser's Preview of it).
+    ModelCopy { key: ResKey, layer: String },
     /// A model, in the 3D viewer.
     Model(ResKey),
     /// The blueprint palettes.
@@ -96,6 +99,20 @@ impl Tab {
         matches!(self, Tab::Area(_) | Tab::Welcome | Tab::NoArea)
     }
 
+    /// What its kind was called before, where it was another: the
+    /// encounters', sounds', triggers' and waypoints' blueprints were all
+    /// `blueprint` until each type had its own. A size or place kept by
+    /// that name is used until one is kept by the new.
+    pub(crate) fn kind_before(&self) -> Option<&'static str> {
+        match self {
+            Tab::Blueprint(k) => {
+                matches!(k.restype, ResType::UTE | ResType::UTS | ResType::UTT | ResType::UTW)
+                    .then_some("blueprint")
+            }
+            _ => None,
+        }
+    }
+
     /// The kind of tab, whatever it shows: what its window's size is
     /// remembered by.
     pub(crate) fn kind(&self) -> &'static str {
@@ -115,16 +132,11 @@ impl Tab {
             Tab::Tileset(_) => "tileset",
             Tab::Dialog(_) => "dialog",
             Tab::Resource(_) | Tab::ResourceCopy { .. } => "resource",
-            Tab::Model(_) | Tab::InstanceModel { .. } => "model",
+            Tab::Model(_) | Tab::InstanceModel { .. } | Tab::ModelCopy { .. } => "model",
             Tab::Palette => "palette",
-            Tab::Blueprint(k) => match k.restype {
-                ResType::UTC => "creature",
-                ResType::UTI => "item",
-                ResType::UTP => "placeable",
-                ResType::UTD => "door",
-                ResType::UTM => "store",
-                _ => "blueprint",
-            },
+            Tab::Blueprint(k) => {
+                mg_area::ObjectKind::from_restype(k.restype).map_or("blueprint", |k| k.name())
+            }
             Tab::Blueprints(_) => "blueprints",
             Tab::Area(_) => "area",
             Tab::AreaProperties(_) | Tab::AreasProperties(_) => "area-properties",
@@ -169,7 +181,7 @@ impl Tab {
             Tab::Dialog(_) => (920.0, 692.0),
             Tab::Tileset(_) | Tab::Hak(_) => (920.0, 720.0),
             Tab::Table(_) => (1040.0, 732.0),
-            Tab::Model(_) | Tab::InstanceModel { .. } => (780.0, 680.0),
+            Tab::Model(_) | Tab::InstanceModel { .. } | Tab::ModelCopy { .. } => (780.0, 680.0),
             Tab::Factions | Tab::Journal => (780.0, 632.0),
             Tab::Gff(_) => (780.0, 600.0),
             Tab::ModuleProperties | Tab::AreaProperties(_) => (760.0, 612.0),
@@ -290,8 +302,10 @@ impl Viewer<'_> {
             && !crate::widgets::escape_left_search(ui.ctx())
             && ui.memory(|m| m.focused().is_none())
             && !ui.input(|i| i.pointer.any_down());
-        let model = matches!(tab, Tab::Model(_) | Tab::InstanceModel { .. } | Tab::Tile { .. })
-            && ui.rect_contains_pointer(ui.max_rect());
+        let model = matches!(
+            tab,
+            Tab::Model(_) | Tab::InstanceModel { .. } | Tab::ModelCopy { .. } | Tab::Tile { .. }
+        ) && ui.rect_contains_pointer(ui.max_rect());
         let layer = ui.layer_id();
         let front = layer.order == egui::Order::Middle
             && ui.memory(|m| {
@@ -366,6 +380,10 @@ impl Viewer<'_> {
             Tab::Model(k) => model_view::ui(self.app, ui, model_view::Source::Resource(*k)),
             Tab::InstanceModel { area, path } => {
                 let source = model_view::Source::Instance { area: *area, path: path.clone() };
+                model_view::ui(self.app, ui, source);
+            }
+            Tab::ModelCopy { key, layer } => {
+                let source = model_view::Source::Copy { key: *key, layer: layer.clone() };
                 model_view::ui(self.app, ui, source);
             }
             Tab::Area(r) => area_view::ui(self.app, ui, *r),
@@ -459,6 +477,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Resource(k) => format!("{k} (read-only)").into(),
             Tab::ResourceCopy { key, layer } => format!("{key} from {layer} (read-only)").into(),
             Tab::Model(k) => k.to_string().into(),
+            Tab::ModelCopy { key, layer } => format!("{key} from {layer}").into(),
             Tab::Area(r) => area_label(self.app, *r).into(),
             Tab::Instance { area, path } => instance_title(self.app, *area, path).into(),
             Tab::AreaProperties(area) => {
@@ -479,8 +498,8 @@ impl TabViewer for Viewer<'_> {
             Tab::Options => "Options".into(),
             Tab::TileProperties => "Tile Properties".into(),
             Tab::Tile { tileset, tile } => {
-                let model = (self.app.area_views.values().filter_map(|v| v.terrain.as_ref()))
-                    .find(|t| t.tileset == *tileset)
+                // (As an open area has the tileset: not read for a title.)
+                let model = (self.app.open_tileset(*tileset))
                     .and_then(|t| t.set.tiles.get(*tile as usize).map(|t| t.model.clone()));
                 format!("{} (tile)", model.unwrap_or_else(|| format!("{tileset} tile {tile}")))
                     .into()
@@ -670,7 +689,7 @@ fn instance_title(app: &mut Moonglow, area: mg_core::ResRef, path: &mg_edit::Gff
 /// The middle of the window while no area is open: how to open one, and
 /// the module's areas to open with a click.
 fn no_area(app: &mut Moonglow, ui: &mut Ui) {
-    let areas = app.ws.as_ref().and_then(|ws| ws.module.areas().ok()).unwrap_or_default();
+    let areas = app.ws.as_ref().map(|ws| mg_module::areas::every(&ws.module)).unwrap_or_default();
     ui.vertical_centered(|ui| {
         ui.add_space(40.0);
         ui.heading("No area open");
@@ -792,6 +811,20 @@ fn welcome(app: &mut Moonglow, ui: &mut Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each blueprint type's windows are kept by its own name, and the
+    /// four once kept together as `blueprint` say so, for the sizes and
+    /// places kept by it before.
+    #[test]
+    fn each_blueprint_type_is_a_kind_of_window() {
+        let tab = |t| Tab::Blueprint(ResKey::parse("x", t).unwrap());
+        let kinds: Vec<_> =
+            mg_area::ObjectKind::ALL.map(|k| (tab(k.restype()).kind(), k.name())).into();
+        assert!(kinds.iter().all(|(a, b)| a == b), "{kinds:?}");
+        assert_eq!(tab(ResType::UTC).kind_before(), None);
+        assert_eq!(tab(ResType::UTW).kind_before(), Some("blueprint"));
+        assert_eq!(Tab::Factions.kind_before(), None);
+    }
 
     /// A window's last tab closed takes the window with it, and the
     /// others stay where they are; the window drawn after it is whole.

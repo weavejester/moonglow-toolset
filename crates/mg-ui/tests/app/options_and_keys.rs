@@ -10,7 +10,7 @@ fn options_choose_the_game_folder() {
         None,
         Box::new(NoDialogs { folders: vec![dir.clone()], ..Default::default() }),
     );
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
     h.run();
@@ -52,7 +52,7 @@ fn options_say_the_user_folder_of_this_run() {
         settings,
         Box::new(NoDialogs { folders: vec![other.clone()], ..Default::default() }),
     );
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let user = |h: &Harness<Moonglow>| h.state().install.as_ref().and_then(|i| i.user_dir.clone());
     assert_eq!(user(&h), Some(run.clone()));
@@ -81,7 +81,7 @@ fn options_leave_the_module_open() {
     let mut app = Moonglow::new(None, Box::new(dialogs));
     app.settings.no_last_area = true;
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // Unsaved work: the module's tag changed.
     let ifo = ResKey::parse("module", ResType::IFO).unwrap();
@@ -179,7 +179,11 @@ fn the_command_palette_finds_a_command_and_runs_it() {
     h.key_press(egui::Key::Enter);
     h.run();
     assert!(h.state().command_palette.is_some(), "nothing to redo: nothing done");
-    // A click runs one; Escape closes without running anything.
+    // A click runs one; Escape clears what is typed (the palette stays),
+    // and Escape again closes without running anything.
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert_eq!(h.state().command_palette.as_ref().map(|f| f.filter.as_str()), Some(""));
     h.key_press(egui::Key::Escape);
     h.run();
     assert!(h.state().command_palette.is_none());
@@ -292,6 +296,60 @@ fn keys_remapped_in_options_and_used() {
     assert_eq!(starts(&mut h), 1);
 }
 
+/// Options › Keyboard › Export… and Import…, through their dialogs: the
+/// keys chosen go to the file the save dialog names, and come back from
+/// the one the open dialog names in place of others, kept by OK; a dialog
+/// canceled does nothing.
+#[test]
+fn key_sets_are_exported_and_imported_through_their_dialogs() {
+    use mg_ui::keys::Cmd;
+    let dir = mg_testkit::scratch_dir("ui-key-sets");
+    let file = dir.join("my-keys.json");
+    let _ = std::fs::remove_file(&file);
+    let dialogs =
+        NoDialogs { save: vec![file.clone()], open: vec![file.clone()], ..Default::default() };
+    let app = Moonglow::new(None, Box::new(dialogs));
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+    h.run();
+    h.get_by_label("Keyboard").click();
+    h.run();
+    let ctrl_m = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::M);
+    h.state_mut().options.as_mut().unwrap().keymap.set(Cmd::Manual, vec![ctrl_m]);
+    h.run();
+    let logged = |h: &Harness<'_, Moonglow>, what: &str| {
+        h.state().log.entries.iter().any(|(_, m)| m.contains(what))
+    };
+    h.get_by_label("Export…").click();
+    h.run();
+    let written = std::fs::read_to_string(&file).expect("written where the dialog said");
+    assert_eq!(written, h.state().options.as_ref().unwrap().keymap.to_file());
+    assert!(written.contains("Ctrl+M"), "{written}");
+    assert!(logged(&h, "Keys written to"), "{:?}", h.state().log.entries);
+    // Reset, then taken back from the file.
+    h.get_by_label("Reset All").click();
+    h.run();
+    let manual =
+        |h: &Harness<'_, Moonglow>| h.state().options.as_ref().unwrap().keymap.keys(Cmd::Manual);
+    assert_ne!(manual(&h), [ctrl_m]);
+    h.get_by_label("Import…").click();
+    h.run();
+    assert_eq!(manual(&h), [ctrl_m]);
+    assert!(logged(&h, "taken from"), "{:?}", h.state().log.entries);
+    // Canceled (the dialogs have no more answers): nothing changes.
+    let entries = h.state().log.entries.len();
+    h.get_by_label("Export…").click();
+    h.run();
+    h.get_by_label("Import…").click();
+    h.run();
+    assert_eq!(h.state().log.entries.len(), entries);
+    h.get_by_label("OK").click();
+    h.run();
+    let chosen = &h.state().settings.key_bindings;
+    assert_eq!(chosen.get("manual"), Some(&vec!["Ctrl+M".to_string()]), "{chosen:?}");
+}
+
 /// GitHub issue 9: the menus by the keyboard. F10 opens the first (and
 /// closes them), Left and Right go from menu to menu, Up and Down from row
 /// to row past those that can't be chosen, Enter chooses, Right opens a
@@ -397,6 +455,42 @@ fn menus_by_the_keyboard() {
     key(&mut h, egui::Key::Escape);
     assert!(!shown(&h, "Faction Editor"));
 
+    // Alt alone, pressed and let go: File opens; again: closed. With a
+    // key between, not.
+    let modifiers = |h: &mut Harness<'_, Moonglow>, m: egui::Modifiers| {
+        h.event(egui::Event::ModifiersChanged(m));
+        h.run();
+        h.run();
+    };
+    modifiers(&mut h, egui::Modifiers::ALT);
+    modifiers(&mut h, egui::Modifiers::NONE);
+    assert!(shown(&h, "Save As"), "Alt alone opens the first menu");
+    modifiers(&mut h, egui::Modifiers::ALT);
+    modifiers(&mut h, egui::Modifiers::NONE);
+    assert!(!shown(&h, "Save As"), "and closes them");
+    modifiers(&mut h, egui::Modifiers::ALT);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::F7);
+    h.run();
+    modifiers(&mut h, egui::Modifiers::NONE);
+    assert!(!shown(&h, "Save As"), "Alt with a key is not Alt alone");
+
+    // A command given Alt and a menu's letter (Options › Keyboard) has
+    // the key: the menu doesn't open.
+    h.state_mut().settings.key_bindings.insert("view-log".into(), vec!["Alt+V".into()]);
+    h.run();
+    let log = h.state().settings.hide_log;
+    alt(&mut h, egui::Key::V);
+    assert!(!shown(&h, "Hide All Panels"), "the command's key, not the menu's");
+    assert_eq!(h.state().settings.hide_log, !log, "the command");
+    alt(&mut h, egui::Key::H);
+    assert!(shown(&h, "About Moonscar"), "the other menus' letters as they were");
+    key(&mut h, egui::Key::Escape);
+    // AltGr and a letter (Ctrl+Alt, as Windows gives it: a letter of
+    // another layout typed) opens no menu.
+    h.key_press_modifiers(egui::Modifiers::CTRL | egui::Modifiers::ALT, egui::Key::H);
+    h.run_steps(3);
+    assert!(!shown(&h, "About Moonscar"), "AltGr+H is not Help's");
+
     // By the mouse: with File open, the pointer over Edit opens Edit.
     h.get_by_label("File").click();
     h.run();
@@ -441,7 +535,7 @@ fn the_user_manual_opens_from_help_and_follows_its_links() {
 /// back to the usual size when set back.
 #[test]
 fn the_interface_size_is_set_in_options() {
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app_with(Vec::new()));
+    let mut h = window_harness(app_with(Vec::new()));
     h.run();
     assert_eq!(h.ctx.zoom_factor(), 1.0);
     h.state_mut().settings.ui_scale = Some(150);
@@ -525,16 +619,18 @@ fn the_toolbar_shows_icons_only_when_asked() {
     h.run();
     // The glyphs alone.
     assert!(h.query_by_label("💾 Save").is_none() && h.query_by_label("📦 Palettes").is_none());
-    let narrow = width(&h, "🗋", "✔");
+    // (Named by their names for a screen reader, not by their glyphs.)
+    assert!(h.query_by_label("💾").is_none() && h.query_by_label("📦").is_none());
+    let narrow = width(&h, "New", "Verify");
     assert!(narrow < wide * 0.6, "the toolbar narrower: {narrow} of {wide}");
     // A tip named for the button: first where it doesn't begin so.
-    let palettes = h.get_by_label("📦").rect().center();
+    let palettes = h.get_by_label("Palettes").rect().center();
     h.hover_at(palettes);
     // (A tooltip waits a moment.)
     h.run_steps(60);
     h.get_by_label("Palettes\nBlueprint palettes");
     // Save (disabled without a module): its tip too, with its key.
-    let save = h.get_by_label("💾").rect().center();
+    let save = h.get_by_label("Save").rect().center();
     h.hover_at(save);
     h.run_steps(60);
     let tip = h.get_by_label_contains("Save module").accesskit_node();
@@ -544,13 +640,13 @@ fn the_toolbar_shows_icons_only_when_asked() {
     h.state_mut().settings.toolbar_icons_only = false;
     h.run();
     h.get_by_label("💾 Save");
-    assert!(h.query_by_label("💾").is_none());
+    assert!(h.query_by_label("Save").is_none());
 }
 
 /// Options › General › Light theme.
 #[test]
 fn the_theme_is_set_in_options() {
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app_with(Vec::new()));
+    let mut h = window_harness(app_with(Vec::new()));
     h.run();
     assert_eq!(h.ctx.theme(), egui::Theme::Dark);
     h.state_mut().settings.light_theme = true;
@@ -719,7 +815,7 @@ fn the_updates_option_turns_automatic_checks_off() {
     settings.update_checked = None;
     let (mut app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
     app.settings = settings.clone();
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     assert_eq!(asked.load(Ordering::SeqCst), 0, "switched off");
     assert!(h.state().updates.notice.is_none());
@@ -796,4 +892,61 @@ fn the_update_check_asks_on_its_own_thread() {
         h.run_steps(1);
     }
     assert_eq!(asked.load(Ordering::SeqCst), 2);
+}
+
+/// Options › General › Toolbar buttons, Icons only, in the editors'
+/// toolbars too (ShadowM's request): the script editor's and the
+/// conversation editor's buttons show their glyphs alone and take less
+/// room, each named in its tip and by its name for a screen reader; with
+/// Icons and text, their words alone, as before.
+#[test]
+fn the_editors_toolbars_show_icons_only_when_asked() {
+    let dir = mg_testkit::scratch_dir("ui-editor-icons-only");
+    let path = sample_module(&dir);
+    let script = ResKey::parse("hello", ResType::NSS).unwrap();
+    let mut m = Module::open(&path).unwrap();
+    m.set(script, b"void main() { }\n".to_vec());
+    m.set_gff(ResKey::parse("talk", ResType::DLG).unwrap(), &mg_module::dialog::new_dialog())
+        .unwrap();
+    m.save().unwrap();
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = harness(app, 1600.0, 800.0);
+    h.run();
+    // (The buttons' widths together: a toolbar wraps.)
+    let width = |h: &Harness<'_, Moonglow>, names: &[&str]| -> f32 {
+        names.iter().map(|n| h.get_by_label(n).rect().width()).sum()
+    };
+    let scripts = ["Save As…", "Print…", "Open…", "Find…", "Replace…", "Definition", "Used By"];
+    let lines = ["Add", "Copy", "Cut", "Paste", "Paste As Link", "Expand All", "Scripts"];
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Script(script)));
+    h.run_steps(3);
+    let words = width(&h, &scripts);
+    h.state_mut().settings.toolbar_icons_only = true;
+    h.run_steps(3);
+    let glyphs = width(&h, &scripts);
+    assert!(glyphs < words * 0.6, "the script's toolbar narrower: {glyphs} of {words}");
+    h.get_by_label("Used By").hover();
+    // (A tooltip waits a moment.)
+    h.run_steps(60);
+    h.get_by_label("Used By\nWhere the module runs or includes this script");
+    h.hover_at(egui::pos2(5.0, 790.0));
+    h.state_mut().settings.toolbar_icons_only = false;
+    h.run_steps(3);
+    let tab = h.state().dock.find_tab(&Tab::Script(script)).unwrap();
+    h.state_mut().dock.remove_tab(tab);
+    let talk = ResKey::parse("talk", ResType::DLG).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Dialog(talk)));
+    h.run_steps(3);
+    let words = width(&h, &lines);
+    h.state_mut().settings.toolbar_icons_only = true;
+    h.run_steps(3);
+    let glyphs = width(&h, &lines);
+    assert!(glyphs < words * 0.6, "the conversation's toolbar narrower: {glyphs} of {words}");
+    // The toggles still toggle, said to be on or off.
+    h.get_by_label("Comments").click();
+    h.run_steps(2);
+    let toggled = h.get_by_label("Comments").accesskit_node().toggled();
+    assert_eq!(toggled, Some(egui::accesskit::Toggled::True));
 }

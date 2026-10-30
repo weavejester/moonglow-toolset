@@ -9,7 +9,7 @@ use std::sync::Arc;
 use egui::{Color32, FontFamily, FontId, Painter, Rect, pos2, vec2};
 use mg_core::ResType;
 use mg_module::Module;
-use mg_resman::{ResKey, ResMan, priority};
+use mg_resman::{ResKey, ResMan};
 use serde_json::Value;
 
 use super::{Settings, resolved};
@@ -244,6 +244,11 @@ pub(super) struct Record {
     /// Each control drawn or passed over, in the order the canvas reached
     /// them (a parent before its children).
     pub placed: Vec<Placed>,
+    /// The title as its bar shows it, and whether it was cut there (text
+    /// cut outside every control: the title is the only text the window
+    /// draws of its own).
+    pub title: Option<String>,
+    pub title_cut: bool,
     /// The controls being drawn, innermost last: whose text a cut belongs to.
     current: Vec<usize>,
 }
@@ -278,6 +283,8 @@ impl Default for Record {
             window: Rect::NOTHING,
             body: Rect::NOTHING,
             placed: Vec::new(),
+            title: None,
+            title_cut: false,
             current: Vec::new(),
         }
     }
@@ -340,12 +347,21 @@ impl Assets {
         }
     }
 
-    /// Text the control being drawn cut because it did not fit.
+    /// The window's title, drawn in its bar.
+    pub(super) fn record_title(&self, title: &str) {
+        if let Some(r) = self.record.borrow_mut().as_mut() {
+            r.title = Some(title.into());
+        }
+    }
+
+    /// Text the control being drawn cut because it did not fit (outside
+    /// every control: the title).
     pub(super) fn record_cut(&self, text: &str) {
-        if let Some(r) = self.record.borrow_mut().as_mut()
-            && let Some(&at) = r.current.last()
-        {
-            r.placed[at].cut.push(text.into());
+        if let Some(r) = self.record.borrow_mut().as_mut() {
+            match r.current.last() {
+                Some(&at) => r.placed[at].cut.push(text.into()),
+                None => r.title_cut = true,
+            }
         }
     }
 
@@ -372,24 +388,16 @@ fn hash(v: impl Hash) -> u64 {
     h.finish()
 }
 
-/// A live module takes its proper position below HAKs, even before it is saved.
+/// A live module takes its proper position below HAKs, even before it is
+/// saved (`ResMan::get_over`, as the images' loader finds them).
 fn resource(rm: Option<&ResMan>, module: &Module, key: ResKey) -> Option<(Vec<u8>, String)> {
-    if let Some(rm) = rm {
-        for l in rm.layers().iter().filter(|l| l.priority > priority::MODULE) {
-            if l.container.contains(&key) {
-                return l.container.read(&key).ok().map(|b| (b.into_owned(), l.label.clone()));
-            }
-        }
-    }
-    if let Some(b) = module.get(&key) {
-        return Some((b.to_vec(), "module (current edits)".into()));
-    }
-    for l in rm?.layers().iter().filter(|l| l.priority < priority::MODULE) {
-        if l.container.contains(&key) {
-            return l.container.read(&key).ok().map(|b| (b.into_owned(), l.label.clone()));
-        }
-    }
-    None
+    let Some(rm) = rm else {
+        return module.get(&key).map(|b| (b.to_vec(), "module (current edits)".into()));
+    };
+    let live = |k: &ResKey| module.get(k).map(std::borrow::Cow::Borrowed);
+    let (bytes, label) = rm.get_over(&key, live)?;
+    let label = if label == mg_resman::MODULE_LABEL { "module (current edits)" } else { label };
+    Some((bytes.into_owned(), label.into()))
 }
 
 /// The types a NUI picture may have, in the order the client looks for them:
@@ -463,47 +471,18 @@ fn read_tga(bytes: &[u8]) -> Result<egui::ColorImage, String> {
     ))
 }
 
-/// A PNG of any color type and depth as RGBA8: 16-bit samples rounded to
-/// the nearest 8-bit one.
+/// A PNG of any color type and depth as RGBA8 (`mg_image::png`, as a
+/// plugin's `mg.image` reads one), no more than [`MAX_SIDE`] a side.
 fn read_png(bytes: &[u8]) -> Result<egui::ColorImage, String> {
-    let limits = png::Limits { bytes: 128 * 1024 * 1024 };
-    let mut decoder = png::Decoder::new_with_limits(std::io::Cursor::new(bytes), limits);
-    decoder.set_transformations(png::Transformations::EXPAND);
-    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let (width, height) = (reader.info().width, reader.info().height);
-    if width > MAX_SIDE || height > MAX_SIDE {
+    let most = u64::from(MAX_SIDE) * u64::from(MAX_SIDE);
+    let rgba = mg_image::png::read_picture(bytes, most).map_err(|e| e.to_string())?;
+    if rgba.width > MAX_SIDE || rgba.height > MAX_SIDE {
         return Err(format!("image exceeds {MAX_SIDE} pixels a side"));
     }
-    let size = reader.output_buffer_size().ok_or("image is too large")?;
-    let mut buffer = vec![0; size];
-    let info = reader.next_frame(&mut buffer).map_err(|e| e.to_string())?;
-    let data = buffer.get(..info.buffer_size()).ok_or("image is cut short")?;
-    // The samples of a pixel, each as 8 bits.
-    let samples: Vec<u8> = match info.bit_depth {
-        png::BitDepth::Sixteen => data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|s| ((u32::from(u16::from_be_bytes(*s)) + 128) / 257) as u8)
-            .collect(),
-        _ => data.to_vec(),
-    };
-    let rgba: Vec<u8> = match info.color_type {
-        png::ColorType::Grayscale => samples.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        png::ColorType::GrayscaleAlpha => {
-            samples.as_chunks::<2>().0.iter().flat_map(|p| [p[0], p[0], p[0], p[1]]).collect()
-        }
-        png::ColorType::Rgb => {
-            samples.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect()
-        }
-        png::ColorType::Rgba => samples,
-        png::ColorType::Indexed => return Err("the image's palette was not unpacked".into()),
-    };
-    let size = [width as usize, height as usize];
-    if rgba.len() != size[0] * size[1] * 4 {
-        return Err("image is cut short".into());
-    }
-    Ok(egui::ColorImage::from_rgba_unmultiplied(size, &rgba))
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width as usize, rgba.height as usize],
+        &rgba.data,
+    ))
 }
 
 /// A JPEG or BMP.
@@ -1056,6 +1035,7 @@ mod tests {
 
     #[test]
     fn resources_observe_hak_live_module_override_order_and_dds_fallback() {
+        use mg_resman::priority;
         let key = ResKey::parse("nui_skin", ResType::TML).unwrap();
         let mut rm = ResMan::new();
         let mut module = Module::new();

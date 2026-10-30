@@ -1,9 +1,9 @@
 ---
 type: Proposal
 title: 'Lights placed on the fly: a proposal'
-description: Placing a light in an area without making a custom placeable by hand first - what the game offers for lights, what was built and measured (the stock light placeables from the area's right-click menu, their reach in the client), and the open proposal - lights of any color and reach by generated content, scripted light effects, and two questions not yet measured.
+description: Placing a light in an area without making a custom placeable by hand first - what the game offers for lights, what was built and measured (the stock light placeables from the area's right-click menu, their reach in the client), and the open proposal - lights of any color and reach by generated content, scripted light effects, and the two questions measured in the client for way B's defaults.
 tags: [proposal, lights, placeables, areas, custom-content]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-12T05:30:26Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T01:56:06Z }
 sources:
   - id: request
     resource: human:august, relaying the builder dafena (Discord, 2026-10-07)
@@ -22,14 +22,15 @@ a custom placeable that carries the light.[^request]
 Three ways were proposed. Way A (the game's stock light placeables) was
 chosen first on 2026-10-07 and is built and measured: see
 [What was built](#what-was-built-way-a). Way B (lights of any color and
-reach, by generated content) is the open proposal and is not started. Way
+reach, by generated content) is built too, on 2026-10-29, behind an option
+that is off by default: see [Way B](#way-b-lights-moonglow-generates). Way
 C (scripted effects) is not recommended. Two questions about the game's
-lights are [not measured yet](#not-measured-yet).
+lights are [measured](#measured-for-way-b) (2026-10-29).
 
 | Way | What the builder gets | What the module needs | State |
 | --- | --- | --- | --- |
 | A. Stock light placeables | Seven colors, fixed reach | Nothing: base game | built |
-| B. Generated content | Any color, reach, brightness, shadows, flicker | A hak Moonglow writes (models and a placeables.2da) | proposed |
+| B. Generated content | Any color, reach, brightness, shadows (no flicker yet) | A hak Moonglow writes (models and a placeables.2da), the builder's choice | built, behind an option off by default |
 | C. Scripted effects | The game's fixed light effects, switchable in play | A script on an invisible object | not recommended |
 
 ## What the game offers
@@ -69,8 +70,9 @@ light ends. The view is lit by it, as by any placeable with a
 `LightColor`. Nothing is added to the module: the placeables are the
 base game's. The limit is the game's: seven colors, one reach.
 
-Not built of way A as it was proposed: an entry in the palette beside
-the menu (in the [deferred list](deferred.md)).
+The palette has it too (2026-10-29): **☀ Lights**, beside the blueprint
+types, lists the same lights; one chosen is put where the area's view
+is clicked (Shift + click places more). Way A is built whole.
 
 ### Measured
 
@@ -95,18 +97,38 @@ nothing. This is what Moonglow already assumed for its own view, so its
 view was right; the ring in the area view is drawn at where the light
 ends.
 
-### Not measured yet
+### Measured for way B
 
-In the game client, with the oracle the renderer uses:
+In the game client (`reading_lights_on_creatures_and_placeables` in
+`client_render.rs`'s `batch3.rs`, 2026-10-29, 89.8193.37: the game's
+`inc_standard` painting each lit fragment with the number of lights its
+draw was handed, in a dark tic01 room):
 
-- whether a placeable's `LightColor` light and a model's light node light
-  creatures and placeables or only tiles;
-- how many dynamic lights the game draws at one place before dropping
-  some.
+- a placeable's `LightColor` light ("Light, White") and a model's light
+  node (a box with one white node of radius 5) each light a creature (a
+  commoner) and a placeable (an armoire) beside them as they light the
+  floor: one light in each draw, none without them;
+- a draw takes as many lights as the client's Max Lights
+  (`graphics.lighting.max-lights`, 32 by default, 3 to 128), the most
+  important first: 40 "Light, White" in a ring 2 m across gave the floor
+  and the walls 32 lights each at the default and 40 at Max Lights 64.
+  So way B's lights are not dropped at one place before that setting.
 
-Both bear on the defaults of way B.
+## Way B: lights Moonglow generates
 
-## Way B: lights Moonglow generates (proposed)
+Built on 2026-10-29 as the owner decided it ("As an option, default off
+to prevent unwittingly touching PW haks from maintainers"): Options ›
+Areas, and the project file's `[lights]` (`generated`, `hak`,
+`first_row`), with Custom Light… on the area's menu and the palette
+(`mg_module::lights`, `crates/mg-ui/src/light_maker.rs`; the manual's
+[Areas](manual/04-areas.md#lights-of-any-color-and-reach)). The hak is
+the builder's choice in the window, which says what it writes and that
+the players must have the hak before it writes. The placeables.2da is
+the copy the game reads with the row added, so no merge is needed; a
+hak below another's copy is refused. Not built: the flicker, and taking
+rows and models out that no light uses (the [deferred
+list](deferred.md) has both, with the client's two questions). What
+follows is the proposal as it was.
 
 A light editor (color by picker, radius, multiplier, shadows on or off,
 flicker, height above the ground) whose result Moonglow turns into
@@ -126,8 +148,16 @@ What this needs, and where it is hard:
   writers moved into the Toolset from Moonglow Viewer on 2026-10-09
   (`crates/mg-mdl`: `compile.rs`, `binary_write.rs`, `ascii_write.rs`),
   so this part is at hand. A light-only model is the simplest case.
-- **Owning a placeables.2da.** Only one placeables.2da wins in the load
-  order. If the module's haks already have one (CEP, a server's own),
+- **Owning a placeables.2da.** Since 2026-10-29 there is a way that
+  needs no merge, made for lighting schemes of one's own (Area
+  Properties › Saved Lighting › Make a Lighting Scheme): the table is
+  opened in the 2DA editor where the builder chooses (the module's, a
+  copy in it, the table of a hak of the module, a hak open in the hak
+  editor) and the row added there (`Editing::add_row_of`), to be saved
+  with the hak. A generated light's row could be added so, to the copy
+  of placeables.2da the game reads. What follows is the case of a
+  generated hak of Moonglow's own, beside the others. Only one
+  placeables.2da wins in the load order. If the module's haks already have one (CEP, a server's own),
   Moonglow's must be a merged copy of that one plus its rows, placed
   above it, and re-merged when the other changes. `mg 2da-diff --base`
   merges two tables against the one both were made from, but nothing in
@@ -165,18 +195,17 @@ features.
 
 ## Order of what is left
 
-1. Measure the two questions above.
-2. The merge of several haks' copies of a 2DA, as its own feature.
-3. Way B on top of it: the light editor, generated models, the hak.
+Both questions are measured (2026-10-30, the third client batch) and way B is built,
+behind an option that is off by default (the owner's word, 2026-10-30); nothing
+of this proposal is left to do but the flicker, which the deferred list keeps.
 
 ## Decisions wanted
 
-- For B: is a hak that Moonglow writes and keeps acceptable, given that a
-  persistent world must distribute it?
 - Whether C is wanted at all.
 
 Decided already: A was worth shipping first (2026-10-07), and the tool
-lives on the area's right-click menu.
+lives on the area's right-click menu; B as an option, off by default
+(2026-10-29).
 
 ## Not proposed
 

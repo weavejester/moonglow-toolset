@@ -216,26 +216,18 @@ impl Moonglow {
         let waited = live.changed.map_or(PAUSE, |t| t.elapsed());
         // (The first look at a script has no pause: `changed` is unset.)
         if waited < PAUSE {
-            ctx.request_repaint_after(PAUSE - waited);
+            self.frame_after(ctx, PAUSE - waited);
             return;
         }
         let name = key.resref.to_lowercase().to_string();
         let error = {
             let module = self.ws.as_ref().map(|w| &w.module);
             let resman = self.game.as_deref().map(|g| &g.resman);
-            let scripts = &self.scripts;
-            let mut c = Compiler::new(|n: &str, t: ResType| {
-                let k = mg_resman::ResKey::parse(n, t)?;
-                if t == ResType::NSS
-                    && let Some(b) = scripts.get(&k)
-                {
-                    return Some(b.bytes());
-                }
-                module
-                    .and_then(|m| m.get(&k))
-                    .map(<[u8]>::to_vec)
-                    .or_else(|| resman?.get(&k).ok().map(|d| d.into_owned()))
-            });
+            // (Its includes as Compile reads them: the module's, not their
+            // editors' unsaved text.)
+            let source = self.scripts.get(&key).map(ScriptBuffer::bytes).unwrap_or_default();
+            let mut c =
+                Compiler::new(crate::script_view::sources(module, resman, &name, &source, None));
             c.set_require_entry_point(false);
             c.compile(&name).err()
         };
@@ -280,12 +272,9 @@ pub(crate) fn rename_window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some((decl, mut name)) = app.script_nav.rename.take() else { return };
     let mut open = true;
     let (mut ok, mut cancel) = (false, false);
-    egui::Window::new(format!("Rename {}", decl.name))
-        .pivot(egui::Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center())
+    crate::widgets::dialog(ctx, &format!("Rename {}", decl.name), &mut open)
         .collapsible(false)
         .resizable(false)
-        .open(crate::widgets::open_unless_escape(ctx, &format!("Rename {}", decl.name), &mut open))
         .show(ctx, |ui| {
             ui.label(format!("{} — every use in the module's scripts", decl.signature));
             ui.horizontal(|ui| {

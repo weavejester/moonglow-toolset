@@ -10,7 +10,7 @@ use mg_area::ObjectKind;
 use mg_core::{ResRef, ResType};
 use mg_edit::{Command, Edit, GffPath};
 use mg_gff::Struct;
-use mg_module::instances::{Held, Placing, held_items, update, update_held};
+use mg_module::instances::{Held, held_items, update, update_held};
 use mg_resman::ResKey;
 
 use crate::{Action, Moonglow};
@@ -57,7 +57,7 @@ impl Moonglow {
         let Some(ws) = self.ws.as_mut() else { return };
         let wanted: HashSet<ResKey> = blueprints.iter().copied().collect();
         let mut objects = Vec::new();
-        for area in ws.module.areas().unwrap_or_default() {
+        for area in mg_module::areas::every(&ws.module) {
             let Ok(git) = ws.doc(&ResKey::new(area, ResType::GIT)) else { continue };
             for restype in wanted.iter().map(|k| k.restype).collect::<HashSet<_>>() {
                 let Some(kind) = ObjectKind::from_restype(restype) else { continue };
@@ -106,7 +106,7 @@ impl Moonglow {
     /// Makes the ticked objects again from their blueprints, as one
     /// command; how many.
     pub fn apply_update(&mut self, draft: &UpdateDraft) -> usize {
-        let (Some(ws), Some(game)) = (self.ws.as_mut(), self.game.as_deref()) else { return 0 };
+        let Some(ws) = self.ws.as_mut() else { return 0 };
         let wanted: HashSet<ResKey> = draft.blueprints.iter().copied().collect();
         let mut blueprints = std::collections::HashMap::new();
         for k in &wanted {
@@ -126,49 +126,50 @@ impl Moonglow {
                 ws.doc(&key).ok().map(|g| (key, g.root.clone()))
             })
             .collect();
-        let module = &ws.module;
-        let items =
-            |r: ResRef| mg_module::gff_root(Some(module), game, &ResKey::new(r, ResType::UTI));
-        let placing = Placing { game, item: &items };
         let blueprint = |t: ResType, r: ResRef| blueprints.get(&ResKey::new(r, t)).cloned();
-        let mut edits = Vec::new();
-        let mut total = 0;
-        for (key, git) in &gits {
-            let (key, area) = (*key, key.resref);
-            let which = |list: &str, index: usize| {
-                draft.objects.iter().any(|o| {
-                    o.area == area
-                        && o.held.is_empty()
-                        && o.list == list
-                        && o.index == index
-                        && o.on
-                })
-            };
-            // The items held first (where they are is by their places
-            // now), then the placed objects.
-            let held = |at: &[(&'static str, usize)]| {
-                draft.objects.iter().any(|o| o.area == area && o.held == at && o.on)
-            };
-            let item = |r: ResRef| blueprint(ResType::UTI, r);
-            let (with_held, held_n) =
-                update_held(&placing, git, &item, &held).unwrap_or_else(|| (git.clone(), 0));
-            let (new, n) = update(&placing, &with_held, &blueprint, &which)
-                .map_or((with_held, held_n), |(new, n)| (new, n + held_n));
-            if n == 0 {
-                continue;
-            }
-            total += n;
-            for list in ObjectKind::ALL.map(ObjectKind::list) {
-                if new.get(list) != git.get(list) {
-                    edits.push(Edit::SetField {
-                        key,
-                        path: GffPath::root(),
-                        label: list.to_string(),
-                        value: new.get(list).cloned(),
-                    });
+        // (The items the objects hold, as their editors have them.)
+        let made = crate::area_view::placing(self, |placing, _| {
+            let mut edits = Vec::new();
+            let mut total = 0;
+            for (key, git) in &gits {
+                let (key, area) = (*key, key.resref);
+                let which = |list: &str, index: usize| {
+                    draft.objects.iter().any(|o| {
+                        o.area == area
+                            && o.held.is_empty()
+                            && o.list == list
+                            && o.index == index
+                            && o.on
+                    })
+                };
+                // The items held first (where they are is by their places
+                // now), then the placed objects.
+                let held = |at: &[(&'static str, usize)]| {
+                    draft.objects.iter().any(|o| o.area == area && o.held == at && o.on)
+                };
+                let item = |r: ResRef| blueprint(ResType::UTI, r);
+                let (with_held, held_n) =
+                    update_held(placing, git, &item, &held).unwrap_or_else(|| (git.clone(), 0));
+                let (new, n) = update(placing, &with_held, &blueprint, &which)
+                    .map_or((with_held, held_n), |(new, n)| (new, n + held_n));
+                if n == 0 {
+                    continue;
+                }
+                total += n;
+                for list in ObjectKind::ALL.map(ObjectKind::list) {
+                    if new.get(list) != git.get(list) {
+                        edits.push(Edit::SetField {
+                            key,
+                            path: GffPath::root(),
+                            label: list.to_string(),
+                            value: new.get(list).cloned(),
+                        });
+                    }
                 }
             }
-        }
+            (edits, total)
+        });
+        let Some((edits, total)) = made else { return 0 };
         if total > 0 {
             let what = match draft.blueprints.as_slice() {
                 [one] => format!("Update instances of {}", one.resref),
@@ -202,11 +203,7 @@ pub(crate) fn update_window(app: &mut Moonglow, ctx: &Context) {
     let (mut ok, mut cancel) = (false, false);
     crate::widgets::dialog(ctx, "Update Instances", &mut open).collapsible(false).show(ctx, |ui| {
         let names: Vec<String> = draft.blueprints.iter().map(|k| k.resref.to_string()).collect();
-        let shown_names = if names.len() > 6 {
-            format!("{} and {} more", names[..6].join(", "), names.len() - 6)
-        } else {
-            names.join(", ")
-        };
+        let shown_names = crate::text::some_of(&names, 7);
         ui.label(format!(
             "Makes each object placed from {shown_names} again from its blueprint, \
                  where it stands: its tag, name, scripts and variables become the blueprint's."
@@ -246,7 +243,9 @@ pub(crate) fn update_window(app: &mut Moonglow, ctx: &Context) {
 }
 
 /// The Find and Replace Text window (Edit › Find and Replace Text…): the
-/// module's player-facing strings (`mg_module::text`).
+/// module's player-facing strings, and where ticked its tags, resrefs,
+/// variables and other text fields (`mg_module::text`), found as typed or
+/// by a regular expression.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextReplace {
     pub find: String,
@@ -267,7 +266,7 @@ impl Default for TextReplace {
             find: String::new(),
             with: String::new(),
             options: Default::default(),
-            kinds: mg_module::text::TextKind::ALL.to_vec(),
+            kinds: mg_module::text::TextKind::PLAYERS.to_vec(),
             hits: Vec::new(),
             searched: None,
             refind: false,
@@ -312,18 +311,17 @@ impl Moonglow {
                     .collect(),
             );
             let Ok(doc) = ws.doc(&hit.key) else { continue };
-            let Some(ls) = path.get(&doc.root).and_then(|s| s.locstring(&hit.label)).cloned()
-            else {
+            let Some(v) = path.get(&doc.root).and_then(|s| s.get(&hit.label)).cloned() else {
                 continue;
             };
-            match mg_module::text::replace_locstring(&ls, &find, &draft.with, options) {
-                Ok(new) if new != ls => {
+            match mg_module::text::replaced(&v, hit, &find, &draft.with, options) {
+                Ok(Some(new)) if new != v => {
                     total += hit.count;
                     edits.push(Edit::SetField {
                         key: hit.key,
                         path,
                         label: hit.label.clone(),
-                        value: Some(mg_gff::Value::LocString(new)),
+                        value: Some(new),
                     });
                 }
                 Ok(_) => {}
@@ -356,7 +354,8 @@ pub(crate) fn text_window(app: &mut Moonglow, ctx: &Context) {
         |ui| {
             ui.weak(
                 "The module's names, descriptions, conversation lines and journal, in every \
-                 language they're written in (not the game's talk table).",
+                 language they're written in (not the game's talk table); and, ticked, its \
+                 tags, resrefs, variables and other text fields.",
             );
             egui::Grid::new("text-replace").num_columns(2).show(ui, |ui| {
                 crate::widgets::field_label(ui, "Find what");
@@ -371,19 +370,61 @@ pub(crate) fn text_window(app: &mut Moonglow, ctx: &Context) {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut draft.options.match_case, "Match case");
                 ui.checkbox(&mut draft.options.whole_word, "Whole words");
+                ui.checkbox(&mut draft.options.regex, "Regular expression").on_hover_text(
+                    "Find what is a regular expression (kz_\\d+, ^wp_(.*)$, (inn|tavern)); \
+                     Replace with may name what its groups found ($1, ${name}). Without \
+                     Match case, letters A to Z in either case",
+                );
             });
-            ui.horizontal_wrapped(|ui| {
-                for k in TextKind::ALL {
-                    let mut on = draft.kinds.contains(&k);
-                    if ui.checkbox(&mut on, k.label()).changed() {
-                        draft.kinds.retain(|x| *x != k);
-                        if on {
-                            draft.kinds.push(k);
-                        }
+            let mut tick = |ui: &mut egui::Ui, k: TextKind, hover: Option<&str>| {
+                let mut on = draft.kinds.contains(&k);
+                let r = ui.checkbox(&mut on, k.label());
+                let r = match hover {
+                    Some(h) => r.on_hover_text(h),
+                    None => r,
+                };
+                if r.changed() {
+                    draft.kinds.retain(|x| *x != k);
+                    if on {
+                        draft.kinds.push(k);
                     }
                 }
+            };
+            ui.horizontal_wrapped(|ui| {
+                for k in TextKind::PLAYERS {
+                    tick(ui, k, None);
+                }
             });
-            find |= ui.add_enabled(!draft.find.is_empty(), egui::Button::new("Find")).clicked();
+            ui.horizontal_wrapped(|ui| {
+                for k in TextKind::ALL.into_iter().filter(|k| !k.players()) {
+                    let hover = match k {
+                        TextKind::Tag => {
+                            "Objects' and areas' tags: a tag made another's is \
+                                         said, as a paste's is"
+                        }
+                        TextKind::ResRef => {
+                            "Fields that name a script, a blueprint, a \
+                                            conversation…: the resource itself isn't renamed \
+                                            (Rename… does that, and what names it)"
+                        }
+                        TextKind::Variable => "Local variables' names and string values",
+                        _ => "The other text fields (a door's Linked To, a key's tag, comments)",
+                    };
+                    tick(ui, k, Some(hover));
+                }
+            });
+            let bad = (draft.options.regex && !draft.find.is_empty())
+                .then(|| mg_module::text::Finder::new(&draft.find, draft.options).err())
+                .flatten();
+            if let Some(e) = &bad {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Not a regular expression: {e}"),
+                );
+            }
+            let can = !draft.find.is_empty() && bad.is_none();
+            find &= can;
+            find |= ui.add_enabled(can, egui::Button::new("Find")).clicked();
             // What was found, if it's still what's asked for.
             let current = draft.searched.as_ref() == Some(&(draft.find.clone(), draft.options));
             if current {

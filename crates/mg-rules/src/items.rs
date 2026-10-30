@@ -12,6 +12,77 @@ use crate::GameData;
 /// Item property type of Cast Spell (itempropdef.2da row).
 pub const CAST_SPELL: u16 = 15;
 
+/// Item property types of Use Limitation (itempropdef.2da rows): by
+/// alignment group (iprp_aligngrp.2da), class (classes.2da), race
+/// (racialtypes.2da) and specific alignment (iprp_alignment.2da).
+pub const USE_LIMITATION_ALIGNMENT_GROUP: u16 = 62;
+pub const USE_LIMITATION_CLASS: u16 = 63;
+pub const USE_LIMITATION_RACE: u16 = 64;
+pub const USE_LIMITATION_SPECIFIC_ALIGNMENT: u16 = 65;
+
+/// Why a creature may not wear an item ([`GameData::wear_problem`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WearProblem {
+    /// It has none of these feats, one of which the item needs.
+    Feats(Vec<u16>),
+    /// Its classes are none of these (classes.2da rows) the item is
+    /// limited to.
+    Class(Vec<u16>),
+    /// Its race is none of these (racialtypes.2da rows).
+    Race(Vec<u16>),
+    /// Its alignment is in none of these groups (iprp_aligngrp.2da rows)
+    /// and none of these alignments (iprp_alignment.2da rows).
+    Alignment { groups: Vec<u16>, specific: Vec<u16> },
+}
+
+/// A creature's alignment, on its two axes (0 to 100): good at 70 and
+/// above, evil at 30 and below; lawful and chaotic likewise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Alignment {
+    pub good_evil: i64,
+    pub lawful_chaotic: i64,
+}
+
+impl Alignment {
+    /// A creature's (`GoodEvil`, `LawfulChaotic`; 50 where left out).
+    pub fn of(creature: &mg_gff::Struct) -> Alignment {
+        Alignment {
+            good_evil: creature.integer("GoodEvil").unwrap_or(50),
+            lawful_chaotic: creature.integer("LawfulChaotic").unwrap_or(50),
+        }
+    }
+
+    /// On an axis: 0 the high end (good, lawful), 1 neutral, 2 the low
+    /// (evil, chaotic).
+    fn step(v: i64) -> u16 {
+        match v {
+            70.. => 0,
+            31..=69 => 1,
+            _ => 2,
+        }
+    }
+
+    /// Its iprp_alignment.2da row: LG, LN, LE, NG, TN, NE, CG, CN, CE.
+    pub fn specific(self) -> u16 {
+        Self::step(self.lawful_chaotic) * 3 + Self::step(self.good_evil)
+    }
+
+    /// Whether it is in iprp_aligngrp.2da's group `g`: 0 all, 1 neutral
+    /// (on either axis), 2 lawful, 3 chaotic, 4 good, 5 evil.
+    pub fn in_group(self, g: u16) -> bool {
+        let (law, good) = (Self::step(self.lawful_chaotic), Self::step(self.good_evil));
+        match g {
+            0 => true,
+            1 => law == 1 || good == 1,
+            2 => law == 0,
+            3 => law == 2,
+            4 => good == 0,
+            5 => good == 2,
+            _ => false,
+        }
+    }
+}
+
 /// One entry of an item's `PropertiesList`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ItemProperty {
@@ -159,6 +230,98 @@ impl GameData {
         if need.iter().any(|f| feats.contains(f)) { Vec::new() } else { need }
     }
 
+    /// Why `creature` (a creature's fields: `FeatList`, `ClassList`,
+    /// `Race`, `GoodEvil`, `LawfulChaotic`) may not wear `item`, if it may
+    /// not: the game takes such an item off, into the backpack, as it
+    /// loads the creature (placed or made from its blueprint), and
+    /// `ActionEquipItem` does not put it on (`engine_equipped_items.rs`).
+    /// It needs one of the item's [`required_feats`](Self::required_feats)
+    /// (from its own `FeatList`), and of each kind of the item's Use
+    /// Limitation properties, one that it fits: one of its classes, its
+    /// race, its alignment. The item's worth and the creature's level are
+    /// no matter.
+    pub fn wear_problem(
+        &self,
+        creature: &mg_gff::Struct,
+        item: &mg_gff::Struct,
+    ) -> Option<WearProblem> {
+        let feats: Vec<u16> = creature
+            .list("FeatList")
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|f| u16::try_from(f.integer("Feat")?).ok())
+            .collect();
+        let missing = self.missing_feats(item, &feats);
+        if !missing.is_empty() {
+            return Some(WearProblem::Feats(missing));
+        }
+        let properties: Vec<ItemProperty> =
+            item.list("PropertiesList").unwrap_or(&[]).iter().map(ItemProperty::from_gff).collect();
+        let of = |kind: u16| -> Vec<u16> {
+            properties.iter().filter(|p| p.property == kind).map(|p| p.subtype).collect()
+        };
+        let classes: Vec<u16> = creature
+            .list("ClassList")
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|c| u16::try_from(c.integer("Class")?).ok())
+            .collect();
+        let limit = of(USE_LIMITATION_CLASS);
+        if !limit.is_empty() && !limit.iter().any(|c| classes.contains(c)) {
+            return Some(WearProblem::Class(limit));
+        }
+        let race = creature.integer("Race").and_then(|r| u16::try_from(r).ok());
+        let limit = of(USE_LIMITATION_RACE);
+        if !limit.is_empty() && !race.is_some_and(|r| limit.contains(&r)) {
+            return Some(WearProblem::Race(limit));
+        }
+        // (A group and a specific alignment are one kind: either fits.)
+        let alignment = Alignment::of(creature);
+        let (groups, specific) =
+            (of(USE_LIMITATION_ALIGNMENT_GROUP), of(USE_LIMITATION_SPECIFIC_ALIGNMENT));
+        let fits = groups.iter().any(|&g| alignment.in_group(g))
+            || specific.contains(&alignment.specific());
+        if (!groups.is_empty() || !specific.is_empty()) && !fits {
+            return Some(WearProblem::Alignment { groups, specific });
+        }
+        None
+    }
+
+    /// What a [`WearProblem`] says, for a builder: "it has none of the
+    /// feats: Martial Weapon Proficiency", "only Wizard may wear it"….
+    pub fn wear_problem_text(&self, p: &WearProblem) -> String {
+        use crate::rows::RowTable;
+        let names = |table, name, label, rows: &[u16]| {
+            let t = RowTable { table, name: Some(name), label: Some(label) };
+            let named: Vec<String> = rows
+                .iter()
+                .map(|&r| self.row_name(&t, i64::from(r)).unwrap_or_else(|| format!("({r})")))
+                .collect();
+            named.join(", ")
+        };
+        match p {
+            WearProblem::Feats(f) => {
+                format!("it has none of the feats it needs: {}", names("feat", "FEAT", "LABEL", f))
+            }
+            WearProblem::Class(c) => {
+                format!("it is limited to {}", names("classes", "Name", "Label", c))
+            }
+            WearProblem::Race(r) => {
+                format!("it is limited to {}", names("racialtypes", "Name", "Label", r))
+            }
+            WearProblem::Alignment { groups, specific } => {
+                let mut all = Vec::new();
+                if !groups.is_empty() {
+                    all.push(names("iprp_aligngrp", "Name", "Label", groups));
+                }
+                if !specific.is_empty() {
+                    all.push(names("iprp_alignment", "Name", "Label", specific));
+                }
+                format!("it is limited to {}", all.join(", "))
+            }
+        }
+    }
+
     /// A property's cost multiplier: its type's `Cost` (else its subtype's)
     /// times its cost table value's `Cost`.
     pub fn property_cost(&self, p: &ItemProperty) -> f32 {
@@ -254,6 +417,53 @@ pub fn wide_label(label: &str) -> String {
 /// BYTE field's.
 pub fn part_number(s: &mg_gff::Struct, label: &str) -> Option<i64> {
     s.integer(&wide_label(label)).or_else(|| s.integer(label))
+}
+
+/// Armor icon parts, bottom first: (field, icon part).
+pub const ARMOR_ICON: [(&str, &str); 6] = [
+    ("ArmorPart_Pelvis", "pelvis"),
+    ("ArmorPart_Torso", "chest"),
+    ("ArmorPart_Belt", "belt"),
+    ("ArmorPart_LShoul", "shol"),
+    ("ArmorPart_RShoul", "shor"),
+    ("ArmorPart_Robe", "robe"),
+];
+
+/// The names of an item's inventory icon layers, bottom first (nwn.wiki,
+/// baseitems.2da): `i<ItemClass>_<model>` for simple and layered items
+/// (`_m_` between for gender-specific ones), a composite weapon's bottom,
+/// middle and top (`_b_`, `_m_`, `_t_`), an armor's pelvis, chest, belt,
+/// shoulders and robe (`ipm_<part><number>`). Where `female`, the icons a
+/// woman's inventory shows (`ipf_`, `_f_`), for the items that have both.
+/// What the window draws an icon with, and what a hak's usage counts.
+pub fn icon_names(game: &GameData, item: &mg_gff::Struct, female: bool) -> Vec<String> {
+    let part = |label: &str| part_number(item, label).unwrap_or(0);
+    let g = if female { 'f' } else { 'm' };
+    let Ok(t) = game.table("baseitems") else { return Vec::new() };
+    let Ok(row) = usize::try_from(item.integer("BaseItem").unwrap_or(-1)) else {
+        return Vec::new();
+    };
+    let class = t.get(row, "ItemClass").unwrap_or_default().to_ascii_lowercase();
+    match t.get_int(row, "ModelType").unwrap_or(0) {
+        2 => [("ModelPart1", "b"), ("ModelPart2", "m"), ("ModelPart3", "t")]
+            .iter()
+            .map(|(l, p)| format!("i{class}_{p}_{:03}", part(l)))
+            .collect(),
+        3 => ARMOR_ICON
+            .iter()
+            .map(|(l, p)| (part(l), p))
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, p)| format!("ip{g}_{p}{n:03}"))
+            .collect(),
+        _ => {
+            let gender = if t.get_int(row, "GenderSpecific") == Some(1) {
+                format!("{g}_")
+            } else {
+                String::new()
+            };
+            vec![format!("i{class}_{gender}{:03}", part("ModelPart1"))]
+        }
+    }
 }
 
 /// An armor's parts, in the game's order (`ITEM_APPR_ARMOR_MODEL_*`): the

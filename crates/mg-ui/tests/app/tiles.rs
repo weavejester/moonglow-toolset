@@ -3,6 +3,142 @@
 
 use crate::common::*;
 
+/// A tileset with holes in the tileset editor (a builder's big old
+/// tileset, merged by hand): a tile without its section, and one without
+/// `Model=`, are said to be holes in the list and over their fields, a
+/// terrain's missing section over the Terrains page; a model typed into a
+/// hole fills it in.
+#[test]
+fn a_tileset_s_holes_are_shown_in_its_editor() {
+    let dir = mg_testkit::scratch_dir("ui-tileset-holes");
+    let path = dir.join("zzh01.set");
+    let text = "[GENERAL]\r\nName=zzh01\r\n[TERRAIN TYPES]\r\nCount=3\r\n[TERRAIN0]\r\nName=Grass\r\n[TERRAIN2]\r\nName=Water\r\n\
+                [CROSSER TYPES]\r\nCount=0\r\n[PRIMARY RULES]\r\nCount=0\r\n[SECONDARY RULES]\r\n\
+                Count=0\r\n[TILES]\r\nCount=3\r\n[TILE0]\r\nModel=zzh01_a01_01\r\nTopLeft=Grass\r\n\
+                [TILE2]\r\nWalkMesh=msb01\r\n[GROUPS]\r\nCount=0\r\n";
+    std::fs::write(&path, text).unwrap();
+    let mut h = harness(Moonglow::new(None, Box::new(NoDialogs::default())), 1300.0, 900.0);
+    h.run();
+    mg_ui::tileset_view::open_path(h.state_mut(), path);
+    h.run();
+    let t = h.state().tilesets[0].tileset().expect("read").clone();
+    assert_eq!(t.missing_sections, ["TERRAIN1", "TILE1"]);
+    h.get_by_label("Terrains and Crossers").click();
+    h.run();
+    assert!(h.query_by_label_contains("the file has no [TERRAIN1]").is_some());
+    h.get_by_label("Tiles").click();
+    h.run();
+    assert!(h.query_by_label_contains("a hole: no [TILE1] section").is_some());
+    assert!(h.query_by_label_contains("a hole: no Model=").is_some());
+    assert!(h.query_by_label_contains("A hole").is_none(), "no tile chosen yet");
+    h.state_mut().tilesets[0].tile = Some(1);
+    h.run();
+    assert!(h.query_by_label_contains("A hole: no [TILE1] section. The game draws").is_some());
+    h.state_mut().tilesets[0].tile = Some(0);
+    h.run();
+    assert!(h.query_by_label_contains("A hole").is_none(), "a whole tile");
+    // A model typed into the hole fills it in.
+    h.state_mut().tilesets[0].change(|f| f.set("TILE1", "Model", "zzh01_a02_01"));
+    h.run();
+    let t = h.state().tilesets[0].tileset().unwrap().clone();
+    assert_eq!(t.tiles[1].model, "zzh01_a02_01");
+    assert!(mg_ui::tileset_view::tile_hole(&t, 1).is_none());
+    assert_eq!(mg_ui::tileset_view::tile_hole(&t, 2).as_deref(), Some("no Model="));
+}
+
+/// Undo and Redo over a tileset's editor, by their keys and from the Edit
+/// menu, are the tileset's (it shares the hak's path, `side_doc.rs`), and
+/// the menu says plain "Undo": its steps have no names. Away from it, the
+/// module's.
+#[test]
+fn undo_over_a_tileset_editor_is_the_tileset_s() {
+    let dir = mg_testkit::scratch_dir("ui-tileset-undo");
+    let set_path = dir.join("zzu01.set");
+    let _ = std::fs::remove_file(&set_path);
+    let dialogs = NoDialogs { save: vec![set_path.clone()], ..Default::default() };
+    let mut app = Moonglow::new(None, Box::new(dialogs));
+    app.settings.no_last_area = true;
+    app.open_module(&sample_module(&dir));
+    let key = ResKey::parse("mystore", ResType::TWODA).unwrap();
+    app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "A table",
+        vec![mg_edit::Edit::SetResource { key, data: Some(SMALL_TABLE.to_vec()) }],
+    )));
+    let mut h = harness(app, 1300.0, 900.0);
+    h.run();
+    mg_ui::tileset_view::new_tileset(h.state_mut());
+    h.run();
+    h.get_by_label("Terrains and Crossers").click();
+    h.run();
+    h.state_mut().tilesets[0].new_type = "Grass".into();
+    h.run();
+    h.get_by_label("Add Terrain").click();
+    h.run();
+    let terrains =
+        |h: &Harness<'_, Moonglow>| h.state().tilesets[0].tileset().unwrap().terrains.len();
+    let module_step =
+        |h: &Harness<'_, Moonglow>| h.state().ws.as_ref().unwrap().can_undo().map(str::to_string);
+    assert_eq!((terrains(&h), module_step(&h).as_deref()), (1, Some("A table")));
+    let ctrl = egui::Modifiers::COMMAND;
+    let over = |h: &mut Harness<'_, Moonglow>| {
+        h.hover_at(h.get_by_label("Add Terrain").rect().center());
+        h.run();
+    };
+    over(&mut h);
+    h.key_press_modifiers(ctrl, egui::Key::Z);
+    h.run();
+    assert_eq!(terrains(&h), 0, "the tileset's step undone");
+    assert_eq!(module_step(&h).as_deref(), Some("A table"), "not the module's");
+    over(&mut h);
+    h.key_press_modifiers(ctrl, egui::Key::Y);
+    h.run();
+    assert_eq!(terrains(&h), 1, "redone");
+    // From the Edit menu: plain Undo, the tileset's.
+    over(&mut h);
+    h.get_by_label("Edit").click();
+    h.run();
+    // (The menu's entry is the one with its key: the editor's own button
+    // and the toolbar's say "Undo" with no more, or after a glyph.)
+    let label = |n: &egui_kittest::Node<'_>| n.accesskit_node().label().unwrap_or_default();
+    let entries: Vec<String> = h
+        .get_all_by_label_contains("Undo")
+        .map(|n| label(&n))
+        .filter(|l| l.starts_with("Undo "))
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = entries[0].clone();
+    let key = entry.strip_prefix("Undo ").unwrap_or_default();
+    assert!(key.ends_with('Z') && key.len() <= 6, "plain Undo and its key: {entry}");
+    h.get_by_label(&entry).click();
+    h.run();
+    assert_eq!(terrains(&h), 0, "the tileset's step, from the menu");
+    assert_eq!(module_step(&h).as_deref(), Some("A table"));
+    // Away from it (over the module tree): the module's.
+    h.hover_at(h.get_by_label("Areas (1)").rect().center());
+    h.run();
+    h.key_press_modifiers(ctrl, egui::Key::Z);
+    h.run();
+    assert_ne!(module_step(&h).as_deref(), Some("A table"), "the module's step undone");
+}
+
+/// A new tileset's name is one by the rule of the names Moonglow makes
+/// (`ResRef::new_name`): a file named with a space is refused and not
+/// written; capitals are lowered in the tileset's own name.
+#[test]
+fn a_new_tileset_is_named_by_the_rule_of_new_names() {
+    let dir = mg_testkit::scratch_dir("ui-tileset-new-name");
+    let spaced = dir.join("my tiles.set");
+    let capitals = dir.join("ZZN01.set");
+    let dialogs = NoDialogs { save: vec![capitals.clone(), spaced.clone()], ..Default::default() };
+    let mut app = Moonglow::new(None, Box::new(dialogs));
+    mg_ui::tileset_view::new_tileset(&mut app);
+    assert!(!spaced.exists());
+    assert!(app.log.entries.iter().any(|e| e.1.contains("my tiles: a tileset's name: ' '")));
+    mg_ui::tileset_view::new_tileset(&mut app);
+    let text = std::fs::read_to_string(&capitals).unwrap();
+    assert!(text.contains("UnlocalizedName=zzn01"), "{text}");
+}
+
 #[test]
 fn tileset_made_edited_saved_with_its_palette() {
     let root = mg_testkit::corpus!();
@@ -10,9 +146,8 @@ fn tileset_made_edited_saved_with_its_palette() {
     let set_path = dir.join("zzz01.set");
     let _ = std::fs::remove_file(&set_path);
     // A game tileset's copy, to edit too.
-    let game =
-        mg_resman::ResMan::for_game(&mg_resman::GameInstall::new(&root, None, "en")).unwrap();
-    let tic = game.get(&ResKey::parse("tic01", ResType::SET).unwrap()).unwrap().into_owned();
+    let game = game_data(&root);
+    let tic = game.resman.get(&ResKey::parse("tic01", ResType::SET).unwrap()).unwrap().into_owned();
     let tic_path = dir.join("tic01.set");
     std::fs::write(&tic_path, &tic).unwrap();
     let dialogs = NoDialogs {
@@ -106,9 +241,8 @@ fn a_tileset_s_terrain_and_crosser_are_renamed_where_its_tiles_name_them() {
     let root = mg_testkit::corpus!();
     let Some(rs) = gpu() else { return };
     let dir = mg_testkit::scratch_dir("ui-tileset-rename");
-    let game =
-        mg_resman::ResMan::for_game(&mg_resman::GameInstall::new(&root, None, "en")).unwrap();
-    let ttr = game.get(&ResKey::parse("ttr01", ResType::SET).unwrap()).unwrap().into_owned();
+    let game = game_data(&root);
+    let ttr = game.resman.get(&ResKey::parse("ttr01", ResType::SET).unwrap()).unwrap().into_owned();
     let path = dir.join("ttr01.set");
     std::fs::write(&path, &ttr).unwrap();
     let dialogs = NoDialogs { open: vec![path.clone()], ..Default::default() };
@@ -262,6 +396,85 @@ fn a_tileset_group_s_name_is_typed() {
         assert!(h.state().tilesets[0].findings.is_none());
     }
     assert_eq!(group(&h).name, "Bridge");
+}
+
+/// The painting rules and a tile's door hooks are on the editor's pages:
+/// a rule added, its terrain chosen, taken away; a door added to the
+/// chosen tile, moved, taken away; each a step to undo, saved as the
+/// game reads it.
+#[test]
+fn a_tileset_s_rules_and_doors_are_edited() {
+    let dir = mg_testkit::scratch_dir("ui-tileset-rules");
+    let set_path = dir.join("zzz03.set");
+    let dialogs = NoDialogs { save: vec![set_path.clone()], ..Default::default() };
+    let mut app = Moonglow::new(None, Box::new(dialogs));
+    app.open_module(&sample_module(&dir));
+    app.open_palette = false;
+    let mut h = harness(app, 1300.0, 900.0);
+    h.run();
+    mg_ui::tileset_view::new_tileset(h.state_mut());
+    h.run();
+    h.get_by_label("Terrains and Crossers").click();
+    h.run();
+    for name in ["Grass", "Water"] {
+        h.state_mut().tilesets[0].new_type = name.into();
+        h.run();
+        h.get_by_label("Add Terrain").click();
+        h.run();
+    }
+    let set = |h: &Harness<'_, Moonglow>| h.state().tilesets[0].tileset().unwrap().clone();
+
+    h.get_by_label("Painting Rules").click();
+    h.run();
+    h.get_all_by_label("Add Rule").next().expect("the primary rules' Add Rule").click();
+    h.run();
+    let rule = set(&h).primary_rules[0].clone();
+    assert_eq!((rule.placed.as_str(), rule.adjacent.as_str()), ("Grass", "Grass"));
+    assert!(set(&h).secondary_rules.is_empty());
+    // Its Changed chosen from the tileset's terrains.
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    let grass = |n: &egui_kittest::Node<'_>| n.accesskit_node().value().as_deref() == Some("Grass");
+    assert_eq!(h.query_all(combo.clone()).filter(grass).count(), 3, "Placed, Adjacent, Changed");
+    h.query_all(combo).filter(grass).nth(2).expect("the rule's Changed").click();
+    h.run();
+    h.get_by_label("Water").click();
+    h.run();
+    assert_eq!(set(&h).primary_rules[0].changed, "Water");
+    h.get_all_by_label("Add Rule").nth(1).expect("the secondary rules' Add Rule").click();
+    h.run();
+    assert_eq!(set(&h).secondary_rules.len(), 1);
+    h.get_all_by_label("Remove Last Rule").nth(1).unwrap().click();
+    h.run();
+    assert!(set(&h).secondary_rules.is_empty());
+
+    h.get_by_label("Tiles").click();
+    h.run();
+    h.get_by_label("Add Tile").click();
+    h.run();
+    h.get_by_label("Add Door").click();
+    h.run();
+    let doors = |h: &Harness<'_, Moonglow>| set(h).tiles[0].doors.clone();
+    assert_eq!(doors(&h).len(), 1);
+    // Moved: its X set, as its field sets it.
+    let doc = &mut h.state_mut().tilesets[0];
+    doc.change(|f| f.set("TILE0DOOR0", "X", "5.0"));
+    h.run();
+    assert_eq!(doors(&h)[0].position[0], 5.0);
+    h.get_by_label("Add Door").click();
+    h.run();
+    assert_eq!(doors(&h).len(), 2);
+    h.get_by_label("Remove Last Door").click();
+    h.run();
+    assert_eq!(doors(&h).len(), 1);
+    h.state_mut().tilesets[0].undo();
+    assert_eq!(doors(&h).len(), 2, "taking it away is a step to undo");
+
+    h.state_mut().tilesets[0].save().unwrap();
+    let saved = std::fs::read(&set_path).unwrap();
+    let t = mg_set::Tileset::parse(&saved, mg_core::Codepage::default()).unwrap();
+    assert!(t.warnings.is_empty(), "{:?}", t.warnings);
+    assert_eq!((t.primary_rules.len(), t.tiles[0].doors.len()), (1, 2));
+    assert_eq!(t.primary_rules[0].changed, "Water");
 }
 
 #[test]
@@ -533,8 +746,8 @@ fn area_viewer_selects_tiles_and_sets_their_properties() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         are.root.list("Tile_List").unwrap()[i].clone()
     };
-    // A replacement texture in the file (BioWare's unused `Tile_ReplaceTex`,
-    // set by hand): kept, and not in the window.
+    // A replacement texture in the file (`Tile_ReplaceTex`, set by hand)
+    // on a tile whose model has no replace_tex: kept, greyed out.
     let set = mg_edit::Edit::SetField {
         key: ResKey::new(area, ResType::ARE),
         path: mg_edit::GffPath::root().item("Tile_List", 5),
@@ -599,7 +812,9 @@ fn area_viewer_selects_tiles_and_sets_their_properties() {
     // Main light 1 to colour 9, through the colour picker.
     h.state_mut().tile_props.as_mut().unwrap().main[0] = 9;
     h.state_mut().tile_props.as_mut().unwrap().loops = [false, false, false];
-    assert!(h.query_by_label_contains("Replacement Texture").is_none(), "no longer in the window");
+    // (No tic01 tile has a replace_tex texture: Replacement Texture is
+    // greyed out, and the file's value kept.)
+    assert!(h.get_by_label("Replacement Texture").accesskit_node().is_disabled());
     h.run_steps(1);
     h.get_by_label("OK").click();
     h.run_steps(2);
@@ -2497,7 +2712,7 @@ fn an_exact_tile_goes_in_alone() {
     // Not shown with the List and no tile chosen; beside the Gallery's
     // switch with it.
     assert!(h.query_by_label("📌 Exact tile").is_none());
-    h.get_by_label("⊞").click();
+    h.get_by_label("🖼").click();
     h.run_steps(2);
     assert!(!h.state().settings.exact_tiles, "off at first");
     h.get_by_label("📌 Exact tile").click();
@@ -2967,9 +3182,10 @@ fn tile_properties_changes_show_at_once() {
     h.get_by_label("Defaults").click();
     h.run_steps(2);
     let p = h.state().tile_props.clone().expect("the window stays");
-    assert_eq!(p.touched, [true; 7]);
+    // (Not the replacement texture, which Aurora's Defaults hasn't got.)
+    assert_eq!(p.touched, [true, true, true, true, true, true, true, false]);
     let now = tile_list(&mut h, area);
-    for (k, label) in mg_ui::tile_select::LIGHTS.iter().enumerate() {
+    for (k, label) in mg_ui::tile_select::FIELDS.iter().enumerate().take(7) {
         let (has, value) = match k {
             0 | 1 => (p.has_main[k], p.main[k]),
             2 | 3 => (p.has_source[k - 2], p.source[k - 2]),
@@ -3203,7 +3419,7 @@ fn tile_properties_turn_turns_the_tiles_at_once() {
     let now = tile_list(&mut h, area);
     assert_eq!(now[5].integer("Tile_Orientation"), Some(to), "turned at once");
     assert_eq!(now[5].integer("Tile_ID"), list[5].integer("Tile_ID"), "its own tile");
-    for label in mg_ui::tile_select::LIGHTS {
+    for label in mg_ui::tile_select::FIELDS {
         assert_eq!(now[5].get(label), list[5].get(label), "{label} kept");
     }
     only_changed(&list, &now, &[5]);
@@ -3396,6 +3612,14 @@ fn the_tile_gallery_searches_opens_a_tile_and_drops_one_in_the_area() {
     let tileset = ResRef::from_str("ttr01").unwrap();
     let tab = h.state().dock.find_tab(&Tab::Tile { tileset, tile }).expect("its view");
     h.get_by_label("Corners");
+    // The tileset is the one the area's view read, not read again: the
+    // same each time it is asked for (one read from the game is new).
+    let (once, again) = (h.state().tileset(tileset).unwrap(), h.state().tileset(tileset).unwrap());
+    assert!(std::sync::Arc::ptr_eq(&once, &again), "the open area's tileset");
+    let unopened = ResRef::from_str("tin01").unwrap();
+    let (a, b) = (h.state().tileset(unopened).unwrap(), h.state().tileset(unopened).unwrap());
+    assert!(!std::sync::Arc::ptr_eq(&a, &b), "a tileset no area has open is read");
+    assert!(h.state().tileset(ResRef::from_str("nosuchset").unwrap()).is_none());
     h.state_mut().dock.remove_tab(tab);
     h.run_steps(3);
     // Dragged into the area: placed in the tile it is dropped on.
@@ -4032,7 +4256,7 @@ fn f10_and_a_click_go_between_objects_and_tiles() {
 fn an_area_of_a_tileset_with_holes_draws_its_other_tiles() {
     let Some(root) = mg_testkit::nwn_root() else { return };
     let user = mg_testkit::scratch_dir("ui-tileset-holes-user");
-    let game = mg_rules::GameData::open(&mg_resman::GameInstall::new(&root, None, "en")).unwrap();
+    let game = game_data(&root);
     let ttr01 = game.resman.get(&ResKey::parse("ttr01", ResType::SET).unwrap()).unwrap();
     let ttr01 = String::from_utf8_lossy(&ttr01).into_owned();
     drop(game);
@@ -4193,4 +4417,135 @@ fn a_tile_s_textures_show_where_the_tile_is_looked_at() {
     h.get_by_label("diffuse of sign");
     let shots = mg_testkit::scratch_dir("ui-tile-textures");
     h.render().unwrap().save(shots.join("tileset-editor.png")).unwrap();
+}
+
+/// A 4 by 4 tms01 area whose tile 5 (tile 0 of the tileset) is the game's
+/// one model with a `replace_tex` texture (`tms01_c08_01`, a flag; its
+/// text renamed into the module) and whose `replacetexture.2da` (the
+/// module's) names three solid textures, blue, green and white; tile 5's
+/// `Tile_ReplaceTex` is `value`.
+fn replacement_area(name: &str, value: Option<u8>) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    let solid = |rgb: [u8; 3]| {
+        let mut t = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 8, 0, 32, 8];
+        for _ in 0..64 {
+            t.extend([rgb[2], rgb[1], rgb[0], 255]);
+        }
+        t
+    };
+    let prepare = |m: &mut mg_module::Module, game: &mg_rules::GameData, area: ResRef| {
+        let set = game.resman.get(&ResKey::parse("tms01", ResType::SET).unwrap()).unwrap();
+        let set = mg_set::Tileset::parse(&set, game.language.codepage()).unwrap();
+        let name = set.tiles[0].model.to_ascii_lowercase();
+        let flag = game.resman.get(&ResKey::parse("tms01_c08_01", ResType::MDL).unwrap()).unwrap();
+        let text = String::from_utf8_lossy(&flag)
+            .replace("TMS01_C08_01", &name)
+            .replace("tms01_c08_01", &name);
+        m.set(ResKey::parse(&name, ResType::MDL).unwrap(), text.into_bytes());
+        let table =
+            "2DA V2.0\r\n\r\n   TEXTURENAME\r\n0  mgr_row0\r\n1  mgr_row1\r\n2  mgr_row2\r\n";
+        m.set(ResKey::parse("replacetexture", ResType::TWODA).unwrap(), table.as_bytes().to_vec());
+        let textures =
+            [("mgr_row0", [0, 0, 255]), ("mgr_row1", [0, 255, 0]), ("mgr_row2", [255; 3])];
+        for (t, rgb) in textures {
+            m.set(ResKey::parse(t, ResType::TGA).unwrap(), solid(rgb));
+        }
+        let key = ResKey::new(area, ResType::ARE);
+        let mut are = m.gff(&key).unwrap().unwrap();
+        if let Some(v) = value {
+            let tile = &mut are.root.list_mut("Tile_List").unwrap()[5];
+            tile.set("Tile_ReplaceTex", mg_gff::Value::Byte(v));
+        }
+        m.set_gff(key, &are).unwrap();
+    };
+    area_harness_with(name, "tms01", Some(0), 4, None, &prepare)
+}
+
+/// Tile Properties' Replacement Texture (BioWare's `Tile_ReplaceTex`,
+/// back in the window as the client was seen drawing it: a builder's tile
+/// feedback, October 2026): the `replacetexture.2da` rows, the one a tile
+/// draws shown (the value's row before it, row 0 for a tile without the
+/// field), enabled where a tile's model has a `replace_tex` texture.
+#[test]
+fn tile_properties_set_a_tile_s_replacement_texture() {
+    use glam::Vec3;
+    let Some((mut h, area)) = replacement_area("tile-replace", Some(2)) else { return };
+    let tile = |h: &mut Harness<'_, Moonglow>, i: usize| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
+        are.root.list("Tile_List").unwrap()[i].clone()
+    };
+    let replace = |h: &mut Harness<'_, Moonglow>, i: usize| tile(h, i).integer("Tile_ReplaceTex");
+    let dir = mg_testkit::scratch_dir("ui-tile-replace");
+    let (one, two) = (Vec3::new(15.0, 15.0, 0.0), Vec3::new(25.0, 15.0, 0.0));
+    tile_properties_of(&mut h, area, &[one]);
+    h.run_steps(20);
+    h.render().unwrap().save(dir.join("tile-properties.png")).unwrap();
+    // Value 2: row 1, shown; the table's rows offered, each written as its
+    // number plus one.
+    let props = h.state().tile_props.clone().expect("the window is open");
+    assert!(props.has_replace);
+    assert_eq!(props.replace, 2);
+    assert!(!h.get_by_label("Replacement Texture").accesskit_node().is_disabled());
+    h.get_by_value("1: mgr_row1").click();
+    h.run_steps(2);
+    h.get_by_label("2: mgr_row2").click();
+    h.run_steps(3);
+    assert_eq!(replace(&mut h, 5), Some(3), "shown in the area at once");
+    h.get_by_label("Defaults").click();
+    h.run_steps(2);
+    assert_eq!(replace(&mut h, 5), Some(3), "Defaults leaves it as it is");
+    h.get_by_label("OK").click();
+    h.run_steps(20);
+    h.render().unwrap().save(dir.join("row-2-chosen.png")).unwrap();
+    // One step to undo.
+    h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+    h.run_steps(2);
+    assert_eq!(replace(&mut h, 5), Some(2));
+
+    // With tile 6 (no replace_tex): each tile is written only what its
+    // own model has.
+    let was6 = tile(&mut h, 6);
+    tile_properties_of(&mut h, area, &[one, two]);
+    let props = h.state().tile_props.clone().expect("the window is open");
+    assert_eq!(props.tiles, [5, 6]);
+    assert_eq!(props.has_each.iter().map(|f| f.replace).collect::<Vec<_>>(), [true, false]);
+    {
+        let p = h.state_mut().tile_props.as_mut().unwrap();
+        p.replace = 1;
+    }
+    h.run_steps(1);
+    h.get_by_label("OK").click();
+    h.run_steps(2);
+    assert_eq!(replace(&mut h, 5), Some(1), "row 0");
+    assert_eq!(tile(&mut h, 6), was6, "tile 6 has no replace_tex: kept as it was");
+
+    // Tile 6 alone: not enabled.
+    tile_properties_of(&mut h, area, &[two]);
+    assert!(!h.state().tile_props.as_ref().unwrap().has_replace);
+    assert!(h.get_by_label("Replacement Texture").accesskit_node().is_disabled());
+    h.state_mut().tile_props = None;
+    h.run_steps(2);
+
+    // A value the client crashes on (0, or past the table): said so, and
+    // kept until a row is chosen.
+    for bad in [0, 4] {
+        let set = mg_edit::Edit::SetField {
+            key: ResKey::new(area, ResType::ARE),
+            path: mg_edit::GffPath::root().item("Tile_List", 5),
+            label: "Tile_ReplaceTex".into(),
+            value: Some(mg_gff::Value::Byte(bad)),
+        };
+        let set = mg_edit::Command::new("Replacement texture", vec![set]);
+        h.state_mut().actions.push(mg_ui::Action::Apply(set));
+        h.run_steps(2);
+        tile_properties_of(&mut h, area, &[one]);
+        h.get_by_value(&format!("{bad}: no row"));
+        h.get_by_label("crashes the game as the area loads");
+        if bad == 0 {
+            h.render().unwrap().save(dir.join("crash-value.png")).unwrap();
+        }
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        assert_eq!(replace(&mut h, 5), Some(i64::from(bad)), "kept: nothing chosen");
+    }
 }

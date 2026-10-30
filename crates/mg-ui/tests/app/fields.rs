@@ -13,7 +13,7 @@ fn insert_and_delete_keys_copy_cut_and_paste_text() {
     let mut app = app_with(Vec::new());
     app.settings.no_last_area = true;
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let is_input =
         |n: &egui_kittest::Node<'_>| n.accesskit_node().role() == egui::accesskit::Role::TextInput;
@@ -87,7 +87,7 @@ fn multi_line_text_keeps_its_line_ends() {
     // (The module opens on its Properties, not on an area.)
     app.settings.no_last_area = true;
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.get_by_label("Description").click();
     h.run();
@@ -134,8 +134,7 @@ fn module_description_harness(
     let mut app = app_with(Vec::new());
     app.settings.no_last_area = true;
     app.open_module(&path);
-    let mut h =
-        Harness::builder().with_size(size).build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = harness(app, size.x, size.y);
     h.run();
     h.get_by_label("Description").click();
     h.run();
@@ -443,6 +442,47 @@ fn a_placeable_s_numbers_have_arrows() {
     assert!(h.query_all_by_label("⏶").count() >= 3, "the lock's DCs have arrows");
 }
 
+/// A number typed past a field's end is kept at Aurora's limit (measured
+/// in Aurora 89.8193.37 by typing past them, `docs/log.md` 2026-10-29): an
+/// encounter's creatures are 1 to 8, and a minimum typed above the
+/// maximum raises the maximum to it, as Aurora's does.
+#[test]
+fn a_number_typed_past_aurora_s_limit_is_kept_at_it() {
+    let Some((mut h, key)) = blueprint_harness("x2_golem001", "enc_limits", ResType::UTE) else {
+        return;
+    };
+    h.run();
+    let int = |h: &mut Harness<'_, Moonglow>, label: &str| field(h, &key).integer(label).unwrap();
+    assert_eq!(int(&mut h, "MaxCreatures"), 4, "the golems' encounter, as the game has it");
+    assert_eq!(int(&mut h, "RecCreatures"), 2);
+    // A minimum of 6 raises the maximum of 4 to it, in one command; one
+    // of 3 leaves it.
+    let type_into = |h: &mut Harness<'_, Moonglow>, was: &str, typed: &str| {
+        h.get_all_by_value(was).next().expect("the field").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.get_all_by_value(was).next().expect("the field in hand").type_text(typed);
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+    };
+    type_into(&mut h, "2", "6");
+    assert_eq!((int(&mut h, "RecCreatures"), int(&mut h, "MaxCreatures")), (6, 6));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!((int(&mut h, "RecCreatures"), int(&mut h, "MaxCreatures")), (2, 4));
+    type_into(&mut h, "2", "3");
+    assert_eq!((int(&mut h, "RecCreatures"), int(&mut h, "MaxCreatures")), (3, 4));
+    h.get_all_by_value("4").next().expect("Maximum Creatures' field").click();
+    h.run();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_all_by_value("4").next().expect("the field in hand").type_text("99");
+    h.run();
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert_eq!(int(&mut h, "MaxCreatures"), 8);
+}
+
 /// GitHub issue 18: Ctrl+Z while a text field has the keyboard is the
 /// field's (its typing is taken back), not the module's Undo, which undid
 /// an earlier change somewhere else; with no field in hand it is the
@@ -669,6 +709,348 @@ fn a_properties_window_s_cancel_sets_back_what_it_changed() {
     h.get_by_label("Cancel").click();
     h.run_steps(4);
     assert_eq!(tag(&mut h), format!("{original}_Y"));
+}
+
+/// A text field typed in whose page goes away other than by a press of
+/// the pointer (a key, the window's page kept for it) sets its text as
+/// it goes (`Moonglow::held_text`), and that is among what the window's
+/// Cancel sets back.
+#[test]
+fn cancel_sets_back_text_set_as_its_page_went() {
+    let Some((mut h, key)) = blueprint_harness("plc_chest1", "chest_held", ResType::UTP) else {
+        return;
+    };
+    h.run();
+    let tag = |h: &mut Harness<'_, Moonglow>| {
+        String::from_utf8_lossy(field(h, &key).string("Tag").unwrap_or_default()).into_owned()
+    };
+    let original = tag(&mut h);
+    let is = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some(&*original)
+    };
+    let at = h.get(egui_kittest::kittest::by().predicate(is)).rect().center();
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text("_K".into()));
+    h.run_steps(2);
+    // The page changes with the field still holding the keyboard.
+    h.state_mut().blueprint_pages.insert((key, mg_edit::GffPath::root()), "Lock");
+    h.run_steps(3);
+    assert_eq!(tag(&mut h), format!("{original}_K"), "set as the field went");
+    h.get_by_label("Cancel").click();
+    h.run_steps(4);
+    assert_eq!(tag(&mut h), original, "and set back by Cancel");
+    assert!(h.state().dock.find_tab(&Tab::Blueprint(key)).is_none(), "closed");
+}
+
+/// The faction editor's Cancel after a removal: the factions are as they
+/// were, and the objects the removal renumbered are numbered back, as
+/// they are now: what was changed in them meanwhile stays (they were set
+/// back whole, and took it back with them).
+#[test]
+fn a_faction_s_removal_cancelled_numbers_its_objects_back() {
+    use mg_module::factions::Factions;
+    let dir = mg_testkit::scratch_dir("ui-faction-cancel");
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let mut f = Factions::of_module(&m);
+    let guards = f.add("Guards", true, 1);
+    let thieves = f.add("Thieves", true, 1);
+    m.set_gff(ResKey::parse("repute", ResType::FAC).unwrap(), &f.to_gff()).unwrap();
+    let thief = ResKey::parse("thief", ResType::UTC).unwrap();
+    let mut g = mg_gff::Gff::new(*b"UTC ");
+    g.root.set("Tag", mg_gff::Value::String(b"THIEF".to_vec()));
+    g.root.set("FactionID", mg_gff::Value::Word(thieves as u16));
+    m.set_gff(thief, &g).unwrap();
+    m.save().unwrap();
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    close_tab(&mut app, &Tab::ModuleProperties);
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+    let thief_now = |h: &mut Harness<'_, Moonglow>| {
+        let root = h.state_mut().ws.as_mut().unwrap().doc(&thief).unwrap().root.clone();
+        (root.integer("FactionID"), root.string("Tag").map(<[u8]>::to_vec))
+    };
+    let factions =
+        |app: &Moonglow| Factions::of_module(&app.ws.as_ref().unwrap().module).factions.len();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Factions));
+    h.run_steps(4);
+    h.get_by_label("Guards").click();
+    h.run_steps(2);
+    h.get_by_label("Remove Faction").click();
+    h.run_steps(3);
+    assert_eq!(factions(h.state()), 6, "Guards removed");
+    assert_eq!(thief_now(&mut h).0, Some(i64::from(guards)), "the thieves renumbered");
+    // The thief changed elsewhere meanwhile.
+    let elsewhere = mg_edit::Edit::SetField {
+        key: thief,
+        path: mg_edit::GffPath::root(),
+        label: "Tag".into(),
+        value: Some(mg_gff::Value::String(b"THIEF_2".to_vec())),
+    };
+    let elsewhere = mg_edit::Command::new("Elsewhere", vec![elsewhere]);
+    h.state_mut().actions.push(mg_ui::Action::Apply(elsewhere));
+    h.run_steps(3);
+    h.get_by_label("Cancel").click();
+    h.run_steps(4);
+    assert!(h.state().dock.find_tab(&Tab::Factions).is_none(), "closed");
+    assert_eq!(factions(h.state()), 7, "Guards are back");
+    assert_eq!(
+        thief_now(&mut h),
+        (Some(i64::from(thieves)), Some(b"THIEF_2".to_vec())),
+        "the thief numbered back, its change kept"
+    );
+}
+
+/// Module Properties' and the journal's fields are a blueprint's
+/// (`blueprint::Form`): the module's tag and a category's take 32
+/// characters as typed; the XP slider dragged back to where it began
+/// changes nothing (it added an empty step); the module's tag typed and
+/// its page gone with the field holding the keyboard is set, and
+/// Cancel sets it back.
+#[test]
+fn module_properties_and_the_journal_fields_are_a_form_s() {
+    let dir = mg_testkit::scratch_dir("ui-ifo-form");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run_steps(3);
+    let info = ResKey::parse("module", ResType::IFO).unwrap();
+    let root = |h: &mut Harness<'_, Moonglow>| {
+        h.state_mut().ws.as_mut().unwrap().doc(&info).unwrap().root.clone()
+    };
+    let tag = |h: &mut Harness<'_, Moonglow>| {
+        String::from_utf8_lossy(root(h).string("Mod_Tag").unwrap_or_default()).into_owned()
+    };
+    // (The field on the row of the label "Tag": the module's name may
+    // read the same.)
+    let click_field = |h: &mut Harness<'_, Moonglow>, value: &str| {
+        let row = h.get_all_by_label("Tag").last().unwrap().rect().center().y;
+        let is = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+            n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some(value)
+        };
+        let at = (h.query_all(egui_kittest::kittest::by().predicate(is)))
+            .map(|n| n.rect().center())
+            .find(|c| (c.y - row).abs() < 8.0)
+            .expect("the tag's field");
+        h.hover_at(at);
+        press(h, at, true, egui::Modifiers::NONE);
+        press(h, at, false, egui::Modifiers::NONE);
+        h.run_steps(2);
+        h.key_press(egui::Key::End);
+    };
+    // The tag: 32 characters at most, as typed.
+    click_field(&mut h, "SAMPLE");
+    h.event(egui::Event::Text("_".repeat(40)));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(tag(&mut h).chars().count(), 32, "{}", tag(&mut h));
+    // Typed, and its page gone with the field holding the keyboard: set,
+    // and set back by Cancel with the rest.
+    let long = tag(&mut h);
+    click_field(&mut h, &long);
+    h.key_press(egui::Key::Home);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    h.state_mut().module_page = mg_ui::module_props::Page::Description;
+    h.run_steps(3);
+    assert_eq!(tag(&mut h).chars().count(), 31, "set as the field went");
+    h.get_by_label("Cancel").click();
+    h.run_steps(4);
+    assert_eq!(tag(&mut h), "SAMPLE", "set back");
+
+    // The XP slider dragged away and back: no change, no step. (First
+    // set by a press where the drag is to begin and end: the value there.)
+    h.state_mut().module_page = mg_ui::module_props::Page::Advanced;
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::ModuleProperties));
+    h.run_steps(4);
+    let steps =
+        |h: &Harness<'_, Moonglow>| h.state().ws.as_ref().unwrap().can_undo().map(str::to_owned);
+    let slider = h.get_by_role(egui::accesskit::Role::Slider).rect();
+    let along = |x: f32| egui::pos2(slider.left() + slider.width() * x, slider.center().y);
+    let at = along(0.3);
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(3);
+    let before = (steps(&h), root(&mut h).integer("Mod_XPScale"));
+    assert_eq!(before.0.as_deref(), Some("Experience scale"), "set by the press");
+    press(&h, at, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    for x in [0.5, 0.9, 0.3] {
+        h.hover_at(along(x));
+        h.run_steps(1);
+    }
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(3);
+    assert_eq!(root(&mut h).integer("Mod_XPScale"), before.1, "where it began");
+    assert_eq!(steps(&h), before.0);
+    h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+    assert_ne!(root(&mut h).integer("Mod_XPScale"), before.1, "one Undo takes the press back");
+
+    // A journal category's tag: 32 characters too.
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Journal));
+    h.run_steps(4);
+    h.get_by_label("Add").click();
+    h.run_steps(4);
+    let jrl = ResKey::parse("module", ResType::JRL).unwrap();
+    let cat_tag = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let cats = ws.doc(&jrl).unwrap().root.list("Categories").unwrap_or(&[]).to_vec();
+        String::from_utf8_lossy(cats[0].string("Tag").unwrap_or_default()).into_owned()
+    };
+    let was = cat_tag(&mut h);
+    click_field(&mut h, &was);
+    h.event(egui::Event::Text("x".repeat(40)));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(cat_tag(&mut h).chars().count(), 32, "{}", cat_tag(&mut h));
+}
+
+/// The editors of files saved when asked have OK and Cancel as the 2DA
+/// editor's: OK saves and closes; Cancel asks about what is unsaved and,
+/// with Don't Save, closes with it dropped. A script (its text into the
+/// module), the talk table, a hak (saved where it is asked) and a
+/// tileset; the raw fields view's Cancel is a Properties window's.
+#[test]
+fn the_file_editors_ok_saves_and_cancel_drops() {
+    use mg_module::talk::{Source, Table};
+    let dir = mg_testkit::scratch_dir("ui-file-editors-ok-cancel");
+    let path = sample_module(&dir);
+    let script = ResKey::parse("hello", ResType::NSS).unwrap();
+    let mut m = Module::open(&path).unwrap();
+    m.set(script, b"void main()\n{\n}\n".to_vec());
+    m.save().unwrap();
+    let (hak, set) = (dir.join("mine.hak"), dir.join("zzz01.set"));
+    let dialogs = NoDialogs { save: vec![set.clone(), hak.clone()], ..Default::default() };
+    let mut app = Moonglow::new(None, Box::new(dialogs));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    close_tab(&mut app, &Tab::ModuleProperties);
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+    let open = |h: &mut Harness<'_, Moonglow>, tab: Tab| {
+        h.state_mut().actions.push(mg_ui::Action::OpenTab(tab));
+        h.run_steps(4);
+    };
+    let press = |h: &mut Harness<'_, Moonglow>, label: &str| {
+        h.get_all_by_label(label).last().unwrap().click();
+        h.run_steps(4);
+    };
+    let type_code = |h: &mut Harness<'_, Moonglow>, text: &str| {
+        let code = egui_kittest::kittest::by().role(egui::accesskit::Role::MultilineTextInput);
+        h.get(code).click();
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
+        h.event(egui::Event::Text(text.into()));
+        h.run_steps(2);
+    };
+    let text = |h: &mut Harness<'_, Moonglow>| {
+        let data = h.state().ws.as_ref().unwrap().module.get(&script).unwrap().to_vec();
+        String::from_utf8_lossy(&data).into_owned()
+    };
+
+    // A script: OK puts its text into the module and closes it.
+    open(&mut h, Tab::Script(script));
+    type_code(&mut h, "// kept\n");
+    press(&mut h, "OK");
+    assert!(h.state().dock.find_tab(&Tab::Script(script)).is_none(), "closed by OK");
+    assert!(text(&mut h).contains("// kept"), "saved into the module: {}", text(&mut h));
+    // Cancel asks; Don't Save drops what was typed.
+    open(&mut h, Tab::Script(script));
+    type_code(&mut h, "// dropped\n");
+    press(&mut h, "Cancel");
+    assert!(h.query_by_label("Save changes to hello.nss?").is_some(), "asked");
+    press(&mut h, "Don't Save");
+    assert!(h.state().dock.find_tab(&Tab::Script(script)).is_none(), "closed by Cancel");
+    assert!(!text(&mut h).contains("// dropped"));
+    open(&mut h, Tab::Script(script));
+    let code = egui_kittest::kittest::by().role(egui::accesskit::Role::MultilineTextInput);
+    let shown = h.get(code).accesskit_node().value().unwrap_or_default();
+    assert!(!shown.contains("// dropped"), "opened again, as the module has it: {shown}");
+    press(&mut h, "Cancel");
+    assert!(h.state().dock.find_tab(&Tab::Script(script)).is_none(), "nothing to ask: closed");
+
+    // The talk table: a line added; Cancel, Don't Save: not written.
+    let file = dir.join("words.tlk");
+    let mut table = Table::create("words", &dir, mg_core::Language::ENGLISH, false);
+    table.source = Source::File(file.clone());
+    table.save().unwrap();
+    let written = std::fs::read(&file).unwrap();
+    h.state_mut().talk = Some(table);
+    h.state_mut().talk_view.outside = true;
+    open(&mut h, Tab::TalkTable);
+    press(&mut h, "Add Line");
+    assert!(h.state().talk.as_ref().unwrap().is_dirty());
+    press(&mut h, "Cancel");
+    press(&mut h, "Don't Save");
+    assert!(h.state().dock.find_tab(&Tab::TalkTable).is_none());
+    assert!(h.state().talk.as_ref().is_none_or(|t| !t.is_dirty()), "dropped");
+    assert_eq!(std::fs::read(&file).unwrap(), written, "the file as it was");
+
+    // A new hak: OK asks where, saves it there and closes.
+    mg_ui::hak_view::new_hak(h.state_mut());
+    h.run_steps(4);
+    let tab = Tab::Hak(h.state().haks[0].id);
+    press(&mut h, "OK");
+    assert!(hak.is_file(), "saved where it was asked");
+    assert!(h.state().dock.find_tab(&tab).is_none() && h.state().haks.is_empty(), "closed");
+
+    // A tileset: a terrain added; Cancel, Don't Save: the file as it was.
+    mg_ui::tileset_view::new_tileset(h.state_mut());
+    h.run_steps(4);
+    let made = std::fs::read(&set).unwrap();
+    let tab = Tab::Tileset(h.state().tilesets[0].id);
+    h.get_by_label("Terrains and Crossers").click();
+    h.run_steps(2);
+    h.state_mut().tilesets[0].new_type = "Grass".into();
+    h.run_steps(2);
+    press(&mut h, "Add Terrain");
+    press(&mut h, "Cancel");
+    press(&mut h, "Don't Save");
+    assert!(h.state().dock.find_tab(&tab).is_none() && h.state().tilesets.is_empty(), "closed");
+    assert_eq!(std::fs::read(&set).unwrap(), made, "not saved");
+}
+
+/// The raw fields view's OK and Cancel are a Properties window's: Cancel
+/// sets back what was typed in it.
+#[test]
+fn the_raw_fields_view_s_cancel_sets_back_its_change() {
+    let Some((mut h, key)) = blueprint_harness("plc_chest1", "chest_raw", ResType::UTP) else {
+        return;
+    };
+    h.state_mut().actions.push(mg_ui::Action::CloseTab(Tab::Blueprint(key)));
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Gff(key)));
+    h.run_steps(4);
+    let tag = |h: &mut Harness<'_, Moonglow>| {
+        String::from_utf8_lossy(field(h, &key).string("Tag").unwrap_or_default()).into_owned()
+    };
+    let original = tag(&mut h);
+    let is = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some(&*original)
+    };
+    let at = h.get(egui_kittest::kittest::by().predicate(is)).rect().center();
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text("_R".into()));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(tag(&mut h), format!("{original}_R"), "set");
+    h.get_by_label("Cancel").click();
+    h.run_steps(4);
+    assert_eq!(tag(&mut h), original, "set back");
+    assert!(h.state().dock.find_tab(&Tab::Gff(key)).is_none(), "closed");
 }
 
 /// The other editors have OK and Cancel too: Cancel sets back what the
@@ -1001,10 +1383,16 @@ fn an_open_dropdown_keeps_its_width() {
         n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some("Armoire")
     };
     let filter = h.get(egui_kittest::kittest::by().predicate(input)).rect();
-    assert_eq!(filter.width(), first.0, "the list keeps its width, narrowed");
+    // (The field and its clear button, now that something is typed.)
+    let clear = h.get_by_label("×").rect();
+    let across = clear.right() - filter.left();
+    assert!(
+        (across - first.0).abs() <= 2.0,
+        "the list keeps its width, narrowed: {across} {first:?}"
+    );
     // (Its rows still within it: with no scroll bar now, as wide as it.)
     let row = h.get_all_by_label_contains("Armoire").next().unwrap().rect();
-    assert!(row.right() <= filter.right() + 1.0, "{row:?} within the list beside {filter:?}");
+    assert!(row.right() <= clear.right() + 1.0, "{row:?} within the list beside {clear:?}");
 }
 
 /// A dropdown with a Filter field stays open while the field is clicked
@@ -1034,11 +1422,26 @@ fn a_dropdown_s_filter_field_can_be_typed_in() {
     let found = h.query_all_by_label_contains("Armoire").count();
     assert!(found > 0, "the dropdown is still open, and filtered");
     assert!(h.query_by_label("Altar").is_none(), "what doesn't match is left out");
+    // Escape clears what is typed, the list still open; Escape again
+    // closes it, the appearance as it was.
+    let hint = |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some("Filter");
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert!(h.query(egui_kittest::kittest::by().predicate(hint)).is_some(), "open");
+    assert!(h.query_all_by_label("Altar").next().is_some(), "every row again");
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert!(h.query(egui_kittest::kittest::by().predicate(hint)).is_none(), "closed");
+    assert_eq!(field(&mut h, &key).integer("Appearance"), Some(before));
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run();
+    type_into_hint(&mut h, "Filter", "Armoire");
     // A choice closes it and sets the appearance.
     h.get_all_by_label_contains("Armoire").next().unwrap().click();
     h.run();
     assert_ne!(field(&mut h, &key).integer("Appearance"), Some(before));
-    let hint = |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some("Filter");
     assert!(h.query(egui_kittest::kittest::by().predicate(hint)).is_none(), "closed");
 }
 
@@ -1071,7 +1474,7 @@ fn text_is_edited_in_the_chosen_language() {
 fn enter_does_what_a_dialog_s_main_button_does() {
     let root = mg_testkit::corpus!();
     let app = game_app(&root, None);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let is_input =
         |n: &egui_kittest::Node<'_>| n.accesskit_node().role() == egui::accesskit::Role::TextInput;
@@ -1101,7 +1504,7 @@ fn enter_does_what_a_dialog_s_main_button_does() {
 fn dialogs_open_with_their_main_field_ready_to_type_in() {
     let root = mg_testkit::corpus!();
     let app = game_app(&root, None);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // New Module: typed straight away, no click, the name is replaced...
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
@@ -1199,6 +1602,55 @@ fn arrow_keys_step_through_a_list_of_choices() {
 /// do once clicked (GitHub issue 7): the area's toolbar (Fade Geometry,
 /// Snap, Turn), without the camera moving, and Area Properties' (a
 /// table's rows, and the grass's surface material).
+/// Area Properties' Cancel sets back the sound or music it changed, not
+/// the area's others with it (they are one struct of its GIT): the music
+/// changed elsewhere meanwhile stays.
+#[test]
+fn area_properties_cancel_sets_back_its_sound_alone() {
+    let Some((mut h, area)) = area_harness("area-audio-cancel") else { return };
+    h.run_steps(3);
+    let git = ResKey::new(area, ResType::GIT);
+    let props = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.doc(&git).unwrap().root.child("AreaProperties").unwrap().clone()
+    };
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AreaProperties(area)));
+    h.run_steps(5);
+    h.get_all_by_label("Audio").last().unwrap().click();
+    h.run_steps(3);
+    let eax = |h: &mut Harness<'_, Moonglow>| props(h).integer("EnvAudio");
+    let was = eax(&mut h);
+    let line = h.get_by_label("Environmental Audio Effects").rect().center().y;
+    let combo = egui::accesskit::Role::ComboBox;
+    h.get_all_by_role(combo).find(|n| (n.rect().center().y - line).abs() < 6.0).unwrap().click();
+    h.run_steps(2);
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(2);
+    if eax(&mut h) == was {
+        h.key_press(egui::Key::ArrowUp);
+        h.run_steps(2);
+    }
+    assert_ne!(eax(&mut h), was, "changed in the window");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // The music, changed elsewhere.
+    let music = props(&mut h).integer("MusicDay").unwrap_or(0) + 1;
+    let elsewhere = mg_edit::Edit::SetField {
+        key: git,
+        path: mg_edit::GffPath::root().field("AreaProperties"),
+        label: "MusicDay".into(),
+        value: Some(mg_gff::Value::Int(music as i32)),
+    };
+    let elsewhere = mg_edit::Command::new("Elsewhere", vec![elsewhere]);
+    h.state_mut().actions.push(mg_ui::Action::Apply(elsewhere));
+    h.run_steps(3);
+    h.get_by_label("Cancel").click();
+    h.run_steps(4);
+    assert!(h.state().dock.find_tab(&Tab::AreaProperties(area)).is_none(), "closed");
+    assert_eq!(eax(&mut h), was, "the audio environment is set back");
+    assert_eq!(props(&mut h).integer("MusicDay"), Some(music), "the music stays");
+}
+
 #[test]
 fn arrow_keys_step_through_the_area_s_lists() {
     use mg_area::grass::{AreaGrass, GrassOverride};
@@ -1260,7 +1712,7 @@ fn arrow_keys_step_through_the_area_s_lists() {
 
     // Area Properties › Grass: the surface material of the area's own.
     let root = h.state_mut().ws.as_mut().unwrap().doc(&git).unwrap().root.clone();
-    let edits = mg_area::grass::add_override(git, &root, &GrassOverride::new(1, None));
+    let edits = mg_area::grass::set_override(git, &root, &GrassOverride::new(1, None));
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Grass", edits)));
     h.run_steps(2);
     h.get_all_by_label("Grass").last().unwrap().click();
@@ -1676,4 +2128,41 @@ fn escape_in_a_field_is_the_window_s_cancel_but_in_a_search_field() {
     h.run();
     h.run();
     assert!(!open(&h));
+}
+
+/// The form widgets are the crate's to share (Moonglow Viewer's forms
+/// held copies of them): a field label, a section heading and the PLT
+/// color chooser, used from outside the crate, a color chosen by its
+/// swatch's name.
+#[test]
+fn the_form_widgets_and_the_color_chooser_are_exported() {
+    // A palette of 176 rows, each its own grey.
+    let mut data = Vec::new();
+    for row in 0..176u32 {
+        for _ in 0..256 {
+            data.extend_from_slice(&[row as u8, row as u8, row as u8, 255]);
+        }
+    }
+    let palette = mg_image::Rgba { width: 256, height: 176, data };
+    let mut h = Harness::new_ui_state(
+        |ui, color: &mut u8| {
+            mg_ui::widgets::install_fonts(ui.ctx());
+            mg_ui::widgets::section_heading(ui, "Colors");
+            mg_ui::widgets::field_label(ui, "Cloth 1");
+            if let Some(c) =
+                mg_ui::widgets::palette_color(ui, "cloth1", Some(&palette), "Cloth 1", *color, None)
+            {
+                *color = c;
+            }
+        },
+        3u8,
+    );
+    h.run();
+    h.get_by_label("Colors");
+    let combo = egui::accesskit::Role::ComboBox;
+    (h.get_all_by_value("3").find(|n| n.accesskit_node().role() == combo)).unwrap().click();
+    h.run();
+    h.get_by_label("Cloth 1 42").click();
+    h.run();
+    assert_eq!(*h.state(), 42);
 }

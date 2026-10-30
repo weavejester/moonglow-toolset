@@ -11,15 +11,15 @@ fn replace_lists_then_changes_the_modules_text() {
     let path = dir.join("contest.mod");
     let mut m = Module::open(&root.join("data/mod/Contest Of Champions 0492.mod")).unwrap();
     m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
-    let o = Options { match_case: false, whole_word: true, game: None };
+    let o = Options { match_case: false, whole_word: true, ..Default::default() };
     // The word the module uses most in its own text.
     let word = "champion";
-    let hits = find(&m, word, o, &TextKind::ALL);
+    let hits = find(&m, word, o, &TextKind::PLAYERS);
     assert!(!hits.is_empty(), "the module names {word}");
     let bytes = std::fs::read(&path).unwrap();
     let run = |extra: &[&str]| {
-        crate::mg()
-            .args(["--root", root.to_str().unwrap(), "--no-user-dir", "replace", "--whole-word"])
+        crate::mg_on(&root, None)
+            .args(["replace", "--whole-word"])
             .args(extra)
             .arg(&path)
             .args([word, "victor"])
@@ -33,6 +33,6 @@ fn replace_lists_then_changes_the_modules_text() {
     let out = run(&[]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let saved = Module::open(&path).unwrap();
-    assert!(find(&saved, word, o, &TextKind::ALL).is_empty());
-    assert!(!find(&saved, "victor", o, &TextKind::ALL).is_empty());
+    assert!(find(&saved, word, o, &TextKind::PLAYERS).is_empty());
+    assert!(!find(&saved, "victor", o, &TextKind::PLAYERS).is_empty());
 }

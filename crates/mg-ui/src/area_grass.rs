@@ -13,7 +13,7 @@ use mg_core::{ResRef, ResType};
 use mg_edit::{Command, Edit};
 use mg_gff::Struct;
 use mg_resman::ResKey;
-use mg_rules::{Choice, ChoiceColumns};
+use mg_rules::Choice;
 
 use crate::{Action, Moonglow};
 
@@ -36,8 +36,7 @@ pub(crate) fn tried(ctx: &egui::Context, area: ResRef) -> Option<Vec<(u32, Grass
 
 /// The surface materials, by row: surfacemat.2da's labels.
 fn materials(app: &Moonglow) -> std::sync::Arc<Vec<Choice>> {
-    let columns = ChoiceColumns { name: None, label: Some("Label") };
-    app.game.as_ref().and_then(|g| g.choice_list("surfacemat", columns).ok()).unwrap_or_default()
+    crate::widgets::table_choices(app.game.as_deref(), "surfacemat", None, Some("Label"))
 }
 
 fn material_name(materials: &[Choice], row: u32) -> String {
@@ -54,10 +53,62 @@ fn tileset_grass(app: &Moonglow, ctx: &egui::Context, tileset: ResRef) -> Option
     if let Some(known) = ctx.data(|d| d.get_temp::<Option<GrassLook>>(id)) {
         return known;
     }
-    let game = app.game.as_deref()?;
-    let look = mg_area::tileset(game, tileset).ok().and_then(|t| GrassLook::of_tileset(&t));
+    app.game.as_ref()?;
+    let look = app.tileset(tileset).and_then(|t| GrassLook::of_tileset(&t));
     ctx.data_mut(|d| d.insert_temp(id, look.clone()));
     look
+}
+
+/// How much of the area's tiles' walkmesh is of each surface material
+/// (square meters, by surfacemat.2da row: [`grass::materials_of`]), read
+/// once for each revision of the module.
+fn materials_present(
+    app: &mut Moonglow,
+    ctx: &egui::Context,
+    area: ResRef,
+    tileset: ResRef,
+) -> std::sync::Arc<std::collections::BTreeMap<u32, f32>> {
+    type Known = (Option<u64>, std::sync::Arc<std::collections::BTreeMap<u32, f32>>);
+    let id = egui::Id::new(("mg-grass-materials", area));
+    let revision = app.ws.as_ref().map(|w| w.revision());
+    if let Some((at, known)) = ctx.data(|d| d.get_temp::<Known>(id))
+        && at == revision
+    {
+        return known;
+    }
+    let are = app.ws.as_mut().and_then(|ws| ws.doc(&ResKey::new(area, ResType::ARE)).ok());
+    let are = are.map(|d| d.root.clone());
+    let present = (app.game.as_deref())
+        .zip(are)
+        .and_then(|(game, are)| {
+            let set = mg_area::tileset(game, tileset).ok()?;
+            Some(grass::materials_of(game, &set, &are))
+        })
+        .unwrap_or_default();
+    let present = std::sync::Arc::new(present);
+    ctx.data_mut(|d| d.insert_temp::<Known>(id, (revision, present.clone())));
+    present
+}
+
+/// A grass texture's picture (four tufts, two by two), small, beside its
+/// name, on a light ground (the tufts are dark, and see-through between);
+/// an empty frame where it is found nowhere.
+fn texture_picture(app: &mut Moonglow, ui: &mut Ui, texture: &str) {
+    let size = egui::vec2(32.0, 32.0);
+    let picture = app.loader().and_then(|mut l| l.thumbnail(ui.ctx(), texture, 64));
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    match picture {
+        Some(p) => {
+            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(205));
+            egui::Image::new(&p.texture).alt_text(texture).paint_at(ui, rect);
+            response.on_hover_text(format!("{texture}: four tufts, two by two"));
+        }
+        None => {
+            ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+            response.on_hover_text(format!("{texture}: found nowhere"));
+        }
+    }
 }
 
 /// The GITs' `AreaProperties` alone (what the edits look at: not the
@@ -108,6 +159,7 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
         .unwrap_or(ResRef::EMPTY);
     let own = tileset_grass(app, ui.ctx(), tileset);
     let materials = materials(app);
+    let present = materials_present(app, ui.ctx(), area, tileset);
     // What is being tried out, in place of the stored values.
     let mut trying = current.clone();
     let mut tried = false;
@@ -128,12 +180,15 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
                 .changed()
             {
                 let what = if grows { "Grow the tileset's grass" } else { "No tileset grass" };
-                apply(app, &gits, what, |k, _| vec![grass::set_disabled(k, !grows)]);
+                apply(app, &gits, what, |k, root| grass::set_disabled(k, root, !grows));
             }
-            ui.weak(format!(
-                "{tileset}: texture {}, density {}, height {} m",
-                look.texture, look.density, look.height
-            ));
+            ui.horizontal(|ui| {
+                texture_picture(app, ui, &look.texture);
+                ui.weak(format!(
+                    "{tileset}: texture {}, density {}, height {} m",
+                    look.texture, look.density, look.height
+                ));
+            });
             if current.for_material(grass::GRASS_MATERIAL).is_some() {
                 ui.weak("The area's own grass on Grass grows in its place.");
             }
@@ -196,14 +251,19 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
                 ui.end_row();
                 crate::widgets::field_label(ui, "Texture");
                 let texture = ResRef::from_str(&o.look.texture).unwrap_or(ResRef::EMPTY);
-                let picked = crate::widgets::resref_field(
-                    app,
-                    ui,
-                    id.with("texture"),
-                    texture,
-                    "Grass texture (four tufts, two by two)",
-                    &[ResType::TGA, ResType::DDS],
-                );
+                let picked = ui
+                    .horizontal(|ui| {
+                        texture_picture(app, ui, &o.look.texture);
+                        crate::widgets::resref_field(
+                            app,
+                            ui,
+                            id.with("texture"),
+                            texture,
+                            "Grass texture (four tufts, two by two)",
+                            &[ResType::TGA, ResType::DDS],
+                        )
+                    })
+                    .inner;
                 if let Some(t) = picked.filter(|t| !t.is_empty()) {
                     changed.look.texture = t.to_string();
                     set = true;
@@ -240,6 +300,9 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
                     ui.end_row();
                 }
             });
+            if !present.contains_key(&o.material) {
+                ui.weak("No face of this area's tiles is of this material: nothing grows here.");
+            }
             if set && changed != *o {
                 apply(app, &gits, "Grass", |k, root| grass::set_override(k, root, &changed));
             } else if changed != *o
@@ -253,12 +316,37 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
     ui.horizontal(|ui| {
         let free: Vec<&Choice> =
             materials.iter().filter(|c| !taken.contains(&(c.row as u32))).collect();
+        // The materials the area's tiles have first, the most of the
+        // ground first; the others after.
+        let mut on: Vec<(&Choice, f32)> =
+            free.iter().filter_map(|c| Some((*c, *present.get(&(c.row as u32))?))).collect();
+        on.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.row.cmp(&b.0.row)));
+        let off: Vec<&Choice> =
+            free.iter().copied().filter(|c| !present.contains_key(&(c.row as u32))).collect();
         let mut pick: Option<u32> = None;
         ui.menu_button("Add Grass to…", |ui| {
             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                for c in free {
-                    if ui.button(material_name(&materials, c.row as u32)).clicked() {
-                        pick = Some(c.row as u32);
+                ui.weak("On this area's tiles");
+                if on.is_empty() {
+                    ui.weak("(none left)");
+                }
+                for (c, square_meters) in &on {
+                    let row = c.row as u32;
+                    let b = ui.button(material_name(&materials, row)).on_hover_text(format!(
+                        "{square_meters:.0} m\u{b2} of the area's walkmesh faces are of this \
+                         material"
+                    ));
+                    if b.clicked() {
+                        pick = Some(row);
+                    }
+                }
+                ui.separator();
+                ui.weak("Not on this area's tiles (nothing grows until a tile has it)");
+                for c in off {
+                    let row = c.row as u32;
+                    let text = egui::RichText::new(material_name(&materials, row)).weak();
+                    if ui.button(text).clicked() {
+                        pick = Some(row);
                     }
                 }
             });
@@ -266,9 +354,9 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
         .response
         .on_hover_text("Grass of the area's own on a surface material: the tileset's, as a start");
         if let Some(m) = pick {
-            let set = app.game.as_deref().and_then(|g| mg_area::tileset(g, tileset).ok());
-            let o = GrassOverride::new(m, set.as_ref());
-            apply(app, &gits, "Add grass", |k, root| grass::add_override(k, root, &o));
+            let set = app.tileset(tileset);
+            let o = GrassOverride::new(m, set.as_deref());
+            apply(app, &gits, "Add grass", |k, root| grass::set_override(k, root, &o));
         }
     });
     ui.add_space(8.0);

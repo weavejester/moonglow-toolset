@@ -23,6 +23,9 @@
 //!
 //! [resrefs]
 //! pattern = "{code}_{name}"           # a new ResRef, by the builder's code
+//!
+//! [pack]                              # a nasher project's Pack
+//! compile_models = true               # models kept as text go in compiled
 //! ```
 //!
 //! And in `.moonglow/user.toml`, the builder's own:
@@ -174,6 +177,19 @@ pub struct StaticRules {
     pub keep_tags: Patterns,
     /// A placeable whose blueprint's ResRef (`TemplateResRef`) these match.
     pub keep_resrefs: Patterns,
+    /// Not of the file: the module's scripts' string literals, so that a
+    /// placeable whose tag a script names stays dynamic
+    /// ([`StaticRules::with_scripts`]; none until it is called).
+    pub scripts: crate::areas::ScriptStrings,
+}
+
+impl StaticRules {
+    /// These rules, with the string literals of `module`'s scripts read
+    /// ([`crate::areas::ScriptStrings::of`]).
+    pub fn with_scripts(mut self, module: &crate::Module) -> StaticRules {
+        self.scripts = crate::areas::ScriptStrings::of(module);
+        self
+    }
 }
 
 impl Default for StaticRules {
@@ -182,6 +198,7 @@ impl Default for StaticRules {
             keep_variables: Patterns::new(&["*"]).expect("a glob"),
             keep_tags: Patterns::default(),
             keep_resrefs: Patterns::default(),
+            scripts: Default::default(),
         }
     }
 }
@@ -269,6 +286,38 @@ pub struct StoreRules {
     pub keeper_variable: Option<String>,
 }
 
+/// `[pack]`: what a nasher project's Pack does on the way in.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PackRules {
+    /// `compile_models`: the models kept as text are compiled into the
+    /// target's file (`Module::target_archive_with`), as `mg pack
+    /// --compile-models` compiles a folder's; off, they go in as text.
+    pub compile_models: bool,
+}
+
+/// `[lights]`: lights of any color and reach, as content Moonglow writes
+/// ([`crate::lights`]): off unless asked for.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LightRules {
+    /// `generated`: the team's word, which wins over the builder's
+    /// Options › Areas (none: the builder's).
+    pub generated: Option<bool>,
+    /// `hak`: the hak (its name, without `.hak`) the lights go into, the
+    /// one offered first.
+    pub hak: Option<String>,
+    /// `first_row`: the least placeables.2da row a light takes (a range
+    /// the team keeps for them).
+    pub first_row: Option<usize>,
+}
+
+impl LightRules {
+    /// Whether lights are made as content: the project's `generated`
+    /// where it says, else the builder's option.
+    pub fn generated_or(&self, builder: bool) -> bool {
+        self.generated.unwrap_or(builder)
+    }
+}
+
 /// `[used]`: what the Unused report counts as used though nothing in the
 /// module names it, by name or glob: a script `ExecuteScript` runs by a
 /// name made as it runs (`"ai_" + sMode`), a blueprint `CreateObject`
@@ -339,6 +388,27 @@ pub struct ProjectCommand {
     /// The keys it asks for (`key = "Ctrl+Shift+U"`), as a plugin's
     /// command does: the builder's own in Options › Keyboard win.
     pub key: Option<String>,
+    /// Whether it reads what the builder types (`input = true`: its
+    /// standard input is the line under its output while it runs, a
+    /// question it asks answered there). Else its input is closed, so a
+    /// question it asks has its answer empty at once rather than waiting.
+    pub input: bool,
+}
+
+/// `[nwsync] upload`: the command Build › Publish to NWSync runs to send
+/// the repository to the web server that serves it, once for each of its
+/// parts in turn (`{folder}` the repository, `{part}` the part:
+/// [`crate::nwsync::upload_command`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UploadCommand {
+    /// What runs, on this system (none: the file gives none for it).
+    pub run: Option<String>,
+    /// Whether it reads what the builder types (`input = true`), as a
+    /// project's command does.
+    pub input: bool,
+    /// From the builder's own file (`.moonglow/user.toml`), which wins
+    /// over the team's.
+    pub own: bool,
 }
 
 /// A command's name in the menu, from its name in the file:
@@ -449,6 +519,18 @@ impl Naming {
     pub fn resref(&self, name: &str, number: &str) -> Option<ResRef> {
         ResRef::from_str(&self.fit(name, number)).ok().filter(|r| !r.is_empty())
     }
+
+    /// The first of `name` numbered from `from` (`name001`, `name002`...,
+    /// [`Naming::fit`] each) that `taken` doesn't name: how every new
+    /// resource Moonglow numbers is named (a copy, a blueprint a wizard
+    /// makes, a store's conversation, a conversation imported). Past 999,
+    /// the number has four digits; none past 9999.
+    pub fn numbered(&self, name: &str, from: u32, taken: &dyn Fn(&str) -> bool) -> Option<ResRef> {
+        (from.max(1)..10_000)
+            .map(|n| self.fit(name, &format!("{n:03}")))
+            .find(|s| !taken(s))
+            .and_then(|s| ResRef::from_str(&s).ok().filter(|r| !r.is_empty()))
+    }
 }
 
 /// What is wrong with a builder code, or none where it is one: letters,
@@ -548,6 +630,10 @@ pub struct ProjectFile {
     pub store: Option<StoreRules>,
     /// `[used]`: what the Unused report counts as used.
     pub used: UsedRules,
+    /// `[pack]`: what Pack does on the way in.
+    pub pack: PackRules,
+    /// `[lights]`: lights made as content.
+    pub lights: LightRules,
     /// `[resrefs] pattern`: how a new ResRef is made by the builder's
     /// code, or the team's prefix (none: [`DEFAULT_PATTERN`]).
     pub resref_pattern: Option<String>,
@@ -563,6 +649,8 @@ pub struct ProjectFile {
     pub claim_table: Option<crate::claims::Claims>,
     /// `[commands]`, in the file's order.
     pub commands: Vec<ProjectCommand>,
+    /// `[nwsync] upload`, the builder's own file's over the team's.
+    pub nwsync_upload: Option<UploadCommand>,
     /// The team's described variables (`variables.toml` beside the
     /// team's file): none without it.
     pub variables: crate::var_desc::Variables,
@@ -695,8 +783,9 @@ impl<'a> Reader<'a> {
             self.warn(key.span().start, message);
             return None;
         }
+        let label = label_of(&name);
         let mut c =
-            ProjectCommand { label: label_of(&name), name, run: None, writes: true, key: None };
+            ProjectCommand { label, name, run: None, writes: true, key: None, input: false };
         match value.get_ref() {
             DeValue::String(s) => c.run = Some(s.to_string()),
             DeValue::Table(t) => {
@@ -716,6 +805,10 @@ impl<'a> Reader<'a> {
                             _ => self.warn(e.1.span().start, "writes is true or false"),
                         },
                         "key" => c.key = self.text(e).filter(|k| !k.trim().is_empty()),
+                        "input" => match e.1.get_ref() {
+                            DeValue::Boolean(b) => c.input = *b,
+                            _ => self.warn(e.1.span().start, "input is true or false"),
+                        },
                         _ => self.unknown(&format!("commands.{}", c.name), e),
                     }
                 }
@@ -726,6 +819,39 @@ impl<'a> Reader<'a> {
                     "{} is to be its command, in quotes, or a table: {{ run = \"…\", label = \"…\" }}",
                     c.name
                 );
+                self.warn(value.span().start, message);
+                return None;
+            }
+        }
+        c.run = c.run.filter(|r| !r.trim().is_empty());
+        Some(c)
+    }
+
+    /// `[nwsync] upload`: its text, or a table of `run` (or `windows` and
+    /// `unix`, each for its systems) and `input`.
+    fn upload(&mut self, (_, value): Entry, own: bool) -> Option<UploadCommand> {
+        let mut c = UploadCommand { run: None, input: false, own };
+        match value.get_ref() {
+            DeValue::String(s) => c.run = Some(s.to_string()),
+            DeValue::Table(t) => {
+                let (mut run, mut windows, mut unix) = (None, None, None);
+                for e in in_order(t) {
+                    match e.0.get_ref().as_ref() {
+                        "run" => run = self.text(e),
+                        "windows" => windows = self.text(e),
+                        "unix" => unix = self.text(e),
+                        "input" => match e.1.get_ref() {
+                            DeValue::Boolean(b) => c.input = *b,
+                            _ => self.warn(e.1.span().start, "input is true or false"),
+                        },
+                        _ => self.unknown("nwsync.upload", e),
+                    }
+                }
+                c.run = if cfg!(windows) { windows.or(run) } else { unix.or(run) };
+            }
+            _ => {
+                let message = "upload is to be its command, in quotes, or a table: { run = \"…\", \
+                               windows = \"…\" }";
                 self.warn(value.span().start, message);
                 return None;
             }
@@ -924,7 +1050,8 @@ impl ProjectFile {
             let section = key.get_ref().as_ref();
             // (A .mod's folder holds other modules: what is a checkout's,
             // and the builder's own file, are a project folder's.)
-            if beside && matches!(section, "claims" | "commands" | "plugins" | "builder") {
+            if beside && matches!(section, "claims" | "commands" | "nwsync" | "plugins" | "builder")
+            {
                 r.warn(
                     key.span().start,
                     format!(
@@ -1033,6 +1160,46 @@ impl ProjectFile {
                         r.warn(at, "[resrefs] kinds: the pattern has no {kind} to put them in");
                     }
                 }
+                ("pack", false) => {
+                    for e in r.section(entry) {
+                        match e.0.get_ref().as_ref() {
+                            "compile_models" => match e.1.get_ref() {
+                                DeValue::Boolean(b) => self.pack.compile_models = *b,
+                                _ => r.warn(e.1.span().start, "compile_models is true or false"),
+                            },
+                            _ => r.unknown(section, e),
+                        }
+                    }
+                }
+                ("lights", false) => {
+                    for e in r.section(entry) {
+                        match e.0.get_ref().as_ref() {
+                            "generated" => match e.1.get_ref() {
+                                DeValue::Boolean(b) => self.lights.generated = Some(*b),
+                                _ => r.warn(e.1.span().start, "generated is true or false"),
+                            },
+                            "hak" => {
+                                if let Some(t) = r.text(e) {
+                                    self.lights.hak =
+                                        Some(t.trim().trim_end_matches(".hak").into());
+                                }
+                            }
+                            "first_row" => match e.1.get_ref() {
+                                DeValue::Integer(i) if i.radix() == 10 => {
+                                    match i.as_str().parse::<usize>() {
+                                        Ok(n) => self.lights.first_row = Some(n),
+                                        Err(_) => r.warn(
+                                            e.1.span().start,
+                                            "first_row is a row: 0 or more",
+                                        ),
+                                    }
+                                }
+                                _ => r.warn(e.1.span().start, "first_row is a row: 0 or more"),
+                            },
+                            _ => r.unknown(section, e),
+                        }
+                    }
+                }
                 ("store", false) => {
                     let mut store = StoreRules::default();
                     for e in r.section(entry) {
@@ -1081,6 +1248,19 @@ impl ProjectFile {
                         }
                     }
                 }
+                // (Either file's: the team's server, or a builder's own.)
+                ("nwsync", _) => {
+                    for e in r.section(entry) {
+                        match e.0.get_ref().as_ref() {
+                            "upload" => {
+                                if let Some(c) = r.upload(e, own) {
+                                    self.nwsync_upload = Some(c);
+                                }
+                            }
+                            _ => r.unknown(section, e),
+                        }
+                    }
+                }
                 // (A trust decision is never read from the checkout: one a
                 // repository carries would run its commands unasked.)
                 ("allowed_commands", _) => r.warn(
@@ -1122,7 +1302,8 @@ impl ProjectFile {
                     crate::project_plugins::read_decided(self, &mut r, entry, own)
                 }
                 (
-                    "make_static" | "tags" | "store" | "resrefs" | "used" | "claims" | "commands",
+                    "make_static" | "tags" | "store" | "resrefs" | "used" | "claims" | "commands"
+                    | "pack",
                     true,
                 ) => r.warn(
                     key.span().start,
@@ -1220,6 +1401,38 @@ impl ProjectFile {
         let name = area.to_string_lossy();
         let glob = self.claims.protected.matching(&name)?;
         Some(format!("{area} is protected ({FILE_NAME}'s [claims] protected: {glob})"))
+    }
+
+    /// Every area of the claims table and of the module (`module`: its
+    /// areas, where it opened; those in no row are free), the table's
+    /// first, whose each is to this builder: what `mg claims` lists and
+    /// the Claims Table window shows.
+    pub fn claims_listing(&self, module: Option<&[ResRef]>) -> Vec<crate::claims::Listed> {
+        use crate::claims::{Listed, Standing, Whose};
+        let table = self.claim_table.clone().unwrap_or_default();
+        let mut areas: Vec<ResRef> = table.rows.iter().map(|c| c.area).collect();
+        for a in module.unwrap_or_default() {
+            if !areas.contains(a) {
+                areas.push(*a);
+            }
+        }
+        areas
+            .into_iter()
+            .map(|area| {
+                let standing = Standing::of(&table, area, self.user.builder_code.as_deref());
+                Listed {
+                    area,
+                    whose: match standing {
+                        Standing::Mine(_) => Whose::Mine,
+                        Standing::Others(_) => Whose::Others,
+                        Standing::Free(_) => Whose::Free,
+                    },
+                    claim: standing.claim().cloned(),
+                    protected: self.protected(area).is_some(),
+                    in_module: module.is_none_or(|m| m.contains(&area)),
+                }
+            })
+            .collect()
     }
 
     /// The claims table's file, where the project names one.
@@ -1475,6 +1688,30 @@ keeper_variable = "tdod_store"
         p
     }
 
+    /// `[lights]`: the team's word on lights made as content wins over the
+    /// builder's option; the hak and the first row are read, and what
+    /// isn't understood said.
+    #[test]
+    fn lights_are_the_team_s_word() {
+        let p = read("[lights]\ngenerated = true\nhak = \"tdod_lights.hak\"\nfirst_row = 20000\n");
+        assert_eq!(p.warnings, Vec::<String>::new());
+        assert!(p.lights.generated_or(false));
+        assert_eq!(p.lights.hak.as_deref(), Some("tdod_lights"));
+        assert_eq!(p.lights.first_row, Some(20000));
+        let off = read("[lights]\ngenerated = false\n");
+        assert!(!off.lights.generated_or(true), "the team's off wins");
+        assert!(read("").lights.generated_or(true) && !read("").lights.generated_or(false));
+        let bad = read("[lights]\ngenerated = \"yes\"\nfirst_row = -3\ncolour = 1\n");
+        assert_eq!(
+            bad.warnings,
+            [
+                "moonglow.toml:2: generated is true or false",
+                "moonglow.toml:3: first_row is a row: 0 or more",
+                "moonglow.toml:4: \"colour\" is not a key of [lights]",
+            ]
+        );
+    }
+
     #[test]
     fn the_example_reads_whole() {
         let p = read(EXAMPLE);
@@ -1499,6 +1736,21 @@ keeper_variable = "tdod_store"
         assert_eq!(store.tag.as_deref(), Some("{area}_STORE_{n}"));
         assert_eq!(store.blueprint, ResRef::from_str("tdod_vendor").ok());
         assert_eq!(store.keeper_variable.as_deref(), Some("tdod_store"));
+    }
+
+    /// `[pack] compile_models`: off unless said; a value not true or false
+    /// is said, and the builder's own file may not set it.
+    #[test]
+    fn pack_compiles_models_when_the_team_says() {
+        assert!(!read("").pack.compile_models);
+        assert!(read("[pack]\ncompile_models = true\n").pack.compile_models);
+        let wrong = read("[pack]\ncompile_models = \"yes\"\nfast = 1\n");
+        assert!(!wrong.pack.compile_models);
+        assert_eq!(wrong.warnings.len(), 2, "{:?}", wrong.warnings);
+        let mut own = ProjectFile::default();
+        own.apply(USER_FILE, "[pack]\ncompile_models = true\n", true);
+        assert!(!own.pack.compile_models);
+        assert!(own.warnings[0].contains("is the team's"), "{:?}", own.warnings);
     }
 
     /// The manual's example (Modules, the project file) reads whole.
@@ -1536,7 +1788,7 @@ keeper_variable = "tdod_store"
     fn what_is_not_understood_is_said_by_line_and_the_rest_read() {
         let p = read(
             "[store]\nopen_script = \"tdod_vendor_open\"\ncolour = 3\n\n[tags]\n\
-             unique = \"TDOD_*\"\npaste_warning = \"loud\"\n[lights]\nx = 1\n\
+             unique = \"TDOD_*\"\npaste_warning = \"loud\"\n[shadows]\nx = 1\n\
              [make_static]\nkeep_tags = [\"A_*\", 4, \"[\"]\n[store2]\n[builder]\ncode = \"x\"\n",
         );
         assert_eq!(
@@ -1545,7 +1797,7 @@ keeper_variable = "tdod_store"
                 "moonglow.toml:3: \"colour\" is not a key of [store]",
                 "moonglow.toml:6: unique is to be a list of names: [\"A_*\", \"B\"]",
                 "moonglow.toml:7: paste_warning \"loud\": \"custom\", \"any\", \"unique\" or \"off\"",
-                "moonglow.toml:8: [lights] is not a section Moonglow reads",
+                "moonglow.toml:8: [shadows] is not a section Moonglow reads",
                 "moonglow.toml:11: keep_tags: not text",
                 "moonglow.toml:11: [: missing ']'",
                 "moonglow.toml:12: [store2] is not a section Moonglow reads",
@@ -1584,6 +1836,16 @@ keeper_variable = "tdod_store"
         let t = Naming::new("ab", "t{code}_{name}");
         assert_eq!(t.fit("averyveryverylongname", "1"), "tab_averyveryve1");
         assert_eq!(Naming::new("abcdefgh", DEFAULT_PATTERN).room(), 7);
+        // Numbered: the first free from a number, in the pattern, cut.
+        let numbered = |n: &Naming, name: &str, from: u32, taken: &dyn Fn(&str) -> bool| {
+            n.numbered(name, from, taken).map(|r| r.to_string())
+        };
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(numbered(&plain, "chicken", 1, &|_| false), some("chicken001"));
+        assert_eq!(numbered(&ab, "chicken", 3, &|s| s == "ab_chicken003"), some("ab_chicken004"));
+        assert_eq!(numbered(&plain, "averyveryverylong", 0, &|_| false), some("averyveryvery001"));
+        assert_eq!(numbered(&plain, "x", 1, &|s| s != "x1000"), some("x1000"), "past 999");
+        assert_eq!(numbered(&plain, "x", 1, &|_| true), None);
         // An area's (the Area Wizard's): a number added where it is taken.
         let area = |name: &str, taken: &dyn Fn(&ResRef) -> bool| {
             crate::new::resref_for_named(name, &ab, taken).to_string()
@@ -1991,7 +2253,8 @@ keeper_variable = "tdod_store"
              for Review\" }\nrun_tests = { unix = \"bin/test\", windows = \"bin\\\\test.cmd\" }\n\
              only_windows = { windows = \"x.cmd\" }\n\"two words\" = \"x\"\nbad = 3\nempty = \"\"\n\
              review = { run = \"bin/review\", writes = false, key = \"Ctrl+Shift+R\" }\n\
-             odd = { run = \"x\", writes = \"no\" }\n",
+             odd = { run = \"x\", writes = \"no\" }\n\
+             ask = { run = \"bin/ask\", input = true }\nodder = { run = \"x\", input = 1 }\n",
         );
         assert_eq!(
             p.warnings,
@@ -2000,8 +2263,12 @@ keeper_variable = "tdod_store"
                 "moonglow.toml:7: bad is to be its command, in quotes, or a table: { run = \"…\", \
                  label = \"…\" }",
                 "moonglow.toml:10: writes is true or false",
+                "moonglow.toml:12: input is true or false",
             ]
         );
+        let ask = p.commands.iter().find(|c| c.name == "ask").unwrap();
+        assert!(ask.input);
+        assert!(p.commands.iter().filter(|c| c.name != "ask").all(|c| !c.input), "closed");
         let review = p.commands.iter().find(|c| c.name == "review").unwrap();
         assert!(!review.writes);
         assert_eq!(review.key.as_deref(), Some("Ctrl+Shift+R"));
@@ -2022,6 +2289,8 @@ keeper_variable = "tdod_store"
                 ("empty", "Empty", None),
                 ("review", "Review", Some("bin/review")),
                 ("odd", "Odd", Some("x")),
+                ("ask", "Ask", Some("bin/ask")),
+                ("odder", "Odder", Some("x")),
             ]
         );
         // What was allowed is never read from the project's files, the
@@ -2038,6 +2307,52 @@ keeper_variable = "tdod_store"
                 p.warnings
             );
         }
+    }
+
+    /// `[nwsync] upload`: text, or a table for each system and `input`;
+    /// the builder's own file's wins over the team's; a module kept in
+    /// one file doesn't read it (a checkout's program).
+    #[test]
+    fn the_nwsync_upload_command_is_read_from_either_file() {
+        let p = read("[nwsync]\nupload = \"rsync -a {part} host:/srv/nwsync/\"\n");
+        let c = p.nwsync_upload.clone().unwrap();
+        assert_eq!(c.run.as_deref(), Some("rsync -a {part} host:/srv/nwsync/"));
+        assert!(!c.input && !c.own && p.warnings.is_empty());
+        let p = read(
+            "[nwsync]\nupload = { unix = \"u {part}\", windows = \"w {part}\", input = true, \
+             x = 1 }\nfolder = \"y\"\n",
+        );
+        let c = p.nwsync_upload.clone().unwrap();
+        let run = if cfg!(windows) { "w {part}" } else { "u {part}" };
+        assert_eq!((c.run.as_deref(), c.input), (Some(run), true));
+        assert_eq!(
+            p.warnings,
+            [
+                "moonglow.toml:2: \"x\" is not a key of [nwsync.upload]",
+                "moonglow.toml:3: \"folder\" is not a key of [nwsync]",
+            ]
+        );
+        let p = read("[nwsync]\nupload = 3\n");
+        assert!(p.nwsync_upload.is_none());
+        assert!(p.warnings[0].starts_with("moonglow.toml:2: upload is to be its command"));
+        let p = read("[nwsync]\nupload = { input = 1, run = \"\" }\n");
+        assert_eq!(p.warnings, ["moonglow.toml:2: input is true or false"]);
+        assert_eq!(p.nwsync_upload.unwrap().run, None, "empty: none");
+        // The builder's own over the team's.
+        let mut p = ProjectFile::default();
+        p.apply("moonglow.toml", "[nwsync]\nupload = \"team {part}\"\n", false);
+        p.apply("user.toml", "[nwsync]\nupload = \"mine {part}\"\n", true);
+        let c = p.nwsync_upload.unwrap();
+        assert_eq!((c.run.as_deref(), c.own), (Some("mine {part}"), true));
+        // Beside a .mod: not read.
+        let dir = std::env::temp_dir().join(format!("mg-pf-nwsync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let module = dir.join("krezk.mod");
+        std::fs::write(dir.join("krezk.moonglow.toml"), "[nwsync]\nupload = \"x\"\n").unwrap();
+        let p = ProjectFile::read_at(&Place::beside(&module).unwrap());
+        assert!(p.nwsync_upload.is_none());
+        assert!(p.warnings[0].contains("[nwsync] is not read beside a module"), "{:?}", p.warnings);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `[used]` reads scripts, conversations and blueprints by name or

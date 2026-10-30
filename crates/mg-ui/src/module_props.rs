@@ -3,98 +3,30 @@
 //! command.
 
 use egui::Ui;
-use mg_core::{LocString, ResRef, ResType};
+use mg_core::ResRef;
 use mg_edit::{Command, Edit, GffPath};
 use mg_gff::{Struct, Value};
 use mg_resman::{GameInstall, ResKey};
 use mg_schema::{ExoString, Field, GffValue, StructExt, ifo};
 
-use crate::text::{decode, encode, with_english};
-use crate::widgets::{FieldTarget, LocStringEdit, resref_field, variables_button};
+use crate::blueprint::Form;
 use crate::{Action, Moonglow};
 
 pub(crate) fn info_key() -> ResKey {
     mg_module::Module::info_key()
 }
 
-fn target(label: &str) -> FieldTarget {
-    FieldTarget::new(info_key(), GffPath::root(), label)
-}
-
 /// A command setting one module-info field.
 fn set<T: GffValue>(label: &str, f: &Field<T>, v: T) -> Action {
-    set_value(label, f.label, v.into_value())
-}
-
-fn set_value(what: &str, label: &str, value: Value) -> Action {
     Action::Apply(Command::new(
-        what,
+        label,
         vec![Edit::SetField {
             key: info_key(),
             path: GffPath::root(),
-            label: label.to_string(),
-            value: Some(value),
+            label: f.label.to_string(),
+            value: Some(v.into_value()),
         }],
     ))
-}
-
-/// A one-line text field that commits when focus leaves it.
-fn text_field(app: &mut Moonglow, ui: &mut Ui, id: &str, current: &str) -> Option<String> {
-    edit_field(app, ui, id, current, false, false)
-}
-
-/// [`edit_field`] for a localized string: its text in the language
-/// edited, else what [`crate::widgets::loc_shown`] finds, marked as not
-/// its own.
-fn loc_field(
-    app: &mut Moonglow,
-    ui: &mut Ui,
-    id: &str,
-    ls: &LocString,
-    multiline: bool,
-) -> Option<String> {
-    match crate::widgets::loc_shown(app, ls) {
-        (shown, None) => edit_field(app, ui, id, &shown, multiline, true),
-        (shown, Some((from, why))) => crate::widgets::borrowed_field(ui, &from, why, |ui| {
-            edit_field(app, ui, id, &shown, multiline, true)
-        }),
-    }
-}
-
-/// A text field (one line or several) that commits when focus leaves it.
-/// Multi-line text keeps the line-end style it had (CRLF or LF); a line
-/// typed into a text of one line gets a localized string's (`loc`: plain,
-/// as Aurora writes) or a `CExoString`'s (CRLF).
-fn edit_field(
-    app: &mut Moonglow,
-    ui: &mut Ui,
-    id: &str,
-    current: &str,
-    multiline: bool,
-    loc: bool,
-) -> Option<String> {
-    let id = egui::Id::new(("ifo", id));
-    let (rows, width) = if multiline { (Some(12), f32::INFINITY) } else { (None, 320.0) };
-    let buffers = &mut app.buffers;
-    match loc {
-        true => crate::widgets::commit_loc_text_in(buffers, ui, id, current, rows, width, None),
-        false => crate::widgets::commit_text_in(buffers, ui, id, current, rows, width, None),
-    }
-}
-
-/// A number with a range and Aurora's arrows, committed when it changes (a
-/// drag: when released; an arrow held: when let go).
-fn number<T: egui::emath::Numeric + GffValue>(
-    app: &mut Moonglow,
-    ui: &mut Ui,
-    what: &str,
-    f: &Field<T>,
-    current: T,
-    range: std::ops::RangeInclusive<T>,
-) {
-    if let Some(v) = crate::widgets::spin_number(ui, current, range) {
-        app.actions.push(set(what, f, v));
-    }
 }
 
 /// The dialog's tabs.
@@ -172,80 +104,67 @@ fn pages(app: &mut Moonglow, ui: &mut Ui) {
         }
     });
     ui.separator();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match app.module_page {
-        Page::Basic => basic(app, ui, &root),
-        Page::Events => events(app, ui, &root),
-        Page::Advanced => advanced(app, ui, &root),
-        Page::Description => description(app, ui, &root),
-        Page::CustomContent => custom_content(app, ui, &root),
+    let page = app.module_page;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // (The module's fields as a blueprint's are: `blueprint::Form`'s,
+        // their typing kept, a tag of 32 characters, a slider's drag one
+        // change.)
+        if page == Page::CustomContent {
+            return custom_content(app, ui, &root);
+        }
+        let key = info_key();
+        let mut f = Form { app, key, path: GffPath::root(), also: Vec::new(), root };
+        match page {
+            Page::Basic => basic(&mut f, ui),
+            Page::Events => events(&mut f, ui),
+            Page::Advanced => advanced(&mut f, ui),
+            Page::Description => f.locstring_memo(ui, "Description", ifo::MOD_DESCRIPTION.label),
+            Page::CustomContent => {}
+        }
     });
 }
 
-fn basic(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
+fn basic(f: &mut Form<'_>, ui: &mut Ui) {
     egui::Grid::new("ifo-basic").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         crate::widgets::field_label(ui, "Name");
-        let name: LocString = root.read(&ifo::MOD_NAME);
-        ui.horizontal(|ui| {
-            if let Some(v) = loc_field(app, ui, "name", &name, false) {
-                app.actions.push(set(
-                    "Module name",
-                    &ifo::MOD_NAME,
-                    with_english(name.clone(), &v),
-                ));
-            }
-            if ui.small_button("…").on_hover_text("Edit text in multiple languages").clicked() {
-                app.loc_edit =
-                    Some(LocStringEdit::new(target(ifo::MOD_NAME.label), "Module name", &name));
-            }
-        });
+        f.locstring(ui, "Module name", ifo::MOD_NAME.label);
         ui.end_row();
 
         crate::widgets::field_label(ui, "Tag");
-        let tag = decode(root.read(&ifo::MOD_TAG).as_bytes());
-        if let Some(v) = text_field(app, ui, "tag", &tag) {
-            app.actions.push(set("Module tag", &ifo::MOD_TAG, ExoString(encode(&v))));
-        }
+        f.tag(ui, "Module tag", ifo::MOD_TAG.label);
         ui.end_row();
 
         // Set by placing the start location in an area, as in Aurora.
         crate::widgets::field_label(ui, "Start area");
-        ui.label(root.read(&ifo::MOD_ENTRY_AREA).to_string());
+        ui.label(f.root.read(&ifo::MOD_ENTRY_AREA).to_string());
         ui.end_row();
         crate::widgets::field_label(ui, "Start location");
         ui.label(format!(
             "{:.2}, {:.2}, {:.2}",
-            root.read(&ifo::MOD_ENTRY_X),
-            root.read(&ifo::MOD_ENTRY_Y),
-            root.read(&ifo::MOD_ENTRY_Z)
+            f.root.read(&ifo::MOD_ENTRY_X),
+            f.root.read(&ifo::MOD_ENTRY_Y),
+            f.root.read(&ifo::MOD_ENTRY_Z)
         ));
         ui.end_row();
     });
 }
 
-fn events(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
-    egui::Grid::new("ifo-events").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+fn events(f: &mut Form<'_>, ui: &mut Ui) {
+    egui::Grid::new("ifo-events").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
         for (label, field) in EVENTS {
-            let current = root.resref(field).unwrap_or(ResRef::EMPTY);
-            if field == "Mod_OnModStart" && current.is_empty() {
+            if field == "Mod_OnModStart" && f.root.resref(field).is_none_or(|r| r.is_empty()) {
                 continue;
             }
             crate::widgets::field_label(ui, label);
-            let id = egui::Id::new(("ifo-event", field));
-            let types = [ResType::NSS, ResType::NCS];
-            if let Some(v) = resref_field(app, ui, id, current, "Select a script", &types) {
-                app.actions.push(set_value(&format!("{label} script"), field, Value::resref(v)));
-            }
-            if let Some(name) = crate::widgets::edit_script_button(app, ui, id, current) {
-                app.actions.push(Action::EditScript { name, condition: false });
-            }
+            f.script(ui, label, field);
             ui.end_row();
         }
     });
 }
 
-fn advanced(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
+fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
     egui::Grid::new("ifo-advanced").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        let rows: [(&str, &Field<u8>, std::ops::RangeInclusive<u8>); 6] = [
+        let rows: [(&str, &Field<u8>, std::ops::RangeInclusive<i64>); 6] = [
             ("Starting month", &ifo::MOD_START_MONTH, 1..=12),
             ("Starting day", &ifo::MOD_START_DAY, 1..=31),
             ("Starting hour", &ifo::MOD_START_HOUR, 0..=23),
@@ -253,36 +172,25 @@ fn advanced(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
             ("Dawn start hour", &ifo::MOD_DAWN_HOUR, 0..=23),
             ("Dusk start hour", &ifo::MOD_DUSK_HOUR, 0..=23),
         ];
-        for (label, f, range) in rows {
+        for (label, field, range) in rows {
             crate::widgets::field_label(ui, label);
-            number(app, ui, label, f, root.read(f), range);
+            f.spin(ui, label, field.label, range);
             ui.end_row();
         }
         crate::widgets::field_label(ui, "Starting year");
-        number(
-            app,
-            ui,
-            "Starting year",
-            &ifo::MOD_START_YEAR,
-            root.read(&ifo::MOD_START_YEAR),
-            0..=30000,
-        );
+        f.spin(ui, "Starting year", ifo::MOD_START_YEAR.label, 0..=30000);
         ui.end_row();
 
         crate::widgets::field_label(ui, "XP scale");
-        let mut xp = root.read(&ifo::MOD_XP_SCALE);
-        let r = ui.add(egui::Slider::new(&mut xp, 0..=200).clamping(egui::SliderClamping::Edits));
-        if r.drag_stopped() || (r.changed() && !r.dragged()) {
-            app.actions.push(set("Experience scale", &ifo::MOD_XP_SCALE, xp));
-        }
+        f.slider(ui, "Experience scale", ifo::MOD_XP_SCALE.label, 0..=200);
         ui.end_row();
 
         crate::widgets::field_label(ui, "Starting movie");
-        let movie = root.read(&ifo::MOD_START_MOVIE);
+        let movie = f.root.read(&ifo::MOD_START_MOVIE);
         let shown = if movie.is_empty() { "(none)".to_string() } else { movie.to_string() };
         // (Read only while the list is used: open, or with the keys.)
         let movies = || {
-            let names = (app.install.as_ref())
+            let names = (f.app.install.as_ref())
                 .map(|i| GameInstall::file_names(&i.movie_dirs(), "bik"))
                 .unwrap_or_default();
             let movies = names.iter().filter_map(|m| ResRef::from_str(m).ok());
@@ -301,29 +209,14 @@ fn advanced(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
             },
         );
         if pick != movie {
-            app.actions.push(set("Starting movie", &ifo::MOD_START_MOVIE, pick));
+            f.app.actions.push(set("Starting movie", &ifo::MOD_START_MOVIE, pick));
         }
         ui.end_row();
 
         crate::widgets::field_label(ui, "Variables");
-        variables_button(app, ui, target(ifo::VAR_TABLE.label), root.items(&ifo::VAR_TABLE));
+        f.variables(ui);
         ui.end_row();
     });
-}
-
-fn description(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
-    let desc: LocString = root.read(&ifo::MOD_DESCRIPTION);
-    ui.horizontal(|ui| {
-        let language = crate::text::edit_language().name().unwrap_or("?");
-        crate::widgets::field_label(ui, format!("Description ({language})"));
-        if ui.small_button("…").on_hover_text("Edit text in multiple languages").clicked() {
-            let t = target(ifo::MOD_DESCRIPTION.label);
-            app.loc_edit = Some(LocStringEdit::new(t, "Module description", &desc));
-        }
-    });
-    if let Some(v) = loc_field(app, ui, "desc", &desc, true) {
-        app.actions.push(set("Module description", &ifo::MOD_DESCRIPTION, with_english(desc, &v)));
-    }
 }
 
 /// The hak list of Module Properties › Custom Content: the rows chosen,
@@ -338,6 +231,28 @@ pub struct HakList {
     cursor: Option<usize>,
     /// The cursor's row is to be brought into view.
     reveal: bool,
+    /// The haks in the hak folders ([`haks_on_disk`]), and when they were
+    /// read (egui's time).
+    on_disk: Option<(f64, std::sync::Arc<Vec<String>>)>,
+}
+
+/// How long the hak folders' listing is kept before they are read again
+/// (a hak copied in meanwhile shows then): not read every frame.
+const ON_DISK_KEPT: f64 = 2.0;
+
+/// The haks in the hak folders, by the names a module names them by
+/// ([`GameInstall::hak_names`]): the list read at most [`ON_DISK_KEPT`]
+/// seconds ago, else read now. `None` without a game install.
+fn haks_on_disk(app: &mut Moonglow, now: f64) -> Option<std::sync::Arc<Vec<String>>> {
+    let install = app.install.as_ref()?;
+    match &app.hak_list.on_disk {
+        Some((read, haks)) if (0.0..ON_DISK_KEPT).contains(&(now - read)) => Some(haks.clone()),
+        _ => {
+            let haks = std::sync::Arc::new(install.hak_names());
+            app.hak_list.on_disk = Some((now, haks.clone()));
+            Some(haks)
+        }
+    }
 }
 
 /// A row of the hak list being dragged.
@@ -381,18 +296,19 @@ pub(crate) fn moved(
 fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
     use std::collections::BTreeSet;
     let items = root.items(&ifo::MOD_HAK_LIST);
-    let haks: Vec<String> =
-        items.iter().map(|h| decode(h.read(&ifo::mod_hak_list::MOD_HAK).as_bytes())).collect();
+    // (A hak's name is its file's bytes, read as the game data's layering
+    // reads them, not by the module's codepage: `mg_resman::file_name_text`.)
+    let haks: Vec<String> = (items.iter())
+        .map(|h| mg_resman::file_name_text(h.read(&ifo::mod_hak_list::MOD_HAK).as_bytes()))
+        .collect();
     let n = haks.len();
     let list = || ifo::MOD_HAK_LIST.label.to_string();
     let command = |edits: Vec<Edit>, label: &str| Action::Apply(Command::new(label, edits));
     // The haks there are to attach, and those of the module's that are not
     // among them: not found, which the game will not load the module with.
-    let on_disk: Option<Vec<String>> =
-        app.install.as_ref().map(|i| GameInstall::file_names(&i.hak_dirs(), "hak"));
-    let missing = |h: &str| {
-        on_disk.as_ref().is_some_and(|all| !all.iter().any(|x| x.eq_ignore_ascii_case(h)))
-    };
+    let on_disk = haks_on_disk(app, ui.ctx().input(|i| i.time));
+    // (By the game's rule: on Linux a name in another case is another file.)
+    let listed = |h: &str| on_disk.as_ref().map(|all| mg_resman::listed(all, h));
     let mut state = std::mem::take(&mut app.hak_list);
     state.selected.retain(|i| *i < n);
     state.cursor = state.cursor.filter(|c| *c < n);
@@ -418,8 +334,18 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
         let mut rects = Vec::with_capacity(n);
         egui::ScrollArea::vertical().id_salt("ifo-haks").max_height(tall).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            if n == 0 {
-                ui.weak("No haks: the module uses the game's own resources.");
+            // (An older module's single hak, `Mod_Hak`, read where it has
+            // no list: the haks layered, `mg_module::haks_of`.)
+            match mg_module::haks_of(root).first().filter(|_| n == 0) {
+                Some(old) => {
+                    _ = ui.weak(format!(
+                        "No list of haks: the module names its hak, {old}, in the older single \
+                     field (Mod_Hak), which is read where there is no list. A hak added here \
+                     starts the list in its place: add {old} to it too, to keep it."
+                    ))
+                }
+                None if n == 0 => _ = ui.weak("No haks: the module uses the game's own resources."),
+                None => {}
             }
             for (i, h) in haks.iter().enumerate() {
                 let row = ui.horizontal(|ui| {
@@ -445,11 +371,25 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
                         egui::Button::selectable(chosen, egui::RichText::new(h).monospace())
                             .sense(egui::Sense::click_and_drag()),
                     );
-                    if missing(h) {
-                        ui.colored_label(ui.visuals().warn_fg_color, "not found").on_hover_text(
-                            "No hak of this name is in the hak folders: the game will not \
-                             load the module until there is, or it is removed here",
-                        );
+                    match listed(h) {
+                        Some(mg_resman::Listed::Missing) => {
+                            let warn = ui.visuals().warn_fg_color;
+                            ui.colored_label(warn, "not found").on_hover_text(
+                                "No hak of this name is in the hak folders: the game will not \
+                                 load the module until there is, or it is removed here",
+                            );
+                        }
+                        Some(mg_resman::Listed::OtherCase(file)) => {
+                            let warn = ui.visuals().warn_fg_color;
+                            ui.colored_label(warn, format!("not found: the file is {file}.hak"))
+                                .on_hover_text(format!(
+                                    "The game opens a hak only by its exact name, and on Linux \
+                                     {file}.hak, in another case, is another file: the game \
+                                     will not load the module. Rename the file to {h}.hak, or \
+                                     remove {h} here and add {file}"
+                                ));
+                        }
+                        Some(mg_resman::Listed::Found) | None => {}
                     }
                     if state.reveal && state.cursor == Some(i) {
                         name.scroll_to_me(None);
@@ -457,21 +397,17 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
                     if name.clicked() {
                         let (command, shift) =
                             ui.input(|i| (i.modifiers.command, i.modifiers.shift));
-                        match (command, shift, state.anchor) {
-                            (true, ..) => {
-                                if !state.selected.remove(&i) {
-                                    state.selected.insert(i);
-                                }
-                                state.anchor = Some(i);
-                            }
-                            (false, true, Some(a)) => {
-                                state.selected = (a.min(i)..=a.max(i)).collect();
-                            }
-                            _ => {
-                                state.selected = BTreeSet::from([i]);
-                                state.anchor = Some(i);
-                            }
-                        }
+                        // The rule of every list of several (Ctrl+Shift
+                        // adds the range, as Windows' lists do).
+                        let listed: Vec<usize> = (0..n).collect();
+                        crate::widgets::select_in_list(
+                            &mut state.selected,
+                            &mut state.anchor,
+                            &listed,
+                            i,
+                            command,
+                            shift,
+                        );
                         state.cursor = Some(i);
                         // (The arrow keys are the list's now, not a camera's.)
                         crate::palette_view::give_keys(ui.ctx(), crate::palette_view::Keys::List);
@@ -571,27 +507,35 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
         state.reveal = false;
     }
 
-    let available: Vec<String> = on_disk
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|h| !haks.iter().any(|x| x.eq_ignore_ascii_case(h)))
+    let available: Vec<&String> = (on_disk.iter().flat_map(|all| all.iter()))
+        // (Those the module names not: on Linux, one in another case is another.)
+        .filter(|h| mg_resman::listed(&haks, h) != mg_resman::Listed::Found)
         .collect();
     // The list's commands, under it: what adds to it and checks it, and
     // what is done with the rows chosen.
     ui.horizontal(|ui| {
-        // (Commands, not a choice: no arrow keys.)
-        crate::widgets::dropdown("ifo-add-hak").selected_text("Add hak…").show_ui(ui, |ui| {
-            for h in &available {
-                if ui.selectable_label(false, h).clicked() {
-                    let mut item = ifo::MOD_HAK_LIST.new_item();
-                    item.write(&ifo::mod_hak_list::MOD_HAK, ExoString(encode(h)));
-                    let insert =
-                        Edit::insert_item(info_key(), GffPath::root(), list(), haks.len(), item);
-                    app.actions.push(command(vec![insert], "Add hak"));
+        // (Commands, not a choice: the arrows move along them, Enter adds.)
+        crate::widgets::dropdown("ifo-add-hak").selected_text("Add hak…").show_menu(
+            ui,
+            |ui, keys| {
+                for h in &available {
+                    let r = ui.selectable_label(false, h.as_str());
+                    if keys.row(&r) || r.clicked() {
+                        let mut item = ifo::MOD_HAK_LIST.new_item();
+                        let name = mg_resman::file_name_bytes(h);
+                        item.write(&ifo::mod_hak_list::MOD_HAK, ExoString(name));
+                        let insert = Edit::insert_item(
+                            info_key(),
+                            GffPath::root(),
+                            list(),
+                            haks.len(),
+                            item,
+                        );
+                        app.actions.push(command(vec![insert], "Add hak"));
+                    }
                 }
-            }
-        });
+            },
+        );
         if ui
             .button("Add Haks and Talk Table…")
             .on_hover_text(
@@ -670,22 +614,25 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
     crate::widgets::section_heading(ui, "Talk Table");
     ui.horizontal(|ui| {
         crate::widgets::field_label(ui, "Custom TLK");
-        let tlk = decode(root.read(&ifo::MOD_CUSTOM_TLK).as_bytes());
+        // (A table's name is its file's bytes, as a hak's:
+        // `mg_resman::file_name_text`.)
+        let tlk = mg_resman::file_name_text(root.read(&ifo::MOD_CUSTOM_TLK).as_bytes());
         let shown = if tlk.is_empty() { "(none)".to_string() } else { tlk.clone() };
         // (Read only while the list is used: open, or with the keys.) The
         // game reads talk tables from haks and the module too. The one
         // chosen as the module names it.
         let tlks = || {
-            let mut tlks = (app.install.as_ref())
-                .map(|i| GameInstall::file_names(&i.tlk_dirs(), "tlk"))
-                .unwrap_or_default();
+            // (The folders' files by their exact names; a hak's or the
+            // module's table is a resource, found by its name in any case.)
+            let mut tlks = app.install.as_ref().map(GameInstall::tlk_names).unwrap_or_default();
             if let Some(game) = &app.game {
-                tlks.extend(game.resman.list(mg_core::ResType::TLK).iter().map(|r| r.to_string()));
-                tlks.sort();
-                tlks.dedup();
+                let named = |t: String| if t.eq_ignore_ascii_case(&tlk) { tlk.clone() } else { t };
+                let resources = game.resman.list(mg_core::ResType::TLK);
+                tlks.extend(resources.iter().map(|r| named(r.to_string())));
             }
-            let named = |t: String| if t.eq_ignore_ascii_case(&tlk) { tlk.clone() } else { t };
-            std::iter::once(String::new()).chain(tlks.into_iter().map(named)).collect::<Vec<_>>()
+            tlks.sort();
+            tlks.dedup();
+            std::iter::once(String::new()).chain(tlks).collect::<Vec<_>>()
         };
         let mut pick = tlk.clone();
         crate::widgets::dropdown("ifo-tlk").selected_text(shown).show_with(
@@ -699,8 +646,9 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
                 }
             },
         );
-        if !pick.eq_ignore_ascii_case(&tlk) {
-            app.actions.push(set("Custom TLK", &ifo::MOD_CUSTOM_TLK, ExoString(encode(&pick))));
+        if pick != tlk {
+            let name = ExoString(mg_resman::file_name_bytes(&pick));
+            app.actions.push(set("Custom TLK", &ifo::MOD_CUSTOM_TLK, name));
         }
         let label = if tlk.is_empty() { "New…" } else { "Edit…" };
         if ui.button(label).on_hover_text("Tools › Talk Table").clicked() {
@@ -738,66 +686,67 @@ pub(crate) fn attach_window(app: &mut Moonglow, ctx: &egui::Context) {
     use mg_module::attach::There;
     let Some(mut draft) = app.attach.take() else { return };
     let mut done = None;
-    egui::Window::new("Add Haks and Talk Table")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.label("Haks go at the top of the module's list, highest priority first:");
-            let n = draft.placements.len();
-            let mut swap = None;
-            for (i, p) in draft.placements.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.monospace(if p.is_tlk {
-                        format!("{}.tlk", p.name)
-                    } else {
-                        format!("{}.hak", p.name)
-                    });
-                    let folder = if p.is_tlk { "tlk" } else { "hak" };
-                    let what = match p.there {
-                        There::Nothing => format!("copied to your {folder} folder"),
-                        There::Same => format!("already in your {folder} folder"),
-                        There::Different => format!("a different one is in your {folder} folder"),
-                    };
-                    ui.weak(what).on_hover_text(p.to.display().to_string());
-                    if !p.is_tlk {
-                        let next_hak = (i + 1..n).find(|&j| !draft.placements[j].is_tlk);
-                        let prev_hak = (0..i).rev().find(|&j| !draft.placements[j].is_tlk);
-                        if ui
-                            .add_enabled(prev_hak.is_some(), egui::Button::new("Move Up").small())
-                            .clicked()
-                        {
-                            swap = prev_hak.map(|j| (i, j));
-                        }
-                        if ui
-                            .add_enabled(next_hak.is_some(), egui::Button::new("Move Down").small())
-                            .clicked()
-                        {
-                            swap = next_hak.map(|j| (i, j));
-                        }
-                    } else {
-                        ui.weak("(the module's talk table)");
-                    }
-                });
-            }
-            if let Some((a, b)) = swap {
-                draft.placements.swap(a, b);
-            }
-            if draft.placements.iter().any(|p| p.there == There::Different) {
-                ui.checkbox(
-                    &mut draft.replace,
-                    "Replace the files of the same names that are there",
-                );
-            }
+    crate::widgets::modal(ctx, "Add Haks and Talk Table").show(ctx, |ui| {
+        ui.label("Haks go at the top of the module's list, highest priority first:");
+        let n = draft.placements.len();
+        let mut swap = None;
+        for (i, p) in draft.placements.iter().enumerate() {
             ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    done = Some(true);
-                }
-                if crate::widgets::cancel(ui) {
-                    done = Some(false);
+                ui.monospace(if p.is_tlk {
+                    format!("{}.tlk", p.name)
+                } else {
+                    format!("{}.hak", p.name)
+                });
+                let folder = if p.is_tlk { "tlk" } else { "hak" };
+                let what = match p.there {
+                    There::Nothing => format!("copied to your {folder} folder"),
+                    There::Same => format!("already in your {folder} folder"),
+                    There::Different => format!("a different one is in your {folder} folder"),
+                };
+                let from = match &p.entry {
+                    Some(entry) => format!("{entry} in {}", p.from.display()),
+                    None => p.from.display().to_string(),
+                };
+                ui.weak(what).on_hover_text(format!(
+                    "{from}
+→ {}",
+                    p.to.display()
+                ));
+                if !p.is_tlk {
+                    let next_hak = (i + 1..n).find(|&j| !draft.placements[j].is_tlk);
+                    let prev_hak = (0..i).rev().find(|&j| !draft.placements[j].is_tlk);
+                    if ui
+                        .add_enabled(prev_hak.is_some(), egui::Button::new("Move Up").small())
+                        .clicked()
+                    {
+                        swap = prev_hak.map(|j| (i, j));
+                    }
+                    if ui
+                        .add_enabled(next_hak.is_some(), egui::Button::new("Move Down").small())
+                        .clicked()
+                    {
+                        swap = next_hak.map(|j| (i, j));
+                    }
+                } else {
+                    ui.weak("(the module's talk table)");
                 }
             });
+        }
+        if let Some((a, b)) = swap {
+            draft.placements.swap(a, b);
+        }
+        if draft.placements.iter().any(|p| p.there == There::Different) {
+            ui.checkbox(&mut draft.replace, "Replace the files of the same names that are there");
+        }
+        ui.horizontal(|ui| {
+            if ui.button("OK").clicked() {
+                done = Some(true);
+            }
+            if crate::widgets::cancel(ui) {
+                done = Some(false);
+            }
         });
+    });
     match done {
         None => app.attach = Some(draft),
         Some(false) => {}
@@ -833,7 +782,7 @@ fn attach(app: &mut Moonglow, draft: &AttachDraft) {
             key: info_key(),
             path: GffPath::root(),
             label: ifo::MOD_CUSTOM_TLK.label.to_string(),
-            value: Some(ExoString(encode(&t.name)).into_value()),
+            value: Some(ExoString(mg_resman::file_name_bytes(&t.name)).into_value()),
         });
     }
     app.log.info(format!("Copied {copied} files into the user folder"));
@@ -874,5 +823,24 @@ mod tests {
         assert!(speed(60.0) > speed(100.0), "and past it");
         assert_eq!(speed(0.0), speed(-500.0), "up to a most");
         assert_eq!(speed(395.0), -speed(105.0));
+    }
+
+    /// The hak folders are listed for Custom Content once a couple of
+    /// seconds, not every frame: a hak copied in shows then.
+    #[test]
+    fn the_hak_folders_are_read_again_after_a_while() {
+        let dir = mg_testkit::scratch_dir("ui-hak-folders");
+        let user = dir.join("user");
+        std::fs::create_dir_all(user.join("hak")).unwrap();
+        std::fs::write(user.join("hak/first.hak"), "").unwrap();
+        let mut app = crate::Moonglow::new(None, Box::new(crate::NoDialogs::default()));
+        assert!(super::haks_on_disk(&mut app, 0.0).is_none(), "no install");
+        app.install = Some(mg_resman::GameInstall::new(dir.join("game"), Some(user.clone()), "en"));
+        let listed =
+            |app: &mut crate::Moonglow, now| super::haks_on_disk(app, now).unwrap().to_vec();
+        assert_eq!(listed(&mut app, 1.0), ["first"]);
+        std::fs::write(user.join("hak/second.hak"), "").unwrap();
+        assert_eq!(listed(&mut app, 2.5), ["first"], "kept a while");
+        assert_eq!(listed(&mut app, 3.0), ["first", "second"]);
     }
 }

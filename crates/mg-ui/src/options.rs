@@ -105,6 +105,8 @@ pub struct OptionsDraft {
     pub dialog_font_size: Option<u8>,
     pub script_templates: String,
     pub scratch_dir: String,
+    pub nwsync_upload: String,
+    pub nwsync_upload_input: bool,
     pub external_editor: String,
     pub external_compiler: String,
     pub workshop: bool,
@@ -117,9 +119,15 @@ pub struct OptionsDraft {
     /// Height and Width, tenths of a metre.
     pub spawn_marker_size: (u8, u8),
     pub door_arrows: bool,
-    /// Verify: the groups left out of its report, by id.
+    pub generated_lights: bool,
+    /// Verify: the groups, checks and categories of missing references
+    /// left out of its report, by id ([`mg_module::doctor::Skip`]), each a
+    /// checkbox...
     pub verify_skip: Vec<String>,
+    /// ...and the rest, as typed: haks, folders and resources.
+    pub verify_more: String,
     pub merchant_signs: bool,
+    pub shadow_quality: crate::settings::ShadowQuality,
     pub edit_group_tiles: bool,
     pub turn_ring: bool,
     pub dialog_npc_color: Option<[u8; 3]>,
@@ -143,11 +151,33 @@ pub struct OptionsDraft {
     pub plugin_commands: Vec<(String, String)>,
     /// And the open project's (`[commands]`), after the plugins'.
     pub project_commands: Vec<(String, String)>,
+    /// The enabled plugins' checks, for Options › Verify: each one's id
+    /// (as its findings carry it) and its name.
+    pub plugin_checks: Vec<(String, String)>,
     /// The command (by the id its keys are kept under) taking the next key.
     pub recording: Option<String>,
     /// The game install found on this machine when Options opened, for the
     /// Folders page's hints under an empty field.
     pub detected: Option<GameInstall>,
+}
+
+/// Whether a word Verify leaves out is one of Options › Verify's
+/// checkboxes (a group, a check, a category of missing references), not
+/// typed in its field.
+fn verify_box(word: &str) -> bool {
+    use mg_module::doctor::{Check, Group};
+    Group::from_id(word).is_some()
+        || Check::from_id(word).is_some()
+        || word.starts_with("references:")
+        || word.contains('/')
+}
+
+/// The words of Options › Verify's field: separated by commas or spaces.
+fn verify_words(text: &str) -> Vec<String> {
+    (text.split(|c: char| c == ',' || c.is_whitespace()))
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn text(p: &Option<PathBuf>) -> String {
@@ -166,6 +196,7 @@ impl OptionsDraft {
             keymap: crate::keys::Keymap::new(&s.key_bindings),
             plugin_commands: Vec::new(),
             project_commands: Vec::new(),
+            plugin_checks: Vec::new(),
             recording: None,
             detected: None,
             game_root: text(&s.game_root),
@@ -196,7 +227,7 @@ impl OptionsDraft {
             auto_reload: !s.no_auto_reload,
             backups: !s.no_backups,
             autosave: !s.no_autosave,
-            autosave_minutes: s.autosave_minutes.unwrap_or(5),
+            autosave_minutes: s.autosave_every(),
             hak_warning: !s.no_hak_warning,
             namespace_warning: !s.no_namespace_warning,
             spell_warning: !s.no_spell_warning,
@@ -216,6 +247,8 @@ impl OptionsDraft {
             dialog_font_size: s.dialog_font_size,
             script_templates: text(&s.script_templates),
             scratch_dir: text(&s.scratch_dir),
+            nwsync_upload: s.nwsync_upload.clone().unwrap_or_default(),
+            nwsync_upload_input: s.nwsync_upload_input,
             external_editor: text(&s.external_editor),
             external_compiler: text(&s.external_compiler),
             workshop: s.read_workshop,
@@ -227,8 +260,15 @@ impl OptionsDraft {
             spawn_markers: !s.no_spawn_markers,
             spawn_marker_size: s.spawn_marker_size.unwrap_or(crate::area_view::SPAWN_MARKER),
             door_arrows: !s.no_door_arrows,
-            verify_skip: s.verify_skip.clone(),
+            generated_lights: s.generated_lights,
+            verify_skip: (s.verify_skip.iter()).filter(|w| verify_box(w)).cloned().collect(),
+            verify_more: (s.verify_skip.iter())
+                .filter(|w| !verify_box(w))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
             merchant_signs: s.merchant_signs,
+            shadow_quality: s.shadow_quality,
             edit_group_tiles: s.edit_group_tiles,
             turn_ring: !s.no_turn_ring,
             dialog_npc_color: s.dialog_npc_color,
@@ -237,7 +277,7 @@ impl OptionsDraft {
             dialog_paste_source_to_dest: s.dialog_paste_source_to_dest,
             dialog_drag_source_to_dest: !s.dialog_drag_dest_to_source,
             dialog_backup: !s.dialog_no_backup,
-            dialog_backup_minutes: s.dialog_backup_minutes.unwrap_or(5),
+            dialog_backup_minutes: s.dialog_backup_every(),
             placed_sounds: !s.no_placed_sounds,
             ambient_sound: s.ambient_sound,
             ambient_music: s.ambient_music,
@@ -282,7 +322,7 @@ impl OptionsDraft {
             no_auto_reload: !self.auto_reload,
             no_backups: !self.backups,
             no_autosave: !self.autosave,
-            autosave_minutes: (self.autosave_minutes != 5)
+            autosave_minutes: (self.autosave_minutes != crate::settings::AUTOSAVE_MINUTES)
                 .then_some(self.autosave_minutes.clamp(1, 120)),
             no_hak_warning: !self.hak_warning,
             no_namespace_warning: !self.namespace_warning,
@@ -303,6 +343,8 @@ impl OptionsDraft {
             dialog_font_size: self.dialog_font_size,
             script_templates: path(&self.script_templates),
             scratch_dir: path(&self.scratch_dir),
+            nwsync_upload: Some(self.nwsync_upload.trim().to_string()).filter(|c| !c.is_empty()),
+            nwsync_upload_input: self.nwsync_upload_input,
             external_editor: path(&self.external_editor),
             external_compiler: path(&self.external_compiler),
             read_workshop: self.workshop,
@@ -315,8 +357,16 @@ impl OptionsDraft {
             spawn_marker_size: (self.spawn_marker_size != crate::area_view::SPAWN_MARKER)
                 .then_some(self.spawn_marker_size),
             no_door_arrows: !self.door_arrows,
-            verify_skip: self.verify_skip.clone(),
+            generated_lights: self.generated_lights,
+            verify_skip: {
+                // (What isn't something to leave out is dropped: the page
+                // says so.)
+                let more = verify_words(&self.verify_more).into_iter();
+                let more = more.filter(|w| mg_module::doctor::Skip::parse(&[w]).is_ok());
+                self.verify_skip.iter().cloned().chain(more).collect()
+            },
             merchant_signs: self.merchant_signs,
+            shadow_quality: self.shadow_quality,
             edit_group_tiles: self.edit_group_tiles,
             no_turn_ring: !self.turn_ring,
             dialog_npc_color: self.dialog_npc_color,
@@ -325,7 +375,8 @@ impl OptionsDraft {
             dialog_paste_source_to_dest: self.dialog_paste_source_to_dest,
             dialog_drag_dest_to_source: !self.dialog_drag_source_to_dest,
             dialog_no_backup: !self.dialog_backup,
-            dialog_backup_minutes: (self.dialog_backup_minutes != 5)
+            dialog_backup_minutes: (self.dialog_backup_minutes
+                != crate::settings::DIALOG_BACKUP_MINUTES)
                 .then_some(self.dialog_backup_minutes.clamp(1, 180)),
             no_placed_sounds: !self.placed_sounds,
             ambient_sound: self.ambient_sound,
@@ -485,6 +536,27 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                 "Where To Scratch copies a script (with its compiled script) or \
                                  an area as loose files: a development folder, a server's, or \
                                  anywhere. Empty: asked for the first time.",
+                            );
+                            ui.add_space(6.0);
+                            crate::widgets::field_label(ui, "NWSync upload command");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.nwsync_upload)
+                                    .desired_width(420.0)
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text("rsync -a {part} you@host:/srv/nwsync/"),
+                            );
+                            ui.checkbox(&mut draft.nwsync_upload_input, "It reads what I type")
+                                .on_hover_text(
+                                    "A line under its output takes what you type, as a \
+                                     project's command with input = true",
+                                );
+                            ui.weak(
+                                "What Publish to NWSync's Upload runs to send the repository to \
+                                 your web server: once for each part, the data, then the \
+                                 manifests, then latest, in the repository's folder ({part} the \
+                                 part's name, {folder} the folder). It uses your own tools' \
+                                 logins (an SSH key, a cloud tool's profile): Moonglow keeps no \
+                                 password. A project's [nwsync] upload is used in its place.",
                             );
                         }
                         OptionsPage::General => {
@@ -707,11 +779,10 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                     "In Moonglow's data folder; offered back after a crash \
                                      (Recover Unsaved Work)",
                                 );
-                                ui.add_enabled(
-                                    draft.autosave,
-                                    egui::DragValue::new(&mut draft.autosave_minutes)
-                                        .range(1..=120),
-                                );
+                                ui.add_enabled_ui(draft.autosave, |ui| {
+                                    let minutes = &mut draft.autosave_minutes;
+                                    crate::widgets::spin_draft(ui, minutes, 1..=120, 1.0, |d| d);
+                                });
                                 ui.label("minutes");
                             });
                             ui.add_space(8.0);
@@ -774,14 +845,22 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                             ui.add_enabled_ui(draft.spawn_markers, |ui| {
                                 ui.horizontal(|ui| {
                                     crate::widgets::field_label(ui, "Height");
-                                    ui.add(
-                                        egui::DragValue::new(&mut draft.spawn_marker_size.0)
-                                            .range(0..=100),
+                                    let size = &mut draft.spawn_marker_size;
+                                    crate::widgets::spin_draft(
+                                        ui,
+                                        &mut size.0,
+                                        0..=100,
+                                        1.0,
+                                        |d| d,
                                     );
                                     crate::widgets::field_label(ui, "Width");
-                                    ui.add(
-                                        egui::DragValue::new(&mut draft.spawn_marker_size.1)
-                                            .range(0..=100),
+                                    let size = &mut draft.spawn_marker_size;
+                                    crate::widgets::spin_draft(
+                                        ui,
+                                        &mut size.1,
+                                        0..=100,
+                                        1.0,
+                                        |d| d,
                                     );
                                     ui.weak("(tenths of a meter)");
                                 });
@@ -796,11 +875,27 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                  With Shift held, two rings that tilt their models \
                                  and arrows that move them along one axis",
                             );
+                            ui.checkbox(
+                                &mut draft.generated_lights,
+                                "Lights of any color and reach, written into a hak",
+                            )
+                            .on_hover_text(
+                                "On, Add Light Here and the palette's Lights offer Custom \
+                                 Light…: a light of the color, reach and shadows you choose, \
+                                 made as content (a model and a placeables.2da row) written \
+                                 into a hak you choose, which the module's players must have. \
+                                 Off, nothing is ever written into a hak for a light. A \
+                                 project's moonglow.toml ([lights] generated) wins over this",
+                            );
                             ui.checkbox(&mut draft.merchant_signs, "Show stores as $ signs")
                                 .on_hover_text(
                                     "The game's marker for a store, as Aurora shows them, \
                                  rather than an arrow along the store's facing",
                                 );
+                            ui.horizontal(|ui| {
+                                crate::widgets::field_label(ui, "Shadows quality");
+                                shadow_quality_choice(ui, &mut draft.shadow_quality);
+                            });
                             ui.checkbox(
                                 &mut draft.edit_group_tiles,
                                 "Allow editing tiles of groups and features",
@@ -890,9 +985,12 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                 "The size of the conversation editor's text: its lines and the \
                                  fields under them",
                             );
+                            // (The defaults of the theme the window shows.)
+                            let (npc, pc) =
+                                crate::dialog_view::default_colors(ui.visuals().dark_mode);
                             for (label, color, default) in [
-                                ("NPC Text Color", &mut draft.dialog_npc_color, [210, 70, 70]),
-                                ("Player Text Color", &mut draft.dialog_pc_color, [90, 140, 230]),
+                                ("NPC Text Color", &mut draft.dialog_npc_color, npc),
+                                ("Player Text Color", &mut draft.dialog_pc_color, pc),
                             ] {
                                 ui.horizontal(|ui| {
                                     crate::widgets::field_label(ui, label);
@@ -937,11 +1035,10 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                                     "Every few minutes, a copy of each open conversation with \
                                  unsaved changes, in the temporary folder's moonglow-backups",
                                 );
-                                ui.add_enabled(
-                                    draft.dialog_backup,
-                                    egui::DragValue::new(&mut draft.dialog_backup_minutes)
-                                        .range(1..=180),
-                                );
+                                ui.add_enabled_ui(draft.dialog_backup, |ui| {
+                                    let minutes = &mut draft.dialog_backup_minutes;
+                                    crate::widgets::spin_draft(ui, minutes, 1..=180, 1.0, |d| d);
+                                });
                                 ui.label("minutes");
                             });
                         }
@@ -1110,7 +1207,8 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     match keys_file {
         Some(true) => {
             let suggested = std::path::Path::new("moonglow-keys.json");
-            if let Some(p) = app.dialogs.save_file(crate::dialogs::FileKind::Any, Some(suggested)) {
+            if let Some(p) = app.dialogs.save_file(crate::dialogs::FileKind::Keys, Some(suggested))
+            {
                 match std::fs::write(&p, draft.keymap.to_file()) {
                     Ok(()) => app.log.info(format!("Keys written to {}", p.display())),
                     Err(e) => app.log.error(format!("{}: {e}", p.display())),
@@ -1118,7 +1216,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
             }
         }
         Some(false) => {
-            if let Some(p) = app.dialogs.open_file(crate::dialogs::FileKind::Any, None) {
+            if let Some(p) = app.dialogs.open_file(crate::dialogs::FileKind::Keys, None) {
                 let taken = std::fs::read_to_string(&p)
                     .map_err(|e| e.to_string())
                     .and_then(|text| draft.keymap.take_file(&text));
@@ -1141,6 +1239,24 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
 
 /// Options › General › Toolbar buttons: Icons and text, or Icons only
 /// (the main toolbar's and the area view's, at once).
+/// The shadows' quality, Fast or High, to choose (Options › Area and the
+/// area view's Shadows menu): whether it changed.
+pub(crate) fn shadow_quality_choice(
+    ui: &mut Ui,
+    quality: &mut crate::settings::ShadowQuality,
+) -> bool {
+    use crate::settings::ShadowQuality;
+    let fast = ui.radio_value(quality, ShadowQuality::Fast, "Fast").on_hover_text(
+        "A shadow map stands in for the game's shadows: cheap in every area, its edges stepped \
+         where seen up close",
+    );
+    let high = ui.radio_value(quality, ShadowQuality::High, "High").on_hover_text(
+        "Stencil shadow volumes, as the game casts them: edges as sharp as the picture's, \
+         smoothed with it; dearer in the largest areas",
+    );
+    fast.changed() || high.changed()
+}
+
 fn toolbar_buttons(ui: &mut Ui, draft: &mut OptionsDraft) {
     let name = |icons_only: &bool| if *icons_only { "Icons only" } else { "Icons and text" };
     ui.horizontal(|ui| {
@@ -1266,16 +1382,29 @@ fn script_style(ui: &mut Ui, style: &mut ScriptStyle) {
     });
 }
 
-/// Options › Verify: what Build › Verify Module reports, by group (a
-/// builder's tileset errors nobody is going to fix hid the missing
-/// references among them).
+/// Options › Verify: what Build › Verify Module reports, by group, each
+/// group's checks (and the missing references' categories, the enabled
+/// plugins' checks) under it, and the haks, folders and resources typed
+/// in its field (a builder's tileset errors nobody is going to fix hid the
+/// missing references among them; Taro49's report).
 fn verify(ui: &mut Ui, draft: &mut OptionsDraft) {
     use mg_module::doctor::{Check, Group};
-    ui.label("What Verify Module reports:");
+    use mg_module::verify::Category;
+    // A word's checkbox: on while it isn't left out.
+    fn word(ui: &mut Ui, skip: &mut Vec<String>, id: &str, label: &str, tip: &str) {
+        let mut on = !skip.iter().any(|w| w == id);
+        let response = ui.checkbox(&mut on, label);
+        let response = if tip.is_empty() { response } else { response.on_hover_text(tip) };
+        if response.changed() {
+            skip.retain(|w| w != id);
+            if !on {
+                skip.push(id.to_string());
+            }
+        }
+    }
+    ui.label("What Verify Module reports (a group's \u{25B8} shows its checks):");
     for group in Group::ALL {
-        let mut on = !draft.verify_skip.iter().any(|id| id == group.id());
-        let checks: Vec<&str> =
-            Check::ALL.iter().filter(|c| c.group() == group).map(|c| c.about()).collect();
+        let checks: Vec<Check> = Check::ALL.into_iter().filter(|c| c.group() == group).collect();
         let tip = match group {
             Group::References => {
                 "Scripts, conversations, blueprints, areas and other resources the module names \
@@ -1283,14 +1412,69 @@ fn verify(ui: &mut Ui, draft: &mut OptionsDraft) {
                     .to_string()
             }
             Group::Plugins => "The checks of the enabled plugins".to_string(),
-            _ => format!("That {}", checks.join("; that ")),
-        };
-        if ui.checkbox(&mut on, group.title()).on_hover_text(tip).changed() {
-            draft.verify_skip.retain(|id| id != group.id());
-            if !on {
-                draft.verify_skip.push(group.id().to_string());
+            _ => {
+                let about: Vec<&str> = checks.iter().map(|c| c.about()).collect();
+                format!("That {}", about.join("; that "))
             }
-        }
+        };
+        let id = ui.make_persistent_id(("verify-group", group.id()));
+        let whole = draft.verify_skip.iter().any(|w| w == group.id());
+        // (Open at first where some of its checks are left out.)
+        let some = match group {
+            Group::References => draft.verify_skip.iter().any(|w| w.starts_with("references:")),
+            Group::Plugins => draft.verify_skip.iter().any(|w| w.contains('/')),
+            _ => checks.iter().any(|c| draft.verify_skip.iter().any(|w| w == c.id())),
+        };
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, some)
+            .show_header(ui, |ui| {
+                word(ui, &mut draft.verify_skip, group.id(), group.title(), &tip);
+            })
+            .body(|ui| {
+                ui.add_enabled_ui(!whole, |ui| match group {
+                    Group::References => {
+                        for c in Category::ALL {
+                            let id = format!("references:{}", c.id());
+                            let label = format!("Of {}", c.id());
+                            let tip =
+                                format!("Missing references made by the module's {}", { c.id() });
+                            word(ui, &mut draft.verify_skip, &id, &label, &tip);
+                        }
+                    }
+                    Group::Plugins if draft.plugin_checks.is_empty() => {
+                        ui.weak("No enabled plugin has checks.");
+                    }
+                    Group::Plugins => {
+                        for (id, name) in draft.plugin_checks.clone() {
+                            word(ui, &mut draft.verify_skip, &id, &name, &id);
+                        }
+                    }
+                    _ => {
+                        for c in &checks {
+                            word(ui, &mut draft.verify_skip, c.id(), c.id(), c.about());
+                        }
+                    }
+                });
+            });
+    }
+    ui.add_space(6.0);
+    crate::widgets::field_label(ui, "Also leave out");
+    ui.add(
+        egui::TextEdit::singleline(&mut draft.verify_more)
+            .hint_text("tdod_tiles01.hak, ttr01.set, override")
+            .desired_width(f32::INFINITY),
+    )
+    .on_hover_text(
+        "Haks (NAME.hak), the override or development folder, and resources (a tileset, \
+         ttr01.set, with its tiles' models; a 2DA; a model), separated by commas",
+    );
+    let wrong: Vec<String> = (verify_words(&draft.verify_more).into_iter())
+        .filter(|w| mg_module::doctor::Skip::parse(&[w]).is_err())
+        .collect();
+    if !wrong.is_empty() {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("Not something Verify can leave out (not kept): {}", wrong.join(", ")),
+        );
     }
     ui.weak("What is left out isn't checked, which is quicker; the log's summary line names it.");
 }
@@ -1507,6 +1691,8 @@ mod tests {
         d.armor_on_woman = true;
         d.script_templates = " /tmp/templates ".into();
         d.scratch_dir = "/tmp/scratch".into();
+        d.nwsync_upload = " rsync -a {part} h:/srv/ ".into();
+        d.nwsync_upload_input = true;
         assert!(d.live_check, "checked as you type unless asked");
         d.live_check = false;
         let t = d.apply(&s);
@@ -1536,6 +1722,10 @@ mod tests {
         assert_eq!(t.script_templates, Some(PathBuf::from("/tmp/templates")));
         assert_eq!(t.scratch_dir, Some(PathBuf::from("/tmp/scratch")));
         assert_eq!(s.scratch_dir, None, "asked for the first time");
+        assert_eq!(t.nwsync_upload.as_deref(), Some("rsync -a {part} h:/srv/"));
+        assert!(t.nwsync_upload_input && !s.nwsync_upload_input);
+        assert_eq!(s.nwsync_upload, None, "none unless set");
+        assert_eq!(OptionsDraft::from_settings(&t).nwsync_upload, "rsync -a {part} h:/srv/");
         assert!(!d.moves_game(&s), "no reload for these");
         assert_eq!(OptionsDraft::from_settings(&t).script_templates, "/tmp/templates");
     }
@@ -1549,9 +1739,13 @@ mod tests {
         assert!(!d.edit_group_tiles, "groups are one thing unless asked");
         assert!(d.turn_ring, "the turning ring shows unless switched off");
         assert_eq!(d.area_background, None, "the fog color by default");
+        use crate::settings::ShadowQuality;
+        assert_eq!(d.shadow_quality, ShadowQuality::Fast, "the shadow map unless asked");
         (d.spawn_markers, d.area_background) = (false, Some([192, 192, 192]));
         d.edit_group_tiles = true;
+        d.shadow_quality = ShadowQuality::High;
         let t = d.apply(&s);
+        assert_eq!(t.shadow_quality, ShadowQuality::High);
         assert!(t.no_spawn_markers && !t.no_door_arrows);
         assert!(t.edit_group_tiles && OptionsDraft::from_settings(&t).edit_group_tiles);
         assert_eq!(d.spawn_marker_size, (12, 4), "Aurora's Height and Width");
@@ -1648,6 +1842,44 @@ mod tests {
         let t = d.apply(&s);
         assert!(t.no_placed_sounds && t.ambient_music && !t.ambient_sound);
         assert_eq!(t.music_volume, Some(40));
+    }
+
+    /// Options › Verify: groups, checks and categories are checkboxes,
+    /// the rest (haks, folders, resources) its field; what isn't
+    /// something to leave out is dropped when applied.
+    #[test]
+    fn verify_s_checkboxes_and_field_apply() {
+        let s = Settings {
+            verify_skip: vec![
+                "tilesets".into(),
+                "tdod_tiles01.hak".into(),
+                "set-hole".into(),
+                "ttr01.set".into(),
+                "references:creatures".into(),
+                "example.tags/tag-case".into(),
+            ],
+            ..Settings::default()
+        };
+        let mut d = OptionsDraft::from_settings(&s);
+        assert_eq!(
+            d.verify_skip,
+            ["tilesets", "set-hole", "references:creatures", "example.tags/tag-case"]
+        );
+        assert_eq!(d.verify_more, "tdod_tiles01.hak, ttr01.set");
+        d.verify_more = "tdod_tiles01.hak,ttr01.set  override, tilesetz".into();
+        d.verify_skip.retain(|w| w != "tilesets");
+        let t = d.apply(&s);
+        assert_eq!(
+            t.verify_skip,
+            [
+                "set-hole",
+                "references:creatures",
+                "example.tags/tag-case",
+                "tdod_tiles01.hak",
+                "ttr01.set",
+                "override"
+            ]
+        );
     }
 
     #[test]

@@ -231,14 +231,13 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
             .add_enabled(narrowed, egui::Button::new(format!("Export {found} as Files…")))
             .on_hover_text(
                 "The resources listed, as loose files in a folder (name.ext), as the load \
-                 order has them (not the copies they override). Choose a type or type part \
-                 of a name first.",
+                 order has them; the overridden copies listed each in a folder of its layer's \
+                 (hak_name/name.ext). Choose a type or type part of a name first.",
             )
             .clicked()
         {
             let keys = (browser.shown.iter().map(|&i| &browser.entries[i]))
-                .filter(|r| r.over.is_none())
-                .map(|r| r.key)
+                .map(|r| (r.key, r.over.as_ref().map(|_| r.layer.clone())))
                 .collect();
             actions.push(Action::SaveResources(keys));
         }
@@ -296,13 +295,17 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                     if ui.button("Open").clicked() {
                         actions.push(Action::OpenTab(tab()));
                     }
-                    // (The viewer shows the copy the game reads.)
-                    if copy.is_none()
-                        && k.restype != ResType::MDL
-                        && crate::model_view::previewable(k.restype)
+                    // (A copy's as its layer has it: a model, a blueprint.)
+                    let previewable = crate::model_view::previewable(k.restype)
+                        && (copy.is_some() || k.restype != ResType::MDL);
+                    if previewable
                         && ui.button("Preview").on_hover_text("See it in the 3D viewer").clicked()
                     {
-                        actions.push(Action::OpenTab(Tab::Model(*k)));
+                        let tab = match &copy {
+                            Some(layer) => Tab::ModelCopy { key: *k, layer: layer.clone() },
+                            None => Tab::Model(*k),
+                        };
+                        actions.push(Action::OpenTab(tab));
                     }
                     if ui.button("Save As…").on_hover_text("As a file, as it is").clicked() {
                         actions.push(Action::SaveResource(*k, copy.clone()));
@@ -327,7 +330,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
 }
 
 /// Where a table shown in the browser is to be edited.
-enum EditTable {
+pub(crate) enum EditTable {
     InModule,
     Copy(crate::table_view::Home),
     CopyInFile,
@@ -339,7 +342,6 @@ enum EditTable {
 /// its file, where that is the builder's own (not one of the game's).
 fn haks_with(app: &Moonglow, key: ResKey) -> Vec<(String, std::path::PathBuf)> {
     let (Some(game), Some(install)) = (&app.game, &app.install) else { return Vec::new() };
-    let dirs = install.hak_dirs();
     let mut layers: Vec<_> = game.resman.layers().iter().collect();
     layers.sort_by_key(|l| std::cmp::Reverse(l.priority));
     layers
@@ -349,7 +351,7 @@ fn haks_with(app: &Moonglow, key: ResKey) -> Vec<(String, std::path::PathBuf)> {
             if !l.container.contains(&key) {
                 return None;
             }
-            let path = dirs.iter().map(|d| d.join(format!("{name}.hak"))).find(|p| p.is_file())?;
+            let path = install.find_hak(name)?;
             (!path.starts_with(&install.root)).then(|| (name.to_string(), path))
         })
         .collect()
@@ -359,10 +361,16 @@ fn haks_with(app: &Moonglow, key: ResKey) -> Vec<(String, std::path::PathBuf)> {
 /// one the game reads, in the module, in a hak open in the hak editor,
 /// or in a file. (The game's own tables are never changed.)
 fn table_menu(app: &Moonglow, ui: &mut Ui, key: ResKey) -> Option<EditTable> {
+    ui.menu_button("Edit…", |ui| table_homes(app, ui, key)).inner.flatten()
+}
+
+/// The places a table can be edited in, as buttons ([`table_menu`]'s):
+/// the one clicked.
+pub(crate) fn table_homes(app: &Moonglow, ui: &mut Ui, key: ResKey) -> Option<EditTable> {
     use crate::table_view::Home;
     let mut out = None;
     let in_module = app.ws.as_ref().is_some_and(|w| w.module.contains(&key));
-    ui.menu_button("Edit…", |ui| {
+    {
         if in_module {
             if ui.button("The Module's Table").clicked() {
                 out = Some(EditTable::InModule);
@@ -410,8 +418,22 @@ fn table_menu(app: &Moonglow, ui: &mut Ui, key: ResKey) -> Option<EditTable> {
         if ui.button("A Copy in a File…").clicked() {
             out = Some(EditTable::CopyInFile);
         }
-    });
+    }
     out
+}
+
+/// Opens table `key` in the 2DA editor where `home` says; its document's
+/// id, where it opened.
+pub(crate) fn open_table(app: &mut Moonglow, key: ResKey, home: EditTable) -> Option<u32> {
+    match home {
+        EditTable::InModule => crate::table_view::open_in_module(app, key),
+        EditTable::Copy(home) => crate::table_view::edit_copy(app, key, home),
+        EditTable::CopyInFile => crate::table_view::edit_copy_in_file(app, key),
+        EditTable::InHak(path) => {
+            let hak = crate::hak_view::open_at(app, &path)?;
+            crate::table_view::open_in_hak(app, hak, key)
+        }
+    }
 }
 
 /// A copy of a table that a hak of the module has (`layer`, `hak:name`),
@@ -437,7 +459,8 @@ pub(crate) fn save_as(app: &mut Moonglow, key: ResKey, layer: Option<&str>, as_t
         }
         return;
     };
-    let data = match as_text.then(|| mg_mdl::decompile(&data)) {
+    let skeleton = |n: &str| game.resman.get_named(n, ResType::MDL).ok().map(|d| d.into_owned());
+    let data = match as_text.then(|| mg_mdl::decompile_with(&data, &skeleton)) {
         Some(Ok(text)) => text.into_bytes().into(),
         Some(Err(mg_mdl::DecompileError::NotBinary)) | None => data,
         Some(Err(e)) => {
@@ -455,33 +478,57 @@ pub(crate) fn save_as(app: &mut Moonglow, key: ResKey, layer: Option<&str>, as_t
     }
 }
 
+/// The folder an overridden copy goes into, under Export as Files'
+/// folder: its layer's label, in letters, digits, `-` and `_`
+/// (`hak:mg_low` is `hak_mg_low`), a name every system takes.
+fn layer_folder(layer: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    layer.chars().map(|c| if safe(c) { c } else { '_' }).collect()
+}
+
 /// Export as Files: the resources listed, each as `name.ext` in a folder
-/// the user chooses.
-pub(crate) fn export(app: &mut Moonglow, keys: &[ResKey]) {
+/// the user chooses; an overridden copy (with its layer's label) as its
+/// layer has it, in a folder of the layer's under that one
+/// ([`layer_folder`]).
+pub(crate) fn export(app: &mut Moonglow, keys: &[(ResKey, Option<String>)]) {
     let Some(game) = &app.game else { return };
     let Some(dir) = app.dialogs.pick_folder("Export as files into", app.export_dir.as_deref())
     else {
         return;
     };
-    let (mut written, mut as_text) = (0, 0);
-    for key in keys {
-        let Ok(data) = game.resman.get(key) else { continue };
+    let (mut written, mut as_text, mut copies) = (0, 0, 0);
+    for (key, layer) in keys {
+        let Some(data) = read_copy(&game.resman, key, layer.as_deref()) else { continue };
         // (Asked for: a compiled model as its text; one that can't be
         // read so goes out as it is.)
-        let text = (app.browser.models_as_text).then(|| model_text(*key, &data)).flatten();
+        let text = (app.browser.models_as_text)
+            .then(|| model_text(*key, &data, Some(&game.resman)))
+            .flatten();
         as_text += usize::from(text.is_some());
         let data = text.map_or(data, |t| t.into_bytes().into());
-        if let Err(e) = key.path_in(&dir).and_then(|path| std::fs::write(path, &data)) {
-            app.log.error(format!("Could not write to {}: {e}", dir.display()));
+        let into = match layer {
+            Some(layer) => dir.join(layer_folder(layer)),
+            None => dir.clone(),
+        };
+        let wrote = std::fs::create_dir_all(&into)
+            .and_then(|()| key.path_in(&into))
+            .and_then(|path| std::fs::write(path, &data));
+        if let Err(e) = wrote {
+            app.log.error(format!("Could not write to {}: {e}", into.display()));
             return;
         }
         written += 1;
+        copies += usize::from(layer.is_some());
     }
     let models = match as_text {
         0 => String::new(),
         n => format!(" ({n} compiled models as text)"),
     };
-    app.log.info(format!("Exported {written} resources to {}{models}", dir.display()));
+    let copies = match copies {
+        0 => String::new(),
+        n => format!(", {n} overridden copies in folders of their layers"),
+    };
+    app.log.info(format!("Exported {written} resources to {}{models}{copies}", dir.display()));
     app.export_dir = Some(dir);
 }
 
@@ -532,7 +579,7 @@ impl Viewed {
             Content::Script(crate::text::to_editor(&crate::text::decode_script(&data)).0)
         } else if is_text(key.restype, &data) {
             Content::Text(crate::text::to_editor(&codepage.decode(&data)).0)
-        } else if let Some(text) = model_text(key, &data) {
+        } else if let Some(text) = model_text(key, &data, Some(rm)) {
             Content::Text(text)
         } else {
             Content::Binary(hex(&data[..data.len().min(512)]))
@@ -551,7 +598,8 @@ pub(crate) enum Plain {
 }
 
 /// What `data`, a resource of `key`'s type, shows as.
-pub(crate) fn plain(key: ResKey, data: &[u8]) -> Plain {
+/// (`rm`: where a body part's skeleton is found, for a model as text.)
+pub(crate) fn plain(key: ResKey, data: &[u8], rm: Option<&mg_resman::ResMan>) -> Plain {
     if key.restype.is_gff() {
         match Gff::read(data) {
             Ok(g) => Plain::Gff(Box::new(g)),
@@ -561,7 +609,7 @@ pub(crate) fn plain(key: ResKey, data: &[u8]) -> Plain {
         // (Its bytes as Latin-1 where they aren't UTF-8.)
         let latin = || data.iter().map(|&b| b as char).collect();
         Plain::Text(String::from_utf8(data.to_vec()).unwrap_or_else(|_| latin()))
-    } else if let Some(text) = model_text(key, data) {
+    } else if let Some(text) = model_text(key, data, rm) {
         Plain::Text(text)
     } else {
         Plain::Text(hex(&data[..data.len().min(512)]))
@@ -570,8 +618,14 @@ pub(crate) fn plain(key: ResKey, data: &[u8]) -> Plain {
 
 /// A compiled model as the text it compiles from (`mg_mdl::decompile`);
 /// nothing for anything else, or a model that can't be read.
-pub(crate) fn model_text(key: ResKey, data: &[u8]) -> Option<String> {
-    (key.restype == ResType::MDL).then(|| mg_mdl::decompile(data).ok()).flatten()
+pub(crate) fn model_text(
+    key: ResKey,
+    data: &[u8],
+    rm: Option<&mg_resman::ResMan>,
+) -> Option<String> {
+    // (A body part bound to its skeleton: its bones named from it.)
+    let skeleton = |n: &str| rm?.get_named(n, ResType::MDL).ok().map(|d| d.into_owned());
+    (key.restype == ResType::MDL).then(|| mg_mdl::decompile_with(data, &skeleton).ok()).flatten()
 }
 
 /// Draws a [`Plain`] view, scrolling.
@@ -635,16 +689,8 @@ pub(crate) fn resource_ui(app: &mut Moonglow, ui: &mut Ui, key: ResKey, layer: O
         ui.weak(format!("Overridden by {over}, whose copy the game reads."));
     }
     ui.separator();
-    match edit_table {
-        Some(EditTable::InModule) => _ = crate::table_view::open_in_module(app, key),
-        Some(EditTable::Copy(home)) => _ = crate::table_view::edit_copy(app, key, home),
-        Some(EditTable::CopyInFile) => crate::table_view::edit_copy_in_file(app, key),
-        Some(EditTable::InHak(path)) => {
-            if let Some(hak) = crate::hak_view::open_at(app, &path) {
-                crate::table_view::open_in_hak(app, hak, key);
-            }
-        }
-        None => {}
+    if let Some(home) = edit_table {
+        open_table(app, key, home);
     }
     if copy {
         app.actions.push(Action::Apply(Command::new(
@@ -720,17 +766,10 @@ fn hex(data: &[u8]) -> String {
 }
 
 fn value_text(v: &Value) -> String {
+    if let Some(number) = v.number_text() {
+        return number;
+    }
     match v {
-        Value::Byte(x) => x.to_string(),
-        Value::Char(x) => x.to_string(),
-        Value::Word(x) => x.to_string(),
-        Value::Short(x) => x.to_string(),
-        Value::Dword(x) => x.to_string(),
-        Value::Int(x) => x.to_string(),
-        Value::Dword64(x) => x.to_string(),
-        Value::Int64(x) => x.to_string(),
-        Value::Float(x) => x.to_string(),
-        Value::Double(x) => x.to_string(),
         Value::String(b) | Value::ResRef(b) => format!("{:?}", decode(b)),
         Value::LocString(ls) => {
             let mut parts: Vec<String> = Vec::new();
@@ -741,7 +780,7 @@ fn value_text(v: &Value) -> String {
             parts.join(", ")
         }
         Value::Void(b) => format!("{} bytes", b.len()),
-        Value::Struct(_) | Value::List(_) => String::new(),
+        _ => String::new(),
     }
 }
 
@@ -786,7 +825,7 @@ fn gff_tree(ui: &mut Ui, s: &Struct, id: &str) {
 /// editor, the column names stay in sight over the rows and the rows'
 /// numbers beside them, and a column is as wide as the edge of its name
 /// was dragged to (here or there: the widths are the table's).
-fn two_da(
+pub(crate) fn two_da(
     app: &mut Moonglow,
     ui: &mut Ui,
     key: ResKey,

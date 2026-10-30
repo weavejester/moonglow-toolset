@@ -23,6 +23,7 @@ mg-tiles.workspace = true
 fastrand.workspace = true
 mg-schema.workspace = true
 mg-script.workspace = true
+mg-ssf.workspace = true
 rayon.workspace = true
 regex-lite.workspace = true
 serde_json.workspace = true
@@ -30,7 +31,11 @@ toml.workspace = true
 toml_edit.workspace = true
 thiserror.workspace = true
 mg-tlk.workspace = true
+notify.workspace = true
 png.workspace = true
+rars.workspace = true
+sevenz-rust2.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 mg-testkit.workspace = true

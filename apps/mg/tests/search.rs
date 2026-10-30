@@ -10,11 +10,7 @@ use mg_resman::ResKey;
 use serde_json::Value as Json;
 
 fn run(root: &std::path::Path, args: &[&str]) -> (bool, Json, String) {
-    let out = crate::mg()
-        .args(["--root", root.to_str().unwrap(), "--no-user-dir", "--json", "search"])
-        .args(args)
-        .output()
-        .unwrap();
+    let out = crate::mg_on(root, None).args(["--json", "search"]).args(args).output().unwrap();
     let json = serde_json::from_slice(&out.stdout).unwrap_or(Json::Null);
     (out.status.success(), json, String::from_utf8_lossy(&out.stderr).into_owned())
 }
@@ -51,7 +47,19 @@ fn module(dir: &std::path::Path) -> std::path::PathBuf {
     let mut utc = Gff::new(*b"UTC ");
     utc.root.set("Tag", Value::String(b"PRIEST".to_vec()));
     utc.root.set("ItemList", Value::List(vec![held]));
+    let mut priestly = Struct::new(0);
+    priestly.set("Name", Value::String(b"nPriestly".to_vec()));
+    priestly.set("Type", Value::Dword(1));
+    priestly.set("Value", Value::Int(1));
+    utc.root.set("VarTable", Value::List(vec![priestly]));
     m.set_gff(ResKey::parse("priest", ResType::UTC).unwrap(), &utc).unwrap();
+    // An encounter that spawns the priest.
+    let mut spawn = Struct::new(0);
+    spawn.set("ResRef", Value::resref(ResRef::from_str("priest").unwrap()));
+    let mut ute = Gff::new(*b"UTE ");
+    ute.root.set("Tag", Value::String(b"SHRINE".to_vec()));
+    ute.root.set("CreatureList", Value::List(vec![spawn]));
+    m.set_gff(ResKey::parse("shrine", ResType::UTE).unwrap(), &ute).unwrap();
     let path = dir.join("search.mod");
     m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
     path
@@ -80,6 +88,14 @@ fn search_a_module_without_the_game() {
         (Some("amulet.uti"), Some("/VarTable[0]"))
     );
     assert_eq!(vars[1]["carried"], "amulet.uti");
+    // A creature blueprint's, also through the encounter that spawns it.
+    let priestly = found(&["--var", "nPriestly"]);
+    let places: Vec<&str> = priestly.iter().map(|f| f["place"].as_str().unwrap()).collect();
+    assert_eq!(places, ["priest.utc", "shrine.ute › spawns priest.utc"]);
+    assert_eq!(
+        (priestly[0]["spawned"].is_null(), &priestly[1]["spawned"]),
+        (true, &"priest.utc".into())
+    );
     assert_eq!(found(&["--var", "sDeidad", "--var-type", "int"]).len(), 0);
     assert_eq!(found(&["--var", "sDeidad", "--value", "ez*", "--blueprints"]).len(), 2);
     let bonus = found(&["--property", "52", "--subtype", "5", "--value", "3"]);
@@ -104,6 +120,21 @@ fn search_a_module_without_the_game() {
     assert!(found(&["--appearance", "103", "--of", "placeable"]).is_empty());
     assert_eq!(found(&["--field", "tag", "--text", "GUA"]).len(), 1);
     assert_eq!(found(&["--text", "ezra", "--type", "utc"]).len(), 0);
+    // By regular expressions: anywhere unless anchored, case ignored.
+    assert_eq!(found(&["--var", "^sdeidad$", "--value", "^e.ra$", "--regex"]).len(), 2);
+    assert!(found(&["--var", "^sdeidad$"]).is_empty(), "a * pattern, not an expression");
+    assert_eq!(found(&["--field", "^tag$", "--text", "^gua", "--regex"]).len(), 1);
+    // Several conditions, all met: the guard has 3 fighter levels and
+    // appearance 103; nothing has a fighter level and the variable.
+    assert_eq!(found(&["--class", "4", "--appearance", "103"]).len(), 1);
+    assert!(found(&["--class", "4", "--var", "sDeidad"]).is_empty());
+    // A class by its levels, and a number in a range.
+    assert_eq!(found(&["--class", "4", "--levels", "2..3"]).len(), 1);
+    assert_eq!(found(&["--class", "4", "--levels", "3"]).len(), 1);
+    assert!(found(&["--class", "4", "--levels", "4.."]).is_empty());
+    let ranged = found(&["--field", "Appearance_Type", "--number", "100..110"]);
+    assert_eq!(ranged.len(), 1);
+    assert!(found(&["--field", "Appearance_Type", "--number", "..50"]).is_empty());
     // What it can't do.
     let fails = |args: &[&str]| {
         let mut all = vec![p];
@@ -113,10 +144,61 @@ fn search_a_module_without_the_game() {
         json["error"].as_str().unwrap_or_default().to_string()
     };
     assert!(fails(&[]).contains("say what to search for"));
-    assert!(fails(&["--class", "4", "--feat", "1"]).contains("one kind"));
+    assert!(fails(&["--var", "x", "--property", "52", "--value", "3"]).contains("--value"));
+    assert!(fails(&["--class", "4", "--levels", "a..b"]).contains("not a number"));
     assert!(fails(&["--class", "fighter"]).contains("row number"));
     assert!(fails(&["--var", "x", "--var-type", "dog"]).contains("not a variable type"));
     assert!(fails(&["--var", "x", "--type", "nss"]).contains("not a kind of object"));
+    assert!(fails(&["--var", "dei(dad", "--regex"]).contains("dei(dad"));
+}
+
+/// `--any` of the conditions, and `--not` before one to leave out what
+/// meets it, where it is on the command line.
+#[test]
+fn search_for_any_condition_and_leave_one_out() {
+    let dir = mg_testkit::scratch_dir("mg-search-any-not");
+    let path = module(&dir);
+    let p = path.to_str().unwrap();
+    let nowhere = dir.join("no-game");
+    let ask = |args: &[&str]| {
+        let mut all = vec![p];
+        all.extend_from_slice(args);
+        run(&nowhere, &all)
+    };
+    let found = |args: &[&str]| -> Vec<String> {
+        let (ok, json, err) = ask(args);
+        assert!(ok, "{args:?}: {err}");
+        let found = json["found"].as_array().unwrap();
+        found.iter().map(|f| f["place"].as_str().unwrap().to_string()).collect()
+    };
+    // The priest's variable, but not on what carries an item with the
+    // property (the priest carries the amulet); nor on fighters (none).
+    assert!(found(&["--var", "nPriestly", "--not", "--property", "52"]).is_empty());
+    let priestly = ["priest.utc", "shrine.ute › spawns priest.utc"];
+    assert_eq!(found(&["--var", "nPriestly", "--not", "--class", "4"]), priestly);
+    // The guard has appearance 103.
+    assert!(found(&["--class", "4", "--not", "--appearance", "103"]).is_empty());
+    // --not goes with the condition after it, wherever that is.
+    assert_eq!(found(&["--not", "--var", "nPriestly", "--class", "4"]), ["keep › creature GUARD"]);
+    // Any of them: each one's.
+    assert_eq!(
+        found(&["--class", "4", "--var", "nPriestly", "--any"]),
+        ["keep › creature GUARD", "priest.utc", "shrine.ute › spawns priest.utc"]
+    );
+    assert!(found(&["--class", "4", "--var", "nPriestly"]).is_empty(), "all of them");
+    let either = ["--any", "--class", "4", "--var", "sDeidad", "--not", "--property", "52"];
+    assert_eq!(found(&either), ["keep › creature GUARD"]);
+    // What it can't do.
+    let fails = |args: &[&str]| {
+        let (ok, json, _) = ask(args);
+        assert!(!ok, "{args:?}");
+        json["error"].as_str().unwrap_or_default().to_string()
+    };
+    assert!(fails(&["--class", "4", "--not"]).contains("--not goes before"));
+    assert!(fails(&["--not", "--class", "4"]).contains("besides what to leave out"));
+    assert!(fails(&["--not", "--not", "--class", "4", "--var", "x"]).contains("--not twice"));
+    let both = ["--not", "--var", "nPriestly", "--not", "--class", "4"];
+    assert!(fails(&both).contains("besides what to leave out"));
 }
 
 #[test]

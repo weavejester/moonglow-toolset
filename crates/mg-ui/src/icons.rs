@@ -3,7 +3,6 @@
 //! fonts.
 
 use mg_area::ObjectKind;
-use mg_module::palette::BlueprintKind;
 
 pub(crate) const TILES: &str = "🗻";
 pub(crate) const ERASER: &str = "🗑";
@@ -28,13 +27,32 @@ pub(crate) const MUSIC: &str = "🎵";
 pub(crate) const WALKMESH: &str = "👣";
 pub(crate) const SELECT_TILES: &str = "⛶";
 pub(crate) const PAINT: &str = "✏";
-pub(crate) const PROPERTIES: &str = "ℹ";
+/// The area view's Area Properties (the main toolbar's Module Properties
+/// is ℹ).
+pub(crate) const AREA_PROPERTIES: &str = "🔧";
+/// A palette's Gallery (its pictures; the area view's Grid is [`GRID`]).
+pub(crate) const GALLERY: &str = "🖼";
+/// The area view's Show All and Show None, Together (turning several as
+/// one), To Scratch and Save as Prefab…, and its dropdowns' glyphs with
+/// Icons only (Fade Geometry, Snap, Turn).
+pub(crate) const SHOW_ALL: &str = "☑";
+pub(crate) const SHOW_NONE: &str = "☐";
+pub(crate) const TOGETHER: &str = "🔗";
+pub(crate) const TO_SCRATCH: &str = "📤";
+/// The area view's Onto Objects (what is placed goes onto the placeable
+/// or door under the pointer).
+pub(crate) const ONTO_OBJECTS: &str = "📥";
+pub(crate) const FADE: &str = "🏠";
+pub(crate) const SNAP: &str = "📐";
+pub(crate) const TURN: &str = "↻";
 pub(crate) const CAMERA: &str = "🎥";
 pub(crate) const GO_TO_START: &str = "🏃";
 pub(crate) const LIGHTING: &str = "💡";
 pub(crate) const ANIMATIONS: &str = "▶";
 pub(crate) const SOUNDS: &str = "🔊";
 pub(crate) const SOUND_RANGES: &str = "◎";
+/// The area view's Minimap (the area's map in its corner).
+pub(crate) const MINIMAP: &str = "🗾";
 /// An area another builder has claimed, one this builder has, and one
 /// merged (its Tag and ResRef kept): the module tree's marks.
 pub(crate) const CLAIMED: &str = "🔒";
@@ -42,6 +60,12 @@ pub(crate) const CLAIMED_MINE: &str = "✔";
 pub(crate) const MERGED: &str = "📌";
 /// Prefabs: groups of placed objects kept to place again.
 pub(crate) const PREFABS: &str = "🗐";
+/// The palette's lights (the game's invisible light placeables), a sun
+/// as the area view marks them.
+pub(crate) const LIGHTS: &str = "☀";
+/// A window's bar: Maximize, and Restore while it is maximized.
+pub(crate) const MAXIMIZE: &str = "🗖";
+pub(crate) const RESTORE: &str = "🗗";
 
 /// An object type's glyph.
 pub(crate) fn object(kind: ObjectKind) -> &'static str {
@@ -58,20 +82,100 @@ pub(crate) fn object(kind: ObjectKind) -> &'static str {
     }
 }
 
-/// A blueprint type's glyph: its objects'.
-pub(crate) fn blueprint(kind: BlueprintKind) -> &'static str {
-    ObjectKind::from_restype(kind.restype()).map_or("", object)
-}
-
 /// `text` after `glyph`.
 pub(crate) fn labelled(glyph: &str, text: &str) -> String {
     format!("{glyph} {text}")
 }
 
+/// The editors' toolbars' glyphs, with Icons only (beside the others,
+/// their words alone): the script editor's, the conversation editor's,
+/// the model view's and the NUI Creator's.
+pub(crate) mod editor {
+    pub(crate) const SAVE: &str = "💾";
+    pub(crate) const COMPILE: &str = "⚙";
+    pub(crate) const SAVE_AS: &str = "🖹";
+    pub(crate) const PRINT: &str = "🖶";
+    pub(crate) const OPEN: &str = "🗁";
+    pub(crate) const EXTERNAL: &str = "🖊";
+    pub(crate) const FIND: &str = "🔍";
+    pub(crate) const REPLACE: &str = "🔄";
+    pub(crate) const BOOKMARK: &str = "🔖";
+    pub(crate) const DEFINITION: &str = "🎯";
+    pub(crate) const REFERENCES: &str = "🔗";
+    pub(crate) const RENAME: &str = "🏷";
+    pub(crate) const USED_BY: &str = "⤴";
+    pub(crate) const ADD: &str = "➕";
+    pub(crate) const COPY: &str = "📑";
+    pub(crate) const CUT: &str = "✂";
+    pub(crate) const PASTE: &str = "📋";
+    pub(crate) const PASTE_LINK: &str = "📎";
+    pub(crate) const DELETE: &str = "🗑";
+    pub(crate) const EXPAND_ALL: &str = "⏬";
+    pub(crate) const COLLAPSE_ALL: &str = "⏫";
+    pub(crate) const COMMENTS: &str = "💬";
+    pub(crate) const ACTIONS: &str = "⚡";
+    pub(crate) const QUESTS: &str = "📜";
+    pub(crate) const ANIMATIONS: &str = "🎭";
+    pub(crate) const SOUNDS: &str = "🔊";
+    pub(crate) const EXPORT: &str = "📤";
+    pub(crate) const IMPORT: &str = "📥";
+    pub(crate) const SCRIPTS: &str = "📃";
+    pub(crate) const PLAY: &str = "▶";
+    pub(crate) const PAUSE: &str = "⏸";
+    pub(crate) const FRAME: &str = "🔲";
+    pub(crate) const LIGHTS: &str = "💡";
+    pub(crate) const POP_OUT: &str = "🗗";
+    pub(crate) const BUILD: &str = "🔨";
+    pub(crate) const HOW_TO_OPEN: &str = "❓";
+
+    /// Every one (the fonts must have them all).
+    #[cfg(test)]
+    pub(crate) const ALL: [&str; 36] = [
+        SAVE,
+        COMPILE,
+        SAVE_AS,
+        PRINT,
+        OPEN,
+        EXTERNAL,
+        FIND,
+        REPLACE,
+        BOOKMARK,
+        DEFINITION,
+        REFERENCES,
+        RENAME,
+        USED_BY,
+        ADD,
+        COPY,
+        CUT,
+        PASTE,
+        PASTE_LINK,
+        DELETE,
+        EXPAND_ALL,
+        COLLAPSE_ALL,
+        COMMENTS,
+        ACTIONS,
+        QUESTS,
+        ANIMATIONS,
+        SOUNDS,
+        EXPORT,
+        IMPORT,
+        SCRIPTS,
+        PLAY,
+        PAUSE,
+        FRAME,
+        LIGHTS,
+        POP_OUT,
+        BUILD,
+        HOW_TO_OPEN,
+    ];
+}
+
 /// How a toolbar's buttons are labelled (Options › General › Toolbar
 /// buttons): a glyph and its name, or, with Icons only, the glyph alone
-/// and its name in its tip, as Aurora's toolbars have them. The main
-/// toolbar and the area view's take it from the settings each frame.
+/// and its name in its tip (and as its name for a screen reader), as
+/// Aurora's toolbars have them. The main toolbar and the area view's take
+/// it from the settings each frame; the editors' toolbars show their
+/// words alone beside them ([`Tools::word`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Tools {
     pub(crate) icons_only: bool,
@@ -85,6 +189,12 @@ impl Tools {
     /// A button's text: the glyph and the name, or the glyph alone.
     pub(crate) fn label(self, glyph: &str, name: &str) -> String {
         if self.icons_only { glyph.to_string() } else { labelled(glyph, name) }
+    }
+
+    /// An editor's toolbar button's text: its words (`name`), or with
+    /// Icons only its glyph alone.
+    pub(crate) fn word(self, glyph: &str, name: &str) -> String {
+        if self.icons_only { glyph.to_string() } else { name.to_string() }
     }
 
     /// A button's tip from `tip` (with its key, where it has one; empty:
@@ -122,6 +232,38 @@ impl Tools {
         tip: &str,
     ) -> egui::Response {
         let r = ui.toggle_value(on, self.label(glyph, name));
+        self.named(r, name, tip, Some(*on))
+    }
+
+    /// An editor's toolbar toggle: its words, or its glyph ([`Tools::word`]).
+    pub(crate) fn toggle_word(
+        self,
+        ui: &mut egui::Ui,
+        on: &mut bool,
+        glyph: &str,
+        name: &str,
+        tip: &str,
+    ) -> egui::Response {
+        let r = ui.toggle_value(on, self.word(glyph, name));
+        self.named(r, name, tip, Some(*on))
+    }
+
+    /// An editor's toolbar tick: its words, or its glyph.
+    pub(crate) fn checkbox_word(
+        self,
+        ui: &mut egui::Ui,
+        on: &mut bool,
+        glyph: &str,
+        name: &str,
+        tip: &str,
+    ) -> egui::Response {
+        let r = ui.checkbox(on, self.word(glyph, name));
+        if self.icons_only {
+            let (enabled, ticked) = (r.enabled(), *on);
+            r.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, ticked, name)
+            });
+        }
         self.with_tip(r, name, tip)
     }
 
@@ -134,6 +276,26 @@ impl Tools {
         tip: &str,
     ) -> egui::Response {
         let r = ui.add(button);
+        self.named(r, name, tip, None)
+    }
+
+    /// `r`, a button (`selected`: one that stays down while on), with its
+    /// tip, and with Icons only named `name` for a screen reader, not by
+    /// its glyph.
+    pub(crate) fn named(
+        self,
+        r: egui::Response,
+        name: &str,
+        tip: &str,
+        selected: Option<bool>,
+    ) -> egui::Response {
+        if self.icons_only {
+            let enabled = r.enabled();
+            r.widget_info(|| match selected {
+                Some(on) => egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, name),
+                None => egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, name),
+            });
+        }
         self.with_tip(r, name, tip)
     }
 
@@ -163,15 +325,30 @@ impl Tools {
             GRID,
             SOUNDS,
             SOUND_RANGES,
+            MINIMAP,
             AMBIENT,
             MUSIC,
             WALKMESH,
             SELECT_TILES,
             PAINT,
-            PROPERTIES,
             CAMERA,
             GO_TO_START,
+            AREA_PROPERTIES,
+            GALLERY,
+            SHOW_ALL,
+            SHOW_NONE,
+            TOGETHER,
+            ONTO_OBJECTS,
+            TO_SCRATCH,
+            FADE,
+            MAXIMIZE,
+            RESTORE,
+            SNAP,
+            TURN,
+            PREFABS,
+            LIGHTS,
         ]);
+        all.extend(editor::ALL);
         all
     }
 }
@@ -197,6 +374,57 @@ mod tests {
         // (A tip shorter than the name, or cut inside a character.)
         assert_eq!(icons.tip("Properties", "ℹ").as_deref(), Some("Properties\nℹ"));
         assert_eq!(icons.tip("ab", "ℹ").as_deref(), Some("ab\nℹ"));
+    }
+
+    /// A glyph is one command's across the main toolbar and the area
+    /// view's (Module Properties ℹ, Area Properties 🔧; the area's Grid
+    /// ⊞, a palette's Gallery 🖼): the one they share is Go to Start
+    /// Location, the same command on both.
+    #[test]
+    fn a_glyph_is_one_command_s() {
+        let main: Vec<&str> = crate::commands::TOOLBAR.iter().flatten().map(|t| t.1).collect();
+        let area = [
+            START,
+            NIGHT,
+            LIGHTING,
+            SHADOWS,
+            FOG,
+            ANIMATIONS,
+            GRASS,
+            SHADERS,
+            GRID,
+            SOUNDS,
+            SOUND_RANGES,
+            MINIMAP,
+            AMBIENT,
+            MUSIC,
+            WALKMESH,
+            SELECT_TILES,
+            PAINT,
+            CAMERA,
+            GO_TO_START,
+            AREA_PROPERTIES,
+            SHOW_ALL,
+            SHOW_NONE,
+            TOGETHER,
+            ONTO_OBJECTS,
+            TO_SCRATCH,
+            PREFABS,
+            LIGHTS,
+        ];
+        let shared: Vec<&str> = area.into_iter().filter(|g| main.contains(g)).collect();
+        assert_eq!(shared, [GO_TO_START]);
+        let mut seen = area.to_vec();
+        seen.extend(ObjectKind::ALL.map(object));
+        seen.push(GALLERY);
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "a glyph for two of the area's buttons");
+        let mut editor = editor::ALL.to_vec();
+        editor.sort_unstable();
+        editor.dedup();
+        assert_eq!(editor.len(), editor::ALL.len(), "a glyph for two of an editor's buttons");
     }
 
     /// The toolbars' glyphs are all in the app's fonts (none drawn as a

@@ -8,17 +8,7 @@ use std::path::Path;
 use serde_json::Value;
 
 fn run(root: &Path, user: &Path, args: &[&str]) -> (bool, Value) {
-    let (ok, json) = crate::quiet_json_out(
-        crate::mg()
-            .args([
-                "--root",
-                root.to_str().unwrap(),
-                "--user-dir",
-                user.to_str().unwrap(),
-                "--json",
-            ])
-            .args(args),
-    );
+    let (ok, json) = crate::quiet_json_out(crate::mg_on(root, Some(user)).arg("--json").args(args));
     assert!(json.is_object(), "{args:?}: {json}");
     (ok, json)
 }
@@ -71,13 +61,51 @@ fn every_command_answers_in_json() {
     let listed = ok(&["model-files", "plc_a01", &at("files"), "--dry-run"]);
     assert_eq!(listed["files"], files["files"]);
     ok(&["model-files", "plc_a01", &at("files"), "--force"]);
-    let refused = crate::mg()
-        .args(["--root", root.to_str().unwrap(), "--no-user-dir"])
-        .args(["model-files", "plc_a01", &at("files")])
-        .output()
-        .unwrap();
+    let refused =
+        crate::mg_on(&root, None).args(["model-files", "plc_a01", &at("files")]).output().unwrap();
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--force"));
+    // (What it names and the game lacks: the armoire's emitter names a
+    // cloud texture the game has none of.)
+    let missing = files["missing"].as_array().unwrap();
+    assert!(missing.iter().all(|m| !names.contains(&m.as_str().unwrap())), "{missing:?}");
+    // A blueprint's: the blueprint itself first, then its row of
+    // placeables.2da, a 2DA of that row as it is numbered there.
+    let chest = ok(&["model-files", "plc_chest1.utp", &at("chest")]);
+    let names: Vec<&str> =
+        chest["files"].as_array().unwrap().iter().map(|f| f["file"].as_str().unwrap()).collect();
+    assert_eq!(names[0], "plc_chest1.utp", "{names:?}");
+    assert!(names[1].starts_with("placeables.2da-row-"), "{names:?}");
+    let row = std::fs::read_to_string(std::path::Path::new(&at("chest")).join(names[1])).unwrap();
+    assert!(row.starts_with("2DA V2.0") && row.contains("ModelName"), "{row}");
+    assert!(names.iter().any(|n| n.ends_with(".mdl")), "{names:?}");
+    // A waypoint's: its flag, waypoint.2da's model of its appearance (the
+    // module's own blueprint: the game's have no appearance, no flag).
+    let utw = serde_json::json!({
+        "__data_type": "UTW ",
+        "Tag": { "type": "cexostring", "value": "MG_FLAG" },
+        "TemplateResRef": { "type": "resref", "value": "mg_flag" },
+        "Appearance": { "type": "byte", "value": 3 },
+    });
+    std::fs::write(at("mg_flag.utw.json"), utw.to_string()).unwrap();
+    ok(&["gff", &at("mg_flag.utw.json"), "-o", &at("unpacked/mg_flag.utw")]);
+    let module = at("unpacked");
+    let flag = ok(&["model-files", "mg_flag.utw", &at("flag"), "--all", "--module", &module]);
+    let names: Vec<&str> =
+        flag["files"].as_array().unwrap().iter().map(|f| f["file"].as_str().unwrap()).collect();
+    assert_eq!(names[0], "mg_flag.utw", "{names:?}");
+    assert!(names.contains(&"gi_waypoint03.mdl"), "{names:?}");
+    assert!(names[1].starts_with("waypoint.2da-row-"), "{names:?}");
+    // An area's: its own .are and .git, its tileset, its tiles' models and
+    // walkmeshes, and the models of what is placed in it (the chess
+    // pieces, creatures).
+    let area = ok(&["model-files", "chess.are", &at("area"), "--module", c]);
+    let names: Vec<&str> =
+        area["files"].as_array().unwrap().iter().map(|f| f["file"].as_str().unwrap()).collect();
+    assert_eq!(names[..2], ["chess.are", "chess.git"], "{names:?}");
+    assert!(names.iter().any(|n| n.ends_with(".set")), "{names:?}");
+    assert!(names.iter().any(|n| n.ends_with(".wok")), "{names:?}");
+    assert!(names.iter().filter(|n| n.ends_with(".mdl")).count() > 5, "{names:?}");
     // Plugins: the plugin host's own fixture, listed, checked, run and
     // its checks counted.
     let plugins = concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/mg-plugin/tests/fixtures");
@@ -148,6 +176,38 @@ fn every_command_answers_in_json() {
     let synced = ok(&["nwsync", c, &at("repo"), "--with-module"]);
     assert_eq!(synced["sha1"].as_str().unwrap().len(), 40);
     assert!(synced["files"].as_u64().unwrap() > 100);
+    // Nothing unused in it: nothing to prune.
+    let pruned = ok(&["nwsync-prune", &at("repo"), "--dry-run"]);
+    assert_eq!(
+        (pruned["manifests"].as_u64(), pruned["removed"].as_array().map(Vec::len)),
+        (Some(1), Some(0))
+    );
+    assert_eq!(pruned["problems"], serde_json::json!([]));
+    // Uploaded by a stand-in command (nothing goes anywhere but this
+    // folder): each part in turn, in the repository's folder, its output
+    // kept off the JSON.
+    let order = dir.join("order.txt");
+    let _ = std::fs::remove_file(&order);
+    let stand_in = format!("echo {{part}}>> {}", mg_module::nwsync::shell_quoted(&order));
+    let sent = || -> Vec<String> {
+        let text = std::fs::read_to_string(&order).unwrap_or_default();
+        text.lines().map(|l| l.trim().to_string()).collect()
+    };
+    let synced = ok(&["nwsync", c, &at("repo"), "--with-module", "--upload", &stand_in]);
+    assert_eq!(synced["uploaded"], serde_json::json!(["data", "manifests", "latest"]));
+    assert_eq!(sent(), ["data", "manifests", "latest"]);
+    let pruned = ok(&["nwsync-prune", &at("repo"), "--upload", &stand_in]);
+    assert_eq!(pruned["uploaded"], serde_json::json!(["manifests", "data"]));
+    assert_eq!(sent()[3..], ["manifests", "data"]);
+    // A part that fails: what came after it isn't sent, and mg fails.
+    let (success, json) =
+        run(&root, &user, &["nwsync", c, &at("repo"), "--with-module", "--upload", "exit 3"]);
+    assert!(!success);
+    let error = json["error"].as_str().unwrap();
+    assert!(error.contains("failed sending data") && error.contains("nothing was sent"), "{error}");
+    // No command given, and the module's project names none.
+    let (success, json) = run(&root, &user, &["nwsync", c, &at("repo"), "--upload"]);
+    assert!(!success && json["error"].as_str().unwrap().contains("no upload command"));
 
     // A failure.
     let (success, json) = run(&root, &user, &["which", "nothing_at_all.2da"]);

@@ -41,12 +41,7 @@ fn tdod(root: &std::path::Path, dir: &std::path::Path) -> ResMan {
 }
 
 fn gpu() -> Option<Gpu> {
-    mg_testkit::gpu::hold();
-    let g = Gpu::headless();
-    if g.is_none() {
-        eprintln!("skipped: no GPU adapter");
-    }
-    g
+    mg_testkit::gpu::open(Gpu::headless)
 }
 
 fn model(gpu: &Gpu, rm: &ResMan, name: &str) -> Arc<GpuModel> {
@@ -317,7 +312,6 @@ impl Assets for WithCutOuts<'_> {
         Some(mg_render::LoadedTexture {
             texture: self.textures.get(name)?.clone(),
             txi: mg_image::txi::Txi::parse(b"blending punchthrough\n"),
-            mtr: None,
         })
     }
 

@@ -29,7 +29,7 @@ mg-mdl.workspace = true
 mg-module.workspace = true
 mg-nui.workspace = true
 mg-plugin.workspace = true
-mg-preview = { workspace = true, features = ["render"] }
+mg-preview = { workspace = true, features = ["render", "usage"] }
 mg-render.workspace = true
 mg-resman.workspace = true
 mg-rules.workspace = true
@@ -39,9 +39,11 @@ mg-script.workspace = true
 mg-set.workspace = true
 mg-tiles.workspace = true
 mg-tlk.workspace = true
+notify.workspace = true
 ron.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+siphasher.workspace = true
 skrifa.workspace = true
 toml.workspace = true
 wgpu.workspace = true

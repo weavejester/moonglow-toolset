@@ -23,20 +23,11 @@
 //! Aurora's two quirks with blueprints lacking `Comment` (a creature then
 //! gets an empty `Comment`, and its first skill another) are not copied.
 
-use std::f32::consts::FRAC_PI_2;
-
 use mg_core::{LocString, ResRef, ResType};
 use mg_gff::{Struct, Value};
 use mg_rules::{GameData, ObjectKind};
 
-/// Where an instance stands: a position in metres and its model's turn
-/// around Z in radians (its facing less 90°: 0 faces north, as Aurora
-/// places everything).
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Placement {
-    pub position: [f32; 3],
-    pub rotation: f32,
-}
+pub use crate::placement::Placement;
 
 /// What placing a blueprint reads besides it: the rules, and item
 /// blueprints (the module's, else the game's) for inventories.
@@ -49,6 +40,21 @@ impl std::fmt::Debug for Placing<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Placing").finish_non_exhaustive()
     }
+}
+
+/// Places blueprints as `module` has them, else as the game does: `f` is
+/// given the [`Placing`] (its item blueprints read so) and the reader of
+/// any blueprint by key, the one way every tool that makes placed objects
+/// reads them (the area view's palette, painting, Replace, Update
+/// Instances, the store and level-up wizards, `mg update-instances`).
+pub fn with_placing<R>(
+    game: &GameData,
+    module: Option<&crate::Module>,
+    f: impl FnOnce(&Placing<'_>, &dyn Fn(mg_resman::ResKey) -> Option<Struct>) -> R,
+) -> R {
+    let read = |k: mg_resman::ResKey| crate::gff_root(module, game, &k);
+    let item = |r: ResRef| read(mg_resman::ResKey::new(r, ResType::UTI));
+    f(&Placing { game, item: &item }, &read)
 }
 
 /// The GIT list a blueprint type's instances go in, and their struct id
@@ -501,9 +507,6 @@ const MODEL_PARTS: [&str; 3] = ["ModelPart1", "ModelPart2", "ModelPart3"];
 /// An item property's fields in Aurora's order.
 const PROPERTY_ORDER: &[&str] =
     &["PropertyName", "Subtype", "CostTable", "CostValue", "Param1", "Param1Value", "ChanceAppear"];
-/// A store's pages (struct ids: armour, weapons, potions and scrolls,
-/// rings and amulets, miscellaneous), as a new store has them.
-const STORE_PAGES: [u32; 5] = [0, 4, 2, 3, 1];
 const ITEM_COLORS: [&str; 6] =
     ["Leather1Color", "Leather2Color", "Cloth1Color", "Cloth2Color", "Metal1Color", "Metal2Color"];
 
@@ -976,23 +979,18 @@ pub fn instance(
     at: Placement,
     outline: &[[f32; 3]],
 ) -> Option<Struct> {
-    let id = ObjectKind::from_restype(restype)?.struct_id();
+    let kind = ObjectKind::from_restype(restype)?;
+    let id = kind.struct_id();
     let mut s = blueprint.clone();
     s.id = id;
     for label in ["PaletteID", "Comment"] {
         s.remove(label);
     }
-    let [x, y, z] = at.position;
-    let facing = at.rotation + FRAC_PI_2;
+    let [x, y, _] = at.position;
     let f = Value::Float;
+    // (Where it stands, as its kind keeps it: `placement`.)
     let orientation = |s: &mut Struct| {
-        for (label, v) in [
-            ("XPosition", x),
-            ("YPosition", y),
-            ("ZPosition", z),
-            ("XOrientation", facing.cos()),
-            ("YOrientation", facing.sin()),
-        ] {
+        for (label, v) in at.fields(kind) {
             s.set(label, f(v));
         }
     };
@@ -1058,7 +1056,9 @@ pub fn instance(
             s.remove("ID");
             fill(&mut s, STORE);
             if !s.contains("StoreList") {
-                let pages = STORE_PAGES.iter().map(|&id| Struct::new(id)).collect();
+                // (A store's pages, as a new store has them.)
+                let pages =
+                    mg_rules::rows::STORE_PAGES.iter().map(|&(id, _)| Struct::new(id)).collect();
                 s.set("StoreList", Value::List(pages));
             }
             let mut pages = s.list("StoreList").unwrap_or(&[]).to_vec();
@@ -1078,18 +1078,14 @@ pub fn instance(
                 s.set("Static", Value::Byte(u8::from(!usable)));
             }
             held_list(p, &mut s, "ItemList", 0);
-            for (label, v) in [("X", x), ("Y", y), ("Z", z), ("Bearing", at.rotation)] {
-                s.set(label, f(v));
-            }
+            orientation(&mut s);
         }
         ResType::UTD => {
             renew(&mut s, "GenericType", "GenericType_New");
             s.remove("Portrait");
             fill(&mut s, SITUATED);
             fill(&mut s, DOOR);
-            for (label, v) in [("X", x), ("Y", y), ("Z", z), ("Bearing", at.rotation)] {
-                s.set(label, f(v));
-            }
+            orientation(&mut s);
         }
         ResType::UTS => {
             fill(&mut s, SOUND);
@@ -1105,9 +1101,7 @@ pub fn instance(
             let mut sounds = s.list("Sounds").unwrap_or(&[]).to_vec();
             sounds.iter_mut().for_each(|w| w.id = 0);
             s.set("Sounds", Value::List(sounds));
-            for (label, v) in [("XPosition", x), ("YPosition", y), ("ZPosition", z)] {
-                s.set(label, f(v));
-            }
+            orientation(&mut s);
         }
         ResType::UTW => {
             fill(&mut s, WAYPOINT);
@@ -1177,27 +1171,8 @@ fn arrange_as(restype: ResType, s: &mut Struct) {
 /// of its placement), and its outline (triggers' and encounters'
 /// `Geometry`, as stored).
 pub fn placement_of(restype: ResType, s: &Struct) -> (Placement, Vec<[f32; 3]>) {
-    let f = |l: &str| s.float(l).unwrap_or(0.0);
-    let (position, rotation) = match restype {
-        ResType::UTD | ResType::UTP => ([f("X"), f("Y"), f("Z")], f("Bearing")),
-        _ => {
-            let (x, y) = (f("XOrientation"), f("YOrientation"));
-            // Sounds, triggers and encounters don't face anywhere.
-            let facing = if x == 0.0 && y == 0.0 { FRAC_PI_2 } else { y.atan2(x) };
-            ([f("XPosition"), f("YPosition"), f("ZPosition")], facing - FRAC_PI_2)
-        }
-    };
-    let labels = match restype {
-        ResType::UTT => ["PointX", "PointY", "PointZ"],
-        _ => ["X", "Y", "Z"],
-    };
-    let outline = s
-        .list("Geometry")
-        .unwrap_or(&[])
-        .iter()
-        .map(|p| labels.map(|l| p.float(l).unwrap_or(0.0)))
-        .collect();
-    (Placement { position, rotation }, outline)
+    let Some(kind) = ObjectKind::from_restype(restype) else { return Default::default() };
+    (Placement::read(kind, s), crate::placement::outline(kind, s))
 }
 
 /// What Update Instances keeps of a placed object besides where it
@@ -1337,11 +1312,12 @@ pub type Held = Vec<(&'static str, usize)>;
 pub type WhichHeld<'a> = &'a dyn Fn(&[(&'static str, usize)]) -> bool;
 
 /// What an item keeps where it is held, when it is made again from its
-/// blueprint: its place in the grid, how many of it there are, whether it
-/// drops or can be stolen, and whether a store has no end of it. (The
-/// slot it is equipped in is its struct's id, kept too.)
-const HELD_KEPT: [&str; 6] =
-    ["Repos_PosX", "Repos_Posy", "StackSize", "Dropable", "Pickpocketable", "Infinite"];
+/// blueprint: its place in the grid, whether it drops or can be stolen,
+/// and whether a store has no end of it. (The slot it is equipped in is
+/// its struct's id, kept too.) How many there are is the blueprint's, as
+/// Aurora's Update Instances makes them (captured 2026-10-29: a chest's
+/// three and a creature's two became the blueprint's one).
+const HELD_KEPT: [&str; 5] = ["Repos_PosX", "Repos_Posy", "Dropable", "Pickpocketable", "Infinite"];
 
 /// The lists of held items a struct of a GIT list (or an item) has.
 fn held_lists(list: &str) -> &'static [&'static str] {
@@ -1409,9 +1385,9 @@ pub fn held_items(git: &Struct, wanted: &dyn Fn(ResRef) -> bool) -> Vec<(Held, R
 /// [`update`] for the items a GIT's placed objects hold
 /// ([`held_items`]): each that `which` picks (by where it is) made again
 /// from its blueprint, keeping where it is held (its place in the grid,
-/// its slot), how many there are (`StackSize`: twenty arrows stay
-/// twenty) and what is said of it there (`Dropable`, `Pickpocketable`,
-/// a store's `Infinite`). A bag made again holds what its blueprint
+/// its slot) and what is said of it there (`Dropable`, `Pickpocketable`,
+/// a store's `Infinite`); how many there are (`StackSize`) is the
+/// blueprint's, as Aurora's Update Instances has it. A bag made again holds what its blueprint
 /// does. Returns the GIT with them replaced, and how many, or `None`
 /// when it has none of them.
 pub fn update_held(
@@ -1834,7 +1810,8 @@ mod tests {
         let pack = &creature.list("ItemList").unwrap()[0];
         assert_eq!(cost(pack), Some(Value::Dword(99)));
         assert_eq!(pack.get("Dropable"), Some(&Value::Byte(0)), "what is said of it there");
-        assert_eq!(pack.get("StackSize"), Some(&Value::Word(20)), "and how many there are");
+        // How many: the blueprint's, as Aurora makes them again.
+        assert_eq!(pack.get("StackSize"), Some(&Value::Word(1)), "the blueprint's stack");
         let page = &updated.list("StoreList").unwrap()[0].list("StoreList").unwrap()[0];
         let stock = &page.list("ItemList").unwrap()[0];
         assert_eq!(cost(stock), Some(Value::Dword(99)));

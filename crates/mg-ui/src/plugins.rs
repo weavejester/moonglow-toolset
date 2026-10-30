@@ -363,11 +363,16 @@ pub(crate) fn level(l: mg_plugin::Level) -> Level {
 /// checks logged. A check that fails is itself a finding.
 pub(crate) fn check_findings(
     plugins: &[(Plugin, mg_plugin::Settings)],
+    skip: &mg_module::doctor::Skip,
     job: &Context,
 ) -> (Vec<Found>, Vec<(Level, String)>) {
     let (mut findings, mut said) = (Vec::new(), Vec::new());
     for (plugin, settings) in plugins {
         for check in &plugin.manifest.checks {
+            // (One Options › Verify leaves out isn't run.)
+            if skip.plugin_check(&plugin.check_id(&check.id)) {
+                continue;
+            }
             if job.progress.cancelled() {
                 return (findings, said);
             }
@@ -779,6 +784,11 @@ impl Moonglow {
             | Tab::Gff(key)
             | Tab::Dialog(key)
             | Tab::Resource(key) => Selected::Resource(key),
+            // (The resource browser's overridden copies, as their layer
+            // has them.)
+            Tab::ResourceCopy { key, layer } | Tab::ModelCopy { key, layer } => {
+                Selected::Copy { key, layer }
+            }
             _ => return None,
         })
     }
@@ -1074,9 +1084,9 @@ impl Moonglow {
         // module's edits may name them.
         let (mut wrote, mut wrote_files) = (false, false);
         let result = result.and_then(|outcome| {
-            let dir = self.install.as_ref().and_then(|gi| gi.user_dir.clone());
+            let dir = self.install.as_ref().and_then(mg_resman::GameInstall::user_hak_dir);
             for hak in &outcome.haks {
-                let Some(dir) = dir.as_ref().map(|u| u.join("hak")) else {
+                let Some(dir) = dir.clone() else {
                     return Err(PluginError::Package(format!(
                         "{name}: {title}: there is no user folder to write the hak {} into",
                         hak.name
@@ -1343,11 +1353,9 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             .collect();
     let shadowed: Vec<String> =
         (trusts.iter()).filter(|(_, t)| t.runs()).map(|(id, _)| id.clone()).collect();
-    egui::Window::new("Plugins")
-        .open(crate::widgets::open_unless_escape(ctx, "Plugins", &mut open))
-        .default_pos([180.0, 90.0])
-        .default_size([560.0, 480.0])
-        .show(ctx, |ui| {
+    crate::widgets::dialog(ctx, "Plugins", &mut open).default_size([560.0, 480.0]).show(
+        ctx,
+        |ui| {
             ui.label(
                 "A plugin adds commands and checks. It reads the open module and the game data \
              and hands back changes that Undo takes back; it cannot reach your files, the \
@@ -1557,7 +1565,8 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     ui.label(egui::RichText::new(line).monospace().color(l.color(ui)));
                 }
             });
-        });
+        },
+    );
     if let Some((id, on)) = toggle {
         app.enable_plugin(&id, on);
     }
@@ -1754,10 +1763,8 @@ pub(crate) fn settings_window(app: &mut Moonglow, ctx: &egui::Context) {
     let (mut save, mut cancel, mut defaults) = (false, false, false);
     let mut open = true;
     let title = format!("Settings: {}", p.manifest.name);
-    egui::Window::new(&title)
+    crate::widgets::dialog(ctx, &title, &mut open)
         .id(egui::Id::new("plugin-settings"))
-        .open(crate::widgets::open_unless_escape(ctx, &title, &mut open))
-        .default_pos([260.0, 140.0])
         .default_width(460.0)
         .collapsible(false)
         .show(ctx, |ui| {

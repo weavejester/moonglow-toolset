@@ -18,9 +18,12 @@ struct Placed {
     /// The base's node it hangs from.
     attach: Option<usize>,
     scale: f32,
+    /// Its own visual transform within where it hangs (`Part::local`).
+    local: Mat4,
     textures: Option<Arc<HashMap<String, String>>>,
     colors: Option<[u8; 10]>,
     env_map: Option<String>,
+    env_map_default: bool,
     animated: bool,
     /// A body part whose skins are bound to the base's skeleton: its
     /// nodes from here on stand for the base's, posed as the base is
@@ -31,6 +34,16 @@ struct Placed {
 }
 
 impl Placed {
+    /// Where it is drawn within the base's model when it hangs at `at`:
+    /// there, in its own visual transform, at its scale. And where its
+    /// skin's bones are worked out from (without its own transform: a
+    /// skin bound to the base's skeleton follows the skeleton, and is
+    /// carried by the transform as a whole).
+    fn hung(&self, at: Mat4) -> (Mat4, Mat4) {
+        let scale = Mat4::from_scale(Vec3::splat(self.scale));
+        (at * self.local * scale, at * scale)
+    }
+
     /// One of its animations (its own or a supermodel's), by name.
     fn animation(&self, name: &str) -> Option<&Animation> {
         let owner = self.anims.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))?;
@@ -85,6 +98,11 @@ pub struct Composed {
     /// other light, whatever the placeable's **Illuminated** says (read
     /// from the client: `model_light_uniforms` in `client_render.rs`).
     lamps: Vec<anim::Lamp>,
+    /// How many of [`Composed::lamps`] are the base model's (the first).
+    base_lamps: usize,
+    /// Its idle animation keys the base's meshes (their alpha or
+    /// self-illumination, or their vertices): played with the pose.
+    idle_keys_meshes: bool,
     /// Models named by the preview that could not be loaded.
     pub missing: Vec<String>,
     /// Posing it failed once: it is drawn no more (rather than fail again
@@ -132,10 +150,12 @@ fn place_unguarded(
         gpu: Arc::new(GpuModel::new(gpu, model)),
         attach,
         scale: part.scale,
+        local: part.local.unwrap_or(Mat4::IDENTITY),
         textures: (!part.textures.is_empty())
             .then(|| Arc::new(part.textures.iter().map(|(a, b)| (a.clone(), b.clone())).collect())),
         colors: part.colors,
         env_map: part.env_map.clone(),
+        env_map_default: part.env_map_default,
         animated: part.animated,
         skeleton,
         anims,
@@ -187,28 +207,6 @@ fn bound_to_skeleton(skin: &mg_mdl::Skin, part: &Model, skeleton: &Model) -> boo
         && skin.bones.iter().all(|&b| b < nodes)
 }
 
-/// A model's nodes in the order of a depth-first walk of its tree from its
-/// first root, children in their order: where the engine binds a skin's
-/// bones (nwn-mdl-spec MDL-SKIN-011). A binary model's nodes are read in
-/// this order; one read from text keeps the file's. Nodes outside the tree
-/// follow, in their order.
-fn tree_order(model: &Model) -> Vec<usize> {
-    let mut out = Vec::with_capacity(model.nodes.len());
-    let mut seen = vec![false; model.nodes.len()];
-    let root = model.nodes.iter().position(|n| n.parent.is_none());
-    let mut stack: Vec<usize> = root.into_iter().collect();
-    while let Some(i) = stack.pop() {
-        if std::mem::replace(&mut seen[i], true) {
-            continue;
-        }
-        out.push(i);
-        let children = model.nodes[i].children.iter().rev();
-        stack.extend(children.filter(|&&c| c < model.nodes.len() && !seen[c]));
-    }
-    out.extend((0..model.nodes.len()).filter(|&i| !seen[i]));
-    out
-}
-
 /// Where a body part's stand-ins for the skeleton's nodes start, and the
 /// base's node each stands for.
 #[derive(Debug)]
@@ -236,7 +234,7 @@ fn on_skeleton(model: &Model, skeleton: &Model) -> Option<(Arc<Model>, Skeleton)
     // A compiled skin's bone is the skeleton's node at that place in a
     // depth-first walk of its tree (nwn-mdl-spec MDL-SKIN-011: not its part
     // number, which a skeleton on a supermodel takes from that one's).
-    let nodes = tree_order(skeleton);
+    let nodes = skeleton.tree_order();
     let mut on = model.clone();
     for (n, was) in on.nodes.iter_mut().zip(&model.nodes) {
         if !bound(was) {
@@ -298,12 +296,30 @@ impl Composed {
             idle: preview.idle.clone(),
             lights: preview.lights.clone(),
             lamps: Vec::new(),
+            base_lamps: 0,
+            idle_keys_meshes: false,
             missing,
             failed: Default::default(),
         };
         // (Once: where they are as it stands, not as each frame poses it.)
         let name = c.base.gpu.model.name.clone();
         c.lamps = mg_render::guard::guarded(&name, || c.lamps_standing()).unwrap_or_default();
+        let base_model = &*c.base.gpu.model;
+        c.base_lamps = base_model
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, mg_mdl::NodeKind::Light(_)))
+            .count()
+            .min(c.lamps.len());
+        let idle = c.idle.as_deref().and_then(|a| playing(a, |n| c.base.animation(n)));
+        c.idle_keys_meshes = idle.is_some_and(|a| {
+            a.nodes.iter().any(|n| {
+                n.anim_mesh.is_some()
+                    || n.controllers
+                        .iter()
+                        .any(|k| matches!(k.name.as_str(), "alpha" | "selfillumcolor"))
+            })
+        });
         Some(c)
     }
 
@@ -327,7 +343,7 @@ impl Composed {
                 continue;
             }
             let at = p.attach.and_then(|i| base_pose.get(i).copied()).unwrap_or(Mat4::IDENTITY);
-            let hung = at * Mat4::from_scale(Vec3::splat(p.scale));
+            let (hung, _) = p.hung(at);
             let own = anim::lamps_layers(&p.gpu.model, &[], 0.0, &p.gpu.rest);
             lamps.extend(
                 own.into_iter().map(|l| anim::Lamp { at: hung.transform_point3(l.at), ..l }),
@@ -398,14 +414,29 @@ impl Composed {
         let instance = |p: &Placed, transform: Mat4, pose: Option<Arc<Vec<Mat4>>>| Instance {
             pose,
             env_map: p.env_map.clone(),
+            env_map_default: p.env_map_default,
             plt_colors: p.colors,
             textures: p.textures.clone(),
             ..Instance::new(p.gpu.clone(), transform)
         };
-        let mut out = vec![instance(&self.base, transform, Some(base_pose.clone()))];
+        // (The base in its own visual transform too, where it has one: a
+        // placed composite item's bottom part.)
+        let mut out =
+            vec![instance(&self.base, transform * self.base.local, Some(base_pose.clone()))];
+        // Its idle animation's keys of the base's meshes (a card's
+        // self-illumination keyed in a placeable's `default`, which the
+        // client plays on a dynamic placeable:
+        // `reading_static_placeable_default_animation`).
+        if self.idle_keys_meshes
+            && animation.is_some()
+            && animation == self.idle.as_deref()
+            && let Some(a) = base_anim
+        {
+            out[0].state = Some(Arc::new(anim::mesh_state(&self.base.gpu, a, t)));
+        }
         for p in &self.parts {
             let at = p.attach.and_then(|i| base_pose.get(i).copied()).unwrap_or(Mat4::IDENTITY);
-            let hung = at * Mat4::from_scale(Vec3::splat(p.scale));
+            let (hung, bones) = p.hung(at);
             let placed = transform * hung;
             // Animated parts play the animation on their own nodes: their
             // own (wings, tails), else the base's (robe and cloak bones).
@@ -419,7 +450,7 @@ impl Composed {
                 let worn = self.base.gpu.model.animation_scale;
                 own.or(base_anim).map(|a| Arc::new(anim::pose_worn(&p.gpu.model, a, t, worn)))
             } else {
-                p.skeleton_pose(&base_pose, hung).map(Arc::new)
+                p.skeleton_pose(&base_pose, bones).map(Arc::new)
             };
             out.push(instance(p, placed, pose));
         }
@@ -431,6 +462,34 @@ impl Composed {
     pub fn point_lights(&self, transform: Mat4) -> Vec<PointLight> {
         let mut lights = self.row_lights(transform);
         lights.extend(self.lamps.iter().filter_map(|l| l.placed(transform, &|_| None)));
+        lights
+    }
+
+    /// [`Composed::point_lights`] as `animation` has them `t` seconds in:
+    /// the base model's light nodes take its keys (their colour, radius and
+    /// multiplier: a flicker keyed in a placeable's `default`, which the
+    /// client plays on a dynamic placeable, `reading_static_placeable_default_animation`),
+    /// where they move with the pose; the parts' as they stand.
+    pub fn point_lights_at(
+        &self,
+        animation: Option<&str>,
+        t: f32,
+        transform: Mat4,
+    ) -> Vec<PointLight> {
+        // (Only an object whose base has light nodes looks its animation
+        // up: every frame, for every object.)
+        let base_anim = animation
+            .filter(|_| self.base_lamps > 0)
+            .and_then(|a| playing(a, |n| self.base.animation(n)));
+        let Some(a) = base_anim else {
+            return self.point_lights(transform);
+        };
+        let model = &*self.base.gpu.model;
+        let pose = anim::pose(model, a, t);
+        let mut lights = self.row_lights(transform);
+        let base = anim::lamps_layers(model, &[a], t, &pose);
+        let parts = self.lamps.iter().skip(self.base_lamps);
+        lights.extend(base.iter().chain(parts).filter_map(|l| l.placed(transform, &|_| None)));
         lights
     }
 
@@ -475,9 +534,58 @@ impl Composed {
         sum
     }
 
+    /// How much of it a viewer in direction `towards` (from the model, in
+    /// its space) sees at rest, square meters: the drawn triangles of its
+    /// models (the base's and the parts') that face that way, each by its
+    /// area as seen from there. Unlike [`Composed::facing`] it goes by
+    /// area and takes every part: a sword's blade (a part of its own) has
+    /// as many vertices along its edges as on its flats, and from the side
+    /// of its flat shows many times what it shows edge on.
+    pub fn seen_area(&self, towards: Vec3) -> f32 {
+        let towards = towards.normalize_or_zero();
+        let mut sum = 0.0;
+        self.each_mesh_in(&self.stance(None, 0.0), &mut |mesh, places| {
+            let corner = |i: u32| places.get(i as usize).copied();
+            let faces = mesh.faces.iter().map(|f| f.vertices);
+            for [a, b, c] in faces.chain(mesh.drawn.iter().copied()) {
+                if let (Some(a), Some(b), Some(c)) = (corner(a), corner(b), corner(c)) {
+                    sum += ((b - a).cross(c - a).dot(towards) * 0.5).max(0.0);
+                }
+            }
+        });
+        sum
+    }
+
+    /// Where the vertices of its drawn meshes (the base's and the parts')
+    /// are as it stands in `stance`, a skin's where its bones put them:
+    /// what a picture of it is framed on, as tightly as the picture sees
+    /// it (a dragon is long and its box, corner to corner, much more).
+    pub fn points_in(&self, stance: &Stance) -> Vec<Vec3> {
+        let mut points = Vec::new();
+        self.each_mesh_in(stance, &mut |_, places| points.extend_from_slice(places));
+        points
+    }
+
+    /// Each drawn mesh of its models with its vertices where `stance`
+    /// puts them, in the preview's space.
+    fn each_mesh_in(&self, stance: &Stance, each: &mut dyn FnMut(&mg_mdl::Mesh, &[Vec3])) {
+        for (gm, nodes, to) in self.models_in(stance) {
+            for m in &gm.meshes {
+                let Some(mesh) = gm.model.nodes.get(m.node).and_then(|n| n.mesh()) else {
+                    continue;
+                };
+                let places = skinned_places(gm, m, nodes, to).unwrap_or_else(|| {
+                    let at = to * nodes.get(m.node).copied().unwrap_or(Mat4::IDENTITY);
+                    mesh.vertices.iter().map(|v| at.transform_point3(Vec3::from(*v))).collect()
+                });
+                each(mesh, &places);
+            }
+        }
+    }
+
     /// Bounds of everything in the rest pose (for framing a camera).
     pub fn bounds(&self) -> (Vec3, Vec3) {
-        self.bounds_with(&self.base.gpu.rest, None)
+        self.bounds_of(&self.stance(None, 0.0))
     }
 
     /// The box around the base model's meshes that are not drawn (`render
@@ -508,13 +616,51 @@ impl Composed {
     /// taller or shorter than at rest, and a picture framed by its rest
     /// cut its head off.
     pub fn bounds_in(&self, animation: Option<&str>, t: f32) -> (Vec3, Vec3) {
+        self.bounds_of(&self.stance(animation, t))
+    }
+
+    /// How it stands in `animation` at `t` (`None`, or one it lacks: at
+    /// rest): its models' nodes, as [`Composed::bounds_in`] boxes it and
+    /// [`Composed::ray_hit_in`] meets it. Made once and kept, a click on
+    /// it is tried against what the box is around.
+    pub fn stance(&self, animation: Option<&str>, t: f32) -> Stance {
         let playing = animation.and_then(|a| playing(a, |n| self.base.animation(n)));
-        match (playing, animation) {
-            (Some(a), Some(asked)) => {
-                self.bounds_with(&anim::pose(&self.base.gpu.model, a, t), Some((asked, a, t)))
-            }
-            _ => self.bounds(),
-        }
+        let (base, playing) = match (playing, animation) {
+            (Some(a), Some(asked)) => (anim::pose(&self.base.gpu.model, a, t), Some((asked, a, t))),
+            _ => (self.base.gpu.rest.clone(), None),
+        };
+        // The parts: those that play it (wings, tails, robes) as they
+        // stand in it too, as [`Composed::instances`] draws them; the
+        // others on the base's nodes.
+        let parts = (self.parts.iter())
+            .map(|p| {
+                let at = p.attach.and_then(|i| base.get(i).copied()).unwrap_or(Mat4::IDENTITY);
+                let posed = playing.filter(|_| p.animated).and_then(|(asked, base, t)| {
+                    let find = |name: &str| p.animation(name);
+                    let own = find(asked)
+                        .or_else(|| ["creadyl", "cpause1", "pause1"].iter().find_map(|a| find(a)));
+                    let worn = self.base.gpu.model.animation_scale;
+                    Some(anim::pose_worn(&p.gpu.model, own.or(Some(base))?, t, worn))
+                });
+                let (hung, bones) = p.hung(at);
+                (posed.or_else(|| p.skeleton_pose(&base, bones)), hung)
+            })
+            .collect();
+        Stance { base, parts }
+    }
+
+    /// Its models with the nodes `stance` has: the base's, and each
+    /// part's with where it hangs.
+    fn models_in<'a>(
+        &'a self,
+        stance: &'a Stance,
+    ) -> impl Iterator<Item = (&'a GpuModel, &'a [Mat4], Mat4)> {
+        let base = std::iter::once((&*self.base.gpu, stance.base.as_slice(), Mat4::IDENTITY));
+        let parts =
+            self.parts.iter().zip(&stance.parts).map(|(p, (posed, hung))| {
+                (&*p.gpu, posed.as_deref().unwrap_or(&p.gpu.rest), *hung)
+            });
+        base.chain(parts)
     }
 
     /// How far along a ray (from `origin` along `dir`, in the preview's own
@@ -524,6 +670,13 @@ impl Composed {
     /// preview with no mesh to meet, an emitter alone: see
     /// [`Composed::has_meshes`]).
     pub fn ray_hit(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
+        self.ray_hit_in(&self.stance(None, 0.0), origin, dir)
+    }
+
+    /// [`Composed::ray_hit`] with its nodes as `stance` has them
+    /// ([`Composed::stance`]): a creature as it stands in its pause, where
+    /// its box is.
+    pub fn ray_hit_in(&self, stance: &Stance, origin: Vec3, dir: Vec3) -> Option<f32> {
         let mut best: Option<f32> = None;
         let mut meet = |gm: &GpuModel, nodes: &[Mat4], to: Mat4| {
             for m in &gm.meshes {
@@ -564,13 +717,8 @@ impl Composed {
                 }
             }
         };
-        let rest = &self.base.gpu.rest;
-        meet(&self.base.gpu, rest, Mat4::IDENTITY);
-        for p in &self.parts {
-            let at = p.attach.and_then(|i| rest.get(i).copied()).unwrap_or(Mat4::IDENTITY);
-            let hung = at * Mat4::from_scale(Vec3::splat(p.scale));
-            let posed = p.skeleton_pose(rest, hung);
-            meet(&p.gpu, posed.as_deref().unwrap_or(&p.gpu.rest), hung);
+        for (gm, nodes, to) in self.models_in(stance) {
+            meet(gm, nodes, to);
         }
         best
     }
@@ -580,11 +728,9 @@ impl Composed {
         self.models().any(|m| !m.meshes.is_empty())
     }
 
-    /// The box around it with the base's nodes at `pose` (model space); in
-    /// an animation (`playing`: the one asked for, the base's and the
-    /// time), the parts that play it (wings, tails, robes) as they stand in
-    /// it too, as [`Composed::instances`] draws them.
-    fn bounds_with(&self, pose: &[Mat4], playing: Option<(&str, &Animation, f32)>) -> (Vec3, Vec3) {
+    /// The box around it with its nodes as `stance` has them (model
+    /// space).
+    pub fn bounds_of(&self, stance: &Stance) -> (Vec3, Vec3) {
         let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         let mut add = |gm: &GpuModel, nodes: &[Mat4], to: Mat4| {
             for m in &gm.meshes {
@@ -601,34 +747,28 @@ impl Composed {
                     }
                     continue;
                 }
-                for c in 0..8 {
-                    let p = Vec3::new(
-                        if c & 1 == 0 { m.min.x } else { m.max.x },
-                        if c & 2 == 0 { m.min.y } else { m.max.y },
-                        if c & 4 == 0 { m.min.z } else { m.max.z },
-                    );
+                for p in mg_render::box_corners(m.min, m.max) {
                     let w = (to * node).transform_point3(p);
                     min = min.min(w);
                     max = max.max(w);
                 }
             }
         };
-        add(&self.base.gpu, pose, Mat4::IDENTITY);
-        for p in &self.parts {
-            let at = p.attach.and_then(|i| pose.get(i).copied()).unwrap_or(Mat4::IDENTITY);
-            let posed = playing.filter(|_| p.animated).and_then(|(asked, base, t)| {
-                let find = |name: &str| p.animation(name);
-                let own = find(asked)
-                    .or_else(|| ["creadyl", "cpause1", "pause1"].iter().find_map(|a| find(a)));
-                let worn = self.base.gpu.model.animation_scale;
-                Some(anim::pose_worn(&p.gpu.model, own.or(Some(base))?, t, worn))
-            });
-            let hung = at * Mat4::from_scale(Vec3::splat(p.scale));
-            let posed = posed.or_else(|| p.skeleton_pose(pose, hung));
-            add(&p.gpu, posed.as_deref().unwrap_or(&p.gpu.rest), hung);
+        for (gm, nodes, to) in self.models_in(stance) {
+            add(gm, nodes, to);
         }
         if min.x > max.x { (Vec3::splat(-1.0), Vec3::splat(1.0)) } else { (min, max) }
     }
+}
+
+/// How a preview stands: its models' nodes in an animation at a time, or
+/// at rest ([`Composed::stance`]).
+#[derive(Debug, Clone, Default)]
+pub struct Stance {
+    /// The base model's nodes.
+    base: Vec<Mat4>,
+    /// Each part's nodes (`None`: at rest), and where it hangs.
+    parts: Vec<(Option<Vec<Mat4>>, Mat4)>,
 }
 
 /// A drawn mesh's skin, if it is skinned: its bones, and each vertex's
@@ -678,6 +818,37 @@ fn skinned_places(
         if total > 0.0 { at / total } else { (to * node).transform_point3(v) }
     };
     Some(vertices.iter().zip(weights).map(place).collect())
+}
+
+/// A camera looking at `points` from `yaw` and `pitch` (radians, as
+/// [`mg_render::Camera::orbit`] takes them), framed tightly on them: what
+/// it looks at, and how far from it, so that every point is within a view
+/// `fov_y` tall (radians) and `aspect` times as wide, as the view sees
+/// them (a long thing seen from its side fills its picture, where a ball
+/// around its box left most of the picture empty). `None` for no points.
+pub fn framed_on(
+    points: &[Vec3],
+    (yaw, pitch): (f32, f32),
+    fov_y: f32,
+    aspect: f32,
+) -> Option<(Vec3, f32)> {
+    let dir = Vec3::new(pitch.cos() * yaw.cos(), pitch.cos() * yaw.sin(), pitch.sin());
+    let right = Vec3::Z.cross(dir).normalize_or_zero();
+    let up = dir.cross(right);
+    // In the view's axes: across, up, and towards the eye.
+    let seen = |p: &Vec3| Vec3::new(p.dot(right), p.dot(up), p.dot(dir));
+    let first = seen(points.first()?);
+    let (min, max) = points.iter().map(seen).fold((first, first), |(a, b), p| (a.min(p), b.max(p)));
+    let mid = (min + max) * 0.5;
+    let target = right * mid.x + up * mid.y + dir * mid.z;
+    let ty = (fov_y * 0.5).tan();
+    let tx = ty * aspect.max(0.01);
+    // (Each point within the view's edges, from where the eye is.)
+    let distance = points.iter().fold(0.05f32, |d, p| {
+        let v = seen(p) - mid;
+        d.max(v.z + (v.x.abs() / tx).max(v.y.abs() / ty))
+    });
+    Some((target, distance))
 }
 
 /// How far along a ray (from `origin` along `dir`) it meets the box
@@ -825,7 +996,7 @@ mod ray_tests {
             node dummy hand\n  parent arm\nendnode\n\
             endmodelgeom s\ndonemodel s\n";
         let m = Model::read(text.as_bytes()).unwrap();
-        let names: Vec<&str> = tree_order(&m).iter().map(|&i| m.nodes[i].name.as_str()).collect();
+        let names: Vec<&str> = m.tree_order().iter().map(|&i| m.nodes[i].name.as_str()).collect();
         assert_eq!(names, ["s", "arm", "hand", "head"]);
     }
 
@@ -863,6 +1034,41 @@ mod ray_tests {
         );
     }
 
+    /// A part's own visual transform (a placed creature's head scaled,
+    /// `Part::local`) places it within the node it hangs from: the part
+    /// bound to the skeleton, twice the size about `pelvis_g` (half a meter
+    /// up), has its torso at 1.5 m and is twice as wide, drawn and boxed
+    /// alike.
+    #[test]
+    fn a_part_s_own_visual_transform_places_it_about_its_node() {
+        mg_testkit::gpu::hold();
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("skipped: no GPU");
+            return;
+        };
+        let (base, part) = (Arc::new(skeleton()), Arc::new(bound_part()));
+        let load = |name: &str| match name {
+            "base" => Some(base.clone()),
+            "part" => Some(part.clone()),
+            _ => None,
+        };
+        let twice = crate::visual_matrix(2.0, [0.0; 3], [0.0; 3]);
+        let part = crate::Part {
+            attach: Some("pelvis_g".into()),
+            local: Some(twice),
+            ..crate::Part::new("part")
+        };
+        let preview = Preview { parts: vec![part], ..Preview::model("base") };
+        let c = Composed::new(&gpu, &preview, &load).unwrap();
+        let (min, max) = c.bounds();
+        assert!((min.z - 1.5).abs() < 1e-4 && (max.z - 1.5).abs() < 1e-4, "{min} {max}");
+        assert!((max.x - 2.0).abs() < 1e-4 && (max.y - 2.0).abs() < 1e-4, "{min} {max}");
+        let instances = c.instances(None, 0.0, Mat4::IDENTITY);
+        let pose = instances[1].pose.as_ref().expect("posed by the skeleton");
+        let torso = instances[1].transform * pose[4];
+        assert!(torso.w_axis.truncate().abs_diff_eq(Vec3::Z * 1.5, 1e-5), "{torso}");
+    }
+
     #[test]
     fn a_ray_meets_a_triangle_ahead_of_it() {
         let (a, b, c) = (Vec3::ZERO, Vec3::X, Vec3::Y);
@@ -898,5 +1104,36 @@ mod ray_tests {
         assert_eq!(name(playing("deadfnt", find)), Some("deadfnt".into()));
         assert_eq!(name(playing("CPAUSE1", find)), Some("pause1".into()));
         assert_eq!(name(playing("pause1", find)), Some("pause1".into()));
+    }
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    /// A long thing (a dragon's length, 8 m by 1 by 1) seen from its side
+    /// is framed nearer than a ball around its box, and every corner of
+    /// it is in the view, one at its edge.
+    #[test]
+    fn a_long_thing_is_framed_tightly() {
+        let mut points = Vec::new();
+        for c in 0..8 {
+            let pick = |bit: i32, low: f32, high: f32| if c & bit == 0 { low } else { high };
+            points.push(Vec3::new(pick(1, -4.0, 4.0), pick(2, -0.5, 0.5), pick(4, 0.0, 1.0)));
+        }
+        let (yaw, pitch) = (-std::f32::consts::FRAC_PI_2, 20f32.to_radians());
+        let fov = mg_render::Camera::orbit(Vec3::ZERO, 1.0, yaw, pitch).fov_y;
+        let (target, distance) = framed_on(&points, (yaw, pitch), fov, 1.0).unwrap();
+        let ball = (Vec3::new(8.0, 1.0, 1.0).length() * 0.5) / (fov * 0.5).sin();
+        assert!(distance < ball, "{distance} against {ball}");
+        let camera = mg_render::Camera::orbit(target, distance, yaw, pitch);
+        let clip = camera.projection(1.0) * camera.view();
+        let edge = points.iter().fold(0.0f32, |most, p| {
+            let p = clip.project_point3(*p);
+            assert!(p.x.abs() <= 1.0 + 1e-4 && p.y.abs() <= 1.0 + 1e-4, "{p:?} in the view");
+            most.max(p.x.abs()).max(p.y.abs())
+        });
+        assert!(edge > 0.99, "one at the edge: {edge}");
+        assert_eq!(framed_on(&[], (yaw, pitch), fov, 1.0), None);
     }
 }

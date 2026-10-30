@@ -22,6 +22,7 @@ use mg_module::locks::Lock;
 use mg_module::nasher::Outside;
 use mg_module::outside::OutsideFound;
 use mg_module::palette::BlueprintKind;
+use mg_module::watch::Watch;
 use mg_resman::ResKey;
 
 use crate::{Moonglow, Tab};
@@ -47,6 +48,22 @@ pub(crate) struct OutsideState {
     /// custom palettes are still to be looked at
     /// ([`Moonglow::look_at_palettes`]).
     palettes: Option<(PathBuf, Vec<ResKey>)>,
+    /// What a watch asks for a frame with, when it hears a change, and
+    /// whether at once ([`crate::jobs::wake`]).
+    pub(crate) repaint: Option<(egui::Context, bool)>,
+    /// Scripts read again being compiled, a few each frame.
+    compiling: Option<Compiling>,
+    /// The watches walk the files rather than be told by the system (a
+    /// test of the walk).
+    pub(crate) walk: bool,
+}
+
+impl OutsideState {
+    /// What a watch calls when it hears a change: a frame asked for.
+    fn on_change(&self) -> Option<mg_module::watch::OnChange> {
+        let (ctx, at_once) = self.repaint.clone()?;
+        Some(Arc::new(move || crate::jobs::wake(&ctx, at_once)))
+    }
 }
 
 /// A look at the module's files under way ([`Moonglow::look_outside`]).
@@ -56,6 +73,11 @@ struct Looking {
     root: PathBuf,
     started: Instant,
     done: std::sync::mpsc::Receiver<Looked>,
+    /// What the thread found, kept while a text field typed in sets its
+    /// text first ([`Moonglow::take_looked`]).
+    found: Option<Looked>,
+    /// The keyboard was taken from such a field in the frame before.
+    left_text: bool,
 }
 
 /// What a look found.
@@ -66,106 +88,6 @@ struct Looked {
     /// module had the area when the look began: put back as the area is
     /// read again ([`Moonglow::take_outside`]).
     locks: HashMap<ResKey, (Arc<[u8]>, Vec<Lock>)>,
-}
-
-/// A thread that looks at a module folder's (or a nasher project's) files
-/// every few seconds and says when any was changed, added or removed, so
-/// that the window's thread reads them only then. (Looked at there, a
-/// large module's thousands of files stalled the window for a moment
-/// every few seconds: a builder saw it.)
-#[derive(Debug)]
-struct Watch {
-    /// The folders (with what is under them, where `deep`) and files
-    /// looked at.
-    paths: Vec<PathBuf>,
-    changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Drop for Watch {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// The files `paths` name, and those in the folders they name, as one
-/// number: their names, times and sizes. With `deep`, the folders under
-/// a folder too (not what a version control or a build keeps there:
-/// `.git`, `.nasher` and other hidden folders).
-fn signature(paths: &[PathBuf], deep: bool) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut dirs = Vec::new();
-    for path in paths {
-        match std::fs::metadata(path) {
-            Ok(meta) if meta.is_dir() => dirs.push(path.clone()),
-            Ok(meta) => (path, meta.modified().ok(), meta.len()).hash(&mut h),
-            Err(_) => path.hash(&mut h),
-        }
-    }
-    while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        let mut seen: Vec<(std::ffi::OsString, Option<std::time::SystemTime>, u64)> = Vec::new();
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.is_dir() {
-                if deep && !name.to_string_lossy().starts_with('.') {
-                    dirs.push(e.path());
-                }
-            } else {
-                seen.push((name, meta.modified().ok(), meta.len()));
-            }
-        }
-        seen.sort();
-        (dir, seen).hash(&mut h);
-    }
-    h.finish()
-}
-
-impl Watch {
-    fn start(paths: Vec<PathBuf>, deep: bool, every: std::time::Duration) -> Watch {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let changed = std::sync::Arc::new(AtomicBool::new(false));
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let (dirs, flag, done) = (paths.clone(), changed.clone(), stop.clone());
-        let work = move || {
-            let mut last = signature(&dirs, deep);
-            // (Looked at once at the start, and only now: what changed
-            // before this first look is in it, and would never be said.)
-            flag.store(true, Ordering::Relaxed);
-            while !done.load(Ordering::Relaxed) {
-                // (In short naps, to end soon after the module closes.)
-                let until = std::time::Instant::now() + every;
-                while std::time::Instant::now() < until && !done.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                let mut now = signature(&dirs, deep);
-                if now == last {
-                    continue;
-                }
-                // A burst of changes (a pull, a checkout) is said once it
-                // is over: when a look a moment later finds the same, or
-                // after a while of changes.
-                let settle = (every / 6).min(Duration::from_millis(500));
-                for _ in 0..20 {
-                    std::thread::sleep(settle);
-                    let again = signature(&dirs, deep);
-                    if again == now || done.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    now = again;
-                }
-                last = now;
-                flag.store(true, Ordering::Relaxed);
-            }
-        };
-        if std::thread::Builder::new().name("moonglow files".into()).spawn(work).is_err() {
-            // (No thread: looked at every time, as before.)
-            stop.store(true, Ordering::Relaxed);
-            changed.store(true, Ordering::Relaxed);
-        }
-        Watch { paths, changed, stop }
-    }
 }
 
 /// Whether two resources are the same bytes: at once where they are the
@@ -199,12 +121,14 @@ fn named(changes: &[Outside]) -> String {
 }
 
 impl Moonglow {
-    /// The module's folder or nasher project, if it has one.
+    /// The module's folder or nasher project, or the file it is kept in
+    /// (a `.mod`), if it has one.
     fn module_root(&self) -> Option<PathBuf> {
         self.ws.as_ref().and_then(|ws| {
             let m = &ws.module;
             (m.project.as_ref().map(|p| p.root().to_path_buf()))
                 .or_else(|| m.folder.as_ref().map(|f| f.dir().to_path_buf()))
+                .or_else(|| m.archive.as_ref().map(|a| a.path().to_path_buf()))
         })
     }
 
@@ -213,42 +137,57 @@ impl Moonglow {
     /// change among them. The watch is the module's place's: begun with
     /// it, ended when the module is closed or kept elsewhere.
     pub fn reload_changed_files(&mut self) {
-        use std::sync::atomic::Ordering;
         let Some(root) = self.module_root() else {
             self.outside.watch = None;
             self.outside.looking = None;
-            // (A module kept in one file: its own project files beside it,
-            // `krezk.moonglow.toml`, looked at as they are, a few small
-            // files.)
-            if let Some(ws) = self.ws.as_mut()
-                && matches!(ws.module.location, Some(mg_module::ModuleLocation::Archive(_)))
-            {
-                let had = ws.module.project_file.found;
-                if ws.module.reread_project_file() {
-                    self.log_project_file(true, had);
-                }
-            }
             return;
         };
+        // A module kept in one file: the file (and its own project files
+        // beside it, `krezk.moonglow.toml`, looked at as they are, a few
+        // small files).
+        let archive = self.ws.as_ref().is_some_and(|ws| ws.module.archive.is_some());
+        if archive {
+            self.reread_project_file();
+        }
         // (And the builder's own project file, in a hidden folder the
         // walk passes over.)
-        let paths = vec![root.clone(), mg_module::project_file::ProjectFile::user_path(&root)];
-        if self.outside.watch.as_ref().is_none_or(|w| w.paths != paths) {
-            let every = std::time::Duration::from_secs(3);
-            self.outside.watch = Some(Watch::start(paths, true, every));
+        let paths = match archive {
+            true => vec![root.clone()],
+            false => vec![root.clone(), mg_module::project_file::ProjectFile::user_path(&root)],
+        };
+        if self.outside.watch.as_ref().is_none_or(|w| w.paths() != paths.as_slice()) {
+            let (every, walk, repaint) =
+                (Duration::from_secs(3), self.outside.walk, self.outside.on_change());
+            self.outside.watch = Some(Watch::start(paths, !archive, every, walk, repaint));
         }
         let watch = self.outside.watch.as_ref().expect("just made");
         // (A watch without its thread says nothing: looked at each time,
         // on the window's thread, as there are no threads to be had.)
-        if watch.stop.load(Ordering::Relaxed) {
+        if watch.dead() {
             self.reload_project_files();
             return;
         }
         // (One look at a time: a change seen during one is looked at
         // after it.)
-        if self.outside.looking.is_none() && watch.changed.swap(false, Ordering::Relaxed) {
-            self.look_outside();
+        if self.outside.looking.is_none()
+            && let Some(heard) = watch.take()
+        {
+            self.look_outside_at(heard.files());
         }
+    }
+
+    /// Whether a watch heard a change not yet looked at: looked at in
+    /// this frame, not when the few seconds' look is due.
+    pub(crate) fn heard_outside(&self) -> bool {
+        let module = self.outside.looking.is_none()
+            && self.outside.watch.as_ref().is_some_and(Watch::pending);
+        module || self.outside.content.as_ref().is_some_and(Watch::pending)
+    }
+
+    /// Whether the module's files are told of by the system (not walked
+    /// for every few seconds).
+    pub fn outside_told(&self) -> bool {
+        self.outside.watch.as_ref().is_some_and(Watch::told)
     }
 
     /// Begins a look at the module's files on a thread of its own: what is
@@ -256,25 +195,37 @@ impl Moonglow {
     /// [`Moonglow::take_looked`] takes what the thread found when it is
     /// done. Without a thread, looked at here and now.
     pub fn look_outside(&mut self) {
+        self.look_outside_at(None);
+    }
+
+    /// [`Moonglow::look_outside`] at these files alone (those a watch
+    /// heard of: their snapshot and their look are theirs alone, not the
+    /// module's thousands), or all (`None`).
+    fn look_outside_at(&mut self, files: Option<Vec<PathBuf>>) {
         let Some(root) = self.module_root() else { return };
-        let Some(ws) = self.ws.as_mut() else { return };
         // The project file (`moonglow.toml`) made, changed or deleted.
-        let had = ws.module.project_file.found;
-        if ws.module.reread_project_file() {
-            self.log_project_file(true, had);
-        }
+        self.reread_project_file();
         let Some(ws) = self.ws.as_ref() else { return };
-        let Some(scan) = ws.module.outside_scan() else { return };
+        let scan = match &files {
+            Some(files) => ws.module.outside_scan_of(files),
+            None => ws.module.outside_scan(),
+        };
+        let Some(scan) = scan else { return };
         // (The areas as they are now, for their locks: only the project's
-        // files leave them out.)
+        // files leave them out. Those of the files named, where they are:
+        // all of them were 1,400 a look.)
         let areas: HashMap<ResKey, Arc<[u8]>> = if ws.module.project.is_some() {
-            (ws.module.keys_of(ResType::GIT))
-                .filter_map(|k| Some((*k, ws.module.shared(k)?.clone())))
-                .collect()
+            let gits: Vec<ResKey> = match &files {
+                Some(_) => scan.keys().filter(|k| k.restype == ResType::GIT).collect(),
+                None => ws.module.keys_of(ResType::GIT).copied().collect(),
+            };
+            (gits.into_iter()).filter_map(|k| Some((k, ws.module.shared(&k)?.clone()))).collect()
         } else {
             HashMap::new()
         };
         let (send, done) = std::sync::mpsc::channel();
+        // (A frame asked for once it is done: what it found is taken then.)
+        let wake = self.outside.repaint.clone();
         let work = move || {
             let found = scan.run();
             let mut locks = HashMap::new();
@@ -285,10 +236,15 @@ impl Moonglow {
                     .insert(c.key, (bytes.clone(), mg_module::locks::locks_in(c.key.resref, &git)));
             }
             let _ = send.send(Looked { found, locks });
+            if let Some((ctx, at_once)) = wake {
+                crate::jobs::wake(&ctx, at_once);
+            }
         };
         match std::thread::Builder::new().name("moonglow outside".into()).spawn(work) {
             Ok(_) => {
-                self.outside.looking = Some(Looking { root, started: Instant::now(), done });
+                let started = Instant::now();
+                self.outside.looking =
+                    Some(Looking { root, started, done, found: None, left_text: false });
             }
             Err(_) => self.reload_project_files(),
         }
@@ -307,8 +263,34 @@ impl Moonglow {
         self.outside.looking.is_some()
     }
 
-    /// What the status bar says of a look under way that takes a while.
+    /// What of the looks at what changed outside is under way
+    /// ([`Moonglow::under_way`]): a look at the module's files, the
+    /// scripts it read still to compile, the palettes of blueprints it
+    /// read to look at, a burst of changes a watch is hearing (said, and
+    /// then looked at, once it is quiet a moment).
+    pub(crate) fn outside_under_way(&self) -> Option<&'static str> {
+        if self.outside.looking.is_some() {
+            Some("a look at the module's files")
+        } else if self.outside.compiling.is_some() {
+            Some("scripts read again to compile")
+        } else if self.outside.palettes.is_some() {
+            Some("palettes of blueprints read again")
+        } else if [&self.outside.watch, &self.outside.content]
+            .iter()
+            .any(|w| w.as_ref().is_some_and(Watch::hearing))
+        {
+            Some("changes outside being heard")
+        } else {
+            None
+        }
+    }
+
+    /// What the status bar says of a look under way that takes a while,
+    /// or of scripts read again being compiled.
     pub(crate) fn looking_note(&self) -> Option<&'static str> {
+        if self.outside.compiling.as_ref().is_some_and(|c| c.queue.len() > 1) {
+            return Some("Compiling scripts changed outside Moonglow…");
+        }
         let looking = self.outside.looking.as_ref()?;
         (looking.started.elapsed() > Duration::from_millis(400))
             .then_some("Reading files changed outside Moonglow…")
@@ -319,21 +301,41 @@ impl Moonglow {
     /// the game data the module's layer is in): the changes are taken as
     /// [`Moonglow::reload_project_files`] takes them. Returns whether one
     /// is still under way.
-    pub fn take_looked(&mut self) -> bool {
-        let Some(looking) = self.outside.looking.as_ref() else { return false };
+    ///
+    /// A text field that sets its text when the keyboard leaves it, typed
+    /// in and not left, sets it first (the keyboard is taken from it, and
+    /// what it sets is done, before what was found is taken): read again
+    /// under it, its window would go or show the file's text, and what
+    /// was typed with it. Set, it is a change of Moonglow's, and the file
+    /// changed outside is asked about as any other.
+    pub fn take_looked(&mut self, ctx: &egui::Context) -> bool {
+        if self.outside.looking.is_none() {
+            return false;
+        }
         if self.busy() {
             return true;
         }
-        let looked = match looking.done.try_recv() {
-            Ok(looked) => looked,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.outside.looking = None;
-                self.log.error("Could not look at the module's files (the look stopped)");
-                return false;
+        let looking = self.outside.looking.as_mut().expect("under way");
+        if looking.found.is_none() {
+            match looking.done.try_recv() {
+                Ok(looked) => looking.found = Some(looked),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.outside.looking = None;
+                    self.log.error("Could not look at the module's files (the look stopped)");
+                    return false;
+                }
             }
-        };
-        let looking = self.outside.looking.take().expect("under way");
+        }
+        // (The field sets its text as it is drawn next, and that is done
+        // with that frame's actions: taken after them.)
+        let left = std::mem::replace(&mut looking.left_text, crate::widgets::leave_text(ctx));
+        if looking.left_text || (left && !self.actions.is_empty()) {
+            ctx.request_repaint();
+            return true;
+        }
+        let mut looking = self.outside.looking.take().expect("under way");
+        let looked = looking.found.take().expect("found");
         // (Another module open since: what was found is another's.)
         if self.module_root().as_ref() != Some(&looking.root) {
             return false;
@@ -362,7 +364,8 @@ impl Moonglow {
             return false;
         };
         let here = (ws.module.project.as_ref().map(|p| p.root()))
-            .or_else(|| ws.module.folder.as_ref().map(|f| f.dir()));
+            .or_else(|| ws.module.folder.as_ref().map(|f| f.dir()))
+            .or_else(|| ws.module.archive.as_ref().map(|a| a.path()));
         if ws.is_modified() || here != Some(root.as_path()) {
             self.outside.palettes = None;
             return false;
@@ -390,7 +393,6 @@ impl Moonglow {
     /// a large `override` looked at on the window's thread every time is
     /// what a module's files were.
     pub fn reload_changed_content(&mut self) {
-        use std::sync::atomic::Ordering;
         let Some(game) = self.game.as_ref() else {
             self.outside.content = None;
             return;
@@ -400,9 +402,10 @@ impl Moonglow {
             .filter_map(|l| l.container.watched().map(PathBuf::from))
             .collect();
         paths.extend(self.tlk_stamp.as_ref().map(|(path, _)| path.clone()));
-        if self.outside.content.as_ref().is_none_or(|w| w.paths != paths) {
-            let every = std::time::Duration::from_secs(3);
-            self.outside.content = Some(Watch::start(paths, false, every));
+        if self.outside.content.as_ref().is_none_or(|w| w.paths() != paths.as_slice()) {
+            let (every, walk, repaint) =
+                (Duration::from_secs(3), self.outside.walk, self.outside.on_change());
+            self.outside.content = Some(Watch::start(paths, false, every, walk, repaint));
         }
         // (Held by something else, a job: looked at once it is free. Not
         // let go of by the 3D views here: only when something changed.)
@@ -412,9 +415,18 @@ impl Moonglow {
         }
         crate::trace::changed("content", || "the game data is free".into());
         let watch = self.outside.content.as_ref().expect("just made");
-        let dead = watch.stop.load(Ordering::Relaxed);
-        if watch.changed.swap(false, Ordering::Relaxed) || dead {
+        if watch.take().is_some() || watch.dead() {
             self.reload_resources(false);
+        }
+    }
+
+    /// Reads the project file (`moonglow.toml`) again if it was made,
+    /// changed or deleted, and says so in the log.
+    pub(crate) fn reread_project_file(&mut self) {
+        let Some(ws) = self.ws.as_mut() else { return };
+        let had = ws.module.project_file.found;
+        if ws.module.reread_project_file() {
+            self.log_project_file(true, had);
         }
     }
 
@@ -424,12 +436,8 @@ impl Moonglow {
     /// watch's looks are done on a thread of their own:
     /// [`Moonglow::look_outside`].)
     pub fn reload_project_files(&mut self) {
-        let Some(ws) = self.ws.as_mut() else { return };
         // The project file (`moonglow.toml`) made, changed or deleted.
-        let had = ws.module.project_file.found;
-        if ws.module.reread_project_file() {
-            self.log_project_file(true, had);
-        }
+        self.reread_project_file();
         let Some(ws) = self.ws.as_mut() else { return };
         let Some((changes, problems)) = ws.module.outside() else { return };
         self.take_found(changes, problems, &HashMap::new());
@@ -557,6 +565,19 @@ impl Moonglow {
         if !locks.is_empty() {
             ws.module.restore_locks(&locks);
         }
+        // Areas added outside (a pull's) join a project's area list, as
+        // when it is opened.
+        let added_area =
+            changes.iter().any(|c| c.key.restype == ResType::ARE && c.resource.is_some());
+        let mut keys: Vec<ResKey> = changes.iter().map(|c| c.key).collect();
+        if added_area && let Some(info) = ws.module.area_list_settled() {
+            let key = mg_module::Module::info_key();
+            if let Err(e) = ws.adopt(&[(key, Some(info))]) {
+                self.log.error(e.to_string());
+            }
+            keys.push(key);
+            self.take_project_warnings();
+        }
         for c in changes {
             // A script's editor reads its text again.
             self.scripts.remove(&c.key);
@@ -578,7 +599,6 @@ impl Moonglow {
         // Names shown from the module are read again.
         self.area_names = Default::default();
         self.area_contents.clear();
-        let keys: Vec<ResKey> = changes.iter().map(|c| c.key).collect();
         self.update_module_layer(&keys);
         // (A module.ifo read again may list other haks: a pull's.)
         if keys.contains(&mg_module::Module::info_key()) {
@@ -595,8 +615,11 @@ impl Moonglow {
     /// Options › Script Editor › Automatically Compile Scripts on Save: a
     /// script another program saved is compiled as one saved here is, so
     /// that its compiled script is not the older one, and so are the
-    /// scripts that include it. (Not a great many at once, a checkout's,
-    /// which would hold the window: Compile All is for those.)
+    /// scripts that include it: a few each frame
+    /// ([`Moonglow::compile_outside_step`]), however many a checkout
+    /// changed, the window taking input meanwhile. (A job, which holds the
+    /// window, compiles them only for an external compiler, which is run
+    /// once for them all.)
     fn compile_outside(&mut self, changes: &[Outside]) {
         if !self.settings.auto_compile {
             return;
@@ -616,14 +639,85 @@ impl Moonglow {
             ));
             return;
         }
+        let Some(root) = self.module_root() else { return };
+        let Some(ws) = self.ws.as_mut() else { return };
+        if let Err(e) = ws.flush() {
+            self.log.error(e.to_string());
+            return;
+        }
         // (And the scripts that include them.)
-        let Some(scripts) = self.with_includers(&scripts) else { return };
+        let mut all = scripts.clone();
+        all.extend(mg_module::refs::includers(&ws.module, &scripts));
+        if self.settings.external_compiler.is_some() && all.len() > 1 {
+            self.log.info(format!(
+                "{} scripts (those changed and those that include them) are compiled in the \
+                 background",
+                all.len()
+            ));
+            self.compile_job(Some(all));
+            return;
+        }
+        let compiling = match self.outside.compiling.take() {
+            Some(c) if c.root == root => c,
+            _ => Compiling { root, ..Compiling::default() },
+        };
+        let mut compiling = compiling;
+        for key in all {
+            if !compiling.queue.contains(&key) {
+                compiling.queue.push_back(key);
+            }
+        }
+        self.outside.compiling = Some(compiling);
+        self.compile_outside_step();
+    }
+
+    /// Compiles some of the scripts read again from outside that are still
+    /// to be compiled: for a few milliseconds of the frame (one at least);
+    /// once none is left, puts what they made in the module (as made from
+    /// it where the module has no unsaved changes, a folder's compiled
+    /// scripts written beside them; else as one step to undo) and says
+    /// so. A script changed meanwhile (typed, read again) is left out of
+    /// what is put in: it is compiled again when it is saved. Returns
+    /// whether any is still to be compiled.
+    pub(crate) fn compile_outside_step(&mut self) -> bool {
+        let Some(mut c) = self.outside.compiling.take() else { return false };
+        if self.module_root().as_ref() != Some(&c.root) || self.game.is_none() {
+            return false;
+        }
+        let started = Instant::now();
+        while let Some(key) = c.queue.pop_front() {
+            let source = self.ws.as_ref().and_then(|ws| ws.module.shared(&key).cloned());
+            crate::script_view::compile_edits(self, &[key], &mut c.made);
+            c.sources.push((key, source));
+            if started.elapsed() >= Compiling::BUDGET {
+                break;
+            }
+        }
+        if !c.queue.is_empty() {
+            self.outside.compiling = Some(c);
+            return true;
+        }
+        let Compiling { sources, mut made, .. } = c;
+        let Some(ws) = self.ws.as_mut() else { return false };
+        if let Err(e) = ws.flush() {
+            self.log.error(e.to_string());
+            return false;
+        }
+        let changed: Vec<ResKey> = (sources.iter())
+            .filter(|(k, was)| match (ws.module.shared(k), was) {
+                (Some(now), Some(was)) => !Arc::ptr_eq(now, was),
+                (None, None) => false,
+                _ => true,
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        made.drop_scripts(&changed);
         // A module with no unsaved changes has none after: what is
         // compiled is made from the files as they are, and a folder's
         // compiled scripts are written beside them at once (a project
         // keeps none: they are build output).
-        let clean = self.ws.as_ref().is_some_and(|ws| !ws.is_modified());
-        let (compiled, _) = crate::script_view::compile_stale_into(self, &scripts, clean);
+        let clean = !ws.is_modified();
+        let (compiled, _) = crate::script_view::put_compiled(self, made, clean);
         if clean && !compiled.is_empty() {
             let made: Vec<ResKey> = (compiled.iter())
                 .filter_map(|n| mg_core::ResRef::from_str(n).ok())
@@ -639,10 +733,10 @@ impl Moonglow {
                 crate::transfer::listed(&compiled)
             ));
         }
-        let failed: Vec<String> = scripts
-            .iter()
-            .filter(|k| !compiled.contains(&k.resref.to_string()))
-            .filter(|k| self.script_fails(**k))
+        let failed: Vec<String> = (sources.iter())
+            .map(|(k, _)| *k)
+            .filter(|k| !changed.contains(k) && !compiled.contains(&k.resref.to_string()))
+            .filter(|k| self.script_fails(*k))
             .map(|k| k.resref.to_string())
             .collect();
         if !failed.is_empty() {
@@ -651,7 +745,30 @@ impl Moonglow {
                 crate::transfer::listed(&failed)
             ));
         }
+        false
     }
+
+    /// Whether scripts read again from outside are being compiled.
+    pub fn compiling_outside(&self) -> bool {
+        self.outside.compiling.is_some()
+    }
+}
+
+/// Scripts read again from outside being compiled, a few each frame
+/// ([`Moonglow::compile_outside_step`]).
+#[derive(Debug, Default)]
+pub(crate) struct Compiling {
+    /// The module's folder or project they are of.
+    root: PathBuf,
+    queue: std::collections::VecDeque<ResKey>,
+    /// Each compiled, with its source as it was compiled.
+    sources: Vec<(ResKey, Option<Arc<[u8]>>)>,
+    made: crate::script_view::Compiled,
+}
+
+impl Compiling {
+    /// How long a frame compiles for.
+    const BUDGET: Duration = Duration::from_millis(4);
 }
 
 /// Changed Outside Moonglow: the files changed outside that Moonglow has
@@ -667,49 +784,43 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         Later,
     }
     let mut answer = None;
-    egui::Window::new("Changed Outside Moonglow")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.label(
-                "These files of the project were changed by another program, and Moonglow has \
+    crate::widgets::modal(ctx, "Changed Outside Moonglow").show(ctx, |ui| {
+        ui.label(
+            "These files of the project were changed by another program, and Moonglow has \
                  unsaved changes to them:",
-            );
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                for c in &app.outside.conflicts {
-                    let gone = if c.resource.is_none() { " (deleted)" } else { "" };
-                    ui.monospace(format!("{}{gone}", c.path.display()));
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Keep Moonglow's")
-                    .on_hover_text("Your changes stay; the next Save writes them over the files")
-                    .clicked()
-                {
-                    answer = Some(Answer::Ours);
-                }
-                if ui
-                    .button("Take the Files'")
-                    .on_hover_text(
-                        "The files are read again; your unsaved changes to them are lost",
-                    )
-                    .clicked()
-                {
-                    answer = Some(Answer::Theirs);
-                }
-                if ui
-                    .button("Later")
-                    .on_hover_text("Moonglow's stay for now, and Save won't write over these files")
-                    .clicked()
-                    || crate::widgets::escape_closes(ui.ctx(), "Changed Outside Moonglow")
-                {
-                    answer = Some(Answer::Later);
-                }
-            });
+        );
+        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            for c in &app.outside.conflicts {
+                let gone = if c.resource.is_none() { " (deleted)" } else { "" };
+                ui.monospace(format!("{}{gone}", c.path.display()));
+            }
         });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Keep Moonglow's")
+                .on_hover_text("Your changes stay; the next Save writes them over the files")
+                .clicked()
+            {
+                answer = Some(Answer::Ours);
+            }
+            if ui
+                .button("Take the Files'")
+                .on_hover_text("The files are read again; your unsaved changes to them are lost")
+                .clicked()
+            {
+                answer = Some(Answer::Theirs);
+            }
+            if ui
+                .button("Later")
+                .on_hover_text("Moonglow's stay for now, and Save won't write over these files")
+                .clicked()
+                || crate::widgets::escape_closes(ui.ctx(), "Changed Outside Moonglow")
+            {
+                answer = Some(Answer::Later);
+            }
+        });
+    });
     let conflicts = std::mem::take(&mut app.outside.conflicts);
     match answer {
         Some(Answer::Ours) => {
@@ -730,57 +841,5 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             app.outside.conflicts = conflicts;
         }
         None => app.outside.conflicts = conflicts,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    use super::*;
-
-    #[test]
-    fn the_watch_says_when_a_file_changes_and_only_then() {
-        let dir = mg_testkit::scratch_dir("ui-outside-watch");
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        std::fs::write(dir.join("src/a.nss"), "void main() {}").unwrap();
-        // The files as one number: other when one is longer, added or
-        // removed; the same for what a hidden folder holds.
-        let first = signature(std::slice::from_ref(&dir), true);
-        assert_eq!(signature(std::slice::from_ref(&dir), true), first);
-        std::fs::write(dir.join(".git/index"), "x").unwrap();
-        assert_eq!(signature(std::slice::from_ref(&dir), true), first);
-        std::fs::write(dir.join("src/a.nss"), "void main() { int a; }").unwrap();
-        let longer = signature(std::slice::from_ref(&dir), true);
-        assert_ne!(longer, first);
-        std::fs::write(dir.join("src/b.nss"), "").unwrap();
-        let added = signature(std::slice::from_ref(&dir), true);
-        assert_ne!(added, longer);
-        std::fs::remove_file(dir.join("src/b.nss")).unwrap();
-        assert_eq!(signature(std::slice::from_ref(&dir), true), longer);
-
-        // The watch: once at the start, then only after a change.
-        let watch = Watch::start(vec![dir.clone()], true, Duration::from_millis(40));
-        let seen = |watch: &Watch| {
-            for _ in 0..100 {
-                if watch.changed.swap(false, Ordering::Relaxed) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            false
-        };
-        assert!(seen(&watch), "looked at once, at the start");
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(!watch.changed.load(Ordering::Relaxed), "nothing changed: nothing said");
-        std::fs::write(dir.join("src/c.nss"), "void main() {}").unwrap();
-        assert!(seen(&watch), "a file added is seen");
-        // (The watch may have seen the file made and then written: twice.)
-        std::thread::sleep(Duration::from_millis(300));
-        watch.changed.store(false, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(!watch.changed.load(Ordering::Relaxed), "and nothing said after");
     }
 }

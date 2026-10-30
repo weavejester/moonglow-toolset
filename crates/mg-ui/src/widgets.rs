@@ -275,6 +275,26 @@ impl VarHelp {
         }
     }
 
+    /// What the rows lack that one of them needs beside it (the
+    /// description's `requires`, its `[[rules]]`), a note each; not of
+    /// the row whose name is being typed.
+    fn needed(&self, rows: &[VarRow], typing: Option<usize>) -> Vec<String> {
+        let file = self.variables.file();
+        let here: Vec<(&str, &str)> = (rows.iter().enumerate())
+            .filter(|(i, r)| Some(*i) != typing && !r.name.trim().is_empty())
+            .map(|(_, r)| (r.name.trim(), r.value.as_str()))
+            .collect();
+        (self.variables.missing(&here).into_iter())
+            .map(|n| match n.is {
+                Some(is) => format!(
+                    "{} is {is}: {} is needed beside it ({file}:{})",
+                    n.by, n.require, n.line
+                ),
+                None => format!("{} needs {} beside it ({file}:{})", n.by, n.require, n.line),
+            })
+            .collect()
+    }
+
     /// What is wrong with a row by the descriptions, for the note under
     /// the list (none where nothing is, or nothing is described).
     fn note(&self, r: &VarRow) -> Option<String> {
@@ -488,11 +508,24 @@ fn description_tip(d: &Described) -> String {
 
 /// A row named (anew) as a described variable takes the type it is
 /// described with, where the window sets that type; a value that type
-/// can't hold is emptied.
+/// can't hold is emptied. One with no value of its own yet (empty, or a
+/// new row's 0) takes the description's default.
 fn take_described_type(variables: &Variables, r: &mut VarRow) {
     // (Not one the scripts alone set: it is said, not taken.)
     let described = variables.describe(r.name.trim()).filter(|d| !d.runtime);
-    let Some(t) = described.and_then(|d| d.var_type) else { return };
+    if let Some(default) = described.and_then(|d| d.default.clone()) {
+        take_type(described.and_then(|d| d.var_type), r);
+        if matches!(r.value.trim(), "" | "0" | "0.0") {
+            r.value = default;
+        }
+        return;
+    }
+    take_type(described.and_then(|d| d.var_type), r);
+}
+
+/// [`take_described_type`]'s type.
+fn take_type(t: Option<VarType>, r: &mut VarRow) {
+    let Some(t) = t else { return };
     let editable = |k: u32| VarType::of(k.into()).is_some_and(|t| t.field_type().is_some());
     if t.code() == r.kind || t.field_type().is_none() || !editable(r.kind) {
         return;
@@ -590,16 +623,17 @@ fn value_choice(
     if d.other {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(value).desired_width(width - 28.0));
-            ui.menu_button("▾", |ui| {
-                for x in &c.list {
-                    if ui.button(shown(x)).clicked() {
-                        *value = x.value.clone();
-                        ui.close();
-                    }
-                }
-            })
-            .response
-            .on_hover_text("Its values (variables.toml)");
+            // (Its values to choose from, the arrow keys stepping through
+            // them as every dropdown's do.)
+            let values: Vec<String> = c.list.iter().map(|x| x.value.clone()).collect();
+            dropdown(("var-value-offer", row))
+                .selected_text("")
+                .width(24.0)
+                .height(320.0)
+                .show(ui, value, &values, |v| {
+                    c.list.iter().find(|x| x.value == *v).map_or_else(String::new, shown)
+                })
+                .on_hover_text("Its values (variables.toml)");
         });
         return;
     }
@@ -628,7 +662,6 @@ fn kind_name(kind: u32) -> &'static str {
 pub struct Picker {
     pub id: egui::Id,
     pub title: String,
-    pub types: Vec<ResType>,
     pub filter: String,
     choices: Vec<ResRef>,
 }
@@ -649,13 +682,7 @@ impl Moonglow {
         }
         choices.sort();
         choices.dedup();
-        self.picker = Some(Picker {
-            id,
-            title: title.to_string(),
-            types: types.to_vec(),
-            filter: String::new(),
-            choices,
-        });
+        self.picker = Some(Picker { id, title: title.to_string(), filter: String::new(), choices });
     }
 
     /// The resource picked for a field, once.
@@ -673,7 +700,25 @@ const VAR_FOOT: f32 = 96.0;
 /// The most notes of the project's descriptions shown under the list.
 const VAR_NOTES: usize = 4;
 
-/// A window in the middle of the app's, of a size its content gives it.
+/// The variable sets saved in `dir`, each read ([`crate::var_sets::read_all`],
+/// the files read again only when they change, kept in `ctx`'s memory).
+fn read_sets(
+    ctx: &egui::Context,
+    dir: Option<&std::path::Path>,
+) -> Vec<(String, Result<Vec<VarRow>, String>)> {
+    let id = egui::Id::new("variable-sets-read");
+    let mut kept: crate::var_sets::Read = ctx.data_mut(|d| d.remove_temp(id)).unwrap_or_default();
+    let read = crate::var_sets::read_all(dir, &mut kept);
+    ctx.data_mut(|d| d.insert_temp(id, kept));
+    read
+}
+
+/// A set's name as the menu and the Variable Sets window list it: one
+/// whose file isn't a set marked so, why in its tip.
+fn not_a_set(ui: &Ui, name: &str) -> egui::RichText {
+    egui::RichText::new(format!("{name} (not a set)")).color(ui.visuals().warn_fg_color)
+}
+
 /// The Variable Sets window: the saved sets, each renamed or deleted (the
 /// one deleted last put back), and their folder opened.
 fn sets_window(app: &mut Moonglow, ctx: &egui::Context, sets: &mut Option<SetsWindow>) {
@@ -681,7 +726,8 @@ fn sets_window(app: &mut Moonglow, ctx: &egui::Context, sets: &mut Option<SetsWi
         *sets = None;
         return;
     };
-    let names = crate::var_sets::list(Some(&dir));
+    let read = read_sets(ctx, Some(&dir));
+    let names: Vec<String> = read.iter().map(|(n, _)| n.clone()).collect();
     let mut open = true;
     let mut close = false;
     let window = dialog(ctx, "Variable Sets", &mut open).collapsible(false).resizable(false);
@@ -769,8 +815,12 @@ fn sets_window(app: &mut Moonglow, ctx: &egui::Context, sets: &mut Option<SetsWi
         }
         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
             egui::Grid::new("variable-sets").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
-                for name in &names {
-                    ui.label(name);
+                for (name, set) in &read {
+                    // (What it holds in its tip; one that isn't a set, why.)
+                    match set {
+                        Ok(rows) => ui.label(name).on_hover_text(crate::var_sets::describe(rows)),
+                        Err(e) => ui.label(not_a_set(ui, name)).on_hover_text(e),
+                    };
                     if ui.small_button("Rename…").clicked() {
                         w.renaming = Some((name.clone(), name.clone()));
                     }
@@ -808,13 +858,6 @@ pub(crate) fn open_folder(ctx: &egui::Context, dir: &std::path::Path, log: &mut 
     ctx.open_url(egui::OpenUrl::new_tab(crate::script_view::file_url(dir)));
 }
 
-pub(crate) fn window(title: &str) -> egui::Window<'_> {
-    egui::Window::new(title)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-}
-
 const GENDERS: [(Gender, &str); 2] = [(Gender::Male, "Male"), (Gender::Female, "Female")];
 
 pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
@@ -829,7 +872,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         let mut close = false;
         let tlk = tlk_text(app, &edit.strref);
         let movable = crate::talk_view::can_add(app);
-        window(&format!("String Edit: {}", edit.title)).show(&ctx, |ui| {
+        modal(&ctx, format!("String Edit: {}", edit.title)).show(&ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("String Ref");
                 ui.add(
@@ -978,11 +1021,8 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         // A window to size as the list needs: its edges are dragged, and the
         // name and value fields take the width there is.
         let room = ctx.content_rect();
-        egui::Window::new("Variables")
-            .collapsible(false)
+        modal(&ctx, "Variables")
             .resizable(true)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(room.center())
             .default_size([
                 (room.width() * 0.5).clamp(620.0, 900.0),
                 (room.height() * 0.5).max(320.0),
@@ -993,10 +1033,10 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 // name being typed), a line each under the list.
                 let notes: Vec<String> = if described {
                     let typing = help.completing;
-                    (edit.rows.iter().enumerate())
-                        .filter(|(i, _)| Some(*i) != typing)
-                        .filter_map(|(_, r)| help.note(r))
-                        .collect()
+                    let rows = (edit.rows.iter().enumerate()).filter(|(i, _)| Some(*i) != typing);
+                    let mut notes: Vec<String> = rows.filter_map(|(_, r)| help.note(r)).collect();
+                    notes.extend(help.needed(&edit.rows, typing));
+                    notes
                 } else {
                     Vec::new()
                 };
@@ -1161,27 +1201,37 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                     // Variable sets, kept in Moonglow's data folder, and in
                     // files anywhere.
                     let dir = app.var_set_dir.clone();
-                    let names = crate::var_sets::list(dir.as_deref());
                     ui.menu_button("Add Set", |ui| {
+                        // (Read as the menu is drawn: what each holds is its
+                        // tip, and a file that isn't a set is said so.)
+                        let read = read_sets(ui.ctx(), dir.as_deref());
                         if dir.is_none() {
                             ui.weak("Moonglow has no data folder to keep sets in");
-                        } else if names.is_empty() {
+                        } else if read.is_empty() {
                             ui.weak("No variable sets saved yet");
                         }
-                        for n in &names {
-                            if ui.button(n).clicked() {
-                                let dir = dir.as_deref().expect("listed");
-                                match crate::var_sets::load(dir, n) {
-                                    Ok(set) => crate::var_sets::merge(&mut edit.rows, set),
-                                    Err(e) => app.log.error(format!("Add Set: {e}")),
+                        for (n, set) in read {
+                            match set {
+                                Ok(rows) => {
+                                    let tip = crate::var_sets::describe(&rows);
+                                    if ui.button(n).on_hover_text(tip).clicked() {
+                                        crate::var_sets::merge(&mut edit.rows, rows);
+                                        ui.close();
+                                    }
                                 }
-                                ui.close();
+                                Err(e) => {
+                                    let b = egui::Button::new(not_a_set(ui, &n));
+                                    ui.add_enabled(false, b).on_disabled_hover_text(e);
+                                }
                             }
                         }
                         ui.separator();
                         if ui
                             .button("Add from File…")
-                            .on_hover_text("Add the variables of a set file (.vars.json) anywhere")
+                            .on_hover_text(
+                                "Add the variables of set files (.vars.json) anywhere, one or \
+                                 several",
+                            )
                             .clicked()
                         {
                             add_file = true;
@@ -1229,10 +1279,14 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                         )
                         .clicked();
                 });
-                if add_file && let Some(path) = app.dialogs.open_file(FileKind::VariableSet, None) {
-                    match crate::var_sets::load_file(&path) {
-                        Ok(set) => crate::var_sets::merge(&mut edit.rows, set),
-                        Err(e) => app.log.error(format!("Add from File: {e}")),
+                // (Several at once, in the order chosen: a later file's
+                // variable of a name an earlier one has takes its value.)
+                if add_file {
+                    for path in app.dialogs.open_files(FileKind::VariableSet, None) {
+                        match crate::var_sets::load_file(&path) {
+                            Ok(set) => crate::var_sets::merge(&mut edit.rows, set),
+                            Err(e) => app.log.error(format!("Add from File: {e}")),
+                        }
                     }
                 }
                 if save_file
@@ -1318,10 +1372,18 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
 
     if let Some(mut p) = app.picker.take() {
         let mut close = false;
-        window(&p.title).show(&ctx, |ui| {
+        modal(&ctx, &p.title).show(&ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Filter");
-                let field = ui.text_edit_singleline(&mut p.filter);
+                let field = SearchField::new(
+                    egui::Id::new(("resref-picker-find", &p.title)),
+                    &mut p.filter,
+                )
+                .hint("ResRef")
+                .width(200.0)
+                .find_over()
+                .show(ui)
+                .response;
                 crate::widgets::autofocus(ui, &field);
             });
             let filter = mg_core::text::Needle::new(&p.filter);
@@ -1400,17 +1462,11 @@ pub(crate) fn open_variables(app: &mut Moonglow, key: ResKey, path: GffPath) {
     app.var_edit = Some(VarTableEdit::new(FieldTarget::new(key, path, "VarTable"), &list));
 }
 
-/// A "Variables…" button for an object's VarTable.
-pub(crate) fn variables_button(
-    app: &mut Moonglow,
-    ui: &mut Ui,
-    target: FieldTarget,
-    list: &[Struct],
-) {
-    let label = format!("Variables ({})…", list.len());
-    if ui.button(label).clicked() {
-        app.var_edit = Some(VarTableEdit::new(target, list));
-    }
+/// The "Variables (N)…" button of an object's, an area's or the module's
+/// VarTable of `count` variables: whether it was pressed.
+pub(crate) fn variables_button(ui: &mut Ui, count: usize) -> bool {
+    let label = format!("Variables ({count})…");
+    ui.button(label).on_hover_text("Edit scripting variables").clicked()
 }
 
 /// Whether the text kept under `id` (a list's filter) is another than at
@@ -1517,6 +1573,12 @@ pub(crate) fn loc_text(
             commit_loc_text(app, ui, id, &shown, multiline, width)
         }),
     }
+}
+
+/// The "…" beside a localized string's text, which opens String Edit for
+/// its text in every language: whether it was clicked.
+pub(crate) fn languages_button(ui: &mut Ui) -> bool {
+    ui.small_button("…").on_hover_text("Edit text in multiple languages").clicked()
 }
 
 /// `current` (a text field's value, the field `id`) with `token` put
@@ -1796,6 +1858,24 @@ pub(crate) fn spin_number<T: egui::emath::Numeric>(
     spin_with(ui, current, range, 1.0, |d| d)
 }
 
+/// [`spin_with`] on a dialog's own copy of a number (a wizard's, Options',
+/// Adjust Location's), set when it changes: the response is the field's
+/// and its arrows', changed then.
+pub(crate) fn spin_draft<T: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut T,
+    range: std::ops::RangeInclusive<T>,
+    step: f64,
+    make: impl for<'a> FnOnce(egui::DragValue<'a>) -> egui::DragValue<'a>,
+) -> egui::Response {
+    let mut r = ui.scope(|ui| spin_with(ui, *value, range, step, make));
+    if let Some(v) = r.inner {
+        *value = v;
+        r.response.mark_changed();
+    }
+    r.response
+}
+
 /// How long an arrow is held before it repeats, and how often it does
 /// then (seconds).
 const SPIN_DELAY: f64 = 0.4;
@@ -2025,7 +2105,8 @@ pub(crate) struct SearchField<'a> {
 /// this frame so far ([`search_field_shown`]): what is typed there finds,
 /// and changes nothing.
 pub(crate) fn is_search_field(ctx: &egui::Context, id: egui::Id) -> bool {
-    ctx.data(|x| x.get_temp::<Dialogs>(dialogs_id())).is_some_and(|d| d.searches.contains(&id))
+    ctx.data(|x| x.get_temp::<Dialogs>(dialogs_id()))
+        .is_some_and(|d| d.searches.iter().any(|(s, _)| *s == id))
 }
 
 /// What a [`SearchField`] did: the field's response, and how its keys
@@ -2092,11 +2173,14 @@ impl<'a> SearchField<'a> {
         let here = find.unwrap_or(false) || (find_over && ui.rect_contains_pointer(ui.clip_rect()));
         let find = find_here(ui, here);
         let left = field_keys(ui, id, text, find, down);
-        search_field_shown(ui.ctx(), id);
         let response = ui
             .horizontal(|ui| {
                 let clear = !text.is_empty();
-                let button = if clear { 26.0 } else { 0.0 };
+                // (The field and its clear button fill the room together:
+                // the button as wide as it was last drawn.)
+                let button_id = id.with("clear-width");
+                let button = ui.data(|d| d.get_temp::<f32>(button_id)).unwrap_or(26.0);
+                let button = if clear { button } else { 0.0 };
                 let room = width.unwrap_or(ui.available_width() - button).max(60.0);
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut *text)
@@ -2104,12 +2188,23 @@ impl<'a> SearchField<'a> {
                         .hint_text(hint)
                         .desired_width(room),
                 );
-                if clear && ui.small_button("×").on_hover_text(clear_tip).clicked() {
-                    text.clear();
+                if clear {
+                    let b = ui.small_button("×").on_hover_text(clear_tip);
+                    let wide = b.rect.width() + ui.spacing().item_spacing.x;
+                    if (wide - button).abs() > 0.1 {
+                        ui.data_mut(|d| d.insert_temp(button_id, wide));
+                        ui.ctx().request_repaint();
+                    }
+                    if b.clicked() {
+                        text.clear();
+                    }
                 }
                 r
             })
             .inner;
+        // (After the field: typed in this frame counts for the next
+        // frame's Escape.)
+        search_field_shown(ui.ctx(), id, !text.is_empty());
         Searched { response, left }
     }
 }
@@ -2157,13 +2252,19 @@ struct Dialogs {
     open: Vec<egui::LayerId>,
     seen: Vec<egui::LayerId>,
     escape: bool,
-    /// The search fields shown this frame ([`search_field_shown`]).
-    searches: Vec<egui::Id>,
+    /// The search fields shown this frame ([`search_field_shown`]), and
+    /// whether something was typed in each.
+    searches: Vec<(egui::Id, bool)>,
     /// Whether a search field had the keyboard as the last frame ended
     /// ([`dialogs_end`]), and so whether this frame's Escape is the
-    /// field's (it clears what is typed, then leaves it).
+    /// field's (it clears what is typed, then leaves it); and whether
+    /// something was typed in it.
     searching: bool,
+    searching_text: bool,
     leaves_search: bool,
+    /// This frame's Escape clears a search field's text: the dialog it is
+    /// in stays open ([`escape_on`]).
+    clears_search: bool,
 }
 
 fn dialogs_id() -> egui::Id {
@@ -2194,6 +2295,7 @@ pub(crate) fn dialogs_begin(ctx: &egui::Context) {
     d.escape = ctx.input(|i| i.key_pressed(egui::Key::Escape) && i.modifiers.is_none())
         && !egui::Popup::is_any_open(ctx);
     d.leaves_search = d.escape && d.searching;
+    d.clears_search = d.escape && d.searching_text;
     ctx.data_mut(|x| x.insert_temp(dialogs_id(), d));
 }
 
@@ -2204,6 +2306,7 @@ pub(crate) fn keep_escape(ctx: &egui::Context) {
         let d = x.get_temp_mut_or_default::<Dialogs>(dialogs_id());
         d.escape = false;
         d.leaves_search = false;
+        d.clears_search = false;
     });
 }
 
@@ -2216,14 +2319,19 @@ pub(crate) fn dialogs_end(ctx: &egui::Context) {
     ctx.data_mut(|x| {
         let d = x.get_temp_mut_or_default::<Dialogs>(dialogs_id());
         let searches = std::mem::take(&mut d.searches);
-        d.searching = focused.is_some_and(|f| searches.contains(&f));
+        let typed = focused.and_then(|f| searches.iter().find(|(id, _)| *id == f));
+        d.searching = typed.is_some();
+        d.searching_text = typed.is_some_and(|(_, text)| *text);
     });
 }
 
-/// A search field (`id`, its text field's) shown this frame: Escape in it
-/// is its own ([`escape_left_search`]).
-fn search_field_shown(ctx: &egui::Context, id: egui::Id) {
-    ctx.data_mut(|x| x.get_temp_mut_or_default::<Dialogs>(dialogs_id()).searches.push(id));
+/// A search field (`id`, its text field's) shown this frame, `typed` in or
+/// not: Escape in it is its own ([`escape_left_search`]), and a dialog it
+/// is in stays open while it clears what is typed ([`escape_on`]).
+fn search_field_shown(ctx: &egui::Context, id: egui::Id, typed: bool) {
+    ctx.data_mut(|x| {
+        x.get_temp_mut_or_default::<Dialogs>(dialogs_id()).searches.push((id, typed));
+    });
 }
 
 /// Whether this frame's Escape was in a search field (a list's filter, an
@@ -2236,14 +2344,16 @@ pub(crate) fn escape_left_search(ctx: &egui::Context) -> bool {
 
 /// Escape for the dialog on `layer`: true when it was pressed and this is
 /// the dialog opened last. Each dialog asks every frame it shows, which is
-/// also how it is known to be open.
+/// also how it is known to be open. Not while it clears what was typed
+/// in a search field of it (Open Script's name, a wizard's Find): the next
+/// Escape closes it.
 fn escape_on(ctx: &egui::Context, layer: egui::LayerId) -> bool {
     ctx.data_mut(|x| {
         let d = x.get_temp_mut_or_default::<Dialogs>(dialogs_id());
         if !d.seen.contains(&layer) {
             d.seen.push(layer);
         }
-        d.escape && d.open.last() == Some(&layer)
+        d.escape && !d.clears_search && d.open.last() == Some(&layer)
     })
 }
 
@@ -2400,68 +2510,137 @@ impl NameWindow<'_> {
         name: &mut String,
     ) -> Named {
         let mut out = Named::Open;
-        egui::Window::new(self.title)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(self.label);
-                let field = ui.add(egui::TextEdit::singleline(name).char_limit(16));
-                // (Where the name goes: after `ab_`, before a code that goes after
-                // it, `{name}_ab`.)
-                if self.new
-                    && first_shown(ui, &field)
-                    && let Some(m) = module
+        modal(ctx, self.title).show(ctx, |ui| {
+            ui.label(self.label);
+            let field = ui.add(egui::TextEdit::singleline(name).char_limit(16));
+            // (Where the name goes: after `ab_`, before a code that goes after
+            // it, `{name}_ab`.)
+            if self.new
+                && first_shown(ui, &field)
+                && let Some(m) = module
+            {
+                let naming = m.project_file.naming_for(self.restype);
+                if !naming.is_plain() && *name == naming.fit("", "") {
+                    place_cursor(ui, &field, naming.before().chars().count());
+                }
+            }
+            autofocus(ui, &field);
+            let key = mg_core::ResRef::from_str(name.trim())
+                .ok()
+                .filter(|r| !r.is_empty())
+                .map(|r| ResKey::new(r, self.restype));
+            let exists = key.is_some_and(|k| module.is_some_and(|m| m.contains(&k)));
+            if exists {
+                let color = match self.replaces {
+                    true => ui.visuals().warn_fg_color,
+                    false => ui.visuals().error_fg_color,
+                };
+                ui.colored_label(color, self.taken);
+            }
+            let may = key.is_some() && (self.replaces || !exists);
+            ui.horizontal(|ui| {
+                if (ui.add_enabled(may, egui::Button::new(self.button)).clicked()
+                    || (may && enter(ui)))
+                    && let Some(k) = key
                 {
-                    let naming = m.project_file.naming_for(self.restype);
-                    if !naming.is_plain() && *name == naming.fit("", "") {
-                        place_cursor(ui, &field, naming.before().chars().count());
-                    }
+                    out = Named::Chosen(k);
                 }
-                autofocus(ui, &field);
-                let key = mg_core::ResRef::from_str(name.trim())
-                    .ok()
-                    .filter(|r| !r.is_empty())
-                    .map(|r| ResKey::new(r, self.restype));
-                let exists = key.is_some_and(|k| module.is_some_and(|m| m.contains(&k)));
-                if exists {
-                    let color = match self.replaces {
-                        true => ui.visuals().warn_fg_color,
-                        false => ui.visuals().error_fg_color,
-                    };
-                    ui.colored_label(color, self.taken);
+                if cancel(ui) {
+                    out = Named::Cancelled;
                 }
-                let may = key.is_some() && (self.replaces || !exists);
-                ui.horizontal(|ui| {
-                    if (ui.add_enabled(may, egui::Button::new(self.button)).clicked()
-                        || (may && enter(ui)))
-                        && let Some(k) = key
-                    {
-                        out = Named::Chosen(k);
-                    }
-                    if cancel(ui) {
-                        out = Named::Cancelled;
-                    }
-                });
             });
+        });
         out
     }
 }
 
-/// A dialog: a window in the middle of the application's, which its
-/// close button or Escape closes (`open`).
-pub(crate) fn dialog<'a>(ctx: &egui::Context, title: &str, open: &'a mut bool) -> egui::Window<'a> {
+/// A window of its own over the application's, in the middle of it as it
+/// opens (by its middle: a window that grows, a wizard's next page,
+/// grows about it), and moved by its title. Every dialog is one, as
+/// [`modal`] or [`dialog`] make it.
+fn centered<'a>(ctx: &egui::Context, title: impl Into<egui::WidgetText>) -> egui::Window<'a> {
     egui::Window::new(title)
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(ctx.content_rect().center())
-        .open(open_unless_escape(ctx, title, open))
+}
+
+/// A dialog that its own buttons answer (OK and Cancel, Yes and No, a
+/// wizard's Finish), with no close button: [`centered`], not folded or
+/// resized (a caller that wants it resized says so). Escape is its
+/// Cancel button's ([`cancel`]), or, for one whose answer is drawn some
+/// other way, what [`escape_here`] says inside it. (Aurora's message
+/// boxes, pickers and wizards. An `egui::Modal`, the rest of the window
+/// dimmed and out of reach, is kept for what stops the work until it is
+/// answered: a job's progress, a plugin's question, a save a plugin
+/// refuses, the Command Palette. Opened over a Properties window, it
+/// took its Escape too: Escape in Select Portrait closed the blueprint's
+/// window, as its Cancel.)
+pub(crate) fn modal<'a>(
+    ctx: &egui::Context,
+    title: impl Into<egui::WidgetText>,
+) -> egui::Window<'a> {
+    centered(ctx, title).collapsible(false).resizable(false)
+}
+
+/// A dialog that its close button or Escape closes (`open`), as well as
+/// what it has to answer it: [`centered`].
+pub(crate) fn dialog<'a>(ctx: &egui::Context, title: &str, open: &'a mut bool) -> egui::Window<'a> {
+    centered(ctx, title).open(open_unless_escape(ctx, title, open))
 }
 
 /// Escape was pressed with no dialog open (for a window of the dock to
 /// close on it).
 pub(crate) fn escape_past_dialogs(ctx: &egui::Context) -> bool {
     ctx.data(|x| x.get_temp::<Dialogs>(dialogs_id())).is_some_and(|d| d.escape && d.open.is_empty())
+}
+
+/// What a "Files Already in…" window was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Already {
+    /// Write (or add) every file, over those there.
+    Replace,
+    /// Write the others, and leave those there as they are.
+    Skip,
+    Cancel,
+}
+
+/// Asks what to do with files that are there already, before they are
+/// written over: the hak editor's adding ("Files Already in the Hak") and
+/// a model's Export Files ("…in the Folder"). `said` heads the list of
+/// them (each with what it is on hover, where given); `replace` and
+/// `skip` say what Replace and Skip Those do. `None` while unanswered.
+pub(crate) fn files_already(
+    ctx: &egui::Context,
+    place: &str,
+    said: &str,
+    files: &[(String, Option<String>)],
+    [replace, skip]: [&str; 2],
+) -> Option<Already> {
+    let mut answer = None;
+    modal(ctx, format!("Files Already in the {place}")).show(ctx, |ui| {
+        ui.label(said);
+        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+            for (name, about) in files {
+                let r = ui.label(egui::RichText::new(name).monospace());
+                if let Some(about) = about {
+                    r.on_hover_text(about);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let n = files.len();
+            if ui.button(format!("Replace {n}")).on_hover_text(replace).clicked() {
+                answer = Some(Already::Replace);
+            }
+            if ui.button("Skip Those").on_hover_text(skip).clicked() {
+                answer = Some(Already::Skip);
+            }
+            if cancel(ui) {
+                answer = Some(Already::Cancel);
+            }
+        });
+    });
+    answer
 }
 
 /// A dialog's Cancel button: clicked, or Escape pressed for its window.
@@ -2552,6 +2731,22 @@ pub(crate) const FILTERED_CHOICES: usize = 30;
 
 /// The greatest height of a filtered list's rows, under its Filter field.
 const ROWS_HEIGHT: f32 = 170.0;
+
+/// How many of a long list's rows (the longest) its width is measured by.
+const MEASURED_ROWS: usize = 64;
+
+/// The rows of a 2DA as a list's choices, by its `name` column (StrRefs
+/// read in the talk tables) else its `label` (`GameData::choice_list`:
+/// the list made once and kept, not copied); none without a game.
+pub(crate) fn table_choices(
+    game: Option<&mg_rules::GameData>,
+    table: &str,
+    name: Option<&str>,
+    label: Option<&str>,
+) -> std::sync::Arc<Vec<mg_rules::Choice>> {
+    let columns = mg_rules::ChoiceColumns { name, label };
+    game.and_then(|g| g.choice_list(table, columns).ok()).unwrap_or_default()
+}
 
 /// A list of `choices` with `current` chosen (`None`: no row), its box
 /// `id`: see [`RowChoice`].
@@ -2738,8 +2933,19 @@ impl<'a> RowChoice<'a> {
                 // builder's report). (A short list is egui's own.)
                 let pad = 2.0 * ui.spacing().button_padding.x;
                 let bar = ui.spacing().scroll.allocated_width();
-                let widest = (none.map(std::borrow::Cow::from).into_iter())
-                    .chain(in_order().iter().map(|c| text(c, numbered)))
+                // (Measured: the longest rows by their characters, not
+                // every row of a table of thousands.)
+                let mut texts: Vec<std::borrow::Cow<'_, str>> =
+                    (none.map(std::borrow::Cow::from).into_iter())
+                        .chain(in_order().iter().map(|c| text(c, numbered)))
+                        .collect();
+                let measured = texts.len().min(MEASURED_ROWS);
+                if measured < texts.len() {
+                    texts.select_nth_unstable_by_key(measured, |t| {
+                        std::cmp::Reverse(t.chars().count())
+                    });
+                }
+                let widest = (texts.into_iter().take(measured))
                     .map(|t| {
                         egui::WidgetText::from(t.as_ref())
                             .into_galley(
@@ -2768,8 +2974,14 @@ impl<'a> RowChoice<'a> {
             // had been scrolled to.)
             let mut narrowed = false;
             if long {
-                narrowed =
-                    ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Filter")).changed();
+                // (Escape clears what is typed, then closes the list.)
+                let before = filter.clone();
+                let searched =
+                    SearchField::new(filter_id.with("field"), &mut filter).hint("Filter").show(ui);
+                narrowed = filter != before;
+                if searched.left == Some(FilterLeft::Escape) {
+                    ui.close();
+                }
                 ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
             }
             // (Case and accents aside: `arbol` finds `Árbol`.)
@@ -2777,41 +2989,84 @@ impl<'a> RowChoice<'a> {
             let matches = |c: &mg_rules::Choice| {
                 filter.finds(&text(c, numbered)) || c.row.to_string() == filter.as_str()
             };
-            // (The rows scroll under the Filter field, which stays.)
-            let mut rows = |ui: &mut Ui| {
-                if let Some(none) = none {
-                    let r = ui.selectable_label(current.is_none(), none);
-                    if go && current.is_none() {
-                        r.scroll_to_me(Some(egui::Align::Center));
+            // The rows shown: the row of none (`None`) first, then those
+            // the filter finds.
+            // (Of a long list, found once while it is open and kept until
+            // the filter changes: not sorted and searched every frame.)
+            let found: Vec<&mg_rules::Choice> = if long {
+                // (Where in `choices` each row shown is, by the list it was
+                // found in and the filter.)
+                type Kept = (usize, usize, String, std::sync::Arc<Vec<usize>>);
+                let kept_id = open_id.with("found");
+                let made_for = (choices.as_ptr() as usize, choices.len(), filter.as_str());
+                let kept = ui.data(|d| d.get_temp::<Kept>(kept_id));
+                let at = match kept {
+                    Some((p, n, f, at)) if !opened && (p, n, f.as_str()) == made_for => at,
+                    _ => {
+                        let order = match by_name {
+                            true => mg_rules::name_order(choices),
+                            false => (0..choices.len()).collect(),
+                        };
+                        let at: Vec<usize> =
+                            order.into_iter().filter(|&i| matches(&choices[i])).collect();
+                        let at = std::sync::Arc::new(at);
+                        let kept: Kept = (made_for.0, made_for.1, made_for.2.into(), at.clone());
+                        ui.data_mut(|d| d.insert_temp(kept_id, kept));
+                        at
                     }
-                    if r.clicked() {
-                        pick = Some(None);
-                        ui.close();
-                    }
+                };
+                at.iter().map(|&i| &choices[i]).collect()
+            } else {
+                in_order().iter().filter(|c| matches(c)).collect()
+            };
+            let shown: Vec<Option<&mg_rules::Choice>> =
+                (none.map(|_| None).into_iter()).chain(found.into_iter().map(Some)).collect();
+            let chosen = |c: Option<&mg_rules::Choice>| match c {
+                Some(c) => current == Some(c.row as i64),
+                None => current.is_none(),
+            };
+            let mut row = |ui: &mut Ui, c: Option<&mg_rules::Choice>, scroll: bool| {
+                let label = match c {
+                    Some(c) => text(c, numbered),
+                    None => none.unwrap_or_default().into(),
+                };
+                let mut r = ui.selectable_label(chosen(c), label);
+                if scroll && go && chosen(c) {
+                    r.scroll_to_me(Some(egui::Align::Center));
                 }
-                for c in in_order().iter().filter(|c| matches(c)) {
-                    let chosen = current == Some(c.row as i64);
-                    let mut r = ui.selectable_label(chosen, text(c, numbered));
-                    if go && chosen {
-                        r.scroll_to_me(Some(egui::Align::Center));
-                    }
-                    if let Some(about) = about.as_mut() {
-                        r = r.on_hover_ui_at_pointer(|ui| about(ui, c.row));
-                    }
-                    if r.clicked() {
-                        pick = Some(Some(c.row as i64));
-                        ui.close();
-                    }
+                if let (Some(about), Some(c)) = (about.as_mut(), c) {
+                    r = r.on_hover_ui_at_pointer(|ui| about(ui, c.row));
+                }
+                if r.clicked() {
+                    pick = Some(c.map(|c| c.row as i64));
+                    ui.close();
                 }
             };
             if long {
+                // (The rows scroll under the Filter field, which stays;
+                // only those in sight are laid out, of a table of tens of
+                // thousands too. Opened, the chosen one is in the middle.)
+                let height = ui.spacing().interact_size.y.max(
+                    ui.text_style_height(&egui::TextStyle::Button)
+                        + 2.0 * ui.spacing().button_padding.y,
+                );
+                let step = height + ui.spacing().item_spacing.y;
                 let mut area = egui::ScrollArea::vertical().max_height(ROWS_HEIGHT);
                 if narrowed {
                     area = area.vertical_scroll_offset(0.0);
+                } else if go && let Some(at) = shown.iter().position(|c| chosen(*c)) {
+                    let offset = at as f32 * step + height / 2.0 - ROWS_HEIGHT / 2.0;
+                    area = area.vertical_scroll_offset(offset.max(0.0));
                 }
-                area.show(ui, rows);
+                area.show_rows(ui, height, shown.len(), |ui, range| {
+                    for c in &shown[range] {
+                        row(ui, *c, false);
+                    }
+                });
             } else {
-                rows(ui);
+                for c in &shown {
+                    row(ui, *c, true);
+                }
             }
         });
         let r = &list.response;
@@ -2828,9 +3083,22 @@ impl<'a> RowChoice<'a> {
         // shown), and the wheel where asked.
         let stepping = r.clicked() || r.has_focus() || (wheel && r.hovered());
         if pick.is_none() && stepping {
-            let rows: Vec<i64> = (none.map(|_| NO_ROW).into_iter())
-                .chain(in_order().iter().map(|c| c.row as i64))
-                .collect();
+            // (Put in order only for a key or the wheel: a box with the
+            // keys is drawn every frame, its list of thousands too.)
+            let asked = ui.input(|i| {
+                (i.events.iter()).any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { pressed: true, .. } | egui::Event::MouseWheel { .. }
+                    )
+                })
+            });
+            let rows: Vec<i64> = match asked {
+                true => (none.map(|_| NO_ROW).into_iter())
+                    .chain(in_order().iter().map(|c| c.row as i64))
+                    .collect(),
+                false => Vec::new(),
+            };
             let at = current.unwrap_or(NO_ROW);
             let stepped = arrow_pick(ui, r, &rows, at)
                 .or_else(|| wheel.then(|| wheel_pick(ui, r, &rows, at)).flatten());
@@ -2855,17 +3123,9 @@ impl<'a> RowChoice<'a> {
 /// shows them), Page Up and Page Down ten away, Home and End the first
 /// and last. The row chosen so.
 pub(crate) fn arrow_pick(ui: &Ui, r: &egui::Response, rows: &[i64], current: i64) -> Option<i64> {
-    if r.clicked() {
-        r.request_focus();
-    }
-    if !r.has_focus() || rows.is_empty() {
+    if !hold_arrows(ui, r) || rows.is_empty() {
         return None;
     }
-    claim_arrows(ui, r);
-    // (The arrows are the list's while it has the focus, not egui's way
-    // from one widget to the next.)
-    let arrows = egui::EventFilter { vertical_arrows: true, ..Default::default() };
-    ui.memory_mut(|m| m.set_focus_lock_filter(r.id, arrows));
     let last = rows.len() as i64 - 1;
     let at = rows.iter().position(|&row| row == current).map(|a| a as i64);
     let to = ui.input(|i| {
@@ -2888,6 +3148,22 @@ pub(crate) fn arrow_pick(ui: &Ui, r: &egui::Response, rows: &[i64], current: i64
         }
     })?;
     rows.get(to as usize).copied().filter(|&row| row != current)
+}
+
+/// A list of choices' box `r` takes the keyboard when clicked, and the
+/// arrow keys while it has it (not egui's way from one widget to the
+/// next): whether it has it.
+fn hold_arrows(ui: &Ui, r: &egui::Response) -> bool {
+    if r.clicked() {
+        r.request_focus();
+    }
+    if !r.has_focus() {
+        return false;
+    }
+    claim_arrows(ui, r);
+    let arrows = egui::EventFilter { vertical_arrows: true, ..Default::default() };
+    ui.memory_mut(|m| m.set_focus_lock_filter(r.id, arrows));
+    true
 }
 
 /// (Where the list of choices with the keyboard is kept: [`choice_has_keys`].)
@@ -2979,11 +3255,15 @@ pub(crate) fn arrow_step<T: PartialEq + Clone>(
 /// builder over egui's combo box, `id_salt` its id.
 pub(crate) struct Dropdown {
     combo: egui::ComboBox,
+    /// Its id salt as an id: where [`Dropdown::show_menu`] keeps its keys.
+    salt: egui::Id,
+    stays_open: bool,
 }
 
 /// A [`Dropdown`] with the id `id_salt`.
 pub(crate) fn dropdown(id_salt: impl egui::AsIdSalt) -> Dropdown {
-    Dropdown { combo: egui::ComboBox::from_id_salt(id_salt) }
+    let salt = egui::Id::new(&id_salt);
+    Dropdown { combo: egui::ComboBox::from_id_salt(id_salt), salt, stays_open: false }
 }
 
 /// A [`Dropdown`] with `label` after its box (and naming it).
@@ -2991,7 +3271,8 @@ pub(crate) fn dropdown_labelled(
     id_salt: impl egui::AsIdSalt,
     label: impl Into<egui::WidgetText>,
 ) -> Dropdown {
-    Dropdown { combo: egui::ComboBox::new(id_salt, label) }
+    let salt = egui::Id::new(&id_salt);
+    Dropdown { combo: egui::ComboBox::new(id_salt, label), salt, stays_open: false }
 }
 
 impl Dropdown {
@@ -3016,6 +3297,7 @@ impl Dropdown {
     /// Open until a click lands outside it (a list of ticks, not one choice).
     pub(crate) fn stays_open(mut self) -> Self {
         self.combo = self.combo.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        self.stays_open = true;
         self
     }
 
@@ -3053,21 +3335,138 @@ impl Dropdown {
         rows: impl FnOnce(&mut Ui, &mut T),
     ) -> egui::Response {
         let r = self.combo.show_ui(ui, |ui| rows(ui, current)).response;
-        if r.clicked() || r.has_focus() {
+        // (The options read only when an arrow key is pressed: not each
+        // frame the box has the keys.)
+        let keyed = ui.input(|i| {
+            use egui::Key;
+            [Key::ArrowDown, Key::ArrowUp, Key::PageDown, Key::PageUp, Key::Home, Key::End]
+                .iter()
+                .any(|k| i.key_pressed(*k) && i.modifiers.is_none())
+        });
+        if keyed && (r.clicked() || r.has_focus()) {
             arrow_step(ui, &r, &options(), current);
+        } else {
+            hold_arrows(ui, &r);
         }
         r
     }
 
+    /// A dropdown of commands (Add hak…) or of
+    /// ticks (the 2DA editor's flags), not one choice: once its box is
+    /// clicked or reached with Tab, Up and Down open it and move a cursor
+    /// along its rows (Home and End: the first and last), and Enter or
+    /// Space does what the row's click does ([`MenuKeys::row`]): a
+    /// command closes the list, a tick leaves it open. The box's response.
+    pub(crate) fn show_menu(
+        self,
+        ui: &mut Ui,
+        contents: impl FnOnce(&mut Ui, &mut MenuKeys),
+    ) -> egui::Response {
+        let state_id = ui.make_persistent_id(("menu-keys", self.salt));
+        let mut state: MenuState = ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
+        let focused = state.button.is_some_and(|b| ui.memory(|m| m.has_focus(b)));
+        let popup = state.button.map(|b| b.with("popup"));
+        let open = popup.is_some_and(|p| egui::Popup::is_id_open(ui.ctx(), p));
+        let mut pressed = None;
+        if focused && let Some(popup) = popup {
+            let none = egui::Modifiers::NONE;
+            let key = |k| ui.input_mut(|i| i.consume_key(none, k));
+            let last = state.rows.saturating_sub(1);
+            let at = state.cursor;
+            let to = if key(egui::Key::ArrowDown) {
+                Some(at.map_or(0, |a| (a + 1).min(last)))
+            } else if key(egui::Key::ArrowUp) {
+                Some(at.map_or(last, |a| a.saturating_sub(1)))
+            } else if open && key(egui::Key::Home) {
+                Some(0)
+            } else if open && key(egui::Key::End) {
+                Some(last)
+            } else {
+                None
+            };
+            if let Some(to) = to {
+                if !open {
+                    // (Opened at its first row: its rows are not known yet.)
+                    egui::Popup::open_id(ui.ctx(), popup);
+                    state.cursor = Some(0);
+                } else {
+                    state.cursor = Some(to);
+                }
+                state.reveal = true;
+            }
+            if open && state.cursor.is_some() && (key(egui::Key::Enter) || key(egui::Key::Space)) {
+                pressed = state.cursor;
+            }
+        }
+        let mut keys = MenuKeys { cursor: state.cursor, pressed, reveal: state.reveal, rows: 0 };
+        let r = self.combo.show_ui(ui, |ui| contents(ui, &mut keys)).response;
+        hold_arrows(ui, &r);
+        let still_open = egui::ComboBox::is_open(ui.ctx(), r.id);
+        if pressed.is_some() && !self.stays_open {
+            egui::Popup::close_id(ui.ctx(), r.id.with("popup"));
+        }
+        state = MenuState {
+            button: Some(r.id),
+            // (Once open, the rows are known.)
+            rows: if still_open { keys.rows } else { state.rows.max(keys.rows) },
+            cursor: if still_open || state.cursor.is_some() && !open {
+                state.cursor.map(|c| c.min(keys.rows.max(1) - 1))
+            } else {
+                None
+            },
+            reveal: false,
+        };
+        if pressed.is_some() && !self.stays_open {
+            state.cursor = None;
+        }
+        ui.data_mut(|d| d.insert_temp(state_id, state));
+        r
+    }
+
     /// A dropdown that is not a list of choices, whose arrow keys would
-    /// have nothing to step through: commands (Add hak…), a set of ticks,
-    /// a grid of colors.
+    /// have nothing to step through: a grid of colors.
     pub(crate) fn show_ui<R>(
         self,
         ui: &mut Ui,
         contents: impl FnOnce(&mut Ui) -> R,
     ) -> egui::InnerResponse<Option<R>> {
         self.combo.show_ui(ui, contents)
+    }
+}
+
+/// Where [`Dropdown::show_menu`]'s keys are: the box (last drawn), its
+/// rows (when last open) and the row the cursor is at.
+#[derive(Clone, Copy, Default)]
+struct MenuState {
+    button: Option<egui::Id>,
+    rows: usize,
+    cursor: Option<usize>,
+    reveal: bool,
+}
+
+/// The keys of a [`Dropdown::show_menu`]'s rows: each row's response goes
+/// through [`MenuKeys::row`], in the order shown.
+pub(crate) struct MenuKeys {
+    cursor: Option<usize>,
+    pressed: Option<usize>,
+    reveal: bool,
+    rows: usize,
+}
+
+impl MenuKeys {
+    /// A row of the list, `r` its response: shown as under the pointer
+    /// where the cursor is; true when Enter or Space was pressed there (do
+    /// what its click does).
+    pub(crate) fn row(&mut self, r: &egui::Response) -> bool {
+        let at = self.rows;
+        self.rows += 1;
+        if self.cursor == Some(at) {
+            r.clone().highlight();
+            if self.reveal {
+                r.scroll_to_me(None);
+            }
+        }
+        self.pressed == Some(at)
     }
 }
 
@@ -3228,7 +3627,7 @@ const BOLD: &str = "bold";
 /// Adds the bold font family to `ctx`'s fonts (once a context; it is there
 /// from the next frame): Ubuntu Bold, then egui's emoji fonts for the
 /// glyphs it lacks.
-pub(crate) fn install_fonts(ctx: &egui::Context) {
+pub fn install_fonts(ctx: &egui::Context) {
     let done = egui::Id::new("moonglow-fonts");
     if ctx.data(|d| d.get_temp::<bool>(done)).is_some() {
         return;
@@ -3251,14 +3650,111 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
 /// A form's field label (the first column of an editor's grid: "Tag",
 /// "Name"…): in the strong text colour (white in the dark theme), to stand
 /// apart from the values beside it; not bold, which is the headings'.
-pub(crate) fn field_label(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+/// (Public, with the headings, [`install_fonts`] and [`palette_color`], for
+/// Moonglow Viewer's forms to look as the toolset's.)
+pub fn field_label(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     ui.label(egui::RichText::new(text).strong())
+}
+
+/// A PLT color (0 to 175) chosen among a palette's swatches (a TGA of
+/// `pal_*`, its rows the colours): its swatch, then a list showing
+/// `current` (or `text` in place of its number) that opens on all 176,
+/// sixteen to a row, each named "`what` N". `None` for the palette (no
+/// game data) leaves the list without swatches. The colour chosen.
+pub fn palette_color(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    palette: Option<&mg_image::Rgba>,
+    what: &str,
+    current: u8,
+    text: Option<&str>,
+) -> Option<u8> {
+    let mut pick = None;
+    ui.horizontal(|ui| {
+        if let Some(p) = palette {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 16.0), egui::Sense::hover());
+            swatch(ui, rect, &tones(p, current));
+        }
+        // (The arrow keys step through the colors in their order.)
+        let mut chosen = current;
+        dropdown(id_salt)
+            .selected_text(text.map_or_else(|| current.to_string(), str::to_string))
+            .width(56.0)
+            .height(11.0 * 16.0 + 24.0)
+            .show_with(
+                ui,
+                &mut chosen,
+                || (0..176).collect(),
+                |ui, chosen| {
+                    let Some(p) = palette else {
+                        ui.weak("No palette");
+                        return;
+                    };
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    // 176 colours, 16 to a row.
+                    for row in 0..11u8 {
+                        ui.horizontal(|ui| {
+                            for i in row * 16..row * 16 + 16 {
+                                let size = egui::vec2(16.0, 14.0);
+                                let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click());
+                                swatch(ui, rect, &tones(p, i));
+                                if i == current && text.is_none() {
+                                    let stroke = ui.visuals().selection.stroke;
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        0.0,
+                                        stroke,
+                                        egui::StrokeKind::Outside,
+                                    );
+                                }
+                                let name = format!("{what} {i}");
+                                r.widget_info(|| {
+                                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name)
+                                });
+                                if r.on_hover_text(&name).clicked() {
+                                    *chosen = i;
+                                    pick = Some(i);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                },
+            );
+        if chosen != current {
+            pick = Some(chosen);
+        }
+    });
+    pick
+}
+
+/// A palette colour's tones (its row, `index` counted from the top, at four
+/// grey levels), as the colour chooser shows them.
+pub fn tones(palette: &mg_image::Rgba, index: u8) -> [egui::Color32; 4] {
+    let rows = palette.height.max(1);
+    let y = rows - 1 - u32::from(index).min(rows - 1);
+    [64u32, 128, 192, 250].map(|x| {
+        let [r, g, b, _] = palette.pixel(x.min(palette.width.saturating_sub(1)), y);
+        egui::Color32::from_rgb(r, g, b)
+    })
+}
+
+/// Paints a swatch: the tones side by side.
+pub fn swatch(ui: &egui::Ui, rect: egui::Rect, tones: &[egui::Color32; 4]) {
+    let w = rect.width() / tones.len() as f32;
+    for (i, c) in tones.iter().enumerate() {
+        let r = egui::Rect::from_min_size(
+            rect.min + egui::vec2(w * i as f32, 0.0),
+            egui::vec2(w, rect.height()),
+        );
+        ui.painter().rect_filled(r, 0.0, *c);
+    }
 }
 
 /// A heading in a table's cell (a group of rows: Options › Keyboard's):
 /// as a section's, without its rule and room, which a cell has no place
 /// for.
-pub(crate) fn table_heading(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+pub fn table_heading(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     let bold = egui::FontFamily::Name(BOLD.into());
     let size = egui::TextStyle::Body.resolve(ui.style()).size * HEADING_SCALE;
     let mut text = egui::RichText::new(text).strong().size(size);
@@ -3272,7 +3768,7 @@ pub(crate) fn table_heading(ui: &mut egui::Ui, text: impl Into<String>) -> egui:
 /// Bold (headings alone are bold), the strong text colour, and larger than
 /// the field labels under it; under it a rule a pixel thick, three quarters
 /// as wide as the pane it is in, then a little room before what follows.
-pub(crate) fn section_heading(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+pub fn section_heading(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     let heading = table_heading(ui, text);
     // (A pane with no width of its own yet: the heading's.)
     let pane = ui.available_width();
@@ -3286,7 +3782,7 @@ pub(crate) fn section_heading(ui: &mut egui::Ui, text: impl Into<String>) -> egu
 
 /// The room above a section heading that follows other content (its rule
 /// is under it; no separator above).
-pub(crate) const SECTION_GAP: f32 = 10.0;
+pub const SECTION_GAP: f32 = 10.0;
 /// How much larger than the body text a section heading is.
 const HEADING_SCALE: f32 = 1.25;
 /// How much of its pane's width a section heading's rule spans.
@@ -3615,6 +4111,36 @@ mod tests {
 }
 
 #[cfg(test)]
+mod select_tests {
+    use super::select_in_list;
+    use std::collections::BTreeSet;
+
+    /// The rule of every list of which several can be selected (the hak
+    /// editor's, the module's haks, Open Script's, the tree's): a click
+    /// alone, Ctrl toggling, Shift a range from the anchor, Ctrl+Shift the
+    /// range added.
+    #[test]
+    fn a_click_with_ctrl_and_shift_selects_as_lists_do() {
+        let listed = [10, 20, 30, 40, 50];
+        let (mut selected, mut anchor) = (BTreeSet::new(), None);
+        let mut click = |row, command, shift| {
+            select_in_list(&mut selected, &mut anchor, &listed, row, command, shift);
+            (selected.iter().copied().collect::<Vec<_>>(), anchor)
+        };
+        assert_eq!(click(20, false, false), (vec![20], Some(20)));
+        assert_eq!(click(40, false, true), (vec![20, 30, 40], Some(20)), "anchor stays");
+        assert_eq!(click(10, false, true), (vec![10, 20], Some(20)));
+        assert_eq!(click(50, true, false), (vec![10, 20, 50], Some(50)));
+        assert_eq!(click(20, true, false), (vec![10, 50], Some(20)), "Ctrl takes one away");
+        assert_eq!(click(40, true, true), (vec![10, 20, 30, 40, 50], Some(20)));
+        // Shift with no anchor listed is a click alone.
+        let (mut selected, mut anchor) = (BTreeSet::new(), Some(99));
+        select_in_list(&mut selected, &mut anchor, &listed, 30, false, true);
+        assert_eq!((selected.into_iter().collect::<Vec<_>>(), anchor), (vec![30], Some(30)));
+    }
+}
+
+#[cfg(test)]
 mod token_tests {
     use super::with_token;
     use egui::text::{CCursor, CCursorRange};
@@ -3689,7 +4215,7 @@ mod token_tests {
 #[cfg(test)]
 mod row_choice_tests {
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     /// The list of a dropdown of `count` rows (one of them long) open:
     /// where its box is, and where its list is on each of the first 60
@@ -3758,5 +4284,50 @@ mod row_choice_tests {
         let (at, lists) = open_list(200, true);
         assert!(lists.iter().all(|l| *l == lists[0]), "{lists:?}");
         assert!(lists[0].width() > at.width() + 50.0, "{lists:?} beside {at:?}");
+    }
+
+    /// A list of tens of thousands of rows (a 2DA's) lays out only those
+    /// in sight while open, the chosen one among them in the middle,
+    /// and isn't sorted or searched again each frame: 62 frames of one
+    /// of 50,000 took 5.8 s before (93 ms a frame, in a release build),
+    /// 20 ms after.
+    #[test]
+    fn a_long_list_lays_out_only_the_rows_in_sight() {
+        struct State {
+            choices: Vec<mg_rules::Choice>,
+        }
+        let choices = (0..50_000)
+            .map(|row| mg_rules::Choice { row, text: format!("Choice {row:05}") })
+            .collect();
+        let mut h = Harness::builder().with_size(egui::vec2(800.0, 600.0)).build_ui_state(
+            |ui, s: &mut State| {
+                let id = egui::Id::new("list");
+                super::row_choice(id, &s.choices, 31_234).width(160.0).show(ui);
+            },
+            State { choices },
+        );
+        h.run();
+        h.get(egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox)).click();
+        h.run();
+        let rows = h.query_all_by_label_contains("Choice ").count();
+        assert!(rows < 30, "{rows} rows laid out");
+        assert!(h.query_by_label("Choice 31234").is_some(), "the chosen one in sight");
+        // Narrowed by the filter: from its top.
+        h.get(egui_kittest::kittest::by().role(egui::accesskit::Role::TextInput)).click();
+        h.run();
+        h.event(egui::Event::Text("4999".into()));
+        h.run();
+        h.run();
+        let shown: Vec<String> = (h.query_all_by_label_contains("Choice "))
+            .map(|n| n.accesskit_node().label().unwrap_or_default())
+            .collect();
+        assert_eq!(shown[0], "Choice 04999", "{shown:?}");
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            h.step();
+        }
+        // (A frame of it in a debug build, with a margin: it took 93 ms
+        // in a release build when every row was laid out.)
+        assert!(t.elapsed() < std::time::Duration::from_millis(20 * 40), "{:?}", t.elapsed());
     }
 }

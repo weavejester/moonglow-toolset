@@ -21,6 +21,15 @@ pub struct Instance {
     /// meshes whose texture names none reflect it, their texture alpha
     /// being the reflectivity. `None`: only what textures ask for.
     pub env_map: Option<String>,
+    /// `env_map` is what the object's own `default` comes to (a
+    /// placeable's `Reflection` `default` is `chrome1`, whatever the
+    /// area's): a mesh whose texture says `envmaptexture default` reflects
+    /// the area's map instead, as it does on an object whose map is
+    /// `default` or none; only a map the object names is taken over the
+    /// area's (read from the client: `program_choice_in_the_client` in
+    /// `client_render.rs`, `MG_LYING_ENVD=1` with `MG_REFLECTION`
+    /// `default` and `plc_g_env`).
+    pub env_map_default: bool,
     /// Colours for PLT textures by layer (skin, hair, metal 1 and 2, cloth
     /// 1 and 2, leather 1 and 2, tattoo 1 and 2); `None`: colour 0.
     pub plt_colors: Option<[u8; 10]>,
@@ -68,6 +77,7 @@ impl Instance {
             pose: None,
             state: None,
             env_map: None,
+            env_map_default: false,
             plt_colors: None,
             textures: None,
             opacity: 1.0,
@@ -249,6 +259,11 @@ pub struct Scene {
     /// Lines drawn after the meshes, hidden behind them (the area's tile
     /// grid), a pixel wide.
     pub lines: Vec<Line>,
+    /// Lines drawn many times over, after [`Scene::lines`] and as they are:
+    /// each shape's copies (an area's Sound Ranges, a dotted sphere for
+    /// each distance), its lines sent to the GPU once and only the copies
+    /// each frame.
+    pub line_shapes: Vec<LineShape>,
     /// Seconds, for what moves by itself: the game's water ripples, and
     /// the game's shaders' clock (`worldtimerTimeOfDay`,
     /// `sceneCurrentFrame`: wind-swayed grass, flowing water).
@@ -347,6 +362,26 @@ pub fn wind(power: i64) -> Vec3 {
 pub struct Line {
     pub from: Vec3,
     pub to: Vec3,
+    /// Gamma-space colour and alpha.
+    pub color: [f32; 4],
+}
+
+/// Lines drawn many times over ([`Scene::line_shapes`]): the same lines,
+/// moved and scaled, in each copy's colour. The renderer keeps a shape's
+/// lines on the GPU while the shape is drawn, known by its `lines` (the
+/// same `Arc` from frame to frame): only the copies are sent each frame.
+#[derive(Debug, Clone)]
+pub struct LineShape {
+    /// The lines' ends, about the origin.
+    pub lines: Arc<[[Vec3; 2]]>,
+    pub copies: Vec<LineCopy>,
+}
+
+/// One of a [`LineShape`]'s copies: each end at `offset + end * scale`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LineCopy {
+    pub offset: Vec3,
+    pub scale: f32,
     /// Gamma-space colour and alpha.
     pub color: [f32; 4],
 }

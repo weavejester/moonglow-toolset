@@ -3,6 +3,39 @@
 
 use crate::common::*;
 
+/// A blueprint's Category lists its type's categories made once, not read
+/// and parsed every frame: again when the module changes, or they are
+/// asked for by name.
+#[test]
+fn a_blueprint_s_categories_are_made_once() {
+    use mg_module::palette::BlueprintKind;
+    use mg_ui::palette_view::categories;
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-categories-kept");
+    let path = sample_module(&dir);
+    let mut app = game_app(&root, None);
+    app.open_module(&path);
+    let first = categories(&mut app, BlueprintKind::Creature);
+    assert!(!first.is_empty(), "the game's creature categories");
+    assert!(std::sync::Arc::ptr_eq(&first, &categories(&mut app, BlueprintKind::Creature)));
+    assert!(!std::sync::Arc::ptr_eq(&first, &categories(&mut app, BlueprintKind::Item)));
+    // By name: made again, the same categories in another order.
+    app.settings.categories_by_name = !app.settings.categories_by_name;
+    let by_name = categories(&mut app, BlueprintKind::Creature);
+    assert!(!std::sync::Arc::ptr_eq(&first, &by_name));
+    let rows = |c: &[mg_rules::Choice]| {
+        let mut rows: Vec<usize> = c.iter().map(|c| c.row).collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(rows(&first), rows(&by_name));
+    // The module changed: made again.
+    let key = ResKey::parse("mg_cat_kept", ResType::NSS).unwrap();
+    let edit = mg_edit::Edit::SetResource { key, data: Some(b"void main() {}".to_vec()) };
+    app.ws.as_mut().unwrap().apply(mg_edit::Command::new("Script", vec![edit])).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&by_name, &categories(&mut app, BlueprintKind::Creature)));
+}
+
 /// Saving writes the custom palettes with their blueprints' names as the
 /// game reads them: the bytes the names have in the module (an accent in
 /// the game's codepage, a color token's bytes), not UTF-8, which the DM's
@@ -29,7 +62,7 @@ fn a_saved_module_s_custom_palette_has_names_in_the_game_s_bytes() {
             vec![mg_edit::Edit::SetResource { key, data: Some(data) }],
         )));
     }
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.state_mut().actions.push(mg_ui::Action::Save);
     h.run();
@@ -110,8 +143,7 @@ fn the_custom_palette_keeps_the_entries_of_hak_blueprints() {
     let probe = mg_testkit::aurora_capture!("palettes/before.mod");
     let hak = mg_testkit::aurora_capture!("palettes/mgpal.hak");
     let dir = mg_testkit::scratch_dir("ui-palette-haks");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let user = user_folder(&dir, &["hak"]);
     std::fs::copy(&hak, user.join("hak/mgpal.hak")).unwrap();
     let path = dir.join("palette_probe.mod");
     std::fs::copy(&probe, &path).unwrap();
@@ -175,6 +207,68 @@ fn the_custom_palette_keeps_the_entries_of_hak_blueprints() {
     assert_eq!(saved, before, "every other entry as it was");
 }
 
+/// A blueprint copied with a tag another blueprint has is said in the
+/// Copy window (not stopping it) and in the log, as a paste's tags are
+/// weighed: with Options › General › Show duplicate tags warning on, a
+/// tag typed there; the original's kept asks nothing (as Aurora's Edit
+/// Copy); where the project wants it unique, or warns of any tag, either.
+#[test]
+fn a_blueprint_copied_with_another_s_tag_is_said() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-copy-tag");
+    let path = sample_module(&dir);
+    let mut app = game_app(&root, None);
+    app.open_module(&path);
+    app.settings.warn_duplicate_tags = true;
+    // Two waypoint blueprints of the module's: one tagged KZ_GATE.
+    let game = app.game.as_deref().unwrap();
+    let data = game.resman.get(&ResKey::parse("nw_waypoint001", ResType::UTW).unwrap()).unwrap();
+    let mut edits = Vec::new();
+    for (name, tag) in [("kz_gate", "KZ_GATE"), ("kz_well", "KZ_WELL")] {
+        let mut g = Gff::read(&data).unwrap();
+        g.root.set("TemplateResRef", mg_gff::Value::resref(ResRef::from_str(name).unwrap()));
+        g.root.set("Tag", mg_gff::Value::String(tag.as_bytes().to_vec()));
+        let key = ResKey::parse(name, ResType::UTW).unwrap();
+        edits.push(mg_edit::Edit::SetResource { key, data: Some(g.to_bytes().unwrap()) });
+    }
+    app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", edits)));
+    let mut h = harness(app, 900.0, 700.0);
+    h.run();
+    let well = ResKey::parse("kz_well", ResType::UTW).unwrap();
+    let said = |h: &mut Harness<'_, Moonglow>, tag: &str| {
+        use egui_kittest::kittest::NodeT;
+        h.state_mut().copy_as.as_mut().unwrap().tag = Some(tag.into());
+        h.run();
+        h.query_by_label_contains("what is placed from either has it").map(|n| {
+            n.accesskit_node().label().or_else(|| n.accesskit_node().value()).unwrap_or_default()
+        })
+    };
+    h.state_mut().actions.push(mg_ui::Action::CopyDialog(well));
+    h.run();
+    assert_eq!(said(&mut h, "KZ_WELL"), None, "the original's kept");
+    assert_eq!(
+        said(&mut h, "KZ_GATE").as_deref(),
+        Some("KZ_GATE is kz_gate.utw's tag too: what is placed from either has it")
+    );
+    assert_eq!(said(&mut h, "KZ_NEW"), None, "a tag of its own");
+    // Where the project wants it unique, the original's kept too.
+    h.state_mut().ws.as_mut().unwrap().module.project_file.tags.unique =
+        mg_module::project_file::Patterns::new(&["KZ_*"]).unwrap();
+    assert_eq!(
+        said(&mut h, "KZ_WELL").as_deref(),
+        Some(
+            "KZ_WELL is kz_well.utw's tag too: what is placed from either has it (the project \
+             wants KZ_* unique)"
+        )
+    );
+    // Not stopping the copy (Enter makes it); said in the log once made.
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    let copy = h.state().log.entries.iter().any(|e| e.1.contains("kz_well.utw's tag too"));
+    assert!(copy, "in the log");
+    assert!(h.state().copy_as.is_none(), "copied");
+}
+
 #[test]
 fn palette_edit_copy_and_delete() {
     let root = mg_testkit::corpus!();
@@ -222,15 +316,16 @@ fn palette_edit_copy_and_delete() {
     h.get_by_label("Edit Copy…").click();
     h.run();
     let draft = h.state().copy_as.clone().expect("the Copy window");
-    assert_eq!(draft.resref, "nw_wp_tavern001");
+    // As Aurora's Edit Copy names it: without `nw_`, numbered past it.
+    assert_eq!(draft.resref, "wp_tavern001");
     let tag = draft.tag.expect("a waypoint has a tag");
     h.state_mut().copy_as.as_mut().unwrap().tag = Some("MY_TAVERN".into());
     h.get_by_label("Create Copy").click();
     h.run();
     // A copy in the module, shown in the Custom palette.
-    let copy = ResKey::parse("nw_wp_tavern001", ResType::UTW).unwrap();
+    let copy = ResKey::parse("wp_tavern001", ResType::UTW).unwrap();
     let gff = h.state_mut().ws.as_mut().unwrap().doc(&copy).unwrap().clone();
-    assert_eq!(gff.root.resref("TemplateResRef").unwrap().to_string(), "nw_wp_tavern001");
+    assert_eq!(gff.root.resref("TemplateResRef").unwrap().to_string(), "wp_tavern001");
     assert_eq!(gff.root.string("Tag"), Some(&b"MY_TAVERN"[..]), "not {tag}");
     assert!(h.state().palette.custom);
     // Custom palettes list blueprints under their own names.
@@ -239,8 +334,10 @@ fn palette_edit_copy_and_delete() {
         &gff.root,
         h.state().game.as_deref().unwrap(),
     );
-    // (The copy's editor, opened in a window, closed first.)
+    // (The copy's editor, opened in a window, closed first; the filter
+    // finds the copy, which has no `nw_`.)
     close_windows(&mut h);
+    h.state_mut().palette.filter = "wp_tavern001".into();
     h.run();
     h.get_by_label(&name).click_secondary();
     h.run();
@@ -609,26 +706,126 @@ fn a_module_gets_palette_categories_of_its_own() {
     h.run();
     assert!(h.query_by_label("Ruins (1)").is_some(), "the custom palette has the category");
 
-    // With a blueprint in it, it isn't removed.
+    // With a blueprint in it, Remove asks where the blueprint goes;
+    // Keep It keeps it, Cancel moves nothing.
+    let reopen = |h: &mut Harness<'_, Moonglow>| {
+        h.get_by_label("More").click();
+        h.run();
+        h.get_by_label("Categories…").click();
+        h.run();
+        h.get_by_label("This module's own categories, kept in the module.");
+        h.state_mut().palette_categories.as_mut().unwrap().selected = Some(ruins.clone());
+        h.run();
+        h.get_by_label("Remove").click();
+        h.run();
+        h.get_by_label("1 of the module's blueprint is in it. Move them to:");
+    };
+    let category_of = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.doc(&key).unwrap().root.integer("PaletteID")
+    };
+    reopen(&mut h);
+    assert!(h.get_by_label("Move and Remove").accesskit_node().is_disabled(), "none chosen");
+    h.get_by_label("Keep It").click();
+    h.run();
+    assert!(h.query_by_label("Move and Remove").is_none());
+    h.get_by_label("Remove").click();
+    h.run();
+    h.get_by_label("Move and Remove");
+    h.get_by_label("Cancel").click();
+    h.run();
+    assert!(own(&mut h).unwrap().ids().contains(&id));
+    assert_eq!(category_of(&mut h), Some(i64::from(id)), "nothing moved");
+    // Moved to the category chosen, and removed: one step with the list,
+    // which Undo takes back whole.
+    reopen(&mut h);
+    let target = categories[0].clone();
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    let unchosen = |n: &egui_kittest::Node<'_>| {
+        n.accesskit_node().value().is_some_and(|v| v == "choose a category")
+    };
+    h.query_all(combo).find(unchosen).expect("the categories' dropdown").click();
+    h.run();
+    h.get_all_by_label(&target.1).last().unwrap().click();
+    h.run();
+    h.get_by_label("Move and Remove").click();
+    h.run();
+    assert!(h.query_by_label("Ruins  (category 0)").is_none());
+    h.get_by_label("OK").click();
+    h.run();
+    assert!(!own(&mut h).unwrap().ids().contains(&id), "removed");
+    assert_eq!(category_of(&mut h), Some(i64::from(target.0)), "the chest moved");
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Palette categories"));
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run();
+    assert!(own(&mut h).unwrap().ids().contains(&id), "back");
+    assert_eq!(category_of(&mut h), Some(i64::from(id)), "and the chest in it");
+}
+
+/// Palette › Categories…: a category named by a talk-table string, shown
+/// in each player's language as the game's own are: by a StrRef typed,
+/// or by the name typed, moved into the module's own talk table.
+#[test]
+fn a_palette_category_is_named_by_a_talk_table_string() {
+    use mg_module::palette::{BlueprintKind, PaletteName, node_name};
+    let Some((mut h, key)) = blueprint_harness("plc_chest1", "chest_strref", ResType::UTP) else {
+        return;
+    };
+    h.run();
+    {
+        let app = h.state_mut();
+        close_tab(app, &Tab::Blueprint(key));
+        app.actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+        app.palette.kind = BlueprintKind::Placeable;
+        app.palette.tiles = false;
+        app.palette.custom = true;
+    }
+    h.run();
     h.get_by_label("More").click();
     h.run();
     h.get_by_label("Categories…").click();
     h.run();
-    h.get_by_label("This module's own categories, kept in the module.");
-    {
-        let w = h.state_mut().palette_categories.as_mut().unwrap();
-        w.selected = Some(ruins);
-    }
+    type_into_hint(&mut h, "a category's or group's name", "Ruins");
+    h.get_by_label("Add Category").click();
     h.run();
-    h.get_by_label("Remove").click();
+    let path = h.state().palette_categories.as_ref().unwrap().selected.clone().unwrap();
+    let name_of = |h: &Harness<'_, Moonglow>| {
+        let w = h.state().palette_categories.as_ref().unwrap();
+        let mut node = &w.skeleton.root.list("MAIN").unwrap()[path[0]];
+        for i in &path[1..] {
+            node = &node.list("LIST").unwrap()[*i];
+        }
+        node_name(node)
+    };
+    assert!(matches!(name_of(&h), PaletteName::Text(_)));
+    // A StrRef typed: the game's talk table's line 5, its text shown
+    // beside it.
+    type_into_hint(&mut h, "a talk-table line", "5");
+    let game = h.state().game.clone().unwrap();
+    let five = game.string(mg_core::StrRef(5)).unwrap();
+    h.get_by_label(&five);
+    h.get_by_label("Name by StrRef").click();
     h.run();
-    let w = h.state().palette_categories.as_ref().unwrap();
-    assert!(
-        w.error.as_deref().is_some_and(|e| e.starts_with("1 of the module's blueprint is in it"))
-    );
-    h.get_by_label("Cancel").click();
+    assert_eq!(name_of(&h), PaletteName::StrRef(5));
+    h.get_by_label(&format!("{five}  (category {})", {
+        let w = h.state().palette_categories.as_ref().unwrap();
+        let mut node = &w.skeleton.root.list("MAIN").unwrap()[path[0]];
+        for i in &path[1..] {
+            node = &node.list("LIST").unwrap()[*i];
+        }
+        node.integer("ID").unwrap()
+    }));
+    // Without the module's own talk table, Move Name to Talk Table is off.
+    assert!(h.get_by_label("Move Name to Talk Table").accesskit_node().is_disabled());
+    // Kept: the skeleton's node has the StrRef and no name written out.
+    h.get_by_label("OK").click();
     h.run();
-    assert!(own(&mut h).unwrap().ids().contains(&id));
+    let skeleton = BlueprintKind::Placeable.skeleton_key();
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let doc = ws.doc(&skeleton).unwrap();
+    let palette = mg_module::palette::Palette::read(doc);
+    let names: Vec<PaletteName> = palette.nodes.iter().map(|n| n.name.clone()).collect();
+    assert!(names.contains(&PaletteName::StrRef(5)), "{names:?}");
 }
 
 #[test]
@@ -689,7 +886,8 @@ fn add_to_palette_create_waypoint_and_set() {
     h.run_steps(3);
     let chest = git(&mut h).list("Placeable List").unwrap()[0].clone();
     let new = chest.resref("TemplateResRef").unwrap();
-    assert!(new.to_string().starts_with("plc_chest"), "{new}");
+    // (`plc_` left off where `chest1` is free, as Aurora names it.)
+    assert_eq!(new.to_string(), "chest1");
     let key = ResKey::new(new, ResType::UTP);
     assert!(h.state().ws.as_ref().unwrap().module.contains(&key), "the new blueprint");
     assert!(h.state().dock.find_tab(&Tab::Blueprint(key)).is_some(), "its editor opens");
@@ -1137,7 +1335,7 @@ fn prefabs_are_offered_on_the_toolbar_and_in_the_palette() {
     // Two objects selected: the toolbar offers to save them.
     h.state_mut().area_views.get_mut(&area).unwrap().selection = vec![(Waypoint, 0), (Waypoint, 1)];
     h.run_steps(2);
-    h.get_by_label("Save 2 as Prefab…").click();
+    h.get_by_label("🗐 Save 2 as Prefab…").click();
     h.run_steps(2);
     let (_, clip) = h.state().prefab_save.clone().expect("the Save as Prefab window");
     assert_eq!(clip.objects.len(), 2);
@@ -1239,7 +1437,34 @@ fn the_palette_shown_last_is_remembered() {
     palette_type(&mut h, "🚪", "Doors");
     h.run_steps(2);
     assert_eq!(h.state().settings.palette_type.as_deref(), Some("utd"));
-    // Another start with those settings: the doors again.
+    // A category opened, and what is typed in the search: kept too (a
+    // category a search opens is not).
+    let first = h.state().settings.palette_open.clone();
+    // (The doors' standard palette: Tileset Specific and Universal.)
+    let header = "Universal".to_string();
+    // (Open: its rows under it.)
+    let open_now = |h: &Harness<'_, Moonglow>| {
+        let at = h.get_by_label(&header).rect();
+        let under = |n: &egui_kittest::Node<'_>| {
+            let r = n.rect();
+            r.top() > at.bottom() && r.top() < at.bottom() + 40.0 && r.left() > at.left()
+        };
+        h.query_all(egui_kittest::kittest::by().role(egui::accesskit::Role::Button))
+            .any(|n| under(&n))
+    };
+    assert!(!open_now(&h), "{header} closed at first");
+    h.get_by_label(&header).click();
+    h.run_steps(3);
+    assert!(open_now(&h), "{header} opened");
+    let open = h.state().settings.palette_open.clone();
+    assert_eq!(open.len(), first.len() + 1, "{open:?}");
+    assert!(open.iter().all(|k| k.starts_with("utd/standard/")), "{open:?}");
+    type_into_hint(&mut h, "Find", "zzzz");
+    h.run_steps(2);
+    assert_eq!(h.state().settings.palette_search, "zzzz");
+    assert_eq!(h.state().settings.palette_open, open, "a search opens none for good");
+    // Another start with those settings: the doors again, the category
+    // open and the search as it was.
     let settings = h.state().settings.clone();
     let Some((mut again, _)) = plugin_harness("ui-palette-remembered-2", true) else { return };
     again.state_mut().settings = settings;
@@ -1247,6 +1472,11 @@ fn the_palette_shown_last_is_remembered() {
     again.run_steps(3);
     assert_eq!(again.state().palette.kind, BlueprintKind::Door);
     assert!(!again.state().palette.tiles);
+    assert_eq!(again.state().palette.filter, "zzzz");
+    again.state_mut().palette.filter.clear();
+    again.run_steps(3);
+    assert_eq!(again.state().settings.palette_search, "");
+    assert!(open_now(&again), "{header} open at the start");
 }
 
 /// A blueprint copied into an open module folder from elsewhere (one
@@ -1268,8 +1498,7 @@ fn a_blueprint_copied_into_the_folder_shows_in_its_palette(
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir(&format!("ui-palette-outside-{}", kind.name()));
     let folder = dir.join("module");
-    std::fs::create_dir_all(dir.join("user")).unwrap();
-    let mut app = game_app(&root, Some(dir.join("user")));
+    let mut app = game_app(&root, Some(user_folder(&dir, &[])));
     let game = app.game.clone().unwrap();
     let original = game.resman.get_named(template, kind.restype()).unwrap().to_vec();
     let category = Gff::read(&original).unwrap().root.integer(kind.palette_field()).unwrap();
@@ -1447,7 +1676,7 @@ fn the_palette_s_gallery_shows_blueprints_as_pictures() {
     assert!(!h.state().settings.palette_gallery);
     let row = h.get_all_by_label(&name).next().expect("the chest's row").rect().size();
     assert!(row.y < 30.0, "a row of the list: {row:?}");
-    h.get_by_label("⊞").click();
+    h.get_by_label("🖼").click();
     h.run_steps(3);
     assert!(h.state().settings.palette_gallery);
 }
@@ -1509,6 +1738,109 @@ fn a_gallery_s_pictures_are_made_once_and_kept_while_in_sight() {
         (now as u64) < kept as u64 + more && now as u64 <= more + 4,
         "those out of sight are let go, but for four: {now} kept of {kept} and {more} more"
     );
+}
+
+/// A gallery's pictures, made with one of the shaders, are made anew with
+/// the other when the Shaders switch is flipped (they were kept as they
+/// were drawn, until asked for anew); a flip that changes nothing (the
+/// switch set as it is) keeps them.
+#[test]
+fn a_gallery_s_pictures_are_made_anew_when_the_shaders_switch() {
+    let Some((mut h, _)) = area_harness("gallery-shaders") else { return };
+    {
+        let p = &mut h.state_mut().palette;
+        p.kind = mg_module::palette::BlueprintKind::Placeable;
+        (p.tiles, p.custom) = (false, false);
+        p.filter = "chest".into();
+    }
+    h.state_mut().settings.palette_gallery = true;
+    h.state_mut().settings.gallery_tile = Some(64);
+    let settle = |h: &mut Harness<'static, Moonglow>| {
+        for _ in 0..400 {
+            h.run_steps(1);
+            let t = &h.state().thumbnails;
+            let game = h.state().viewport.as_ref().unwrap().renderer.drawn.game_pending;
+            if t.waiting() == 0 && game == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.run_steps(2);
+        assert_eq!(h.state().thumbnails.waiting(), 0, "every picture in sight is made");
+    };
+    settle(&mut h);
+    assert!(!h.state().game_shaders(), "the area tests' own shader");
+    let (kept, drawn) = (h.state().thumbnails.kept(), h.state().thumbnails.drawn);
+    assert!(kept > 0);
+    // As it is: nothing let go.
+    h.state_mut().set_game_shaders(false);
+    settle(&mut h);
+    assert_eq!(h.state().thumbnails.drawn, drawn, "none drawn anew");
+    // On: each made again, with the game's shaders.
+    h.state_mut().set_game_shaders(true);
+    assert_eq!(h.state().thumbnails.kept(), 0, "the pictures let go at once");
+    settle(&mut h);
+    let again = h.state().thumbnails.drawn - drawn;
+    assert!(again >= kept as u64, "each drawn anew: {again} of {kept}");
+    // And off: again.
+    let drawn = h.state().thumbnails.drawn;
+    h.state_mut().set_game_shaders(false);
+    settle(&mut h);
+    assert!(h.state().thumbnails.drawn - drawn >= kept as u64);
+}
+
+/// Where the window keeps going (`background_jobs`, as the desktop app
+/// runs), a gallery's pictures have their models and textures read apart
+/// from the window and are drawn in a later frame, each once: the gallery
+/// looks as it does with them made in the frame (a picture of a model with
+/// large textures took a frame of 7 to 9 ms so).
+#[test]
+fn a_gallery_s_pictures_are_read_apart_and_look_the_same() {
+    let gallery = |apart: bool| {
+        let (mut h, _area) = area_harness(if apart { "gallery-apart" } else { "gallery-here" })?;
+        {
+            let app = h.state_mut();
+            app.background_jobs = apart;
+            app.palette.kind = mg_module::palette::BlueprintKind::Placeable;
+            (app.palette.tiles, app.palette.custom) = (false, false);
+            app.palette.filter = "chest".into();
+            app.settings.palette_gallery = true;
+        }
+        let mut read_apart = 0;
+        for _ in 0..2000 {
+            h.run_steps(1);
+            let t = &h.state().thumbnails;
+            read_apart = read_apart.max(t.reading());
+            if t.waiting() == 0 && t.reading() == 0 && t.kept() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        h.run_steps(2);
+        let t = &h.state().thumbnails;
+        assert_eq!((t.waiting(), t.reading()), (0, 0), "every picture in sight made");
+        assert_eq!(t.drawn, t.kept() as u64, "each drawn once");
+        assert_eq!(read_apart > 0, apart, "read apart only where the window keeps going");
+        // The palette's pictures, as drawn: the area view left out, and
+        // the log and the status bar under it, which name the module's
+        // path (another for each harness, and cut where the checkout's
+        // path makes it reach).
+        let ppp = h.ctx.pixels_per_point();
+        let palette = h.get_all_by_label("Placeables").next().expect("the palette").rect();
+        let log = h.get_all_by_label("Copy Log").next().expect("the log's Copy").rect();
+        let image = h.render().expect("render");
+        let x = ((palette.min.x * ppp) as u32).min(image.width());
+        let bottom = ((log.min.y * ppp) as u32).min(image.height());
+        Some(image::imageops::crop_imm(&image, x, 0, image.width() - x, bottom).to_image())
+    };
+    let Some(apart) = gallery(true) else { return };
+    let here = gallery(false).unwrap();
+    let differ = apart.pixels().zip(here.pixels()).filter(|(a, b)| a != b).count();
+    // (Both kept, to look at: target/test-output/gallery-apart.)
+    let dir = mg_testkit::output_dir("gallery-apart");
+    apart.save(dir.join("apart.png")).unwrap();
+    here.save(dir.join("here.png")).unwrap();
+    assert!(differ < 50, "{differ} pixels differ");
 }
 
 /// Replace Selected with This, on a blueprint in the palette: the selected
@@ -1696,4 +2028,100 @@ fn the_palette_s_item_pictures_are_kept_by_who_wears_them() {
     h.state_mut().settings.armor_on_woman = false;
     h.run_steps(30);
     assert_eq!(drawn(&h), hers, "the man's, kept");
+}
+
+/// Next Pane (F6) to the palettes puts the palette's cursor at its first
+/// row (GitHub issue 12): Right opens it there, with no arrow pressed
+/// first.
+#[test]
+fn next_pane_puts_the_palette_s_cursor_at_its_first_row() {
+    use mg_module::palette::BlueprintKind;
+    let Some((mut h, _)) = area_harness("palette-next-pane") else { return };
+    h.state_mut().palette.kind = BlueprintKind::Waypoint;
+    h.state_mut().palette.tiles = false;
+    h.state_mut().palette.custom = false;
+    h.run_steps(3);
+    let tavern = h.state().game.as_deref().unwrap().string(mg_core::StrRef(69068)).unwrap();
+    assert!(h.query_by_label(&tavern).is_none(), "the category closed");
+    // (The keys nowhere yet are taken as the middle's, the area's: the
+    // palettes next.)
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.key_press(egui::Key::ArrowRight);
+    h.run_steps(4);
+    assert!(h.query_by_label(&tavern).is_some(), "opened from the first row");
+}
+
+/// The palette's Gallery marks a blueprint whose appearance has no model
+/// (dansen9191's report: such a blueprint showed an empty picture, and
+/// nothing said why): the standard chest, its placeables.2da row made to
+/// name a model no one has (the module's copy of the table), shows "No
+/// model" in a red frame; another chest, whose row is as it was, doesn't.
+/// The picture goes to `target/test-output/ui-gallery-no-model/`.
+#[test]
+fn the_palette_s_gallery_marks_a_blueprint_with_no_model() {
+    let chest = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+    let prepare = |m: &mut mg_module::Module, game: &mg_rules::GameData, _: ResRef| {
+        let utp = Gff::read(&game.resman.get(&chest).unwrap()).unwrap();
+        let row = utp.root.integer("Appearance").unwrap();
+        let table = game.table("placeables").unwrap();
+        let model = table.get(row as usize, "ModelName").unwrap().to_ascii_lowercase();
+        let text = game.resman.get_named("placeables", ResType::TWODA).unwrap();
+        let text = String::from_utf8_lossy(&text);
+        let lines: Vec<String> = text
+            .split("\r\n")
+            .flat_map(|l| l.split('\n'))
+            .map(|line| {
+                if line.split_whitespace().next() != Some(&row.to_string()) {
+                    return line.to_string();
+                }
+                (line.split(' ').map(|w| {
+                    if w.eq_ignore_ascii_case(&model) {
+                        "plc_x99".to_string()
+                    } else {
+                        w.to_string()
+                    }
+                }))
+                .collect::<Vec<_>>()
+                .join(" ")
+            })
+            .collect();
+        m.set(
+            ResKey::parse("placeables", ResType::TWODA).unwrap(),
+            lines.join("\r\n").into_bytes(),
+        );
+    };
+    let Some((mut h, _area)) =
+        area_harness_with("gallery-no-model", "ttr01", None, 4, None, &prepare)
+    else {
+        return;
+    };
+    {
+        let p = &mut h.state_mut().palette;
+        p.kind = mg_module::palette::BlueprintKind::Placeable;
+        (p.tiles, p.custom) = (false, false);
+        p.filter = "plc_chest".into();
+    }
+    h.state_mut().settings.palette_gallery = true;
+    h.state_mut().settings.gallery_tile = Some(64);
+    // (A few are made a frame.)
+    h.run_steps(40);
+    let img = h.render().expect("render");
+    img.save(mg_testkit::scratch_dir("ui-gallery-no-model").join("gallery.png")).unwrap();
+    assert!(h.state().thumbnails.blueprint_has_no_model(chest), "the chest is marked");
+    // (Another chest of another row is not.)
+    let game = h.state().game.clone().unwrap();
+    let row = |key: ResKey| {
+        let data = game.resman.get(&key).unwrap();
+        Gff::read(&data).unwrap().root.integer("Appearance")
+    };
+    let others = ["plc_chest2", "plc_chest3", "plc_chest4", "plc_chest5"]
+        .map(|r| ResKey::parse(r, ResType::UTP).unwrap())
+        .into_iter()
+        .filter(|k| game.resman.contains(k) && row(*k) != row(chest))
+        .collect::<Vec<_>>();
+    assert!(!others.is_empty());
+    for other in others {
+        assert!(!h.state().thumbnails.blueprint_has_no_model(other), "{other} is not marked");
+    }
 }

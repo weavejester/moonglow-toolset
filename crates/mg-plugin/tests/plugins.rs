@@ -567,6 +567,57 @@ fn the_game_s_data_is_read() {
     assert_eq!(outcome.label, "Paladin|true|Paladin|true|false|NW_IT_TORCH001|true");
 }
 
+/// An overridden copy open in the window (the resource browser's) is
+/// `ctx.open` with its layer, and `ctx.game` reads that layer's copy, not
+/// the one the game loads.
+#[test]
+fn a_layer_s_copy_is_open_and_read() {
+    use mg_plugin::{Selected, Selection, run_console};
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let install = mg_resman::GameInstall::new(&root, None, "en");
+    let game = std::sync::Arc::new(mg_rules::GameData::open(&install).unwrap());
+    let rm = &game.resman;
+    // A blueprint of which a lower layer has another copy.
+    let (copy, layers) = rm
+        .every_copy()
+        .into_iter()
+        .find(|(k, layers)| {
+            k.restype.is_gff()
+                && layers.len() > 1
+                && rm.get_in(layers[0], k).ok() != rm.get_in(layers[1], k).ok()
+        })
+        .expect("a resource the game has two copies of");
+    let label = rm.layers()[layers[1]].label.clone();
+    let lower = rm.get_in(layers[1], &copy).unwrap().into_owned();
+    let open = Selected::Copy { key: copy, layer: label.clone() };
+    assert_eq!(Selected::parse(&format!("{copy}@{label}")).unwrap(), open);
+    assert_eq!(open.target(), None);
+    let code = r#"
+        local o = ctx.open
+        local mine = ctx.game:bytes(o.resource, o.layer)
+        local loaded = ctx.game:bytes(o.resource)
+        local gff = ctx.game:gff(o.resource, o.layer)
+        return o.kind, o.layer, tostring(o.module), #mine, mine ~= loaded, type(gff),
+            tostring(select(2, pcall(function() return ctx.game:bytes(o.resource, "no such layer") end))),
+            tostring(select(2, pcall(function() return ctx.module:bytes(o.resource, o.layer) end)))
+    "#;
+    let host = Rc::new(TestHost::default());
+    let selection = Selection { selected: Vec::new(), open: Some(open) };
+    let input = Input { selection, ..Input::new(module(), Some(game.clone())) };
+    run_console(code, input, host.clone()).unwrap();
+    let said: Vec<String> = host.log.borrow().iter().map(|(_, t)| t.clone()).collect();
+    // (Strings said as written, quoted.)
+    let ext = format!("{:?}", copy.restype.extension().unwrap());
+    let expected = [ext, format!("{label:?}"), "\"false\"".into(), lower.len().to_string()];
+    assert_eq!(said[..4], expected);
+    assert_eq!(said[4..6], ["true", "\"table\""], "the layer's copy, not the one loaded");
+    assert!(said[6].contains("is not a layer of the game's load order"), "{}", said[6]);
+    assert!(said[7].contains("ctx.module has no layers"), "{}", said[7]);
+}
+
 /// 2DAs and talk tables are made, changed and written as values
 /// (`mg.twoda`, `mg.tlk`), not as text put together by hand.
 #[test]
@@ -623,7 +674,7 @@ fn tables_are_made_and_written() {
         local mg = require("@moonglow")
         local t = mg.tlk.new()
         local first = t:add("Cleave")
-        t:set(3, { text = "Hide", sound = "vs_hide", sound_length = 1.5 })
+        t:set(3, { text = "Hide", sound = "VS_Hide", sound_length = 1.5 })
         local again = mg.tlk.parse(t:write())
         return first, again.lines, again:get(0).text, again:get(1), again:get(3).sound,
             again:get(3).sound_length
@@ -631,6 +682,16 @@ fn tables_are_made_and_written() {
     run_console(code, input(), host.clone()).unwrap();
     let log: Vec<String> = host.log.borrow().iter().map(|(_, m)| m.clone()).collect();
     assert_eq!(log, ["0", "4", "\"Cleave\"", "nil", "\"vs_hide\"", "1.5"]);
+    // A sound is named by the rule the talk-table editor and `mg tlk`
+    // hold one to (`ResRef::new_name`): one they refuse, a plugin can't
+    // write either.
+    let e = run_console(
+        "local mg = require('@moonglow') mg.tlk.new():set(0, { text = 'x', sound = 'a b.wav' })",
+        input(),
+        host.clone(),
+    );
+    let said = e.unwrap_err().to_string();
+    assert!(said.contains("a b.wav: a sound's name: ' '"), "{said}");
 }
 
 /// What the tables for plugins did not do (the deferred list's "Tables
@@ -1254,7 +1315,8 @@ fn a_plugin_s_tests_run_moonglow_s_own_checks() {
             local text = mg.vars.describe("tdod_lore_text")
             local lore = mg.vars.describe("tdod_lore_old")
             local all = mg.vars.described()
-            local said = `{text.name} {text.type} {text.file}:{text.line} {tostring(text.runtime)}, `
+            local said = `{text.name} {text.type} {text.file}:{text.line} {tostring(text.runtime)} `
+                .. `{text.default} {text.requires[1]} {#text.requires}, `
                 .. `{lore.name} {tostring(lore.pattern)} {tostring(lore.runtime)}, `
                 .. `{tostring(mg.vars.describe("nope"))}, {#all} {all[2].name} {all[2].type}`
             return { { resource = "module.ifo", message = said } }
@@ -1304,6 +1366,7 @@ fn a_plugin_s_tests_run_moonglow_s_own_checks() {
         fixture.join("variables.toml"),
         "colour = 3\n\
          [tdod_lore_text]\ntype = \"string\"\n\
+         default = \"a plaque\"\nrequires = [\"tdod_lore_seen\"]\n\
          [\"tdod_*_d20\"]\ntype = \"int\"\nruntime = true\n\
          [\"tdod_lore_*\"]\nruntime = true\n",
     )
@@ -1322,7 +1385,7 @@ fn a_plugin_s_tests_run_moonglow_s_own_checks() {
         [[test.finding]]
         resource = "module.ifo"
         at = "Module › VarTable › tdod_lore_txt"
-        message = "tdod_lore_txt (tdod_lore_*) is set by the scripts while the server runs (variables.toml:7 says runtime = true), and is never to be kept in a file: one kept here is there from the start, on every server: tdod_lore_text? (variables.toml:2)"
+        message = "tdod_lore_txt (tdod_lore_*) is set by the scripts while the server runs (variables.toml:9 says runtime = true), and is never to be kept in a file: one kept here is there from the start, on every server: tdod_lore_text? (variables.toml:2)"
 
         [[test]]
         name = "a start waypoint twice, retagged"
@@ -1395,7 +1458,7 @@ fn a_plugin_s_tests_run_moonglow_s_own_checks() {
         check = "vars"
         [[test.finding]]
         resource = "module.ifo"
-        message = "tdod_lore_text string variables.toml:2 false, tdod_lore_* true true, nil, 3 tdod_*_d20 int"
+        message = "tdod_lore_text string variables.toml:2 false a plaque tdod_lore_seen 1, tdod_lore_* true true, nil, 3 tdod_*_d20 int"
     "#;
     std::fs::write(source.join("tests").join("own.toml"), tests).unwrap();
     let plugin = Plugin::load(&source).unwrap();
@@ -1407,7 +1470,7 @@ fn a_plugin_s_tests_run_moonglow_s_own_checks() {
     assert_eq!(
         runtime.notes,
         ["the fixture's project file: variables.toml:1: \"colour\" is neither a variable \
-             ([colour]) nor undescribed = [...]"]
+             ([colour]) nor undescribed = [...] or [[rules]]"]
     );
     assert_eq!(result("a start waypoint twice, retagged").problems, Vec::<String>::new());
     let unknown = result("a check Moonglow has not").problems;

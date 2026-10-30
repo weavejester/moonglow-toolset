@@ -74,6 +74,15 @@ pub struct GpuSkin {
     /// The bones and weights of the mesh's chunk: the mesh's at its
     /// vertices' places ([`GpuMesh::base_vertex`]).
     pub vertices: wgpu::Buffer,
+    /// The least and the most a vertex's weights add up to, of the
+    /// vertices weighed to a bone (1 and 1 for a skin as the game's are):
+    /// where its bones can carry the mesh, as the game's programs weigh
+    /// them (Moonglow's own shader makes them add up to one).
+    pub weighed: [f32; 2],
+    /// A vertex is weighed to no bone: it stays where it is bound
+    /// (Moonglow's own shader), or goes to the skin node's origin (the
+    /// game's).
+    pub unweighed: bool,
 }
 
 /// A mesh's material, from the model.
@@ -129,6 +138,9 @@ pub struct GpuMesh {
     /// Its place in its chunk, given back when the last mesh drawing from
     /// it is dropped.
     slot: Arc<crate::pool::Slot>,
+    /// Its shadow volume ([`crate::volume`]), made the first time it casts
+    /// one with the shadows' High quality.
+    pub(crate) volume: crate::volume::VolumeSlot,
 }
 
 impl GpuMesh {
@@ -202,7 +214,7 @@ impl GpuModel {
             // (A face naming a vertex the mesh hasn't would draw another
             // mesh's, in the shared buffers: left out.)
             let n = vertices.len() as u32;
-            let indices: Vec<u32> =
+            let mut indices: Vec<u32> =
                 m.triangles().filter(|t| t.iter().all(|&i| i < n)).flatten().collect();
             let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
             for p in &m.vertices {
@@ -232,11 +244,42 @@ impl GpuModel {
                 }
                 _ => None,
             };
+            // (A skin's face that has a vertex no bone weighs is not
+            // drawn: the game's programs put such a vertex at clip space's
+            // origin, w 0 (MDL-SKIN-030), and the client shows nothing of
+            // its faces, the stock `c_wings2`'s 102 of them
+            // (`reading_wings_without_bones` in `client_render.rs`).)
+            // (A skin none of whose bones is a node of the model, as
+            // `c_wings2`'s right wing, has none of its faces drawn.)
+            if matches!(&m.extra, MeshExtra::Skin(s) if s.bones.is_empty()) {
+                indices.clear();
+            }
+            if let Some((_, data)) = &skin {
+                let weighed = |i: u32| data[i as usize].weights.iter().any(|w| *w > 0.0);
+                indices = indices
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .filter(|t| t.iter().all(|&i| weighed(i)))
+                    .flatten()
+                    .copied()
+                    .collect();
+            }
             let slot = gpu.pool.put(gpu, &vertices, &indices, skin.as_ref().map(|(_, d)| &d[..]));
-            let skin = skin.map(|(s, _)| GpuSkin {
-                bones: s.bones.clone(),
-                inverse_bind: inverse_binds(s, &rest, i),
-                vertices: slot.chunk.skin.clone().expect("a skinned chunk"),
+            let skin = skin.map(|(s, data)| {
+                let totals = data.iter().map(|v| v.weights.iter().filter(|w| **w > 0.0).sum());
+                let (least, most, unweighed) =
+                    totals.fold((f32::MAX, 0.0f32, false), |(l, m, u), t: f32| match t > 0.0 {
+                        true => (l.min(t), m.max(t), u),
+                        false => (l, m, true),
+                    });
+                GpuSkin {
+                    bones: s.bones.clone(),
+                    inverse_bind: inverse_binds(s, &rest, i),
+                    vertices: slot.chunk.skin.clone().expect("a skinned chunk"),
+                    weighed: if most > 0.0 { [least, most] } else { [1.0, 1.0] },
+                    unweighed,
+                }
             });
             let mesh = GpuMesh {
                 node: i,
@@ -250,7 +293,7 @@ impl GpuModel {
                     texture: m.textures[0].clone(),
                     maps: [m.textures[1].clone(), m.textures[2].clone(), m.textures[3].clone()],
                     mtr: m.material.clone(),
-                    normal_mapped: m.renderhint.as_deref().is_some_and(|h| h != "none"),
+                    normal_mapped: m.renderhint.as_deref().is_some_and(hint_wants_tangents),
                     diffuse: Vec3::from(m.diffuse),
                     ambient: Vec3::from(m.ambient),
                     emissive,
@@ -265,6 +308,7 @@ impl GpuModel {
                 casts: m.shadow,
                 skin,
                 slot: Arc::new(slot),
+                volume: Default::default(),
             };
             if m.render { meshes.push(mesh) } else { shadow_only.push(mesh) }
         }
@@ -294,6 +338,7 @@ impl GpuModel {
                 tangents_made: m.tangents_made,
                 casts: m.casts,
                 slot: m.slot.clone(),
+                volume: Default::default(),
             })
             .collect();
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -301,6 +346,15 @@ impl GpuModel {
         let (model, rest) = (self.model.clone(), self.rest.clone());
         GpuModel { id, model, meshes, shadow_only: Vec::new(), rest }
     }
+}
+
+/// Whether a model's render hint (any case) gives its mesh tangents: only
+/// `NormalAndSpecMapped` and `NormalTangents`, as the client reads an
+/// ASCII model's (another word, such as `NormalAndSpecMappedMesh`, gives
+/// none: `reading_tangents`, the deferred sprint's fifth client batch),
+/// as the game's compiler takes one and as an MTR's is read.
+pub fn hint_wants_tangents(hint: &str) -> bool {
+    ["normalandspecmapped", "normaltangents"].iter().any(|h| hint.eq_ignore_ascii_case(h))
 }
 
 /// Tangents for a mesh that has none (each vertex's, and the bitangent's
@@ -400,6 +454,11 @@ mod tests {
     /// angles to the normal where the coordinates give none.
     #[test]
     fn tangents_are_made_from_the_texture_coordinates() {
+        // (Only the two hints the game knows ask for them.)
+        assert!(
+            hint_wants_tangents("normalandspecmapped") && hint_wants_tangents("normaltangents")
+        );
+        assert!(!hint_wants_tangents("normalandspecmappedmesh") && !hint_wants_tangents("none"));
         let quad = |uvs: Vec<[f32; 2]>| Mesh {
             vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4],

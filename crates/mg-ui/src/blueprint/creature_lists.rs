@@ -59,6 +59,17 @@ pub(crate) fn offered(table: &mg_2da::TwoDa, row: usize, name: &str, label: &str
     !gone && table.get_int(row, name).is_some()
 }
 
+/// Whether a spells.2da row is one Special Abilities offers, as Aurora's
+/// list does (captured, `docs/log.md` 2026-10-29): an [`offered`] spell
+/// (`UserType` 1) or creature ability (2), not a subradial choice of
+/// another (a `Master`: Greater Shadow Conjuration's five, Holy Aura). A
+/// feat's, an item's power and the rest are not.
+pub(crate) fn special_ability(spells: &mg_2da::TwoDa, row: usize) -> bool {
+    offered(spells, row, "Name", "Label")
+        && matches!(spells.get_int(row, "UserType"), Some(1 | 2))
+        && spells.get_int(row, "Master").is_none()
+}
+
 /// feat.2da `TOOLSCATEGORIES`: the toolset's categories of feats.
 const FEAT_CATEGORIES: [(i32, &str); 6] = [
     (1, "Combat"),
@@ -846,9 +857,8 @@ pub(super) fn special_abilities(f: &mut Form<'_>, ui: &mut Ui) {
             egui::ScrollArea::vertical().id_salt(("utc-special-all", key)).max_height(400.0).show(
                 ui,
                 |ui| {
-                    let offer = |row: usize| {
-                        spell_table.as_ref().is_none_or(|t| offered(t, row, "Name", "Label"))
-                    };
+                    let offer =
+                        |row: usize| spell_table.as_ref().is_none_or(|t| special_ability(t, row));
                     for c in names
                         .iter()
                         .filter(|c| needle.finds(&c.text) && in_category(c.row) && offer(c.row))
@@ -930,6 +940,10 @@ pub(super) fn special_abilities(f: &mut Form<'_>, ui: &mut Ui) {
         apply(f, what, e);
     }
 }
+
+/// The primary and the secondary weapon slots.
+const PRIMARY: u32 = 0x10;
+const SECONDARY: u32 = 0x20;
 
 /// Equipment slots: (bit, name). The last four are the creature's natural
 /// equipment.
@@ -1226,6 +1240,10 @@ const MISSING_FEATS: (u32, &str) = (
      creature so that it can equip the item?",
 );
 
+/// What an equipped item's tip says when the creature may not wear it.
+const WORN_OFF: &str = "The game takes this off, into the backpack, as it loads the creature, \
+     and the area view and the creature's preview leave it off";
+
 /// A talk table string, else its English text.
 fn tlk(game: Option<&GameData>, (strref, english): (u32, &str)) -> String {
     game.and_then(|g| g.string(mg_core::StrRef(strref))).unwrap_or_else(|| english.to_string())
@@ -1315,6 +1333,9 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
     }
     let equipped: Vec<Struct> = f.root.list("Equip_ItemList").unwrap_or(&[]).to_vec();
     let backpack: Vec<Struct> = f.root.list("ItemList").unwrap_or(&[]).to_vec();
+    // (The icons as the creature's own inventory shows them in the game:
+    // a woman's armor with her icons, whatever Options › General says.)
+    let female = f.root.integer("Gender") == Some(1);
     let names = f.blueprint_names(BlueprintKind::Item);
     let name_of = |r: ResRef| names.get(&r).cloned().unwrap_or_else(|| r.to_string());
     let (mut add, mut chosen, mut equip) = (None, None, None);
@@ -1380,19 +1401,33 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
         super::side_panel(ui, egui::Id::new(("utc-inventory", key)), |ui| {
             {
                 crate::widgets::section_heading(ui, "Equipment");
-                let icons: Vec<_> = equipped.iter().map(|e| f.entry_icon(ui.ctx(), e)).collect();
+                let icons: Vec<_> =
+                    equipped.iter().map(|e| f.entry_icon_of(ui.ctx(), e, female)).collect();
+                // What the game takes off as it loads the creature: the
+                // item marked, and why in its tip.
+                let off: Vec<Option<String>> = equipped.iter().map(|e| f.wear_problem(e)).collect();
                 let layout = SlotLayout::new(ui);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for (n, (bit, slot)) in SLOTS.into_iter().enumerate() {
                         let at = equipped.iter().position(|s| s.id == bit);
-                        let shown = at.map_or_else(
-                            || "—".to_string(),
-                            |i| f.entry_name(&equipped[i], &names),
-                        );
+                        let name = at.map(|i| f.entry_name(&equipped[i], &names));
                         let tip = at.map(|i| {
-                            format!("{shown} ({})", inventory::entry_resref(&equipped[i]))
+                            let r = inventory::entry_resref(&equipped[i]);
+                            let mut tip = format!("{} ({r})", name.as_deref().unwrap_or(""));
+                            if let Some(why) = &off[i] {
+                                tip += &format!(
+                                    "\n\n{WORN_OFF}: {why}{}",
+                                    if why.ends_with('.') { "" } else { "." }
+                                );
+                            }
+                            tip
                         });
+                        let shown = match (name, at.and_then(|i| off[i].as_ref())) {
+                            (Some(name), Some(_)) => format!("⚠ {name}"),
+                            (Some(name), None) => name,
+                            (None, _) => "—".to_string(),
+                        };
                         let look = SlotLook {
                             slot,
                             icon: at.map_or(&[][..], |i| &icons[i][..]),
@@ -1430,7 +1465,7 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
                                     ui.close();
                                 }
                                 if ui.button("Copy").clicked() {
-                                    copy = Some(resref);
+                                    copy = Some(i);
                                     ui.close();
                                 }
                                 if ui.button("Remove").clicked() {
@@ -1467,8 +1502,9 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
                     selected.items.iter().filter(|c| c.0 == "ItemList").map(|c| c.1).collect();
                 let copied = f.app.item_clip.len();
                 let ctx = ui.ctx().clone();
-                let mut row =
-                    |_: usize, it: &Struct| (f.entry_icon(&ctx, it), f.entry_name(it, &names));
+                let mut row = |_: usize, it: &Struct| {
+                    (f.entry_icon_of(&ctx, it, female), f.entry_name(it, &names))
+                };
                 let look = inventory::ItemLook {
                     row: &mut row,
                     infinite: false,
@@ -1538,8 +1574,8 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
             Err(why) => f.app.log.warn(why),
         }
     }
-    if let Some(r) = copy {
-        f.copy_item(ui, r);
+    if let Some(item) = copy.and_then(|i: usize| equipped.get(i)) {
+        f.copy_item(ui, item);
     }
     if let Some(i) = unequip {
         edits.push(("Unequip", remove(key, base.clone(), "Equip_ItemList", i)));
@@ -1551,6 +1587,12 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
     // taken out and equipped there; an equipped one moved to it; one from
     // another object's inventory equipped here, and taken from there unless
     // Ctrl is held, which copies it.
+    // (Whether it was a drop, and of the creature's primary weapon.)
+    let dropped = slot_drop.is_some();
+    let from_primary = slot_drop.as_ref().is_some_and(|(_, d)| {
+        matches!(d, inventory::Dragged::Equipped { owner, index, .. }
+            if *owner == whose && equipped.get(*index).is_some_and(|s| s.id == PRIMARY))
+    });
     match slot_drop {
         Some((bit, inventory::Dragged::Palette(r))) => (equip, chosen) = (Some(bit), Some(r)),
         Some((bit, inventory::Dragged::Listed { owner, index, resref, .. })) if owner == whose => {
@@ -1615,8 +1657,23 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
     // add the first (and does not equip it otherwise; one moved stays where
     // it was).
     let ask = egui::Id::new(("utc-equip-feat", key, base.clone()));
-    if let (Some(bit), Some(r)) = (equip, chosen) {
+    if let (Some(mut bit), Some(r)) = (equip, chosen) {
         let whole = moving.as_ref().map(|m| &m.item).filter(|s| inventory::is_whole(s));
+        // A weapon dropped on the secondary weapon slot while the primary
+        // is free goes in the primary, as in Aurora (seen with a longsword,
+        // a dagger and a hand axe; a torch, which goes in the secondary
+        // alone, stays there); so one dragged there from the primary stays
+        // in the primary (after the question about a missing feat, whose
+        // Yes still adds it: Aurora, 2026-10-30).
+        let taken = moving.as_ref().map_or(&[][..], |m| &m.taken[..]);
+        if dropped
+            && bit == SECONDARY
+            && item_slots(f, r, whole) & PRIMARY != 0
+            && !after_taken(f, &equipped, "Equip_ItemList", taken).iter().any(|s| s.id == PRIMARY)
+        {
+            bit = PRIMARY;
+        }
+        let stays = from_primary && bit == PRIMARY;
         if item_slots(f, r, whole) & bit == 0 {
             let name = whole.map_or_else(|| name_of(r), |s| f.entry_name(s, &names));
             f.app.log.error(format!("{name} does not go in that slot"));
@@ -1639,8 +1696,10 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
                 _ => Vec::new(),
             };
             if missing.is_empty() {
-                let e = equip_edits(f, (&equipped, &backpack), bit, r, moving.as_ref());
-                apply(f, "Equip", e);
+                if !stays {
+                    let e = equip_edits(f, (&equipped, &backpack), bit, r, moving.as_ref());
+                    apply(f, "Equip", e);
+                }
             } else {
                 ui.data_mut(|d| d.insert_temp(ask, (bit, r, missing, moving)));
             }
@@ -1661,12 +1720,14 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
             .collect();
         let text = tlk(game, MISSING_FEATS).replacen("%s", &names.join("\n"), 1);
         let (mut yes, mut no) = (false, false);
-        let modal = egui::Modal::new(ask.with("modal")).show(ui.ctx(), |ui| {
+        // (Escape is its No.)
+        let window = crate::widgets::modal(ui.ctx(), "Missing Feats").id(ask.with("modal"));
+        window.show(ui.ctx(), |ui| {
             ui.set_max_width(360.0);
             crate::widgets::field_label(ui, text);
             ui.horizontal(|ui| {
                 yes = ui.button("Yes").clicked();
-                no = ui.button("No").clicked();
+                no = ui.button("No").clicked() || crate::widgets::escape_here(ui);
             });
         });
         if yes {
@@ -1677,7 +1738,7 @@ pub(super) fn inventory(f: &mut Form<'_>, ui: &mut Ui) {
             e.extend(equip_edits(f, (&equipped, &backpack), bit, r, moving.as_ref()));
             apply(f, "Equip", e);
         }
-        if yes || no || modal.should_close() {
+        if yes || no {
             ui.data_mut(|d| d.remove::<Asked>(ask));
         }
     }
@@ -1708,6 +1769,17 @@ mod tests {
         assert_eq!(offer, [true, false, false, false, false]);
         assert_eq!(row_line(&t, "spells", 0), "spells.2da row 0: Acid_Fog, innate level 6");
         assert_eq!(row_line(&t, "feat", 4), "feat.2da row 4");
+    }
+
+    #[test]
+    fn special_abilities_are_spells_and_creature_abilities_without_a_master() {
+        let text = b"2DA V2.0\n\n  Label Name UserType Master\n0 Acid_Fog 2 1 ****\n\
+            1 AURA_BLINDING 5226 2 ****\n2 BARBARIAN_RAGE 3 3 ****\n3 ACTIVATE_ITEM 4 4 ****\n\
+            4 GR_SHADOW_CON_Acid_Arrow 6309 1 71\n5 ITEM_Teleport 83473 **** ****\n\
+            6 DELETED 9 1 ****\n";
+        let t = mg_2da::TwoDa::parse(&text[..], mg_core::Codepage::default()).unwrap();
+        let offer: Vec<bool> = (0..7).map(|r| special_ability(&t, r)).collect();
+        assert_eq!(offer, [true, true, false, false, false, false, false]);
     }
 
     #[test]

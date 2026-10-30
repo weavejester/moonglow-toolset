@@ -36,7 +36,12 @@ pub mod terrain;
 pub mod walk;
 
 pub use grass_view::{CHUNK, GrassDraw, Grown, chunk_of, grass_chosen};
-pub use scene::{AreaScene, Sight, Usage, View, fog, overview};
+pub use mg_rules::rows::{replacement_row, replacement_value};
+pub use scene::{AreaScene, BareLight, Sight, Usage, View, fog, overview};
+
+/// The texture a tile model's mesh is drawn with where the tile's
+/// `Tile_ReplaceTex` replaces it ([`replacement_row`]).
+pub const REPLACE_TEX: &str = "replace_tex";
 
 /// A tile's edge, metres.
 pub const TILE_SIZE: f32 = 10.0;
@@ -86,8 +91,8 @@ pub struct AreaTile {
     pub source_lights: [u8; 2],
     /// Whether animation loops `animloop01`..`03` play.
     pub anim_loops: [bool; 3],
-    /// The texture the model's `replace_tex` is drawn with
-    /// (`Tile_ReplaceTex`, a `replacetexture.2da` row; lower case).
+    /// The texture the model's `replace_tex` is drawn with (lower case):
+    /// see [`replacement_row`] (`mg_rules::rows`).
     pub replace_texture: Option<String>,
     /// The centre of the tile's floor.
     pub position: Vec3,
@@ -109,18 +114,20 @@ impl AreaTile {
 /// have 1 for every tile); the model does: a light node `<model>ml1` or
 /// `ml2` for a main light, a node (a dummy) `<model>sl1` or `sl2` where a
 /// source light's flame goes, and an animation `animloop01`..`03` for a
-/// loop.
+/// loop. Its replacement texture (EE's Tile Properties alone: Aurora has
+/// none) where a mesh is drawn with a texture named `replace_tex`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TileFeatures {
     pub main: [bool; 2],
     pub source: [bool; 2],
     pub loops: [bool; 3],
+    pub replace: bool,
 }
 
 impl TileFeatures {
     /// Every light and loop (what a model not found is taken to have).
     pub const ALL: TileFeatures =
-        TileFeatures { main: [true; 2], source: [true; 2], loops: [true; 3] };
+        TileFeatures { main: [true; 2], source: [true; 2], loops: [true; 3], replace: true };
 
     /// What tile model `model`, read from resource `resref`, has. A node
     /// counts named after the model's own name or the resource's (they
@@ -141,6 +148,7 @@ impl TileFeatures {
             main: [has("ml1", true), has("ml2", true)],
             source: [has("sl1", false), has("sl2", false)],
             loops: ["animloop01", "animloop02", "animloop03"].map(|a| model.animation(a).is_some()),
+            replace: model.draws_texture(REPLACE_TEX),
         }
     }
 
@@ -151,6 +159,7 @@ impl TileFeatures {
             main: [a.main[0] | b.main[0], a.main[1] | b.main[1]],
             source: [a.source[0] | b.source[0], a.source[1] | b.source[1]],
             loops: [a.loops[0] | b.loops[0], a.loops[1] | b.loops[1], a.loops[2] | b.loops[2]],
+            replace: a.replace | b.replace,
         })
     }
 }
@@ -200,30 +209,15 @@ impl Default for VisualTransform {
 }
 
 impl VisualTransform {
-    /// A placed object's (`None` without one).
+    /// A placed object's, as its model is drawn with it (`None` without
+    /// one): [`mg_module::placement::visual_transform`].
     pub fn read(s: &Struct) -> Option<VisualTransform> {
-        let axes = |get: &dyn Fn(&str) -> Option<f32>, default: f32, prefix: &str| {
-            Vec3::new(
-                get(&format!("{prefix}X")).unwrap_or(default),
-                get(&format!("{prefix}Y")).unwrap_or(default),
-                get(&format!("{prefix}Z")).unwrap_or(default),
-            )
-        };
-        let from = |get: &dyn Fn(&str) -> Option<f32>| VisualTransform {
-            scale: axes(get, 1.0, "Scale"),
-            rotate: axes(get, 0.0, "Rotate"),
-            translate: axes(get, 0.0, "Translate"),
-        };
-        if let Some(list) = s.list("VisTransformList") {
-            let entry = list
-                .iter()
-                .find(|e| e.integer("Scope").unwrap_or(0) == 0)
-                .or_else(|| list.first())?;
-            let get = |label: &str| entry.child(label).and_then(|c| c.float("ValueTo"));
-            return Some(from(&get));
-        }
-        let legacy = s.child("VisualTransform")?;
-        Some(from(&|label: &str| legacy.float(label)))
+        let t = mg_module::placement::visual_transform(s)?;
+        Some(VisualTransform {
+            scale: Vec3::from(t.scale),
+            rotate: Vec3::from(t.rotate),
+            translate: Vec3::from(t.translate),
+        })
     }
 
     pub fn is_identity(&self) -> bool {
@@ -236,15 +230,12 @@ impl VisualTransform {
     /// about its X by `RotateY`, then turned about its upright axis by
     /// `RotateX`; then moved by the translation.
     pub fn matrix(&self) -> Mat4 {
-        Mat4::from_translation(self.translate)
-            * self.turn()
-            * Mat4::from_scale(Vec3::splat(self.scale.x))
+        mg_preview::visual_matrix(self.scale.x, self.rotate.into(), self.translate.into())
     }
 
     /// The rotation alone (of [`VisualTransform::matrix`]).
     pub fn turn(&self) -> Mat4 {
-        let r = self.rotate * (std::f32::consts::PI / 180.0);
-        Mat4::from_rotation_z(r.x) * Mat4::from_rotation_x(r.y) * Mat4::from_rotation_y(r.z)
+        mg_preview::visual_turn(self.rotate.into())
     }
 }
 
@@ -271,6 +262,11 @@ pub struct AreaObject {
     pub outline: Vec<Vec3>,
     /// Its model's visual transform.
     pub visual: Option<VisualTransform>,
+    /// Every entry of its `VisTransformList`: the whole object's (scope 0)
+    /// with its animation speed and lerps in progress, and a creature's
+    /// head, tail, wings and cloak (drawn on those parts:
+    /// `mg_preview::scope_matrix`). What Adjust Location shows of them.
+    pub scopes: Vec<mg_module::placement::Scoped>,
     /// A placeable's `Static`: part of the scenery. The game gives a
     /// static placeable no visual transform (Aurora resets it).
     pub is_static: bool,
@@ -305,21 +301,18 @@ impl AreaObject {
             let data = game.resman.get(&ResKey::new(r, ResType::UTI)).ok()?;
             Gff::read(&data).ok()
         };
+        let preview = mg_preview::of_object(game, kind, s, &items, mg_preview::Shown::Placed);
+        // A waypoint without a flag (no appearance) is drawn as a marker:
+        // nothing is wrong with it; a store or a sound without the game's
+        // marker model, drawn as one.
         let preview = match kind {
-            ObjectKind::Creature => Some(mg_preview::creature(game, s, &items)),
-            ObjectKind::Door => Some(mg_preview::door(game, s)),
-            ObjectKind::Item => Some(mg_preview::item_placed(game, s)),
-            ObjectKind::Placeable => Some(mg_preview::placeable(game, s)),
-            // A waypoint without a flag (no appearance) is drawn as a
-            // marker: nothing is wrong with it.
-            ObjectKind::Waypoint => mg_preview::waypoint(game, s).ok().map(Ok),
-            // A store's marker; without the game's model, drawn as one.
-            ObjectKind::Store => mg_preview::store(game).ok().map(Ok),
-            ObjectKind::Sound => mg_preview::sound(game, s).ok().map(Ok),
-            _ => None,
+            ObjectKind::Waypoint | ObjectKind::Store | ObjectKind::Sound => {
+                preview.and_then(Result::ok).map(Ok)
+            }
+            _ => preview,
         };
         let (preview, problem) = match preview {
-            Some(Ok(p)) => (Some(mg_preview::replaced(p, s)), None),
+            Some(Ok(p)) => (Some(p), None),
             Some(Err(e)) => (None, Some(e.to_string())),
             None => (None, None),
         };
@@ -331,25 +324,10 @@ impl AreaObject {
     /// it stands, how it turns, its outline and fields), without the game:
     /// no preview, and an item not turned as it lies.
     pub fn placed(kind: ObjectKind, index: usize, s: &Struct) -> AreaObject {
-        let float = |label: &str| s.float(label).unwrap_or(0.0);
-        let (position, rotation) = if kind.has_bearing() {
-            (Vec3::new(float("X"), float("Y"), float("Z")), float("Bearing"))
-        } else {
-            let position = Vec3::new(float("XPosition"), float("YPosition"), float("ZPosition"));
-            let (x, y) = (float("XOrientation"), float("YOrientation"));
-            let rotation =
-                if kind.has_outline() || kind == ObjectKind::Sound || (x == 0.0 && y == 0.0) {
-                    0.0
-                } else {
-                    y.atan2(x) - FRAC_PI_2
-                };
-            (position, rotation)
-        };
-        let outline = match kind {
-            ObjectKind::Trigger => outline(s, ["PointX", "PointY", "PointZ"], position),
-            ObjectKind::Encounter => outline(s, ["X", "Y", "Z"], position),
-            _ => Vec::new(),
-        };
+        let at = mg_module::placement::Placement::read(kind, s);
+        let (position, rotation) = (Vec3::from(at.position), at.rotation);
+        let points = mg_module::placement::outline(kind, s);
+        let outline = points.into_iter().map(|p| position + Vec3::from(p)).collect();
         let template_field = kind.resref_field();
         AreaObject {
             laid: 0,
@@ -366,6 +344,7 @@ impl AreaObject {
             problem: None,
             outline,
             visual: VisualTransform::read(s),
+            scopes: mg_module::placement::visual_scopes(s),
             is_static: kind == ObjectKind::Placeable && s.integer("Static").unwrap_or(0) != 0,
             trigger_type: if kind == ObjectKind::Trigger {
                 s.integer("Type").unwrap_or(0)
@@ -434,19 +413,6 @@ impl AreaObject {
     pub fn facing(&self) -> f32 {
         self.rotation + FRAC_PI_2
     }
-}
-
-/// An outline's points (`Geometry`, relative to the position) in world
-/// space.
-fn outline(s: &Struct, labels: [&str; 3], at: Vec3) -> Vec<Vec3> {
-    s.list("Geometry")
-        .unwrap_or(&[])
-        .iter()
-        .map(|p| {
-            let c = |i: usize| p.float(labels[i]).unwrap_or(0.0);
-            at + Vec3::new(c(0), c(1), c(2))
-        })
-        .collect()
 }
 
 /// The door hooks of `tiles` (with the tileset they are from).
@@ -519,9 +485,42 @@ pub struct Lighting {
     /// (`areaFlags`, `areaGlobalWind`: wind-swayed grass and leaves).
     pub flags: u32,
     pub wind_power: i64,
+    /// The directions towards the sun and the moon its GIT gives
+    /// (`AreaProperties` `SunDirectionX/Y/Z`, `MoonDirectionX/Y/Z`), which
+    /// the client lights the area and casts its shadows by (seen:
+    /// `reading_git_sun_direction` in `client_render.rs`); `None`: the
+    /// game's own.
+    pub sun_direction: Option<Vec3>,
+    pub moon_direction: Option<Vec3>,
 }
 
 impl Lighting {
+    /// [`Lighting::read`], with the directions of the sun and moon the
+    /// GIT whose root is `git` gives.
+    pub fn read_with(are: &Struct, git: &Struct, tileset: Option<&Tileset>) -> Lighting {
+        let props = match git.get("AreaProperties") {
+            Some(mg_gff::Value::Struct(p)) => Some(p),
+            _ => None,
+        };
+        let direction = |prefix: &str| {
+            let props = props?;
+            let c = |axis: &str| props.float(&format!("{prefix}Direction{axis}"));
+            let d = Vec3::new(c("X")?, c("Y")?, c("Z")?);
+            (d.is_finite() && d.length_squared() > 1e-12).then(|| d.normalize())
+        };
+        Lighting {
+            sun_direction: direction("Sun"),
+            moon_direction: direction("Moon"),
+            ..Lighting::read(are, tileset)
+        }
+    }
+
+    /// The direction towards the sun, or the moon at night: the GIT's,
+    /// else the game's own.
+    pub fn direction(&self, night: bool) -> Option<Vec3> {
+        if night { self.moon_direction } else { self.sun_direction }
+    }
+
     pub fn read(are: &Struct, tileset: Option<&Tileset>) -> Lighting {
         Lighting {
             sun: Sky::read(are, "Sun"),
@@ -537,6 +536,8 @@ impl Lighting {
             shadow_opacity: are.integer("ShadowOpacity").unwrap_or(0).clamp(0, 100) as u8,
             flags: are.integer("Flags").unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32,
             wind_power: are.integer("WindPower").unwrap_or(0),
+            sun_direction: None,
+            moon_direction: None,
         }
     }
 
@@ -632,13 +633,10 @@ impl AreaModel {
                     main_lights: [byte("Tile_MainLight1"), byte("Tile_MainLight2")],
                     source_lights: [byte("Tile_SrcLight1"), byte("Tile_SrcLight2")],
                     anim_loops: [1, 2, 3].map(|n| int(&format!("Tile_AnimLoop{n}")) != 0),
-                    replace_texture: t
-                        .integer("Tile_ReplaceTex")
-                        .and_then(|row| {
-                            let t = replacements.as_ref()?;
-                            t.get(usize::try_from(row).ok()?, "TEXTURENAME")
-                        })
-                        .map(str::to_ascii_lowercase),
+                    replace_texture: replacements.as_ref().and_then(|table| {
+                        let row = replacement_row(t.integer("Tile_ReplaceTex"), table.len())?;
+                        Some(table.get(row, "TEXTURENAME")?.to_ascii_lowercase())
+                    }),
                     position: Vec3::new(
                         (column as f32 + 0.5) * TILE_SIZE,
                         (row as f32 + 0.5) * TILE_SIZE,
@@ -680,7 +678,7 @@ impl AreaModel {
             tiles,
             objects,
             hooks,
-            lighting: Lighting::read(are, tileset),
+            lighting: Lighting::read_with(are, git, tileset),
             grass: grass::AreaGrass::read(git).growing(tileset),
             problems,
         }
@@ -751,6 +749,28 @@ doneanim animloop02 tst01_a01_01\ndonemodel tst01_a01_01\n";
         assert_eq!(TileFeatures::union([has, none]), has);
         let other = TileFeatures { loops: [true, false, false], ..none };
         assert_eq!(TileFeatures::union([has, other]).loops, [true, true, false]);
+        assert!(!has.replace, "no mesh drawn with replace_tex");
+    }
+
+    /// A tile model has a replacement texture where a mesh's bitmap is
+    /// `replace_tex` (any case), and not where only another texture is.
+    #[test]
+    fn a_tile_s_replacement_texture_is_its_model_s() {
+        let model = |bitmap: &str| {
+            let text = format!(
+                "newmodel tst01_a01_01\nsetsupermodel tst01_a01_01 NULL\nclassification tile\n\
+beginmodelgeom tst01_a01_01\nnode dummy tst01_a01_01\n  parent NULL\nendnode\n\
+node trimesh flag\n  parent tst01_a01_01\n  bitmap {bitmap}\n  verts 3\n    0 0 0\n    1 0 0\n\
+    0 1 0\n  faces 1\n    0 1 2 1 0 1 2 1\nendnode\nendmodelgeom tst01_a01_01\n\
+donemodel tst01_a01_01\n"
+            );
+            mg_mdl::Model::read(text.as_bytes()).unwrap()
+        };
+        assert!(TileFeatures::of(&model("Replace_Tex"), "tst01_a01_01").replace);
+        let plain = TileFeatures::of(&model("tst01_grass"), "tst01_a01_01");
+        assert!(!plain.replace);
+        let with = TileFeatures { replace: true, ..plain };
+        assert!(TileFeatures::union([plain, with]).replace, "any of them");
     }
 
     fn object(fields: &[(&str, f32)]) -> Struct {
@@ -856,6 +876,26 @@ doneanim animloop02 tst01_a01_01\ndonemodel tst01_a01_01\n";
         assert!(close(x.x, 0.0) && close(x.y, 1.0));
     }
 
+    /// The sun's and the moon's directions are the GIT's where it gives
+    /// them (as the client lights the area), normalized; none where it
+    /// doesn't or gives no direction.
+    #[test]
+    fn the_sun_and_moon_take_the_git_s_directions() {
+        let mut props = Struct::new(100);
+        for (axis, v) in [("X", -2.0f32), ("Y", 0.0), ("Z", 0.5)] {
+            props.set(&format!("SunDirection{axis}"), Value::Float(v));
+            props.set(&format!("MoonDirection{axis}"), Value::Float(0.0));
+        }
+        let mut git = Struct::new(0xFFFF_FFFF);
+        git.set("AreaProperties", Value::Struct(props));
+        let l = Lighting::read_with(&Struct::new(0), &git, None);
+        let sun = l.direction(false).unwrap();
+        assert!((sun - Vec3::new(-2.0, 0.0, 0.5).normalize()).length() < 1e-6);
+        assert_eq!(l.direction(true), None, "a zero direction is none");
+        let l = Lighting::read_with(&Struct::new(0), &Struct::new(0xFFFF_FFFF), None);
+        assert_eq!((l.direction(false), l.direction(true)), (None, None));
+    }
+
     #[test]
     fn tiles_take_their_replacement_texture() {
         let mut rm = mg_resman::ResMan::new();
@@ -869,11 +909,22 @@ doneanim animloop02 tst01_a01_01\ndonemodel tst01_a01_01\n";
         let mut are = Struct::new(0);
         are.set("Width", Value::Int(2));
         are.set("Height", Value::Int(1));
-        let mut replaced = Struct::new(1);
-        replaced.set("Tile_ReplaceTex", Value::Byte(1));
-        are.set("Tile_List", Value::List(vec![replaced, Struct::new(1)]));
+        are.set("Width", Value::Int(5));
+        // (As the client draws them: the value is one past the row; a tile
+        // without the field takes row 0; 0 and a value past the table are
+        // no row, which the client crashes on.)
+        let tile = |v: Option<u8>| {
+            let mut t = Struct::new(1);
+            if let Some(v) = v {
+                t.set("Tile_ReplaceTex", Value::Byte(v));
+            }
+            t
+        };
+        let values = [Some(2), Some(1), None, Some(0), Some(3)];
+        are.set("Tile_List", Value::List(values.into_iter().map(tile).collect()));
         let area = AreaModel::read(&game, &are, &Struct::new(0xFFFF_FFFF), None);
-        assert_eq!(area.tiles[0].replace_texture.as_deref(), Some("t_flag03"));
-        assert_eq!(area.tiles[1].replace_texture, None);
+        let drawn: Vec<Option<&str>> =
+            area.tiles.iter().map(|t| t.replace_texture.as_deref()).collect();
+        assert_eq!(drawn, [Some("t_flag03"), Some("t_flag02"), Some("t_flag02"), None, None]);
     }
 }

@@ -120,10 +120,13 @@ struct Change {
 /// lines by.
 const CHANGES: usize = 256;
 
-/// A conversation's fingerprint: a hash of its bytes.
+/// A conversation's fingerprint: a hash of its bytes. Kept with a
+/// module's tabs, so it is the same whatever the toolchain: SipHash-1-3
+/// with zero keys (`siphasher`), which is what Rust's `DefaultHasher`
+/// gave the records written before, and may not give later.
 pub(crate) fn fingerprint(g: &Gff) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = siphasher::sip::SipHasher13::new();
     g.to_bytes().unwrap_or_default().hash(&mut h);
     h.finish()
 }
@@ -762,8 +765,9 @@ pub enum Bottom {
 pub struct DialogSearch {
     pub find: String,
     pub replace: String,
-    pub match_case: bool,
-    pub whole_word: bool,
+    /// Match Case and Whole Word, as the script editor's Find Text has them
+    /// (its `backwards` is not offered here).
+    pub options: crate::script_tools::SearchOptions,
     /// All conversations in the module, not only this one.
     pub all_files: bool,
     /// Conversation, line, and its text.
@@ -960,7 +964,13 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
     let add_hint =
         keymap.titled("Add a line under the selection", crate::keys::Cmd::AddLine, ui.ctx());
 
-    // Toolbar.
+    // Toolbar. (With Icons only, each glyph alone, its name in its tip.)
+    let tools = crate::icons::Tools::of(&app.settings);
+    use crate::icons::editor as glyph;
+    let button = |ui: &mut Ui, enabled: bool, g: &str, name: &str, tip: &str| {
+        let r = ui.add_enabled(enabled, egui::Button::new(tools.word(g, name)));
+        tools.named(r, name, tip, None)
+    };
     ui.horizontal_wrapped(|ui| {
         let sel = view.selected;
         let add_parent = match sel {
@@ -971,11 +981,7 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
             }
             Some(_) => None,
         };
-        if (ui
-            .add_enabled(add_parent.is_some(), egui::Button::new("Add"))
-            .on_hover_text(add_hint)
-            .clicked()
-            || key_add)
+        if (button(ui, add_parent.is_some(), glyph::ADD, "Add", &add_hint).clicked() || key_add)
             && let Some(p) = add_parent
         {
             if popup {
@@ -998,7 +1004,7 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
                 target: target_of(r),
             })
         };
-        if ui.add_enabled(sel.is_some(), egui::Button::new("Copy")).clicked()
+        if button(ui, sel.is_some(), glyph::COPY, "Copy", "").clicked()
             || (key_copy && sel.is_some())
         {
             app.dialog_clip = sel.and_then(copy);
@@ -1007,8 +1013,7 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
             }
         }
         let mut delete = false;
-        if (ui.add_enabled(sel.is_some(), egui::Button::new("Cut")).clicked() || key_cut)
-            && sel.is_some()
+        if (button(ui, sel.is_some(), glyph::CUT, "Cut", "").clicked() || key_cut) && sel.is_some()
         {
             app.dialog_clip = sel.and_then(copy);
             if app.dialog_clip.is_some() {
@@ -1020,7 +1025,7 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
         let clip = app.dialog_clip.as_ref();
         let fits = |p: Parent| clip.is_some_and(|c| c.branch.kind == p.child_kind());
         let can_paste = paste_parent.is_some_and(fits);
-        if (ui.add_enabled(can_paste, egui::Button::new("Paste")).clicked() || key_paste)
+        if (button(ui, can_paste, glyph::PASTE, "Paste", "").clicked() || key_paste)
             && can_paste
             && let (Some(p), Some(c)) = (paste_parent, clip)
         {
@@ -1042,7 +1047,7 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
             }
             _ => None,
         };
-        if (ui.add_enabled(pair.is_some(), egui::Button::new("Paste As Link")).clicked()
+        if (button(ui, pair.is_some(), glyph::PASTE_LINK, "Paste As Link", "").clicked()
             || asked == Some(Asked::PasteLink))
             && let Some((from, to)) = pair
         {
@@ -1051,7 +1056,7 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
                 actions.push(replace(key, "Paste as link", &ng));
             }
         }
-        if ui.add_enabled(sel.is_some(), egui::Button::new("Delete")).clicked() || key_delete {
+        if button(ui, sel.is_some(), glyph::DELETE, "Delete", "").clicked() || key_delete {
             delete = true;
         }
         if delete && let Some(r) = sel {
@@ -1095,10 +1100,10 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
             }
         }
         ui.separator();
-        if ui.button("Expand All").clicked() {
+        if button(ui, true, glyph::EXPAND_ALL, "Expand All", "").clicked() {
             view.collapsed.clear();
         }
-        if ui.button("Collapse All").clicked() {
+        if button(ui, true, glyph::COLLAPSE_ALL, "Collapse All", "").clicked() {
             for k in [Kind::Entry, Kind::Reply] {
                 for i in 0..mg_module::dialog::nodes(&g, k).len() as u32 {
                     view.collapsed.insert((k, i));
@@ -1106,16 +1111,23 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
             }
         }
         ui.separator();
-        for (i, label) in
-            ["Comments", "Actions", "Quests", "Animations", "Sounds"].iter().enumerate()
+        for (i, (g, label)) in [
+            (glyph::COMMENTS, "Comments"),
+            (glyph::ACTIONS, "Actions"),
+            (glyph::QUESTS, "Quests"),
+            (glyph::ANIMATIONS, "Animations"),
+            (glyph::SOUNDS, "Sounds"),
+        ]
+        .into_iter()
+        .enumerate()
         {
-            ui.toggle_value(&mut view.highlight[i], *label)
-                .on_hover_text(format!("Highlight lines with {}", label.to_lowercase()));
+            let tip = format!("Highlight lines with {}", label.to_lowercase());
+            tools.toggle_word(ui, &mut view.highlight[i], g, label, &tip);
         }
         ui.separator();
         // Export and import (dialog_io): the lines back by CSV.
         let mut export = None;
-        ui.menu_button("Export", |ui| {
+        let menu = ui.menu_button(tools.word(glyph::EXPORT, "Export"), |ui| {
             for f in mg_module::dialog_io::Format::ALL {
                 if ui.button(format!("{}…", f.name())).clicked() {
                     export = Some(f);
@@ -1123,33 +1135,44 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
                 }
             }
         });
+        tools.named(menu.response, "Export", "The lines out: plain text, CSV, Twine or Ink", None);
         if let Some(f) = export {
             let suggested =
                 std::path::PathBuf::from(format!("{}.{}", key.resref, f.extensions()[0]));
             if let Some(path) =
                 app.dialogs.save_file(crate::dialogs::FileKind::Conversation(f), Some(&suggested))
             {
-                // (The lines as the module's own table reads them, if any.)
-                let text = crate::text::from_windows_1252(&f.write(&g, &key.resref.to_string()));
+                // (The lines as the module's own table reads them, if any;
+                // a CSV with a column for the language edited, to
+                // translate into.)
+                let edited = crate::text::edit_language();
+                let to = if edited == mg_core::Language::ENGLISH { vec![] } else { vec![edited] };
+                let game = crate::text::game_table();
+                let text = f.write_in(&g, &key.resref.to_string(), game, &to);
                 match std::fs::write(&path, text) {
                     Ok(()) => app.log.info(format!("Exported {key} to {}", path.display())),
                     Err(e) => app.log.error(format!("{}: {e}", path.display())),
                 }
             }
         }
-        if ui
-            .button("Import Lines…")
-            .on_hover_text("Read back the text, speakers and comments of a CSV export")
-            .clicked()
+        if button(
+            ui,
+            true,
+            glyph::IMPORT,
+            "Import Lines…",
+            "Read back the text, speakers and comments of a CSV export",
+        )
+        .clicked()
             && let Some(path) = app.dialogs.open_file(
                 crate::dialogs::FileKind::Conversation(mg_module::dialog_io::Format::Csv),
                 None,
             )
         {
             let mut ng = g.clone();
-            let read = (std::fs::read_to_string(&path).map_err(|e| e.to_string()))
-                .map(|csv| crate::text::for_windows_1252(&csv));
-            match read.and_then(|csv| mg_module::dialog_io::update_from_csv(&mut ng, &csv)) {
+            let read = std::fs::read_to_string(&path).map_err(|e| e.to_string());
+            let game = crate::text::game_table();
+            match read.and_then(|csv| mg_module::dialog_io::update_from_csv_in(&mut ng, &csv, game))
+            {
                 Ok(0) => app.log.info(format!("{}: no lines changed", path.display())),
                 Ok(n) => {
                     app.log.info(format!("{}: {n} line(s) changed", path.display()));
@@ -1160,11 +1183,8 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
         }
         ui.separator();
         let mut scripts = !app.settings.dialog_hide_scripts;
-        if ui
-            .toggle_value(&mut scripts, "Scripts")
-            .on_hover_text("Show each line's condition, action, journal update and sound")
-            .changed()
-        {
+        let tip = "Show each line's condition, action, journal update and sound";
+        if tools.toggle_word(ui, &mut scripts, glyph::SCRIPTS, "Scripts", tip).changed() {
             app.settings.dialog_hide_scripts = !scripts;
         }
     });
@@ -1285,10 +1305,8 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
                                     ui,
                                     key,
                                     link_path(r),
-                                    "Active",
-                                    "ConditionParams",
+                                    true,
                                     &link,
-                                    "cond",
                                     &mut actions,
                                 ),
                                 DataTab::Action => script_with_params(
@@ -1296,10 +1314,8 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
                                     ui,
                                     key,
                                     node_path(kind, index),
-                                    "Script",
-                                    "ActionParams",
+                                    false,
                                     &n,
-                                    "act",
                                     &mut actions,
                                 ),
                                 DataTab::Other => {
@@ -1345,7 +1361,7 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
     // The tree, in the Options' colours.
     let hl = view.highlight;
     let mut dropped: Option<Drop> = None;
-    let look = Look::new(&app.settings);
+    let look = Look::new(&app.settings, ui.visuals().dark_mode);
     let lines = egui::ScrollArea::both().id_salt(("dlg-tree", key)).auto_shrink([false, false]);
     let shown = lines.show(ui, |ui| {
         // Ctrl+Up and Ctrl+Down: a row up or down, the selection staying.
@@ -1424,7 +1440,9 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
     if let Some(mut input) = view.input.take() {
         let prompt = &prompts[usize::from(input.parent.child_kind() == Kind::Reply)];
         let (mut ok, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new(("dlg-input", key))).show(ui.ctx(), |ui| {
+        let window =
+            crate::widgets::modal(ui.ctx(), "Input Text").id(egui::Id::new(("dlg-input", key)));
+        window.show(ui.ctx(), |ui| {
             ui.set_width(340.0);
             ui.label(prompt.as_str());
             let id = egui::Id::new(("dlg-input-text", key));
@@ -1464,7 +1482,7 @@ fn editor(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
                 view.collapsed.remove(&(k, i));
             }
             actions.push(replace(key, "Add line", &ng));
-        } else if !cancel && !modal.should_close() {
+        } else if !cancel {
             view.input = Some(input);
         }
     }
@@ -1528,17 +1546,33 @@ struct Look {
     scripts: bool,
     npc: Color32,
     pc: Color32,
+    /// A link's lines.
+    link: Color32,
+}
+
+/// The NPC's and the player's text colors by default, for the dark theme
+/// or the light (darker there, to stand out against white as the dark
+/// theme's do against black).
+pub(crate) fn default_colors(dark: bool) -> ([u8; 3], [u8; 3]) {
+    match dark {
+        true => ([210, 70, 70], [90, 140, 230]),
+        false => ([180, 30, 30], [25, 85, 200]),
+    }
 }
 
 impl Look {
-    fn new(s: &crate::Settings) -> Look {
-        let rgb =
-            |c: Option<[u8; 3]>, d: Color32| c.map_or(d, |[r, g, b]| Color32::from_rgb(r, g, b));
+    fn new(s: &crate::Settings, dark: bool) -> Look {
+        let rgb = |c: Option<[u8; 3]>, [r, g, b]: [u8; 3]| {
+            let [r, g, b] = c.unwrap_or([r, g, b]);
+            Color32::from_rgb(r, g, b)
+        };
+        let (npc, pc) = default_colors(dark);
         Look {
             names: !s.dialog_hide_names,
             scripts: !s.dialog_hide_scripts,
-            npc: rgb(s.dialog_npc_color, Color32::from_rgb(210, 70, 70)),
-            pc: rgb(s.dialog_pc_color, Color32::from_rgb(90, 140, 230)),
+            npc: rgb(s.dialog_npc_color, npc),
+            pc: rgb(s.dialog_pc_color, pc),
+            link: if dark { Color32::GRAY } else { Color32::from_gray(110) },
         }
     }
 }
@@ -1575,7 +1609,7 @@ fn tree(
         let label = row_label(game, g, kind, l, look.names);
         let cond = l.resref("Active").filter(|r| !r.is_empty());
         let color = if linked {
-            Color32::GRAY
+            look.link
         } else if kind == Kind::Entry {
             look.npc
         } else {
@@ -1707,7 +1741,7 @@ fn creature_tags(app: &mut Moonglow, ctx: &egui::Context) -> std::sync::Arc<Vec<
     {
         return tags;
     }
-    let areas = ws.module.areas().unwrap_or_default();
+    let areas = mg_module::areas::every(&ws.module);
     let mut tags = std::collections::BTreeSet::new();
     for a in areas {
         let Ok(g) = ws.doc(&ResKey::new(a, mg_core::ResType::GIT)) else { continue };
@@ -1781,7 +1815,7 @@ fn text_panel(
     let ls = n.locstring("Text").cloned().unwrap_or_default();
     ui.horizontal(|ui| {
         ui.label("Text");
-        if ui.small_button("…").on_hover_text("Edit text in multiple languages").clicked() {
+        if crate::widgets::languages_button(ui) {
             app.loc_edit = Some(LocStringEdit::new(
                 FieldTarget::new(key, path.clone(), "Text"),
                 "Line text",
@@ -1834,49 +1868,48 @@ fn text_panel(
         // (Those of the language edited: Options › General.)
         let tokens = crate::widgets::language_tokens(app, crate::text::edit_language());
         let mut close = false;
-        egui::Window::new("Select Token")
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ui.ctx().content_rect().center())
-            .collapsible(false)
-            .show(ui.ctx(), |ui| {
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    for t in &tokens {
-                        if ui.selectable_label(false, t).clicked() {
-                            let v = crate::widgets::with_token(ui.ctx(), id, &shown, t);
-                            actions.push(set(
-                                key,
-                                "Insert token",
-                                path.clone(),
-                                "Text",
-                                with_english(ls.clone(), &v).into_value(),
-                            ));
-                            close = true;
-                        }
+        crate::widgets::modal(ui.ctx(), "Select Token").resizable(true).show(ui.ctx(), |ui| {
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for t in &tokens {
+                    if ui.selectable_label(false, t).clicked() {
+                        let v = crate::widgets::with_token(ui.ctx(), id, &shown, t);
+                        actions.push(set(
+                            key,
+                            "Insert token",
+                            path.clone(),
+                            "Text",
+                            with_english(ls.clone(), &v).into_value(),
+                        ));
+                        close = true;
                     }
-                });
-                if crate::widgets::cancel(ui) {
-                    close = true;
                 }
             });
+            if crate::widgets::cancel(ui) {
+                close = true;
+            }
+        });
         if close {
             view.token_picker = false;
         }
     }
 }
 
-/// A script field with its parameters and a preview of its source.
-#[allow(clippy::too_many_arguments)]
+/// A script field with its parameters and a preview of its source: a
+/// link's condition (`Active`, `ConditionParams`), else a line's action
+/// (`Script`, `ActionParams`).
 fn script_with_params(
     app: &mut Moonglow,
     ui: &mut Ui,
     key: ResKey,
     path: GffPath,
-    label: &str,
-    list: &str,
+    condition: bool,
     s: &Struct,
-    salt: &str,
     actions: &mut Vec<Action>,
 ) {
+    let (label, list, salt) = match condition {
+        true => ("Active", "ConditionParams", "cond"),
+        false => ("Script", "ActionParams", "act"),
+    };
     let current = s.resref(label).unwrap_or(ResRef::EMPTY);
     ui.horizontal(|ui| {
         ui.label("Script");
@@ -1887,7 +1920,7 @@ fn script_with_params(
             actions.push(set(key, "Script", path.clone(), label, Value::resref(v)));
         }
         if let Some(name) = crate::widgets::edit_script_button(app, ui, id, current) {
-            actions.push(Action::EditScript { name, condition: label == "Active" });
+            actions.push(Action::EditScript { name, condition });
         }
     });
     // (As wide as they are, not as the page: the page stretches what is
@@ -1899,7 +1932,7 @@ fn script_with_params(
         })
         .inner;
     if wizard.clicked() {
-        app.open_script_wizard(key, path.clone(), label, salt == "cond");
+        app.open_script_wizard(key, path.clone(), label, condition);
     }
     // The pairs being edited live in a buffer until a field loses focus or a
     // row is added or removed; with no field focused the file's pairs show.
@@ -2164,12 +2197,7 @@ pub(crate) fn windows(app: &mut Moonglow, ui: &mut Ui) {
 }
 
 fn matches(text: &str, find: &str, s: &DialogSearch) -> bool {
-    let o = crate::script_tools::SearchOptions {
-        match_case: s.match_case,
-        whole_word: s.whole_word,
-        backwards: false,
-    };
-    crate::script_tools::find(text, find, 0, &o).is_some()
+    crate::script_tools::find(text, find, 0, &s.options).is_some()
 }
 
 /// The Search pane: find in this conversation or all of them, replace in
@@ -2203,8 +2231,8 @@ fn search_pane(
         ui.end_row();
     });
     ui.horizontal(|ui| {
-        ui.checkbox(&mut s.match_case, "Match Case");
-        ui.checkbox(&mut s.whole_word, "Match Whole Word Only");
+        ui.checkbox(&mut s.options.match_case, "Match Case");
+        ui.checkbox(&mut s.options.whole_word, "Match Whole Word Only");
         ui.checkbox(&mut s.all_files, "All Files in Module");
     });
     let mut find = false;
@@ -2254,13 +2282,8 @@ fn search_pane(
             if let Some(list) = ng.root.list_mut(kind.list()) {
                 for line in list {
                     let t = text(line);
-                    let o = crate::script_tools::SearchOptions {
-                        match_case: s.match_case,
-                        whole_word: s.whole_word,
-                        backwards: false,
-                    };
                     let (new, count) =
-                        crate::script_tools::replace_all(&t, &s.find, &s.replace, &o);
+                        crate::script_tools::replace_all(&t, &s.find, &s.replace, &s.options);
                     if count > 0 {
                         let ls = line.locstring("Text").cloned().unwrap_or_default();
                         line.set("Text", with_english(ls, &new).into_value());
@@ -2316,22 +2339,18 @@ impl Moonglow {
             }
         };
         let ws = self.ws.as_mut()?;
-        let stem: String = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .take(16)
-            .collect();
+        let stem = path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+        let stem: String = mg_core::ResRef::name_of(&stem).chars().take(16).collect();
         let stem = if stem.is_empty() { "conversation".to_string() } else { stem };
         let free =
             |name: &str| ResKey::parse(name, ResType::DLG).filter(|k| !ws.module.contains(k));
         // (With the builder's code, as the team's pattern puts it; never
         // twice.)
         let naming = ws.module.project_file.naming_for(ResType::DLG);
-        let key = free(&naming.fit(&stem, ""))
-            .or_else(|| (1..1000).find_map(|n| free(&naming.fit(&stem, &format!("{n:03}")))))?;
+        let key = free(&naming.fit(&stem, "")).or_else(|| {
+            let r = naming.numbered(&stem, 1, &|s| free(s).is_none())?;
+            Some(ResKey::new(r, ResType::DLG))
+        })?;
         let lines = mg_module::dialog::nodes(&g, Kind::Entry).len()
             + mg_module::dialog::nodes(&g, Kind::Reply).len();
         self.actions.push(Action::Apply(mg_edit::Command::new(
@@ -2398,97 +2417,91 @@ pub(crate) fn test_window(app: &mut Moonglow, ui: &mut Ui) {
         let mut assume = view.assume.clone();
         let title = format!("Conversation Test: {key}");
         let mut close = crate::widgets::escape_closes(ui.ctx(), &title);
-        egui::Window::new(title)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ui.ctx().content_rect().center())
-            .collapsible(false)
-            .show(ui.ctx(), |ui| {
-                // What was said so far.
-                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                    for (k, i) in &path {
-                        if let Some(n) = node(&g, *k, *i) {
-                            let who = if *k == Kind::Entry { "NPC" } else { "You" };
-                            ui.weak(format!("{who}: {}", line_text(game, n)));
-                        }
+        crate::widgets::modal(ui.ctx(), title).resizable(true).show(ui.ctx(), |ui| {
+            // What was said so far.
+            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                for (k, i) in &path {
+                    if let Some(n) = node(&g, *k, *i) {
+                        let who = if *k == Kind::Entry { "NPC" } else { "You" };
+                        ui.weak(format!("{who}: {}", line_text(game, n)));
+                    }
+                }
+            });
+            ui.separator();
+            // The NPC's turn: from the root, or after the last reply.
+            let parent = match path.last() {
+                None => Parent::Root,
+                Some(&(k, i)) => Parent::Node(k, i),
+            };
+            let candidates = links(&g, parent).to_vec();
+            let spoken = npc_line(&g, parent, &assume);
+            // The NPC lines before the one said were passed over.
+            for l in &candidates {
+                let i = link_index(l);
+                let Some(n) = node(&g, Kind::Entry, i) else { continue };
+                ui.horizontal(|ui| {
+                    if Some(i) == spoken {
+                        ui.label(RichText::new(format!("NPC: {}", line_text(game, n))).strong());
+                    } else {
+                        ui.weak(format!("(not said) {}", line_text(game, n)));
+                    }
+                    if let Some(c) = condition(l) {
+                        condition_toggle(ui, &c, &mut assume);
                     }
                 });
-                ui.separator();
-                // The NPC's turn: from the root, or after the last reply.
-                let parent = match path.last() {
-                    None => Parent::Root,
-                    Some(&(k, i)) => Parent::Node(k, i),
-                };
-                let candidates = links(&g, parent).to_vec();
-                let spoken = npc_line(&g, parent, &assume);
-                // The NPC lines before the one said were passed over.
-                for l in &candidates {
-                    let i = link_index(l);
-                    let Some(n) = node(&g, Kind::Entry, i) else { continue };
-                    ui.horizontal(|ui| {
-                        if Some(i) == spoken {
-                            ui.label(
-                                RichText::new(format!("NPC: {}", line_text(game, n))).strong(),
-                            );
-                        } else {
-                            ui.weak(format!("(not said) {}", line_text(game, n)));
-                        }
-                        if let Some(c) = condition(l) {
-                            condition_toggle(ui, &c, &mut assume);
-                        }
-                    });
-                    if Some(i) == spoken {
-                        let e = effects(l, n);
-                        if !e.is_empty() {
-                            ui.weak(e);
-                        }
-                        break;
+                if Some(i) == spoken {
+                    let e = effects(l, n);
+                    if !e.is_empty() {
+                        ui.weak(e);
                     }
+                    break;
                 }
-                let Some(entry) = spoken else {
-                    ui.weak(if candidates.is_empty() {
-                        "[END DIALOGUE]"
-                    } else {
-                        "[END DIALOGUE: no NPC line's condition passes]"
-                    });
-                    footer(ui, &mut path, &mut close);
-                    return;
-                };
-                ui.separator();
-                // The player's replies.
-                let replies = links(&g, Parent::Node(Kind::Entry, entry)).to_vec();
-                if replies.is_empty() {
-                    ui.weak("[END DIALOGUE]");
-                }
-                // Numbered as the game numbers the ones it offers.
-                let mut number = 0;
-                for l in &replies {
-                    let i = link_index(l);
-                    let Some(n) = node(&g, Kind::Reply, i) else { continue };
-                    let t = line_text(game, n);
-                    let t = if t.is_empty() { "[CONTINUE]".to_string() } else { t };
-                    let shown = passes(l, &assume);
-                    number += usize::from(shown);
-                    let label = if shown { format!("{number}. {t}") } else { t };
-                    ui.horizontal(|ui| {
-                        if shown {
-                            if ui.button(&label).clicked() {
-                                path.push((Kind::Entry, entry));
-                                path.push((Kind::Reply, i));
-                            }
-                        } else {
-                            ui.weak(format!("(hidden) {label}"));
-                        }
-                        if let Some(c) = condition(l) {
-                            condition_toggle(ui, &c, &mut assume);
-                        }
-                        let e = effects(l, n);
-                        if !e.is_empty() {
-                            ui.weak(e);
-                        }
-                    });
-                }
+            }
+            let Some(entry) = spoken else {
+                ui.weak(if candidates.is_empty() {
+                    "[END DIALOGUE]"
+                } else {
+                    "[END DIALOGUE: no NPC line's condition passes]"
+                });
                 footer(ui, &mut path, &mut close);
-            });
+                return;
+            };
+            ui.separator();
+            // The player's replies.
+            let replies = links(&g, Parent::Node(Kind::Entry, entry)).to_vec();
+            if replies.is_empty() {
+                ui.weak("[END DIALOGUE]");
+            }
+            // Numbered as the game numbers the ones it offers.
+            let mut number = 0;
+            for l in &replies {
+                let i = link_index(l);
+                let Some(n) = node(&g, Kind::Reply, i) else { continue };
+                let t = line_text(game, n);
+                let t = if t.is_empty() { "[CONTINUE]".to_string() } else { t };
+                let shown = passes(l, &assume);
+                number += usize::from(shown);
+                let label = if shown { format!("{number}. {t}") } else { t };
+                ui.horizontal(|ui| {
+                    if shown {
+                        if ui.button(&label).clicked() {
+                            path.push((Kind::Entry, entry));
+                            path.push((Kind::Reply, i));
+                        }
+                    } else {
+                        ui.weak(format!("(hidden) {label}"));
+                    }
+                    if let Some(c) = condition(l) {
+                        condition_toggle(ui, &c, &mut assume);
+                    }
+                    let e = effects(l, n);
+                    if !e.is_empty() {
+                        ui.weak(e);
+                    }
+                });
+            }
+            footer(ui, &mut path, &mut close);
+        });
         view.test = if close { None } else { Some(path) };
         view.assume = assume;
     }
@@ -2513,6 +2526,43 @@ mod tests {
     use super::*;
     use egui::Key;
     use mg_module::dialog::{add_link, new_link, node_mut};
+
+    /// The light theme's text colors stand out against its white as the
+    /// web asks of text (a contrast of 4.5 or more), and more than the dark
+    /// theme's would there.
+    #[test]
+    fn the_light_theme_s_text_colors_stand_out_against_white() {
+        fn luminance([r, g, b]: [u8; 3]) -> f64 {
+            let c = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * c(r) + 0.7152 * c(g) + 0.0722 * c(b)
+        }
+        let against_white = |c: [u8; 3]| 1.05 / (luminance(c) + 0.05);
+        let (light, dark) = (default_colors(false), default_colors(true));
+        for (l, d) in [(light.0, dark.0), (light.1, dark.1)] {
+            assert!(against_white(l) >= 4.5, "{l:?}: {}", against_white(l));
+            assert!(against_white(l) > against_white(d));
+        }
+    }
+
+    /// A conversation's fingerprint, kept with a module's tabs, is fixed:
+    /// the same as the records written with Rust's `DefaultHasher` have
+    /// (none is lost by the change), and the same whatever the toolchain.
+    #[test]
+    fn a_conversation_s_fingerprint_is_fixed() {
+        use std::hash::{Hash, Hasher};
+        let g = sample();
+        let bytes = g.to_bytes().unwrap();
+        let mut before = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut before);
+        assert_eq!(fingerprint(&g), before.finish(), "as the records written before have it");
+        let mut fixed = siphasher::sip::SipHasher13::new_with_keys(0, 0);
+        bytes.hash(&mut fixed);
+        assert_eq!(fingerprint(&g), fixed.finish());
+        assert_eq!(fingerprint(&new_dialog()), 15_852_168_482_793_792_934, "pinned");
+    }
 
     /// Root, a greeting with a reply that has a line under it, and a link.
     fn sample() -> Gff {

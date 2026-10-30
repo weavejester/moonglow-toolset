@@ -41,6 +41,15 @@ impl GameInstall {
         }
     }
 
+    /// The game as a player who downloads the module has it: this
+    /// install's own files, without the user directory's folders
+    /// (`override/`, `development/`, portraits, `userpatch.ini`) or the
+    /// Workshop's. A module's haks are still found where this install
+    /// finds them ([`ResMan::add_haks`] with the install itself).
+    pub fn as_player(&self) -> GameInstall {
+        GameInstall { user_dir: None, workshop: false, ..self.clone() }
+    }
+
     /// The haks `userpatch.ini` (in the user directory) names, highest
     /// first, each with its file in the `PATCH` folder if it is there:
     /// `PatchFile000=name` and on, the highest number winning, as the game
@@ -123,9 +132,9 @@ impl GameInstall {
         self.root.join("lang").join(&self.language).join("data")
     }
 
-    /// The talk table for the language (`dialog.tlk`, or `dialogf.tlk`).
-    pub fn talk_table(&self, feminine: bool) -> PathBuf {
-        self.lang_data().join(if feminine { "dialogf.tlk" } else { "dialog.tlk" })
+    /// The talk table for the language (`dialog.tlk`).
+    pub fn talk_table(&self) -> PathBuf {
+        self.lang_data().join("dialog.tlk")
     }
 
     fn user(&self, sub: &str) -> Option<PathBuf> {
@@ -172,6 +181,86 @@ impl GameInstall {
             .chain(self.workshop("hak"))
             .chain([self.root.join("data").join("hk")])
             .collect()
+    }
+
+    /// The user's own hak folder (`hak/` in the user folder), where haks
+    /// made or written go; `None` without a user folder.
+    pub fn user_hak_dir(&self) -> Option<PathBuf> {
+        self.user("hak")
+    }
+
+    /// The file of the hak `name` (without `.hak`, as
+    /// [`crate::file_name_text`] reads a module's) the game opens: the
+    /// first of [`GameInstall::hak_dirs`] that has [`crate::named_file`].
+    pub fn find_hak(&self, name: &str) -> Option<PathBuf> {
+        let file = crate::named_file(name, "hak");
+        self.hak_dirs().into_iter().map(|d| d.join(&file)).find(|p| p.is_file())
+    }
+
+    /// The haks in the hak folders, by the names a module names them by
+    /// ([`crate::name_of_file`]), sorted and without duplicates.
+    pub fn hak_names(&self) -> Vec<String> {
+        GameInstall::names_in(&self.hak_dirs(), "hak")
+    }
+
+    /// The talk tables in the talk table folders, by the names a module
+    /// names them by, sorted and without duplicates.
+    pub fn tlk_names(&self) -> Vec<String> {
+        GameInstall::names_in(&self.tlk_dirs(), "tlk")
+    }
+
+    /// The names a module names the files of an extension in some folders
+    /// by ([`crate::name_of_file`]: as they are, not lower case), sorted
+    /// and without duplicates. The extension in its case where the file
+    /// system has one ([`crate::CASE_IGNORED`]): the game opens `.hak`.
+    pub fn names_in(dirs: &[PathBuf], ext: &str) -> Vec<String> {
+        let ours = |e: &std::ffi::OsStr| match crate::CASE_IGNORED {
+            true => e.eq_ignore_ascii_case(ext),
+            false => e == ext,
+        };
+        let mut out: Vec<String> = (dirs.iter())
+            .filter_map(|d| std::fs::read_dir(d).ok())
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(ours))
+            .filter_map(|p| p.file_stem().map(crate::name_of_file))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Where the game finds no hak `name`: a file in the hak folders whose
+    /// name differs from it in case alone ([`crate::Listed::OtherCase`]),
+    /// which the game doesn't open on Linux. `None` where it finds one.
+    pub fn hak_in_other_case(&self, name: &str) -> Option<PathBuf> {
+        if self.find_hak(name).is_some() {
+            return None;
+        }
+        let dirs = self.hak_dirs();
+        let crate::Listed::OtherCase(other) =
+            crate::listed(&GameInstall::names_in(&dirs, "hak"), name)
+        else {
+            return None;
+        };
+        let file = crate::named_file(&other, "hak");
+        dirs.iter().map(|d| d.join(&file)).find(|p| p.is_file())
+    }
+
+    /// What every tool says of the hak `name` the game doesn't find (`mg`
+    /// after `warning: `, the window's log with a capital): that it isn't
+    /// found, and where a file of its name in another case is there, that
+    /// file and what to do.
+    pub fn hak_not_found(&self, name: &str) -> String {
+        match self.hak_in_other_case(name) {
+            Some(file) => format!(
+                "hak {name} not found: the game opens a hak only by its exact name, and {} has \
+                 its name in another case (rename the file or the module's hak to match)",
+                file.display()
+            ),
+            None => format!("hak {name} not found"),
+        }
     }
 
     /// Where custom talk tables are: the user's `tlk/`, then the install's
@@ -239,8 +328,10 @@ fn candidate_roots() -> Vec<PathBuf> {
                 other.push(PathBuf::from(p).join("GOG Galaxy").join("Games").join(gog));
             }
         }
-        // Steam, a library of its own or GOG's folder on any drive (Steam
-        // put elsewhere isn't found by its usual place).
+        // Steam where its installer put it, as the registry says (a
+        // folder of the user's choosing).
+        steam.extend(steam_from_registry());
+        // Steam, a library of its own or GOG's folder on any drive.
         for drive in 'C'..='Z' {
             let drive = PathBuf::from(format!("{drive}:\\"));
             steam.push(drive.join("Steam"));
@@ -257,6 +348,24 @@ fn candidate_roots() -> Vec<PathBuf> {
             }
         }
     }
+    // Beamdog's client: its library folders (its settings, else its
+    // usual one), the stable release before the development one.
+    let beamdog_settings = if cfg!(windows) {
+        env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("USERPROFILE").map(|h| Path::new(&h).join("AppData/Roaming")))
+    } else if cfg!(target_os = "macos") {
+        home.as_ref().map(|h| h.join("Library/Application Support"))
+    } else {
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".config")))
+    }
+    .map(|d| d.join("Beamdog Client").join("settings.json"));
+    let beamdog_home =
+        if cfg!(windows) { env::var_os("USERPROFILE").map(PathBuf::from) } else { home };
+    let settings = beamdog_settings.and_then(|p| std::fs::read_to_string(p).ok());
+    other.extend(beamdog_roots(settings.as_deref(), beamdog_home.as_deref()));
     let mut v: Vec<PathBuf> = Vec::new();
     for root in libraries.into_iter().map(|l| l.join(&game)).chain(other) {
         if !v.contains(&root) {
@@ -285,6 +394,72 @@ fn steam_libraries(vdf: &str) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Beamdog's numbers for the game: the stable release, then the
+/// development one (neverwinter.nim's `findNwnRoot` looks for both).
+const BEAMDOG_RELEASES: [&str; 2] = ["00785", "00829"];
+
+/// Where Beamdog's client may have put the game: in each library folder
+/// its `settings.json` lists (`"folders"`), else in its usual one
+/// (`Beamdog Library` in the home folder), each release's folder.
+fn beamdog_roots(settings: Option<&str>, home: Option<&Path>) -> Vec<PathBuf> {
+    let listed: Vec<PathBuf> = settings
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|j| {
+            j.get("folders")?
+                .as_array()
+                .map(|a| a.iter().filter_map(|f| f.as_str()).map(PathBuf::from).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    let folders = if listed.is_empty() {
+        home.map(|h| vec![h.join("Beamdog Library")]).unwrap_or_default()
+    } else {
+        listed
+    };
+    BEAMDOG_RELEASES.iter().flat_map(|r| folders.iter().map(move |f| f.join(r))).collect()
+}
+
+/// Steam's own folder as Windows' registry has it: the user's
+/// `SteamPath`, then the machine's `InstallPath` (Steam installed where
+/// its installer was told to). Elsewhere, none.
+fn steam_from_registry() -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    [
+        (r"HKCU\Software\Valve\Steam", "SteamPath"),
+        (r"HKLM\SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+        (r"HKLM\SOFTWARE\Valve\Steam", "InstallPath"),
+    ]
+    .into_iter()
+    .filter_map(|(key, name)| {
+        let mut reg = std::process::Command::new("reg");
+        reg.args(["query", key, "/v", name]);
+        #[cfg(windows)]
+        {
+            // (No console window flashing up from the window's program.)
+            use std::os::windows::process::CommandExt;
+            reg.creation_flags(0x0800_0000);
+        }
+        let out = reg.output().ok().filter(|o| o.status.success())?;
+        reg_value(&String::from_utf8_lossy(&out.stdout), name)
+    })
+    .map(PathBuf::from)
+    .collect()
+}
+
+/// A value of `reg query KEY /v NAME`'s output (`    NAME    REG_SZ
+/// VALUE`), its slashes as they are.
+fn reg_value(output: &str, name: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let line = line.trim_start();
+        let rest = line.strip_prefix(name)?;
+        let rest = rest.trim_start().strip_prefix("REG_")?;
+        // (The type's name, then the value, which may hold spaces.)
+        let (_, value) = rest.split_once(char::is_whitespace)?;
+        Some(value.trim().to_string()).filter(|v| !v.is_empty())
+    })
 }
 
 /// The `key=value` lines of an INI file's `[section]` (names compared
@@ -329,7 +504,8 @@ pub fn default_user_dir() -> Option<PathBuf> {
 
 impl ResMan {
     /// The stack the toolset sees with no module open (see [`priority`]):
-    /// portraits, `development/`, `override/`, ambient and music folders and
+    /// portraits, `development/`, `override/`, ambient and music folders
+    /// (with Steam Workshop items' own under the user's, when read) and
     /// the keys (`nwn_retail*` over `nwn_base*`, localized keys over their
     /// base). The install's `ovr/` is not searched: EE keeps `nwscript.nss`
     /// there for external tools only, and the engine resolves it from the keys.
@@ -341,27 +517,36 @@ impl ResMan {
         let mut rm = ResMan::new();
         let root = &install.root;
         let data = root.join("data");
-        let mut dir = |p: u32, label: &str, path: Option<PathBuf>| {
+        // A Workshop item's folder of a kind, as a layer at `p` (each item
+        // labelled by its number; of two items, the first by number first,
+        // the game's order not being known), added before the install's
+        // own of that priority: under the user's own, over the install's.
+        let workshop = |rm: &mut ResMan, p: u32, sub: &str| {
+            for item in install.workshop(sub) {
+                let id = item.parent().and_then(Path::file_name).unwrap_or_default();
+                let label = format!("workshop:{}", id.to_string_lossy());
+                rm.add(p, label, LayerClass::Directory, DirContainer::open(&item));
+            }
+        };
+        let dir = |rm: &mut ResMan, p: u32, label: &str, path: Option<PathBuf>| {
             if let Some(path) = path {
                 rm.add(p, label, LayerClass::Directory, DirContainer::open(&path));
             }
         };
-        dir(priority::PORTRAITS_USER, "user portraits", install.user("portraits"));
-        dir(priority::PORTRAITS, "portraits", Some(data.join("prt")));
-        dir(priority::DEVELOPMENT_USER, "development", install.user("development"));
-        dir(priority::OVERRIDE, "override", install.user("override"));
+        dir(&mut rm, priority::PORTRAITS_USER, "user portraits", install.user("portraits"));
+        workshop(&mut rm, priority::PORTRAITS, "portraits");
+        dir(&mut rm, priority::PORTRAITS, "portraits", Some(data.join("prt")));
+        dir(&mut rm, priority::DEVELOPMENT_USER, "development", install.user("development"));
+        dir(&mut rm, priority::OVERRIDE, "override", install.user("override"));
         // The Workshop's overrides, under the user's own (the game started
-        // through Steam reads them; which of two items' wins isn't known:
-        // the first by number here).
-        for item in install.workshop("override").into_iter().rev() {
-            let id = item.parent().and_then(Path::file_name).unwrap_or_default();
-            let label = format!("workshop:{}", id.to_string_lossy());
-            dir(priority::WORKSHOP, &label, Some(item));
-        }
-        dir(priority::AMBIENT_USER, "user ambient", install.user("ambient"));
-        dir(priority::MUSIC_USER, "user music", install.user("music"));
-        dir(priority::AMBIENT, "ambient", Some(data.join("amb")));
-        dir(priority::MUSIC, "music", Some(data.join("mus")));
+        // through Steam reads them).
+        workshop(&mut rm, priority::WORKSHOP, "override");
+        dir(&mut rm, priority::AMBIENT_USER, "user ambient", install.user("ambient"));
+        dir(&mut rm, priority::MUSIC_USER, "user music", install.user("music"));
+        workshop(&mut rm, priority::AMBIENT, "ambient");
+        dir(&mut rm, priority::AMBIENT, "ambient", Some(data.join("amb")));
+        workshop(&mut rm, priority::MUSIC, "music");
+        dir(&mut rm, priority::MUSIC, "music", Some(data.join("mus")));
         // userpatch.ini's haks, under the module and its haks, over
         // `override/`; the highest first (an archive that can't be read is
         // left out, as a missing one is).
@@ -401,26 +586,14 @@ impl ResMan {
         let mut missing = Vec::new();
         for name in names {
             let name = name.as_ref();
-            let file = format!("{name}.hak");
-            // (A Workshop item's hak counts as the user's.)
-            let user = install
-                .user("hak")
-                .into_iter()
-                .chain(install.workshop("hak"))
-                .map(|d| d.join(&file))
-                .find(|p| p.is_file());
-            let (p, path) = match user {
-                Some(path) => (priority::HAK_USER, path),
-                None => {
-                    match Some(install.root.join("data/hk").join(&file)).filter(|p| p.is_file()) {
-                        Some(path) => (priority::HAK, path),
-                        None => {
-                            missing.push(name.to_string());
-                            continue;
-                        }
-                    }
-                }
+            let Some(path) = install.find_hak(name) else {
+                missing.push(name.to_string());
+                continue;
             };
+            // (The install's own, `data/hk/`, under the user's; a
+            // Workshop item's hak counts as the user's.)
+            let stock = path.parent() == Some(install.root.join("data").join("hk").as_path());
+            let p = if stock { priority::HAK } else { priority::HAK_USER };
             self.add(p, format!("hak:{name}"), LayerClass::Erf, ErfContainer::open(&path)?);
         }
         Ok(missing)
@@ -447,6 +620,57 @@ mod install_tests {
         assert!(steam_libraries("not a list at all").is_empty());
     }
 
+    /// Beamdog's client: the game in each library its settings list, the
+    /// stable release before the development one; without its settings,
+    /// in its usual library.
+    #[test]
+    fn beamdog_s_libraries_are_looked_in() {
+        let settings = r#"{"folders": ["D:\\Games\\Beamdog Library", "/mnt/bd"], "other": 1}"#;
+        let home = Path::new("/home/me");
+        assert_eq!(
+            beamdog_roots(Some(settings), Some(home)),
+            [
+                PathBuf::from("D:\\Games\\Beamdog Library").join("00785"),
+                PathBuf::from("/mnt/bd/00785"),
+                PathBuf::from("D:\\Games\\Beamdog Library").join("00829"),
+                PathBuf::from("/mnt/bd/00829"),
+            ]
+        );
+        let usual = [home.join("Beamdog Library/00785"), home.join("Beamdog Library/00829")];
+        assert_eq!(beamdog_roots(None, Some(home)), usual);
+        assert_eq!(beamdog_roots(Some("not json"), Some(home)), usual);
+        assert_eq!(beamdog_roots(Some(r#"{"folders": []}"#), Some(home)), usual);
+        assert!(beamdog_roots(None, None).is_empty());
+    }
+
+    /// Steam's folder from `reg query`'s output, spaces in it kept.
+    #[test]
+    fn the_registry_s_steam_folder_is_read() {
+        let out = "\r\nHKEY_CURRENT_USER\\Software\\Valve\\Steam\r\n    SteamPath    REG_SZ    \
+                   e:/my games/steam\r\n\r\n";
+        assert_eq!(reg_value(out, "SteamPath").as_deref(), Some("e:/my games/steam"));
+        let machine = "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Valve\\Steam\n    InstallPath    \
+                       REG_SZ    E:\\Steam\n";
+        assert_eq!(reg_value(machine, "InstallPath").as_deref(), Some("E:\\Steam"));
+        assert_eq!(reg_value(machine, "SteamPath"), None);
+        assert_eq!(reg_value("ERROR: The system was unable to find the key", "SteamPath"), None);
+        assert!(steam_from_registry().is_empty() || cfg!(windows));
+    }
+
+    /// This machine's registry asked (run by hand on Windows, or under
+    /// Wine with `wine reg add HKCU\Software\Valve\Steam /v SteamPath /t
+    /// REG_SZ /d "c:/my games/steam"`): `MG_STEAM_EXPECTED` is what it
+    /// should find first.
+    #[test]
+    #[ignore]
+    fn steam_folder_from_this_machine_s_registry() {
+        let found = steam_from_registry();
+        eprintln!("{found:?}");
+        if let Some(expected) = env::var_os("MG_STEAM_EXPECTED") {
+            assert_eq!(found.first(), Some(&PathBuf::from(expected)));
+        }
+    }
+
     /// A Steam install's Workshop items are read when asked for: their
     /// overrides under the user's own, their haks found by name.
     #[test]
@@ -464,8 +688,21 @@ mod install_tests {
         std::fs::write(item.join("override/mg_both.2da"), "workshop").unwrap();
         std::fs::write(user.join("override/mg_both.2da"), "user").unwrap();
         std::fs::write(item.join("hak/mg_ws_hak.hak"), "").unwrap();
+        // Its portraits, ambient sounds and music: under the user's, over
+        // the install's.
+        for (sub, name, ext) in [
+            ("portraits", "po_mgws_m", mg_core::ResType::TGA),
+            ("ambient", "al_mg_ws", mg_core::ResType::WAV),
+            ("music", "mus_mg_ws", mg_core::ResType::BMU),
+        ] {
+            std::fs::create_dir_all(item.join(sub)).unwrap();
+            let file = format!("{name}.{}", ext.extension().unwrap());
+            std::fs::write(item.join(sub).join(file), sub).unwrap();
+        }
+        std::fs::create_dir_all(user.join("portraits")).unwrap();
+        std::fs::write(user.join("portraits/po_mgws_m.tga"), "user").unwrap();
         let key = |n: &str| crate::ResKey::parse(n, mg_core::ResType::TWODA).unwrap();
-        let mut install = GameInstall::new(&root, Some(user), "en");
+        let mut install = GameInstall::new(&root, Some(user.clone()), "en");
         let without = ResMan::for_game(&install).unwrap();
         assert!(!without.contains(&key("mg_ws")));
         assert!(install.workshop_items().is_empty());
@@ -474,6 +711,16 @@ mod install_tests {
         assert_eq!(&*with.get(&key("mg_ws")).unwrap(), b"workshop");
         assert_eq!(&*with.get(&key("mg_both")).unwrap(), b"user", "the user's own comes first");
         assert!(install.hak_dirs().contains(&item.join("hak")));
+        let res = |n: &str, t| crate::ResKey::parse(n, t).unwrap();
+        let (tga, wav, bmu) = (mg_core::ResType::TGA, mg_core::ResType::WAV, mg_core::ResType::BMU);
+        assert_eq!(&*with.get(&res("po_mgws_m", tga)).unwrap(), b"user", "the user's portrait");
+        assert_eq!(&*with.get(&res("al_mg_ws", wav)).unwrap(), b"ambient");
+        assert_eq!(&*with.get(&res("mus_mg_ws", bmu)).unwrap(), b"music");
+        assert_eq!(with.origin(&res("mus_mg_ws", bmu)), Some("workshop:123"));
+        std::fs::remove_file(user.join("portraits/po_mgws_m.tga")).unwrap();
+        let with = ResMan::for_game(&install).unwrap();
+        assert_eq!(&*with.get(&res("po_mgws_m", tga)).unwrap(), b"portraits");
+        assert!(!without.contains(&res("mus_mg_ws", bmu)));
         // Not for a game outside a Steam library.
         let elsewhere = GameInstall { root: lib.join("game"), ..install };
         assert!(elsewhere.workshop_items().is_empty());

@@ -80,8 +80,8 @@ fn usage_says_what_the_module_reaches_in_each_hak() {
     m.set_gff(ResKey::parse("a1", ResType::GIT).unwrap(), &git).unwrap();
     m.save_as(&ModuleLocation::Folder(dir.join("module"))).unwrap();
 
-    let out = crate::mg()
-        .args(["--root", root.to_str().unwrap(), "--user-dir", user.to_str().unwrap(), "--json"])
+    let out = crate::mg_on(&root, Some(user.as_ref()))
+        .arg("--json")
         .args(["haks", "--usage", dir.join("module").to_str().unwrap()])
         .output()
         .unwrap();
@@ -123,8 +123,7 @@ fn usage_says_what_the_module_reaches_in_each_hak() {
     assert_eq!(names(hak("mg_usage_top"), "used_resources"), ["mg_usage_wood.tga"]);
 
     // As text: a line a hak, and the whole.
-    let out = crate::mg()
-        .args(["--root", root.to_str().unwrap(), "--user-dir", user.to_str().unwrap()])
+    let out = crate::mg_on(&root, Some(user.as_ref()))
         .args(["haks", "--usage", dir.join("module").to_str().unwrap()])
         .output()
         .unwrap();
@@ -133,6 +132,59 @@ fn usage_says_what_the_module_reaches_in_each_hak() {
     assert!(text.contains("1 unused, 1 shadowed, 1 not judged"), "{text}");
     assert!(text.contains("All\t5 of 8 used"), "{text}");
     assert!(text.contains("nothing reaches 0 of 2 haks"), "{text}");
+}
+
+/// `mg --userpatch` reads the haks userpatch.ini names, as the window's
+/// Options › General switch does (off unless asked for), and Verify warns
+/// of a script only such a hak or the user's override has.
+#[test]
+fn userpatch_haks_are_read_when_asked_for() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("mg-userpatch");
+    let user = dir.join("user");
+    std::fs::create_dir_all(user.join("patch")).unwrap();
+    std::fs::create_dir_all(user.join("override")).unwrap();
+    std::fs::write(user.join("userpatch.ini"), "[Patch]\r\nPatchFile000=mg_up\r\n").unwrap();
+    hak(&user.join("patch/mg_up.hak"), &[("mg_up_load.ncs", Vec::new())]);
+    std::fs::write(user.join("override/mg_up_beat.ncs"), b"").unwrap();
+    let mut m = Module::new();
+    let mut info = Gff::new(*b"IFO ");
+    info.root.write(&ifo::MOD_ON_MOD_LOAD, ResRef::from_str("mg_up_load").unwrap());
+    info.root.write(&ifo::MOD_ON_HEARTBEAT, ResRef::from_str("mg_up_beat").unwrap());
+    m.set_info(&info).unwrap();
+    let module = dir.join("module");
+    m.save_as(&ModuleLocation::Folder(module.clone())).unwrap();
+    let run = |args: &[&str]| -> Json {
+        let mut c = crate::mg_on(&root, Some(user.as_ref()));
+        let out = c.arg("--json").args(args).output().unwrap();
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+    };
+    assert!(run(&["which", "mg_up_load.ncs"])["error"].is_string(), "off unless asked for");
+    let found = run(&["--userpatch", "which", "mg_up_load.ncs"]);
+    assert_eq!(found["layer"], "userpatch:mg_up", "{found}");
+    let verified = run(&["--userpatch", "verify", module.to_str().unwrap()]);
+    let mut said: Vec<(String, String, String)> = verified["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| {
+            let s = |k: &str| x[k].as_str().unwrap_or_default().to_string();
+            (s("target"), s("only_in"), s("severity"))
+        })
+        .collect();
+    said.sort();
+    let s = |a: &str, b: &str| (a.to_string(), b.to_string(), "warning".to_string());
+    assert_eq!(said, [s("mg_up_beat", "override"), s("mg_up_load", "userpatch")], "{verified}");
+    // Left out by the kind of the player's own content (a builder who keeps
+    // content in override): that one, then all of them.
+    let targets = |skip: &str| -> Vec<String> {
+        let v = run(&["--userpatch", "verify", module.to_str().unwrap(), "--skip", skip]);
+        let missing = v["missing"].as_array().unwrap_or_else(|| panic!("{v}"));
+        missing.iter().map(|x| x["target"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(targets("references:override"), ["mg_up_load"]);
+    assert!(targets("references:local").is_empty());
 }
 
 /// `mg which --module`: a table in two of the module's haks and the game
@@ -157,8 +209,7 @@ fn which_names_every_copy_of_a_resource() {
     m.set_info(&info).unwrap();
     m.save_as(&ModuleLocation::Folder(dir.join("module"))).unwrap();
     let which = |json: bool| {
-        let mut c = crate::mg();
-        c.args(["--root", root.to_str().unwrap(), "--user-dir", user.to_str().unwrap()]);
+        let mut c = crate::mg_on(&root, Some(user.as_ref()));
         if json {
             c.arg("--json");
         }
@@ -184,8 +235,7 @@ fn which_names_every_copy_of_a_resource() {
         ["hak:mg_which_top", "hak:mg_which_low (overridden by hak:mg_which_top)"]
     );
     // Without the module: the game's alone.
-    let out = crate::mg()
-        .args(["--root", root.to_str().unwrap(), "--user-dir", user.to_str().unwrap()])
+    let out = crate::mg_on(&root, Some(user.as_ref()))
         .args(["--json", "which", "portraits.2da"])
         .output()
         .unwrap();

@@ -10,7 +10,7 @@ use mg_edit::{Command, Edit};
 use mg_module::blueprints::{self, CreatureSpec};
 use mg_module::palette::BlueprintKind;
 use mg_resman::ResKey;
-use mg_rules::{Choice, ChoiceColumns, GameData};
+use mg_rules::{Choice, GameData};
 
 use crate::images::Loader;
 use crate::{Action, Moonglow, Tab};
@@ -82,57 +82,50 @@ impl Default for CreatureWizard {
     }
 }
 
-fn choices(game: &GameData, table: &str, name: &str, label: &str) -> Vec<Choice> {
-    game.choices(table, ChoiceColumns { name: Some(name), label: Some(label) }).unwrap_or_default()
-}
-
-/// The portraits of a race and gender (portraits.2da, not plot ones):
-/// those of the gender, then those of no gender (`Sex` 2 both, 3 other, 4
-/// none), which are all that monsters' races have (an outsider's are all
-/// `Sex` 4).
-fn portraits(game: &GameData, race: u32, gender: u8, all: bool) -> Vec<(u16, String)> {
+/// The portraits of a race and gender (portraits.2da, not plot ones), as
+/// Aurora's wizard lists them (its Select Portrait with Race and Gender
+/// ticked, captured 2026-10-30 in `w1probe`): the gender's exactly (no
+/// rows of `Sex` 4, none: a human male's list has no `kid_` of row 238),
+/// in the table's order, the module's own portraits among them. A race
+/// with none of the gender, as a monster's (an outsider's are all `Sex`
+/// 4), has those of no gender (`Sex` 2 both, 3 other, 4 none), where
+/// Aurora's list is empty (a senior builder's review: the wizard is to
+/// offer a monster's portraits).
+fn portraits(
+    game: &GameData,
+    ws: Option<&mg_edit::Workspace>,
+    race: u32,
+    gender: u8,
+    all: bool,
+) -> Vec<(u16, String)> {
     let Ok(t) = game.table("portraits") else { return Vec::new() };
-    // Every creature's (not a door's or placeable's), for a creature that
-    // isn't to look like its race.
-    if all {
-        return (0..t.len())
-            .filter(|&r| t.get_int(r, "InanimateType").is_none())
-            .filter_map(|r| Some((r as u16, t.get(r, "BaseResRef")?.to_string())))
-            .filter(|(_, base)| crate::images::has_portrait(game, None, base))
-            .collect();
-    }
-    let of = |any_gender: bool| {
-        let t = t.clone();
+    let rows = |fits: &dyn Fn(Option<i32>) -> bool| -> Vec<(u16, String)> {
         (0..t.len())
-            .filter(move |&r| {
-                let sex = t.get_int(r, "Sex");
-                let fits = if any_gender {
-                    sex.is_some_and(|s| s >= 2)
-                } else {
-                    sex == Some(i32::from(gender))
-                };
-                // (Not a door's or placeable's: `door01_` is listed under
-                // the fey's race.)
-                t.get_int(r, "Race") == Some(race as i32)
-                    && fits
-                    && t.get_int(r, "Plot").unwrap_or(0) == 0
-                    && t.get_int(r, "InanimateType").is_none()
+            .filter(|&r| {
+                // Every creature's (not a door's or placeable's), for a
+                // creature that isn't to look like its race. (`door01_` is
+                // listed under the fey's race.)
+                t.get_int(r, "InanimateType").is_none()
+                    && (all
+                        || t.get_int(r, "Race") == Some(race as i32)
+                            && fits(t.get_int(r, "Sex"))
+                            && t.get_int(r, "Plot").unwrap_or(0) == 0)
             })
-            .collect::<Vec<_>>()
+            .filter_map(|r| Some((r as u16, t.get(r, "BaseResRef")?.to_string())))
+            .filter(|(_, base)| crate::images::has_portrait(game, ws, base))
+            .collect()
     };
-    of(false)
-        .into_iter()
-        .chain(of(true))
-        .filter_map(|r| Some((r as u16, t.get(r, "BaseResRef")?.to_string())))
-        .filter(|(_, base)| crate::images::has_portrait(game, None, base))
-        .collect()
+    let of_gender = rows(&|sex| sex == Some(i32::from(gender)));
+    if of_gender.is_empty() && !all {
+        return rows(&|sex| sex.is_some_and(|s| s >= 2));
+    }
+    of_gender
 }
 
 /// The racial types a creature can be given: racialtypes.2da's rows that
 /// have a name (its `DELETED` and `INVALID_RACE` rows have none).
-fn races(game: &GameData) -> Vec<Choice> {
-    game.choices("racialtypes", ChoiceColumns { name: Some("Name"), label: None })
-        .unwrap_or_default()
+fn races(game: &GameData) -> std::sync::Arc<Vec<Choice>> {
+    crate::widgets::table_choices(Some(game), "racialtypes", Some("Name"), None)
 }
 
 impl CreatureWizard {
@@ -198,11 +191,9 @@ fn review(app: &Moonglow, w: &CreatureWizard) -> String {
     let g = blueprints::creature(game, &w.spec(ResRef::EMPTY), &item);
     let c = &g.root;
     let name_of = |table: &str, row: i64| {
-        choices(game, table, if table == "appearance" { "STRING_REF" } else { "Name" }, "Label")
-            .into_iter()
-            .find(|x| x.row as i64 == row)
-            .map(|x| x.text)
-            .unwrap_or_default()
+        let name = if table == "appearance" { "STRING_REF" } else { "Name" };
+        let names = crate::widgets::table_choices(Some(game), table, Some(name), Some("Label"));
+        names.iter().find(|x| x.row as i64 == row).map(|x| x.text.clone()).unwrap_or_default()
     };
     let int = |l: &str| c.integer(l).unwrap_or(0);
     let rating = c.float("ChallengeRating").unwrap_or(0.0);
@@ -244,7 +235,6 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     }
     let (mut finish, mut cancel) = (false, false);
     let summary = if w.page == 7 { review(app, &w) } else { String::new() };
-    let mut looks = Looks { ready: app.thumbnails.looks(), shown: Vec::new() };
     // The ResRef the name gives, as Finish makes it (on the names' page).
     let names = Names {
         naming: crate::blueprint_wizard::naming(app, ResType::UTC),
@@ -254,7 +244,8 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         },
     };
     // The game data, and its pictures (the portraits).
-    let mut loader = app.loader().expect("checked");
+    let (mut loader, ready) = app.loader_and_thumbnails().expect("checked");
+    let mut looks = Looks { ready, shown: Vec::new() };
     // Most of the screen to begin with, and resizable: the pages' lists and
     // the review fill what is between the heading and the buttons.
     let screen = ctx.content_rect();
@@ -262,14 +253,11 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         (screen.width() * 0.6).clamp(560.0, 960.0),
         (screen.height() * 0.75).clamp(440.0, 800.0),
     );
-    egui::Window::new("Creature Wizard")
-        .collapsible(false)
+    crate::widgets::modal(ctx, "Creature Wizard")
         .resizable(true)
         .default_size(size)
         .min_width(480.0)
         .min_height(360.0)
-        .pivot(egui::Align2::CENTER_CENTER)
-        .default_pos(screen.center())
         .show(ctx, |ui| {
             egui::Panel::bottom("cw-buttons").show(ui, |ui| {
                 ui.add_space(4.0);
@@ -293,7 +281,8 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         });
     // The appearances' pictures in sight: kept while they are, and those
     // still to make are made a few a frame.
-    app.thumbnails.show(looks.shown.iter().map(|l| crate::model_view::Pictured::Look(*l)));
+    let shown = looks.shown;
+    app.thumbnails.show(shown.into_iter().map(crate::model_view::Pictured::Look));
     if finish {
         make(app, &w);
     } else if !cancel {
@@ -303,8 +292,8 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
 
 /// The pictures of creatures' looks the Appearance page shows: those made,
 /// and those in sight (made or not).
-struct Looks {
-    ready: std::collections::HashMap<mg_preview::CreatureLook, Option<egui::TextureId>>,
+struct Looks<'a> {
+    ready: &'a crate::model_view::Thumbnails,
     shown: Vec<mg_preview::CreatureLook>,
 }
 
@@ -342,7 +331,7 @@ fn page(
                  Creature.",
             );
             egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-                for c in races(game) {
+                for c in races(game).iter() {
                     if ui.selectable_label(w.race == Some(c.row as u32), &c.text).clicked() {
                         w.choose_race(game, c.row as u32);
                     }
@@ -351,7 +340,8 @@ fn page(
         }
         2 => {
             ui.label("Please choose 1 to 8 classes for this creature and select the level for each class.");
-            let names = choices(game, "classes", "Name", "Label");
+            let names =
+                crate::widgets::table_choices(Some(game), "classes", Some("Name"), Some("Label"));
             let name = |k: u32| {
                 names.iter().find(|c| c.row == k as usize).map_or(String::new(), |c| c.text.clone())
             };
@@ -363,7 +353,7 @@ fn page(
                     ui.set_width(160.0);
                     egui::ScrollArea::vertical().id_salt("cw-classes").show(ui, |ui| {
                         ui.set_width(160.0);
-                        for c in &names {
+                        for c in names.iter() {
                             let k = c.row as u32;
                             if w.classes.iter().any(|(x, _)| *x == k) {
                                 continue;
@@ -397,7 +387,7 @@ fn page(
                         let n = w.classes.len();
                         for (i, (k, level)) in w.classes.iter_mut().enumerate() {
                             ui.label(name(*k));
-                            ui.add(egui::DragValue::new(level).range(1..=60));
+                            crate::widgets::spin_draft(ui, level, 1..=60, 1.0, |d| d);
                             if n > 1
                                 && ui.small_button("✖").on_hover_text("Remove this Class").clicked()
                             {
@@ -431,7 +421,15 @@ fn page(
             });
             // The appearances as pictures (a plain body of each), narrowed by
             // Find: the list of names alone is long, and many are alike.
-            let appearances = mg_rules::by_name(choices(game, "appearance", "STRING_REF", "LABEL"));
+            let appearances = mg_rules::by_name(
+                crate::widgets::table_choices(
+                    Some(game),
+                    "appearance",
+                    Some("STRING_REF"),
+                    Some("LABEL"),
+                )
+                .to_vec(),
+            );
             let chosen = appearances
                 .iter()
                 .find(|c| c.row == usize::from(w.appearance))
@@ -439,11 +437,14 @@ fn page(
             ui.horizontal(|ui| {
                 crate::widgets::field_label(ui, "Appearance");
                 ui.label(chosen);
-                ui.add(
-                    egui::TextEdit::singleline(&mut w.appearance_find)
-                        .hint_text("Find")
-                        .desired_width(160.0),
-                );
+                crate::widgets::SearchField::new(
+                    egui::Id::new("creature-wizard-appearance-find"),
+                    &mut w.appearance_find,
+                )
+                .hint("Find an appearance")
+                .width(160.0)
+                .find_over()
+                .show(ui);
             });
             let needle = mg_core::text::Needle::new(&w.appearance_find);
             let shown: Vec<&Choice> =
@@ -464,7 +465,8 @@ fn page(
                             for c in shown.iter().skip(line * per_row).take(per_row) {
                                 let mut look = mg_preview::CreatureLook::new(c.row as u16);
                                 look.gender = gender;
-                                let made = looks.ready.get(&look).copied();
+                                let made =
+                                    looks.ready.made(crate::model_view::Pictured::Look(look));
                                 let on = usize::from(w.appearance) == c.row;
                                 let (r, seen) =
                                     crate::widgets::picture_tile(ui, side, &c.text, on, made);
@@ -493,7 +495,8 @@ fn page(
             {
                 // The race's and gender's portraits as pictures, the chosen one
                 // large beside them (as Select Portrait shows them).
-                let list = portraits(game, w.race.unwrap_or(6), w.gender, w.all_portraits);
+                let list =
+                    portraits(game, loader.ws, w.race.unwrap_or(6), w.gender, w.all_portraits);
                 w.no_portraits = list.is_empty();
                 if list.is_empty() {
                     ui.weak(
@@ -712,5 +715,43 @@ fn make(app: &mut Moonglow, w: &CreatureWizard) {
             }
         }
         Err(e) => app.log.error(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_portraits_are_aurora_s_wizard_s() {
+        // Rows of a human (6) male (0), female (1), of no gender (4), a
+        // plot one, a placeable's, one of the module's own (its pictures in
+        // the module) and an outsider's (20), all of no gender.
+        let table = "2DA V2.0\n\n  BaseResRef Sex Race InanimateType Plot\n\
+                     0 hu_m_01_ 0 6 **** 0\n1 hu_f_01_ 1 6 **** 0\n2 kid_ 4 6 **** 0\n\
+                     3 hu_m_31_ 0 6 **** 1\n4 door01_ 0 6 1 ****\n5 w1po_ 0 6 **** 0\n\
+                     6 hu_m_02_ 0 6 **** 0\n7 imp_ 4 20 **** 0\n";
+        let tga = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 32, 8, 9, 9, 9, 255];
+        let mut mem = mg_resman::MemContainer::new();
+        mem.insert(ResKey::parse("portraits", ResType::TWODA).unwrap(), table.as_bytes().to_vec());
+        for base in ["hu_m_01_", "hu_f_01_", "kid_", "hu_m_31_", "door01_", "hu_m_02_", "imp_"] {
+            mem.insert(ResKey::parse(&format!("po_{base}m"), ResType::TGA).unwrap(), tga.clone());
+        }
+        let mut rm = mg_resman::ResMan::new();
+        rm.add(mg_resman::priority::KEY, "game", mg_resman::LayerClass::Key, mem);
+        let game = GameData::new(rm, mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let mut m = mg_module::Module::new();
+        m.set(ResKey::parse("po_w1po_m", ResType::TGA).unwrap(), tga.clone());
+        let ws = mg_edit::Workspace::new(m);
+        let names = |list: Vec<(u16, String)>| list.into_iter().map(|(_, b)| b).collect::<Vec<_>>();
+        // The gender's alone, in the table's order, the module's own too.
+        let male = names(portraits(&game, Some(&ws), 6, 0, false));
+        assert_eq!(male, ["hu_m_01_", "w1po_", "hu_m_02_"]);
+        assert_eq!(names(portraits(&game, None, 6, 0, false)), ["hu_m_01_", "hu_m_02_"]);
+        // A race with none of the gender: those of no gender.
+        assert_eq!(names(portraits(&game, Some(&ws), 20, 0, false)), ["imp_"]);
+        // All: every creature's.
+        let all = names(portraits(&game, Some(&ws), 6, 0, true));
+        assert_eq!(all, ["hu_m_01_", "hu_f_01_", "kid_", "hu_m_31_", "w1po_", "hu_m_02_", "imp_"]);
     }
 }

@@ -28,7 +28,7 @@ const BASIC_SIDE: f32 = 440.0;
 
 pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
     match page {
-        "Basic" => situated::beside_model(f, ui, BASIC_SIDE, false, |f, ui, _| basic(f, ui)),
+        "Basic" => situated::beside_model(f, ui, BASIC_SIDE, |f, ui, _| basic(f, ui)),
         "Lock" => situated::lock(f, ui),
         "Trap" => situated::trap(f, ui),
         "Area Transition" => situated::transition(f, ui),
@@ -79,23 +79,26 @@ fn door_types(f: &Form<'_>) -> Vec<Choice> {
 
 fn basic(f: &mut Form<'_>, ui: &mut Ui) {
     let types = door_types(f);
+    let types = f.appearance_rows(mg_rules::ObjectKind::Door, &types);
     let generic = f.choices("genericdoors", Some("Name"), Some("Label"));
     egui::Grid::new(("utd-basic", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         crate::widgets::field_label(ui, "Name");
         f.locstring(ui, "Name", "LocName");
         ui.end_row();
         crate::widgets::field_label(ui, "Tag");
-        f.text(ui, "Tag", "Tag", 32);
+        f.tag(ui, "Tag", "Tag");
         ui.end_row();
-        // (Each door's picture beside the row the pointer rests on.)
+        // (Each door's picture beside the row the pointer rests on; the
+        // generic door's, the generic appearance chosen below.)
         crate::widgets::field_label(ui, "Appearance Type");
-        let shown: super::Shown = super::door_type_picture;
-        f.pictured_choice(ui, ("Appearance", "Appearance"), &types, FieldType::Dword, shown);
+        let current = f.int(mg_rules::rows::generic_door_field(&f.root));
+        let mut shown =
+            |app: &mut _, ui: &mut Ui, row| super::door_type_picture(app, ui, row, current);
+        f.pictured_choice(ui, ("Appearance", "Appearance"), &types, FieldType::Dword, &mut shown);
         ui.end_row();
         // The generic door's model (EE: GenericType_New; the old byte field
         // follows it where the blueprint has one).
         crate::widgets::field_label(ui, "Generic Appearance");
-        let current = f.int(mg_rules::rows::generic_door_field(&f.root));
         f.mark_mixed(ui, mg_rules::rows::generic_door_field(&f.root));
         ui.add_enabled_ui(f.int("Appearance") == 0, |ui| {
             let app = &mut *f.app;

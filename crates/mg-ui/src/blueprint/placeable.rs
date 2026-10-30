@@ -35,7 +35,7 @@ const BASIC_SIDE: f32 = 440.0;
 
 pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
     match page {
-        "Basic" => situated::beside_model(f, ui, BASIC_SIDE, false, |f, ui, _| basic(f, ui)),
+        "Basic" => situated::beside_model(f, ui, BASIC_SIDE, |f, ui, _| basic(f, ui)),
         "Inventory" => contents(f, ui),
         "Lock" => situated::lock(f, ui),
         "Trap" => situated::trap(f, ui),
@@ -67,12 +67,13 @@ pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
 
 fn basic(f: &mut Form<'_>, ui: &mut Ui) {
     let appearances = f.choices("placeables", Some("StrRef"), Some("Label"));
+    let appearances = f.appearance_rows(mg_rules::ObjectKind::Placeable, &appearances);
     egui::Grid::new(("utp-basic", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         crate::widgets::field_label(ui, "Name");
         f.locstring(ui, "Name", "LocName");
         ui.end_row();
         crate::widgets::field_label(ui, "Tag");
-        f.text(ui, "Tag", "Tag", 32);
+        f.tag(ui, "Tag", "Tag");
         ui.end_row();
         crate::widgets::field_label(ui, "Appearance Type");
         ui.horizontal(|ui| {

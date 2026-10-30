@@ -9,7 +9,7 @@ use mg_core::{ResRef, ResType};
 use mg_edit::Workspace;
 use mg_gff::Gff;
 use mg_resman::ResKey;
-use mg_rules::GameData;
+use mg_rules::{GameData, ObjectKind};
 
 use crate::{Action, Moonglow, Tab};
 
@@ -20,33 +20,30 @@ const STATIC_TIP: &str = "Sets Static on the placeables that lose nothing by it:
     inventory or an animation switched on, or have variables, or the project's moonglow.toml \
     says so";
 
-pub(crate) const GROUPS: &[(&str, &[ResType])] = &[
-    ("Areas", &[ResType::ARE]),
-    ("Conversations", &[ResType::DLG]),
-    ("Scripts", &[ResType::NSS]),
-    ("NUI windows", &[ResType::JUI]),
-    ("Creatures", &[ResType::UTC]),
-    ("Doors", &[ResType::UTD]),
-    ("Encounters", &[ResType::UTE]),
-    ("Items", &[ResType::UTI]),
-    ("Placeables", &[ResType::UTP]),
-    ("Sounds", &[ResType::UTS]),
-    ("Stores", &[ResType::UTM]),
-    ("Triggers", &[ResType::UTT]),
-    ("Waypoints", &[ResType::UTW]),
-    ("Journal and factions", &[ResType::JRL, ResType::FAC]),
-];
+/// The tree's groups: the module's own kinds of resource, then each
+/// kind of blueprint (`mg_rules::ObjectKind`'s order and names), then the
+/// journal and factions.
+pub(crate) const GROUPS: &[(&str, &[ResType])] = &{
+    let mut groups: [(&str, &[ResType]); 14] = [("", &[]); 14];
+    groups[0] = ("Areas", &[ResType::ARE]);
+    groups[1] = ("Conversations", &[ResType::DLG]);
+    groups[2] = ("Scripts", &[ResType::NSS]);
+    groups[3] = ("NUI windows", &[ResType::JUI]);
+    let mut i = 0;
+    while i < ObjectKind::ALL.len() {
+        let kind = ObjectKind::ALL[i];
+        groups[4 + i] = (kind.label(), kind.restypes());
+        i += 1;
+    }
+    groups[13] = ("Journal and factions", &[ResType::JRL, ResType::FAC]);
+    groups
+};
 
-/// What lists of areas show and filter by, from an area's ARE.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct AreaInfo {
-    /// Its name in the editing language, else as the game shows it (its
-    /// talk-table string); empty when it has none.
-    pub name: String,
-    pub tileset: ResRef,
-    /// `Flags`: 1 interior, 2 underground, 4 natural.
-    pub flags: u32,
-}
+/// What lists of areas show and filter by, from an area's ARE: its name
+/// (in the editing language, else as the game shows it), tag, tileset,
+/// flags and whether the module's area list names it; as `mg areas` has
+/// it.
+pub(crate) use mg_module::areas::AreaInfo;
 
 /// The areas' names (and tilesets and flags), each read from its ARE once:
 /// again when the ARE is replaced, and from the open document while it is
@@ -56,12 +53,23 @@ pub(crate) struct AreaNames {
     /// By area: the stored ARE read (where its data is and its length:
     /// replaced data is elsewhere) and what it says.
     read: HashMap<ResRef, ((usize, usize), AreaInfo)>,
+    /// The areas the module's area list names, and what it was read from.
+    listed: Option<(ListRead, std::collections::HashSet<ResRef>)>,
     /// Blueprints' names, likewise.
     names: HashMap<ResKey, ((usize, usize), String)>,
     /// What each of the tree's groups lists, as made for a revision of the
     /// workspace and the two options that shape it (areas by name, ResRefs
     /// beside names): not made again every frame.
     groups: Option<Groups>,
+}
+
+/// What the module's area list was read from: the stored `module.ifo`
+/// (where its data is and its length: replaced data is elsewhere), or the
+/// open document at a revision of the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListRead {
+    Stored(usize, usize),
+    Open(u64),
 }
 
 /// A group's resources in the order the tree shows them, and the names of
@@ -76,24 +84,16 @@ type GroupList = (Vec<ResKey>, HashMap<ResKey, String>);
 struct Groups {
     shape: (u64, usize, bool, bool),
     lists: Arc<Vec<GroupList>>,
+    /// The areas the module's area list leaves out (the game doesn't load
+    /// them): marked in the tree.
+    unlisted: Arc<std::collections::HashSet<ResRef>>,
 }
 
 /// A blueprint's name in the editing language, else as the game shows it:
 /// a creature's first and last names, another's `LocalizedName` or
 /// `LocName`.
 pub(crate) fn blueprint_name(game: Option<&GameData>, root: &mg_gff::Struct) -> String {
-    let text = |label: &str| {
-        root.locstring(label).map_or(String::new(), |name| {
-            let edited = crate::text::edited_text(name);
-            // (Its text in another language is a last resort: below.)
-            if !edited.is_empty() {
-                return edited;
-            }
-            game.and_then(|g| g.locstring(name))
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| crate::text::shown_text(name))
-        })
-    };
+    let text = |label: &str| root.locstring(label).map_or(String::new(), |n| shown(game, n));
     let full = [text("FirstName"), text("LastName")];
     let full: Vec<&str> = full.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if !full.is_empty() {
@@ -101,6 +101,36 @@ pub(crate) fn blueprint_name(game: Option<&GameData>, root: &mg_gff::Struct) -> 
     }
     let name = text("LocalizedName");
     if name.trim().is_empty() { text("LocName") } else { name }
+}
+
+/// The command that adds `area` at the end of the module's area list
+/// (`Mod_Area_list`), as the Area Wizard lists a new one.
+fn list_area(ws: &Workspace, area: ResRef) -> Option<mg_edit::Command> {
+    use mg_schema::{StructExt, ifo};
+    let key = mg_module::Module::info_key();
+    let count = |info: &Gff| info.root.items(&ifo::MOD_AREA_LIST).len();
+    let at = match ws.loaded(&key) {
+        Some(info) => count(info),
+        None => count(&ws.module.info().ok()?),
+    };
+    let mut item = ifo::MOD_AREA_LIST.new_item();
+    item.write(&ifo::mod_area_list::AREA_NAME, area);
+    let label = ifo::MOD_AREA_LIST.label.to_string();
+    let edit = mg_edit::Edit::insert_item(key, mg_edit::GffPath::root(), label, at, item);
+    Some(mg_edit::Command::new("Add to the area list", vec![edit]))
+}
+
+/// What the mark of an area its module's list leaves out says.
+pub(crate) const UNLISTED_TIP: &str = "The module's area list (Mod_Area_list) doesn't name this \
+    area: the game doesn't load it, and nothing in the game can reach it. Add it back with the \
+    module's area list, or delete the area if it is left over.";
+
+/// A localized string's text as the tree and the area lists show it: in
+/// the editing language, else as the game shows it (its talk-table
+/// string), else in another language (`mg_rules::shown`, as `mg` shows
+/// names).
+pub(crate) fn shown(game: Option<&GameData>, s: &mg_core::LocString) -> String {
+    mg_rules::shown(game, s, crate::text::edit_language(), crate::text::game_table())
 }
 
 impl AreaNames {
@@ -111,36 +141,45 @@ impl AreaNames {
         area: ResRef,
     ) -> AreaInfo {
         let key = ResKey::new(area, ResType::ARE);
-        let read = |are: &Gff| {
-            let name = are.root.locstring("Name").map_or(String::new(), |name| {
-                let edited = crate::text::edited_text(name);
-                // (Its text in another language is a last resort: below.)
-                if !edited.is_empty() {
-                    return edited;
-                }
-                game.and_then(|g| g.locstring(name))
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or_else(|| crate::text::shown_text(name))
-            });
-            AreaInfo {
-                name,
-                tileset: are.root.resref("Tileset").unwrap_or(ResRef::EMPTY),
-                flags: are.root.integer("Flags").unwrap_or(0) as u32,
-            }
-        };
+        let listed = self.listed(ws, area);
+        let read =
+            |are: &Gff| mg_module::areas::info_of(area, &are.root, &|n| shown(game, n), listed);
         if let Some(are) = ws.loaded(&key) {
             return read(are);
         }
-        let Some(data) = ws.module.get(&key) else { return AreaInfo::default() };
+        let Some(data) = ws.module.get(&key) else {
+            return AreaInfo { resref: area, listed, ..Default::default() };
+        };
         let stamp = (data.as_ptr() as usize, data.len());
         if let Some((s, info)) = self.read.get(&area)
             && *s == stamp
+            && info.listed == listed
         {
             return info.clone();
         }
         let info = Gff::read(data).map(|g| read(&g)).unwrap_or_default();
+        let info = AreaInfo { resref: area, listed, ..info };
         self.read.insert(area, (stamp, info.clone()));
         info
+    }
+
+    /// Whether the module's area list names `area` (read again once the
+    /// `module.ifo` is another; true for a module without one).
+    fn listed(&mut self, ws: &Workspace, area: ResRef) -> bool {
+        let key = mg_module::Module::info_key();
+        let read = match (ws.loaded(&key), ws.module.get(&key)) {
+            (Some(_), _) => ListRead::Open(ws.revision()),
+            (None, Some(d)) => ListRead::Stored(d.as_ptr() as usize, d.len()),
+            (None, None) => return true,
+        };
+        if self.listed.as_ref().is_none_or(|(r, _)| *r != read) {
+            let names = match ws.loaded(&key) {
+                Some(info) => mg_module::areas_of(&info.root),
+                None => ws.module.areas().unwrap_or_default(),
+            };
+            self.listed = Some((read, names.into_iter().collect()));
+        }
+        self.listed.as_ref().is_some_and(|(_, l)| l.contains(&area))
     }
 
     /// A blueprint's name (empty when it has none), read once as the
@@ -343,6 +382,10 @@ fn contents_ui(
     let mut went = false;
     let matches = |row: &ObjectRow| filter.finds_folded(&row.sought);
     let filtered = !filter.is_empty() && contents.iter().any(|c| c.rows.iter().any(&matches));
+    // (Collapse All closed its kinds too, as they are next shown.)
+    let closing = ui.data_mut(|d| {
+        d.remove_temp::<bool>(egui::Id::new(("tree-area-kinds-closed", area))).is_some()
+    });
     ui.indent(("area-contents", area), |ui| {
         for KindContents { kind, rows, order } in contents {
             // (By their places in the area's list, in the order listed.)
@@ -387,6 +430,8 @@ fn contents_ui(
                 header = header.open(Some(true));
             } else if let Some((_, open)) = keys.fold.filter(|f| f.0 == TreeAt::Kind(area, *kind)) {
                 header = header.open(Some(open));
+            } else if closing {
+                header = header.open(Some(false));
             }
             let (clicked, hovered) = (&mut keys.clicked, &mut keys.hovered);
             let (picked, together) = (&mut keys.picked, &mut keys.together);
@@ -626,12 +671,31 @@ pub(crate) fn module_tree(app: &mut Moonglow, ui: &mut Ui) {
     let typed = crate::widgets::text_changed(ui, filter_id, filter.as_str()) && !filter.is_empty();
     let mut fold = None;
     ui.horizontal(|ui| {
-        fold = crate::palette_view::fold_icons(ui, "group");
+        fold = crate::palette_view::fold_icons(ui, "group", &app.keymap);
         let resources = app.ws.as_ref().map_or(0, |ws| ws.module.len());
         ui.weak(format!("{resources} resource{}", if resources == 1 { "" } else { "s" }))
             .on_hover_text("Resources in the module");
     });
     ui.separator();
+    // (Their keys too, while the keys are the tree's.)
+    let keyed = crate::palette_view::keys_are(ui.ctx(), crate::palette_view::Keys::Tree)
+        && !ui.ctx().egui_wants_keyboard_input();
+    if keyed {
+        fold = fold.or_else(|| crate::palette_view::fold_keys(ui, &app.keymap));
+    }
+    // Collapse All closes every area opened out to its objects too, and
+    // the kinds under it (Expand All leaves them: an area's objects can be
+    // hundreds of rows).
+    if fold == Some(false)
+        && let Some(ws) = app.ws.as_ref()
+    {
+        for area in ws.module.keys_of(ResType::ARE).map(|k| k.resref) {
+            ui.data_mut(|d| {
+                d.insert_temp(egui::Id::new(("tree-area-open", area)), false);
+                d.insert_temp(egui::Id::new(("tree-area-kinds-closed", area)), true);
+            });
+        }
+    }
     let fold = fold.or(typed.then_some(true));
     let mut rows = egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
         // A name too long for the pane goes on past it, and the tree
@@ -781,7 +845,7 @@ type Outs = HashMap<ResRef, Vec<(mg_area::ObjectKind, bool, Vec<usize>)>>;
 
 /// The rows the keys go through, in order: each with how deep it is and,
 /// if it opens, whether it is open.
-fn key_rows(shown: &Shown, outs: &Outs) -> Vec<(TreeAt, usize, Option<bool>)> {
+fn key_rows(shown: &Shown<'_>, outs: &Outs) -> Vec<(TreeAt, usize, Option<bool>)> {
     let mut rows = Vec::new();
     for (name, open, keys) in shown {
         rows.push((TreeAt::Group(name), 0, Some(*open)));
@@ -818,8 +882,10 @@ pub(crate) fn first_row() -> TreeAt {
     TreeAt::Group(GROUPS[0].0)
 }
 
-/// The rows shown: each group, whether it is open, and its resources.
-type Shown = Vec<(&'static str, bool, Vec<ResKey>)>;
+/// The rows shown: each group, whether it is open, and its resources (the
+/// group's list as made, borrowed, unless the Filter keeps some: not
+/// copied every frame).
+type Shown<'a> = Vec<(&'static str, bool, std::borrow::Cow<'a, [ResKey]>)>;
 
 /// The row the letters typed in quick succession (`typed`) go to, as in
 /// the conversation tree ([`crate::dialog_view::type_ahead`]): one
@@ -832,7 +898,7 @@ type Shown = Vec<(&'static str, bool, Vec<ResKey>)>;
 /// resource's, an area's or a blueprint's name where they are listed by
 /// name, else its ResRef; an object's name, or a waypoint's tag).
 fn seek(
-    shown: &Shown,
+    shown: &Shown<'_>,
     outs: &Outs,
     at: Option<TreeAt>,
     typed: &str,
@@ -875,7 +941,7 @@ fn row_text(
 /// What a placed object's row says that has no name (nor tag).
 const NO_NAME: &str = "(no name)";
 
-fn step(shown: &Shown, outs: &Outs, at: Option<TreeAt>, key: egui::Key) -> Step {
+fn step(shown: &Shown<'_>, outs: &Outs, at: Option<TreeAt>, key: egui::Key) -> Step {
     use egui::Key;
     let rows = key_rows(shown, outs);
     let Some(first) = rows.first().map(|r| r.0) else { return Step::None };
@@ -914,7 +980,7 @@ fn step(shown: &Shown, outs: &Outs, at: Option<TreeAt>, key: egui::Key) -> Step 
 /// is deleted: at it, on the row after it among its kind's (else the one
 /// before, else its kind's row); at another of its kind's, at that one
 /// still (the objects after it move up their area's list).
-fn past_deleted(shown: &Shown, outs: &Outs, cursor: TreeAt, deleted: TreeAt) -> TreeAt {
+fn past_deleted(shown: &Shown<'_>, outs: &Outs, cursor: TreeAt, deleted: TreeAt) -> TreeAt {
     let TreeAt::Object(area, kind, index) = deleted else { return cursor };
     let moved_up = |at: TreeAt| match at {
         TreeAt::Object(a, k, i) if a == area && k == kind && i > index => {
@@ -935,8 +1001,8 @@ fn past_deleted(shown: &Shown, outs: &Outs, cursor: TreeAt, deleted: TreeAt) -> 
 
 fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool>) {
     follow_selection(app);
-    // The rows shown, for the keys; a group the keys opened or closed.
-    let mut shown: Shown = Vec::new();
+    // A group the keys opened or closed (the rows shown, for the keys,
+    // once the groups' lists are in hand).
     let mut outs = Outs::new();
     let folded = app.tree_fold.take();
     let cursor = app.tree_cursor;
@@ -1011,9 +1077,15 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
             }
             lists.push((keys, names));
         }
-        app.area_names.groups = Some(Groups { shape, lists: Arc::new(lists) });
+        let unlisted = (ws.module.keys_of(ResType::ARE).map(|k| k.resref))
+            .filter(|a| !app.area_names.listed(ws, *a))
+            .collect();
+        let unlisted = Arc::new(unlisted);
+        app.area_names.groups = Some(Groups { shape, lists: Arc::new(lists), unlisted });
     }
-    let lists = app.area_names.groups.as_ref().map(|g| g.lists.clone()).expect("made above");
+    let groups = app.area_names.groups.as_ref().expect("made above");
+    let (lists, unlisted) = (groups.lists.clone(), groups.unlisted.clone());
+    let mut shown: Shown<'_> = Vec::new();
     // The resource to bring into view is in a group still opening: gone
     // to when it is open (its rows are where they will be then).
     let mut opening = false;
@@ -1064,13 +1136,14 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
             }
             found
         });
-        let keys: &[ResKey] = found.as_deref().unwrap_or(all);
+        let listed_keys: std::borrow::Cow<'_, [ResKey]> =
+            found.map_or(std::borrow::Cow::Borrowed(all.as_slice()), std::borrow::Cow::Owned);
+        let keys: &[ResKey] = &listed_keys;
         // What makes a new resource of the group (its wizard, or the New
         // window): on the group's and its resources' right-click menus.
         let new = new_command(types);
         let new_label = new.map(|id| new_label(&id.name()));
         let at_group = cursor == Some(TreeAt::Group(name));
-        let listed_keys = keys.to_vec();
         let header = egui::CollapsingHeader::new(format!("{name} ({})", keys.len()))
             .id_salt(name)
             .default_open(*name == "Areas")
@@ -1162,6 +1235,11 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
                         if is_area {
                             crate::claims::tree_mark(crate::claims::of(&app.ws), ui, k.resref);
                         }
+                        // (An ARE the module's area list leaves out: the
+                        // game doesn't load it.)
+                        if is_area && unlisted.contains(&k.resref) {
+                            ui.weak("(not in the area list)").on_hover_text(UNLISTED_TIP);
+                        }
                         r
                     });
                     // (A row out of sight is given this height.)
@@ -1251,8 +1329,9 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
                         open = Some(k);
                     }
                     // Delete on the row under the pointer asks, as its
-                    // menu's Delete… does (not while text is typed).
-                    // (With the keys in the tree, the key is read below.)
+                    // menu's Delete… does (not while text is typed): of
+                    // those chosen, when it is one of them. (With the keys
+                    // in the tree, the key is read below.)
                     if r.hovered() {
                         pointed = Some(k);
                     }
@@ -1261,7 +1340,7 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
                         && !ui.ctx().egui_wants_keyboard_input()
                         && ui.input(|i| i.key_pressed(egui::Key::Delete))
                     {
-                        app.actions.push(Action::DeleteDialog(k));
+                        app.actions.push(delete_asked(&app.tree_selected, k));
                     }
                     r.context_menu(|ui| {
                         if chosen {
@@ -1287,6 +1366,19 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
                                     .clicked()
                             {
                                 app.actions.push(Action::OpenTab(Tab::Model(k)));
+                            }
+                            ui.separator();
+                        }
+                        if k.restype == ResType::ARE && unlisted.contains(&k.resref) {
+                            if ui
+                                .button("Add to the Module's Area List")
+                                .on_hover_text(
+                                    "The game loads only the areas the module's list names",
+                                )
+                                .clicked()
+                                && let Some(add) = app.ws.as_ref().and_then(|w| list_area(w, k.resref))
+                            {
+                                app.actions.push(Action::Apply(add));
                             }
                             ui.separator();
                         }
@@ -1380,6 +1472,20 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
                                 dependencies: false,
                                 scratch: false,
                             });
+                        }
+                        if k.restype == ResType::ARE
+                            && ui
+                                .button("Export Model Files…")
+                                .on_hover_text(
+                                    "Write the files the game draws the area with into a \
+                                     folder: its tileset, its tiles' models, walkmeshes and \
+                                     textures, its skybox, and the models of what is placed in \
+                                     it, from the haks and wherever else they are (the game's \
+                                     own are left out, unless all of it is the game's)",
+                                )
+                                .clicked()
+                        {
+                            app.actions.push(Action::ExportAreaFiles(k.resref));
                         }
                         let tip = crate::transfer::scratch_tip(
                             app.settings.scratch_dir.as_deref(),
@@ -1660,7 +1766,7 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
                     app.actions.push(Action::RenameDialog(k));
                 }
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Delete)) {
-                    app.actions.push(Action::DeleteDialog(k));
+                    app.actions.push(delete_asked(&app.tree_selected, k));
                 }
             }
             Some(at @ TreeAt::Object(area, kind, index))
@@ -1862,6 +1968,15 @@ fn tree_rows(app: &mut Moonglow, ui: &mut Ui, filter: &Needle, fold: Option<bool
 /// Export as Files…, Copy to Scratch Folder; for areas, Make Placeables
 /// Static and Dynamic; the plugins' commands for them all (the one chosen
 /// returned).
+/// The Delete key on a resource's row: Delete… of those chosen, when it is
+/// one of several chosen, else of it alone.
+fn delete_asked(selected: &std::collections::BTreeSet<ResKey>, k: ResKey) -> Action {
+    match selected.len() > 1 && selected.contains(&k) {
+        true => Action::DeleteChosenDialog(selected.iter().copied().collect()),
+        false => Action::DeleteDialog(k),
+    }
+}
+
 fn several_menu(
     ui: &mut Ui,
     keys: &[ResKey],
@@ -1916,6 +2031,11 @@ fn several_menu(
         actions.push(Action::ExportFiles { keys, dependencies: false, scratch: true });
         ui.close();
     }
+    let delete = "Delete them from the module, as one step (asked first, with what names them)";
+    if ui.button("Delete…").on_hover_text(delete).clicked() {
+        actions.push(Action::DeleteChosenDialog(keys.to_vec()));
+        ui.close();
+    }
     // The plugins' commands for them, where they are of one kind (areas,
     // or blueprints of one type).
     let target = match first {
@@ -1934,7 +2054,7 @@ fn named_label(name: &str, resref: ResRef, resrefs: bool) -> String {
 
 /// The menu entry for a command that makes something new, from its name:
 /// "Area Wizard" is "New Area…", "New Script" is "New Script…".
-fn new_label(command: &str) -> String {
+pub(crate) fn new_label(command: &str) -> String {
     let what = command.trim_end_matches(" Wizard");
     if what.starts_with("New ") { format!("{what}…") } else { format!("New {what}…") }
 }
@@ -1943,22 +2063,12 @@ fn new_label(command: &str) -> String {
 /// Wizards menu's for it.
 fn new_command(types: &[ResType]) -> Option<crate::commands::Id> {
     use crate::commands::Id;
-    use mg_module::palette::BlueprintKind;
     Some(match *types.first()? {
         ResType::ARE => Id::AreaWizard,
         ResType::DLG => Id::NewConversation,
         ResType::NSS => Id::NewScript,
         ResType::JUI => Id::NewNui,
-        ResType::UTC => Id::CreatureWizard,
-        ResType::UTD => Id::Wizard(BlueprintKind::Door),
-        ResType::UTE => Id::Wizard(BlueprintKind::Encounter),
-        ResType::UTI => Id::Wizard(BlueprintKind::Item),
-        ResType::UTM => Id::Wizard(BlueprintKind::Store),
-        ResType::UTP => Id::Wizard(BlueprintKind::Placeable),
-        ResType::UTS => Id::Wizard(BlueprintKind::Sound),
-        ResType::UTT => Id::Wizard(BlueprintKind::Trigger),
-        ResType::UTW => Id::Wizard(BlueprintKind::Waypoint),
-        _ => return None,
+        t => Id::new_blueprint(ObjectKind::from_restype(t)?),
     })
 }
 
@@ -1972,9 +2082,9 @@ mod tests {
         let key = |name: &str, t| ResKey::parse(name, t).unwrap();
         let (a, b, c) = (key("a", ResType::ARE), key("b", ResType::ARE), key("c", ResType::NSS));
         let shown: Shown = vec![
-            ("Areas", true, vec![a, b]),
-            ("Conversations", false, vec![]),
-            ("Scripts", false, vec![c]),
+            ("Areas", true, vec![a, b].into()),
+            ("Conversations", false, vec![].into()),
+            ("Scripts", false, vec![c].into()),
         ];
         let (areas, scripts) = (TreeAt::Group("Areas"), TreeAt::Group("Scripts"));
         let at = |r| Some(TreeAt::Resource(r));
@@ -2039,7 +2149,7 @@ mod tests {
         use mg_area::ObjectKind::{Creature, Door};
         let key = |name: &str, t| ResKey::parse(name, t).unwrap();
         let (a, b) = (key("a", ResType::ARE), key("b", ResType::ARE));
-        let shown: Shown = vec![("Areas", true, vec![a, b])];
+        let shown: Shown = vec![("Areas", true, vec![a, b].into())];
         let (area, next) = (TreeAt::Resource(a), TreeAt::Resource(b));
         let (creatures, doors) = (TreeAt::Kind(a.resref, Creature), TreeAt::Kind(a.resref, Door));
         let object = |i| TreeAt::Object(a.resref, Creature, i);
@@ -2087,11 +2197,12 @@ mod tests {
     /// keys: area `a`'s creatures Goblin (0) and Bandit (1), listed Bandit
     /// first, its door Gate in a kind closed and its waypoint by its tag
     /// WP_GATE; area `b` after it.
-    fn opened_out() -> (Shown, Outs, HashMap<ResRef, (Read, AreaContents)>, ResKey, ResKey) {
+    fn opened_out() -> (Shown<'static>, Outs, HashMap<ResRef, (Read, AreaContents)>, ResKey, ResKey)
+    {
         use mg_area::ObjectKind::{Creature, Door, Waypoint};
         let key = |name: &str| ResKey::parse(name, ResType::ARE).unwrap();
         let (a, b) = (key("a"), key("b"));
-        let shown: Shown = vec![("Areas", true, vec![a, b])];
+        let shown: Shown = vec![("Areas", true, vec![a, b].into())];
         let mut outs = Outs::new();
         outs.insert(
             a.resref,
@@ -2179,6 +2290,14 @@ mod tests {
         for (_, types) in GROUPS.iter().filter(|(n, _)| *n != "Journal and factions") {
             assert!(new_command(types).is_some(), "{types:?}");
         }
+        // Each kind of blueprint is a group by the name the toolset calls
+        // it by, and its New… is its wizard's, as the palettes' is.
+        for k in ObjectKind::ALL {
+            assert!(GROUPS.contains(&(k.label(), &[k.restype()])), "{k:?}");
+            assert_eq!(new_command(&[k.restype()]), Some(Id::new_blueprint(k)));
+        }
+        assert_eq!(GROUPS.iter().filter(|(n, _)| n.is_empty()).count(), 0);
+        assert_eq!(label(&[ResType::UTW]).as_deref(), Some("New Waypoint…"));
         assert_eq!(
             new_command(&[ResType::UTI]),
             Some(Id::Wizard(mg_module::palette::BlueprintKind::Item))

@@ -3,7 +3,7 @@ type: Manual Page
 title: Journal and factions
 description: The Journal Editor and the Faction Editor.
 tags: [manual, journal, factions]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-22T00:47:20Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-29T14:55:53Z }
 ---
 
 # Journal and factions
@@ -24,6 +24,10 @@ adds an entry, elsewhere a quest. Select a node to edit it:
   priority, the experience it gives, and a comment.
 - An entry: its ID (what scripts set), its text, and **Finish Category**
   (the entry ends the quest).
+
+The pane under the tree, where these are edited, is as tall as you drag
+its top edge to, up to seven tenths of the editor, whatever the node
+chosen has to show.
 
 Conversations set journal entries from a line's **Other Actions** tab;
 scripts with `AddJournalQuestEntry`.
@@ -46,8 +50,10 @@ member, all the others turn too.
 Creatures, doors, placeables, triggers and encounters belong to a faction
 (their Advanced page). The PC faction isn't offered there: it is the
 players' alone, and the game puts a creature of it in Hostile as it
-loads (a placeable, door or trigger keeps it, and is regarded as players
-are). An object whose file has it keeps it, shown as "PC (not for
+loads, where it fights the players (a placeable, door or trigger keeps
+it, and is regarded as players are; it regards a player as hostile, a
+player it as neutral), and an encounter of it spawns nothing when a
+player enters it. An object whose file has it keeps it, shown as "PC (not for
 objects)", until another is picked, and Verify Module warns of it
 (except on a trigger: Aurora writes faction 0 for one whose blueprint
 has none, so ordinary triggers have it).

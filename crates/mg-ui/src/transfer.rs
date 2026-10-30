@@ -2,7 +2,7 @@
 //! with what they depend on.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::Ui;
@@ -24,8 +24,6 @@ pub struct ExportDraft {
     /// Move creatures in the module's own factions to the standard ones.
     pub reset_factions: bool,
     pub comments: String,
-    /// Add to the archive chosen, if there is one, instead of replacing it.
-    pub add: bool,
     /// The module's keys in the window's order, at a workspace revision,
     /// and those the kind and filter then listed: made again only when
     /// one of them changes (a module's 25,000 sorted and each named for
@@ -36,6 +34,28 @@ pub struct ExportDraft {
 /// [`ExportDraft::listed`]: the revision, kind and filter, the keys in
 /// order, and those listed.
 pub(crate) type Listed = (u64, Option<ResType>, String, Arc<Vec<ResKey>>, Arc<Vec<ResKey>>);
+
+/// An Export to an archive that is there, waiting on the question
+/// Aurora's Export asks of it: append to it (Yes), overwrite it (No), or
+/// do nothing (Cancel).
+#[derive(Debug, Clone)]
+pub struct ExportAsk {
+    pub draft: ExportDraft,
+    pub resources: Vec<ResKey>,
+    pub path: PathBuf,
+}
+
+/// The answer to [`ExportAsk`]'s question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportAnswer {
+    /// Yes: the resources are added to the archive (those of the same
+    /// names replaced; the rest and its description stay).
+    Append,
+    /// No: the archive is replaced.
+    Overwrite,
+    /// Cancel: nothing is written.
+    Cancel,
+}
 
 /// An archive being imported and what to overwrite.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,47 +88,82 @@ pub(crate) fn scratch_tip(scratch: Option<&std::path::Path>, what: &str) -> Stri
     }
 }
 
-/// Names for the log: all of a few, else the first and how many more.
+/// Names for the log: all of a few, else the first and how many more
+/// ([`crate::text::some_of`], in eight places).
 pub(crate) fn listed(names: &[String]) -> String {
-    const SHOWN: usize = 8;
-    if names.len() <= SHOWN {
-        names.join(", ")
-    } else {
-        format!("{} and {} more", names[..SHOWN].join(", "), names.len() - SHOWN)
-    }
+    crate::text::some_of(names, 8)
 }
 
-/// The rule for a script that doesn't compile, copied into the scratch
-/// folder (a script editor's To Scratch, the module tree's Copy to Scratch
-/// Folder): it goes as its source alone, and the compiled script (and its
-/// debug file) of each of `scripts` that an earlier copy left in `dir` is
-/// removed, for the game would still run it (El Grillo's request). What
-/// was removed, by file name, and what could not be.
+/// The rule for a script copied into the scratch folder (a script
+/// editor's To Scratch, the module tree's Copy to Scratch Folder): the
+/// compiled scripts and debug files of `scripts` in `dir` that this copy
+/// did not write (`written`) are removed, under any spelling (a
+/// `HELLO.NCS` another program wrote on a file system that tells cases
+/// apart). So one that doesn't compile goes as its source alone, without
+/// the compiled script an earlier copy left, which the game would still
+/// run (El Grillo's request); and one compiled without debug information
+/// goes without the debug file of an older compile. What was removed, by
+/// file name, and what could not be.
 pub(crate) fn remove_stale_compiled(
     dir: &std::path::Path,
     scripts: &[mg_core::ResRef],
+    written: &[std::path::PathBuf],
 ) -> (Vec<String>, Vec<String>) {
     let (mut removed, mut failed) = (Vec::new(), Vec::new());
-    for resref in scripts {
-        for kind in [ResType::NCS, ResType::NDB] {
-            let name = ResKey::new(*resref, kind).to_string();
-            let path = dir.join(&name);
-            if !path.is_file() {
-                continue;
-            }
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed.push(name),
-                Err(e) => failed.push(format!("{}: {e}", path.display())),
-            }
+    let names: Vec<String> = (scripts.iter())
+        .flat_map(|r| [ResType::NCS, ResType::NDB].map(|t| ResKey::new(*r, t).to_string()))
+        .map(|n| n.to_ascii_lowercase())
+        .collect();
+    let Ok(entries) = std::fs::read_dir(dir) else { return (removed, failed) };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+        if !names.contains(&name.to_ascii_lowercase())
+            || !entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            continue;
+        }
+        let path = entry.path();
+        if written.iter().any(|w| same_file(w, &path)) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(name),
+            Err(e) => failed.push(format!("{}: {e}", path.display())),
         }
     }
+    removed.sort();
     (removed, failed)
 }
 
-/// What the log says of the compiled scripts [`remove_stale_compiled`]
-/// removed from the scratch folder.
+/// Whether two paths of one folder are one file: by the file system's own
+/// identity where there is one to ask (Linux and macOS, whose file systems
+/// may or may not tell cases apart), else by the name, case aside (Windows
+/// file systems don't tell cases apart).
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+        name(a) == name(b)
+    }
+}
+
+/// What the log says of the compiled scripts and debug files
+/// [`remove_stale_compiled`] removed from the scratch folder.
 pub(crate) fn removed_said(removed: &[String]) -> String {
-    format!("removed {}, left by an earlier copy (the game would still run it)", listed(removed))
+    let compiled = removed.iter().any(|n| !n.to_ascii_lowercase().ends_with(".ndb"));
+    let why = match compiled {
+        true => "the game would still run it",
+        false => "made by an older compile",
+    };
+    format!("removed {}, left by an earlier copy ({why})", listed(removed))
 }
 
 impl Moonglow {
@@ -310,9 +365,11 @@ impl Moonglow {
                     ));
                 }
                 if scratch {
-                    let alone: Vec<mg_core::ResRef> =
-                        (broken.iter().chain(&uncompiled)).filter_map(|n| n.parse().ok()).collect();
-                    let (removed, failed) = remove_stale_compiled(&dir, &alone);
+                    let copied: Vec<mg_core::ResRef> = (resources.iter())
+                        .filter(|k| k.restype == ResType::NSS)
+                        .map(|k| k.resref)
+                        .collect();
+                    let (removed, failed) = remove_stale_compiled(&dir, &copied, &written);
                     if !removed.is_empty() {
                         self.log.info(format!("Scratch folder: {}", removed_said(&removed)));
                     }
@@ -446,22 +503,48 @@ impl Moonglow {
         let Some(path) = self.dialogs.save_file(FileKind::Erf, suggested.as_deref()) else {
             return;
         };
+        // An archive that is there: asked about first, as Aurora asks.
+        if path.exists() {
+            self.export_ask = Some(ExportAsk { draft, resources, path });
+            return;
+        }
+        self.write_export(&draft, &resources, &path, false);
+    }
+
+    /// [`ExportAsk`] answered.
+    pub fn answer_export(&mut self, answer: ExportAnswer) {
+        let Some(ask) = self.export_ask.take() else { return };
+        if answer != ExportAnswer::Cancel {
+            let append = answer == ExportAnswer::Append;
+            self.write_export(&ask.draft, &ask.resources, &ask.path, append);
+        }
+    }
+
+    /// Writes an Export's resources to `path`: added to the archive there
+    /// (`append`), or a new one in its place.
+    fn write_export(
+        &mut self,
+        draft: &ExportDraft,
+        resources: &[ResKey],
+        path: &Path,
+        append: bool,
+    ) {
         let Some(ws) = &self.ws else { return };
-        // Add to Existing File: what the archive holds stays, but for
-        // resources of the same names.
-        let existing = if draft.add { std::fs::read(&path).ok() } else { None };
+        // Appended: what the archive holds stays, but for resources of the
+        // same names.
+        let existing = if append { std::fs::read(path).ok() } else { None };
         // What it was made from follows the description (Import reads it).
         let stamp = mg_module::stamp::Stamp::of(&ws.module);
         let comments = mg_module::stamp::describe(&draft.comments, &stamp);
         let (comments, reset) = (comments.as_str(), draft.reset_factions);
         let result = match &existing {
             Some(old) => {
-                mg_module::transfer::export_into_erf(old, &ws.module, &resources, comments, reset)
+                mg_module::transfer::export_into_erf(old, &ws.module, resources, comments, reset)
             }
-            None => mg_module::transfer::export_erf(&ws.module, &resources, comments, reset),
+            None => mg_module::transfer::export_erf(&ws.module, resources, comments, reset),
         }
         .map_err(|e| e.to_string())
-        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()));
+        .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| e.to_string()));
         match result {
             Ok(()) => self.log.info(format!(
                 "{} {} resources to {}, stamped with {}",
@@ -475,8 +558,43 @@ impl Moonglow {
     }
 }
 
+/// The question an Export to an archive that is there asks, in Aurora's
+/// words (its Export, captured 2026-10-29): Yes appends, No overwrites,
+/// Cancel does nothing.
+fn ask_ui(app: &mut Moonglow, ctx: &egui::Context) {
+    let Some(ask) = &app.export_ask else { return };
+    let mut answer = None;
+    crate::widgets::modal(ctx, "Export").id(egui::Id::new("export-ask")).show(ctx, |ui| {
+        ui.set_max_width(460.0);
+        ui.label(format!(
+            "The file '{}' already exists. Do you wish to append to it?",
+            ask.path.display()
+        ));
+        ui.add_space(6.0);
+        ui.label("Click YES to append to the file.");
+        ui.label("Click NO to overwrite the file.");
+        ui.label("Click CANCEL to do nothing.");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Yes").clicked() {
+                answer = Some(ExportAnswer::Append);
+            }
+            if ui.button("No").clicked() {
+                answer = Some(ExportAnswer::Overwrite);
+            }
+            if crate::widgets::cancel(ui) {
+                answer = Some(ExportAnswer::Cancel);
+            }
+        });
+    });
+    if let Some(a) = answer {
+        app.answer_export(a);
+    }
+}
+
 pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
+    ask_ui(app, &ctx);
     if let (Some(draft), Some(ws)) = (&mut app.export, &app.ws) {
         let mut close = false;
         // Kind by kind, those of the module's tree first and in its order.
@@ -508,7 +626,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         if draft.kind.is_some_and(|t| kinds.iter().all(|(k, _)| *k != t)) {
             draft.kind = None;
         }
-        crate::widgets::window("Export Resources").show(&ctx, |ui| {
+        crate::widgets::modal(&ctx, "Export Resources").show(&ctx, |ui| {
             ui.horizontal(|ui| {
                 crate::widgets::field_label(ui, "Kind");
                 let shown = match draft.kind {
@@ -620,11 +738,6 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
             });
             ui.checkbox(&mut draft.dependencies, "Include the resources they use");
             ui.checkbox(&mut draft.reset_factions, "Put creatures in the standard factions");
-            ui.checkbox(&mut draft.add, "Add to the file if it exists").on_hover_text(
-                "Choosing an archive that is already there adds these resources to it \
-                 (replacing those of the same names) instead of replacing the whole file. \
-                 The file dialog may still ask about overwriting it.",
-            );
             ui.horizontal(|ui| {
                 crate::widgets::field_label(ui, "Description");
                 ui.text_edit_singleline(&mut draft.comments).on_hover_text(
@@ -668,7 +781,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         let mut close = false;
         let name =
             draft.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        crate::widgets::window("Import Resources").show(&ctx, |ui| {
+        crate::widgets::modal(&ctx, "Import Resources").show(&ctx, |ui| {
             ui.label(format!("{name}: {} resources", draft.resources.len()));
             match &draft.stamp {
                 Some(s) => ui.label(format!("Made from {s}")),

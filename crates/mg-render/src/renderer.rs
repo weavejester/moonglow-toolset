@@ -15,7 +15,7 @@ use crate::assets::Assets;
 use crate::batch::{Batcher, Bounds};
 use crate::model::{SkinVertex, Vertex};
 use crate::particles::{ParticleBlend, ParticleVertex};
-use crate::reach::{Frustum, LightGrid};
+use crate::reach::{Frustum, LightGrid, ReachCache};
 use crate::scene::{Camera, Instance, Scene};
 use crate::texture::GpuTexture;
 
@@ -228,14 +228,20 @@ struct Slots {
     no_env: bool,
     /// The MTR's `transparency`: the mesh is blended.
     transparency: bool,
+    /// The MTR's `sample_framebuffer` (1 or 2): a solid mesh drawn after
+    /// the framebuffer's copy is made, as the engine draws it (after the
+    /// shadows), whether or not its programs read the copy (The Domains
+    /// of Dread's two flow materials' don't).
+    late: bool,
     /// The MTR's `parameter`s, which the game's shaders take by name.
     params: Vec<(String, mg_image::mtr::Param)>,
     /// The program pair the MTR names (`customshaderVS` and `FS`, both):
     /// drawn with it where the game's shaders are on
     /// ([`Renderer::game_shaders`]).
     custom: Option<(String, String)>,
-    /// The MTR names a geometry program (`customshaderGS`), which wgpu has
-    /// no stage for: drawn with Moonglow's own shader.
+    /// The MTR names a geometry program (`customshaderGS`) beside its pair,
+    /// which wgpu has no stage for: drawn with Moonglow's own shader. (One
+    /// named alone is ignored, as the client ignores it.)
     geometry: Option<String>,
     /// The MTR's `twosided`: its faces are drawn from behind too. Nothing
     /// else shows a face's back in the game: not a cut-out texture
@@ -376,16 +382,6 @@ struct Draw<'a> {
     receives: bool,
 }
 
-/// What the renderer draws: the lit scene, or a value for comparing with
-/// the game's (through a debug shader in the game).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DebugView {
-    #[default]
-    Lit,
-    /// Each lit mesh's material diffuse colour, linear, as uploaded.
-    MaterialDiffuse,
-}
-
 /// A mesh's pipeline of the game's programs, and a see-through one's
 /// fringe's.
 type GamePipelines = (Arc<crate::game::GamePipeline>, Option<Arc<crate::game::GamePipeline>>);
@@ -408,7 +404,6 @@ type GamePipelinesKey = (usize, crate::game::Traits, bool, bool, bool, crate::ga
 
 #[derive(Debug)]
 pub struct Renderer {
-    pub debug: DebugView,
     /// Where `Some`, each frame lists there the program pairs the game's
     /// shaders chose for the meshes they draw (for comparing with the
     /// client's choice: `program_choice_in_the_client`).
@@ -440,6 +435,14 @@ pub struct Renderer {
     /// The sun's shadow map and what draws and reads it
     /// ([`crate::shadow`]), made at the first frame with shadows.
     shadow_maps: Option<crate::shadow::ShadowMaps>,
+    /// The shadows are the game's own kind, stencil shadow volumes
+    /// ([`crate::volume`]: the area view's Shadows quality High), where
+    /// on; off (the default), a shadow map stands in for them (Fast:
+    /// cheaper, its edges a texel of the map wide).
+    pub shadow_volumes: bool,
+    /// The stencil volumes' target and pipelines, made at the first frame
+    /// with [`Renderer::shadow_volumes`].
+    volumes: Option<crate::volume::ShadowVolumes>,
     /// Shiny water is drawn by the game's programs this frame: they are
     /// on, [`Renderer::game_water`], and the target has its copies.
     water_now: bool,
@@ -466,6 +469,17 @@ pub struct Renderer {
     particle_buffer: wgpu::Buffer,
     line_pipeline: wgpu::RenderPipeline,
     line_buffer: wgpu::Buffer,
+    line_copy_pipeline: wgpu::RenderPipeline,
+    /// The frame's copies of its line shapes, shape after shape.
+    line_copy_buffer: wgpu::Buffer,
+    /// The line shapes' lines, by where their `Arc` points: those of the
+    /// last frame's shapes.
+    shape_buffers: HashMap<usize, ShapeBuffer>,
+    /// The lights each mesh took, kept from frame to frame.
+    reach_cache: ReachCache,
+    /// The sets of lights the game's draws are lit by, numbered: emptied
+    /// every frame, its room kept (grown a set at a time, it was seen).
+    light_sets: crate::game::Fast<Box<[u32]>, u32>,
     /// Animated and dangly meshes' vertices, rewritten every frame.
     dynamic_buffer: wgpu::Buffer,
     frame_buffer: wgpu::Buffer,
@@ -564,6 +578,39 @@ struct LineVertex {
     color: [f32; 4],
 }
 
+/// A copy of a [`crate::LineShape`]: its offset and scale, its colour.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct LineCopyRaw {
+    offset_scale: [f32; 4],
+    color: [f32; 4],
+}
+
+impl LineCopyRaw {
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<LineCopyRaw>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4],
+    };
+}
+
+/// A shape's line ends, as its copies' draws read them.
+const SHAPE_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: 12,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+};
+
+/// A [`crate::LineShape`]'s lines on the GPU, kept while it is drawn:
+/// the shape's lines (held, so that what they are known by stays theirs),
+/// their buffer and how many ends it has.
+#[derive(Debug)]
+struct ShapeBuffer {
+    _lines: Arc<[[glam::Vec3; 2]]>,
+    buffer: wgpu::Buffer,
+    ends: u32,
+}
+
 impl LineVertex {
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<LineVertex>() as u64,
@@ -591,14 +638,16 @@ fn cols(m: Mat4) -> [[f32; 4]; 4] {
 
 /// A texture read and uploaded (a cube map: a TXI with `cube 1` and six
 /// faces `name0`…`name5`), and what its TXI says of it; `None` where there
-/// is none.
+/// is none, or where the GPU won't take it (said, as
+/// [`crate::guard::note_gpu_error`]: drawn as one that is missing).
 fn load_texture(gpu: &Gpu, assets: &dyn Assets, name: &str) -> Option<TextureEntry> {
     if let Some(txi) = assets.txi(name).filter(|t| t.cube()) {
         let faces: Option<Vec<mg_image::Texture>> =
             (0..6).map(|i| assets.texture(&format!("{name}{i}")).map(|t| t.texture)).collect();
         if let Some(faces) = faces.and_then(|f| <[mg_image::Texture; 6]>::try_from(f).ok()) {
+            let gpu = refused(name, GpuTexture::try_upload_cube(gpu, name, &faces))?;
             return Some(TextureEntry {
-                gpu: GpuTexture::upload_cube(gpu, name, &faces),
+                gpu,
                 alpha: false,
                 cut: false,
                 blending: txi.blending(),
@@ -611,27 +660,33 @@ fn load_texture(gpu: &Gpu, assets: &dyn Assets, name: &str) -> Option<TextureEnt
             });
         }
     }
-    assets.texture(name).map(|t| {
-        let alpha = alpha_in(&t.texture);
-        TextureEntry {
-            cube: false,
-            alpha,
-            cut: t.txi.alpha_mean().map_or(alpha, |mean| mean < 1.0),
-            gpu: GpuTexture::upload(gpu, name, &t.texture, t.txi.mipmap()),
-            blending: t.txi.blending(),
-            // (Water reflects its `bumpyshinytexture`, as the game's
-            // shiny water does: Moonglow's stands in for it.)
-            env: t
-                .txi
-                .envmap()
-                .or_else(|| t.txi.water().then(|| t.txi.bumpy_shiny()).flatten())
-                .map(str::to_ascii_lowercase),
-            decal: t.txi.decal(),
-            clamp: t.txi.clamp(),
-            ripple: t.txi.ripple(),
-            water: t.txi.water(),
-        }
+    let t = assets.texture(name)?;
+    let uploaded = GpuTexture::try_upload(gpu, name, &t.texture, t.txi.mipmap());
+    let gpu = refused(name, uploaded)?;
+    let alpha = alpha_in(&t.texture);
+    Some(TextureEntry {
+        cube: false,
+        alpha,
+        cut: t.txi.alpha_mean().map_or(alpha, |mean| mean < 1.0),
+        gpu,
+        blending: t.txi.blending(),
+        // (Water reflects its `bumpyshinytexture`, as the game's shiny
+        // water does: Moonglow's stands in for it.)
+        env: t
+            .txi
+            .envmap()
+            .or_else(|| t.txi.water().then(|| t.txi.bumpy_shiny()).flatten())
+            .map(str::to_ascii_lowercase),
+        decal: t.txi.decal(),
+        clamp: t.txi.clamp(),
+        ripple: t.txi.ripple(),
+        water: t.txi.water(),
     })
+}
+
+/// A texture uploaded; or, where the GPU refused it, `None`, said.
+fn refused(name: &str, uploaded: Result<GpuTexture, String>) -> Option<GpuTexture> {
+    uploaded.map_err(|e| crate::guard::note_gpu_error(&format!("the texture {name}"), &e)).ok()
 }
 
 /// A texture is being read apart ([`Renderer::read_textures_apart`]).
@@ -762,6 +817,15 @@ fn upload<T: bytemuck::Pod>(
     }
 }
 
+/// Whether a mesh is blended by its alpha (its own, `alpha`, times its
+/// instance's `opacity`): a cut-out (`blending punchthrough`) is not by
+/// its own, which the client leaves solid and cut (a disc of mesh
+/// `alpha 0.5` drawn opaque: `client_render.rs`'s
+/// `reading_see_through_cut_out`); an instance drawn see-through is.
+fn blended_by(alpha: f32, opacity: f32, blending: Blending) -> bool {
+    if blending == Blending::Punchthrough { opacity < 1.0 } else { alpha < 1.0 }
+}
+
 impl Renderer {
     /// A renderer drawing into `color_format` targets with `sample_count`
     /// samples (1 = no MSAA).
@@ -888,9 +952,11 @@ impl Renderer {
                 Pass::SkyFade | Pass::Blend | Pass::Fringe => {
                     Some(wgpu::BlendState::ALPHA_BLENDING)
                 }
+                // (Added as much as its alpha, as the client adds an
+                // additive mesh: `reading_additive_blending`.)
                 Pass::Additive => Some(wgpu::BlendState {
                     color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
+                        src_factor: wgpu::BlendFactor::SrcAlpha,
                         dst_factor: wgpu::BlendFactor::One,
                         operation: wgpu::BlendOperation::Add,
                     },
@@ -1056,6 +1122,41 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        // Copies of a shape's lines: the same, but for where the ends are.
+        let line_copy_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("line copies"),
+            layout: Some(&line_layout),
+            vertex: wgpu::VertexState {
+                module: &line_shader,
+                entry_point: Some("vs_copy"),
+                compilation_options: Default::default(),
+                buffers: &[Some(SHAPE_LAYOUT), Some(LineCopyRaw::LAYOUT)],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: sample_count, ..Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &line_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let buffer = |label, size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -1088,7 +1189,6 @@ impl Renderer {
             ..Default::default()
         });
         Renderer {
-            debug: DebugView::Lit,
             game_programs: None,
             game_shaders: false,
             game_water: GAME_WATER,
@@ -1096,6 +1196,8 @@ impl Renderer {
             soft_particles: true,
             copier: None,
             shadow_maps: None,
+            shadow_volumes: false,
+            volumes: None,
             water_now: false,
             game: crate::game::GameShaders::new(gpu),
             game_pipelines: Default::default(),
@@ -1111,6 +1213,11 @@ impl Renderer {
             particle_buffer: buffer("particles", 1 << 16, wgpu::BufferUsages::VERTEX),
             line_pipeline,
             line_buffer: buffer("lines", 1 << 16, wgpu::BufferUsages::VERTEX),
+            line_copy_pipeline,
+            line_copy_buffer: buffer("line copies", 1 << 12, wgpu::BufferUsages::VERTEX),
+            shape_buffers: HashMap::new(),
+            reach_cache: ReachCache::default(),
+            light_sets: Default::default(),
             dynamic_buffer: buffer("dynamic vertices", 1 << 16, wgpu::BufferUsages::VERTEX),
             frame_buffer,
             light_buffer: buffer("lights", 32 * 256, wgpu::BufferUsages::STORAGE),
@@ -1142,10 +1249,6 @@ impl Renderer {
             textures_apart: false,
             drawn: Drawn::default(),
         }
-    }
-
-    pub fn color_format(&self) -> wgpu::TextureFormat {
-        self.color_format
     }
 
     /// Forgets loaded textures (after the resources change).
@@ -1308,14 +1411,17 @@ impl Renderer {
             out.params = mtr.params.clone();
             out.custom =
                 crate::game::custom_pair(mtr.shader_vs.as_deref(), mtr.shader_fs.as_deref());
+            // (Named alone, without a pair, the client ignores it and draws
+            // the stock programs: `program_choice_in_the_client`.)
             out.geometry = mtr
                 .shader_gs
                 .as_deref()
                 .map(|g| g.trim().to_ascii_lowercase())
-                .filter(|g| !g.is_empty() && g != "null");
+                .filter(|g| !g.is_empty() && g != "null" && out.custom.is_some());
             let fs = mtr.shader_fs.as_deref().unwrap_or_default().to_ascii_lowercase();
             let known = EFFECT_SHADERS.iter().any(|known| fs.starts_with(known));
             out.transparency = mtr.transparency;
+            out.late = mtr.sample_framebuffer > 0;
             out.twosided = mtr.twosided;
             out.no_env = !fs.is_empty() && assets.shader(&fs).is_some_and(|s| env_switched_off(&s));
             let mapper = fs.starts_with("mzlm");
@@ -1548,15 +1654,19 @@ impl Renderer {
         // `Reflection`, appearance.2da `ENVMAP`); `default` the area's
         // (the tileset's `EnvMap`), else `chrome1` (a placeable's
         // `Reflection` `default` is `chrome1` whatever the area's, and
-        // comes here so: `mg_preview::placeable`). And the one every lit
+        // comes here so: `mg_preview::placeable`). A texture's `default`
+        // is the object's map where the object names one, else the
+        // area's, on a placeable whose own is `default` too
+        // (`Instance::env_map_default`). And the one every lit
         // mesh's specular light reflects, bound to `texUnitEnv`: its own,
         // else the area's (read from the client:
         // `program_choice_in_the_client` in `client_render.rs`).
         let area = || scene_env.map_or_else(|| "chrome1".to_string(), str::to_string);
         let resolved = |e: String| if e.eq_ignore_ascii_case("default") { area() } else { e };
         let object = inst.env_map.clone().map(resolved);
+        let named = object.clone().filter(|_| !inst.env_map_default);
         let env = match env {
-            Some(e) if e.eq_ignore_ascii_case("default") => Some(object.unwrap_or_else(area)),
+            Some(e) if e.eq_ignore_ascii_case("default") => Some(named.unwrap_or_else(area)),
             Some(e) => Some(e),
             None => object,
         };
@@ -1617,7 +1727,10 @@ impl Renderer {
         if let Some(t) = self.textures.get(name) {
             return t.clone();
         }
-        let entry = load_texture(gpu, assets, name).map(Arc::new);
+        // (A texture that breaks what reads it is none, as on the threads
+        // that read them apart.)
+        let entry = crate::guard::guarded(name, || load_texture(gpu, assets, name).map(Arc::new));
+        let entry = entry.flatten();
         self.textures.insert(name.to_string(), entry.clone());
         entry
     }
@@ -1797,12 +1910,7 @@ impl Renderer {
                 let (max_inv, falloff) = attenuation_params();
                 [max_inv, falloff, scene.lights.len() as f32, size.1 as f32]
             },
-            scene_color: [
-                0.0,
-                0.0,
-                0.0,
-                if self.debug == DebugView::MaterialDiffuse { 1.0 } else { 0.0 },
-            ],
+            scene_color: [0.0; 4],
             time: [scene.time, 0.0, 0.0, 0.0],
         };
         gpu.queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -1887,12 +1995,16 @@ impl Renderer {
         let on_screen = proj * view;
         let frustum = Frustum::new(on_screen);
         let mut reach = LightGrid::new(&scene.lights);
+        // (What each mesh took in the frames before, while the lights stay.)
+        let mut reach_cache = std::mem::take(&mut self.reach_cache);
+        reach_cache.begin(&scene.lights);
         let mut chosen = Vec::new();
         // (The lights as a game draw's blocks take them.)
         let frame_lights: &[[[f32; 4]; 2]] = bytemuck::cast_slice(&lights);
         // (The sets of lights the game's draws are lit by, each numbered;
         // and the last draw's, which the next often shares.)
-        let mut light_sets: crate::game::Fast<Box<[u32]>, u32> = Default::default();
+        let mut light_sets = std::mem::take(&mut self.light_sets);
+        light_sets.clear();
         let mut light_set: Vec<u32> = Vec::new();
         let mut last_set: (Vec<u32>, u32) = (Vec::new(), u32::MAX);
         let scene_env = scene.env_map.as_deref();
@@ -1929,23 +2041,49 @@ impl Renderer {
                 let world = inst.transform * pose.get(mesh.node).copied().unwrap_or(Mat4::IDENTITY);
                 let half = (mesh.max - mesh.min) * 0.5;
                 let centre = world.transform_point3((mesh.min + mesh.max) * 0.5);
-                // Out of the camera's sight: not drawn. (Of the meshes
-                // that stay in their box: not one a skin moves with its
-                // bones or whose vertices an animation replaces.)
                 let moved = replaced.and_then(|r| r.vertices.as_ref());
+                // Bones: bind pose to current pose, in the skin node's space.
+                let bone_base = bones.len() as u32;
+                if let Some(skin) = &mesh.skin {
+                    let skin_now = pose.get(mesh.node).copied().unwrap_or(Mat4::IDENTITY);
+                    let to_skin = skin_now.inverse();
+                    for (&b, inverse_bind) in skin.bones.iter().zip(&skin.inverse_bind) {
+                        let now = pose.get(b).copied().unwrap_or(Mat4::IDENTITY);
+                        bones.push(cols(to_skin * now * *inverse_bind));
+                    }
+                }
+                // Out of the camera's sight: not drawn. A mesh that stays
+                // in its box, by its box; one a skin moves, by the box its
+                // bones carry it to; one whose vertices an animation
+                // replaces, by theirs.
                 let mut bounds = None;
-                if !is_sky && mesh.skin.is_none() && moved.is_none() {
+                if !is_sky {
+                    let (min, max) = match (moved, &mesh.skin) {
+                        (Some(v), _) => vertices_box(v),
+                        (None, Some(skin)) => {
+                            let bones = &bones[bone_base as usize..];
+                            posed_box(mesh.min, mesh.max, skin.weighed, skin.unweighed, bones)
+                        }
+                        (None, None) => (mesh.min, mesh.max),
+                    };
                     // (The box as it lies in the scene, turned and scaled,
                     // and a ball around it.)
+                    let (centre, half) =
+                        (world.transform_point3((min + max) * 0.5), (max - min) * 0.5);
                     let turned = glam::Mat3::from_mat4(world);
                     let around = turned.x_axis.abs() * half.x
                         + turned.y_axis.abs() * half.y
                         + turned.z_axis.abs() * half.z;
                     if frustum.hides(centre, around.length()) {
+                        bones.truncate(bone_base as usize);
                         hidden += 1;
                         continue;
                     }
-                    bounds = Some(Bounds { min: centre - around, max: centre + around });
+                    // (Where it meets other see-through meshes: of a mesh
+                    // that stays in its box only.)
+                    if mesh.skin.is_none() && moved.is_none() {
+                        bounds = Some(Bounds { min: centre - around, max: centre + around });
+                    }
                 }
                 // (Linear: the material's as worked out once, else as an
                 // animation has it now.)
@@ -1957,16 +2095,6 @@ impl Renderer {
                     dynamic.extend_from_slice(v);
                     (start, dynamic.len() as u64 * size)
                 });
-                // Bones: bind pose to current pose, in the skin node's space.
-                let bone_base = bones.len() as u32;
-                if let Some(skin) = &mesh.skin {
-                    let skin_now = pose.get(mesh.node).copied().unwrap_or(Mat4::IDENTITY);
-                    let to_skin = skin_now.inverse();
-                    for (&b, inverse_bind) in skin.bones.iter().zip(&skin.inverse_bind) {
-                        let now = pose.get(b).copied().unwrap_or(Mat4::IDENTITY);
-                        bones.push(cols(to_skin * now * *inverse_bind));
-                    }
-                }
                 let model_view = view * world;
                 let radius = world.transform_vector3(half).length();
                 let mat = &mesh.material;
@@ -1987,7 +2115,7 @@ impl Renderer {
                     Pass::Sky
                 } else if surface.blending == Blending::Additive {
                     Pass::Additive
-                } else if alpha < 1.0 || see_through {
+                } else if blended_by(alpha, inst.opacity, surface.blending) || see_through {
                     Pass::Blend
                 } else {
                     Pass::Opaque
@@ -2009,7 +2137,7 @@ impl Renderer {
                     && !see_through;
                 let discard = ALPHA_DISCARD;
                 // The 32 most important lights that reach the mesh.
-                reach.reaching(centre, radius, &mut chosen);
+                reach_cache.reaching(&mut reach, centre, radius, &mut chosen);
                 let mut light_index = [[0u32; 4]; 8];
                 for (j, (_, _, i)) in chosen.iter().enumerate() {
                     light_index[j / 4][j % 4] = *i;
@@ -2035,7 +2163,6 @@ impl Renderer {
                     // (A blueprint about to be placed, see-through, is
                     // Moonglow's: it lays its depth first.)
                     && inst.opacity >= 1.0
-                    && self.debug == DebugView::Lit
                     && mesh.skin.as_ref().is_none_or(|s| s.bones.len() <= 64)
                     && self.game_path(slots, surface)
                 {
@@ -2130,11 +2257,14 @@ impl Renderer {
                         let geometry = crate::game::Geometry::Mesh(mesh);
                         let mut draw = self.game.push(p, material, geometry, dynamic_range, f, &d);
                         // (A solid draw that reads the framebuffer's copies,
-                        // shiny water through `fswater`: after them.)
+                        // shiny water through `fswater`, or whose material
+                        // samples the framebuffer: after them, and after
+                        // the shadows.)
                         draw.late = copies.is_some()
-                            && draw.pipeline.wants_fb
+                            && (draw.pipeline.wants_fb || slots.late)
                             && game_pass == crate::game::GamePass::Opaque;
-                        draw.receives = receives && game_pass == crate::game::GamePass::Opaque;
+                        draw.receives =
+                            receives && !draw.late && game_pass == crate::game::GamePass::Opaque;
                         match fringe {
                             None if game_pass == crate::game::GamePass::Opaque => {
                                 game_draws.push(draw)
@@ -2547,9 +2677,7 @@ impl Renderer {
         // pipeline isn't ready, Moonglow's own. (A soft one reads the
         // framebuffer's depth copy: the frame makes it.)
         let mut soft_particles = false;
-        if let Some(f) = &game_frame
-            && self.debug == DebugView::Lit
-        {
+        if let Some(f) = &game_frame {
             use crate::game::{GamePass, PipelineKey, Ready};
             let (format, samples, wait) =
                 (self.color_format, self.sample_count, !self.game_background);
@@ -2631,10 +2759,13 @@ impl Renderer {
             &line_vertices,
             0,
         );
+        // The line shapes: the lines of those not drawn last frame sent,
+        // and every copy; each shape's copies drawn by one draw.
+        let shapes = self.line_shapes(gpu, &scene.line_shapes);
         // The game's shaders' blocks and bind groups; the solid draws by
         // pipeline and material, each set once for its draws.
         // (Those after the framebuffer's copy, last.)
-        game_draws.sort_by_key(|d| (d.late, !d.receives, d.order()));
+        crate::game::sort(&mut game_draws, |d| (d.late, !d.receives));
         let early = game_draws.iter().take_while(|d| !d.late).count();
         // (Those the shadows fall on, first.)
         let received = game_draws.iter().take_while(|d| !d.late && d.receives).count();
@@ -2699,8 +2830,9 @@ impl Renderer {
         }
         let bg = scene.background;
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        // The shadow maps, before the scene.
-        if shadowing {
+        // The shadow maps, before the scene (none for the volumes).
+        let volumes = self.shadow_volumes;
+        if shadowing && !volumes {
             let maps =
                 self.shadow_maps.get_or_insert_with(|| crate::shadow::ShadowMaps::new(&gpu.device));
             if let Some(plan) = &shadow_plan {
@@ -2743,7 +2875,24 @@ impl Renderer {
                         self.game.draw(&mut pass, received, dynamic, particles, &mut game_bound);
                     drop(pass);
                     let format = (self.color_format, self.sample_count);
-                    if let (Some(plan), Some(maps)) = (&shadow_plan, &mut self.shadow_maps) {
+                    if volumes {
+                        let device = &gpu.device;
+                        self.volumes
+                            .get_or_insert_with(|| crate::volume::ShadowVolumes::new(device))
+                            .lay(
+                                gpu,
+                                &mut encoder,
+                                (target, depth),
+                                format,
+                                (shadow_plan.as_ref(), light_plan.as_ref()),
+                                camera,
+                                size,
+                                scene.fog,
+                            );
+                    }
+                    if let (false, Some(plan), Some(maps)) =
+                        (volumes, &shadow_plan, &mut self.shadow_maps)
+                    {
                         let targets = (target, depth);
                         maps.darken(
                             gpu,
@@ -2756,7 +2905,9 @@ impl Renderer {
                             scene.fog,
                         );
                     }
-                    if let (Some(plan), Some(maps)) = (&light_plan, &mut self.shadow_maps) {
+                    if let (false, Some(plan), Some(maps)) =
+                        (volumes, &light_plan, &mut self.shadow_maps)
+                    {
                         let targets = (target, depth);
                         maps.darken_lights(
                             gpu,
@@ -2892,10 +3043,68 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.line_buffer.slice(..));
                 pass.draw(0..line_vertices.len() as u32, 0..1);
             }
+            if !shapes.is_empty() {
+                pass.set_pipeline(&self.line_copy_pipeline);
+                pass.set_bind_group(0, &self.particle_frame, &[]);
+                pass.set_vertex_buffer(1, self.line_copy_buffer.slice(..));
+                for (key, copies) in &shapes {
+                    let shape = &self.shape_buffers[key];
+                    pass.set_vertex_buffer(0, shape.buffer.slice(..));
+                    pass.draw(0..shape.ends, copies.clone());
+                }
+            }
         }
         gpu.queue.submit([encoder.finish()]);
         drop(draws);
         (self.uniforms, self.bones, self.dynamic) = (uniforms, bones, dynamic);
+        self.reach_cache = reach_cache;
+        self.light_sets = light_sets;
+    }
+
+    /// The frame's line shapes put on the GPU: the lines of each not drawn
+    /// in the frame before sent (and those of shapes no longer drawn let
+    /// go), and every copy, shape after shape. Each shape's lines (by
+    /// [`Renderer::shape_buffers`]' key) and the range of its copies.
+    fn line_shapes(
+        &mut self,
+        gpu: &Gpu,
+        shapes: &[crate::LineShape],
+    ) -> Vec<(usize, std::ops::Range<u32>)> {
+        use wgpu::util::DeviceExt;
+        let mut copies = Vec::new();
+        let mut drawn = Vec::new();
+        for shape in shapes.iter().filter(|s| !s.lines.is_empty() && !s.copies.is_empty()) {
+            let key = Arc::as_ptr(&shape.lines) as *const () as usize;
+            self.shape_buffers.entry(key).or_insert_with(|| {
+                let ends: Vec<[f32; 3]> =
+                    shape.lines.iter().flat_map(|l| l.map(|p| p.to_array())).collect();
+                ShapeBuffer {
+                    _lines: shape.lines.clone(),
+                    buffer: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("line shape"),
+                        contents: bytemuck::cast_slice(&ends),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                    ends: ends.len() as u32,
+                }
+            });
+            let first = copies.len() as u32;
+            copies.extend(shape.copies.iter().map(|c| LineCopyRaw {
+                offset_scale: c.offset.extend(c.scale).to_array(),
+                color: c.color,
+            }));
+            drawn.push((key, first..copies.len() as u32));
+        }
+        self.shape_buffers.retain(|key, _| drawn.iter().any(|(k, _)| k == key));
+        upload(
+            gpu,
+            &mut self.line_copy_buffer,
+            "line copies",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            &copies,
+            0,
+        );
+        drawn
     }
 
     /// Ends the scene's first pass's work: fills `copies` from what is
@@ -3042,17 +3251,55 @@ fn scene_pass<'e>(
     pass
 }
 
+/// The box around vertices (an animation's, replacing a mesh's).
+fn vertices_box(vertices: &[Vertex]) -> (Vec3, Vec3) {
+    vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(min, max), v| {
+        let p = Vec3::from(v.pos);
+        (min.min(p), max.max(p))
+    })
+}
+
+/// The box a skinned mesh bound in the box `min`…`max` lies in, posed by
+/// `bones` (each from the bind pose to the pose, in the skin node's
+/// space, as its draw takes them). A posed vertex is its bones' places
+/// for it, weighed: made to add up to one (Moonglow's own shader), it
+/// lies within the boxes the bones carry the bound box to, so their box
+/// holds every vertex, however far the bones go; as they are (the
+/// game's programs), within that box shrunk or grown about the skin
+/// node's origin by what the weights add up to. A vertex weighed to no
+/// bone stays where it was bound (Moonglow's) or goes to the origin (the
+/// game's).
+fn posed_box(
+    min: Vec3,
+    max: Vec3,
+    [least, most]: [f32; 2],
+    unweighed: bool,
+    bones: &[[[f32; 4]; 4]],
+) -> (Vec3, Vec3) {
+    let (centre, half) = ((min + max) * 0.5, (max - min) * 0.5);
+    let empty = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    let (lo, hi) = bones.iter().fold(empty, |(lo, hi), b| {
+        let m = Mat4::from_cols_array_2d(b);
+        let turned = glam::Mat3::from_mat4(m);
+        let at = m.transform_point3(centre);
+        let around = turned.x_axis.abs() * half.x
+            + turned.y_axis.abs() * half.y
+            + turned.z_axis.abs() * half.z;
+        (lo.min(at - around), hi.max(at + around))
+    });
+    let (mut lo, mut hi) = (lo.min(lo * least).min(lo * most), hi.max(hi * least).max(hi * most));
+    if unweighed {
+        (lo, hi) = (lo.min(min).min(Vec3::ZERO), hi.max(max).max(Vec3::ZERO));
+    }
+    (lo, hi)
+}
+
 /// A box of the scene as the camera sees it (`on_screen`: its projection
 /// times its view): the rectangle around it on the screen, from -1 to 1
 /// each way; all of the screen for one that reaches behind the camera.
 fn screen_box(on_screen: Mat4, bounds: &Bounds) -> Bounds {
     let (mut min, mut max) = (glam::Vec2::splat(f32::MAX), glam::Vec2::splat(f32::MIN));
-    for corner in 0..8 {
-        let at = Vec3::new(
-            if corner & 1 == 0 { bounds.min.x } else { bounds.max.x },
-            if corner & 2 == 0 { bounds.min.y } else { bounds.max.y },
-            if corner & 4 == 0 { bounds.min.z } else { bounds.max.z },
-        );
+    for at in crate::box_corners(bounds.min, bounds.max) {
         let clip = on_screen * at.extend(1.0);
         if clip.w.is_nan() || clip.w <= 1e-4 {
             (min, max) = (glam::Vec2::splat(-1.0), glam::Vec2::splat(1.0));
@@ -3166,6 +3413,33 @@ impl Targets {
 
 #[cfg(test)]
 mod tests {
+    use glam::{Mat4, Vec3};
+
+    /// A skinned mesh's posed box holds where every bone carries it, and
+    /// the bound box only where a vertex is weighed to no bone; weights
+    /// that add up to more or less than one (as the game's programs take
+    /// them) grow or shrink it about the skin's origin.
+    #[test]
+    fn a_skinned_mesh_s_posed_box_holds_what_its_bones_carry() {
+        let (min, max) = (Vec3::new(9.0, -1.0, 0.0), Vec3::new(11.0, 1.0, 2.0));
+        let bone = |m: Mat4| m.to_cols_array_2d();
+        let bones = [
+            bone(Mat4::from_translation(Vec3::new(-10.0, 0.0, 0.0))),
+            bone(Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+        ];
+        let (lo, hi) = super::posed_box(min, max, [1.0, 1.0], false, &bones);
+        // (Carried to the origin; turned a quarter about it, to x -1…1,
+        // y 9…11.)
+        assert!(lo.abs_diff_eq(Vec3::new(-1.0, -1.0, 0.0), 1e-4), "{lo}");
+        assert!(hi.abs_diff_eq(Vec3::new(1.0, 11.0, 2.0), 1e-4), "{hi}");
+        let (lo, hi) = super::posed_box(min, max, [1.0, 1.0], true, &bones[..1]);
+        assert!(lo.abs_diff_eq(Vec3::new(-1.0, -1.0, 0.0), 1e-4), "{lo}");
+        assert!(hi.abs_diff_eq(Vec3::new(11.0, 1.0, 2.0), 1e-4), "bound box too: {hi}");
+        let (lo, hi) = super::posed_box(min, max, [0.5, 2.0], false, &bones[1..]);
+        assert!(lo.abs_diff_eq(Vec3::new(-2.0, 4.5, 0.0), 1e-4), "{lo}");
+        assert!(hi.abs_diff_eq(Vec3::new(2.0, 22.0, 4.0), 1e-4), "{hi}");
+    }
+
     /// A program's defines, as a custom fragment program has them (Heed's
     /// `fhss_skintile`, the stock `fslit_nm` but for keyholing): what
     /// Moonglow's own shader lights its material as.

@@ -90,6 +90,11 @@ pub struct Model {
     /// In pre-order; `nodes[0]` is the root.
     pub nodes: Vec<Node>,
     pub animations: Vec<Animation>,
+    /// The node count a compiled model's header holds: its nodes' part
+    /// numbers ([`Node::part`]) run below it, past its supermodel's
+    /// (`None` for a model read from text). With them, its
+    /// [`binary_write::PartNumbers::of`].
+    pub part_count: Option<u32>,
 }
 
 impl Model {
@@ -106,6 +111,39 @@ impl Model {
     /// An animation by name (case-insensitive).
     pub fn animation(&self, name: &str) -> Option<&Animation> {
         self.animations.iter().find(|a| a.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether a mesh of it is drawn with texture `name` as its first
+    /// texture (its bitmap), case aside: a tile's `replace_tex`, which the
+    /// tile's `Tile_ReplaceTex` replaces.
+    pub fn draws_texture(&self, name: &str) -> bool {
+        self.nodes.iter().any(|n| {
+            n.mesh()
+                .and_then(|m| m.textures[0].as_deref())
+                .is_some_and(|t| t.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// Its nodes in the order of a depth-first walk of its tree from its
+    /// first root, children in their order: a node's tree position, by
+    /// which the engine binds a skin's bones (nwn-mdl-spec MDL-SKIN-011).
+    /// Nodes outside the tree follow, in their order.
+    pub fn tree_order(&self) -> Vec<usize> {
+        let count = self.nodes.len();
+        let mut out = Vec::with_capacity(count);
+        let mut seen = vec![false; count];
+        let root = self.nodes.iter().position(|n| n.parent.is_none());
+        let mut stack: Vec<usize> = root.into_iter().collect();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            out.push(i);
+            let children = self.nodes[i].children.iter().rev();
+            stack.extend(children.filter(|&&c| c < count && !seen[c]));
+        }
+        out.extend((0..count).filter(|&i| !seen[i]));
+        out
     }
 }
 
@@ -509,11 +547,24 @@ pub fn animations(
     out
 }
 
+/// `a` less `b`.
+pub(crate) fn sub(a: Vec3, b: Vec3) -> Vec3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// The dot product.
+pub(crate) fn dot(a: Vec3, b: Vec3) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// The cross product.
+pub(crate) fn cross(u: Vec3, v: Vec3) -> Vec3 {
+    [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+}
+
 /// Face normals from positions, area-weighted (the cross product's length).
 pub(crate) fn face_normal(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
-    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+    cross(sub(b, a), sub(c, a))
 }
 
 /// A vector made unit as the game makes it (`Vector::Normalize`,
@@ -615,13 +666,36 @@ pub enum DecompileError {
 /// A compiled model as ASCII, its nodes in the order of their part
 /// numbers, so that compiling the text again keeps them.
 pub fn decompile(data: &[u8]) -> Result<String, DecompileError> {
+    decompile_with(data, &|_| None)
+}
+
+/// [`decompile`], `lookup` giving a model's file by name: a body part's
+/// skin bound to the creature's skeleton it is worn on has its bones named
+/// from that skeleton (`pmh0` for `pmh0_neck001`: nwn-mdl-spec
+/// MDL-SKIN-040), which is looked up only for such a part.
+pub fn decompile_with(
+    data: &[u8],
+    lookup: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<String, DecompileError> {
     if !is_binary(data) {
         return Err(DecompileError::NotBinary);
     }
     let model = Model::read(data)?;
-    let order = match binary_write::PartNumbers::read(data) {
+    let order = match binary_write::PartNumbers::of(&model) {
         Some(parts) => ascii_write::file_order(&model, &parts.numbers),
         None => (0..model.nodes.len()).collect(),
     };
-    Ok(ascii_write::to_ascii_in_order(&model, &ascii_write::Options::default(), &order))
+    let bound = model.nodes.iter().any(|n| {
+        n.mesh().is_some_and(|m| match &m.extra {
+            MeshExtra::Skin(s) => ascii_write::bound_elsewhere(&model, s),
+            _ => false,
+        })
+    });
+    let skeleton = bound
+        .then(|| ascii_write::skeleton_of(&model.name))
+        .flatten()
+        .and_then(lookup)
+        .and_then(|d| Model::read(&d).ok());
+    let opts = ascii_write::Options::default();
+    Ok(ascii_write::to_ascii_on(&model, &opts, &order, skeleton.as_ref()))
 }

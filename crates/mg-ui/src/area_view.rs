@@ -73,6 +73,54 @@ impl Orbit {
     }
 }
 
+/// The wheel over a 3D view in a frame (the area view's, the model
+/// viewer's), as both take it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct Wheel {
+    /// How far to zoom, in the wheel's points, up (positive) nearer: the
+    /// wheel; Shift and the wheel, which egui reports sideways; Ctrl and
+    /// the wheel, which it reports as a zoom; and a pinch on a touchpad.
+    pub zoom: f32,
+    /// Shift or Ctrl is held: the zoom is half as fast.
+    pub fine: bool,
+    /// A sideways scroll (a wheel tilted, a second wheel, two fingers
+    /// across a touchpad), not Shift and the wheel: the view pans left and
+    /// right, as the screen has it (GitHub issue 26).
+    pub sideways: f32,
+}
+
+impl Wheel {
+    pub(crate) fn read(ui: &egui::Ui) -> Wheel {
+        let zoom_speed = ui.ctx().options(|o| o.input_options.scroll_zoom_speed);
+        ui.input(|i| {
+            let d = i.smooth_scroll_delta;
+            let shift = i.modifiers.shift;
+            let mut zoom = if shift && d.y == 0.0 { d.x } else { d.y };
+            // (Ctrl and the wheel while Ctrl is held: egui goes on with
+            // the zoom over the frames after, which Ctrl let go of leaves
+            // alone. A pinch is its zoom events.)
+            let pinch: f32 = (i.events.iter())
+                .filter_map(|e| if let egui::Event::Zoom(by) = e { Some(*by) } else { None })
+                .product();
+            let factor = if i.modifiers.command { i.zoom_delta() } else { pinch };
+            if zoom == 0.0 && zoom_speed > 0.0 {
+                zoom = factor.ln() / zoom_speed;
+            }
+            Wheel {
+                zoom,
+                fine: shift || i.modifiers.command,
+                sideways: if shift { 0.0 } else { d.x },
+            }
+        })
+    }
+
+    /// `distance` zoomed by it, kept within `range`.
+    pub(crate) fn zoomed(&self, distance: f32, (near, far): (f32, f32)) -> f32 {
+        let rate = if self.fine { 0.001 } else { 0.002 };
+        (distance * (-self.zoom * rate).exp()).clamp(near, far)
+    }
+}
+
 /// Objects copied from an area (Ctrl+C), to paste in any area.
 #[derive(Debug, Clone)]
 pub struct ObjectClip {
@@ -404,6 +452,12 @@ pub struct AreaView {
     /// Circles where each placed sound is heard at full volume and where
     /// it stops.
     pub sound_ranges: bool,
+    /// The toolbar's Minimap: the area's map in the view's corner.
+    pub minimap: bool,
+    /// The map, as last drawn ([`crate::minimap::of`]), and where it is
+    /// on the screen while it is shown.
+    map: Option<crate::minimap::Map>,
+    pub map_rect: Option<Rect>,
     pub grid: bool,
     /// Which kinds of object are shown, by [`ObjectKind::index`].
     pub show: [bool; 9],
@@ -415,6 +469,10 @@ pub struct AreaView {
     pub(crate) held: Held,
     /// Options › Area: the turning ring shows around the selection.
     pub turn_ring: bool,
+    /// Why the area is read-only here, where it is (another builder's, in
+    /// a project that keeps those read-only: `claims::access`): it is
+    /// looked at and selected in, its tools off, its forms gray.
+    pub(crate) read_only: Option<String>,
     /// The outline being drawn for a trigger or encounter.
     pub outline: Vec<Vec3>,
     /// Alt was pressed with the outline's first corner set: the next click
@@ -454,6 +512,9 @@ pub struct AreaView {
     /// Several selected objects turn about their middle as one
     /// (Options: the toolbar's Together).
     turn_together: bool,
+    /// What is placed goes onto the placeable or door under the pointer
+    /// (the settings', copied each frame: the toolbar's Onto Objects).
+    onto_objects: bool,
     /// The ground point under the pointer, shown in the corner.
     pub pointer: Option<Vec3>,
     /// The tileset brush's cursor as the last frame drew it: its shapes'
@@ -523,6 +584,21 @@ struct Drawn {
     follows: bool,
     /// The Shaders switch.
     shaders: bool,
+    /// Options › Area › Shadows quality is High: stencil shadow volumes.
+    high_shadows: bool,
+    /// The placed sounds' ranges drawn (Sound Ranges).
+    sound_ranges: Vec<SoundRange>,
+}
+
+/// A positional sound's distances as Sound Ranges draws them in the
+/// picture ([`sound_range_shapes`]): its place in the GIT's list, its
+/// `MinDistance` and `MaxDistance`, and whether it is selected.
+#[derive(Debug, Clone, PartialEq)]
+struct SoundRange {
+    index: usize,
+    min: f32,
+    max: f32,
+    chosen: bool,
 }
 
 /// How long the area's picture is kept while nothing but its animations
@@ -760,6 +836,11 @@ impl Watching {
 }
 
 impl AreaView {
+    /// Whether its first reading is under way, on a thread of its own.
+    pub(crate) fn reading(&self) -> bool {
+        self.reading.is_some()
+    }
+
     /// Reads the area's tiles and objects again from the game data (after
     /// Reload Resources), keeping the camera.
     pub(crate) fn reload(&mut self) {
@@ -840,6 +921,9 @@ impl AreaView {
             light_shadows: true,
             shadows_before: None,
             sound_ranges: false,
+            minimap: false,
+            map: None,
+            map_rect: None,
             grid: true,
             show: [true; 9],
             show_start: true,
@@ -847,6 +931,7 @@ impl AreaView {
             drag: None,
             held: Held::default(),
             turn_ring: true,
+            read_only: None,
             outline: Vec::new(),
             rectangle: false,
             alt_held: None,
@@ -861,6 +946,7 @@ impl AreaView {
             menu_tile: None,
             snap: (None, None),
             turn_together: false,
+            onto_objects: false,
             pointer: None,
             brush_cursor: Vec::new(),
             terrain_drag: None,
@@ -922,6 +1008,12 @@ impl AreaView {
         Some(scene.ghost(&vp.gpu, game, o, self.time, 1.0).1)
     }
 
+    /// The box of the area's object `i` (of its model's objects) in its
+    /// own space, as the view draws it (`None` before its scene is made).
+    pub(crate) fn object_bounds(&self, i: usize) -> Option<(Vec3, Vec3)> {
+        Some(self.scene.as_ref()?.bounds(self.model.as_ref()?, i))
+    }
+
     /// How far Q and E have turned what is about to be placed (radians).
     pub(crate) fn ghost_turn(&self) -> f32 {
         self.ghost_turn
@@ -945,6 +1037,12 @@ impl AreaView {
 
     /// Where a point shows on screen (last drawn view).
     pub fn screen_pos(&self, p: Vec3) -> Option<Pos2> {
+        self.projector()?.at(p)
+    }
+
+    /// What puts points on screen as [`AreaView::screen_pos`] does, for
+    /// many points: the camera worked out once.
+    fn projector(&self) -> Option<Projector> {
         let (orbit, aspect) = (self.orbit?, self.aspect());
         let (matrix, near) = match self.projection.get() {
             Some((o, a, m, n)) if o == orbit && a == aspect => (m, n),
@@ -955,8 +1053,7 @@ impl AreaView {
                 (m, camera.near)
             }
         };
-        let at = mg_area::pick::project_by(matrix, near, p)?;
-        Some(self.rect.min + egui::vec2(at.x * self.rect.width(), at.y * self.rect.height()))
+        Some(Projector { matrix, near, rect: self.rect })
     }
 
     /// The selection as a set: the overlays look up every object in it
@@ -999,6 +1096,13 @@ impl AreaView {
     /// The position of object (kind, index) in `model.objects`.
     fn object_at(&self, kind: ObjectKind, index: usize) -> Option<usize> {
         self.model.as_ref()?.objects.iter().position(|o| o.kind == kind && o.index == index)
+    }
+
+    /// The placed object `index` of `kind` as a light with nothing to see
+    /// ([`AreaScene::bare_light`]), if it is one.
+    pub fn bare_light(&self, kind: ObjectKind, index: usize) -> Option<mg_area::BareLight> {
+        let i = self.object_at(kind, index)?;
+        self.scene.as_ref()?.bare_light(self.model.as_ref()?, i)
     }
 
     /// Where the selected objects are in `model.objects`, in the order
@@ -1167,6 +1271,73 @@ impl AreaView {
         g.height(to, near).map_or(to.extend(o.position.z), |z| to.extend(z + lift))
     }
 
+    /// Where an object put down with the pointer at `pos` stands (before
+    /// its own lift): on the ground there, snapped to the grid; with Onto
+    /// Objects on, on the top of the placeable or door the pointer is on
+    /// (its model, not its box) where that is up to [`ONTO_REACH`] above
+    /// the ground below it, as Drop onto Object sets it. (Higher, a
+    /// tree's canopy: on the ground, as off.)
+    pub(crate) fn put_down_at(&self, pos: Pos2) -> Option<Vec3> {
+        let ground = self.ground_at(pos, 0.0)?;
+        if !self.onto_objects {
+            return Some(self.snapped(ground));
+        }
+        // (No models to stand on yet: the ground.)
+        let (Some(ray), Some(model), Some(scene)) =
+            (self.ray(pos), self.model.as_ref(), self.scene.as_ref())
+        else {
+            return Some(self.snapped(ground));
+        };
+        let along = (ground - ray.origin).length() / ray.dir.length().max(1e-6);
+        // The nearest placeable or door the ray meets before the ground,
+        // low enough to stand on.
+        let on = (0..model.objects.len())
+            .filter(|&j| self.surface_kind(model, j))
+            .filter_map(|j| scene.ray_hit(model, j, &ray).flatten())
+            .filter(|t| *t >= 0.0 && *t < along)
+            .min_by(f32::total_cmp)
+            .map(|t| ray.origin + ray.dir * t)
+            .filter(|p| {
+                let below = self.ground.as_ref().and_then(|g| g.height(p.truncate(), p.z));
+                below.is_none_or(|z| p.z - z <= ONTO_REACH)
+            });
+        let Some(p) = on else { return Some(self.snapped(ground)) };
+        let xy = match self.snap.0 {
+            Some(_) => mg_area::arrange::snap_point(p.truncate(), self.snap.0),
+            None => p.truncate(),
+        };
+        let floor = self.ground.as_ref().and_then(|g| g.height(xy, p.z)).unwrap_or(ground.z);
+        let from = xy.extend(floor + ONTO_REACH);
+        let z = self.surface_below(from, &|_| false).unwrap_or(floor);
+        Some(xy.extend(z))
+    }
+
+    /// Whether object `j` of `model` is one a thing can be set on: a
+    /// placeable or door, shown.
+    fn surface_kind(&self, model: &AreaModel, j: usize) -> bool {
+        let k = model.objects[j].kind;
+        matches!(k, ObjectKind::Placeable | ObjectKind::Door) && self.show[k.index()]
+    }
+
+    /// The height of the first surface straight below `from`: the top of a
+    /// placeable or door there (their models; not those `except` names),
+    /// else the ground.
+    fn surface_below(&self, from: Vec3, except: &dyn Fn(usize) -> bool) -> Option<f32> {
+        let (model, scene) = (self.model.as_ref()?, self.scene.as_ref()?);
+        let ray = Ray { origin: from, dir: Vec3::NEG_Z };
+        let on_object = (0..model.objects.len())
+            .filter(|&j| !except(j) && self.surface_kind(model, j))
+            .filter_map(|j| scene.ray_hit(model, j, &ray).flatten())
+            .filter(|t| *t >= 0.0)
+            .min_by(f32::total_cmp);
+        let on_ground = self.ground.as_ref().and_then(|g| g.hit(&ray)).map(|p| from.z - p.z);
+        let t = match (on_object, on_ground) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        Some(from.z - t)
+    }
+
     /// A point snapped to the grid, on the ground there.
     pub(crate) fn snapped(&self, at: Vec3) -> Vec3 {
         if self.snap.0.is_none() {
@@ -1213,6 +1384,32 @@ impl AreaView {
     pub fn ring_places(&self) -> Vec<(Vec3, f32)> {
         let Some(model) = self.model.as_ref() else { return Vec::new() };
         self.turn_rings(model).into_iter().map(|r| (r.pivot, r.facing)).collect()
+    }
+
+    /// A point on screen where a press and a drag move object `i` (its
+    /// place in the model's objects): on it, as picked, and on none of the
+    /// selection's handles there without a key held (a turning ring, a
+    /// spawn point's arrow or foot); its box's middle first, then about
+    /// it. For the tests that drag one: an object's feet are its ring's.
+    pub fn move_grip(&self, i: usize) -> Option<Pos2> {
+        let (model, scene) = (self.model.as_ref()?, self.scene.as_ref()?);
+        let o = model.objects.get(i)?;
+        let (min, max) = scene.bounds(model, i);
+        let t = o.model_transform();
+        let free = |p: Pos2| {
+            self.rect.contains(p)
+                && self.pick(p) == Some(i)
+                && self.ring_at(p).is_none()
+                && self.spawn_arrow_at(p).is_none()
+                && self.spawn_foot_at(p).is_none()
+        };
+        const ALONG: [f32; 5] = [0.5, 0.35, 0.65, 0.2, 0.8];
+        let points = ALONG.iter().flat_map(|&z| {
+            ALONG.iter().flat_map(move |&y| ALONG.iter().map(move |&x| Vec3::new(x, y, z)))
+        });
+        points
+            .filter_map(|f| self.screen_pos(t.transform_point3(min + (max - min) * f)))
+            .find(|&p| free(p))
     }
 
     /// The ring whose line `pos` is on (or within [`RING_REACH`] of).
@@ -1275,6 +1472,22 @@ impl AreaView {
             self.screen_pos(h.1).is_some_and(|at| (at - pos).length() <= SCALE_HANDLE + 3.0)
         };
         handles.iter().find(near).map(|h| h.0)
+    }
+
+    /// Where the scale handle of the object at `pivot` (its stalk's end
+    /// at `handle`) is drawn on screen: while a scale drag is under way it
+    /// follows the pointer, the one taken under it and the others' out
+    /// along their stalks by as much.
+    fn scale_handle_drawn(&self, pivot: Vec3, handle: Vec3, pointer: Option<Pos2>) -> Option<Pos2> {
+        let at = self.screen_pos(handle)?;
+        let Some(Drag::Scale { pivot: taken, factor, .. }) = self.drag else { return Some(at) };
+        if taken == pivot
+            && let Some(p) = pointer
+        {
+            return Some(p);
+        }
+        let foot = self.screen_pos(pivot)?;
+        Some(foot + (at - foot) * factor)
     }
 
     /// How much a scale drag from `from` to `pos` scales by: the
@@ -1392,6 +1605,7 @@ impl AreaView {
                 o.kind == ObjectKind::Encounter
                     && self.selected(*i)
                     && !o.locked
+                    && self.read_only.is_none()
                     && self.show[o.kind.index()]
             })
             .flat_map(|(i, o)| o.spawn_points.iter().enumerate().map(move |(k, p)| (i, o, k, *p)))
@@ -1415,6 +1629,7 @@ impl AreaView {
                 o.kind == ObjectKind::Encounter
                     && self.selected(*i)
                     && !o.locked
+                    && self.read_only.is_none()
                     && self.show[o.kind.index()]
             })
             .flat_map(|(i, o)| o.spawn_points.iter().enumerate().map(move |(k, p)| (i, k, *p)))
@@ -1423,8 +1638,26 @@ impl AreaView {
             })
     }
 
+    /// Whether `pos` is over the view itself: in it, and not over a window
+    /// in front of it (a tooltip lets it through). What follows the
+    /// pointer (the coordinates, a brush, a see-through copy, an outline
+    /// of what is to be pasted) shows only so: the ground under a window
+    /// is not where the pointer is. `ui` is the view's own.
+    pub(crate) fn is_over(&self, ui: &egui::Ui, pos: Pos2) -> bool {
+        let layer = ui.ctx().layer_id_at(pos);
+        self.rect.contains(pos)
+            && !self.map_rect.is_some_and(|r| r.expand(2.0).contains(pos))
+            && !layer.is_some_and(|l| l != ui.layer_id() && l.order != egui::Order::Tooltip)
+    }
+
+    /// Where the pointer is over the view ([`AreaView::is_over`]), if it
+    /// is.
+    pub(crate) fn pointer_over(&self, ui: &egui::Ui) -> Option<Pos2> {
+        ui.ctx().pointer_hover_pos().filter(|p| self.is_over(ui, *p))
+    }
+
     /// Whether the start location's marker is what is selected.
-    fn start_is_selected(&self) -> bool {
+    pub(crate) fn start_is_selected(&self) -> bool {
         self.start_selected && self.selection.is_empty()
     }
 
@@ -1719,6 +1952,9 @@ fn near_segment(a: Pos2, b: Pos2, pos: Pos2) -> f32 {
 struct Reading {
     /// What the thread hands back.
     read: std::sync::mpsc::Receiver<Read>,
+    /// Read again (Reload Resources): the area shown before is let go of
+    /// as a new one is (its tile tools' hold on the ground).
+    again: bool,
 }
 
 /// What a [`Reading`] read.
@@ -1741,13 +1977,14 @@ fn refresh(app: &mut Moonglow, view: &mut AreaView, ctx: &egui::Context) {
     if let Some(reading) = &view.reading {
         match reading.read.try_recv() {
             Ok(read) => {
+                let again = reading.again;
                 view.reading = None;
                 let Some(game) = app.game.clone() else { return };
                 view.terrain = read.terrain;
                 view.tileset = Some(read.tileset);
                 view.ground = Some(read.ground);
                 view.scene = Some(read.scene);
-                show(app, view, &game, read.model, false, false);
+                show(app, view, &game, read.model, again, again);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1790,12 +2027,15 @@ fn refresh(app: &mut Moonglow, view: &mut AreaView, ctx: &egui::Context) {
         "tileset {tileset_ref}, GIT {}",
         if ws.doc(&view.git()).is_ok() { "read" } else { "none" }
     ));
-    // The first reading, where the window is kept going: on a thread.
+    // The first reading, and a reading again of its models and textures
+    // (Reload Resources), where the window is kept going: on a thread.
+    // (An edit reads the area here: what it changed is shown at once, its
+    // models mostly read already.)
     if app.background_jobs
-        && view.model.is_none()
         && view.scene.is_none()
         && let Some(vp) = &app.viewport
     {
+        let again = view.model.is_some();
         let (tx, rx) = std::sync::mpsc::channel();
         let (gpu, game, ctx) = (vp.gpu.clone(), game.clone(), ctx.clone());
         // (Kept here too, to read here if no thread can be had.)
@@ -1816,7 +2056,7 @@ fn refresh(app: &mut Moonglow, view: &mut AreaView, ctx: &egui::Context) {
         match std::thread::Builder::new().name(format!("moonglow area {area}")).spawn(work) {
             Ok(_) => {
                 step("reading on a thread of its own");
-                view.reading = Some(Reading { read: rx });
+                view.reading = Some(Reading { read: rx, again });
                 return;
             }
             Err(e) => step(&format!("no thread to read it on ({e}): read here")),
@@ -2064,6 +2304,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
         view.creature_shadows = !app.settings.no_creature_shadows;
         view.light_shadows = !app.settings.no_light_shadows;
         view.sound_ranges = app.settings.sound_ranges;
+        view.minimap = app.settings.area_minimap;
         view.fade = Fade::of(app.settings.fade_geometry);
         // (Where its camera was, if a module's kept tabs opened it again.)
         if let Some((orbit, night)) =
@@ -2101,6 +2342,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
         app.settings.snap_angle.map(f32::from),
     );
     view.turn_together = app.settings.turn_together;
+    view.onto_objects = app.settings.place_onto_objects;
     // An object to go to (from Find Instance).
     if let Some((a, kind, index)) = app.area_focus
         && a == area
@@ -2126,6 +2368,14 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
     if app.start_focus == Some(area) && view.orbit.is_some() {
         app.start_focus = None;
         look_at_start(app, &mut view);
+    }
+    // Another builder's, kept read-only: what would change it is off.
+    view.read_only = crate::claims::read_only(app, area);
+    if view.read_only.is_some() {
+        view.tile_mode = false;
+        view.pasting = false;
+        view.redraw = None;
+        view.drag = view.drag.filter(|d| matches!(d, Drag::Box { .. } | Drag::Pan));
     }
     toolbar(app, ui, &mut view);
     // Whose the area is, where it isn't the builder's (the claims table).
@@ -2199,11 +2449,11 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             "Show the start location's marker (a blue ring with a red arrow). To set it: \
              right-click the ground, Set Start Location Here",
         );
-        if ui.button("All").on_hover_text("Show All").clicked() {
+        if tools.button(ui, icons::SHOW_ALL, "All", "Show All").clicked() {
             view.show = [true; 9];
             view.show_start = true;
         }
-        if ui.button("None").on_hover_text("Show None").clicked() {
+        if tools.button(ui, icons::SHOW_NONE, "None", "Show None").clicked() {
             view.show = [false; 9];
             view.show_start = false;
         }
@@ -2228,7 +2478,7 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         {
             app.settings.unlit_areas = !view.lit;
         }
-        shadows_button(ui, view, tools);
+        shadows_button(ui, view, tools, &mut app.settings.shadow_quality);
         let kinds = (view.shadows, view.creature_shadows, view.light_shadows);
         let s = &mut app.settings;
         if kinds != (!s.no_shadows, !s.no_creature_shadows, !s.no_light_shadows) {
@@ -2237,17 +2487,22 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         }
         tools.toggle(ui, &mut view.fog, icons::FOG, "Fog", "");
         let before = view.fade;
-        let fits =
-            Fits::before(ui, "fade-geometry", &format!("Fade Geometry: {}", view.fade.name()));
+        // (With Icons only, a glyph for what the list is: its tip says.)
+        let fade = match tools.icons_only {
+            true => format!("{} {}", icons::FADE, view.fade.name()),
+            false => format!("Fade Geometry: {}", view.fade.name()),
+        };
+        let fits = Fits::before(ui, "fade-geometry", &fade);
         // (The arrow keys step through it once it is clicked, as through
         // every list of choices.)
         let r = crate::widgets::dropdown("fade-geometry")
-            .selected_text(format!("Fade Geometry: {}", view.fade.name()))
+            .selected_text(fade)
             .show(ui, &mut view.fade, &Fade::ALL, |f| f.name())
             .on_hover_text(
-                "Tiles without the parts that fade in the game to show a character behind them \
-                 (roofs, upper walls), to see and place what is under them: never, while \
-                 working on objects (not with Select Tiles or a terrain brush), or always",
+                "Fade Geometry: tiles without the parts that fade in the game to show a \
+                 character behind them (roofs, upper walls), to see and place what is under \
+                 them: never, while working on objects (not with Select Tiles or a terrain \
+                 brush), or always",
             );
         fits.after(ui, &r);
         if view.fade != before {
@@ -2298,6 +2553,19 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             app.set_game_shaders(shaders);
         }
         tools.toggle(ui, &mut view.grid, icons::GRID, "Grid", "Display Grid");
+        if tools
+            .toggle(
+                ui,
+                &mut view.minimap,
+                icons::MINIMAP,
+                "Minimap",
+                "The area's map in the view's corner, as the game's map draws it, with where the \
+                 camera looks: click or drag on it to look there",
+            )
+            .changed()
+        {
+            app.settings.area_minimap = view.minimap;
+        }
         // Aurora's Play Placed Sounds, Play Ambient Sound, Play Ambient
         // Music (the Options › Sounds settings).
         let mut placed = !app.settings.no_placed_sounds;
@@ -2325,17 +2593,19 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         let music = &mut app.settings.ambient_music;
         tools.toggle(ui, music, icons::MUSIC, "Music", "Play ambient music in area");
         ui.separator();
+        let snap = if tools.icons_only { icons::SNAP } else { "Snap:" };
         let grid = |v: Option<u16>| {
-            v.map_or("Snap: off".to_string(), |cm| format!("Snap: {} m", f32::from(cm) / 100.0))
+            v.map_or(format!("{snap} off"), |cm| format!("{snap} {} m", f32::from(cm) / 100.0))
         };
         let fits = Fits::before(ui, "snap-grid", &grid(app.settings.snap_grid));
         let grids = [None, Some(25), Some(50), Some(100), Some(250), Some(500)];
         let r = crate::widgets::dropdown("snap-grid")
             .selected_text(grid(app.settings.snap_grid))
             .show(ui, &mut app.settings.snap_grid, &grids, |g| grid(*g))
-            .on_hover_text("Moved and placed objects snap to this grid");
+            .on_hover_text("Snap: moved and placed objects snap to this grid");
         fits.after(ui, &r);
-        let angle = |v: Option<u16>| v.map_or("Turn: free".to_string(), |a| format!("Turn: {a}°"));
+        let turn = if tools.icons_only { icons::TURN } else { "Turn:" };
+        let angle = |v: Option<u16>| v.map_or(format!("{turn} free"), |a| format!("{turn} {a}°"));
         let fits = Fits::before(ui, "snap-angle", &angle(app.settings.snap_angle));
         let angles = [None, Some(5), Some(15), Some(45), Some(90)];
         let r = crate::widgets::dropdown("snap-angle")
@@ -2359,11 +2629,26 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
                     });
                 },
             )
-            .on_hover_text("Turned objects snap to this angle; Q and E turn by it (15° when free)");
+            .on_hover_text(
+                "Turn: turned objects snap to this angle; Q and E turn by it (15° when free)",
+            );
         fits.after(ui, &r);
-        ui.toggle_value(&mut app.settings.turn_together, "Together").on_hover_text(
+        tools.toggle(
+            ui,
+            &mut app.settings.turn_together,
+            icons::TOGETHER,
+            "Together",
             "Several objects selected turn about their middle as one, keeping their places \
              among themselves; off, each turns where it stands",
+        );
+        tools.toggle(
+            ui,
+            &mut app.settings.place_onto_objects,
+            icons::ONTO_OBJECTS,
+            "Onto Objects",
+            "What is placed from the palette goes onto the top of the placeable or door under \
+             the pointer (a book on a table, a skull on an altar), up to 2 m above the ground; \
+             off, on the ground. Drop onto Object (Shift+G) sets what is selected so after",
         );
         walkmesh_button(ui, view, tools);
         let tip = app.keymap.titled(
@@ -2371,10 +2656,16 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             crate::keys::Cmd::SelectTiles,
             ui.ctx(),
         );
-        if tools
-            .toggle(ui, &mut view.tile_mode, icons::SELECT_TILES, "Select Tiles", &tip)
-            .changed()
-        {
+        // (Off on a read-only area: its tiles and placeables aren't
+        // changed.)
+        let editable = view.read_only.is_none();
+        let off = |ui: &mut egui::Ui, f: &mut dyn FnMut(&mut egui::Ui) -> egui::Response| {
+            if editable { f(ui) } else { ui.add_enabled_ui(false, |ui| f(ui)).inner }
+        };
+        let r = off(ui, &mut |ui| {
+            tools.toggle(ui, &mut view.tile_mode, icons::SELECT_TILES, "Select Tiles", &tip)
+        });
+        if r.changed() {
             view.selection.clear();
             view.tile_selection.clear();
             // (A tile brush would sit on top of tile mode.)
@@ -2388,11 +2679,16 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             crate::keys::Cmd::PaintPlaceables,
             ui.ctx(),
         );
-        if tools.toggle(ui, &mut app.paint, icons::PAINT, "Paint", &tip).changed() && app.paint {
+        let mut painting = app.paint && editable;
+        let r = off(ui, &mut |ui| tools.toggle(ui, &mut painting, icons::PAINT, "Paint", &tip));
+        if r.changed() {
+            app.paint = painting;
+        }
+        if r.changed() && app.paint {
             view.tile_mode = false;
             app.palette.tile_brush = None;
         }
-        if tools.button(ui, icons::PROPERTIES, "Area Properties", "").clicked() {
+        if tools.button(ui, icons::AREA_PROPERTIES, "Area Properties", "").clicked() {
             app.actions.push(Action::OpenTab(crate::Tab::AreaProperties(view.area)));
         }
         if tools.button(ui, icons::CAMERA, "Reorient Camera", "").clicked()
@@ -2411,7 +2707,7 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             "the area as it is now (its .are, .git and .gic), with the module's blueprints, \
              scripts and conversations it uses",
         );
-        if ui.button("To Scratch").on_hover_text(tip).clicked() {
+        if tools.button(ui, icons::TO_SCRATCH, "To Scratch", &tip).clicked() {
             app.actions.push(Action::ExportFiles {
                 keys: vec![ResKey::new(view.area, ResType::ARE)],
                 dependencies: true,
@@ -2420,10 +2716,13 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         }
         // Several objects chosen: they can be kept as a group to place
         // again (the palette's Prefabs has them).
+        let prefab = format!("Save {} as Prefab…", view.selection.len());
         if view.selection.len() > 1
-            && ui
-                .button(format!("Save {} as Prefab…", view.selection.len()))
-                .on_hover_text(
+            && tools
+                .button(
+                    ui,
+                    icons::PREFABS,
+                    &prefab,
                     "Keep the selected objects as a group, under a name, to place again in any \
                      area or module (the palette's Prefabs, or Edit › Prefabs)",
                 )
@@ -2497,6 +2796,17 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
             .to_string()
     } else if view.pasting {
         "Pasting: click to place the copies; right click or Escape: stop".to_string()
+    } else if app.palette.placing_start {
+        "Placing the start location: click to put it here, facing the way the view looks \
+         (Shift + click: and again); right click or Escape: stop"
+            .to_string()
+    } else if let Some(light) = app.palette.placing_light {
+        let name = light_of_row(app, light).map(|l| l.name);
+        format!(
+            "Placing a light ({}): click to put it here (Shift + click: place more); right click \
+             or Escape: stop",
+            name.unwrap_or_else(|| light.to_string())
+        )
     } else if let Some(key) = brush(app) {
         let what = match ObjectKind::from_restype(key.restype) {
             Some(k) if k.has_outline() => {
@@ -2598,7 +2908,8 @@ fn viewport(
     view: &mut AreaView,
     start: Option<(Vec3, f32)>,
 ) {
-    view.turn_ring = !app.settings.no_turn_ring;
+    // (None of the handles that change it on a read-only area.)
+    view.turn_ring = !app.settings.no_turn_ring && view.read_only.is_none();
     if let Some(scene) = view.scene.as_mut() {
         scene.merchant_signs = app.settings.merchant_signs;
         scene.spawn_markers = !app.settings.no_spawn_markers;
@@ -2676,15 +2987,8 @@ fn viewport(
     let mut ghost_instances = ghost_instances;
     let pasted: Vec<mg_area::AreaObject> = match (&app.object_clip, view.pasting) {
         (Some(clip), true) => {
-            // Over the view, not over a window in front of it.
-            let over = |p: &Pos2| {
-                let layer = ui.ctx().layer_id_at(*p);
-                let behind =
-                    layer.is_some_and(|l| l != ui.layer_id() && l.order != egui::Order::Tooltip);
-                view.rect.contains(*p) && !behind
-            };
-            let at = ui.ctx().pointer_hover_pos().filter(over);
-            let at = at.and_then(|p| view.ground_at(p, 0.0)).map(|at| view.snapped(at));
+            let at = view.pointer_over(ui).and_then(|p| view.ground_at(p, 0.0));
+            let at = at.map(|at| view.snapped(at));
             at.map_or_else(Vec::new, |at| {
                 let places = pasted_positions(view, clip, at);
                 let placed = clip.objects.iter().zip(places).map(|((o, _, _), p)| {
@@ -2710,7 +3014,11 @@ fn viewport(
     view.pasted_shown = pasted.len();
     // What the placeable brush has painted in the stroke going on, and the
     // dab it would lay next.
-    let painted = crate::paint_mode::ghosts(app, ui, view);
+    let painted = if view.read_only.is_none() {
+        crate::paint_mode::ghosts(app, ui, view)
+    } else {
+        Vec::new()
+    };
     if let (Some(scene), Some(vp), Some(game)) =
         (view.scene.as_mut(), app.viewport.as_ref(), app.game.as_deref())
     {
@@ -2728,6 +3036,8 @@ fn viewport(
     let clock = module_clock(app);
     let background = app.background_jobs;
     let shaders = app.game_shaders();
+    let high_shadows = app.settings.shadow_quality == crate::settings::ShadowQuality::High;
+    let sound_ranges = sound_ranges_of(app, view);
     let game_arc = app.game.clone();
     let (Some(model), Some(scene), Some(orbit), Some(vp), Some(game)) =
         (&view.model, &view.scene, view.orbit, app.viewport.as_mut(), app.game.as_deref())
@@ -2756,6 +3066,8 @@ fn viewport(
         spawn_markers: scene.spawn_markers,
         follows,
         shaders,
+        high_shadows,
+        sound_ranges: sound_ranges.clone(),
     };
     let since = view.drawn.as_ref().map(|(_, at)| view.time - at);
     let kept = !follows
@@ -2825,6 +3137,12 @@ fn viewport(
         if view.grid {
             frame.lines = grid_lines(view, &shown);
         }
+        let placed: Vec<(usize, Vec3)> = (shown.objects.iter())
+            .filter(|o| o.kind == ObjectKind::Sound)
+            .map(|o| (o.index, o.position))
+            .collect();
+        let size = (w as f32, h as f32);
+        frame.line_shapes = sound_range_shapes(&placed, &sound_ranges, &orbit.camera(), size);
         // Options › Area: the background colour, if chosen (gamma space).
         if let Some([r, g, b]) = app.settings.area_background {
             frame.background = [r, g, b].map(|c| f32::from(c) / 255.0);
@@ -2833,6 +3151,7 @@ fn viewport(
         // (As the picture's key has it: the switch may have changed this
         // frame.)
         vp.renderer.game_shaders = from.shaders;
+        vp.renderer.shadow_volumes = from.high_shadows;
         // (The game's programs made while the view goes on, Moonglow's own
         // shader drawing until they are: no frame waits on them. The view
         // is drawn again as the animations step, and when one is ready.)
@@ -2880,16 +3199,18 @@ fn viewport(
     // The start location where it is being dragged to.
     let start = match view.drag {
         Some(Drag::Start { at, facing, .. }) => Some((at, facing)),
+        // About to be placed (the palette's Start Location): under the
+        // pointer, facing the way the view looks.
+        _ if app.palette.placing_start => view
+            .pointer_over(ui)
+            .and_then(|p| view.ground_at(p, 0.0))
+            .map(|at| (at, view_facing(view))),
         _ => start,
     };
     overlays(ui, view, &shown, start, app.object_clip.as_ref(), door_brush, marks);
     sound_range_overlay(app, ui, view, &shown);
     // Where the pointer is, to the centimeter (Aurora shows whole meters).
-    view.pointer = ui
-        .ctx()
-        .pointer_hover_pos()
-        .filter(|p| view.rect.contains(*p))
-        .and_then(|p| view.ground_at(p, 0.0));
+    view.pointer = view.pointer_over(ui).and_then(|p| view.ground_at(p, 0.0));
     if let Some(p) = view.pointer {
         let painter = ui.painter_at(view.rect);
         let mut text = format!("{:.2}, {:.2}, {:.2}", p.x, p.y, p.z);
@@ -2920,24 +3241,172 @@ fn viewport(
     walkmesh_overlay(app, ui, view);
     object_walkmesh_overlay(app, ui, view);
     crate::terrain_mode::overlay(app, ui, view);
-    crate::paint_mode::overlay(app, ui, view);
+    if view.read_only.is_none() {
+        crate::paint_mode::overlay(app, ui, view);
+    }
     crate::tile_select::overlay(ui, view, app.tile_clip.as_ref());
     crate::tile_select::refused_overlay(ui, view);
     // Tiles animate: keep drawing while the view is on screen, when their
     // next step is due.
     let due = view.drawn.as_ref().map_or(0.0, |(_, at)| ANIMATION_STEP - (view.time - at));
     ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(due.clamp(0.0, 1.0)));
+    // (The map last: over the rest, and the pointer's there.)
+    minimap_overlay(app, ui, view);
     input(app, ui, view, &response);
 }
 
+/// The area's map in the view's top right corner (the toolbar's
+/// Minimap), as the game's map draws it: where the camera looks (its
+/// target, and the way it faces), and the objects selected. A click or a
+/// drag on it moves the camera's target there.
+fn minimap_overlay(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView) {
+    view.map_rect = None;
+    if !view.minimap {
+        return;
+    }
+    let mut kept = view.map.take();
+    let map = crate::minimap::of(app, ui.ctx(), view.area, &mut kept).cloned();
+    view.map = kept;
+    let Some(map) = map else { return };
+    let side = (view.rect.width().min(view.rect.height()) * 0.3).clamp(80.0, MINIMAP_SIDE);
+    let rect = map.placed(view.rect.right_top() + egui::vec2(-10.0, 10.0), side);
+    let painter = ui.painter_at(view.rect);
+    map.draw(&painter, rect);
+    let map_painter = painter.with_clip_rect(rect);
+    if let Some(model) = &view.model {
+        for o in view.chosen(model) {
+            let at = map.to_map(rect, o.position.truncate());
+            map_painter.circle_filled(at, 2.5, Color32::YELLOW);
+        }
+    }
+    if let Some(o) = view.orbit {
+        let camera = o.camera();
+        let at = map.to_map(rect, o.target.truncate());
+        // The way it looks: from the target on, as far as the camera is
+        // (a little at least).
+        if let Some(ahead) = (camera.target - camera.eye).truncate().try_normalize() {
+            let reach = (o.distance * 0.5).clamp(4.0, 40.0);
+            let tip = map.to_map(rect, o.target.truncate() + ahead * reach);
+            let wing = |turn: f32| {
+                let d = Vec2::from_angle(turn).rotate(ahead);
+                map.to_map(rect, o.target.truncate() + d * reach * 0.6)
+            };
+            let fill = Color32::from_rgba_unmultiplied(255, 255, 255, 50);
+            let edge = Stroke::new(1.0, Color32::from_gray(230));
+            let wedge = vec![at, wing(0.5), tip, wing(-0.5)];
+            map_painter.add(egui::Shape::convex_polygon(wedge.clone(), fill, Stroke::NONE));
+            outline(&map_painter, &wedge, edge);
+        }
+        map_painter.circle_filled(at, 3.5, Color32::WHITE);
+        map_painter.circle_stroke(at, 3.5, Stroke::new(1.0, Color32::BLACK));
+    }
+    let id = ui.id().with(("minimap", view.area));
+    // (Not focusable: a click on the map leaves the keys to the view.)
+    let r = ui.interact(rect, id, egui::Sense::CLICK | egui::Sense::DRAG);
+    let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if (r.clicked() || r.dragged())
+        && let Some(p) = r.interact_pointer_pos()
+        && let Some(o) = view.orbit.as_mut()
+    {
+        let to = map.point_under(rect, p);
+        let z = o.target.z;
+        let ground = view.ground.as_ref().and_then(|g| g.height(to, z));
+        o.target = to.extend(ground.unwrap_or(z));
+        ui.ctx().request_repaint();
+    }
+    view.map_rect = Some(rect);
+}
+
+/// The longest side of the view's map, points.
+const MINIMAP_SIDE: f32 = 240.0;
+
+/// Puts points on screen as [`AreaView::screen_pos`] does
+/// ([`AreaView::projector`]).
+#[derive(Clone, Copy)]
+struct Projector {
+    matrix: glam::Mat4,
+    near: f32,
+    rect: Rect,
+}
+
+impl Projector {
+    fn at(&self, p: Vec3) -> Option<Pos2> {
+        let at = mg_area::pick::project_by(self.matrix, self.near, p)?;
+        Some(self.rect.min + egui::vec2(at.x * self.rect.width(), at.y * self.rect.height()))
+    }
+}
+
+/// How far a point is from the eye along the view, less the near
+/// plane's distance, as `mg_area::pick::depth` has it.
+struct NearDepth {
+    eye: Vec3,
+    ahead: Vec3,
+    near: f32,
+}
+
+impl NearDepth {
+    fn of(camera: &Camera) -> NearDepth {
+        let to_target = camera.target - camera.eye;
+        NearDepth {
+            eye: camera.eye,
+            ahead: to_target / to_target.length().max(1e-6),
+            near: camera.near,
+        }
+    }
+
+    fn of_point(&self, p: Vec3) -> f32 {
+        (p - self.eye).dot(self.ahead) - self.near
+    }
+}
+
+/// A triangle on screen, as [`AreaView::screen_polygon`] puts it there
+/// (cut at the near plane: up to four corners, and how many), without
+/// cutting one wholly in front of the eye.
+fn face_on_screen(
+    view: &AreaView,
+    depth: &NearDepth,
+    to_screen: &Projector,
+    corners: [Vec3; 3],
+) -> ([Pos2; 4], usize) {
+    let mut points = [Pos2::ZERO; 4];
+    let mut count = 0;
+    if corners.iter().all(|&c| depth.of_point(c) >= 0.0) {
+        for p in corners.into_iter().filter_map(|c| to_screen.at(c)) {
+            points[count] = p;
+            count += 1;
+        }
+    } else {
+        // (Cut where it passes behind the eye: not left out whole.)
+        for p in view.screen_polygon(&corners, None).into_iter().take(points.len()) {
+            points[count] = p;
+            count += 1;
+        }
+    }
+    (points, count)
+}
+
+/// Whether points on screen all lie beyond one side of `rect` (a shape
+/// with those corners is wholly out of it).
+fn beside(points: &[Pos2], rect: Rect) -> bool {
+    points.iter().all(|p| p.x < rect.min.x)
+        || points.iter().all(|p| p.x > rect.max.x)
+        || points.iter().all(|p| p.y < rect.min.y)
+        || points.iter().all(|p| p.y > rect.max.y)
+}
+
 /// The ground's walkmesh over the view: walkable faces (surfacemat.2da
-/// `Walk`) green, the others red.
+/// `Walk`) green, the others red. (Every face of a large area, each
+/// frame the camera moves: a tile wholly out of the view is passed by,
+/// and a face wholly in front of the eye is put on screen without being
+/// cut, as [`AreaView::screen_polygon`] would leave it.)
 fn walkmesh_overlay(app: &Moonglow, ui: &egui::Ui, view: &mut AreaView) {
     if !view.walkmesh {
         return;
     }
     view.read_walkable(app);
-    let (Some(ground), Some(walkable)) = (view.ground.as_ref(), view.walkable.as_ref()) else {
+    let (Some(ground), Some(walkable), Some(camera), Some(to_screen)) =
+        (view.ground.as_ref(), view.walkable.as_ref(), view.camera(), view.projector())
+    else {
         return;
     };
     let mut mesh = egui::Mesh::default();
@@ -2945,31 +3414,48 @@ fn walkmesh_overlay(app: &Moonglow, ui: &egui::Ui, view: &mut AreaView) {
         egui::Color32::from_rgba_unmultiplied(60, 200, 80, 70),
         egui::Color32::from_rgba_unmultiplied(220, 60, 60, 70),
     );
-    for (corners, material) in ground.faces() {
-        let lifted = corners.map(|c| c + Vec3::Z * 0.03);
-        // (Cut where it passes behind the eye: not left out whole.)
-        let points = view.screen_polygon(&lifted, None);
-        if points.len() < 3 {
+    const LIFT: Vec3 = Vec3::new(0.0, 0.0, 0.03);
+    let depth = NearDepth::of(&camera);
+    for (w, to) in ground.tiles() {
+        // A tile wholly in front of the eye and beside the view: none of
+        // its faces show.
+        let corners = mg_render::box_corners(w.min + LIFT, w.max + LIFT)
+            .map(|c| to.transform_point3(c))
+            .map(|c| (depth.of_point(c) >= 0.0).then(|| to_screen.at(c)).flatten());
+        if let Some(points) = corners.into_iter().collect::<Option<Vec<Pos2>>>()
+            && beside(&points, view.rect)
+        {
             continue;
         }
-        let color =
-            if walkable.get(material as usize).copied().unwrap_or(false) { walk } else { wall };
-        let first = mesh.vertices.len() as u32;
-        for p in &points {
-            mesh.colored_vertex(*p, color);
-        }
-        for k in 1..points.len() as u32 - 1 {
-            mesh.add_triangle(first, first + k, first + k + 1);
+        for f in &w.faces {
+            let lifted = f.corners.map(|c| to.transform_point3(c) + LIFT);
+            let (points, count) = face_on_screen(view, &depth, &to_screen, lifted);
+            let points = &points[..count];
+            if points.len() < 3 || beside(points, view.rect) {
+                continue;
+            }
+            let color = if walkable.get(f.material as usize).copied().unwrap_or(false) {
+                walk
+            } else {
+                wall
+            };
+            let first = mesh.vertices.len() as u32;
+            for p in points {
+                mesh.colored_vertex(*p, color);
+            }
+            for k in 1..points.len() as u32 - 1 {
+                mesh.add_triangle(first, first + k, first + k + 1);
+            }
         }
     }
     ui.painter_at(view.rect).add(egui::Shape::mesh(mesh));
 }
 
-/// Where the placed sounds are heard (the Sound Ranges switch): around
-/// each positional sound, level at its height, a circle of its
-/// `MinDistance` (full volume inside) and one of its `MaxDistance` (silent
-/// outside); the selection's brighter. A sound heard everywhere in the
-/// area has none.
+/// Where a placed sound may play from (the Sound Ranges switch), if its
+/// place is random: a rectangle about where it stands, its ranges wide,
+/// as Aurora draws it; the selection's brighter. Its distances are drawn
+/// in the picture, hidden by what stands in front of them
+/// ([`sound_range_shapes`]).
 fn sound_range_overlay(app: &mut Moonglow, ui: &egui::Ui, view: &AreaView, shown: &AreaModel) {
     if !view.sound_ranges || !view.show[ObjectKind::Sound.index()] {
         return;
@@ -2987,8 +3473,6 @@ fn sound_range_overlay(app: &mut Moonglow, ui: &egui::Ui, view: &AreaView, shown
             continue;
         }
         let alpha = if chosen.contains(&(o.kind, o.index)) { 255 } else { 150 };
-        // Where it may play from, if its place is random: so far each way
-        // east and north of where it stands.
         if let Some(reach) = list.get(o.index).and_then(random_reach) {
             let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(240, 150, 60, alpha));
             let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
@@ -2999,38 +3483,179 @@ fn sound_range_overlay(app: &mut Moonglow, ui: &egui::Ui, view: &AreaView, shown
                 }
             }
         }
-        for (radius, width) in [(sound.min_distance, 2.0), (sound.max_distance, 1.0)] {
-            if radius <= 0.0 {
-                continue;
-            }
-            let stroke = Stroke::new(width, Color32::from_rgba_unmultiplied(240, 220, 80, alpha));
-            let points = sound_circle(o.position, radius);
-            for k in 0..points.len() {
-                if let Some(line) = view.screen_segment(points[k], points[(k + 1) % points.len()]) {
-                    painter.line_segment(line, stroke);
-                }
-            }
-        }
     }
 }
 
-/// How far east and north of itself a placed sound may play (its
-/// `RandomRangeX` and `RandomRangeY`), if its position is random.
+/// The positional sounds whose distances Sound Ranges draws (none while
+/// it is off or the sounds are hidden), read from the area's GIT.
+fn sound_ranges_of(app: &mut Moonglow, view: &AreaView) -> Vec<SoundRange> {
+    if !view.sound_ranges || !view.show[ObjectKind::Sound.index()] {
+        return Vec::new();
+    }
+    let chosen = view.selected_set();
+    let Some(ws) = app.ws.as_mut() else { return Vec::new() };
+    let Ok(doc) = ws.doc(&view.git()) else { return Vec::new() };
+    let list = doc.root.list(ObjectKind::Sound.list()).unwrap_or(&[]);
+    (list.iter().enumerate())
+        .map(|(index, s)| (index, crate::area_audio::PlacedSound::from_git(s)))
+        .filter(|(_, s)| s.positional)
+        .map(|(index, s)| SoundRange {
+            index,
+            min: s.min_distance,
+            max: s.max_distance,
+            chosen: chosen.contains(&(ObjectKind::Sound, index)),
+        })
+        .collect()
+}
+
+/// Sound Ranges in the picture, as Aurora draws them (captured
+/// 2026-10-29: a sound of distances 3 and 12, from above and pitched):
+/// about each positional sound a dotted sphere of its `MinDistance` (full
+/// volume inside) and one of its `MaxDistance` (silent outside), and a
+/// level circle at its height of the `MaxDistance`; the selection's
+/// brighter. Lines of the scene, so the ground and what stands in front
+/// hide them (the spheres' lower halves go under the floor); each
+/// sphere's rings have as many dots as its size on the picture calls for
+/// (the picture's size in pixels), and those wholly out of the picture
+/// are left out. Each a copy of a sphere or circle of that many dots
+/// ([`sound_shapes`]): an area of hundreds of sounds is a hundred
+/// thousand dashes, which the GPU keeps (sent each frame, they were most
+/// of a frame's time).
+fn sound_range_shapes(
+    placed: &[(usize, Vec3)],
+    ranges: &[SoundRange],
+    camera: &mg_render::Camera,
+    (width, height): (f32, f32),
+) -> Vec<mg_render::LineShape> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let (spheres, circles) = sound_shapes();
+    let mut sphere_copies = vec![Vec::new(); spheres.len()];
+    let mut circle_copies = vec![Vec::new(); circles.len()];
+    // (Pixels a metre is across at a metre from the eye.)
+    let tan_y = (camera.fov_y / 2.0).tan();
+    let tan_x = tan_y * width / height.max(1.0);
+    let per_metre = height / 2.0 / tan_y;
+    let view = camera.view();
+    // Whether a sphere is out of the picture (wholly beside, above, below
+    // or behind it): none of it drawn.
+    let out_of_sight = |centre: Vec3, radius: f32| {
+        let p = view.transform_point3(centre);
+        let depth = -p.z;
+        let beside =
+            |along: f32, tan: f32| along.abs() > depth * tan + radius * (1.0 + tan * tan).sqrt();
+        depth < -radius || beside(p.x, tan_x) || beside(p.y, tan_y)
+    };
+    let by_index: std::collections::HashMap<usize, &SoundRange> =
+        ranges.iter().map(|r| (r.index, r)).collect();
+    for &(index, position) in placed {
+        let Some(&range) = by_index.get(&index) else { continue };
+        if out_of_sight(position, range.min.max(range.max)) {
+            continue;
+        }
+        let alpha = if range.chosen { 1.0 } else { 0.8 };
+        let color = [240.0 / 255.0, 220.0 / 255.0, 80.0 / 255.0, alpha];
+        // A ring's length on the picture, in pixels, at its nearest.
+        let across = |radius: f32| {
+            let far = (position.distance(camera.eye) - radius).max(0.5);
+            std::f32::consts::TAU * radius * per_metre / far
+        };
+        for radius in [range.min, range.max] {
+            if radius <= 0.0 {
+                continue;
+            }
+            let dots = ((across(radius) / 18.0) as usize).clamp(SPHERE_DOTS.0, SPHERE_DOTS.1);
+            let copy = mg_render::LineCopy { offset: position, scale: radius, color };
+            sphere_copies[dots - SPHERE_DOTS.0].push(copy);
+        }
+        if range.max > 0.0 {
+            let steps = ((across(range.max) / 10.0) as usize).clamp(CIRCLE_STEPS.0, CIRCLE_STEPS.1);
+            let copy = mg_render::LineCopy { offset: position, scale: range.max, color };
+            circle_copies[steps - CIRCLE_STEPS.0].push(copy);
+        }
+    }
+    let shapes = spheres.iter().zip(sphere_copies).chain(circles.iter().zip(circle_copies));
+    shapes
+        .filter(|(_, copies)| !copies.is_empty())
+        .map(|(lines, copies)| mg_render::LineShape { lines: lines.clone(), copies })
+        .collect()
+}
+
+/// The dots a ring of a Sound Ranges sphere has, fewest and most.
+const SPHERE_DOTS: (usize, usize) = (8, 32);
+/// The steps of a Sound Ranges circle, fewest and most.
+const CIRCLE_STEPS: (usize, usize) = (16, 64);
+
+/// Sound Ranges' shapes, made once: a sphere a metre across about the
+/// origin ([`sound_sphere`]) for each number of dots a ring
+/// ([`SPHERE_DOTS`]), and a circle ([`sound_circle`]) for each number of
+/// steps ([`CIRCLE_STEPS`]); each sound's are copies of them, moved to it
+/// and scaled to its distance.
+#[allow(clippy::type_complexity)]
+fn sound_shapes() -> &'static (Vec<std::sync::Arc<[[Vec3; 2]]>>, Vec<std::sync::Arc<[[Vec3; 2]]>>) {
+    static SHAPES: std::sync::OnceLock<(
+        Vec<std::sync::Arc<[[Vec3; 2]]>>,
+        Vec<std::sync::Arc<[[Vec3; 2]]>>,
+    )> = std::sync::OnceLock::new();
+    SHAPES.get_or_init(|| {
+        let spheres = (SPHERE_DOTS.0..=SPHERE_DOTS.1)
+            .map(|dots| sound_sphere(Vec3::ZERO, 1.0, dots).into())
+            .collect();
+        let circles = (CIRCLE_STEPS.0..=CIRCLE_STEPS.1)
+            .map(|steps| {
+                let points = sound_circle(Vec3::ZERO, 1.0, steps);
+                (0..points.len()).map(|k| [points[k], points[(k + 1) % points.len()]]).collect()
+            })
+            .collect();
+        (spheres, circles)
+    })
+}
+
+/// How far east or west and north or south of itself a placed sound may
+/// play, if its position is random: half its `RandomRangeX` and
+/// `RandomRangeY`, which are the rectangle's width and depth, as Aurora
+/// draws it (captured 2026-10-29: a sound of 6 and 2 has a rectangle 6 m
+/// by 2 about it).
 fn random_reach(sound: &mg_gff::Struct) -> Option<glam::Vec2> {
     let reach = glam::Vec2::new(
         sound.float("RandomRangeX").unwrap_or(0.0),
         sound.float("RandomRangeY").unwrap_or(0.0),
-    );
+    ) / 2.0;
     (sound.integer("RandomPosition").unwrap_or(0) != 0 && reach.max_element() > 0.0)
         .then_some(reach)
 }
 
-/// The points of a level circle around `centre`.
-fn sound_circle(centre: Vec3, radius: f32) -> Vec<Vec3> {
-    const POINTS: usize = 64;
-    (0..POINTS)
+/// The dots of a sphere of `radius` about `centre`, as Sound Ranges draws
+/// a distance, each a short dash along its ring: rings at three heights
+/// (its middle and 45° above and below) and through its poles four
+/// ways, `dots` a ring.
+pub(crate) fn sound_sphere(centre: Vec3, radius: f32, dots: usize) -> Vec<[Vec3; 2]> {
+    use std::f32::consts::{PI, TAU};
+    let step = TAU / dots.max(1) as f32;
+    // (A dash a third of the way to the next dot.)
+    let dash = step / 3.0;
+    let mut out = Vec::new();
+    for latitude in [-45f32, 0.0, 45.0] {
+        let (z, r) = (latitude.to_radians().sin() * radius, latitude.to_radians().cos() * radius);
+        let at = |a: f32| centre + Vec3::new(a.cos() * r, a.sin() * r, z);
+        out.extend((0..dots).map(|k| k as f32 * step).map(|a| [at(a), at(a + dash)]));
+    }
+    // (Each meridian a great circle through the poles.)
+    for m in 0..4 {
+        let along = m as f32 / 4.0 * PI;
+        let (cx, cy) = (along.cos(), along.sin());
+        let at = |a: f32| centre + Vec3::new(cx * a.cos(), cy * a.cos(), a.sin()) * radius;
+        out.extend((0..dots).map(|k| k as f32 * step).map(|a| [at(a), at(a + dash)]));
+    }
+    out
+}
+
+/// The `points` points of a level circle around `centre`.
+fn sound_circle(centre: Vec3, radius: f32, points: usize) -> Vec<Vec3> {
+    (0..points)
         .map(|k| {
-            let a = k as f32 / POINTS as f32 * std::f32::consts::TAU;
+            let a = k as f32 / points as f32 * std::f32::consts::TAU;
             centre + Vec3::new(a.cos(), a.sin(), 0.0) * radius
         })
         .collect()
@@ -3177,8 +3802,14 @@ fn held_menu<'r>(ui: &egui::Ui, r: &'r egui::Response) -> (bool, egui::Popup<'r>
 
 /// The Shadows button: down while any kind of shadow is drawn; a click
 /// turns them all off, or on again as they were (all at first); held or
-/// right-clicked, the kinds to choose from.
-fn shadows_button(ui: &mut egui::Ui, view: &mut AreaView, tools: crate::icons::Tools) {
+/// right-clicked, the kinds to choose from and their `quality` (Options ›
+/// Area's, every area view's).
+fn shadows_button(
+    ui: &mut egui::Ui,
+    view: &mut AreaView,
+    tools: crate::icons::Tools,
+    quality: &mut crate::settings::ShadowQuality,
+) {
     let kinds = [view.shadows, view.creature_shadows, view.light_shadows];
     let on = kinds.iter().any(|&k| k);
     let r = tools.add(
@@ -3212,6 +3843,11 @@ fn shadows_button(ui: &mut egui::Ui, view: &mut AreaView, tools: crate::icons::T
              from the nearest light that casts them (a light node with `shadow 1` and a radius \
              of 10 m or more: a placeable's light), as in the game",
         );
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Quality");
+            crate::options::shadow_quality_choice(ui, quality);
+        });
     });
 }
 
@@ -3266,9 +3902,17 @@ fn overlays(
         let font = egui::FontId::proportional(13.0);
         painter.text(at, egui::Align2::LEFT_BOTTOM, text, font, Color32::WHITE);
     };
-    // (A line is cut where it passes behind the eye.)
+    // (A line is cut where it passes behind the eye, as
+    // `AreaView::screen_segment` cuts it: the camera worked out once for
+    // the thousands of lines of a large selection.)
+    let (camera, to_screen) = (view.camera(), view.projector());
+    let segment = |a: Vec3, b: Vec3| {
+        let (camera, to_screen) = (camera.as_ref()?, to_screen?);
+        let (a, b) = mg_area::pick::clip_segment(camera, a, b, camera.near)?;
+        Some([to_screen.at(a)?, to_screen.at(b)?])
+    };
     let line = |a: Vec3, b: Vec3, stroke: Stroke| {
-        if let Some(points) = view.screen_segment(a, b) {
+        if let Some(points) = segment(a, b) {
             painter.line_segment(points, stroke);
         }
     };
@@ -3387,9 +4031,10 @@ fn overlays(
         }
         // A light with nothing to see: a small sun in its color, where it
         // shines from; dark gray with Illuminated off.
-        if let Some((color, on)) = scene.and_then(|s| s.bare_light(shown, i))
+        if let Some(light) = scene.and_then(|s| s.bare_light(shown, i))
             && let Some(c) = at(o.position)
         {
+            let (color, on) = (light.color, light.on);
             let top = color.max_element().max(1e-3);
             let rgb =
                 if on { (color / top * 255.0).to_array().map(|v| v as u8) } else { [70, 70, 70] };
@@ -3404,11 +4049,10 @@ fn overlays(
             // Selected, how far it reaches: where the game's light ends
             // (20 m, further for a color brighter than 1), level with it.
             if selected {
-                let reach = mg_render::PointLight::new(Vec3::ZERO, color, LIGHT_RADIUS, false, 4);
                 let ring: Vec<Pos2> = (0..96)
                     .filter_map(|k| {
                         let a = k as f32 / 96.0 * std::f32::consts::TAU;
-                        at(o.position + Vec3::new(a.cos(), a.sin(), 0.0) * reach.cutoff)
+                        at(o.position + Vec3::new(a.cos(), a.sin(), 0.0) * light.reach)
                     })
                     .collect();
                 if ring.len() == 96 {
@@ -3430,9 +4074,12 @@ fn overlays(
                 _ => Color32::from_rgb(230, 70, 70),
             };
             let stroke = if selected { highlight } else { Stroke::new(1.5, color) };
-            for (a, b) in box_edges(transform, min, max) {
-                line(a, b, stroke);
-            }
+            // (Painted together: one at a time, each of thousands took
+            // the window's lock.)
+            let edges = box_edges(transform, min, max).filter_map(|(a, b)| {
+                segment(a, b).map(|points| egui::Shape::LineSegment { points, stroke })
+            });
+            painter.extend(edges.collect::<Vec<_>>());
         }
     }
     if view.pasting
@@ -3494,7 +4141,8 @@ fn overlays(
         None => ui.input(|i| i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt),
     };
     // With them, the handle for scaling its model: a square on a stalk
-    // from its feet, pulled away to grow it and pushed in to shrink it.
+    // from its feet, pulled away to grow it and pushed in to shrink it
+    // (and following the pointer as it is).
     let scaling = matches!(view.drag, Some(Drag::Scale { .. }));
     if scaling || (tilting && view.drag.is_none()) {
         let over = ui
@@ -3502,12 +4150,19 @@ fn overlays(
             .pointer_hover_pos()
             .filter(|_| view.drag.is_none())
             .and_then(|p| view.scale_handle_at(p));
+        let pointer = ui.ctx().pointer_latest_pos();
         let white = Color32::from_rgb(240, 240, 240);
         for (pivot, handle) in view.scale_handles(shown) {
             let lit = scaling || over == Some(pivot);
             let color = if lit { white } else { white.gamma_multiply(0.75) };
-            line(pivot, handle, Stroke::new(1.0, color));
-            if let Some(c) = at(handle) {
+            let drawn = view.scale_handle_drawn(pivot, handle, pointer);
+            match (scaling, drawn, at(pivot)) {
+                (true, Some(c), Some(foot)) => {
+                    painter.line_segment([foot, c], Stroke::new(1.0, color));
+                }
+                _ => line(pivot, handle, Stroke::new(1.0, color)),
+            }
+            if let Some(c) = drawn {
                 let half = if lit { SCALE_HANDLE + 1.0 } else { SCALE_HANDLE };
                 let square = Rect::from_center_size(c, egui::Vec2::splat(half * 2.0));
                 painter.rect_filled(square, 1.0, color);
@@ -3716,6 +4371,17 @@ fn overlays(
                 );
             }
         }
+        // The pointer says the marker can be taken hold of (its ring, its
+        // arrow's lines, its tip): a hand, closed while it is held.
+        let over = view.drag.is_none()
+            && view.pointer_over(ui).is_some_and(|q| {
+                view.start_grab((p, facing), q).is_some() && view.pick(q).is_none()
+            });
+        if held {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if over {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
     }
 }
 
@@ -3759,6 +4425,15 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     if view.tile_mode && !was_tile_mode {
         app.palette.tile_brush = None;
     }
+    // A read-only area (another builder's): looked at, selected in and
+    // its objects' Properties opened (gray), nothing changed. What would
+    // change it is off: what is dropped on it is not placed, and the
+    // brushes, pastes and handles do nothing. (The start location is the
+    // module's, not the area's: it still moves.)
+    let read_only = view.read_only.clone();
+    let refused = |app: &mut Moonglow, why: &str| {
+        app.log.warn(format!("Not placed: {why}, and the project keeps others' areas read-only"));
+    };
     // (Asked of each kind only when that is what is dragged: asking takes
     // the payload, whatever it is.)
     type Blueprint = crate::palette_view::Dragged;
@@ -3766,13 +4441,19 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     if egui::DragAndDrop::has_payload_of_type::<Blueprint>(ui.ctx())
         && let Some(dragged) = response.dnd_release_payload::<Blueprint>()
     {
-        drop_blueprint(app, view, response, dragged.0);
+        match &read_only {
+            Some(why) => refused(app, why),
+            None => drop_blueprint(app, view, response, dragged.0),
+        }
         return;
     }
     if egui::DragAndDrop::has_payload_of_type::<Appearance>(ui.ctx())
         && let Some(dragged) = response.dnd_release_payload::<Appearance>()
     {
-        drop_appearance(app, view, response, &dragged);
+        match &read_only {
+            Some(why) => refused(app, why),
+            None => drop_appearance(app, view, response, &dragged),
+        }
         return;
     }
     // A tile from the tiles palette's Gallery: placed where it is dropped.
@@ -3780,9 +4461,13 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     if egui::DragAndDrop::has_payload_of_type::<Tile>(ui.ctx())
         && let Some(dragged) = response.dnd_release_payload::<Tile>()
     {
-        crate::terrain_mode::drop_tile(app, view, response, &dragged);
+        match &read_only {
+            Some(why) => refused(app, why),
+            None => crate::terrain_mode::drop_tile(app, view, response, &dragged),
+        }
         return;
     }
+    let read_only = read_only.is_some();
     // Q and E turn a blueprint about to be placed (dragged, or chosen in
     // the palette), as they turn a selection; doors face as their hooks do.
     let placing = view.ghost_shown.as_ref().filter(|o| o.kind != ObjectKind::Door).is_some()
@@ -3797,6 +4482,7 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     // B, the toolbar's Paint: the placeable brush on or off.
     let typing = ui.ctx().memory(|m| m.focused().is_some());
     if !typing
+        && !read_only
         && response.hovered()
         && ui.input(|i| app.keymap.pressed(i, crate::keys::Cmd::PaintPlaceables))
     {
@@ -3808,7 +4494,11 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     }
     // The tile tools' keys: on the tiles selected, or the tool chosen.
     // (Not while a tree goes to its lines by letters, as the camera's.)
-    if !typing && response.hovered() && !app.paint && !crate::palette_view::letters_taken(ui.ctx())
+    if !typing
+        && !read_only
+        && response.hovered()
+        && !app.paint
+        && !crate::palette_view::letters_taken(ui.ctx())
     {
         crate::terrain_mode::tool_keys(app, ui, view);
     }
@@ -3828,13 +4518,13 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
         }
         return;
     }
-    if crate::paint_mode::input(app, ui, view, response) {
+    if !read_only && crate::paint_mode::input(app, ui, view, response) {
         return;
     }
-    if crate::tile_select::paste_input(app, ui, view, response) {
+    if !read_only && crate::tile_select::paste_input(app, ui, view, response) {
         return;
     }
-    if crate::tile_select::input(app, ui, view, response) {
+    if !read_only && crate::tile_select::input(app, ui, view, response) {
         if response.secondary_clicked() {
             view.tile_menu_at = response.interact_pointer_pos();
         }
@@ -3857,17 +4547,16 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
                 let what = if n == 1 { "1 object".to_string() } else { format!("{n} objects") };
                 crate::widgets::mark_clipboard(ui.ctx(), &what);
             }
-            if cut {
+            if cut && !read_only {
                 delete(app, view);
             }
         }
-        if pasted && app.object_clip.is_some() {
+        if pasted && !read_only && app.object_clip.is_some() {
             view.pasting = true;
         }
     }
     if view.pasting {
-        let cancel = response.secondary_clicked()
-            || (hovered && ui.input(|i| i.key_pressed(egui::Key::Escape)));
+        let cancel = cancelled(ui, response);
         if cancel {
             view.pasting = false;
         } else if response.clicked()
@@ -3882,8 +4571,7 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
 
     // Drawing a trigger's or encounter's outline anew.
     if let Some((kind, index)) = view.redraw {
-        let cancel = response.secondary_clicked()
-            || (hovered && ui.input(|i| i.key_pressed(egui::Key::Escape)));
+        let cancel = cancelled(ui, response);
         if cancel {
             view.redraw = None;
             view.outline.clear();
@@ -3912,10 +4600,52 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
         return;
     }
 
+    // Placing the start location (the palette's Start Location): where a
+    // click puts it, facing the way the view looks, as the menu's Set
+    // Start Location Here.
+    if app.palette.placing_start {
+        // (Its marker shown, to be seen where it would go.)
+        if !view.show_start {
+            view.show_start = true;
+            share_shown(app, view);
+        }
+        if cancelled(ui, response) {
+            app.palette.placing_start = false;
+        } else if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(at) = view.ground_at(pos, 0.0)
+        {
+            set_start_location(app, view, at, view_facing(view));
+            view.selection.clear();
+            view.start_selected = true;
+            if !shift {
+                app.palette.placing_start = false;
+            }
+        }
+        return;
+    }
+
+    // Placing a light (the palette's Lights): where a click puts it, as
+    // the menu's Add Light Here.
+    if let Some(row) = app.palette.placing_light.filter(|_| !read_only) {
+        if cancelled(ui, response) {
+            app.palette.placing_light = None;
+        } else if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(at) = view.ground_at(pos, 0.0)
+            && let Some(light) = light_of_row(app, row)
+        {
+            add_light(app, view, &light, at);
+            if !shift {
+                app.palette.placing_light = None;
+            }
+        }
+        return;
+    }
+
     // Placing the palette's blueprint.
-    if let Some(key) = brush(app) {
-        let cancel = response.secondary_clicked()
-            || (hovered && ui.input(|i| i.key_pressed(egui::Key::Escape)));
+    if let Some(key) = brush(app).filter(|_| !read_only) {
+        let cancel = cancelled(ui, response);
         if cancel {
             app.palette.selected = None;
             view.outline.clear();
@@ -3965,7 +4695,7 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
                     }
                     None => app.log.warn("Doors go on door hooks: click near one"),
                 }
-            } else {
+            } else if let Some(at) = view.put_down_at(pos) {
                 place(app, view, key, at, view.ghost_turn, &[]);
                 if !shift {
                     app.palette.selected = None;
@@ -4021,6 +4751,18 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     {
         view.selection = vec![(o.kind, o.index)];
     }
+    // A right click on the start location's marker, nothing else selected,
+    // selects it: its menu's Adjust Location is the start location's. (With
+    // objects selected the menu stays theirs.)
+    if response.secondary_clicked()
+        && view.selection.is_empty()
+        && let Some(pos) = response.interact_pointer_pos()
+        && view.pick(pos).is_none()
+        && start_on_ground(app, view).is_some_and(|s| view.start_grab(s, pos).is_some())
+    {
+        view.selection.clear();
+        view.start_selected = true;
+    }
     // A double click opens the object's Properties (a quick one after
     // another click counts as a triple).
     if (response.double_clicked() || response.triple_clicked())
@@ -4031,6 +4773,7 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
         let (kind, index) = (o.kind, o.index);
         open_properties(app, view, kind, index);
     } else if response.double_clicked()
+        && !read_only
         && view.drag.is_none()
         && !view.pasting
         && brush(app).is_none()
@@ -4118,13 +4861,15 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
             // camera moves (GitHub issue 25: Alt + drag anywhere raised
             // the selection, and did nothing with none).
             let on_selection = hit.is_some_and(|i| view.selected(i));
-            Some(if on_selection { Drag::Lift { by: 0.0 } } else { Drag::Pan })
+            Some(if on_selection && !read_only { Drag::Lift { by: 0.0 } } else { Drag::Pan })
         } else if let Some(i) = hit {
             let o = view.model.as_ref().map(|m| m.objects[i].clone()).expect("picked");
             if !view.selected(i) {
                 view.selection = vec![(o.kind, o.index)];
             }
-            view.ground_at(pos, o.position.z).map(|from| Drag::Move { from, offset: Vec2::ZERO })
+            // (Read-only: picked, and not moved.)
+            let from = view.ground_at(pos, o.position.z).filter(|_| !read_only);
+            from.map(|from| Drag::Move { from, offset: Vec2::ZERO })
         } else if let Some((was, turn)) = start_on_ground(app, view)
             .filter(|_| !shift && !alt)
             .and_then(|s| Some((s, view.start_grab(s, pos)?)))
@@ -4141,6 +4886,7 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     }
     if response.drag_started_by(egui::PointerButton::Secondary)
         && view.drag.is_none()
+        && !read_only
         && alt
         && !command
         && !view.selection.is_empty()
@@ -4335,7 +5081,7 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     // Q and E (Options › Keyboard) turn the selection by the snapping angle
     // (15° when free), Shift + Q and E by 90°; G drops it to the ground.
     // (While placing, they turn what is being placed instead.)
-    if hovered && !typing && !placing && !view.selection.is_empty() {
+    if hovered && !typing && !placing && !read_only && !view.selection.is_empty() {
         use crate::keys::Cmd;
         // (Which were pressed first: what they do changes the app, not
         // the keys.)
@@ -4353,10 +5099,21 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
             drop_onto_objects(app, view);
         }
     }
+    // And the start location's marker, selected: Q and E turn it.
+    if hovered && !typing && !placing && view.start_is_selected() && view.drag.is_none() {
+        let pressed = |c: crate::keys::Cmd| ui.input(|i| app.keymap.pressed(i, c));
+        let by: f32 = turn_keys(view).into_iter().filter(|(c, _)| pressed(*c)).map(|t| t.1).sum();
+        if by != 0.0
+            && let Some((_, facing)) = start_on_ground(app, view)
+        {
+            turn_start_location(app, facing + by);
+        }
+    }
     // (Delete in a text field is the field's, as the tile selection has it:
     // it deleted the selection under the pointer too.)
     if hovered
         && !typing
+        && !read_only
         && !view.selection.is_empty()
         && ui.input(|i| i.key_pressed(egui::Key::Delete))
     {
@@ -4366,15 +5123,26 @@ fn input(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView, response: &egui
     // first): nothing selected.
     let idle = !in_hand && view.drag.is_none() && !view.pasting && brush(app).is_none();
     if idle
-        && hovered
         && !view.held.on
-        && ui.input(|i| i.key_pressed(egui::Key::Escape))
+        && escaped(ui, response)
         && crate::terrain_mode::active(app, view).is_none()
     {
         view.selection.clear();
         view.tile_selection.clear();
         view.start_selected = false;
     }
+}
+
+/// Escape pressed over the view (not where a window in front of it, or
+/// a field elsewhere, takes it): what is in hand is put down.
+pub(crate) fn escaped(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.hovered() && ui.input(|i| i.key_pressed(egui::Key::Escape))
+}
+
+/// Escape over the view ([`escaped`]) or a right click on it: the brush,
+/// a paste, an outline being drawn, a stroke, put down.
+pub(crate) fn cancelled(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.secondary_clicked() || escaped(ui, response)
 }
 
 /// The camera: Ctrl + drag moves it, Ctrl + right or middle drag (or a
@@ -4449,32 +5217,17 @@ fn camera_input(
         pan(o, Vec2::new(-d.x, d.y) * per_pixel);
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     }
-    // (egui turns the wheel sideways with Shift held.)
-    // (And with Ctrl held it reports the wheel as a zoom, not a scroll.)
-    let zoom_speed = ui.ctx().options(|o| o.input_options.scroll_zoom_speed);
-    let (scroll, slow) = ui.input(|i| {
-        let d = i.smooth_scroll_delta;
-        let mut scroll = if i.modifiers.shift && d.y == 0.0 { d.x } else { d.y };
-        if scroll == 0.0 && i.modifiers.command && zoom_speed > 0.0 {
-            scroll = i.zoom_delta().ln() / zoom_speed;
-        }
-        (scroll, shift || i.modifiers.command)
-    });
-    let scroll = if scaling { 0.0 } else { scroll };
+    let wheel = Wheel::read(ui);
+    let scroll = if scaling { 0.0 } else { wheel.zoom };
     if scroll != 0.0 && response.hovered() && command && shift {
         // Ctrl + Shift + wheel: up and down, finer the nearer the view.
         raise(o, scroll * 0.0006 * o.distance);
     } else if scroll != 0.0 && response.hovered() {
-        let rate = if slow { 0.001 } else { 0.002 };
-        o.distance = (o.distance * (-scroll * rate).exp()).clamp(1.0, 2000.0);
+        o.distance = wheel.zoomed(o.distance, (1.0, 2000.0));
     }
-    // A sideways scroll (a wheel tilted, a second wheel, two fingers on a
-    // touchpad) pans the view left and right, as the screen has it, the
-    // ground following as it does a drag. (Not Shift and the wheel, which
-    // egui reports sideways: that zooms finer. GitHub issue 26.)
-    let sideways = ui.input(|i| if i.modifiers.shift { 0.0 } else { i.smooth_scroll_delta.x });
-    if sideways != 0.0 && response.hovered() && !scaling {
-        pan(o, Vec2::new(-sideways, 0.0) * per_pixel);
+    // The ground following a sideways scroll as it does a drag.
+    if wheel.sideways != 0.0 && response.hovered() && !scaling {
+        pan(o, Vec2::new(-wheel.sideways, 0.0) * per_pixel);
     }
     if !active {
         return;
@@ -4567,7 +5320,7 @@ fn drop_blueprint(app: &mut Moonglow, view: &mut AreaView, response: &egui::Resp
             Some(h) => place(app, view, key, h.position, h.bearing, &[]),
             None => app.log.warn("Doors go on door hooks: drop it near one"),
         }
-    } else {
+    } else if let Some(at) = pointer.and_then(|pos| view.put_down_at(pos)) {
         place(app, view, key, at, view.ghost_turn, &[]);
     }
     // Placed, as a click places it: the palette's choice is let go (with
@@ -4659,8 +5412,8 @@ fn place(
 ) {
     use mg_module::instances::{OUTLINE_LIFT, Placement};
     let Some(kind) = ObjectKind::from_restype(key.restype) else { return };
-    // On the grid (doors go on their hooks; outlines are drawn point by point).
-    let at = if kind == ObjectKind::Door || kind.has_outline() { at } else { view.snapped(at) };
+    // (`at` is on the grid already, or onto an object: `put_down_at`.
+    // Doors go on their hooks; outlines are drawn point by point.)
     let ground = |p: Vec3| view.ground.as_ref().and_then(|g| g.height(p.truncate(), p.z));
     let position = at + Vec3::Z * lift(kind);
     let relative: Vec<[f32; 3]> = outline
@@ -4702,16 +5455,10 @@ fn turn_keys(view: &AreaView) -> [(crate::keys::Cmd, f32); 4] {
 
 /// The twelve edges of the box `min`–`max` placed by `t`.
 fn box_edges(t: glam::Mat4, min: Vec3, max: Vec3) -> impl Iterator<Item = (Vec3, Vec3)> {
-    let c = move |i: usize| {
-        t.transform_point3(Vec3::new(
-            if i & 1 == 0 { min.x } else { max.x },
-            if i & 2 == 0 { min.y } else { max.y },
-            if i & 4 == 0 { min.z } else { max.z },
-        ))
-    };
+    let c = mg_render::box_corners(min, max).map(|p| t.transform_point3(p));
     [(0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
         .into_iter()
-        .map(move |(a, b)| (c(a), c(b)))
+        .map(move |(a, b)| (c[a], c[b]))
 }
 
 /// The farthest the game's camera stands from the player (metres; the
@@ -4753,14 +5500,26 @@ fn instance_of(
     placement: mg_module::instances::Placement,
     relative: &[[f32; 3]],
 ) -> Result<Option<mg_gff::Struct>, String> {
-    use mg_module::instances::{Placing, instance};
-    let (Some(game), Some(ws)) = (app.game.as_deref(), app.ws.as_mut()) else { return Ok(None) };
+    placing(app, |placing, read| {
+        let blueprint = read(key).ok_or_else(|| format!("{key}: not found or not readable"))?;
+        let made =
+            mg_module::instances::instance(placing, key.restype, &blueprint, placement, relative);
+        Ok(made)
+    })
+    .unwrap_or(Ok(None))
+}
+
+/// Makes placed objects of blueprints as their editors have them now, not
+/// as last saved (the workspace is flushed first): the module's, else the
+/// game's ([`mg_module::instances::with_placing`]). `None` without a
+/// module or game data.
+pub(crate) fn placing<R>(
+    app: &mut Moonglow,
+    f: impl FnOnce(&mg_module::instances::Placing<'_>, &dyn Fn(ResKey) -> Option<mg_gff::Struct>) -> R,
+) -> Option<R> {
+    let (Some(game), Some(ws)) = (app.game.as_deref(), app.ws.as_mut()) else { return None };
     let _ = ws.flush();
-    let read = |k: ResKey| mg_module::gff_root(Some(&ws.module), game, &k);
-    let blueprint = read(key).ok_or_else(|| format!("{key}: not found or not readable"))?;
-    let items = |r: ResRef| read(ResKey::new(r, ResType::UTI));
-    let placing = Placing { game, item: &items };
-    Ok(instance(&placing, key.restype, &blueprint, placement, relative))
+    Some(mg_module::instances::with_placing(game, Some(&ws.module), f))
 }
 
 /// Blueprint `key` as an object not yet placed (at the origin, unturned),
@@ -4778,6 +5537,10 @@ pub(crate) fn template(app: &mut Moonglow, key: ResKey) -> Option<mg_area::AreaO
 /// Snapped to the grid, a door on the nearest hook; not for triggers and
 /// encounters (drawn point by point).
 fn ghost(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView) -> Option<mg_area::AreaObject> {
+    // (Nothing is placed in a read-only area.)
+    if view.read_only.is_some() {
+        return None;
+    }
     let dragged = egui::DragAndDrop::payload::<crate::palette_view::Dragged>(ui.ctx());
     // An appearance dragged from the Placeable Gallery: the placeable it
     // would place (kept under a name of its own, no blueprint's).
@@ -4795,21 +5558,12 @@ fn ghost(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView) -> Option<mg_ar
         return None;
     };
     let kind = ObjectKind::from_restype(key.restype).filter(|k| !k.has_outline())?;
-    // Over the view, not over a window in front of it.
-    let pos = ui.ctx().pointer_hover_pos().filter(|p| view.rect.contains(*p))?;
-    if ui
-        .ctx()
-        .layer_id_at(pos)
-        .is_some_and(|l| l != ui.layer_id() && l.order != egui::Order::Tooltip)
-    {
-        return None;
-    }
-    let at = view.ground_at(pos, 0.0)?;
+    let pos = view.pointer_over(ui)?;
     let (at, rotation) = if kind == ObjectKind::Door {
-        let hook = view.model.as_ref()?.hook_near(at, DOOR_REACH)?;
+        let hook = view.model.as_ref()?.hook_near(view.ground_at(pos, 0.0)?, DOOR_REACH)?;
         (hook.position, Some(hook.bearing))
     } else {
-        (view.snapped(at), None)
+        (view.put_down_at(pos)?, None)
     };
     // (Read again after the module changes too: the blueprint edited while
     // it is the brush looks as it does now.)
@@ -4889,9 +5643,11 @@ fn commit_scale(app: &mut Moonglow, view: &AreaView, scaled: &[(usize, mg_area::
 /// placeables that aren't static), as Aurora's does: shown at once, and
 /// made one command when the wheel rests, Ctrl is let go or the selection
 /// changes (Escape drops it). Whether the wheel was taken: the camera
-/// then does not zoom by it. With nothing selected that takes a scale,
-/// the wheel is the camera's (a static placeable selected: the status
-/// line says why).
+/// then does not zoom by it. With nothing selected it does nothing, as
+/// Aurora's (captured 2026-10-29: the view stayed as it was); with
+/// something selected that takes no scale, or the pointer off the
+/// selection, the wheel is the camera's (a static placeable selected: the
+/// status line says why).
 fn wheel_scales(
     app: &mut Moonglow,
     ui: &egui::Ui,
@@ -4902,7 +5658,7 @@ fn wheel_scales(
     let now = ui.input(|i| i.time);
     if let Some(wheel) = &view.wheel_scale {
         let rest = WHEEL_REST - (now - wheel.at);
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if escaped(ui, response) {
             view.wheel_scale = None;
         } else if rest <= 0.0 || !command || wheel.selection != view.selection {
             let scaled = view.scaled_by(&wheel.selection, wheel.factor);
@@ -4924,14 +5680,16 @@ fn wheel_scales(
         view.wheel_scale.is_some()
             || response.hover_pos().and_then(|p| view.pick(p)).is_some_and(|i| view.selected(i))
     };
-    let asked = turned != 0.0
+    let wheeled = turned != 0.0
         && command
         && !shift
         && response.hovered()
         && view.drag.is_none()
-        && crate::terrain_mode::active(app, view).is_none()
-        && on_selected();
-    if !asked {
+        && crate::terrain_mode::active(app, view).is_none();
+    if wheeled && view.selection.is_empty() && view.wheel_scale.is_none() {
+        return true;
+    }
+    if !(wheeled && on_selected()) {
         return false;
     }
     let Some(model) = &view.model else { return false };
@@ -5018,7 +5776,19 @@ fn open_properties(app: &mut Moonglow, view: &AreaView, kind: ObjectKind, index:
 }
 
 fn delete(app: &mut Moonglow, view: &mut AreaView) {
-    let edits = mg_area::edit::delete_edits(view.git(), &view.selection);
+    let selected = std::mem::take(&mut view.selection);
+    delete_objects(app, view, &selected, "Delete");
+}
+
+/// Deletes `objects` (kind and place in its list) from `view`'s area, as
+/// one command named `label` (the selection let go: its places move).
+pub(crate) fn delete_objects(
+    app: &mut Moonglow,
+    view: &mut AreaView,
+    objects: &[(ObjectKind, usize)],
+    label: &str,
+) {
+    let edits = mg_area::edit::delete_edits(view.git(), objects);
     view.selection.clear();
     // Objects after the deleted ones move up their lists: their Properties
     // would show others.
@@ -5028,7 +5798,7 @@ fn delete(app: &mut Moonglow, view: &mut AreaView) {
         |t| !matches!(t, crate::Tab::Instance { area: a, .. } | crate::Tab::Instances { area: a, .. } if *a == area),
     );
     if !edits.is_empty() {
-        app.actions.push(Action::Apply(Command::new("Delete", edits)));
+        app.actions.push(Action::Apply(Command::new(label, edits)));
     }
 }
 
@@ -5042,7 +5812,7 @@ fn delete(app: &mut Moonglow, view: &mut AreaView) {
 /// One command; objects of other types and locked ones are left. How many
 /// were replaced.
 pub(crate) fn replace_selected(app: &mut Moonglow, area: ResRef, key: ResKey, own: bool) -> usize {
-    use mg_module::instances::{Placing, replaced, replaced_keeping_own};
+    use mg_module::instances::{replaced, replaced_keeping_own};
     let Some(kind) = ObjectKind::from_restype(key.restype) else { return 0 };
     let Some(view) = app.area_views.get(&area) else { return 0 };
     let git = view.git();
@@ -5055,7 +5825,7 @@ pub(crate) fn replace_selected(app: &mut Moonglow, area: ResRef, key: ResKey, ow
         })
         .map(|&(_, i)| i)
         .collect();
-    let (Some(game), Some(ws)) = (app.game.as_deref(), app.ws.as_mut()) else { return 0 };
+    let Some(ws) = app.ws.as_mut() else { return 0 };
     let olds: Vec<(usize, mg_gff::Struct)> = match ws.doc(&git) {
         Ok(doc) => {
             let list = doc.root.list(kind.list()).unwrap_or(&[]);
@@ -5063,26 +5833,27 @@ pub(crate) fn replace_selected(app: &mut Moonglow, area: ResRef, key: ResKey, ow
         }
         Err(_) => return 0,
     };
-    let _ = ws.flush();
-    let read = |k: ResKey| mg_module::gff_root(Some(&ws.module), game, &k);
-    let Some(blueprint) = read(key) else {
+    let made = placing(app, |placing, read| {
+        let blueprint = read(key)?;
+        let mut edits = Vec::new();
+        for (index, old) in &olds {
+            let made = if own {
+                replaced_keeping_own(placing, key.restype, old, &blueprint)
+            } else {
+                replaced(placing, key.restype, old, &blueprint)
+            };
+            let Some(item) = made else { continue };
+            let (path, list) = (mg_edit::GffPath::root(), kind.list().to_string());
+            edits.push(mg_edit::Edit::remove_item(git, path.clone(), list.clone(), *index));
+            edits.push(mg_edit::Edit::insert_item(git, path, list, *index, item));
+        }
+        Some(edits)
+    });
+    let Some(made) = made else { return 0 };
+    let Some(edits) = made else {
         app.log.error(format!("{key}: not found or not readable"));
         return 0;
     };
-    let items = |r: ResRef| read(ResKey::new(r, ResType::UTI));
-    let placing = Placing { game, item: &items };
-    let mut edits = Vec::new();
-    for (index, old) in &olds {
-        let made = if own {
-            replaced_keeping_own(&placing, key.restype, old, &blueprint)
-        } else {
-            replaced(&placing, key.restype, old, &blueprint)
-        };
-        let Some(item) = made else { continue };
-        let (path, list) = (mg_edit::GffPath::root(), kind.list().to_string());
-        edits.push(mg_edit::Edit::remove_item(git, path.clone(), list.clone(), *index));
-        edits.push(mg_edit::Edit::insert_item(git, path, list, *index, item));
-    }
     let replaced = edits.len() / 2;
     if replaced == 0 {
         app.log.warn("Select objects of this blueprint's type in the area first");
@@ -5153,7 +5924,6 @@ fn paste_at(app: &mut Moonglow, view: &mut AreaView, at: Vec3) {
         .collect();
     let mut edits = Vec::new();
     let mut selection = Vec::new();
-    let mut made = Vec::new();
     for ((o, s, _), position) in clip.objects.iter().zip(pasted_positions(view, &clip, at)) {
         let count = counts.get_mut(&o.kind).expect("every kind");
         edits.push(mg_edit::Edit::insert_item(
@@ -5164,10 +5934,6 @@ fn paste_at(app: &mut Moonglow, view: &mut AreaView, at: Vec3) {
             mg_area::edit::moved(o, s, position, o.rotation),
         ));
         selection.push((o.kind, *count));
-        made.push(crate::tag_clash::Made {
-            key: git,
-            path: mg_edit::GffPath::root().item(o.kind.list(), *count),
-        });
         *count += 1;
     }
     if !edits.is_empty() {
@@ -5178,8 +5944,8 @@ fn paste_at(app: &mut Moonglow, view: &mut AreaView, at: Vec3) {
             .collect();
         let pasted = crate::plugin_events::Made::objects("paste", pasted, true);
         app.actions.push(Action::ApplyMade(Command::new("Paste", edits), pasted));
-        // (Then, the tags it put on a second object.)
-        app.actions.push(Action::CheckTags { what: "The paste".into(), made });
+        // (The tags it puts on a second object are said as it is applied:
+        // `tag_clash::made_by`.)
         view.selection = selection;
     }
 }
@@ -5325,7 +6091,7 @@ const ONTO_REACH: f32 = 2.0;
 /// up to [`ONTO_REACH`] above it, else the ground. For a skull on an altar
 /// or a book on a table, which Aurora leaves to the height typed in.
 fn drop_onto_objects(app: &mut Moonglow, view: &AreaView) {
-    let (Some(model), Some(scene)) = (&view.model, &view.scene) else { return };
+    let Some(model) = &view.model else { return };
     let chosen: Vec<usize> = view.selected_indices().collect();
     // (Looked up for every object under every one chosen: a set.)
     let is_chosen: std::collections::HashSet<usize> = chosen.iter().copied().collect();
@@ -5336,23 +6102,8 @@ fn drop_onto_objects(app: &mut Moonglow, view: &AreaView) {
             if o.kind == ObjectKind::Creature || o.kind.has_outline() {
                 return None;
             }
-            let ray = Ray { origin: o.position + Vec3::Z * ONTO_REACH, dir: Vec3::NEG_Z };
-            let on_object = (0..model.objects.len())
-                .filter(|j| !is_chosen.contains(j))
-                .filter(|&j| {
-                    let k = model.objects[j].kind;
-                    matches!(k, ObjectKind::Placeable | ObjectKind::Door) && view.show[k.index()]
-                })
-                .filter_map(|j| scene.ray_hit(model, j, &ray).flatten())
-                .filter(|t| *t >= 0.0)
-                .min_by(f32::total_cmp);
-            let on_ground =
-                view.ground.as_ref().and_then(|g| g.hit(&ray)).map(|p| ray.origin.z - p.z);
-            let t = match (on_object, on_ground) {
-                (Some(a), Some(b)) => a.min(b),
-                (a, b) => a.or(b)?,
-            };
-            let z = ray.origin.z - t;
+            let from = o.position + Vec3::Z * ONTO_REACH;
+            let z = view.surface_below(from, &|j| is_chosen.contains(&j))?;
             ((z - o.position.z).abs() > 1e-4).then_some((
                 i,
                 o.position.truncate().extend(z),
@@ -5422,18 +6173,54 @@ fn set_locked(
 /// location and tests from here; last, as in Aurora, Variables and
 /// Properties.
 fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
-    // Opened on a tile, no object there: the tile's items first.
-    if let Some(t) = view.menu_tile {
-        crate::tile_select::ground_items(app, view, ui, t);
-    }
     let single = match view.selection.as_slice() {
         [one] => Some(*one),
         _ => None,
     };
     let same_kind =
         view.selection.len() > 1 && view.selection.iter().all(|(k, _)| *k == view.selection[0].0);
-    // The object in the model viewer, as it is placed (as its Properties'
-    // Preview shows it).
+    // A read-only area's: what looks at it, nothing that changes it.
+    match view.read_only.clone() {
+        Some(why) => {
+            ui.weak(format!("{why}: read-only here"));
+            preview_item(app, view, ui, single);
+        }
+        None => editing_items(app, view, ui, single),
+    }
+    // Variables, then Properties: the menu's last, as in Aurora.
+    ui.separator();
+    if let Some((kind, index)) = single
+        && view.read_only.is_none()
+        && ui.button("Variables…").clicked()
+    {
+        let path = mg_edit::GffPath::root().item(kind.list(), index);
+        crate::widgets::open_variables(app, view.git(), path);
+        ui.close();
+    }
+    if ui.add_enabled(single.is_some() || same_kind, egui::Button::new("Properties")).clicked() {
+        match single {
+            Some((kind, index)) => open_properties(app, view, kind, index),
+            None => {
+                let paths = view
+                    .selection
+                    .iter()
+                    .map(|(k, i)| mg_edit::GffPath::root().item(k.list(), *i))
+                    .collect();
+                app.actions.push(Action::OpenTab(crate::Tab::Instances { area: view.area, paths }));
+            }
+        }
+        ui.close();
+    }
+}
+
+/// The context menu's Preview: the object selected in the model viewer,
+/// as it is placed (as its Properties' Preview shows it).
+fn preview_item(
+    app: &mut Moonglow,
+    view: &AreaView,
+    ui: &mut egui::Ui,
+    single: Option<(ObjectKind, usize)>,
+) {
     let preview = single.filter(|(kind, _)| crate::tree::previewable(*kind));
     if ui
         .add_enabled(preview.is_some(), egui::Button::new("Preview"))
@@ -5445,9 +6232,28 @@ fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
         app.actions.push(Action::OpenTab(crate::Tab::InstanceModel { area: view.area, path }));
         ui.close();
     }
+}
+
+/// The context menu's items of an area that may be changed, Properties
+/// aside: the tile's, the selection's, where it was opened, the plugins'.
+fn editing_items(
+    app: &mut Moonglow,
+    view: &mut AreaView,
+    ui: &mut egui::Ui,
+    single: Option<(ObjectKind, usize)>,
+) {
+    // Opened on a tile, no object there: the tile's items first.
+    if let Some(t) = view.menu_tile {
+        crate::tile_select::ground_items(app, view, ui, t);
+    }
+    preview_item(app, view, ui, single);
     let any = !view.selection.is_empty();
-    if ui.add_enabled(any, egui::Button::new("Adjust Location…")).clicked() {
-        app.adjust = crate::area_tools::adjust(view);
+    let start = view.start_is_selected().then(|| start_location(app, view.area)).flatten();
+    if ui.add_enabled(any || start.is_some(), egui::Button::new("Adjust Location…")).clicked() {
+        app.adjust = match start {
+            Some(at) => Some(crate::area_tools::adjust_start(view.area, at)),
+            None => crate::area_tools::adjust(view),
+        };
         ui.close();
     }
     if ui.add_enabled(any, egui::Button::new("Drop to Ground (G)")).clicked() {
@@ -5658,14 +6464,48 @@ fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
             .filter(|&(k, i)| {
                 let at = view.object_at(k, i);
                 at.zip(view.scene.as_ref().zip(view.model.as_ref()))
-                    .is_some_and(|(i, (s, m))| s.bare_light(m, i).is_some())
+                    .is_some_and(|(i, (s, m))| s.bare_light(m, i).is_some_and(|l| l.stock))
             })
             .collect();
+        let custom = crate::light_maker::generated_lights(app);
         if let Some(at) = view.menu_at {
             ui.menu_button("Add Light Here", |ui| {
                 for light in &lights {
                     if light_button(ui, light).clicked() {
                         add_light(app, view, light, at);
+                        ui.close();
+                    }
+                }
+                // (Lights of any color and reach, as content: only with
+                // the option on.)
+                if custom {
+                    let made = made_lights(app);
+                    if !made.is_empty() {
+                        ui.separator();
+                    }
+                    for light in &made {
+                        if light_button(ui, light).clicked() {
+                            add_light_row(
+                                app,
+                                view,
+                                light.row,
+                                &format!("Light, {}", light.name),
+                                at,
+                            );
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .button("Custom Light…")
+                        .on_hover_text(
+                            "A light of the color, reach and shadows you choose, written into a \
+                             hak you choose (the window says what, before it writes)",
+                        )
+                        .clicked()
+                    {
+                        let draft = crate::light_maker::LightDraft::new(app, view.area, Some(at));
+                        app.light_draft = Some(draft);
                         ui.close();
                     }
                 }
@@ -5675,6 +6515,27 @@ fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
                 "An invisible placeable that lights what is around it, a little above the \
                  ground: move and raise it as any placeable. The game's own, no custom content",
             );
+        }
+        // Lights Moonglow made, selected: other settings (another row).
+        let made: Vec<(ObjectKind, usize)> = view
+            .selection
+            .iter()
+            .copied()
+            .filter(|&(k, i)| {
+                let at = view.object_at(k, i);
+                at.zip(view.scene.as_ref().zip(view.model.as_ref()))
+                    .is_some_and(|(i, (s, m))| s.bare_light(m, i).is_some_and(|l| !l.stock))
+            })
+            .collect();
+        if custom
+            && !made.is_empty()
+            && made.len() == view.selection.len()
+            && ui.button("Change Light…").clicked()
+        {
+            let mut draft = crate::light_maker::LightDraft::new(app, view.area, None);
+            draft.change = made;
+            app.light_draft = Some(draft);
+            ui.close();
         }
         if !chosen.is_empty() && chosen.len() == view.selection.len() {
             ui.menu_button("Light Color", |ui| {
@@ -5791,8 +6652,7 @@ fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            let facing = view.orbit.as_ref().map_or(0.0, |o| o.yaw + std::f32::consts::PI);
-            set_start_location(app, view, at, facing);
+            set_start_location(app, view, at, view_facing(view));
             ui.close();
         }
         // Test the module as it is now, starting here, facing the way the
@@ -5839,29 +6699,6 @@ fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
             app.actions.push(crate::plugins::run_on(&commands[i], selected));
         }
     }
-    // Variables, then Properties: the menu's last, as in Aurora.
-    ui.separator();
-    if let Some((kind, index)) = single
-        && ui.button("Variables…").clicked()
-    {
-        let path = mg_edit::GffPath::root().item(kind.list(), index);
-        crate::widgets::open_variables(app, view.git(), path);
-        ui.close();
-    }
-    if ui.add_enabled(single.is_some() || same_kind, egui::Button::new("Properties")).clicked() {
-        match single {
-            Some((kind, index)) => open_properties(app, view, kind, index),
-            None => {
-                let paths = view
-                    .selection
-                    .iter()
-                    .map(|(k, i)| mg_edit::GffPath::root().item(k.list(), *i))
-                    .collect();
-                app.actions.push(Action::OpenTab(crate::Tab::Instances { area: view.area, paths }));
-            }
-        }
-        ui.close();
-    }
 }
 
 /// The start location's ring, meters across its radius.
@@ -5881,15 +6718,21 @@ fn set_start_location(app: &mut Moonglow, view: &mut AreaView, at: Vec3, facing:
     }
 }
 
+/// The way the view looks along the ground (radians anticlockwise from
+/// east): the way a start location set from it faces.
+fn view_facing(view: &AreaView) -> f32 {
+    view.orbit.as_ref().map_or(0.0, |o| o.yaw + std::f32::consts::PI)
+}
+
 /// Moves the start location to `at`, in the area it is in (a drag of its
 /// marker).
-fn move_start_location(app: &mut Moonglow, at: Vec3) {
+pub(crate) fn move_start_location(app: &mut Moonglow, at: Vec3) {
     let edits = start_at(at).to_vec();
     app.actions.push(Action::Apply(Command::new("Move Start Location", edits)));
 }
 
 /// Turns the start location to face `facing` (a drag of its arrow's tip).
-fn turn_start_location(app: &mut Moonglow, facing: f32) {
+pub(crate) fn turn_start_location(app: &mut Moonglow, facing: f32) {
     let edits = start_facing(facing).to_vec();
     app.actions.push(Action::Apply(Command::new("Turn Start Location", edits)));
 }
@@ -5920,16 +6763,12 @@ fn start_facing(facing: f32) -> [mg_edit::Edit; 2] {
 }
 
 /// A placeable appearance that is a light and nothing to see.
-struct StockLight {
+pub(crate) struct StockLight {
     /// Its placeables.2da row.
-    row: usize,
-    name: String,
-    color: Color32,
+    pub row: usize,
+    pub name: String,
+    pub color: Color32,
 }
-
-/// The radius the game gives a placeable's `LightColor` light (its light
-/// ends twice as far out: `placeable_light_uniforms`, in the client).
-const LIGHT_RADIUS: f32 = 10.0;
 
 /// How far above the ground a light is put (a lamp's height).
 const LIGHT_HEIGHT: f32 = 1.5;
@@ -5938,7 +6777,7 @@ const LIGHT_HEIGHT: f32 = 1.5;
 /// `LightColor` whose model is the game's invisible one (`dag_invisible`):
 /// "Light, Blue" to "Light, Yellow" in the game's own table, and any a
 /// hak adds in the same way.
-fn stock_lights(app: &Moonglow) -> Vec<StockLight> {
+pub(crate) fn stock_lights(app: &Moonglow) -> Vec<StockLight> {
     let Some(game) = app.game.as_deref() else { return Vec::new() };
     let Ok(table) = game.table("placeables") else { return Vec::new() };
     let colors = crate::tile_select::light_colors(app);
@@ -5967,19 +6806,71 @@ fn light_button(ui: &mut egui::Ui, light: &StockLight) -> egui::Response {
     .inner
 }
 
+/// A light's row in the palette: its color and its name, chosen (`on`)
+/// while it is about to be placed.
+pub(crate) fn light_toggle(ui: &mut egui::Ui, light: &StockLight, on: bool) -> egui::Response {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 5.0, light.color);
+        ui.selectable_label(on, &light.name)
+    })
+    .inner
+}
+
 /// Puts light `light` over the ground point `at`: a plain, static
 /// placeable of that appearance, selected.
 fn add_light(app: &mut Moonglow, view: &mut AreaView, light: &StockLight, at: Vec3) {
+    add_light_row(app, view, light.row, &format!("Light, {}", light.name), at);
+}
+
+/// Puts a light of placeables.2da row `row` (named `name`) over the ground
+/// point `at`, as [`add_light`] puts one of the game's: a light Moonglow
+/// made too (`mg_module::lights`).
+pub(crate) fn add_light_row(
+    app: &mut Moonglow,
+    view: &mut AreaView,
+    row: usize,
+    name: &str,
+    at: Vec3,
+) {
     use mg_module::instances::Placement;
     let at = view.snapped(at) + Vec3::Z * LIGHT_HEIGHT;
-    let dragged = crate::appearance_gallery::DraggedAppearance {
-        row: light.row,
-        name: format!("Light, {}", light.name),
-    };
+    let dragged = crate::appearance_gallery::DraggedAppearance { row, name: name.to_string() };
     let placement = Placement { position: at.to_array(), rotation: 0.0 };
     let Some(item) = appearance_item(app, &dragged, placement) else { return };
     let what = format!("Add {}", dragged.name);
     append_object(app, view, ObjectKind::Placeable, item, what, "light");
+}
+
+/// Gives every selected object placeables.2da row `row` (one command).
+pub(crate) fn set_appearance(app: &mut Moonglow, view: &AreaView, what: &str, row: usize) {
+    set_on_selection(app, view, what, "Appearance", Value::Dword(row as u32));
+}
+
+/// The lights Moonglow made that the game data has (placeables.2da rows
+/// whose model is one of `mg_module::lights`'), each with its color as
+/// its label says.
+pub(crate) fn made_lights(app: &Moonglow) -> Vec<StockLight> {
+    let Some(game) = app.game.as_deref() else { return Vec::new() };
+    let Ok(table) = game.table("placeables") else { return Vec::new() };
+    (0..table.len())
+        .filter(|&row| table.get(row, "ModelName").is_some_and(mg_module::lights::is_generated))
+        .map(|row| {
+            let label = table.get(row, "Label").unwrap_or("Light");
+            let name = label.strip_prefix("Light, ").unwrap_or(label).to_string();
+            let hex = name.strip_prefix('#').and_then(|h| h.get(..6));
+            let rgb = hex.and_then(|h| u32::from_str_radix(h, 16).ok()).unwrap_or(0);
+            let color = Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+            StockLight { row, name, color }
+        })
+        .collect()
+}
+
+/// The light of placeables.2da row `row`: one of the game's, or one
+/// Moonglow made.
+fn light_of_row(app: &Moonglow, row: usize) -> Option<StockLight> {
+    let stock = stock_lights(app).into_iter().find(|l| l.row == row);
+    stock.or_else(|| made_lights(app).into_iter().find(|l| l.row == row))
 }
 
 /// Sets a field on every selected object (one command).
@@ -6342,7 +7233,8 @@ mod tests {
         // Not random: none, whatever the ranges say.
         assert_eq!(random_reach(&sound), None);
         sound.set("RandomPosition", mg_gff::Value::Byte(1));
-        assert_eq!(random_reach(&sound), Some(glam::Vec2::new(4.0, 2.5)));
+        // Half each way: the ranges are the rectangle's size, as Aurora's.
+        assert_eq!(random_reach(&sound), Some(glam::Vec2::new(2.0, 1.25)));
         sound.set("RandomRangeX", mg_gff::Value::Float(0.0));
         sound.set("RandomRangeY", mg_gff::Value::Float(0.0));
         assert_eq!(random_reach(&sound), None);
@@ -6362,12 +7254,122 @@ mod tests {
         assert_eq!(o.target.z, TARGET_HEIGHTS.1);
     }
 
+    /// The walkmesh's faces on screen are where
+    /// [`AreaView::screen_polygon`] puts them, those in front of the eye
+    /// and those it cuts; a face beside the view is known to be.
+    #[test]
+    fn walkmesh_faces_are_put_on_screen_as_polygons_are() {
+        let mut view = AreaView::new(ResRef::EMPTY);
+        view.rect = Rect::from_min_size(egui::pos2(30.0, 40.0), egui::vec2(800.0, 500.0));
+        let orbit =
+            Orbit { target: Vec3::new(50.0, 50.0, 0.0), yaw: 0.7, pitch: 0.2, distance: 12.0 };
+        view.orbit = Some(orbit);
+        let camera = view.camera().unwrap();
+        let (depth, to_screen) = (NearDepth::of(&camera), view.projector().unwrap());
+        let mut seed = 5u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let (mut cut, mut whole, mut out) = (0, 0, 0);
+        for _ in 0..2000 {
+            let at = camera.eye + Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5) * 60.0;
+            let corners = [0, 1, 2].map(|_| at + Vec3::new(next(), next(), next() * 0.2) * 8.0);
+            let (points, count) = face_on_screen(&view, &depth, &to_screen, corners);
+            let polygon = view.screen_polygon(&corners, None);
+            assert_eq!(&points[..count], &polygon[..], "{corners:?}");
+            let ahead = corners.iter().filter(|c| depth.of_point(**c) >= 0.0).count();
+            match ahead {
+                3 => whole += 1,
+                0 => {}
+                _ => cut += 1,
+            }
+            out += usize::from(count >= 3 && beside(&polygon, view.rect));
+        }
+        assert!(cut > 100 && whole > 100 && out > 100, "{cut} cut, {whole} whole, {out} beside");
+        let r = view.rect;
+        assert!(beside(
+            &[r.left_top() - egui::vec2(1.0, 0.0), r.left_bottom() - egui::vec2(5.0, 0.0)],
+            r
+        ));
+        assert!(!beside(&[r.left_top() - egui::vec2(1.0, 0.0), r.right_bottom()], r));
+    }
+
+    /// Sound Ranges' copies of its shapes are each sound's spheres and
+    /// circle, moved and scaled to it.
+    #[test]
+    fn sound_ranges_copies_are_its_spheres() {
+        let placed = [(0, Vec3::new(20.0, 20.0, 1.0)), (1, Vec3::new(30.0, 25.0, 0.0))];
+        let ranges = [
+            SoundRange { index: 0, min: 3.0, max: 12.0, chosen: false },
+            SoundRange { index: 1, min: 5.0, max: 20.0, chosen: true },
+        ];
+        let camera = mg_render::Camera::orbit(Vec3::new(25.0, 20.0, 0.0), 60.0, 0.3, 0.8);
+        let shapes = sound_range_shapes(&placed, &ranges, &camera, (1000.0, 1000.0));
+        let mut drawn: Vec<[Vec3; 2]> = Vec::new();
+        for s in &shapes {
+            for c in &s.copies {
+                drawn.extend(s.lines.iter().map(|l| l.map(|p| c.offset + p * c.scale)));
+            }
+        }
+        for (&(_, at), r) in placed.iter().zip(&ranges) {
+            for radius in [r.min, r.max] {
+                let on = |p: Vec3| (p.distance(at) - radius).abs() < 1e-3;
+                let dots = drawn.iter().filter(|[a, b]| on(*a) && on(*b)).count();
+                assert!(dots >= 7 * SPHERE_DOTS.0, "{radius} m about {at}: {dots}");
+            }
+        }
+        let alphas: Vec<f32> =
+            shapes.iter().flat_map(|s| s.copies.iter().map(|c| c.color[3])).collect();
+        assert!(alphas.contains(&1.0) && alphas.contains(&0.8), "the selection's brighter");
+    }
+
     #[test]
     fn a_sounds_circle_is_level_around_it() {
         let centre = Vec3::new(10.0, 20.0, 1.5);
-        let circle = sound_circle(centre, 7.0);
-        assert!(circle.len() >= 32);
+        let circle = sound_circle(centre, 7.0, 64);
+        assert_eq!(circle.len(), 64);
         assert!(circle.iter().all(|p| p.z == 1.5 && ((*p - centre).length() - 7.0).abs() < 1e-4));
+    }
+
+    /// A sound's distance is a dotted sphere about it, as Aurora draws it:
+    /// every dot (a short dash) on it, above and below its height, as many
+    /// a ring as asked: three rings and four meridians.
+    #[test]
+    fn a_sound_s_distance_is_a_sphere_of_dots() {
+        let centre = Vec3::new(10.0, 20.0, 1.5);
+        for radius in [3.0, 12.0] {
+            let dashes = sound_sphere(centre, radius, 24);
+            assert_eq!(dashes.len(), 7 * 24);
+            let on = |p: Vec3| ((p - centre).length() - radius).abs() < 1e-3;
+            assert!(dashes.iter().all(|[a, b]| on(*a) && on(*b)));
+            assert!(dashes.iter().all(|[a, b]| a.distance(*b) < radius * 0.2), "short");
+            let top = dashes.iter().map(|[a, _]| a.z).fold(f32::MIN, f32::max);
+            let bottom = dashes.iter().map(|[a, _]| a.z).fold(f32::MAX, f32::min);
+            assert!((top - (1.5 + radius)).abs() < 0.05 && (bottom - (1.5 - radius)).abs() < 0.05);
+        }
+    }
+
+    /// Sound Ranges in the picture: lines of the scene (hidden by what is
+    /// in front), as many dots a ring as the sphere's size on the picture
+    /// calls for: few for one far off, more near, none while off.
+    #[test]
+    fn sound_ranges_draw_fewer_dots_far_off() {
+        let placed = [(0, Vec3::new(20.0, 20.0, 0.0))];
+        let ranges = [SoundRange { index: 0, min: 3.0, max: 12.0, chosen: false }];
+        let lines = |distance: f32| {
+            let camera = mg_render::Camera::orbit(Vec3::new(20.0, 20.0, 0.0), distance, 0.0, 0.8);
+            let shapes = sound_range_shapes(&placed, &ranges, &camera, (1000.0, 1000.0));
+            shapes.iter().map(|s| s.lines.len() * s.copies.len()).sum::<usize>()
+        };
+        let (near, far) = (lines(20.0), lines(400.0));
+        assert!(far < near && far >= 2 * 7 * 8 + 16, "near {near}, far {far}");
+        let camera = mg_render::Camera::orbit(Vec3::ZERO, 20.0, 0.0, 0.8);
+        assert!(sound_range_shapes(&placed, &[], &camera, (1000.0, 1000.0)).is_empty());
+        // (Out of the picture, behind the eye: none.)
+        let away =
+            mg_render::Camera::orbit(Vec3::new(200.0, 20.0, 0.0), 5.0, std::f32::consts::PI, 0.0);
+        assert!(sound_range_shapes(&placed, &ranges, &away, (1000.0, 1000.0)).is_empty());
     }
 
     #[test]

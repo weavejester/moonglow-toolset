@@ -4,9 +4,10 @@
 //! closed open again with it, in their order and their places (the
 //! middle, the palettes' pane, a pane split off the middle, a window of
 //! their own where it was, split as it was), each pane's tab in front in
-//! front, and each view as it was left: an area's camera, a script's
-//! scroll and cursor, a conversation's selected line, bookmarks and
-//! folded branches, a Properties window's page.
+//! front, and each view as it was left: an area's camera, a model view's,
+//! a script's scroll and cursor, a conversation's selected line,
+//! bookmarks and folded branches, a Properties window's page, a hak's
+//! selected resources, a 2DA's selected cell, a tileset's page and tile.
 //!
 //! They are kept in Moonglow's data folder, never in the module: a small
 //! JSON file a module (`open-tabs/<name>-<hash>.json`, by its canonical
@@ -109,8 +110,8 @@ impl Split {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct View {
-    /// An area's camera: the point it looks at, then its yaw, pitch and
-    /// distance; and whether the view showed the night.
+    /// An area's camera (or a model view's): the point it looks at, then
+    /// its yaw, pitch and distance; and whether the view showed the night.
     #[serde(skip_serializing_if = "Option::is_none")]
     camera: Option<[f32; 6]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,6 +121,15 @@ pub(crate) struct View {
     scroll: Option<[f32; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<[usize; 2]>,
+    /// A script's bookmarked lines (from 0), and its numbered bookmarks
+    /// (Ctrl and a digit): each digit and its line.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    lines: Vec<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    numbered: Vec<[usize; 2]>,
+    /// The talk table's line chosen (its StrRef in the table).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
     /// A Properties window's page (or the Options'), by its name.
     #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<String>,
@@ -135,6 +145,20 @@ pub(crate) struct View {
     bookmarks: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     folded: Vec<String>,
+    /// A hak's selected resources (`name.ext`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    chosen: Vec<String>,
+    /// A 2DA's selected cell: its row and column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cell: Option<[usize; 2]>,
+    /// A tileset's chosen tile and group (its page is `page`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tile: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<usize>,
+    /// Advanced Search's question.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search: Option<crate::search::KeptSearch>,
 }
 
 /// A placed object, as it is found again: its tag, its blueprint and
@@ -258,6 +282,28 @@ impl View {
     pub(crate) fn script(&self) -> (Option<egui::Vec2>, Option<(usize, usize)>) {
         (self.scroll.map(|[x, y]| egui::vec2(x, y)), self.cursor.map(|[a, b]| (a, b)))
     }
+
+    /// The talk table's line kept.
+    pub(crate) fn talk_line(&self) -> Option<usize> {
+        self.line
+    }
+
+    /// A script's bookmarks kept: its bookmarked lines and its numbered
+    /// ones, those within its `lines` lines (its text may have changed
+    /// since).
+    pub(crate) fn script_marks(
+        &self,
+        lines: usize,
+    ) -> (std::collections::BTreeSet<usize>, [Option<usize>; 10]) {
+        let marked = self.lines.iter().copied().filter(|l| *l < lines).collect();
+        let mut numbered = [None; 10];
+        for &[n, line] in &self.numbered {
+            if let Some(slot) = numbered.get_mut(n).filter(|_| line < lines) {
+                *slot = Some(line);
+            }
+        }
+        (marked, numbered)
+    }
 }
 
 /// The file in `dir` that keeps the tabs of the module at `module` (named
@@ -370,6 +416,7 @@ fn plain_text(tab: &Tab) -> Option<String> {
         Tab::Dialog(k) => format!("dialog:{}", key_text(k)),
         Tab::Resource(k) => format!("resource:{}", key_text(k)),
         Tab::ResourceCopy { key, layer } => format!("resource-copy:{}:{layer}", key_text(key)),
+        Tab::ModelCopy { key, layer } => format!("model-copy:{}:{layer}", key_text(key)),
         Tab::Model(k) => format!("model:{}", key_text(k)),
         Tab::Blueprint(k) => format!("blueprint:{}", key_text(k)),
         Tab::Blueprints(keys) => format!("blueprints:{}", list(keys, key_text)),
@@ -421,6 +468,10 @@ fn parse_tab(text: &str) -> Option<Want> {
             Tab::ResourceCopy { key: parse_key(key)?, layer: layer.to_string() }
         }
         "model" => Tab::Model(parse_key(rest)?),
+        "model-copy" => {
+            let (key, layer) = rest.split_once(':')?;
+            Tab::ModelCopy { key: parse_key(key)?, layer: layer.to_string() }
+        }
         "blueprint" => Tab::Blueprint(parse_key(rest)?),
         "blueprints" => Tab::Blueprints(parse_list(rest, parse_key)?),
         "area" => Tab::Area(parse_resref(rest)?),
@@ -694,11 +745,13 @@ impl Moonglow {
             Tab::Resource(k) | Tab::Model(k) => {
                 module.contains(k) || game.is_some_and(|g| g.resman.contains(k))
             }
-            Tab::ResourceCopy { key, layer } => game.is_some_and(|g| {
-                let rm = &g.resman;
-                (rm.layers().iter().position(|l| l.label == *layer))
-                    .is_some_and(|i| rm.get_in(i, key).is_ok())
-            }),
+            Tab::ResourceCopy { key, layer } | Tab::ModelCopy { key, layer } => {
+                game.is_some_and(|g| {
+                    let rm = &g.resman;
+                    (rm.layers().iter().position(|l| l.label == *layer))
+                        .is_some_and(|i| rm.get_in(i, key).is_ok())
+                })
+            }
             Tab::Tile { tileset, .. } => {
                 game.is_some_and(|g| g.resman.contains(&ResKey::new(*tileset, ResType::SET)))
             }
@@ -850,9 +903,14 @@ impl Moonglow {
                 Some(View { camera, night: Some(view.night), ..Default::default() })
             }
             Tab::Script(k) => {
-                let (scroll, cursor) = self.scripts.get(k)?.seen?;
+                let buf = self.scripts.get(k)?;
+                let (scroll, cursor) = buf.seen?;
                 let (scroll, cursor) = (Some([scroll.x, scroll.y]), cursor.map(|(a, b)| [a, b]));
-                Some(View { scroll, cursor, ..Default::default() })
+                let lines = buf.bookmarks.iter().copied().collect();
+                let numbered = (buf.numbered.iter().enumerate())
+                    .filter_map(|(n, l)| Some([n, (*l)?]))
+                    .collect();
+                Some(View { scroll, cursor, lines, numbered, ..Default::default() })
             }
             Tab::Dialog(k) => {
                 let view = self.dialog_views.get(k)?;
@@ -872,6 +930,9 @@ impl Moonglow {
             Tab::Instances { area, paths } => page(git(area), paths.first()?.clone()),
             Tab::AreaProperties(r) => page(are(r), GffPath::root()),
             Tab::AreasProperties(rs) => page(are(rs.first()?), GffPath::root().field("several")),
+            Tab::TalkTable => {
+                Some(View { line: Some(self.talk_view.selected?), ..Default::default() })
+            }
             Tab::ModuleProperties => {
                 let page = crate::module_props::PAGES.iter().find(|p| p.0 == self.module_page);
                 Some(View { page: Some(page?.1.to_string()), ..Default::default() })
@@ -880,6 +941,35 @@ impl Moonglow {
                 let now = self.options.as_ref()?.page;
                 let page = crate::options::PAGES.iter().find(|p| p.0 == now);
                 Some(View { page: Some(page?.1.to_string()), ..Default::default() })
+            }
+            Tab::Model(_) | Tab::InstanceModel { .. } | Tab::ModelCopy { .. } => {
+                let o = self.model_views.get(&crate::model_view::Source::of_tab(tab)?)?.orbit;
+                let [x, y, z] = o.target.to_array();
+                Some(View {
+                    camera: Some([x, y, z, o.yaw, o.pitch, o.distance]),
+                    ..Default::default()
+                })
+            }
+            Tab::AdvancedSearch => {
+                Some(View { search: Some(self.advanced_search.kept()?), ..Default::default() })
+            }
+            Tab::Hak(id) => {
+                let d = self.haks.iter().find(|d| d.id == *id)?;
+                let chosen: Vec<String> = d.selected.iter().map(key_text).collect();
+                (!chosen.is_empty()).then(|| View { chosen, ..Default::default() })
+            }
+            Tab::Table(id) => {
+                let (row, column) = self.tables.iter().find(|d| d.id == *id)?.selected?;
+                Some(View { cell: Some([row, column]), ..Default::default() })
+            }
+            Tab::Tileset(id) => {
+                let d = self.tilesets.iter().find(|d| d.id == *id)?;
+                Some(View {
+                    page: Some(crate::tileset_view::page_name(d.page).to_string()),
+                    tile: d.tile,
+                    group: d.group,
+                    ..Default::default()
+                })
             }
             _ => None,
         }
@@ -962,6 +1052,23 @@ impl Moonglow {
                 self.split_of(path.node).unwrap_or(Place::Middle)
             };
             panes.push(Pane { place: place_text(place), tabs, active, ..Default::default() });
+        }
+        // Tile Properties still waiting for its area's view (its tab not
+        // shown since the module opened): kept as it was read, beside the
+        // tabs it was kept with, else where it was.
+        if let Some(w) = &self.open_tabs.tiles {
+            let text = format!("tile-properties:{}:{}", w.area, list(&w.tiles, |t| t.to_string()));
+            let beside =
+                |p: &&mut Pane| p.split.is_none() && w.beside.iter().any(|b| p.tabs.contains(b));
+            match panes.iter_mut().find(beside) {
+                Some(p) => p.tabs.push(text),
+                None => panes.push(Pane {
+                    place: place_text(w.place.unwrap_or(Place::Window)),
+                    tabs: vec![text],
+                    rect: w.rect.map(|r| [r.left(), r.top(), r.width(), r.height()]),
+                    ..Default::default()
+                }),
+            }
         }
         let pane = focused.or_else(|| self.tab_pane());
         let leaf = pane.and_then(|p| self.dock.leaf(p).ok());
@@ -1247,6 +1354,34 @@ impl Moonglow {
                     let page = crate::options::PAGES.iter().find(|p| view.page == Some(p.1.into()));
                     if let (Some(page), Some(draft)) = (page, &mut self.options) {
                         draft.page = page.0;
+                    }
+                }
+                Tab::AdvancedSearch => {
+                    if let Some(k) = &view.search {
+                        self.advanced_search.ask_again(k);
+                    }
+                }
+                // The side editors are open now: what they showed is set.
+                Tab::Hak(id) => {
+                    if let Some(d) = self.haks.iter_mut().find(|d| d.id == *id) {
+                        let have = |k: &ResKey| d.hak.items().iter().any(|e| e.key == *k);
+                        let keys = view.chosen.iter().filter_map(|t| parse_key(t));
+                        d.selected = keys.filter(|k| have(k)).collect();
+                    }
+                }
+                Tab::Table(id) => {
+                    if let (Some(d), Some([row, column])) =
+                        (self.tables.iter_mut().find(|d| d.id == *id), view.cell)
+                    {
+                        let t = d.edit.table();
+                        if row < t.len() && column < t.columns().len() {
+                            d.go_to(row, column);
+                        }
+                    }
+                }
+                Tab::Tileset(id) => {
+                    if let Some(d) = self.tilesets.iter_mut().find(|d| d.id == *id) {
+                        d.show(view.page.as_deref(), view.tile, view.group);
                     }
                 }
                 tab => _ = self.open_tabs.views.insert(tab.clone(), view),

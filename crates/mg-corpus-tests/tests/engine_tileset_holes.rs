@@ -4,8 +4,8 @@
 //! exist has none, and the rest of the area is as with the whole tileset;
 //! a model named in capitals is the same model; missing terrain, crosser
 //! and rule sections change nothing the server reads. A tileset whose
-//! lines end in a bare LF, not CRLF, stops the module loading: the server
-//! never gets past "Loading Module".
+//! lines end in a bare LF, not CRLF, stops the module loading (the server
+//! never gets past "Loading Module") where its last 256 bytes hold no CR.
 
 use std::time::Duration;
 
@@ -158,6 +158,125 @@ fn the_game_reads_a_tileset_with_holes_tile_by_tile() {
     // No section, no Model=: no walkmesh; the model in capitals and the
     // tile without a hole as they were.
     assert_eq!(holed, [none[0], none[1], whole[2], whole[3]], "{seen}");
+}
+
+/// `set` with the lines of its `[NAME]` section (header and all) ending in
+/// a bare LF, the rest as they were.
+fn section_in_lf(set: &str, name: &str) -> String {
+    let header = format!("[{name}]\r\n");
+    let at = set.find(&header).unwrap_or_else(|| panic!("no {header}"));
+    let rest = at + header.len();
+    let end = set[rest..].find("\r\n[").map_or(set.len(), |e| rest + e + 2);
+    format!("{}{}{}", &set[..at], set[at..end].replace("\r\n", "\n"), &set[end..])
+}
+
+/// `set` with its last `n` lines ending in a bare LF.
+fn last_lf(set: &str, n: usize) -> String {
+    let mut at = set.len();
+    for _ in 0..n {
+        at = set[..at - 1].rfind('\n').unwrap_or(0);
+    }
+    format!("{}{}", &set[..at], set[at..].replace("\r\n", "\n"))
+}
+
+/// A tileset whose lines end both ways, and long lines. The server
+/// refuses (never finishes loading the module) a file with a line of more
+/// than 255 characters (its CR and LF not counted), wherever it is and
+/// however it ends; and one with more than 256 bytes after its last CRLF
+/// (a file all LF is one). Other lines in LF load and read as with CRLF:
+/// at its head, in its middle (a section, every tile's section: thousands
+/// of lines), before a last CRLF line however many. Verify says so
+/// (`set-line-ends`: an error for each of the two, a warning for a mix the
+/// server reads).
+#[test]
+fn a_tileset_whose_lines_end_both_ways() {
+    let root = corpus!();
+    let _ = oracle_tool!("nwn_script_comp");
+    let Some(ttr01) = ttr01(&root) else { return };
+    let dir = scratch_dir("engine_tileset_mixed");
+    let started = std::time::Instant::now();
+    let (base, _) = run(&dir.join("crlf"), &[("mgcrlf", ttr01.clone())], Duration::from_secs(120));
+    assert!(base.finished, "with CRLF:\n{}", base.log);
+    let no_load = (started.elapsed() * 3).max(Duration::from_secs(20));
+    let tiles_lf = {
+        let (a, b) = (ttr01.find("[TILE0]").unwrap(), ttr01.find("[GROUPS]").unwrap());
+        format!("{}{}{}", &ttr01[..a], ttr01[a..b].replace("\r\n", "\n"), &ttr01[b..])
+    };
+    let head_lf = {
+        let a = ttr01.find("[TILE0]").unwrap();
+        format!("{}{}", ttr01[..a].replace("\r\n", "\n"), &ttr01[a..])
+    };
+    let first_crlf = ttr01.replace("\r\n", "\n").replacen('\n', "\r\n", 1);
+    // After the file, a section of ours: `n` short lines ("X=1"), or one
+    // line of `n` characters, each ending in `end`.
+    let lines = |n: usize, end: &str| format!("X=1{end}").repeat(n);
+    let one = |n: usize, end: &str| format!("X={}{end}", "1".repeat(n - 2));
+    let pad = |tail: String| format!("{ttr01}[MGPAD]\r\n{tail}");
+    let in_middle = |line: String| {
+        let a = ttr01.find("[GROUPS]").unwrap();
+        format!("{}[MGPAD]\r\n{line}{}", &ttr01[..a], &ttr01[a..])
+    };
+    let cases = [
+        // Lines in LF: where.
+        ("mgtile20", section_in_lf(&ttr01, "TILE20"), true),
+        ("mgtiles", tiles_lf, true),
+        ("mghead", head_lf, true),
+        ("mgfirst", first_crlf, false),
+        // After the last CRLF: 251 and 256 bytes, 257 and 264.
+        ("mglast27", last_lf(&ttr01, 27), true),
+        ("mglast28", last_lf(&ttr01, 28), false),
+        ("mgshort64", pad(lines(64, "\n")), true),
+        ("mgshort65", pad(lines(65, "\n")), false),
+        ("mgone255", pad(one(255, "\n")), true),
+        ("mgone256", pad(one(256, "\n")), false),
+        // Before a last CRLF line: 600 bytes in LF.
+        ("mgbefore", pad(lines(150, "\n") + "Y=1\r\n"), true),
+        // A long line, however it ends, wherever it is.
+        ("mgcrlf255", pad(one(255, "\r\n")), true),
+        ("mgcrlf256", pad(one(256, "\r\n")), false),
+        ("mgmid300", in_middle(one(300, "\r\n")), false),
+        ("mgmidlf387", in_middle(one(387, "\n")), false),
+    ];
+    // (Each in a server of its own, side by side: a module that doesn't
+    // load is waited on.)
+    let seen = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for (name, text, loads) in &cases {
+            let (dir, seen, ttr01) = (&dir, &seen, &ttr01);
+            s.spawn(move || {
+                let after = text.rfind("\r\n").map_or(text.len(), |at| text.len() - at - 2);
+                let longest = text.split('\n').map(|l| l.trim_end_matches('\r').len()).max();
+                let sets = [("ttr01", String::new()), (*name, text.clone())];
+                let (r, areas) = run(&dir.join(name), &sets, no_load);
+                let mut said = format!(
+                    "{name} ({after} bytes after the last CRLF, the longest line {}): loaded {}",
+                    longest.unwrap_or(0),
+                    r.finished
+                );
+                if r.finished && *loads {
+                    // Read as with CRLF: the area's tiles as ttr01's.
+                    let tiles = r.values("MG_TILES");
+                    let of =
+                        |a: &str| tiles.iter().find(|l| l.starts_with(&format!("{a} "))).cloned();
+                    let rest =
+                        |l: Option<String>| l.map(|l| l.split_once(' ').unwrap().1.to_string());
+                    let (whole, this) = (rest(of("ttr01")), rest(of(&areas[1])));
+                    if whole.is_none() || whole != this {
+                        said += &format!("\n  ^ its tiles {this:?}, ttr01's {whole:?}");
+                    }
+                }
+                if r.finished != *loads {
+                    said += "\n  ^ not as expected";
+                }
+                let _ = ttr01;
+                seen.lock().unwrap().push(said);
+            });
+        }
+    });
+    let mut seen = seen.into_inner().unwrap();
+    seen.sort();
+    let wrong = seen.iter().any(|l| l.contains("  ^"));
+    assert!(!wrong, "{}", seen.join("\n"));
 }
 
 #[test]

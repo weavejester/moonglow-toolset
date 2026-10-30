@@ -5,9 +5,12 @@
 //!
 //! How a conversation maps onto Twine and Ink:
 //! - **NPC lines** are passages (Twine) or knots (Ink), named `E3` when
-//!   exported. The speaker, action script, journal update and sound are
-//!   tags: `speaker:TAG`, `do:SCRIPT`, `journal:QUEST:ENTRY`,
-//!   `sound:SOUND`.
+//!   exported. The speaker, action script, journal update, sound,
+//!   animation, delay and comment are tags: `speaker:TAG`, `do:SCRIPT`,
+//!   `journal:QUEST:ENTRY`, `sound:SOUND`, `anim:talk-forceful` (the
+//!   Other Actions tab's name, else its number), `delay:500` (where it
+//!   isn't the game's own), `comment:TEXT` (escaped as a parameter's
+//!   value is, and a space too in a Twine passage's tags).
 //! - **Player replies** are the links (Twine) or choices (Ink) in an NPC
 //!   line's passage, leading to the next NPC line, or `END`. A reply's
 //!   condition and action go in braces in Twine (`[[Who are you? {if
@@ -30,14 +33,14 @@
 //!   query: `do:a_give?item=gold%20coins&count=5`. Names and values are
 //!   text in the game's codepage, as the lines' are.
 //!
-//! Only English text is exported; animations, comments and delays are
-//! not. A conversation read back plays as the original did
-//! ([`play_outline`]).
+//! A CSV carries every language's text, a column each; Twine and Ink,
+//! which hold one text a line, carry English's. A conversation read back
+//! plays as the original did ([`play_outline`]).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use mg_core::{Codepage, ResRef};
+use mg_core::{Codepage, Gender, Language, LocString, LocStringKey, ResRef};
 use mg_gff::{Gff, Struct, Value};
 
 use crate::dialog::{
@@ -91,6 +94,20 @@ impl Format {
         }
     }
 
+    /// [`write`](Self::write) as a game whose codepage is `game` reads the
+    /// text (a module's `encoding.2da` table, else Windows-1252): a CSV
+    /// with a column for each of `languages` too ([`to_csv_in`]); the
+    /// others in English.
+    pub fn write_in(self, g: &Gff, title: &str, game: Codepage, languages: &[Language]) -> String {
+        match self {
+            Format::Csv => to_csv_in(g, game, languages),
+            f => {
+                let en = game.for_language(Language::ENGLISH);
+                CODEPAGE.spelled_in(&f.write(g, title), en).into_owned()
+            }
+        }
+    }
+
     /// What reading a file in this format gives.
     pub fn reads(self) -> Reads {
         match self {
@@ -116,6 +133,19 @@ impl Format {
     pub fn update(self, g: &mut Gff, text: &str) -> Option<Result<usize, String>> {
         match self {
             Format::Csv => Some(update_from_csv(g, text)),
+            Format::Text | Format::Twine | Format::Ink => None,
+        }
+    }
+
+    /// [`update`](Self::update) for a game whose codepage is `game`.
+    pub fn update_in(
+        self,
+        g: &mut Gff,
+        text: &str,
+        game: Codepage,
+    ) -> Option<Result<usize, String>> {
+        match self {
+            Format::Csv => Some(update_from_csv_in(g, text, game)),
             Format::Text | Format::Twine | Format::Ink => None,
         }
     }
@@ -306,9 +336,49 @@ fn unescape(v: &str) -> String {
     v.replace("%20", " ").replace("%25", "%")
 }
 
+/// An animation's name in a tag (`talk-forceful`): the Other Actions
+/// tab's, lower case, spaces as `-`; one it doesn't name by its number.
+fn animation_name(value: u32) -> String {
+    match crate::dialog::ANIMATIONS.iter().find(|(_, v)| *v == value) {
+        Some((label, _)) => label.to_ascii_lowercase().replace(' ', "-"),
+        None => value.to_string(),
+    }
+}
+
+/// The animation an `anim:` tag names (a name as [`animation_name`]
+/// writes it, in any case, or a number).
+fn read_animation(v: &str) -> Result<u32, String> {
+    let v = v.trim();
+    if let Ok(n) = v.parse() {
+        return Ok(n);
+    }
+    let name = v.to_ascii_lowercase().replace(' ', "-");
+    (crate::dialog::ANIMATIONS.iter())
+        .find(|(label, _)| label.to_ascii_lowercase().replace(' ', "-") == name)
+        .map(|(_, value)| *value)
+        .ok_or(format!("anim:{v} isn't an animation of a conversation's lines (talk-normal, bow…)"))
+}
+
+/// A line's comment in a tag: percent-escaped as a parameter is, and a
+/// space too in a Twine passage's tags (which can't hold one), or at
+/// either end (which a tag's reader trims).
+fn comment_text(comment: &str, passage_tags: bool) -> String {
+    // (Of the whitespace, only the space is left unescaped.)
+    let inner = percent(comment, if passage_tags { " " } else { "" });
+    let core = inner.trim_matches(' ');
+    if core.is_empty() {
+        return "%20".repeat(inner.len());
+    }
+    let lead = inner.len() - inner.trim_start_matches(' ').len();
+    let trail = inner.len() - inner.trim_end_matches(' ').len();
+    format!("{}{core}{}", "%20".repeat(lead), "%20".repeat(trail))
+}
+
 /// A line's tags: speaker, action (with its parameters: `do:a_give
 /// item="gold coins"`, or in a Twine passage's tags, which can't hold a
-/// space, `do:a_give?item=gold%20coins`), journal update, sound.
+/// space, `do:a_give?item=gold%20coins`), journal update, sound,
+/// animation (`anim:bow`), delay (`delay:500`, where it has one) and
+/// comment (`comment:Asked about the sword`).
 fn tags(kind: Kind, n: &Struct, passage_tags: bool) -> Vec<String> {
     let mut out = Vec::new();
     let speaker = string(n, "Speaker");
@@ -330,11 +400,22 @@ fn tags(kind: Kind, n: &Struct, passage_tags: bool) -> Vec<String> {
     if let Some(s) = resref(n, "Sound") {
         out.push(format!("sound:{}", escape(&s)));
     }
+    if let Some(a) = n.integer("Animation").filter(|a| *a != 0) {
+        out.push(format!("anim:{}", animation_name(a as u32)));
+    }
+    // (None: the game's own, `0xFFFFFFFF`, which new lines have.)
+    if let Some(d) = n.integer("Delay").filter(|d| *d != i64::from(u32::MAX)) {
+        out.push(format!("delay:{d}"));
+    }
+    let comment = string(n, "Comment");
+    if !comment.is_empty() {
+        out.push(format!("comment:{}", comment_text(&comment, passage_tags)));
+    }
     out
 }
 
-/// Applies tags (`speaker:`, `do:`, `journal:`, `sound:`) to a line;
-/// others are ignored.
+/// Applies tags (`speaker:`, `do:`, `journal:`, `sound:`, `anim:`,
+/// `delay:`, `comment:`) to a line; others are ignored.
 fn apply_tags(n: &mut Struct, tags: &[String]) -> Result<(), String> {
     let r = |v: &str| ResRef::from_str(v).map(Value::resref).map_err(|e| format!("{v}: {e}"));
     for t in tags {
@@ -362,6 +443,12 @@ fn apply_tags(n: &mut Struct, tags: &[String]) -> Result<(), String> {
                 n.set("Quest", string_value(q));
                 n.set("QuestEntry", Value::Dword(e.trim().parse().unwrap_or(0)));
             }
+            "anim" => n.set("Animation", Value::Dword(read_animation(&v)?)),
+            "delay" => {
+                let d = v.trim().parse().map_err(|_| format!("delay:{v} isn't a number"))?;
+                n.set("Delay", Value::Dword(d));
+            }
+            "comment" => n.set("Comment", string_value(&unpercent(raw.trim()))),
             _ => {}
         }
     }
@@ -665,57 +752,143 @@ pub fn read_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
 
 const CSV_HEADER: [&str; 7] = ["id", "speaker", "text", "condition", "action", "parent", "comment"];
 
+/// The column of a variant of a line's text other than English's (`text`):
+/// `text_fr`, `text_de`..., a feminine one `text_fr_f` (`text_en_f`
+/// English's); a language with no two-letter code by its number
+/// (`text_128`).
+pub fn csv_text_column(key: LocStringKey) -> String {
+    let l = key.language();
+    let code = l.short_code().map_or_else(|| l.0.to_string(), str::to_string);
+    match key.gender() {
+        Gender::Male => format!("text_{code}"),
+        Gender::Female => format!("text_{code}_f"),
+    }
+}
+
+/// The variant a [`csv_text_column`] header names (`TEXT_FR` too), not
+/// English's male `text`.
+fn csv_text_key(header: &str) -> Option<LocStringKey> {
+    let header = header.trim().to_ascii_lowercase();
+    let rest = header.strip_prefix("text_")?;
+    let (code, gender) = match rest.strip_suffix("_f") {
+        Some(c) => (c, Gender::Female),
+        None => (rest, Gender::Male),
+    };
+    let language = Language::from_short_code(code).or_else(|| code.parse().ok().map(Language))?;
+    let key = LocStringKey::new(language, gender);
+    (key != LocStringKey::new(Language::ENGLISH, Gender::Male)).then_some(key)
+}
+
 /// Every line as a CSV row: `id` (`E3` an NPC line, `R5` a reply),
-/// speaker, text, condition, action, the line it follows, comment.
-/// Only `speaker`, `text` and `comment` are read back
-/// ([`update_from_csv`]).
+/// speaker, text, condition and action (each with its parameters, as in
+/// Twine and Ink: `c_has item=gold`), the line it follows, comment; then
+/// a column for each other language (and feminine text) a line has text
+/// in ([`csv_text_column`]). Only `speaker`, the texts and `comment` are
+/// read back ([`update_from_csv`]).
 pub fn to_csv(g: &Gff) -> String {
-    let mut out = CSV_HEADER.join(",") + "\r\n";
+    to_csv_in(g, Codepage::WINDOWS_1252, &[])
+}
+
+/// [`to_csv`] as a game whose codepage is `game` reads the text (a
+/// module's `encoding.2da` table, else Windows-1252), with a column for
+/// each of `languages` too, though no line has text in it yet (the
+/// languages it is to be translated into).
+pub fn to_csv_in(g: &Gff, game: Codepage, languages: &[Language]) -> String {
+    let english = LocStringKey::new(Language::ENGLISH, Gender::Male);
+    let mut keys: Vec<LocStringKey> =
+        languages.iter().map(|l| LocStringKey::new(*l, Gender::Male)).collect();
+    for kind in [Kind::Entry, Kind::Reply] {
+        for n in crate::dialog::nodes(g, kind) {
+            let variants = n.locstring("Text").into_iter().flat_map(|t| &t.strings);
+            keys.extend(variants.map(|(k, _)| *k));
+        }
+    }
+    keys.retain(|k| *k != english);
+    keys.sort();
+    keys.dedup();
+    let mut header: Vec<String> = CSV_HEADER.iter().map(|h| h.to_string()).collect();
+    header.extend(keys.iter().map(|k| csv_text_column(*k)));
+    let mut out = header.join(",") + "\r\n";
     let mut seen = std::collections::HashSet::new();
+    struct Ctx<'a> {
+        g: &'a Gff,
+        game: Codepage,
+        keys: &'a [LocStringKey],
+    }
     fn walk(
-        g: &Gff,
+        c: &Ctx<'_>,
         parent: Parent,
         seen: &mut std::collections::HashSet<(Kind, u32)>,
         out: &mut String,
     ) {
         let kind = parent.child_kind();
-        for l in links(g, parent) {
+        let en = c.game.for_language(Language::ENGLISH);
+        let plain =
+            |s: &Struct, label: &str| en.decode(s.string(label).unwrap_or_default()).into_owned();
+        let call = |s: &Struct, script: &str, params: &str| {
+            let params = crate::dialog::params_in(s, params, en);
+            resref(s, script).map(|r| call_text(&r, &params)).unwrap_or_default()
+        };
+        for l in links(c.g, parent) {
             let i = link_index(l);
             if is_link(l) || !seen.insert((kind, i)) {
                 continue;
             }
-            let Some(n) = node(g, kind, i) else { continue };
+            let Some(n) = node(c.g, kind, i) else { continue };
             let from = match parent {
                 Parent::Root => "start".to_string(),
                 Parent::Node(k, p) => passage(k, p),
             };
-            let row = [
+            let variant = |k: LocStringKey| {
+                n.locstring("Text")
+                    .and_then(|t| t.text_in(k.language(), k.gender(), c.game))
+                    .map(|t| t.into_owned())
+                    .unwrap_or_default()
+            };
+            let mut row = vec![
                 passage(kind, i),
-                string(n, "Speaker"),
-                text(n),
-                resref(l, "Active").unwrap_or_default(),
-                resref(n, "Script").unwrap_or_default(),
+                plain(n, "Speaker"),
+                variant(LocStringKey::new(Language::ENGLISH, Gender::Male)),
+                // The scripts with their parameters, as in Twine and Ink.
+                call(l, "Active", "ConditionParams"),
+                call(n, "Script", "ActionParams"),
                 from,
-                string(n, "Comment"),
+                plain(n, "Comment"),
             ];
+            row.extend(c.keys.iter().map(|k| variant(*k)));
             out.push_str(&row.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(","));
             out.push_str("\r\n");
-            walk(g, Parent::Node(kind, i), seen, out);
+            walk(c, Parent::Node(kind, i), seen, out);
         }
     }
-    walk(g, Parent::Root, &mut seen, &mut out);
+    walk(&Ctx { g, game, keys: &keys }, Parent::Root, &mut seen, &mut out);
     out
 }
 
 /// Reads back the speaker, text and comment of the lines a CSV names by
-/// `id` (columns found by their header; others ignored). How many lines
-/// changed; an unknown id or a missing `id` column is an error.
+/// `id` (columns found by their header; others ignored), and the text of
+/// each other language a `text_fr`... column has ([`csv_text_column`]):
+/// a cell left empty there takes that language's text away. How many
+/// lines changed; an unknown id or a missing `id` column is an error.
 pub fn update_from_csv(g: &mut Gff, csv: &str) -> Result<usize, String> {
+    update_from_csv_in(g, csv, Codepage::WINDOWS_1252)
+}
+
+/// [`update_from_csv`] for a game whose codepage is `game`.
+pub fn update_from_csv_in(g: &mut Gff, csv: &str, game: Codepage) -> Result<usize, String> {
     let rows = read_csv(csv)?;
     let (header, rows) = rows.split_first().ok_or("the file is empty")?;
     let col = |name: &str| header.iter().position(|h| h.trim().eq_ignore_ascii_case(name));
     let id = col("id").ok_or("no id column")?;
     let (speaker, text_col, comment) = (col("speaker"), col("text"), col("comment"));
+    let others: Vec<(usize, LocStringKey)> =
+        header.iter().enumerate().filter_map(|(i, h)| csv_text_key(h).map(|k| (i, k))).collect();
+    let en = game.for_language(Language::ENGLISH);
+    let plain =
+        |s: &Struct, label: &str| en.decode(s.string(label).unwrap_or_default()).into_owned();
+    let shown = |ls: &LocString, l: Language, gender: Gender| {
+        ls.text_in(l, gender, game).map(|t| t.into_owned())
+    };
     let mut changed = 0;
     for (n, row) in rows.iter().enumerate() {
         if row.iter().all(|f| f.is_empty()) {
@@ -732,21 +905,41 @@ pub fn update_from_csv(g: &mut Gff, csv: &str) -> Result<usize, String> {
             rest.parse().map_err(|_| format!("line {line}: {name:?} isn't a line id"))?;
         let n = node_mut(g, kind, index).ok_or(format!("line {line}: there's no line {name}"))?;
         let before = n.clone();
-        if let Some(t) = text_col.and_then(|c| row.get(c)).filter(|t| **t != text(n)) {
-            let mut ls = n.locstring("Text").cloned().unwrap_or_default();
-            ls.set_text(mg_core::Language::ENGLISH, mg_core::Gender::Male, t).ok_or(format!(
+        let mut ls = n.locstring("Text").cloned().unwrap_or_default();
+        if let Some(t) = text_col.and_then(|c| row.get(c))
+            && shown(&ls, Language::ENGLISH, Gender::Male).unwrap_or_default() != *t
+        {
+            ls.set_text_in(Language::ENGLISH, Gender::Male, t, game).ok_or(format!(
                 "line {line}: {name}'s text can't be written in English's codepage"
             ))?;
+        }
+        for (c, key) in &others {
+            let Some(t) = row.get(*c) else { continue };
+            let (l, gender) = (key.language(), key.gender());
+            match shown(&ls, l, gender) {
+                Some(old) if old == *t => {}
+                None if t.is_empty() => {}
+                Some(_) if t.is_empty() => {
+                    ls.remove(l, gender);
+                }
+                _ => {
+                    let lang = l.name().map_or_else(|| l.0.to_string(), str::to_string);
+                    ls.set_text_in(l, gender, t, game).ok_or(format!(
+                        "line {line}: {name}'s {lang} text can't be written in its codepage"
+                    ))?;
+                }
+            }
+        }
+        if n.locstring("Text") != Some(&ls) && !(ls.is_empty() && n.locstring("Text").is_none()) {
             n.set("Text", Value::LocString(ls));
         }
         if kind == Kind::Entry
-            && let Some(s) =
-                speaker.and_then(|c| row.get(c)).filter(|s| **s != string(n, "Speaker"))
+            && let Some(s) = speaker.and_then(|c| row.get(c)).filter(|s| **s != plain(n, "Speaker"))
         {
-            n.set("Speaker", string_value(s));
+            n.set("Speaker", Value::String(en.encode_lossy(s)));
         }
-        if let Some(c) = comment.and_then(|c| row.get(c)).filter(|c| **c != string(n, "Comment")) {
-            n.set("Comment", string_value(c));
+        if let Some(c) = comment.and_then(|c| row.get(c)).filter(|c| **c != plain(n, "Comment")) {
+            n.set("Comment", Value::String(en.encode_lossy(c)));
         }
         changed += usize::from(*n != before);
     }
@@ -951,7 +1144,8 @@ fn parse_twee(source: &str) -> Story {
 }
 
 /// A reply's label as read: its text and the braces after it (`{if c}`,
-/// `{do a}`, `{journal q:10}`, `{sound s}`).
+/// `{do a}`, `{journal q:10}`, `{sound s}`, `{anim bow}`, `{delay 500}`,
+/// `{comment text}`).
 fn reply_label(label: &str) -> (String, Option<String>, Vec<String>) {
     let mut text = label.to_string();
     let mut cond = None;
@@ -961,7 +1155,9 @@ fn reply_label(label: &str) -> (String, Option<String>, Vec<String>) {
         let inner = text[open + 1..open + close].trim().to_string();
         match inner.split_once(' ') {
             Some(("if", c)) => cond = Some(c.trim().to_string()),
-            Some((k @ ("do" | "journal" | "sound"), v)) => tags.push(format!("{k}:{}", v.trim())),
+            Some((k @ ("do" | "journal" | "sound" | "anim" | "delay" | "comment"), v)) => {
+                tags.push(format!("{k}:{}", v.trim()))
+            }
             _ => break,
         }
         text.replace_range(open..open + close + 1, "");
@@ -1512,6 +1708,86 @@ mod tests {
         }
     }
 
+    /// A line's animation, delay and comment go out to Ink and Twine as
+    /// tags and come back: an NPC line's (a passage's tags, which can't
+    /// hold a space; a knot's own lines) and a reply's (Twine's braces, a
+    /// choice's tags); an animation the Other Actions tab doesn't name by
+    /// its number; a comment with what Ink and Twine read as syntax and
+    /// spaces at its ends. A line with the defaults has none of them.
+    #[test]
+    fn animations_comments_and_delays_survive_ink_and_twine() {
+        let mut g = sample();
+        let comment = " Asked {twice} about the sword #2 // keep -> E3 ";
+        let hello = node_mut(&mut g, Kind::Entry, 1).unwrap();
+        hello.set("Animation", Value::Dword(40));
+        hello.set("Delay", Value::Dword(500));
+        hello.set("Comment", string_value(comment));
+        let bye = node_mut(&mut g, Kind::Reply, 1).unwrap();
+        bye.set("Animation", Value::Dword(123));
+        bye.set("Delay", Value::Dword(0));
+        bye.set("Comment", string_value("Zoë's goodbye"));
+        let want = play_outline(&g, 10_000).unwrap();
+        assert!(
+            want.iter().any(|l| l.contains("anim:talk-forceful delay:500 comment:")),
+            "{want:?}"
+        );
+
+        let ink = to_ink(&g);
+        assert!(ink.contains("\n# anim:talk-forceful\n# delay:500\n# comment:%20Asked %7Btwice%7D about the sword %232 %2F%2F keep -%3E E3%20\n"), "{ink}");
+        assert!(ink.contains("# anim:123 # delay:0 # comment:Zoë's goodbye -> END"), "{ink}");
+        let twee = to_twee(&g, "keeper");
+        assert!(
+            twee.contains(" anim:talk-forceful delay:500 comment:%20Asked%20%7Btwice%7D%20about"),
+            "{twee}"
+        );
+        assert!(twee.contains("{anim 123} {delay 0} {comment Zoë's goodbye}->END]]"), "{twee}");
+        // (The defaults: no tag, on the other lines.)
+        assert!(ink.matches("anim:").count() == 2 && ink.matches("delay:").count() == 2, "{ink}");
+
+        for (format, back) in [("Ink", from_ink(&ink)), ("Twine", from_twee(&twee))] {
+            let back = back.unwrap_or_else(|e| panic!("{format}: {e}"));
+            assert_eq!(play_outline(&back, 10_000).unwrap(), want, "{format}");
+            let start = links(&back, Parent::Root);
+            let hello = node(&back, Kind::Entry, link_index(&start[1])).unwrap();
+            assert_eq!(hello.integer("Animation"), Some(40), "{format}");
+            assert_eq!(hello.integer("Delay"), Some(500), "{format}");
+            assert_eq!(string(hello, "Comment"), comment, "{format}");
+            let replies = links(&back, Parent::Node(Kind::Entry, link_index(&start[1])));
+            let bye = node(&back, Kind::Reply, link_index(&replies[1])).unwrap();
+            assert_eq!((bye.integer("Animation"), bye.integer("Delay")), (Some(123), Some(0)));
+            assert_eq!(bye.string("Comment"), Some(&b"Zo\xeb's goodbye"[..]), "{format}");
+            // (Those without: as a new line has them.)
+            let who = node(&back, Kind::Reply, link_index(&replies[0])).unwrap();
+            assert_eq!(
+                (who.integer("Animation"), who.integer("Delay")),
+                (Some(0), Some(u32::MAX.into()))
+            );
+        }
+        // An animation by its label, in any case; one there isn't.
+        let mut n = crate::dialog::new_node(Kind::Entry, "");
+        apply_tags(&mut n, &["anim:Talk Laughing".to_string()]).unwrap();
+        assert_eq!(n.integer("Animation"), Some(41));
+        let e = apply_tags(&mut n, &["anim:dance".to_string()]).unwrap_err();
+        assert!(e.contains("anim:dance"), "{e}");
+        assert!(apply_tags(&mut n, &["delay:soon".to_string()]).is_err());
+    }
+
+    /// The CSV's condition and action name their scripts' parameters too.
+    #[test]
+    fn csv_scripts_carry_their_parameters() {
+        let mut g = sample();
+        crate::dialog::links_mut(&mut g, Parent::Node(Kind::Entry, 1)).unwrap()[0]
+            .set("ConditionParams", params_list(&pairs(&[("item", "gold coins")])));
+        node_mut(&mut g, Kind::Reply, 1)
+            .unwrap()
+            .set("ActionParams", params_list(&pairs(&[("mood", "cold")])));
+        let rows = read_csv(&to_csv(&g)).unwrap();
+        let row = |id: &str| rows.iter().find(|r| r[0] == id).unwrap().clone();
+        assert_eq!(row("R0")[3], "c_curious item=\"gold coins\"");
+        assert_eq!(row("R1")[4], "a_bye mood=cold");
+        assert_eq!(row("E1")[4], "a_hello", "no parameters: the script alone");
+    }
+
     /// An `# if:` tag names the condition it gives parameters to, and one
     /// on its own line goes just before its conditional divert.
     #[test]
@@ -1550,6 +1826,61 @@ mod tests {
             update_from_csv(&mut g, "id,text\r\nE99,x\r\n").unwrap_err().contains("no line E99")
         );
         assert_eq!(read_csv("a,\"b\nc\",d\r\n").unwrap(), [vec!["a", "b\nc", "d"]]);
+    }
+
+    /// A CSV carries a column for each language a line has text in, and
+    /// those asked for, for a translator; they are read back.
+    #[test]
+    fn csv_carries_every_language() {
+        let mut g = sample();
+        let hello = node_mut(&mut g, Kind::Entry, 1).unwrap();
+        let mut ls = hello.locstring("Text").cloned().unwrap();
+        ls.set(Language::GERMAN, Gender::Male, b"Hallo, Fremder.".to_vec());
+        ls.set(Language::GERMAN, Gender::Female, b"Hallo, Fremde.".to_vec());
+        hello.set("Text", Value::LocString(ls));
+        let csv = to_csv(&g);
+        let header = csv.lines().next().unwrap();
+        assert_eq!(header, "id,speaker,text,condition,action,parent,comment,text_de,text_de_f");
+        assert!(csv.contains(",\"Hallo, Fremder.\",\"Hallo, Fremde.\"\r\n"), "{csv}");
+        // Asked for, French has a column though no line has text in it;
+        // Polish is read in its own codepage.
+        let csv = to_csv_in(&g, Codepage::WINDOWS_1252, &[Language::FRENCH, Language::POLISH]);
+        assert!(
+            csv.starts_with("id,speaker,text,condition,action,parent,comment,text_fr,text_de,")
+        );
+        assert_eq!(update_from_csv(&mut g, &csv), Ok(0), "untouched");
+        let rows = read_csv(&csv).unwrap();
+        let col = |h: &str| rows[0].iter().position(|c| c == h).unwrap();
+        let (fr, pl, de_f) = (col("text_fr"), col("text_pl"), col("text_de_f"));
+        let mut edited = rows.clone();
+        let hello_row = edited.iter_mut().find(|r| r[0] == "E1").unwrap();
+        hello_row[fr] = "Bonjour, étranger.".into();
+        hello_row[pl] = "Witaj, przybyszu. Łódź".into();
+        hello_row[de_f] = String::new();
+        let back: String = (edited.iter())
+            .map(|r| r.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(",") + "\r\n")
+            .collect();
+        assert_eq!(update_from_csv(&mut g, &back), Ok(1));
+        let t = node(&g, Kind::Entry, 1).unwrap().locstring("Text").unwrap();
+        assert_eq!(t.text(Language::FRENCH, Gender::Male).unwrap(), "Bonjour, étranger.");
+        assert_eq!(
+            t.get(Language::POLISH, Gender::Male).unwrap(),
+            b"Witaj, przybyszu. \xa3\xf3d\x9f"
+        );
+        assert_eq!(t.text(Language::GERMAN, Gender::Male).unwrap(), "Hallo, Fremder.");
+        assert_eq!(t.get(Language::GERMAN, Gender::Female), None, "an emptied cell");
+        assert_eq!(text(node(&g, Kind::Entry, 1).unwrap()), "Hello, stranger.");
+        // Headers are named in any case; one that names no language is
+        // another column, ignored.
+        assert_eq!(
+            csv_text_key("TEXT_FR"),
+            Some(LocStringKey::new(Language::FRENCH, Gender::Male))
+        );
+        assert_eq!(csv_text_key("text_en_f").map(|k| k.gender()), Some(Gender::Female));
+        assert_eq!(csv_text_key("text_en"), None);
+        assert_eq!(csv_text_key("text_xx"), None);
+        assert_eq!(csv_text_column(LocStringKey::new(Language::KOREAN, Gender::Male)), "text_128");
+        assert_eq!(csv_text_key("text_128").map(|k| k.language()), Some(Language::KOREAN));
     }
 
     #[test]

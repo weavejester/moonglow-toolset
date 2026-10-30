@@ -7,6 +7,7 @@
 //! file is written next to the old one and renamed over it, after the old
 //! one is kept as a single backup.
 
+pub mod archive_file;
 pub mod areas;
 pub mod attach;
 pub mod blueprints;
@@ -18,11 +19,14 @@ pub mod doctor;
 pub mod external_compiler;
 pub mod factions;
 pub mod folder;
+pub mod game_data;
 pub mod grass;
 pub mod hak_edit;
 pub mod haks;
 pub mod instances;
 pub mod journal;
+pub mod lighting;
+pub mod lights;
 pub mod locks;
 pub mod minimap;
 pub mod models;
@@ -32,12 +36,14 @@ pub mod nwsync;
 pub mod outside;
 pub mod palette;
 pub mod palette_add;
+pub mod placement;
 mod process;
 pub mod project_file;
 pub mod project_plugins;
 pub mod query;
 pub mod refs;
 pub mod rename;
+pub mod roundtrip;
 pub mod script_set;
 pub mod script_wizard;
 pub mod search;
@@ -56,6 +62,8 @@ pub mod transfer;
 pub mod var_desc;
 pub mod vars;
 pub mod verify;
+mod verify_cache;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -122,6 +130,9 @@ pub struct Module {
     pub project: Option<Box<nasher::Project>>,
     /// A module folder's files as last read or written, when it is one.
     pub folder: Option<Box<folder::FolderFiles>>,
+    /// A module archive's resources as last read or written, when it is
+    /// one: to find what changed in it outside Moonglow.
+    pub archive: Option<Box<archive_file::ArchiveFile>>,
     /// The project's rules (`moonglow.toml`): none for a module kept in
     /// one file, or a folder or project without the file.
     pub project_file: project_file::ProjectFile,
@@ -144,6 +155,7 @@ impl Module {
             dirty: false,
             project: None,
             folder: None,
+            archive: None,
             project_file: project_file::ProjectFile::default(),
         }
     }
@@ -179,6 +191,7 @@ impl Module {
         if path.is_dir() {
             return Self::open_folder(path);
         }
+        left_writing(&sibling(path, WRITING));
         let data = std::fs::read(path).map_err(io(path))?;
         let erf = Erf::read(&data)
             .map_err(|e| ModuleError::Archive { path: path.into(), message: e.to_string() })?;
@@ -198,6 +211,7 @@ impl Module {
             m.resources.insert(key, Arc::from(bytes.as_ref()));
         }
         m.location = Some(ModuleLocation::Archive(path.into()));
+        m.archive = Some(Box::new(archive_file::ArchiveFile::new(path, m.resources.iter())));
         // (Its own project file beside it, `NAME.moonglow.toml`, if any.)
         m.reread_project_file();
         Ok(m)
@@ -230,6 +244,8 @@ impl Module {
         for f in files.iter().filter(|f| f.is_file()) {
             let Some(name) = f.file_name().and_then(|n| n.to_str()) else { continue };
             let Some(key) = folder_key(name) else {
+                // (A crash's half-written file goes, once it is old.)
+                left_writing(f);
                 continue; // not a resource (notes, editor files, ...)
             };
             let at = f.metadata().and_then(|d| d.modified()).unwrap_or(std::time::UNIX_EPOCH);
@@ -363,44 +379,20 @@ impl Module {
 
     /// The module's areas, in `Mod_Area_list` order.
     pub fn areas(&self) -> Result<Vec<ResRef>, ModuleError> {
-        let info = self.info()?;
-        Ok(info
-            .root
-            .items(&ifo::MOD_AREA_LIST)
-            .iter()
-            .filter_map(|a| a.try_read(&ifo::mod_area_list::AREA_NAME))
-            .collect())
+        Ok(areas_of(&self.info()?.root))
     }
 
     /// The module's haks, highest priority first: `Mod_HakList`, or the
     /// single pre-1.69 `Mod_Hak` field when there is no list.
     pub fn haks(&self) -> Result<Vec<String>, ModuleError> {
-        let info = self.info()?;
-        let text = |s: ExoString| String::from_utf8_lossy(s.as_bytes()).into_owned();
-        let list: Vec<String> = info
-            .root
-            .items(&ifo::MOD_HAK_LIST)
-            .iter()
-            .map(|h| text(h.read(&ifo::mod_hak_list::MOD_HAK)))
-            .filter(|h| !h.is_empty())
-            .collect();
-        if !list.is_empty() || info.root.contains(ifo::MOD_HAK_LIST.label) {
-            return Ok(list);
-        }
-        Ok(info
-            .root
-            .try_read(&ifo::MOD_HAK)
-            .map(text)
-            .filter(|h| !h.is_empty())
-            .into_iter()
-            .collect())
+        Ok(haks_of(&self.info()?.root))
     }
 
     /// The custom talk table's name (without `.tlk`), if any.
     pub fn custom_tlk(&self) -> Result<Option<String>, ModuleError> {
         let info = self.info()?;
-        let name =
-            String::from_utf8_lossy(info.root.read(&ifo::MOD_CUSTOM_TLK).as_bytes()).into_owned();
+        // (Its bytes are its file's name's, as a hak's.)
+        let name = mg_resman::file_name_text(info.root.read(&ifo::MOD_CUSTOM_TLK).as_bytes());
         Ok(Some(name).filter(|n| !n.is_empty()))
     }
 
@@ -420,7 +412,7 @@ impl Module {
         };
         resman.add(
             mg_resman::priority::MODULE,
-            "module",
+            mg_resman::MODULE_LABEL,
             mg_resman::LayerClass::Erf,
             self.container(),
         );
@@ -451,8 +443,21 @@ impl Module {
     /// one there (or adds the module to a project without one).
     pub fn save_as(&mut self, location: &ModuleLocation) -> Result<(), ModuleError> {
         let mut folder = None;
+        let mut archive = None;
         match location {
-            ModuleLocation::Archive(path) => self.write_archive(path)?,
+            ModuleLocation::Archive(path) => {
+                // The file it was read from, changed outside since in a way
+                // not yet taken (or kept as Moonglow has it): not written
+                // over, as a folder's file isn't.
+                if let Some(a) = self.archive.as_ref().filter(|a| a.path() == path.as_path())
+                    && a.changed_outside()
+                {
+                    return Err(ModuleError::ChangedOnDisk(vec![path.clone()]));
+                }
+                self.write_archive(path)?;
+                archive =
+                    Some(Box::new(archive_file::ArchiveFile::new(path, self.resources.iter())));
+            }
             ModuleLocation::Folder(path) => folder = Some(Box::new(self.write_folder(path)?)),
             ModuleLocation::Project { root, target } => {
                 let same = self
@@ -501,6 +506,7 @@ impl Module {
                 let location =
                     ModuleLocation::Project { root: root.clone(), target: project.target.clone() };
                 self.location = Some(location);
+                self.archive = None;
                 self.dirty = false;
                 self.reread_project_file();
                 return Ok(());
@@ -508,6 +514,7 @@ impl Module {
         }
         self.project = None;
         self.folder = folder;
+        self.archive = archive;
         self.location = Some(location.clone());
         self.dirty = false;
         self.reread_project_file();
@@ -527,13 +534,50 @@ impl Module {
     /// For a module in a nasher project, its target's file and contents as
     /// nasher packs them (filters and module name applied).
     pub fn target_archive(&self) -> Result<Option<(PathBuf, Vec<u8>)>, ModuleError> {
+        let packed = self.target_archive_from(None)?;
+        Ok(packed.map(|(path, bytes, _)| (path, bytes)))
+    }
+
+    /// [`Module::target_archive`], the models kept as text compiled on the
+    /// way in where the project file asks (`[pack] compile_models`): each
+    /// against its supermodel among the module's files, else from `lookup`
+    /// (its haks, the game), as [`models::compile_models`] compiles them;
+    /// one that can't be goes in as the text it is. With what became of
+    /// each (none where the project file doesn't ask).
+    #[allow(clippy::type_complexity)]
+    pub fn target_archive_with(
+        &self,
+        lookup: &(dyn Fn(&str, ResType) -> Option<Vec<u8>> + Sync),
+    ) -> Result<Option<(PathBuf, Vec<u8>, Vec<models::Compiled>)>, ModuleError> {
+        let compile = self.project_file.pack.compile_models.then_some(lookup);
+        self.target_archive_from(compile)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn target_archive_from(
+        &self,
+        compile: Option<&(dyn Fn(&str, ResType) -> Option<Vec<u8>> + Sync)>,
+    ) -> Result<Option<(PathBuf, Vec<u8>, Vec<models::Compiled>)>, ModuleError> {
         let Some(project) = &self.project else { return Ok(None) };
         let mut w = ErfWriter::new(self.file_type);
         w.description = self.description.clone();
         let (year, day) = build_date();
         w.build_year = year;
         w.build_day = day;
-        let packed = project.packed(&self.resources)?;
+        let mut packed = project.packed(&self.resources)?;
+        let mut compiled = Vec::new();
+        if let Some(lookup) = compile {
+            let files: Vec<(ResKey, &[u8])> = (packed.iter())
+                .filter(|(k, _)| matches!(k.restype, ResType::MDL | ResType::MTR))
+                .map(|(k, v)| (*k, &v[..]))
+                .collect();
+            compiled = models::compile_models(&files, lookup);
+            for c in &compiled {
+                if let Ok((binary, _)) = &c.result {
+                    packed.insert(c.model, binary.clone().into());
+                }
+            }
+        }
         for (k, v) in &packed {
             w.add(k.resref, k.restype, &v[..]).map_err(|e| ModuleError::Archive {
                 path: project.target_path(),
@@ -544,7 +588,7 @@ impl Module {
             path: project.target_path(),
             message: e.to_string(),
         })?;
-        Ok(Some((project.target_path(), bytes)))
+        Ok(Some((project.target_path(), bytes, compiled)))
     }
 
     /// The module as archive bytes. The build date is today's (or
@@ -598,11 +642,7 @@ impl Module {
             return Err(e);
         }
         if path.exists() {
-            let backup = sibling(path, ".bak");
-            let _ = std::fs::remove_file(&backup);
-            if std::fs::hard_link(path, &backup).is_err() {
-                std::fs::copy(path, &backup).map_err(io(&backup))?;
-            }
+            keep_previous(path).map_err(io(&sibling(path, ".bak")))?;
         }
         std::fs::rename(&tmp, path).map_err(io(path))
     }
@@ -780,9 +820,9 @@ impl Module {
     }
 
     /// The files of the module's folder or nasher project changed, added
-    /// or deleted outside Moonglow since they were read or written, and
-    /// what could not be read of them. `None`: the module is an archive
-    /// (or was never saved), which nothing else edits in place.
+    /// or deleted outside Moonglow since they were read or written (or the
+    /// resources of its archive, since it was), and what could not be read
+    /// of them. `None`: the module was never saved.
     pub fn outside(&mut self) -> Option<(Vec<nasher::Outside>, Vec<String>)> {
         let found = self.outside_scan()?.run();
         Some(self.outside_found(found))
@@ -790,12 +830,29 @@ impl Module {
 
     /// What is known of the module's files, for [`Module::outside`]'s
     /// looking to be done on another thread ([`outside::OutsideScan::run`],
-    /// then [`Module::outside_found`]). `None`: an archive.
+    /// then [`Module::outside_found`]). `None`: never saved.
     pub fn outside_scan(&self) -> Option<outside::OutsideScan> {
         match (&self.project, &self.folder) {
             (Some(project), _) => Some(project.outside_scan()),
             (None, Some(folder)) => Some(folder.outside_scan()),
-            (None, None) => None,
+            (None, None) => self.archive.as_ref().map(|a| a.outside_scan()),
+        }
+    }
+
+    /// [`Module::outside_scan`] of these files alone (those the system said
+    /// changed, added or removed: what a watch of the folder heard), so
+    /// that only they are looked at and no folder is walked for new ones.
+    /// Files only: a folder named is not looked into (where one was made,
+    /// moved or removed whole, [`Module::outside_scan`] looks at all; a
+    /// watch tells it so, as the window's does). (Nothing is looked at on
+    /// disk here: a pull's thousands of files named were 3 ms of the
+    /// window's frame when each was asked whether it was a folder.)
+    pub fn outside_scan_of(&self, paths: &[PathBuf]) -> Option<outside::OutsideScan> {
+        match (&self.project, &self.folder) {
+            (Some(project), _) => Some(project.outside_scan_of(paths)),
+            (None, Some(folder)) => Some(folder.outside_scan_of(paths)),
+            // (An archive is one file, read whole.)
+            (None, None) => self.outside_scan(),
         }
     }
 
@@ -808,11 +865,32 @@ impl Module {
         &mut self,
         found: outside::OutsideFound,
     ) -> (Vec<nasher::Outside>, Vec<String>) {
-        match (&mut self.project, &mut self.folder) {
-            (Some(project), _) => project.outside_found(found),
-            (None, Some(folder)) => folder.outside_found(found),
-            (None, None) => (Vec::new(), Vec::new()),
+        match (&mut self.project, &mut self.folder, &mut self.archive) {
+            (Some(project), ..) => project.outside_found(found),
+            (None, Some(folder), _) => folder.outside_found(found),
+            (None, None, Some(archive)) => archive.outside_found(found),
+            (None, None, None) => (Vec::new(), Vec::new()),
         }
+    }
+
+    /// A nasher project's area list settled again after its files changed
+    /// outside Moonglow (areas a pull added that `module.ifo` doesn't list
+    /// yet are listed after the others, as when the project is opened,
+    /// unless its `removeUnusedAreas` is off), counted as read: its
+    /// `module.ifo` as it is now, for the workspace to take as one changed
+    /// outside (`Workspace::adopt`, which puts it in the module); `None`
+    /// where nothing changed. The module itself is left as it is.
+    pub fn area_list_settled(&mut self) -> Option<Arc<[u8]>> {
+        let project = self.project.as_mut()?;
+        let info = Module::info_key();
+        let was = self.resources.get(&info)?.clone();
+        let mut these: nasher::Resources = (self.resources.iter())
+            .filter(|(k, _)| k.restype == ResType::ARE || **k == info)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        project.settle_area_list(&mut these);
+        let now = these.get(&info)?;
+        (!Arc::ptr_eq(&was, now)).then(|| now.clone())
     }
 
     /// Puts the locks kept apart from a nasher project's files
@@ -851,16 +929,17 @@ impl Module {
         match (&self.project, &self.folder) {
             (Some(project), _) => project.as_read(key),
             (None, Some(folder)) => folder.as_read(key),
-            (None, None) => None,
+            (None, None) => self.archive.as_ref().and_then(|a| a.as_read(key)),
         }
     }
 
     /// Counts a file changed outside as read (see [`nasher::Project::took`]).
     pub fn took(&mut self, change: &nasher::Outside) {
-        match (&mut self.project, &mut self.folder) {
-            (Some(project), _) => project.took(change),
-            (None, Some(folder)) => folder.took(change),
-            (None, None) => {}
+        match (&mut self.project, &mut self.folder, &mut self.archive) {
+            (Some(project), ..) => project.took(change),
+            (None, Some(folder), _) => folder.took(change),
+            (None, None, Some(archive)) => archive.took(change),
+            (None, None, None) => {}
         }
     }
 
@@ -883,6 +962,41 @@ pub(crate) fn folder_key(name: &str) -> Option<ResKey> {
         return ResType::from_extension(ext).map(|t| ResKey::new(ResRef::EMPTY, t));
     }
     ResKey::from_filename(name)
+}
+
+/// What a file is written as beside the one it takes the place of, before
+/// it is moved there ([`write_replacing`], a save): left only by a crash.
+pub(crate) const WRITING: &str = ".moonglow-tmp";
+
+/// Whether `path` is a file Moonglow writes before moving it into place
+/// (`name.ext.moonglow-tmp`): not a resource, and taken away where it is
+/// over ten minutes old, which a write in progress never is (what a crash
+/// left in a module's folder or a project, which version control would
+/// otherwise offer to commit).
+pub(crate) fn left_writing(path: &Path) -> bool {
+    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    if !name.ends_with(WRITING) {
+        return false;
+    }
+    let age =
+        std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    if age.is_some_and(|a| a > std::time::Duration::from_secs(600)) {
+        let _ = std::fs::remove_file(path);
+    }
+    true
+}
+
+/// Keeps the file at `path` as it is now beside it, as `name.ext.bak`
+/// (one there before goes), before a new one is moved into its place: a
+/// second name for the same file where the disk can give one (no copy of
+/// a hak of gigabytes), else a copy. Where it is kept.
+pub(crate) fn keep_previous(path: &Path) -> std::io::Result<PathBuf> {
+    let backup = sibling(path, ".bak");
+    let _ = std::fs::remove_file(&backup);
+    if std::fs::hard_link(path, &backup).is_err() {
+        std::fs::copy(path, &backup)?;
+    }
+    Ok(backup)
 }
 
 pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -912,6 +1026,34 @@ pub(crate) fn write_replacing(path: &Path, data: &[u8]) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// The areas a `module.ifo`'s root lists (`Mod_Area_list`), in its order:
+/// those the game loads. [`Module::areas`] reads the module's saved IFO by
+/// it, and the window its IFO with unsaved edits.
+pub fn areas_of(info: &mg_gff::Struct) -> Vec<ResRef> {
+    (info.items(&ifo::MOD_AREA_LIST).iter())
+        .filter_map(|a| a.try_read(&ifo::mod_area_list::AREA_NAME))
+        .collect()
+}
+
+/// The haks a `module.ifo`'s root names, highest priority first: its
+/// `Mod_HakList`, or the single pre-1.69 `Mod_Hak` field when it has no
+/// list; names trimmed, empty ones left out, each read by
+/// [`mg_resman::file_name_text`] (its bytes are the hak's file name's).
+/// [`Module::haks`] reads the module's saved IFO by it, and the window its
+/// IFO with unsaved edits.
+pub fn haks_of(info: &mg_gff::Struct) -> Vec<String> {
+    // (Trimmed of ASCII's spaces alone: 0xA0 is a byte of the name.)
+    let text = |s: ExoString| mg_resman::file_name_text(s.as_bytes().trim_ascii());
+    let list: Vec<String> = (info.items(&ifo::MOD_HAK_LIST).iter())
+        .map(|h| text(h.read(&ifo::mod_hak_list::MOD_HAK)))
+        .filter(|h| !h.is_empty())
+        .collect();
+    if !list.is_empty() || info.contains(ifo::MOD_HAK_LIST.label) {
+        return list;
+    }
+    info.try_read(&ifo::MOD_HAK).map(text).filter(|h| !h.is_empty()).into_iter().collect()
 }
 
 /// A GFF's root from `module` as it is now, else from the game: how a
@@ -981,6 +1123,23 @@ mod tests {
         ifo.root.set("Mod_Hak", Value::String(b"old".to_vec()));
         m.set_info(&ifo).unwrap();
         assert_eq!(m.haks().unwrap(), ["old"]);
+        assert_eq!(haks_of(&ifo.root), ["old"]);
+        // A list, even an empty one, is read in its place; names are
+        // trimmed and empty ones left out.
+        let mut list = ifo.root.clone();
+        list.set(ifo::MOD_HAK_LIST.label, Value::List(Vec::new()));
+        assert!(haks_of(&list).is_empty());
+        let row = |name: &[u8]| {
+            let mut item = ifo::MOD_HAK_LIST.new_item();
+            item.write(&ifo::mod_hak_list::MOD_HAK, ExoString(name.to_vec()));
+            item
+        };
+        list.set(ifo::MOD_HAK_LIST.label, Value::List(vec![row(b" top "), row(b""), row(b"low")]));
+        assert_eq!(haks_of(&list), ["top", "low"]);
+        // A byte past ASCII is kept, as `mg_resman::file_name_text` reads it.
+        let rows = vec![row(b"mg_\xf1hak"), row(b" mg_x\xa0 ")];
+        list.set(ifo::MOD_HAK_LIST.label, Value::List(rows));
+        assert_eq!(haks_of(&list), ["mg_ñhak", "mg_x\u{a0}"]);
     }
 
     #[test]
@@ -1008,6 +1167,36 @@ mod tests {
         m.save().unwrap();
         assert_eq!(script(&path).as_deref(), Some(&b"again"[..]));
         assert_eq!(script(&dir.join("test.mod.bak")).as_deref(), Some(&b"changed"[..]));
+    }
+
+    /// A file half written when Moonglow stopped (`.moonglow-tmp`), beside
+    /// a module's file or in its folder, goes when the module is opened
+    /// once it is over ten minutes old; a newer one, which a save under
+    /// way may be writing, stays; neither is a resource.
+    #[test]
+    fn a_crash_s_half_written_files_go_when_the_module_is_opened() {
+        let dir = mg_testkit::scratch_dir("mg-module-left-writing");
+        let folder = dir.join("folder");
+        sample().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
+        let archive = dir.join("test.mod");
+        sample().save_as(&ModuleLocation::Archive(archive.clone())).unwrap();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let left = |path: PathBuf, old: bool| {
+            std::fs::write(&path, b"half").unwrap();
+            if old {
+                let f = std::fs::File::options().write(true).open(&path).unwrap();
+                f.set_modified(hour_ago).unwrap();
+            }
+            path
+        };
+        let stale = left(folder.join("script.nss.moonglow-tmp"), true);
+        let fresh = left(folder.join("area.git.moonglow-tmp"), false);
+        let beside = left(dir.join("test.mod.moonglow-tmp"), true);
+        let m = Module::open(&folder).unwrap();
+        assert!(!stale.exists() && fresh.exists());
+        assert_eq!(m.len(), sample().len(), "neither is a resource");
+        Module::open(&archive).unwrap();
+        assert!(!beside.exists());
     }
 
     /// Saving into the module's own folder writes only the files that
@@ -1072,6 +1261,87 @@ mod tests {
         let e = m.save().unwrap_err();
         assert!(matches!(&e, ModuleError::ChangedOnDisk(p) if p == &[dir.join("script.nss")]));
         assert_eq!(std::fs::read(dir.join("script.nss")).unwrap(), b"the editor's again");
+    }
+
+    /// A module kept in one file changed outside (Aurora saved it): what
+    /// changed in it, was added and removed is found, by resource, until
+    /// it is taken; a file written again as it was, and Moonglow's own
+    /// save, are nothing.
+    #[test]
+    fn a_mod_changed_outside_is_found_by_resource() {
+        let dir = mg_testkit::scratch_dir("mg-module-archive-outside");
+        let path = dir.join("castle.mod");
+        sample().save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+        let mut m = Module::open(&path).unwrap();
+        assert_eq!(m.outside(), Some((vec![], vec![])));
+        // Another program's save: one changed, one added, one removed.
+        let mut theirs = Module::open(&path).unwrap();
+        let changed = m.keys().find(|k| k.restype == ResType::NSS).copied().unwrap();
+        let removed = m.keys().find(|k| k.restype != ResType::NSS && k.restype != ResType::IFO);
+        let removed = *removed.unwrap();
+        theirs.set(changed, b"void main() { int theirs; }".to_vec());
+        theirs.set(key("fresh", ResType::NSS), b"void main() {}".to_vec());
+        theirs.remove(&removed);
+        // (Another size: told from the first however soon it is written.)
+        theirs.save().unwrap();
+        let (changes, problems) = m.outside().unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut found: Vec<(ResKey, bool)> =
+            changes.iter().map(|c| (c.key, c.resource.is_some())).collect();
+        found.sort();
+        let mut wanted =
+            vec![(changed, true), (key("fresh", ResType::NSS), true), (removed, false)];
+        wanted.sort();
+        assert_eq!(found, wanted);
+        assert!(changes.iter().all(|c| c.path.starts_with(&path)));
+        // Found and not yet answered: a save doesn't write over them.
+        let e = m.save().unwrap_err();
+        assert!(
+            matches!(&e, ModuleError::ChangedOnDisk(p) if p == std::slice::from_ref(&path)),
+            "{e}"
+        );
+        // Found again until taken; then nothing.
+        assert_eq!(m.outside().unwrap().0.len(), 3);
+        let (changes, _) = m.outside().unwrap();
+        let first = changes[0].clone();
+        m.took(&first);
+        assert_eq!(m.outside().unwrap().0.len(), 2, "the others still to be taken");
+        for c in &changes[1..] {
+            m.took(c);
+        }
+        assert_eq!(m.outside(), Some((vec![], vec![])));
+        assert_eq!(m.as_read(&changed), Some(&b"void main() { int theirs; }"[..]));
+        // Moonglow's own save: nothing.
+        m.set(changed, b"void main() { int ours, more; }".to_vec());
+        m.save().unwrap();
+        assert_eq!(m.outside(), Some((vec![], vec![])));
+    }
+
+    /// A module folder's look at the files a watch named: they alone are
+    /// looked at, one added and one deleted among them; one in a folder
+    /// below isn't the module's.
+    #[test]
+    fn a_folder_s_look_at_the_files_named_looks_at_them_alone() {
+        let dir = mg_testkit::scratch_dir("mg-module-folder-named");
+        sample().save_as(&ModuleLocation::Folder(dir.clone())).unwrap();
+        let mut m = Module::open(&dir).unwrap();
+        let other = m.keys().find(|k| k.restype != ResType::NSS).copied().unwrap();
+        std::fs::write(dir.join(other.to_string()), b"another editor's").unwrap();
+        std::fs::write(dir.join("script.nss"), b"void main() { int x; }").unwrap();
+        std::fs::write(dir.join("fresh.nss"), b"void main() {}").unwrap();
+        std::fs::create_dir_all(dir.join("below")).unwrap();
+        std::fs::write(dir.join("below/deep.nss"), b"void main() {}").unwrap();
+        let named = [dir.join("script.nss"), dir.join("fresh.nss"), dir.join("below/deep.nss")];
+        let found = m.outside_scan_of(&named).unwrap().run();
+        let (changes, _) = m.outside_found(found);
+        let mut names: Vec<String> = changes.iter().map(|c| c.key.to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["fresh.nss", "script.nss"]);
+        std::fs::remove_file(dir.join("script.nss")).unwrap();
+        let found = m.outside_scan_of(&[dir.join("script.nss")]).unwrap().run();
+        let (changes, _) = m.outside_found(found);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].resource.is_none());
     }
 
     /// Save As into a folder of other resources (another module's, a

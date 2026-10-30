@@ -34,6 +34,23 @@ pub struct SourceMap {
     pub animations: Vec<AnimationSpan>,
     /// What the reader left out or guessed, in line order.
     pub notes: Vec<Note>,
+    /// Per node of [`Model::nodes`]: a mesh's vertices and faces as its
+    /// text gives them, before they are merged ([`SourceMesh`]).
+    pub meshes: Vec<Option<SourceMesh>>,
+    /// The lines of the geometry's nodes left out of the model: in no tree,
+    /// as the game leaves them (no `parent` line, nwn-mdl-spec
+    /// MDL-ASCII-031). Each takes a part number all the same.
+    pub left_out: Vec<Span>,
+}
+
+/// A mesh as its text gives it: its `verts` and its `faces` (indices into
+/// them), before the merge and before degenerate faces are left out. The
+/// game's compiler computes a mesh's bounds from these, and its face
+/// records' planes and neighbours (nwn-mdl-spec MDL-MESH-021, -022, -050).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SourceMesh {
+    pub vertices: Vec<Vec3>,
+    pub faces: Vec<[u32; 3]>,
 }
 
 impl SourceMap {
@@ -265,11 +282,21 @@ fn node_block<'a>(
                         rows.push(vec![*w]);
                     }
                 }
+                // A blank line among skin weights is a vertex without any
+                // (it stays where the mesh has it): the rows after it are
+                // still the vertices after it. Unless the list has all of
+                // its rows without them: then they are only spacing.
+                let whole = k == "weights" && {
+                    let row = |l: &Line<'_>| {
+                        let first = l.words[0].to_ascii_lowercase();
+                        first != "endlist"
+                            && !crate::keywords::TOP_LEVEL.contains(&first.as_str())
+                            && !crate::keywords::known_anywhere(&first)
+                    };
+                    ls[i..].iter().take(count).take_while(|l| row(l)).count() == count
+                };
                 while rows.len() < count && i < ls.len() {
-                    // A blank line among skin weights is a vertex without
-                    // any (it stays where the mesh has it): the rows after
-                    // it are still the vertices after it.
-                    if k == "weights" && !rows.is_empty() {
+                    if k == "weights" && !whole && !rows.is_empty() {
                         let room = count - rows.len();
                         rows.extend(std::iter::repeat_n(Vec::new(), ls[i].blank_before.min(room)));
                         if rows.len() == count {
@@ -388,8 +415,9 @@ fn key_controller(name: &str, rows: &[Vec<f32>], bezier: bool) -> Controller {
     c
 }
 
-/// De-indexes a mesh's faces into `m`'s streams.
-fn build_mesh(raw: &RawNode<'_>, m: &mut Mesh, notes: &mut Vec<Note>) {
+/// De-indexes a mesh's faces into `m`'s streams; returns the mesh as its
+/// text gives it.
+fn build_mesh(raw: &RawNode<'_>, m: &mut Mesh, notes: &mut Vec<Note>) -> SourceMesh {
     let verts = vec3s(raw.list("verts"));
     let tangents: Vec<[f32; 4]> = raw
         .list("tangents")
@@ -599,10 +627,12 @@ fn build_mesh(raw: &RawNode<'_>, m: &mut Mesh, notes: &mut Vec<Note>) {
             a != b && b != c && a != c
         });
     }
+    SourceMesh { faces: faces.iter().map(|f| f.v.map(|v| v as u32)).collect(), vertices: verts }
 }
 
-/// A geometry node.
-fn geometry_node(raw: &RawNode<'_>, notes: &mut Vec<Note>) -> Node {
+/// A geometry node, and a mesh's as its text gives it.
+fn geometry_node(raw: &RawNode<'_>, notes: &mut Vec<Note>) -> (Node, Option<SourceMesh>) {
+    let mut source = None;
     let node_flags = type_flags(&raw.ty);
     let p = |k: &str| raw.prop(k);
     let kind = match raw.ty.as_str() {
@@ -690,7 +720,7 @@ fn geometry_node(raw: &RawNode<'_>, notes: &mut Vec<Note>) -> Node {
             for i in 1..4 {
                 m.textures[i] = resname(p(&format!("texture{i}")).and_then(|v| v.first()));
             }
-            build_mesh(raw, &mut m, notes);
+            source = Some(build_mesh(raw, &mut m, notes));
             m.extra = match raw.ty.as_str() {
                 "danglymesh" => {
                     let c: Vec<f32> =
@@ -770,7 +800,7 @@ fn geometry_node(raw: &RawNode<'_>, notes: &mut Vec<Note>) -> Node {
         }
         node.controllers.push(key_controller(name, &k.rows, k.bezier));
     }
-    node
+    (node, source)
 }
 
 /// Parent links to pre-order: the order in which nodes appear when each
@@ -1005,11 +1035,35 @@ pub(crate) fn read_with(data: &[u8], implicit_root: bool) -> Result<(Model, Sour
         model.name = geometry[0].name.clone();
     }
 
+    // A node with no `parent` line (or one not read: `PARENT`) is in no
+    // tree, and the game leaves it out, with the nodes under it
+    // (nwn-mdl-spec MDL-ASCII-031); its number is used all the same
+    // (MDL-NODE-010). (The first node is the root either way.)
+    let mut out_of_tree: HashSet<String> = HashSet::new();
+    let mut kept: HashSet<String> = HashSet::from([geometry[0].name.to_ascii_lowercase()]);
+    let mut left_out = Vec::new();
+    let mut i = 1;
+    while i < geometry.len() {
+        let parent = geometry[i].parent.as_ref().map(|p| p.to_ascii_lowercase());
+        let under_left_out =
+            parent.as_ref().is_some_and(|p| out_of_tree.contains(p) && !kept.contains(p));
+        if parent.is_some() && !under_left_out {
+            kept.insert(geometry[i].name.to_ascii_lowercase());
+            i += 1;
+            continue;
+        }
+        let r = geometry.remove(i);
+        let why = if under_left_out { "hangs from a node left out" } else { "has no parent line" };
+        note(&mut notes, r.span.start, format!("{}: {why}; left out, as the game does", r.name));
+        out_of_tree.insert(r.name.to_ascii_lowercase());
+        left_out.push(r.span);
+    }
+
     // Geometry in pre-order.
     let parent_of = parents(&geometry, Some(&mut notes));
     let (order, new_index) = preorder(&parent_of);
-    let mut nodes: Vec<Node> =
-        order.iter().map(|&old| geometry_node(&geometry[old], &mut notes)).collect();
+    let (mut nodes, meshes): (Vec<Node>, Vec<Option<SourceMesh>>) =
+        order.iter().map(|&old| geometry_node(&geometry[old], &mut notes)).unzip();
     for (new, &old) in order.iter().enumerate() {
         nodes[new].parent = parent_of[old].map(|p| new_index[p]);
     }
@@ -1062,6 +1116,8 @@ pub(crate) fn read_with(data: &[u8], implicit_root: bool) -> Result<(Model, Sour
     model.nodes = nodes;
     let mut map = SourceMap {
         nodes: order.iter().map(|&old| geometry[old].span).collect(),
+        meshes,
+        left_out,
         ..Default::default()
     };
 
@@ -1164,6 +1220,29 @@ donemodel s
         assert_eq!(of(0), ["bone_a"]);
         assert!(of(1).is_empty(), "the blank line's vertex has no bone");
         assert_eq!(of(2), ["bone_b"], "the last keeps its own");
+        // A list with all of its rows: a blank line among them is only
+        // spacing, and each row is its vertex's, the last too; so with one
+        // short of them, ended by a keyword, the blank line is still the
+        // vertex without any.
+        let spaced =
+            text.replace("    \n    bone_b 1.0\n", "\n    bone_b 1.0\n    bone_a 0.5 bone_b 0.5\n");
+        let short = text.replace("    \n    bone_b 1.0\n", "\n    bone_b 1.0\n  shininess 0\n");
+        for (text, middle, last) in
+            [(spaced, vec!["bone_b"], vec!["bone_a", "bone_b"]), (short, vec![], vec!["bone_b"])]
+        {
+            let (m, map) = read_mapped(text.as_bytes()).unwrap();
+            let notes = &map.notes;
+            assert!(notes.iter().all(|n| !n.message.contains("weights")), "{notes:?}");
+            let hide = m.nodes.iter().find(|n| n.name == "hide").unwrap();
+            let NodeKind::Mesh(mesh) = &hide.kind else { panic!("a mesh") };
+            let MeshExtra::Skin(skin) = &mesh.extra else { panic!("a skin") };
+            let of = |source: u32| {
+                let v = mesh.source.iter().position(|&s| s == source).unwrap();
+                let w = skin.weights[v].iter().filter(|w| w.1 > 0.0);
+                w.map(|w| m.nodes[skin.bones[w.0 as usize]].name.as_str()).collect::<Vec<_>>()
+            };
+            assert_eq!((of(0), of(1), of(2)), (vec!["bone_a"], middle, last));
+        }
     }
 
     const CUBE_ISH: &str = "\
@@ -1396,10 +1475,27 @@ donemodel test
         }
         let l = light("given");
         assert_eq!((l.priority, l.ambient_only, l.dynamic_type, l.fading), (2, true, 0, false));
-        // (`PARENT`: no parent read, so not under `bare`.)
-        let caps = m.nodes.iter().position(|n| n.name == "caps").unwrap();
-        let bare = m.nodes.iter().position(|n| n.name == "bare").unwrap();
-        assert_ne!(m.nodes[caps].parent, Some(bare));
+        // (`PARENT`: no parent read, so in no tree: left out, as the game
+        // leaves it out, MDL-ASCII-031.)
+        assert!(m.nodes.iter().all(|n| n.name != "caps"));
+    }
+
+    /// A node with no `parent` line is left out with the nodes under it
+    /// (nwn-mdl-spec MDL-ASCII-031), and the reader says so; its lines are
+    /// kept for its part number. The root needs none.
+    #[test]
+    fn a_node_with_no_parent_line_is_left_out() {
+        let mdl = "newmodel t\nbeginmodelgeom t\nnode dummy t\nendnode\n\
+                   node dummy a\n  parent t\nendnode\n\
+                   node dummy loose\nendnode\n\
+                   node dummy under\n  parent loose\nendnode\n\
+                   node dummy b\n  parent a\nendnode\nendmodelgeom t\ndonemodel t\n";
+        let (m, map) = read_mapped(mdl.as_bytes()).unwrap();
+        let names: Vec<&str> = m.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["t", "a", "b"]);
+        assert_eq!(map.left_out.len(), 2);
+        assert_eq!(map.left_out[0].start, 8);
+        assert!(map.notes.iter().any(|n| n.message.contains("loose: has no parent line")));
     }
 
     #[test]

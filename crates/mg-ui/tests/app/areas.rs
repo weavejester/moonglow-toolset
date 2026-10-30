@@ -41,6 +41,26 @@ fn minimap_exported_and_object_walkmeshes_shown() {
     h.get_by_label("👣 Walkmesh…").click();
     h.run();
     assert!(!h.state().area_views[&area].object_walkmesh);
+    // Held down a moment: the two open, and stay open when it is let go
+    // (the release no click); one chosen there.
+    let at = h.get_by_label("👣 Walkmesh…").rect().center();
+    h.hover_at(at);
+    let button = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(button(true));
+    h.run_steps(30);
+    h.get_by_label("Ground Walkmesh");
+    h.event(button(false));
+    h.run_steps(2);
+    let view = &h.state().area_views[&area];
+    assert!(!view.walkmesh && !view.object_walkmesh, "the release is no click");
+    h.get_by_label("Ground Walkmesh").click();
+    h.run();
+    assert!(h.state().area_views[&area].walkmesh, "chosen in what the hold opened");
 }
 
 /// Area Properties › Visual: another area's lighting given to this one
@@ -76,14 +96,51 @@ fn an_area_s_lighting_is_copied_and_kept_for_another() {
         label: label.into(),
         value: Some(v),
     };
-    let edits = vec![
+    let mut edits = vec![
         set("SunAmbientColor", mg_gff::Value::Dword(0x12_3456)),
         set("MoonFogColor", mg_gff::Value::Dword(0x00_0a0b)),
     ];
+    // The first an exterior without tile lights (three tiles, all 0); the
+    // second an interior with its own (every tile 9, 8, 7).
+    let tiles = |h: &mut Harness<'_, Moonglow>, area: ResRef| -> Vec<mg_gff::Struct> {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
+        are.root.list("Tile_List").unwrap().to_vec()
+    };
+    let lit = |tiles: &[mg_gff::Struct], [a, b, c]: [i64; 3]| {
+        tiles.iter().all(|t| {
+            let l = |f: &str| t.integer(f);
+            (l("Tile_MainLight1"), l("Tile_MainLight2"), l("Tile_SrcLight1"), l("Tile_SrcLight2"))
+                == (Some(a), Some(b), Some(c), Some(c))
+        })
+    };
+    let tile = |[a, b, c]: [u8; 3]| {
+        let mut t = mg_gff::Struct::new(1);
+        for (label, v) in [
+            ("Tile_MainLight1", a),
+            ("Tile_MainLight2", b),
+            ("Tile_SrcLight1", c),
+            ("Tile_SrcLight2", c),
+        ] {
+            t.set(label, mg_gff::Value::Byte(v));
+        }
+        t
+    };
+    edits.push(set("Tile_List", mg_gff::Value::List(vec![tile([0; 3]); 3])));
+    let inside = tiles(&mut h, second).len();
+    edits.push(mg_edit::Edit::SetField {
+        key: ResKey::new(second, ResType::ARE),
+        path: mg_edit::GffPath::root(),
+        label: "Tile_List".into(),
+        value: Some(mg_gff::Value::List(vec![tile([9, 8, 7]); inside])),
+    });
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Own", edits)));
     h.run();
+    assert!(lit(&tiles(&mut h, first), [0; 3]) && lit(&tiles(&mut h, second), [9, 8, 7]));
     assert_ne!(field(&mut h, second, "SunAmbientColor"), Some(mg_gff::Value::Dword(0x12_3456)));
-    // In the second's Visual page: Copy From Area › the first.
+    // In the second's Visual page: Copy From Area › the first. Its lights,
+    // fog and sky; the interior's tile lights left as they are (the
+    // owner's word: "It should leave the lights alone").
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AreaProperties(second)));
     h.run_steps(3);
     h.get_by_label("Visual").click();
@@ -94,6 +151,7 @@ fn an_area_s_lighting_is_copied_and_kept_for_another() {
     h.run_steps(3);
     assert_eq!(field(&mut h, second, "SunAmbientColor"), Some(mg_gff::Value::Dword(0x12_3456)));
     assert_eq!(field(&mut h, second, "MoonFogColor"), Some(mg_gff::Value::Dword(0x00_0a0b)));
+    assert!(lit(&tiles(&mut h, second), [9, 8, 7]), "the interior's tile lights left alone");
     assert!(h.state().ws.as_ref().unwrap().can_undo().is_some_and(|u| u.starts_with("Visual")));
     h.state_mut().actions.push(mg_ui::Action::Undo);
     h.run_steps(2);
@@ -122,50 +180,122 @@ fn an_area_s_lighting_is_copied_and_kept_for_another() {
     h.run_steps(2);
     h.get_by_label("Saved Lighting").click();
     h.run_steps(2);
+    h.get_by_label("Tiles' Lights Too");
     h.get_by_label("Dusk").click();
     h.run_steps(3);
     assert_eq!(field(&mut h, second, "SunAmbientColor"), Some(mg_gff::Value::Dword(0x12_3456)));
+    assert!(lit(&tiles(&mut h, second), [9, 8, 7]), "unticked: the tile lights left alone");
     assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Lighting Dusk"));
+    // Asked for (ticked): the tiles' lights from the colors kept with it.
+    h.get_by_label("Saved Lighting").click();
+    h.run_steps(2);
+    h.get_by_label("Tiles' Lights Too").click();
+    h.run_steps(2);
+    // (The menu closes with the click; the tick stays.)
+    if h.query_by_label("Dusk").is_none() {
+        h.get_by_label("Saved Lighting").click();
+        h.run_steps(2);
+    }
+    let ticked = h.get_by_label("Tiles' Lights Too").accesskit_node().toggled();
+    assert_eq!(ticked, Some(egui::accesskit::Toggled::True));
+    h.get_by_label("Dusk").click();
+    h.run_steps(3);
+    assert!(lit(&tiles(&mut h, second), [0; 3]), "ticked: the first's tiles' colors");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    assert!(lit(&tiles(&mut h, second), [9, 8, 7]), "one step");
+
+    // Renamed, deleted and put back, in the menu.
+    let open_menu = |h: &mut Harness<'_, Moonglow>, sub: &str| {
+        h.get_by_label("Saved Lighting").click();
+        h.run_steps(2);
+        h.get_by_label_contains(sub).hover();
+        h.run_steps(3);
+    };
+    open_menu(&mut h, "Rename");
+    h.get_all_by_label("Dusk").last().unwrap().click();
+    h.run_steps(3);
+    let input = h.get_all_by_role(egui::accesskit::Role::TextInput).last().unwrap();
+    input.focus();
+    h.run_steps(1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_all_by_role(egui::accesskit::Role::TextInput).last().unwrap().type_text("Evening");
+    h.run_steps(2);
+    h.get_by_label("Rename").click();
+    h.run_steps(2);
+    assert_eq!(mg_ui::lighting::list(Some(&dir)), ["Evening"]);
+    open_menu(&mut h, "Delete");
+    h.get_all_by_label("Evening").last().unwrap().click();
+    h.run_steps(2);
+    assert!(mg_ui::lighting::list(Some(&dir)).is_empty());
+    h.get_by_label("Saved Lighting").click();
+    h.run_steps(2);
+    h.get_by_label("Undo Delete 'Evening'").click();
+    h.run_steps(2);
+    assert_eq!(mg_ui::lighting::list(Some(&dir)), ["Evening"]);
+
+    // Made a lighting scheme: a row of environment.2da, here a copy in the
+    // module, open in the 2DA editor to be saved.
+    open_menu(&mut h, "Make a Lighting Scheme");
+    h.get_all_by_label_contains("Evening").last().unwrap().hover();
+    h.run_steps(3);
+    h.get_by_label("A Copy in the Module").click();
+    h.run_steps(3);
+    let table =
+        h.state().tables.iter().find(|t| t.key.resref.as_str() == Some("environment")).unwrap();
+    let (id, t) = (table.id, table.edit.table().clone());
+    let row = t.len() - 1;
+    assert_eq!(t.get(row, "LABEL"), Some("Evening"));
+    assert_eq!(t.get(row, "STRREF"), None);
+    assert_eq!(t.get(row, "MAIN1_COLOR1"), Some("0"), "the first's tiles' colors");
+    assert_eq!(t.get(row, "SECONDARY_COLOR4"), Some("0"));
+    assert_eq!(t.get(row, "LIGHT_AMB_RED"), Some("86"), "0x56, the red of 0x123456");
+    assert!(table.edit.is_dirty(), "not saved until Save");
+    assert!(mg_ui::table_view::save(h.state_mut(), id));
+    let ws = h.state().ws.as_ref().unwrap();
+    let key = ResKey::new(ResRef::from_str("environment").unwrap(), ResType::TWODA);
+    let saved = mg_2da::TwoDa::parse(ws.module.get(&key).unwrap(), mg_core::Codepage::default());
+    assert_eq!(saved.unwrap().get(row, "LABEL"), Some("Evening"));
 }
 
 /// Options › General › Toolbar buttons, Icons only: the area view's
 /// toolbar too, at once: glyphs alone, named in their tips (a button with
-/// no tip of its own: its name), the toggles still toggling; buttons
-/// without a glyph keep their words.
+/// no tip of its own: its name) and by their names for a screen reader,
+/// not by their glyphs; the toggles still toggling. All, None, Together,
+/// To Scratch and Save as Prefab… have glyphs too.
 #[test]
 fn the_area_toolbar_shows_icons_only_when_asked() {
     let Some((mut h, area)) = area_harness("area-icons-only") else { return };
     h.get_by_label("🎥 Reorient Camera");
+    h.get_by_label("☑ All");
     h.state_mut().settings.toolbar_icons_only = true;
     h.run_steps(2);
-    assert!(h.query_by_label("🎥 Reorient Camera").is_none());
-    assert!(h.query_by_label("⊞ Grid").is_none());
-    h.get_by_label("To Scratch");
-    let camera = h.get_by_label("🎥").rect().center();
-    // The area toolbar's button with the glyph `label`: the one nearest
-    // Reorient Camera (the main toolbar's Module Properties is an ℹ too,
-    // the palette's pictures a ⊞).
-    fn tool<'h>(
-        h: &'h Harness<'_, Moonglow>,
-        label: &'h str,
-        near: egui::Pos2,
-    ) -> egui_kittest::Node<'h> {
-        let off = |n: &egui_kittest::Node<'_>| n.rect().center().distance(near);
-        h.get_all_by_label(label).min_by(|a, b| off(a).total_cmp(&off(b))).unwrap()
+    for gone in ["🎥 Reorient Camera", "⊞ Grid", "🎥", "⊞", "☑ All", "📤 To Scratch"] {
+        assert!(h.query_by_label(gone).is_none(), "{gone}");
     }
+    for name in ["All", "None", "Together", "To Scratch", "Area Properties"] {
+        h.get_by_label(name);
+    }
+    let camera = h.get_by_label("Reorient Camera").rect().center();
     h.hover_at(camera);
     // (A tooltip waits a moment.)
     h.run_steps(60);
-    h.get_by_label("Reorient Camera");
-    tool(&h, "⊞", camera).hover();
+    assert_eq!(h.query_all_by_label("Reorient Camera").count(), 2, "the button and its tip");
+    h.get_by_label("Grid").hover();
     h.run_steps(60);
     h.get_by_label("Grid\nDisplay Grid");
     let shown = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].grid;
     let before = shown(&h);
-    tool(&h, "⊞", camera).click();
+    h.get_by_label("Grid").click();
     h.run_steps(2);
     assert_ne!(shown(&h), before, "Grid toggled by its glyph");
-    tool(&h, "ℹ", camera).click();
+    let on = match before {
+        true => egui::accesskit::Toggled::False,
+        false => egui::accesskit::Toggled::True,
+    };
+    let grid = h.get_by_label("Grid").accesskit_node();
+    assert_eq!(grid.toggled(), Some(on), "a toggle, said to be on or off");
+    h.get_by_label("Area Properties").click();
     h.run_steps(2);
     assert!(h.state().dock.find_tab(&Tab::AreaProperties(area)).is_some());
 }
@@ -177,7 +307,7 @@ fn area_properties_edit_the_area() {
         let ws = h.state_mut().ws.as_mut().unwrap();
         ws.doc(&ResKey::new(area, ResType::ARE)).unwrap().root.clone()
     };
-    h.get_by_label("ℹ Area Properties").click();
+    h.get_by_label("🔧 Area Properties").click();
     h.run_steps(2);
     assert!(h.state().dock.find_tab(&Tab::AreaProperties(area)).is_some());
 
@@ -272,6 +402,90 @@ fn an_area_copied_with_its_tags_offers_retag() {
         .map(|i| tag(&mut h, git, mg_edit::GffPath::root().item("WaypointList", i)))
         .collect();
     assert_eq!(w, [format!("{waypoint_tag}_2"), format!("{waypoint_tag}_3")]);
+}
+
+/// An area copied where the project warns of any tag: Retag gives the
+/// tags listed (the area's own) their own, Retag All the counted ones
+/// too; the copy's door that leads to its waypoint leads to the copy's
+/// once that is retagged (the original's still to the original's), and a
+/// script that spells the waypoint's tag is said, not changed.
+#[test]
+fn retag_all_follows_the_copy_s_transitions_and_names_the_scripts() {
+    let Some((mut h, area)) = area_harness("copy-area-retag-all") else { return };
+    let git = ResKey::new(area, ResType::GIT);
+    {
+        let app = h.state_mut();
+        app.ws.as_mut().unwrap().module.project_file.tags.paste_warning =
+            Some(mg_module::project_file::PasteWarning::Any);
+        let game = app.game.as_deref().unwrap();
+        let read = |name: &str, t: ResType| {
+            Gff::read(&game.resman.get(&ResKey::parse(name, t).unwrap()).unwrap()).unwrap().root
+        };
+        let none = |_: ResRef| None;
+        let placing = mg_module::instances::Placing { game, item: &none };
+        let at = mg_module::instances::Placement { position: [10.0, 10.0, 0.0], rotation: 0.0 };
+        let bp = read("nw_door_normal", ResType::UTD);
+        let mut door =
+            mg_module::instances::instance(&placing, ResType::UTD, &bp, at, &[]).unwrap();
+        door.set("Tag", mg_gff::Value::String(b"KZ_INN_DOOR".to_vec()));
+        door.set("LinkedTo", mg_gff::Value::String(b"KZ_INN_EXIT".to_vec()));
+        let script = b"void main() { object o = GetObjectByTag(\"KZ_INN_EXIT\"); }\n".to_vec();
+        let edits = vec![
+            mg_edit::Edit::insert_item(git, mg_edit::GffPath::root(), "Door List", 0, door),
+            mg_edit::Edit::SetField {
+                key: git,
+                path: mg_edit::GffPath::root().item("WaypointList", 1),
+                label: "Tag".into(),
+                value: Some(mg_gff::Value::String(b"KZ_INN_EXIT".to_vec())),
+            },
+            mg_edit::Edit::SetResource {
+                key: ResKey::parse("kz_exit", ResType::NSS).unwrap(),
+                data: Some(script),
+            },
+        ];
+        app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", edits)));
+    }
+    h.run_steps(3);
+    let copy = |h: &mut Harness<'_, Moonglow>, name: &str| {
+        h.state_mut().tag_clash = None;
+        h.state_mut().actions.push(mg_ui::Action::CopyDialog(ResKey::new(area, ResType::ARE)));
+        h.run_steps(3);
+        h.state_mut().copy_as.as_mut().unwrap().resref = name.into();
+        h.run_steps(2);
+        h.get_by_label("Create Copy").click();
+        h.run_steps(3);
+        h.state().tag_clash.clone().expect("the Duplicate Tags window")
+    };
+    let field = |h: &mut Harness<'_, Moonglow>, area: &str, list: &str, i: usize, l: &str| {
+        let key = ResKey::parse(area, ResType::GIT).unwrap();
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let doc = ws.doc(&key).unwrap();
+        let s = &doc.root.list(list).unwrap()[i];
+        String::from_utf8_lossy(s.string(l).unwrap()).into_owned()
+    };
+    // Retag: the area's own tag; the copy's door and waypoints keep theirs.
+    let clash = copy(&mut h, "inn_two");
+    assert_eq!(clash.others, 3, "the two waypoints' tags and the door's, counted");
+    assert_eq!(clash.scripts, ["kz_exit.nss line 1"]);
+    assert!(h.query_by_label_contains("Spelled in scripts (1: kz_exit.nss line 1)").is_some());
+    h.get_by_label("Retag").click();
+    h.run_steps(2);
+    assert_eq!(field(&mut h, "inn_two", "WaypointList", 1, "Tag"), "KZ_INN_EXIT");
+    assert_eq!(field(&mut h, "inn_two", "Door List", 0, "LinkedTo"), "KZ_INN_EXIT");
+    // Retag All: every tag of the copy's its own, its door leading to its
+    // own waypoint; the original's as they were.
+    copy(&mut h, "inn_three");
+    h.get_by_label("Retag All").click();
+    h.run_steps(2);
+    assert_eq!(field(&mut h, "inn_three", "WaypointList", 1, "Tag"), "KZ_INN_EXIT_2");
+    assert_eq!(field(&mut h, "inn_three", "Door List", 0, "Tag"), "KZ_INN_DOOR_2");
+    assert_eq!(field(&mut h, "inn_three", "Door List", 0, "LinkedTo"), "KZ_INN_EXIT_2");
+    let original = area.to_string();
+    assert_eq!(field(&mut h, &original, "Door List", 0, "LinkedTo"), "KZ_INN_EXIT");
+    let said = |s: &str| h.state().log.entries.iter().any(|e| e.1.contains(s));
+    assert!(said("Retagged 4 objects, and 1 transition of what was made to them"));
+    assert!(said("Retag: scripts spell the tags it changed, and still find the original's"));
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Retag"));
 }
 
 /// An area copied whose tags the project wants unique in each area
@@ -390,6 +604,88 @@ fn an_area_is_renamed_from_its_tab() {
     assert!(h.state().area_views.contains_key(&meadow));
 }
 
+/// Edit Areas Together's Holding narrows the areas to those holding a
+/// variable (or music, or a field's value), as they are now (an unsaved
+/// change too); the ticked are kept as a set for the module, and ticked
+/// again from Sets.
+#[test]
+fn areas_are_chosen_by_what_they_hold_and_kept_as_a_set() {
+    let dir = mg_testkit::scratch_dir("ui-areas-holding");
+    let path = sample_module(&dir);
+    let mut m = mg_module::Module::open(&path).unwrap();
+    let key = |name: &str, t| ResKey::parse(name, t).unwrap();
+    let int_var = |name: &str, value: i32| {
+        let mut s = mg_gff::Struct::new(0);
+        s.set("Name", mg_gff::Value::String(name.as_bytes().to_vec()));
+        s.set("Type", mg_gff::Value::Dword(1));
+        s.set("Value", mg_gff::Value::Int(value));
+        s
+    };
+    for (name, title, vars) in [
+        ("cave1", "Wolf Cave", vec![int_var("nDepth", 1)]),
+        ("cave2", "Bear Cave", vec![int_var("nBears", 4)]),
+        ("inn", "Apple Inn", Vec::new()),
+    ] {
+        let mut are = Gff::new(*b"ARE ");
+        let title = LocString::from_text(Language::ENGLISH, Gender::Male, title);
+        are.root.set("Name", mg_gff::Value::LocString(title));
+        m.set(key(name, ResType::ARE), are.to_bytes().unwrap());
+        let mut git = Gff::new(*b"GIT ");
+        git.root.set("AreaProperties", mg_gff::Value::Struct(mg_gff::Struct::new(100)));
+        git.root.set("VarTable", mg_gff::Value::List(vars));
+        m.set(key(name, ResType::GIT), git.to_bytes().unwrap());
+    }
+    m.save().unwrap();
+    let mut app = app_with(Vec::new());
+    app.area_set_dir = Some(dir.join("area-sets"));
+    app.open_module(&path);
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label("Edit").click();
+    h.run();
+    h.get_by_label("Edit Areas Together…").click();
+    h.run();
+    h.get_by_value("Anything").click();
+    h.run();
+    h.get_all_by_label("A variable").last().unwrap().click();
+    h.run();
+    type_into_hint(&mut h, "tdod_rental, kz_*", "n*");
+    h.run();
+    assert!(h.query_by_label_contains("Apple Inn").is_none(), "the inn has none");
+    h.get_by_label_contains("Wolf Cave");
+    type_into_hint(&mut h, "any", "4");
+    assert!(h.query_by_label_contains("Wolf Cave").is_none(), "of value 4");
+    h.get_by_label_contains("Bear Cave");
+    // An unsaved change is what it holds.
+    let edit = mg_edit::Edit::SetField {
+        key: key("cave1", ResType::GIT),
+        path: mg_edit::GffPath::root().item("VarTable", 0),
+        label: "Value".into(),
+        value: Some(mg_gff::Value::Int(4)),
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Var", vec![edit])));
+    h.run();
+    h.get_by_label_contains("Wolf Cave");
+    h.get_by_label("Tick Shown").click();
+    h.run();
+    // Kept as a set, and ticked again.
+    type_into_hint(&mut h, "set name", "Caves");
+    h.get_by_label("Save Set").click();
+    h.run();
+    let file = dir.join("area-sets/Caves.areas.json");
+    let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(kept["areas"], serde_json::json!(["cave1", "cave2"]));
+    assert_eq!(kept["module"], "sample");
+    h.get_by_label("Untick All").click();
+    h.run();
+    assert!(h.query_by_label("Edit 0 Together").is_some());
+    h.get_by_value("Tick a Set…").click();
+    h.run();
+    h.get_all_by_label("Caves").last().unwrap().click();
+    h.run();
+    h.get_by_label("Edit 2 Together");
+}
+
 /// Edit › Edit Areas Together…: areas ticked in the chooser (narrowed by
 /// its filters) open in one Area Properties, where a change is set on each:
 /// a field, a flag (each area keeping its other flags), and the variables
@@ -429,7 +725,7 @@ fn several_areas_are_edited_together() {
     m.save().unwrap();
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let are = |h: &mut Harness<'_, Moonglow>, name: &str| -> mg_gff::Struct {
         let ws = h.state_mut().ws.as_mut().unwrap();
@@ -561,7 +857,7 @@ fn every_area_is_given_the_scheme_s_tile_lights() {
     let caves: Vec<ResRef> =
         ["cave1", "cave2", "cave3"].map(|n| ResRef::from_str(n).unwrap()).to_vec();
     app.actions.push(mg_ui::Action::OpenTab(Tab::AreasProperties(caves)));
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run_steps(3);
     let sources = |h: &mut Harness<'_, Moonglow>, name: &str| -> (Option<i64>, Vec<i64>) {
         let ws = h.state_mut().ws.as_mut().unwrap();

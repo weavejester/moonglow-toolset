@@ -20,6 +20,8 @@ pub struct CopyDraft {
     pub resref: String,
     /// The copy's tag, where the resource has one.
     pub tag: Option<String>,
+    /// The tag of what is copied, as it was.
+    pub original_tag: Option<String>,
     /// From the palette: the copy is shown there and opened.
     pub palette: bool,
 }
@@ -75,13 +77,22 @@ impl Moonglow {
             .map(|ws| ws.module.project_file.naming_for(key.restype))
             .unwrap_or_default();
         let from = key.resref.to_string();
-        let resref = crate::palette_view::copy_resref_named(&from, &naming, &taken);
+        // A blueprint's copy is named as Aurora's Edit Copy names it
+        // (captured: `nw_w1copy007` → `w1copy008`): without `nw_`, from
+        // the template's number on; other resources (a script, a
+        // conversation) the next free number.
+        let resref = if BlueprintKind::from_restype(key.restype).is_some() {
+            mg_module::palette_add::copy_resref_named(&from, &naming, &taken)
+        } else {
+            crate::palette_view::copy_resref_named(&from, &naming, &taken)
+        };
         let tag = resref_field(key.restype)
             .and_then(|_| Gff::read(&data).ok())
             .and_then(|g| g.root.string("Tag").map(decode));
         self.copy_as = Some(CopyDraft {
             from: key,
             resref: resref.map(|r| r.to_string()).unwrap_or_default(),
+            original_tag: tag.clone(),
             tag,
             palette,
         });
@@ -169,6 +180,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     let title = format!("Copy {}", draft.from);
     let mut open = true;
     let (mut done, mut cancel) = (false, false);
+    let mut warned = None;
     crate::widgets::dialog(ctx, &title, &mut open).collapsible(false).resizable(false).show(
         ctx,
         |ui| {
@@ -202,6 +214,16 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             if let Some((p, _)) = &problem {
                 ui.colored_label(ui.visuals().warn_fg_color, p);
             }
+            // (A blueprint's tag another has: said, and in the log once
+            // copied, not stopping it.)
+            let blueprint = BlueprintKind::from_restype(draft.from.restype).is_some();
+            warned = draft.tag.as_deref().filter(|_| blueprint && !stops).and_then(|tag| {
+                let original = draft.original_tag.as_deref();
+                crate::tag_clash::blueprint_copy_warning(app, draft.from, original, tag)
+            });
+            if let Some(w) = &warned {
+                ui.colored_label(ui.visuals().warn_fg_color, w);
+            }
             if draft.from.restype == ResType::ARE {
                 ui.weak("The area is copied with everything placed in it.");
             }
@@ -218,6 +240,9 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     );
     if done {
         if let Some(new) = app.copy_resource(&draft) {
+            if let Some(w) = warned {
+                app.log.warn(format!("{new}: {w}"));
+            }
             if draft.palette {
                 app.palette.custom = true;
                 app.palette.selected = Some(new);

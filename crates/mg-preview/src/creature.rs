@@ -5,38 +5,22 @@
 use mg_core::ResRef;
 use mg_gff::{Gff, Struct, Value};
 use mg_rules::GameData;
+use mg_rules::models::{self, BODY_PARTS};
 
 use crate::{
     HAIR, Lookup, Part, Preview, PreviewError, SKIN, TATTOO1, TATTOO2, cell, cell_f32, cell_int,
     env_map, item_colors,
 };
 
-/// Per capart.2da `MDLNAME`: the creature's field with its part number and
-/// the armour's. (The creature's right foot really is `ArmorPart_RFoot`.)
-/// In the order of the game's armor parts (`mg_rules::items::ARMOR_PARTS`).
-const PARTS: [(&str, &str, &str); 18] = [
-    ("footr", "ArmorPart_RFoot", "ArmorPart_RFoot"),
-    ("footl", "BodyPart_LFoot", "ArmorPart_LFoot"),
-    ("shinr", "BodyPart_RShin", "ArmorPart_RShin"),
-    ("shinl", "BodyPart_LShin", "ArmorPart_LShin"),
-    ("legl", "BodyPart_LThigh", "ArmorPart_LThigh"),
-    ("legr", "BodyPart_RThigh", "ArmorPart_RThigh"),
-    ("pelvis", "BodyPart_Pelvis", "ArmorPart_Pelvis"),
-    ("chest", "BodyPart_Torso", "ArmorPart_Torso"),
-    ("belt", "BodyPart_Belt", "ArmorPart_Belt"),
-    ("neck", "BodyPart_Neck", "ArmorPart_Neck"),
-    ("forer", "BodyPart_RFArm", "ArmorPart_RFArm"),
-    ("forel", "BodyPart_LFArm", "ArmorPart_LFArm"),
-    ("bicepr", "BodyPart_RBicep", "ArmorPart_RBicep"),
-    ("bicepl", "BodyPart_LBicep", "ArmorPart_LBicep"),
-    ("shor", "BodyPart_RShoul", "ArmorPart_RShoul"),
-    ("shol", "BodyPart_LShoul", "ArmorPart_LShoul"),
-    ("handr", "BodyPart_RHand", "ArmorPart_RHand"),
-    ("handl", "BodyPart_LHand", "ArmorPart_LHand"),
-];
-
 /// The robe, among the armor's parts.
 const ROBE: usize = 18;
+
+/// The visual-transform scopes of a creature's parts
+/// (`OBJECT_VISUAL_TRANSFORM_DATA_SCOPE_CREATURE_*`).
+const HEAD_SCOPE: i64 = 254;
+const TAIL_SCOPE: i64 = 253;
+const WINGS_SCOPE: i64 = 252;
+const CLOAK_SCOPE: i64 = 243;
 
 /// `colors` (by PLT layer) with armor part `part`'s own colors over them.
 fn part_colors(armor: &Struct, part: usize, mut colors: [u8; 10]) -> [u8; 10] {
@@ -114,7 +98,7 @@ impl CreatureLook {
         utc.set("Gender", Value::Byte(self.gender));
         utc.set("Phenotype", Value::Int(i32::from(self.phenotype)));
         utc.set("Appearance_Head", Value::Byte(self.head));
-        for (mdlname, field, _) in PARTS {
+        for (mdlname, field, _) in BODY_PARTS {
             let bare = matches!(mdlname, "belt" | "shor" | "shol");
             utc.set(field, Value::Byte(if bare { 0 } else { self.body }));
         }
@@ -135,12 +119,28 @@ pub fn creature_look(game: &GameData, look: &CreatureLook) -> Result<Preview, Pr
     creature(game, &look.to_utc(), &|_| None)
 }
 
-/// A creature blueprint (UTC fields; equipped items through `item`).
+/// A creature blueprint (UTC fields; equipped items through `item`),
+/// without what the game takes off it as it loads it (an item it may not
+/// wear: [`GameData::wear_problem`]).
 pub fn creature(
     game: &GameData,
     utc: &Struct,
     item: &dyn Fn(ResRef) -> Option<Gff>,
 ) -> Result<Preview, PreviewError> {
+    dressed(game, utc, item, true)
+}
+
+/// [`creature`], what it may not wear left off where `as_the_game` (an
+/// armor's preview is a body that wears it whatever).
+pub(crate) fn dressed(
+    game: &GameData,
+    utc: &Struct,
+    item: &dyn Fn(ResRef) -> Option<Gff>,
+    as_the_game: bool,
+) -> Result<Preview, PreviewError> {
+    let worn = |slot| {
+        equipped(utc, slot, item).filter(|it| !as_the_game || game.wear_problem(utc, it).is_none())
+    };
     let lk = Lookup { game };
     let appearance = game.table("appearance")?;
     let row = number(utc, "Appearance_Type");
@@ -163,7 +163,7 @@ pub fn creature(
     ] {
         colors[layer] = number(utc, field).clamp(0, 255) as u8;
     }
-    let armor = equipped(utc, CHEST, item);
+    let armor = worn(CHEST);
     let body_colors = armor.as_ref().map_or(colors, |a| item_colors(a, colors));
 
     let mut preview = Preview {
@@ -191,14 +191,17 @@ pub fn creature(
         let phenotypes = game.table("phenotype")?;
         let default_pheno = cell_int(&phenotypes, pheno as usize, "DefaultPhenoType").unwrap_or(0);
         let letter = race.to_ascii_lowercase();
-        let skeleton = format!("p{g}{letter}{pheno}");
-        let fallback = format!("p{g}{letter}{default_pheno}");
+        let skeleton = models::skeleton(&g, &letter, pheno);
+        let fallback = models::skeleton(&g, &letter, default_pheno);
         let skel = if lk.has_model(&skeleton) { skeleton.clone() } else { fallback.clone() };
         preview.base = Part::new(&skel);
-        let part_model = |name: &str, n: i64, sep: &str| -> Option<String> {
+        let part_model = |name: &str, n: i64| -> Option<String> {
             [&skeleton, &fallback]
                 .into_iter()
-                .map(|s| format!("{s}_{name}{sep}{n:03}"))
+                .map(|s| match name {
+                    "cloak" => models::body_cloak_model(s, n),
+                    _ => models::body_part_model(s, name, n),
+                })
                 .find(|m| lk.has_model(m))
         };
         // `part`: the armor part (an index of `ARMOR_PARTS`), which may
@@ -225,13 +228,13 @@ pub fn creature(
                     == Some("1")
         };
         if robe > 0
-            && let Some(m) = part_model("robe", robe, "")
+            && let Some(m) = part_model("robe", robe)
         {
             preview.parts.push(with(m, None, true, Some(ROBE)));
         }
 
         let capart = game.table("capart")?;
-        let cloak = equipped(utc, CLOAK, item);
+        let cloak = worn(CLOAK);
         if let Some(c) = &cloak {
             let cloaks = game.table("cloakmodel")?;
             let row = number(c, "ModelPart1").max(0) as usize;
@@ -240,9 +243,10 @@ pub fn creature(
             hide_wings = flag("HIDEWING");
             hide_tail = flag("HIDETAIL");
             if let Some(model) =
-                cell_int(&cloaks, row, "MODEL").and_then(|m| part_model("cloak", m, "_"))
+                cell_int(&cloaks, row, "MODEL").and_then(|m| part_model("cloak", m))
             {
                 let mut p = with(model, None, true, None);
+                p.local = crate::scope_matrix(utc, CLOAK_SCOPE);
                 let texture =
                     format!("cloak_{:03}", cell_int(&cloaks, row, "TEXTURE").unwrap_or(1));
                 p.textures =
@@ -257,10 +261,10 @@ pub fn creature(
             let Some(mdlname) = cell(&capart, row, "MDLNAME").map(str::to_ascii_lowercase) else {
                 continue;
             };
-            let Some(part) = PARTS.iter().position(|(n, _, _)| *n == mdlname) else {
+            let Some(part) = BODY_PARTS.iter().position(|(n, _, _)| *n == mdlname) else {
                 continue;
             };
-            let (_, body_field, armor_field) = PARTS[part];
+            let (_, body_field, armor_field) = BODY_PARTS[part];
             if hidden(&mdlname)
                 || (mdlname == "shol" && hide_shoulders[0])
                 || (mdlname == "shor" && hide_shoulders[1])
@@ -271,30 +275,45 @@ pub fn creature(
             // The armor's part covers the creature's own unless it is
             // bare skin (part 1) or nothing: there the creature's shows (a
             // pale master's arm; a jackalwere's legs and paws under armor
-            // whose parts are all 1).
+            // whose parts are all 1), and where the creature has none (no
+            // field), none shows: a commoner made a human, his clothes'
+            // arms 1, has no arms in the client (`reading_part_scopes`).
             let own = number(utc, body_field);
-            let n = if worn > 1 || own <= 0 { worn } else { own };
+            let n = if worn > 1 { worn } else { own };
             if n <= 0 {
                 continue;
             }
             let node = cell(&capart, row, "NODENAME").unwrap_or("rootdummy");
-            if let Some(m) = part_model(&mdlname, n, "") {
+            if let Some(m) = part_model(&mdlname, n) {
                 preview.parts.push(with(m, Some(node), false, Some(part)));
             }
         }
 
         // A helmet takes the head's place.
-        let helmet = equipped(utc, HEAD, item);
+        let helmet = worn(HEAD);
         match &helmet {
             Some(h) => {
-                let model = format!("helm_{:03}", number(h, "ModelPart1"));
-                if lk.has_model(&model) {
+                // (A helmet whose model isn't there is drawn as its base
+                // item's `DefaultModel`, the bag, in the head's place, as
+                // the client draws it: `reading_missing_helmet_model`.)
+                let model = Some(models::helmet_model(number(h, "ModelPart1")))
+                    .filter(|m| lk.has_model(m))
+                    .or_else(|| {
+                        let baseitems = game.table("baseitems").ok()?;
+                        let row = usize::try_from(number(h, "BaseItem")).ok()?;
+                        cell(&baseitems, row, "DefaultModel")
+                            .map(str::to_ascii_lowercase)
+                            .filter(|m| lk.has_model(m))
+                    });
+                if let Some(model) = model {
                     let mut p = Part::new(model);
                     p.attach = Some("head_g".into());
                     let scale_col = if g == "f" { "HELMET_SCALE_F" } else { "HELMET_SCALE_M" };
                     p.scale = cell_f32(&appearance, r, scale_col).unwrap_or(1.0);
                     p.colors = Some(item_colors(h, colors));
                     p.env_map = Some("chrome1".into());
+                    // (In the head's place, as the head's.)
+                    p.local = crate::scope_matrix(utc, HEAD_SCOPE);
                     preview.parts.push(p);
                 }
             }
@@ -303,9 +322,11 @@ pub fn creature(
             None if !hidden("head") => {
                 let head = number(utc, "Appearance_Head");
                 if head > 0
-                    && let Some(m) = part_model("head", head, "")
+                    && let Some(m) = part_model("head", head)
                 {
-                    preview.parts.push(with(m, Some("head_g"), false, None));
+                    let mut p = with(m, Some("head_g"), false, None);
+                    p.local = crate::scope_matrix(utc, HEAD_SCOPE);
+                    preview.parts.push(p);
                 }
             }
             None => {}
@@ -314,9 +335,9 @@ pub fn creature(
 
     // Wings and tails at their dummies.
     let scale = cell_f32(&appearance, r, "WING_TAIL_SCALE").unwrap_or(1.0);
-    for (table, fields, node, hide) in [
-        ("wingmodel", ["Wings_New", "Wings"], "wings", hide_wings),
-        ("tailmodel", ["Tail_New", "Tail"], "tail", hide_tail),
+    for (table, fields, node, hide, scope) in [
+        ("wingmodel", ["Wings_New", "Wings"], "wings", hide_wings, WINGS_SCOPE),
+        ("tailmodel", ["Tail_New", "Tail"], "tail", hide_tail, TAIL_SCOPE),
     ] {
         let n = fields.iter().find_map(|f| utc.integer(f)).unwrap_or(0);
         if n <= 0 || hide {
@@ -330,6 +351,7 @@ pub fn creature(
             p.colors = Some(colors);
             p.env_map = env_map(cell(&t, n as usize, "ENVMAP"));
             p.animated = true;
+            p.local = crate::scope_matrix(utc, scope);
             preview.parts.push(p);
         }
     }
@@ -339,7 +361,7 @@ pub fn creature(
         let weapon_scale = cell_f32(&appearance, r, "WEAPONSCALE").unwrap_or(1.0);
         let baseitems = game.table("baseitems")?;
         for slot in [RIGHT_HAND, LEFT_HAND] {
-            let Some(it) = equipped(utc, slot, item) else { continue };
+            let Some(it) = worn(slot) else { continue };
             let shield =
                 cell_int(&baseitems, number(&it, "BaseItem").max(0) as usize, "WeaponWield")
                     == Some(7);

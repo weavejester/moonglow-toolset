@@ -3,7 +3,7 @@ type: Manual Page
 title: Areas
 description: Areas - the viewer's toolbar, minimaps and camera, selecting, arranging and placing objects, Setup Store, duplicate tags, claimed and protected areas, painting placeables, painting terrain, tiles, Area Properties, area sounds and making tilesets.
 tags: [manual, areas, terrain, tiles]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T21:33:57Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T13:45:00Z }
 ---
 
 # Areas
@@ -19,26 +19,38 @@ Each button shows an icon and its name. With **Tools › Options ›
 General › Toolbar buttons: Icons only** the buttons that have an icon
 show it alone, and the toolbar takes about half the rows it took: rest
 the pointer on an icon and its tip names it (and gives its key, as
-Select Tiles' and Paint's do). All, None, Together, To Scratch and the
-dropdowns keep their words.
+Select Tiles' and Paint's do). All (☑), None (☐), Together (🔗), Onto Objects
+(📥), To Scratch (📤) and Save as Prefab… (🗐) have icons too, and the dropdowns
+show 🏠 (Fade Geometry), 📐 (Snap) and ↻ (Turn) before their choice. A
+palette's Gallery is 🖼, the Grid ⊞.
 
 - **Creatures, Doors, … Waypoints, Start**: show or hide each kind of
   object and the start location marker; **All** and **None**. What you
-  hide is hidden in every area view, as in Aurora: the other open ones,
-  those you open later, and the next time Moonglow starts (an area that
-  looks empty may have its kinds hidden: **All** brings them back).
+  hide is hidden in every area view, as in Aurora: the other open ones
+  and those you open later, until Moonglow is closed (the next time it
+  starts, every kind shows again, as in Aurora).
 - **The start location** (where a player's character enters the module)
   is marked as in Aurora: a blue ring on the ground with a red arrow the
   way the character faces. To set it, right-click the ground where it
-  should be and choose **Set Start Location Here**: it faces the way the
-  view looks. Click the marker to select it (a yellow box, as round an
+  should be and choose **Set Start Location Here**, or choose **🏁 Start
+  Location** among the palette's types (Aurora's Paint Start Location)
+  and click where it should be (the marker follows the pointer until
+  then; Shift + click keeps it for another try, a right click or Escape
+  puts it down): it faces the way the view looks, in the area clicked,
+  which is how it goes to another area (a drag keeps it in its own).
+  The pointer is a hand over the marker. Click the marker to select it (a yellow box, as round an
   object; the game's invisible object, which has nothing to draw, has
   the box its model holds undrawn, 0.6 m across, as Aurora outlines it). Drag it by its ring or its arrow to move it; selected, the
   arrow's tip has a round handle that turns it (both follow the snapping grid and
-  angle; Escape lets go; an object standing on the marker is taken first). **Go to Start Location** brings the view to it; with the start in another area, it opens that area there. **Start** on the main toolbar (View › Go to Start Location) does the same with no area open: move the start location to where you are working, and it is a bookmark.
+  angle; Escape lets go; an object standing on the marker is taken first).
+  Selected, **Q** and **E** turn it as they turn an object, and its menu
+  (a right click on it) has **Adjust Location…** for its exact X, Y, Z
+  and bearing (0 faces north, as an object's). **Go to Start Location** brings the view to it; with the start in another area, it opens that area there. **Start** on the main toolbar (View › Go to Start Location) does the same with no area open: move the start location to where you are working, and it is a bookmark.
 - **Fade Geometry**: draws the tiles without the parts that fade in the
-  game to show a character behind them (roofs, upper walls), to see and
-  place what is under them (Aurora's Environment › Fade Geometry):
+  game to show a character behind them (roofs, upper walls, trees'
+  crowns; the black caps and strips under and beside them stay, as in
+  Aurora), to see and place what is under them (Aurora's Environment ›
+  Fade Geometry):
   **Never**, **Object Mode Only** (while you work on objects: not with
   Select Tiles on or a terrain brush chosen) or **Always**. The choice
   is kept for the areas opened after. This list, **Snap** and **Turn**
@@ -53,6 +65,12 @@ dropdowns keep their words.
   at the area's foot as well. The fog is drawn as the game's camera (at most 20 m from
   the player) would see it from where the view looks, so a view from
   farther off isn't lost in it.
+- **🗾 Minimap**: the area's map in the view's top right corner, as the
+  game's map draws it ([Minimaps](#minimaps)), with where the camera
+  looks (a white dot, and a wedge the way it faces) and the selected
+  objects (yellow dots). Click or drag on it to look there: the
+  camera's target goes to that place, the camera keeping its turn and
+  distance. Areas opened later open as you left it.
 - **▶ Animations**: creatures and other placed objects play their
   animations, and those with particles show them (a campfire's flames,
   magic sparks, a portal: placeables that are only an effect show
@@ -66,12 +84,18 @@ dropdowns keep their words.
 - **🌿 Grass**: the grass the area grows, as the game grows it on the
   tiles' walkmesh faces: the tileset's, and the area's own (Area
   Properties › Grass). It is drawn wherever the view shows grass ground,
-  out to the far edge of the view, as dense as the game's within 45 m of
-  the camera and thinner further off (dense grass from 45 m, the
-  tilesets' own past 180 m). The game draws it within 30 m of its camera
+  out to the far edge of the view, as dense as the game's near the
+  camera and thinner further off, a little at a time rather than at a
+  line (dense grass, more than 10 tufts a square meter, from 45 m to
+  about 56 m and again further off; the tilesets' own from 180 m to
+  225 m). The game draws it within 30 m of its camera
   by default (its `Grass Render Distance` setting, up to about 170 m).
   From high above a field a tuft is a pixel or two, and the grass shows
-  little. Switched off, in every area view; it stays as you leave it.
+  little. It sways in the area's wind (Area Properties › Wind Power) as
+  the game's does, the tops of all its tufts together, north and south,
+  some 8 cm either way in a strong wind and half that in a weak one; in
+  no wind it stands still. Switched off, in every area view; it stays as
+  you leave it.
 - **🎨 Shaders**: draws with the game's own shaders, compiled on your
   machine from the game and the module's haks, as the game draws: a
   material's custom shaders (its MTR's `customshaderVS` and
@@ -110,7 +134,9 @@ dropdowns keep their words.
   time: until they are ready, what they draw is drawn with Moonglow's own
   shader, so an area may change its look a moment after it opens. It is
   one switch for every 3D view (the model viewer has it too) and it stays
-  as you leave it: switched off, it stays off.
+  as you leave it: switched off, it stays off. The pictures already made
+  (the galleries', a hovered row's preview, a tile's variants) are made
+  anew with the shaders it switches to.
 - **💡 Lighting**: the area's lighting: the sun or moon colors of Area
   Properties, the tiles' main and source lights (Tile Properties), the
   light of each placeable whose appearance has one (placeables.2da's
@@ -145,6 +171,11 @@ dropdowns keep their words.
     light with `shadow 1` and a radius of 10 m or more (a placeable's
     light, a lamp post; the tiles' torches, 7 m, cast none), from a little
     above it (its `verticaldisplacement`: a placeable's light 3 m).
+  - **Quality**: **Fast** or **High**, as in Options › Area (and kept
+    there): Fast, a shadow map standing in for the game's shadows; High,
+    the game's own stencil shadow volumes, their edges sharp up close,
+    dearer in the largest areas (see
+    [Options](10-options.md#area)).
 
   All three are on at first. Every shadow darkens the tiles and the
   static placeables, not dynamic ones or creatures, as in the game.
@@ -158,13 +189,16 @@ dropdowns keep their words.
   them. Changes to the shadow fields in Area Properties show at once.
 - **🔊 Sounds**, **Ambient**, **Music**: play the placed sound objects, the
   area's ambient sound and its music, heard from where the camera looks.
-- **◎ Sound Ranges**: two circles around each placed sound that is heard
-  from where it stands: at full volume inside the inner one (its minimum
-  distance), not at all outside the outer one (its maximum). The
+- **◎ Sound Ranges**: two spheres of dots around each placed sound that
+  is heard from where it stands, as Aurora draws them: at full volume
+  inside the inner one (its minimum distance), not at all outside the
+  outer one (its maximum), with a circle at the sound's height where the
+  outer one meets it. The ground and what stands in front of them hide
+  them, as they hide the tile grid; a sphere far off has fewer dots. The
   selection's are brighter; a sound heard everywhere in the area has none.
-  A sound that plays from a random place has a rectangle too: how far
-  east and north of itself it may play. Areas opened later open as you
-  left it.
+  A sound that plays from a random place has a rectangle too, where it
+  may play: its random ranges wide and deep, about where it stands, as
+  Aurora draws it. Areas opened later open as you left it.
 - **Walkmesh…**: a click shows the ground's walkmesh over the area
   (Aurora's Render AABB Nodes): walkable faces green, the others red; a
   click again hides what is shown. Hold the button, or right-click it,
@@ -200,6 +234,10 @@ tiles included. A tile without a picture is black, as in the game. `mg
 minimap` does the same from the command line. Each picture keeps its own
 size unless `--size` sets one; the game's are mostly 16 pixels.
 
+The same map shows in the area view's corner with the toolbar's
+**🗾 Minimap**, and in **Setup Area Transition**, where a door's or
+trigger's destination is picked on it ([Blueprints](05-blueprints.md#placeables-and-doors)).
+
 ## The camera
 
 Aurora's bindings, plus a few of Moonglow's (change the keys in Tools ›
@@ -211,7 +249,7 @@ Options › Keyboard):
 | Right drag, or middle drag | turn the camera (W A S D move it meanwhile) |
 | Alt + middle drag, or Alt + drag begun off the selection | move the camera (Alt + drag on the selection raises or lowers it) |
 | Alt + middle click | look at the ground clicked: the camera's focus goes there at once, at the ground's height (on its walkmesh, else on the tile's floor), its distance, turn and tilt kept, as Alt + middle click in Blender; a click on the sky or off the area does nothing |
-| Wheel | zoom (slowly with Shift, or with Ctrl unless the pointer is on a selected object that takes a scale; when painting tiles, Shift is the brush's) |
+| Wheel, or a pinch on a touchpad | zoom (slowly with Shift, or with Ctrl unless the pointer is on a selected object that takes a scale; when painting tiles, Shift is the brush's) |
 | Sideways scroll (a tilted wheel, a second wheel, two fingers sideways on a touchpad) | move the camera left and right, as the screen has it |
 | Arrow keys, W A S D, or numpad 4, 6, 8, 2 | move the camera |
 | Numpad 7, 9 | turn |
@@ -292,10 +330,14 @@ led along its line.
 **The scale handle**: with **Shift** held, a white square stands on a
 stalk up and to the right of the selected object. Pull it away from the
 object to make the model larger and push it toward the object to make it
-smaller: twice as far from the object's feet, twice the size. The size
-shows beside the pointer as you drag; with **Snap** on it goes in steps
-of 0.05. The model grows from its feet, so it stays on the ground, and
-every way alike (Adjust Location's Scale is the same number). Like the
+smaller: twice as far from the object's feet, twice the size. The
+square follows the pointer as you drag (the other selected objects'
+handles move out or in along their stalks as far), and the size shows
+beside it; with **Snap** on it goes in steps of 0.05. The model grows
+from its feet, so it stays on the ground, and every way alike, as the
+game draws it: the game scales a model by one number (`ScaleX`), the
+same every way, whatever its file's `ScaleY` and `ScaleZ` say, and
+Adjust Location's Scale is that number. Like the
 tilt, it is the model that changes, for the objects a tilt works on;
 several selected objects each scale about their own feet. Escape drops
 the drag.
@@ -305,7 +347,8 @@ the pointer on one of them, turn the wheel up to make their models
 larger and down to make them smaller, about a twentieth a notch. With
 the pointer anywhere else, Ctrl + wheel zooms the view slowly, so that
 the wheel turned while Ctrl still moves the view (Ctrl + drag) leaves
-the selection's size alone. The
+the selection's size alone; with nothing selected it does nothing, as
+in Aurora. The
 size shows beside the pointer and in the status line; it becomes one
 step to undo when Ctrl is let go or the wheel rests (Escape, or Undo
 meanwhile, drops it). It works on what a scale works on: creatures,
@@ -329,7 +372,9 @@ A click on a ring or an arrow selects the object under it, if there is
 one; the selection stays otherwise.
 
 **Lights**: right-click the ground and choose **Add Light Here**, then
-a color. Moonglow puts one of the game's invisible light placeables
+a color, or choose a color in the palette's **☀ Lights** and click
+where it goes (Shift + click places more; a right click or Escape over
+the view stops). Moonglow puts one of the game's invisible light placeables
 there ("Light, White" and the six others of placeables.2da), a little
 above the ground: it lights what is around it in the game and needs no
 custom content. It shows as a small sun in its color; select, move and
@@ -339,6 +384,50 @@ it reaches: where the game's light ends, 20 m out, the light fading
 all the way there. These are the game's fixed lights: seven colors, one
 reach. A hak that adds rows of the same kind (a `LightColor`
 on the model `dag_invisible`) adds to the list.
+
+### Lights of any color and reach
+
+With **Options › Areas › Lights of any color and reach, written into a
+hak** on (off by default, so that nobody writes into a persistent
+world's haks without meaning to; a project's `moonglow.toml` can say it
+for the team: `[lights] generated`), **Add Light Here** and the
+palette's **☀ Lights** have **Custom Light…** too. Its window takes the
+light's **Color**, **Radius** (its light ends at twice it), a
+**Multiplier** that lengthens its reach (the game lengthens a model
+light's reach by it, not its brightness), its **Priority** (1 to 5:
+where more lights shine at one place than the game draws, those of
+priority 1 are kept), whether creatures' shadows are cast from it, and
+whether it lights creatures and placeables as well as the ground.
+
+**Written Into** chooses the hak: one of the module's own (not the
+game's), or a new one, by the name typed, made in your user folder's
+`hak` and put at the top of the module's hak list. Nothing is chosen
+at first (but the project's `[lights] hak`, where that is one of the
+module's), and nothing is written until one is. Before anything is
+written the window says what: the model (`mgl_` and twelve letters and
+digits, named by the settings) and placeables.2da with its row, into
+which hak, from which copy of the table, and that the module's players
+must have that hak (a persistent world ships it to them, by NWSync or
+by hand). **Write and Place** writes them (a hak that is there is first
+kept beside itself as `.bak`), has the game data read them again, and
+puts the light where the menu was opened (from the palette: where you
+click next).
+
+The placeables.2da written is the copy the game reads now (another
+hak's, or the game's), with the light's row added at its end, or at the
+project's `[lights] first_row` (a range the team keeps for lights). So
+the hak must be the one whose copy the game reads, or above it: a hak
+below another that has placeables.2da is refused, and the window says
+which to choose. A light of the same settings as one written before is
+the same model and row: nothing is written again. A hak open in the
+hak editor is refused too (close it there first).
+
+A light made so shows as the game's do: a small sun in its color, a
+ring where its light ends when it is selected, and the view lit by it.
+Lights made so are listed on the palette's ☀ Lights, under the game's,
+and on Add Light Here. **Change Light…** on a selected one gives it
+other settings: another row (and model), written as Custom Light writes
+them; Undo gives it its row back (what was written stays in the hak).
 
 **An encounter's spawn points**: with the encounter selected, the tip of
 each spawn point's arrow is a handle. Lead it round the point and what
@@ -387,6 +476,19 @@ Aurora):
   does, so a static placeable with one in its file was made elsewhere:
   the window says so, and Verify warns of it (`static-transform`), with
   a **Take the transform off** button (since Moonglow 2.13.0).
+  **Animation Speed**, beside Scale, is how fast the model's
+  animations play (1 as made, 2 twice as fast: the script's
+  `OBJECT_VISUAL_TRANSFORM_ANIMATION_SPEED`). What a script can give an
+  object besides, the window shows under the fields and keeps as it is:
+  a creature's head, tail, wings or cloak transformed alone
+  (`SetObjectVisualTransform`'s scopes, kept in a saved game or a
+  module made from one), which the area view draws on that part, about
+  the node it hangs from, the rest of the creature as it is, as the game
+  draws them; an item's (a weapon of three parts lying in the area: the
+  whole item, its middle, its top), drawn on those parts; and a lerp
+  in progress (a value on its way from one to another over some
+  seconds), drawn at its end. Setting that value here ends the lerp; a
+  value left as it is keeps it.
 - **Random Facing**: turns each selected object to face a way of its
   own, at random (by the snap angle, if one is set): for trees and rocks
   placed in numbers.
@@ -397,6 +499,7 @@ Aurora):
   placeable or door below its center (a skull on an altar, a book on a
   table), by that object's model, up to 2 m above it; with nothing there,
   on the ground. Not creatures, which the game stands on the ground.
+  **Onto Objects** on the toolbar places them so in the first place.
 - **Arrange** (several selected; the first selected leads):
   - **Line Up West–East** or **South–North**: on a line through the first.
   - **Space Evenly**: evenly spaced between the two farthest apart.
@@ -424,7 +527,12 @@ Aurora):
   inventory, stores).
 - **Add to Palette**: the instance as a new custom blueprint (its ResRef
   after [your builder code](03-modules.md#your-builder-code), where you
-  have one).
+  have one), named as Aurora names it: a creature's or an item's its
+  blueprint's numbered past those in use (`w2guard` gives `w2guard002`,
+  `nw_wswls001` `wswls003`); a placeable's, door's, trigger's, sound's or
+  waypoint's its blueprint's without a reserved prefix (`nw_`, `plc_`,
+  `x0_`…) where that name is free (`nw_waypoint001` gives
+  `waypoint001`), else numbered (`mgp_utd001`).
 - **Export as Blueprint…**: the instance written into an archive (`.erf`)
   as a blueprint of its own, made and named as Add to Palette makes one
   (with the items it holds, each an item blueprint), but not added to the
@@ -478,7 +586,8 @@ file](03-modules.md#the-project-file-moonglowtoml)'s `[store]`:
   no `openstoreNNN` is written (the wizard's page says so; the log warns
   when neither the module nor the game has the script);
 - `tag`: the store's tag, `{area}` the area's tag and `{n}` the first
-  number no other object of the module has (`{area}_STORE_{n}`); without
+  number no other object of the module has (`{area}_STORE_{n}`), or of
+  the area, for a tag `[tags] unique_in_area` names; without
   a pattern the blueprint's tag, with a number where another object has
   it. Either way no two stores share a tag, and the last page says it;
 - `blueprint`: the store blueprint chosen at first;
@@ -492,9 +601,16 @@ drag it onto the area from the palette or the module tree. Until it is
 placed, a see-through copy in a blue box follows the pointer where it
 would go (on the snapping grid; a door on the nearest hook). **Q** and
 **E** turn it as they turn a selection (Shift + Q and E by 90°), and it is
-placed facing that way; a door faces as its hook does. Shift + click
-places it and keeps it chosen for another; a right click or Escape lets
-it go. Doors go on a tile's door hook when you click near one. Triggers
+placed facing that way; a door faces as its hook does. With **Onto
+Objects** on (the toolbar, beside Together) it goes onto the top of the
+placeable or door the pointer is on, by that object's model (a book on a
+table, a skull on an altar), as Drop onto Object sets it after; where
+that top is more than 2 m above the ground (a tree's canopy) it goes on
+the ground, as with the switch off. Shift + click places it and keeps it
+chosen for another; a right click or Escape over the view lets it go
+(over a window in front of the view, the window takes Escape, and the
+copy and the coordinates in the view's corner wait for the pointer to
+come back to the view). Doors go on a tile's door hook when you click near one. Triggers
 and encounters are drawn point by point: click each corner, double-click
 to close the outline. For a rectangle, click one corner, press Alt (the
 rectangle to the pointer shows), then click the corner opposite: its
@@ -541,15 +657,23 @@ placeables around.
 ## Duplicate tags
 
 A copy keeps its original's tag, and a script that looks an object up by
-its tag (`GetObjectByTag`) finds only one of them: in the game, the copy
-placed later. A copied start waypoint, rental door or store then takes
+its tag (`GetObjectByTag`) finds only one of them: in the game, the one
+loaded last, which is the copy placed later, or the one in the area that
+comes later in the module's list of areas. A copied start waypoint, rental door or store then takes
 its original's place, or the original its copy's, with no error.
 
 With **Options › General › Show duplicate tags warning after a paste
-or a copy** on, a paste (Ctrl+V, a prefab placed) that puts a tag on
-more than one object of the module (its areas and the objects placed in
-them) is said in the log and the **Duplicate Tags** window:
-"KREZK_RENTAL_DOOR is now on two objects". They say it of the tags a
+or a copy** on, a change that puts a tag on more than one object of the
+module (its areas and the objects placed in them) is said in the log and
+the **Duplicate Tags** window: "KREZK_RENTAL_DOOR is now on two
+objects". It is weighed so whatever gives the tag: a paste (Ctrl+V, a
+prefab placed), an object placed from the palette, a tag typed in
+Properties (once you leave the field), **Create Set…** (which numbers
+its waypoints apart from the other waypoints, not from the area's other
+objects), Find and Replace's Tags, Advanced Search's **Set a field**,
+Edit Together, a plugin's change. The window names the change
+("“Paste” put tags on more than one object of the module"). An Undo or
+a Redo asks nothing, nor a tag set to what it was. They say it of the tags a
 builder set: a tag that isn't the object's blueprint's own (as the
 module, its haks or the game have the blueprint; one whose blueprint
 isn't found counts as set), and those the project wants unique. Every
@@ -570,21 +694,49 @@ doesn't set `paste_warning`, the option on warns as above, and off warns
 only of the tags the project wants unique (`unique`, `unique_in_area`),
 the team's own rule; without those, nothing.
 
-- **Retag** gives each pasted object with such a tag one of its own, the
+- **Retag** gives each new object with such a tag one of its own, the
   tag with a number that no object has (`LAMP_2`; `STORE_7` becomes
-  `STORE_8`), as one step to undo.
+  `STORE_8`; `Patrol_01` becomes `Patrol_02`, its number as wide as it
+  was), as one step to undo. A door or trigger made with them whose
+  **Linked To** names one of those tags (a door pasted with its
+  waypoint, an area copied with its transitions) names the new tag, so
+  the copy's transitions lead within the copy and the original's within
+  the original (where only one object made in that area had the tag).
+- **Retag All**, for an area copied where the project warns of any tag
+  (below), retags the tags only counted too.
 - **Keep Tags** leaves them (objects that no script looks up).
+
+Scripts that spell one of the tags (a string `"KZ_INN_EXIT"`, as Find
+References finds it) are named in the window ("Spelled in scripts (1:
+kz_exit.nss line 1)"), and in the log after a Retag: a script is the
+original's and the copy's alike, so Retag leaves it as it is, and it
+finds whichever object the game finds first.
 
 An area copied with **Copy…** in the module tree has every tag of its
 original's objects: with the option on, the window lists the area's own
 tag (an area has no blueprint), the tags a builder set and those the
 project wants unique.
 
+A blueprint copied (the palette's **Edit Copy…**, **Copy…** in the
+module tree) with a tag another of the module's blueprints has is said
+in the Copy window and in the log, not stopping the copy: "KZ_GATE is
+kz_gate.utw's tag too: what is placed from either has it". With the
+option on, a tag typed there is weighed; the original's kept asks
+nothing, as Aurora's Edit Copy keeps it. Where the project wants the
+tag unique, or warns of any tag, the original's kept is said too.
+
+`mg set`, `mg apply` and `mg areas --set Tag=…` say the same in their
+warnings ("warning: WP_DOOR is now on two objects: a script finds one of
+them by it (GetObjectByTag)"), by the project's `paste_warning`, else of
+each tag the command sets and those the project wants unique. An object
+`mg apply` places whose blueprint isn't the module's is taken to have
+its blueprint's tag.
+
 The [project file](03-modules.md#the-project-file-moonglowtoml) says
 which to warn of (`[tags] paste_warning`: `"custom"`, as above;
 `"any"` for every tag but a static placeable's, an area copy's
 then listing only its own tag and the unique ones and counting the
-rest; `"unique"` for only the tags it names in `unique` and
+rest, which **Retag All** retags; `"unique"` for only the tags it names in `unique` and
 `unique_in_area`; or `"off"`), and Verify Module warns of a tag it wants
 unique that is on two objects.
 
@@ -592,9 +744,11 @@ A tag a script looks for in its own area only (a store's, which a
 vendor's script finds as the nearest of that tag) may be on one object
 of each area: the project names those in `[tags] unique_in_area` (since
 Moonglow 2.2.0). A paste then counts such a tag in the area it was
-pasted into, whatever `paste_warning` says ("KZ_SQUARE_STORE_1 is now on
-two objects in kz_square (the project wants \*_STORE_\* unique in each
-area)"), a copy of a whole area is quiet about them, and Verify Module
+pasted into ("KZ_SQUARE_STORE_1 is now on two objects in kz_square (the
+project wants \*_STORE_\* unique in each area)"); one that is in other
+areas only is as meant, and said only where `paste_warning` is `"any"`,
+as any other tag on two objects ("KZ_SQUARE_STORE_1 is now on two
+objects"). A copy of a whole area is quiet about them, and Verify Module
 warns of one that is twice in one area.
 
 ## Painting placeables
@@ -614,10 +768,14 @@ the next time.
   **Radius**).
 - **Density** is how many placeables a tile's ground (10 by 10 m) holds
   once painted. The brush adds placeables until the circle has its share,
-  counting those of the chosen blueprints already there. So going over a
-  painted place again fills its gaps and adds no more.
+  counting those of the chosen blueprints already there (with **Count
+  All**, every placeable there: trees painted among rocks, the rocks
+  counted). So going over a painted place again fills its gaps and adds
+  no more.
 - **Spacing** is the least distance between two placeables: those the
-  brush puts down, and any placeable already in the area.
+  brush puts down, and any placeable already in the area. Between their
+  middles; with **By Size**, between their sides, each by its model's box
+  (as scaled): a large tree keeps further from the next than a shrub.
 - **Flow** is how much of what the circle lacks each dab adds: at 100% a
   click fills the circle at once; lower, it fills as you go over it.
 - **Turn**: each placeable faces the way **Q** and **E** turned the brush,
@@ -640,17 +798,28 @@ the next time.
   The row begins on the snapping grid, and its direction snaps to the
   snapping angle. It follows the ground (walkable or not, so a walkway
   can cross water), raised by **Height**. Of several placeables chosen,
-  each piece is a random pick.
+  each piece is a random pick. A row's end is ringed in green: a drag
+  begun at it (within a meter) goes on from there, the next leg's first
+  piece against the last one's, so a fence goes round corners in legs.
 - **Fill** covers a rectangle instead, in rows (a floor): drag from one
   corner to the opposite one, whichever way. **Q** and **E** turn the
   grid, and the rectangle's sides with it (by the snapping angle, if on;
   Shift + Q by 90°), each piece facing along it. A row lays its pieces end
-  to end, each by its own length and **Gap**; the next row begins past the
-  deepest piece of the one before, and Gap. So pieces of different sizes
-  pack as they are. The first piece's corner is where you pressed (on the
+  to end, each by its own length and **Gap**, their middles in a line
+  across it (a shallow piece centered on a deep one's row, not against
+  its near side); the next row begins past the deepest piece of the one
+  before, and Gap. So pieces of different sizes pack as they are. The first piece's corner is where you pressed (on the
   snapping grid), and pieces go on until the rectangle is covered, so the
   last row and piece may reach a little past it. It follows the ground as
   Row does, raised by **Height**.
+- **Erase** takes placeables out instead: its circle (red, sized as
+  Scatter's) takes out the chosen blueprints' placeables it is dragged
+  over, each marked with a red cross until you let go; then they go as
+  one step, **Erase Placeables**. Locked placeables stay, and so do other
+  blueprints'.
+- **Lock** locks what the brush puts down, as the selection's **Lock**
+  does: later clicks and boxes pass through it to what is beneath, and
+  the eraser leaves it (**Unlock All** frees it).
 
 Before a press, the dab a click would lay (with Row or Fill, the first piece)
 shows see-through under the pointer, and a click lays exactly that. What
@@ -725,7 +894,7 @@ as Aurora's Terrain tab does:
   brush's name, or a tile's model: a group or feature is found by the
   models of its tiles too, and shows as itself, one picture in the
   Gallery), **Expand All** and **Collapse All**,
-  how many there are, and **List** (☰) or **Gallery** (⊞), the same switch
+  how many there are, and **List** (☰) or **Gallery** (🖼), the same switch
   as the blueprint palettes', with the pictures' size beside it.
 - In the **Gallery**, each terrain and crosser is a heading that opens and
   closes, with every tile it can make under it as pictures: each variant,
@@ -890,6 +1059,18 @@ tile's own value. Each tile is given only what its own model has: a
 value already in the area for a light the model hasn't is kept as it
 is. **Defaults** puts back the lighting scheme's colors and the loops.
 
+**Replacement Texture**, under the Height, is Enhanced Edition's field
+that Aurora's window hasn't got (`Tile_ReplaceTex`): what a mesh of the
+tile's model drawn with a texture named `replace_tex` is drawn with
+instead, a row of `replacetexture.2da`. It is there for a tile whose
+model has such a mesh, and greyed out for the others (of the game's own
+tiles, only `tms01_c08_01`, which no tileset uses, has one: it is for
+your own tiles). It shows the row the tile is drawn with: a tile without
+the field draws row 0. The game reads the field as the row plus one, and
+Moonglow writes it so; a tile whose value is 0, or past the table, shows
+it in red, as the game crashes as it loads the area (Verify finds such a
+tile: `tile-replace`). **Defaults** leaves it as it is.
+
 Every change in Tile Properties shows in the area **as you make it**: a
 light, a loop, the Height (each click of - or +, and each step of a
 height dragged), Defaults. While the window stays open, all of them are
@@ -1026,8 +1207,18 @@ In a project that keeps a [claims table](03-modules.md#claimed-areas),
 an area another builder claimed says so above its view (and its
 Properties), with who and since when: its changes are either refused
 (the project keeps others' areas read-only) or asked about before a save
-writes them. An unclaimed one says so too where the project warns of
-those, with **Claim This Area** beside it. The area's tab menu and its
+writes them. A read-only one is there to look at: you move about it,
+select its objects and open their Properties, but its tools are off. A
+drag selects or moves the camera and moves no object; there are no
+rings, arrows or scale handle; Delete, Q, E and G do nothing; Paint and
+Select Tiles are grayed, and the palette's blueprints, tiles and pastes
+aren't placed (one dropped on it says so in the log); its menu has
+Preview and Properties. Its Properties and its objects' are gray, with
+**Close** for OK and Cancel: what you type in them is dropped, and their
+Variables… button is off. (The module's start location may still be
+moved there: it is the module's, not the area's.) An unclaimed one says
+so too where the project warns of those, with **Claim This Area**
+beside it. The area's tab menu and its
 menu in the module tree have **Claim This Area** or **Release Claim**,
 which write the table. A merged (or protected) area says its Tag and
 ResRef are kept; changing either, or deleting it, is
@@ -1050,11 +1241,28 @@ Properties** on the viewer's toolbar:
   first and last. Under them:
   - **Copy From Area** gives this area what another's Visual page holds
     (its lighting, fog, shadows, sky and weather), as one undoable step.
+    The tiles' own lights are left as they are.
   - **Saved Lighting** keeps this page's settings under a name (**Save
-    This Lighting…**) and gives lighting kept so to this area: yours
-    from any module, as small files in Moonglow's data folder
-    (`lighting`), easy to share. A tile's own lights aren't part of it
-    (a scheme picks those).
+    This Lighting…**), with the colors of the area's tiles' lights, and
+    gives lighting kept so to this area: its settings. The tiles' lights
+    are left as they are unless **Tiles' Lights Too** is ticked in the
+    menu (it starts unticked each time Moonglow starts): then every
+    tile's main and source lights are picked at random from the colors
+    kept, the colors used most the most often, as a lighting scheme
+    picks them from its own. Yours from any module, as small files in
+    Moonglow's data folder (`lighting`), easy to share (`mg areas
+    --lighting` gives them from a terminal). Lighting kept by Moonglow
+    2.13 or older has no tiles' colors. In the same menu, **Rename** and **Delete** (**Undo Delete**
+    there puts the last one deleted back), and **Make a Lighting
+    Scheme**: the lighting as a scheme of the module's own, a row of
+    `environment.2da` added where you choose (the module's own table, a
+    copy of the game's in the module, the table of one of its haks, a hak
+    open in the hak editor, or a file), open in the 2DA editor to look at
+    and save. Saved there (a hak's own Save then writes the hak) and with
+    **Tools › Reload Resources**, it is listed with the schemes by its
+    label (it has no talk-table name), and the game's
+    `SetAreaLightingScheme` takes its row. A scheme has no sky box or fog
+    distance: choosing it sets those back to none and 45 meters.
   With several areas edited together, both give each of them the
   lighting.
 - **Grass**: the grass the area grows, by surface material (see
@@ -1088,12 +1296,18 @@ it goes; each change is one step to undo).
 
 - **Grow the tileset's grass on Grass faces**: off, the tileset's grass
   is gone (`SetAreaDefaultGrassDisabled(oArea, TRUE)`). Under it, what
-  the tileset grows. A tileset without grass (an interior) says so.
+  the tileset grows, its texture's picture beside it. A tileset without
+  grass (an interior) says so.
 - **The Area's Own Grass**: a box for each material with grass of the
   area's own, and **Add Grass to…** for another (it starts as the
-  tileset's grass). In each: the **Surface Material** (one already
+  tileset's grass). Its list has the materials the area's tiles have
+  first, the most of the ground first (rest the pointer on one for how
+  many square meters of the tiles' walkmesh faces are of it), then the
+  others, dimmed: grass on a material no tile has grows nothing, and its
+  box says so. In each: the **Surface Material** (one already
   growing the area's grass isn't offered twice), the **Texture** (a
-  ResRef; the game's are four tufts, two by two: `grass`, `ttz_grass`),
+  ResRef, its picture beside it; the game's are four tufts, two by two:
+  `grass`, `ttz_grass`),
   the **Density** (tufts to a square meter of the faces), the **Height**
   (meters), the **Ambient Color** and **Diffuse Color** (the light they
   take, as the tileset's are), and **Remove**.
@@ -1114,6 +1328,12 @@ it goes; each change is one step to undo).
 | `GrassAmbientX`, `Y`, `Z` | FLOAT | the ambient color's red, green and blue, 0 to 1 |
 | `GrassDiffuseX`, `Y`, `Z` | FLOAT | the diffuse color's |
 
+**Aurora loses them.** An area saved in Aurora (any change to it, then
+File › Save) is written without `GrassDefDisabled` and `GrassOverrides`:
+the area grows the tileset's grass again and none of its own. Set the
+grass again in Moonglow after a module has been through Aurora, or keep
+it in a script (below).
+
 They are no local variables: a script can't read them. A script that
 changes grass while the game runs calls `SetAreaGrassOverride`,
 `RemoveAreaGrassOverride` or `SetAreaDefaultGrassDisabled`; what it sets
@@ -1130,15 +1350,35 @@ the diffuse colors, which may be left out), `--remove-grass Dirt` and
 
 Moonglow draws the grass closely enough to judge an override by: a
 tuft's size, the density and the colors match the game near its camera.
-The game's tufts gather in patches, Moonglow's are spread evenly.
+Its tufts gather in clumps with bare ground between them, as the game's
+do, as dense on average as the Density says (a clump to every 5 square
+meters or so, its tufts within 1.4 m of its middle; sparse grass has a
+tuft or two a clump).
 
 ### Several areas together
 
 **Edit › Edit Areas Together…** (or an area's right-click menu in the
 module tree) lists the module's areas to tick. Narrow the list by a name
-or ResRef, by tileset, and by kind (interior or exterior, above or under
-ground, natural or artificial); **Tick Shown** ticks what the filters
-leave. **Edit N Together** opens one Area Properties for the areas
+or ResRef, by tileset, by kind (interior or exterior, above or under
+ground, natural or artificial), and by what they hold (**Holding**):
+- **Music**: the areas that play it by day, by night or in battle (an
+  `ambientmusic.2da` row, named as the game names it).
+- **A variable**: by name, of a value if one is typed (`tdod_rental`,
+  `kz_* = 1`; `*` as in tags, case ignored).
+- **A field's value**: a field of the area or of its sounds and music, by
+  label and value (`MusicDay = 57`, `Fog* = 0`, `OnEnter = kz_*`).
+
+What they hold is read as it is now, unsaved changes too. **Tick Shown**
+ticks what the filters leave; Advanced Search's **Choose N Area(s)…**
+opens the window with the areas of what it found ticked (an area with a
+creature of a class, an item property…).
+
+The areas ticked are kept under a name with **Save Set** (the name
+typed beside it), for this module, in Moonglow's data folder's
+`area-sets` (a small JSON file to share or write by hand: `{ "module":
+"krezk", "areas": ["kz_square", "kz_inn"] }`); **Tick a Set…** ticks
+a set's areas again, and **Delete Set** deletes the set whose name is
+typed. **Edit N Together** opens one Area Properties for the areas
 ticked, shown as the first of them:
 
 - A change is set on each area, as one undoable step: the lighting scheme
@@ -1154,7 +1394,12 @@ ticked, shown as the first of them:
   keeps its tiles' own.
 - **Loading Screen** (Advanced, and a door's or trigger's Area
   Transition page) shows the chosen screen's picture under the list, and
-  each screen's when the pointer rests on its name in the list.
+  each screen's when the pointer rests on its name in the list. The
+  picture is put together as the game's loading screen panel
+  (`pnl_loadscreen`) lays the texture out: a hak's own panel, laid out
+  otherwise (a wide texture in three parts, say), is followed. A screen
+  whose texture isn't found shows the small preview Aurora shows
+  (`NAMEs`), where there is one.
 - Interior, natural, underground and the shader flags change alone: each
   area keeps its other flags.
 - **Variables**: the variables you add or change are set on each area,
@@ -1194,11 +1439,17 @@ it left, and why. Left dynamic are placeables that:
   loaded. The log names each kept for its variables;
 - or the [project file](03-modules.md#the-project-file-moonglowtoml)
   says so (`[make_static]`): its tags or blueprints by name, and which
-  variables count (all, unless it names them).
+  variables count (all, unless it names them);
+- have a tag one of the module's scripts names: the tag written in a
+  script as text (`GetObjectByTag("GATE_LEVER")`, a constant
+  `"LAMP_01"`), which it may destroy, animate or make usable. The log
+  names the script and the line. Tags compare exactly, as the game's
+  lookups do.
 
-One a script destroys or animates by its tag, with no variables, can't
-be told from the rest: make it dynamic again from its menu in the area
-view. **Make
+A tag a script makes up as it runs (`"LAMP_" + IntToString(n)`), or one
+named only in a compiled script with no source (a hak's), can't be seen:
+name such tags in the project file's `keep_tags`, or make the placeable
+dynamic again from its menu in the area view. **Make
 Placeables Dynamic**, on the same menus, clears Static on every
 placeable of the area or the module. From the command line, `mg areas
 --static-placeables` and `--dynamic-placeables` do the same.
@@ -1234,16 +1485,39 @@ open tilesets too, and closing one with unsaved changes asks first.
   number, so they need nothing; when the file is saved, the palette
   beside it (`<tileset>palstd.itp`) follows the names changed since the
   last save, the rest of it as it was.
+- **Painting Rules:** the primary and secondary rules. A primary rule is
+  what the terrain brush changes beside the corners it paints: painting
+  a corner *Placed* (at its height) beside one *Adjacent* (at its
+  height) turns that one into *Changed* (at its height). The secondary
+  rules are kept and edited as the file has them (Moonglow's brush
+  follows the primary ones). Each terrain is chosen from
+  the tileset's and each height typed. **Add Rule** adds one at the end
+  (every terrain the first, at height 0) and **Remove Last Rule** takes
+  the last away, the list's count following.
 - **Tiles:** every tile with its corners and edges; **Find** by model or
   terrain. Per tile: model, walkmesh, minimap picture, path node,
-  orientation, corner terrains and heights, edge crossers, lights and
-  animation loops. **Add Tile** and **Duplicate Tile** add at the end, and
+  orientation, corner terrains and heights, edge crossers, lights,
+  animation loops and its **Doors**: the hooks a door placed on the tile
+  stands at (`[TILEnDOORm]`), each with its `doortypes.2da` row (its
+  label beside it, from the game data), where it stands on the tile (X,
+  Y, Z, in meters) and how it is turned (degrees). **Add Door** adds
+  one at the tile's middle and **Remove Last Door** takes the last away,
+  the tile's `Doors` count following (a count that is no count, as some
+  custom tilesets have, becomes the doors there are). **Add Tile** and **Duplicate Tile** add at the end, and
   **Remove Last Tile** takes the last away: areas store tiles by number,
   so tiles in the middle stay where they are. **Preview** shows the
   model when the game data has it, and under the tile's fields are the
   textures its model draws: each one's picture, file, where in the load
   order it comes from, what draws it and the missing ones marked
   ([A tile's textures](#a-tiles-textures)).
+  A **hole** (a tile the file has no `[TILEn]` section for, or one
+  without `Model=`, as an old tileset merged by hand may have) is
+  listed as one, in orange, and said over its fields: the game draws it
+  as nothing, with no walkmesh, and painting never chooses it; a model
+  typed into it fills it in. A tile chosen from elsewhere (Add Tile)
+  is scrolled into sight in the list. The Terrains and Crossers and
+  Painting Rules pages name the sections their lists lack, which the
+  game leaves out.
 - **Groups:** each group's name, size and tiles, the bottom row first.
 
 The toolbar also has:

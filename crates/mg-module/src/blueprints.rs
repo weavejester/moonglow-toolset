@@ -48,9 +48,9 @@ pub fn resref_named(name: &str, naming: &Naming, taken: impl Fn(&ResRef) -> bool
         }
     }
     let stem = if compact.is_empty() { "blueprint".to_string() } else { compact };
-    (1..)
-        .map(|n| make(stem.trim_end_matches(|c: char| c.is_ascii_digit()), &format!("{n:03}")))
-        .find(|r| !taken(r))
+    let in_use = |s: &str| ResRef::from_str(s).is_ok_and(|r| taken(&r));
+    naming
+        .numbered(stem.trim_end_matches(|c: char| c.is_ascii_digit()), 1, &in_use)
         .expect("a free resref")
 }
 
@@ -798,8 +798,12 @@ pub fn creature(
         c.remove("ItemList");
     }
     let mut sheet = mg_rules::CreatureSheet::from_gff(&c);
-    let max = game.creature_stats(&sheet).max_hit_points;
-    c.set("MaxHitPoints", Value::Short(max.clamp(0, i32::from(i16::MAX)) as i16));
+    let stats = game.creature_stats(&sheet);
+    let short = |n: i32| Value::Short(n.clamp(0, i32::from(i16::MAX)) as i16);
+    c.set("MaxHitPoints", short(stats.max_hit_points));
+    // (With the Great Constitution feats' too, which the game leaves out
+    // of the hit points it starts the creature with.)
+    c.set("CurrentHitPoints", short(stats.current_hit_points));
     sheet.gear_value = game.gear_value(&c, item);
     c.set("ChallengeRating", Value::Float(game.challenge(&sheet).rating));
     g.root = c;

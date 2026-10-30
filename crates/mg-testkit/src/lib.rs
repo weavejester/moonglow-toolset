@@ -11,6 +11,7 @@ pub mod erf;
 pub mod gpu;
 #[cfg(feature = "hlsl")]
 pub mod hlsl;
+pub mod joined;
 pub mod places;
 
 use std::collections::BTreeMap;
@@ -153,10 +154,39 @@ pub fn ungrouped_tests(manifest_dir: &str) -> Vec<String> {
         .collect()
 }
 
-/// A fresh, empty scratch directory for a test under `target/test-output/`.
+/// The files of a test binary kept as a folder (`tests/<name>/main.rs`
+/// and a module per file beside it) that its `main.rs` doesn't name as a
+/// module (`mod <file>;`): such a file is not compiled, and its tests
+/// would pass by not running.
+pub fn unlisted_modules(dir: &Path) -> Vec<String> {
+    let main = std::fs::read_to_string(dir.join("main.rs")).unwrap_or_default();
+    let named: std::collections::HashSet<&str> = main
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("mod ")?.strip_suffix(';'))
+        .map(str::trim)
+        .collect();
+    files_with_ext(dir, "rs")
+        .iter()
+        .filter_map(|p| Some(p.file_stem()?.to_str()?.to_string()))
+        .filter(|stem| stem != "main" && !named.contains(stem.as_str()))
+        .collect()
+}
+
+/// Where tests write: `target/test-output/`, or `MOONGLOW_TEST_OUTPUT`
+/// when it is set (a second run of the same tests beside the first, as a
+/// loaded machine is tried: the same folders, emptied by each run's
+/// [`scratch_dir`] under the other's tests, were most of its failures).
+pub fn test_output() -> PathBuf {
+    match env::var_os("MOONGLOW_TEST_OUTPUT") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-output"),
+    }
+}
+
+/// A fresh, empty scratch directory for a test under `target/test-output/`
+/// ([`test_output`]).
 pub fn scratch_dir(name: &str) -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-output");
-    let dir = base.join(name);
+    let dir = test_output().join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir
@@ -180,7 +210,7 @@ pub fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
 /// output that several tests add to (the pictures of `screens.rs`), which
 /// [`scratch_dir`] would empty under them.
 pub fn output_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-output").join(name);
+    let dir = test_output().join(name);
     std::fs::create_dir_all(&dir).expect("create output dir");
     dir
 }
@@ -219,6 +249,21 @@ macro_rules! oracle_tool {
     };
 }
 
+/// A checkout of nwn-mdl-spec (<https://github.com/plenarius/nwn-mdl-spec>:
+/// its probes and the engine's compiles of them, CC0, and its runner):
+/// `$NWN_MDL_SPEC`, else `nwn-mdl-spec` in the oracle's state directory
+/// (`$MOONGLOW_ORACLE`, default `~/.local/share/moonglow-oracle`). Like the
+/// game, it is read where it is and not committed.
+pub fn mdl_spec() -> Option<PathBuf> {
+    let dir = env::var_os("NWN_MDL_SPEC").map(PathBuf::from).or_else(|| {
+        let base = env::var_os("MOONGLOW_ORACLE").map(PathBuf::from).or_else(|| {
+            env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/moonglow-oracle"))
+        })?;
+        Some(base.join("nwn-mdl-spec"))
+    })?;
+    dir.join("runner/mdlconf.py").is_file().then_some(dir)
+}
+
 /// A file captured from Aurora under Wine (`tools/aurora/`), kept in the
 /// oracle's state directory (`$MOONGLOW_ORACLE`, default
 /// `~/.local/share/moonglow-oracle`) under `captures/`.
@@ -254,6 +299,17 @@ mod tests {
         let root = corpus!();
         assert!(mg_resman::GameInstall::is_install(&root));
         assert!(!bundled_modules(&root).is_empty());
+    }
+
+    #[test]
+    fn a_folder_s_files_left_out_of_its_main_are_named() {
+        let d = scratch_dir("mg-testkit-unlisted");
+        let main = "//! A binary.\n\nmod common;\n\n#[cfg(unix)]\nmod listed;\n// mod commented;\n";
+        std::fs::write(d.join("main.rs"), main).unwrap();
+        for f in ["common.rs", "listed.rs", "commented.rs", "left_out.rs", "notes.txt"] {
+            std::fs::write(d.join(f), b"").unwrap();
+        }
+        assert_eq!(unlisted_modules(&d), ["commented", "left_out"]);
     }
 
     #[test]

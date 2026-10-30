@@ -3,7 +3,8 @@
 //! their tag or name: local variables, item properties, creatures'
 //! classes (by level), feats, spells and skills, appearances, the scripts
 //! attached, or any field by its label and value (a number in a range).
-//! Several conditions together find the objects that meet them all.
+//! Several conditions together find the objects that meet them all, or
+//! any of them; and objects that meet a condition can be left out.
 //!
 //! Every GFF resource of the module is walked, lists included (items in
 //! placed creatures' and containers' inventories and equipment, store
@@ -23,7 +24,7 @@ use mg_rules::{Choice, ChoiceColumns, GameData, ItemProperty, ObjectKind};
 use rayon::prelude::*;
 
 use crate::Module;
-use crate::query::glob;
+use crate::query::like;
 use crate::refs::{RefKind, Reference, gff_references};
 pub use crate::vars::VarType;
 
@@ -210,18 +211,66 @@ pub struct Query {
     pub search: Search,
     /// Conditions the objects found must also meet: what `search` finds
     /// is kept where the same object (or one holding it, or one it holds)
-    /// is found by each of these.
+    /// is found by each of these. With `any`, the others it may meet
+    /// instead.
     pub and: Vec<Search>,
+    /// What `search` and each of `and` find, together (each found where
+    /// it is found, an object meeting several once for each), in place of
+    /// what `search` finds where the same object meets them all.
+    pub any: bool,
+    /// Conditions the objects found must not meet: what is found is left
+    /// out where the same object (or one holding it, or one it holds) is
+    /// found by one of these, as `and` would keep it.
+    pub not: Vec<Search>,
     /// The kinds of object looked at (`utc`, `uti`...; `are` for areas,
     /// `ifo` for the module, `dlg` for conversations); empty: all.
     pub types: Vec<ResType>,
     /// Only placed objects (`Some(true)`), only blueprints (`Some(false)`).
     pub placed: Option<bool>,
+    /// Its names and texts (a variable's name and value, a script's
+    /// name, a field's label and text) are regular expressions, found
+    /// anywhere unless anchored (`^…$`), not `*` patterns.
+    pub regex: bool,
 }
 
 impl Query {
     pub fn new(search: Search) -> Query {
-        Query { search, and: Vec::new(), types: Vec::new(), placed: None }
+        Query {
+            search,
+            and: Vec::new(),
+            any: false,
+            not: Vec::new(),
+            types: Vec::new(),
+            placed: None,
+            regex: false,
+        }
+    }
+
+    /// Why one of its regular expressions isn't one (with `regex`).
+    pub fn check(&self) -> Result<(), String> {
+        if !self.regex {
+            return Ok(());
+        }
+        for s in self.searches() {
+            let texts: Vec<&str> = match s {
+                Search::Variable { name, value, .. } => {
+                    std::iter::once(name.as_str()).chain(value.as_deref()).collect()
+                }
+                Search::Script(name) => vec![name],
+                Search::Field { label, value } => {
+                    let text = match value {
+                        Some(FieldValue::Text(t)) => Some(t.as_str()),
+                        _ => None,
+                    };
+                    label.as_deref().into_iter().chain(text).collect()
+                }
+                _ => Vec::new(),
+            };
+            for t in texts {
+                crate::query::check_regex(t)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -244,6 +293,10 @@ pub struct Hit {
     pub object: ResType,
     /// Through a blueprint's inventory, naming the item blueprint found.
     pub carried: Option<ResRef>,
+    /// Through the creatures an encounter spawns (an encounter
+    /// blueprint's, or a placed encounter's), naming the creature
+    /// blueprint found.
+    pub spawned: Option<ResRef>,
 }
 
 impl Hit {
@@ -283,6 +336,22 @@ impl Hit {
         let root = |key: ResKey| Object { key, path: "/".into(), kind: key.restype };
         if let Some(item) = self.carried {
             return vec![root(ResKey::new(item, ResType::UTI)), root(self.key)];
+        }
+        // A creature blueprint an encounter spawns: it, then the encounter
+        // (a placed one's, its area after it).
+        if let Some(creature) = self.spawned {
+            let mut out = vec![root(ResKey::new(creature, ResType::UTC))];
+            match self.key.restype {
+                ResType::GIT => {
+                    let first = self.path.trim_start_matches('/').split('/').next();
+                    let path = format!("/{}", first.unwrap_or_default());
+                    out.push(Object { key: self.key, path, kind: ResType::UTE });
+                    let are = ResKey::new(self.key.resref, ResType::ARE);
+                    out.push(Object { key: are, path: "/".into(), kind: ResType::ARE });
+                }
+                _ => out.push(root(self.key)),
+            }
+            return out;
         }
         let area = || {
             let key = ResKey::new(self.key.resref, ResType::ARE);
@@ -496,27 +565,13 @@ fn shown(v: &Value, cp: Codepage) -> String {
     out
 }
 
-fn integer(v: &Value) -> Option<i64> {
-    Some(match *v {
-        Value::Byte(x) => x.into(),
-        Value::Char(x) => x.into(),
-        Value::Word(x) => x.into(),
-        Value::Short(x) => x.into(),
-        Value::Dword(x) => x.into(),
-        Value::Int(x) => x.into(),
-        Value::Dword64(x) => i64::try_from(x).ok()?,
-        Value::Int64(x) => x,
-        _ => return None,
-    })
-}
-
 /// Whether a number field holds a number in a range: a float compared
 /// at its own precision (the ends made floats too).
 fn in_range(v: &Value, min: Option<f64>, max: Option<f64>) -> bool {
     let (n, single) = match *v {
         Value::Float(x) => (f64::from(x), true),
         Value::Double(x) => (x, false),
-        ref v => match integer(v) {
+        ref v => match v.as_integer() {
             Some(n) => (n as f64, false),
             None => return false,
         },
@@ -525,9 +580,13 @@ fn in_range(v: &Value, min: Option<f64>, max: Option<f64>) -> bool {
     min.is_none_or(|m| n >= end(m)) && max.is_none_or(|m| n <= end(m))
 }
 
-/// Whether `text` contains `pattern`, ignoring case, `*` matching any run.
-fn contains(pattern: &str, text: &str) -> bool {
-    glob(&format!("*{pattern}*"), text)
+/// Whether `text` contains `pattern`, ignoring case, `*` matching any run
+/// (with `regex`, a regular expression found anywhere in it).
+fn contains(pattern: &str, text: &str, regex: bool) -> bool {
+    match regex {
+        true => like(pattern, text, true),
+        false => like(&format!("*{pattern}*"), text, false),
+    }
 }
 
 /// An event's name, for people: `ScriptSpawn` is `OnSpawn`.
@@ -550,7 +609,9 @@ fn field_hit(
     f: &FieldAt<'_>,
     game: Option<&GameData>,
     cp: Codepage,
+    regex: bool,
 ) -> Option<(String, String)> {
+    let glob = |p: &str, t: &str| like(p, t, regex);
     // The path of the struct the field is in.
     let owner = || f.path.rsplit_once('/').map_or("", |(p, _)| p).to_string();
     match search {
@@ -592,7 +653,7 @@ fn field_hit(
         }
         Search::Class(_) | Search::Feat(_) | Search::Spell(_) | Search::Appearance { .. } => {
             let want = search.table()?;
-            let n = integer(f.value)?;
+            let n = f.value.as_integer()?;
             if Some(n) != search.row() {
                 return None;
             }
@@ -620,7 +681,9 @@ fn field_hit(
             Some((f.path.to_string(), format!("{what}: {name}")))
         }
         Search::ClassLevel { class, min, max } => {
-            if f.list != Some("ClassList") || f.label != "Class" || integer(f.value) != Some(*class)
+            if f.list != Some("ClassList")
+                || f.label != "Class"
+                || f.value.as_integer() != Some(*class)
             {
                 return None;
             }
@@ -639,7 +702,7 @@ fn field_hit(
             let at = labels.len().saturating_sub(2);
             let table = list_table(file_type, &labels[..at], "SkillList")?;
             let (_, index) = item(f.path.rsplit('/').nth(1)?)?;
-            let rank = integer(f.value)?;
+            let rank = f.value.as_integer()?;
             let hit = index == *skill && rank >= i64::from((*min_rank).max(1));
             let name = row_name(game, &table, index as i64);
             hit.then(|| (owner(), format!("Skill: {name}, {rank} rank(s)")))
@@ -651,8 +714,10 @@ fn field_hit(
             }
             let hit = match value {
                 None => true,
-                Some(FieldValue::Number(n)) => integer(f.value) == Some(*n),
-                Some(FieldValue::Text(t)) => texts(f.value, cp).iter().any(|s| contains(t, s)),
+                Some(FieldValue::Number(n)) => f.value.as_integer() == Some(*n),
+                Some(FieldValue::Text(t)) => {
+                    texts(f.value, cp).iter().any(|s| contains(t, s, regex))
+                }
                 Some(FieldValue::Range { min, max }) => in_range(f.value, *min, *max),
             };
             if !hit || (label.is_none() && value.is_none()) {
@@ -671,6 +736,7 @@ fn resource_hits(
     searches: &[&Search],
     game: Option<&GameData>,
     cp: Codepage,
+    regex: bool,
 ) -> Vec<Vec<Hit>> {
     let Read { key, gff, refs } = *read;
     let file_type = gff.file_type_str();
@@ -678,7 +744,7 @@ fn resource_hits(
     for (s, found) in searches.iter().zip(&mut found) {
         let Search::Script(pattern) = s else { continue };
         for r in refs {
-            if r.kind == RefKind::Script && glob(pattern, &r.target.to_string()) {
+            if r.kind == RefKind::Script && like(pattern, &r.target.to_string(), regex) {
                 let label = r.path.rsplit('/').next().unwrap_or_default();
                 let script = r.target.to_lowercase();
                 found.push((r.path.clone(), format!("{}: {script}", event(label))));
@@ -688,7 +754,7 @@ fn resource_hits(
     if searches.iter().any(|s| !matches!(s, Search::Script(_))) {
         gff.root.walk_fields(&mut |f| {
             for (s, found) in searches.iter().zip(&mut found) {
-                if let Some(hit) = field_hit(s, &file_type, f, game, cp) {
+                if let Some(hit) = field_hit(s, &file_type, f, game, cp, regex) {
                     found.push(hit);
                 }
             }
@@ -710,6 +776,7 @@ fn resource_hits(
                 matched,
                 object,
                 carried: None,
+                spawned: None,
             });
         }
         out
@@ -727,7 +794,8 @@ fn carrying(s: &Search) -> bool {
 /// Whether what `searches` find in `key` needs its references: the
 /// scripts attached, the items a blueprint carries.
 fn needs_refs(key: ResKey, searches: &[&Search]) -> bool {
-    let blueprint = ObjectKind::from_restype(key.restype).is_some();
+    // (An area's: its encounters' creatures.)
+    let blueprint = ObjectKind::from_restype(key.restype).is_some() || key.restype == ResType::GIT;
     searches.iter().any(|s| matches!(s, Search::Script(_)) || (blueprint && carrying(s)))
 }
 
@@ -757,7 +825,8 @@ struct Read<'a> {
 /// that carry it (but not for a search of fields, which finds fields).
 /// With other conditions, what is found on an object that meets them
 /// all, each one's first match told after its own (`Class: Fighter,
-/// level 5 · Feat: Alertness`). `game` names what is found as the game
+/// level 5 · Feat: Alertness`); with `any`, what each finds; less what
+/// is on an object meeting one of `not`. `game` names what is found as the game
 /// does (else by numbers); `cp` reads the module's text. Each resource
 /// is read once, for all the conditions ([`Kept`] keeps what it found).
 pub fn search(m: &Module, q: &Query, game: Option<&GameData>, cp: Codepage) -> Vec<Hit> {
@@ -776,6 +845,8 @@ pub fn search(m: &Module, q: &Query, game: Option<&GameData>, cp: Codepage) -> V
 pub struct Kept {
     /// The conditions asked.
     searches: Vec<Search>,
+    /// Whether they were asked as regular expressions.
+    regex: bool,
     /// Each GFF resource, as read, and what they found in it (none: it
     /// doesn't read).
     found: HashMap<ResKey, KeptOne>,
@@ -797,8 +868,9 @@ impl Kept {
         cp: Codepage,
     ) -> Vec<Hit> {
         let searches = q.searches();
-        if !self.searches.iter().eq(searches.iter().copied()) {
+        if !self.searches.iter().eq(searches.iter().copied()) || self.regex != q.regex {
             self.searches = searches.iter().map(|s| (*s).clone()).collect();
+            self.regex = q.regex;
             self.found.clear();
         }
         self.found.retain(|k, _| m.contains(k));
@@ -827,7 +899,8 @@ impl Kept {
                         true => gff_references(key, &gff),
                         false => Vec::new(),
                     };
-                    Found::of(&Read { key, gff: &gff, refs: &refs }, &searches, game, cp)
+                    let read = Read { key, gff: &gff, refs: &refs };
+                    Found::of(&read, &searches, game, cp, q.regex)
                 });
                 (key, (data.clone(), found))
             })
@@ -843,13 +916,72 @@ impl Kept {
 /// What the query finds, from what each resource holds (`found`, in the
 /// order of their keys).
 fn joined(found: &[(ResKey, &Found)], q: &Query) -> Vec<Hit> {
-    let mut hits = condition_hits(found, 0, &q.search);
-    for (c, extra) in q.and.iter().enumerate() {
-        // The objects it finds things on, and those holding them.
-        let theirs = condition_hits(found, c + 1, extra);
+    let mut hits = match q.any {
+        false => {
+            let mut hits = condition_hits(found, 0, &q.search);
+            for (c, extra) in q.and.iter().enumerate() {
+                let theirs = condition_hits(found, c + 1, extra);
+                let near = Near::of(&theirs);
+                hits.retain_mut(|h| {
+                    let also = near.meets(h);
+                    if let Some(text) = also {
+                        h.matched = format!("{} · {text}", h.matched);
+                    }
+                    also.is_some()
+                });
+            }
+            hits
+        }
+        true => any_of(found, q),
+    };
+    for (c, not) in q.not.iter().enumerate() {
+        let theirs = condition_hits(found, 1 + q.and.len() + c, not);
+        let near = Near::of(&theirs);
+        hits.retain(|h| near.meets(h).is_none());
+    }
+    hits.retain(|h| wanted(q, h));
+    hits
+}
+
+/// What each of the query's first conditions (`search` and `and`) finds,
+/// together, resource by resource (each one's in its turn); a place two
+/// of them find once, telling what each found (`Feat: Alertness · Class:
+/// Fighter, level 5`).
+fn any_of(found: &[(ResKey, &Found)], q: &Query) -> Vec<Hit> {
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut at: HashMap<(ResKey, String, Option<ResRef>, Option<ResRef>), usize> = HashMap::new();
+    for (c, s) in std::iter::once(&q.search).chain(&q.and).enumerate() {
+        for h in condition_hits(found, c, s) {
+            let place = (h.key, h.path.clone(), h.carried, h.spawned);
+            match at.get(&place) {
+                Some(&i) if !hits[i].matched.split(" · ").any(|m| m == h.matched) => {
+                    hits[i].matched = format!("{} · {}", hits[i].matched, h.matched);
+                }
+                Some(_) => {}
+                None => {
+                    at.insert(place, hits.len());
+                    hits.push(h);
+                }
+            }
+        }
+    }
+    // (Stable: within a resource, each condition's in the order found.)
+    hits.sort_by_key(|h| h.key);
+    hits
+}
+
+/// The objects a condition finds things on, and those holding them, each
+/// with what it first found there.
+struct Near<'a> {
+    own: HashMap<Object, &'a str>,
+    held: HashMap<Object, &'a str>,
+}
+
+impl<'a> Near<'a> {
+    fn of(theirs: &'a [Hit]) -> Near<'a> {
         let mut own: HashMap<Object, &str> = HashMap::new();
         let mut held: HashMap<Object, &str> = HashMap::new();
-        for h in &theirs {
+        for h in theirs {
             let objects = h.objects();
             if let Some(o) = objects.first() {
                 own.entry(o.clone()).or_insert(&h.matched);
@@ -858,52 +990,68 @@ fn joined(found: &[(ResKey, &Found)], q: &Query) -> Vec<Hit> {
                 held.entry(o).or_insert(&h.matched);
             }
         }
-        // The same object, one holding what it is found on, or one held
-        // by it.
-        hits.retain_mut(|h| {
-            let objects = h.objects();
-            let first = objects.first().and_then(|o| held.get(o)).copied();
-            let also = first.or_else(|| objects.iter().find_map(|o| own.get(o).copied()));
-            if let Some(text) = also {
-                h.matched = format!("{} · {text}", h.matched);
-            }
-            also.is_some()
-        });
+        Near { own, held }
     }
-    hits.retain(|h| wanted(q, h));
-    hits
+
+    /// What the condition found on the object `h` is on, on one it holds,
+    /// or on one holding it.
+    fn meets(&self, h: &Hit) -> Option<&'a str> {
+        let objects = h.objects();
+        let first = objects.first().and_then(|o| self.held.get(o)).copied();
+        first.or_else(|| objects.iter().find_map(|o| self.own.get(o).copied()))
+    }
 }
 
 impl Query {
-    /// Its searches: the first, then the others with it.
+    /// Its searches: the first, the others with it, then those it must
+    /// not meet.
     fn searches(&self) -> Vec<&Search> {
-        std::iter::once(&self.search).chain(&self.and).collect()
+        std::iter::once(&self.search).chain(&self.and).chain(&self.not).collect()
     }
 }
 
-/// What one resource holds for a query: each search's hits, and (a
-/// blueprint's) the item blueprints its inventory names, where.
+/// What one resource holds for a query: each search's hits, (a
+/// blueprint's) the item blueprints its inventory names, and (an
+/// encounter blueprint's, an area's encounters') the creature blueprints
+/// they spawn, where.
 #[derive(Debug)]
 struct Found {
     hits: Vec<Vec<Hit>>,
     /// (path, item blueprint, place).
     carries: Vec<(String, ResRef, String)>,
+    /// (path, creature blueprint, place).
+    spawns: Vec<(String, ResRef, String)>,
 }
 
 impl Found {
-    fn of(read: &Read<'_>, searches: &[&Search], game: Option<&GameData>, cp: Codepage) -> Found {
-        let hits = resource_hits(read, searches, game, cp);
+    fn of(
+        read: &Read<'_>,
+        searches: &[&Search],
+        game: Option<&GameData>,
+        cp: Codepage,
+        regex: bool,
+    ) -> Found {
+        let hits = resource_hits(read, searches, game, cp, regex);
         let key = read.key;
-        let mut carries = Vec::new();
-        if ObjectKind::from_restype(key.restype).is_some() && searches.iter().any(|s| carrying(s)) {
+        let (mut carries, mut spawns) = (Vec::new(), Vec::new());
+        if searches.iter().any(|s| carrying(s)) {
+            let blueprint = ObjectKind::from_restype(key.restype).is_some();
+            let encounters = matches!(key.restype, ResType::UTE | ResType::GIT);
             for r in read.refs {
-                if r.kind == RefKind::Blueprint(ResType::UTI) {
-                    let place = format!("{key} › carries {}.uti", r.target.to_lowercase());
+                let target = r.target.to_lowercase();
+                if blueprint && r.kind == RefKind::Blueprint(ResType::UTI) {
+                    let place = format!("{key} › carries {target}.uti");
                     carries.push((r.path.clone(), r.target, place));
+                } else if encounters
+                    && r.kind == RefKind::Blueprint(ResType::UTC)
+                    && spawned_at(key.restype, &r.path)
+                {
+                    let at = place(key, read.gff, &r.path, cp);
+                    spawns.push((r.path.clone(), r.target, format!("{at} › spawns {target}.utc")));
                 }
             }
         }
-        Found { hits, carries }
+        Found { hits, carries, spawns }
     }
 }
 
@@ -921,23 +1069,108 @@ fn condition_hits(found: &[(ResKey, &Found)], c: usize, s: &Search) -> Vec<Hit> 
                 (k.resref, direct.map(|h| h.matched.clone()).collect())
             })
             .collect();
+        // What each item blueprint carries (a bag's), to follow a found
+        // one down through bags in bags.
+        let bags: HashMap<ResRef, &[(String, ResRef, String)]> = (found.iter())
+            .filter(|(k, f)| k.restype == ResType::UTI && !f.carries.is_empty())
+            .map(|(k, f)| (k.resref, f.carries.as_slice()))
+            .collect();
         for ((key, f), hits) in found.iter().zip(&mut by_key) {
             for (path, target, place) in &f.carries {
-                let Some(matched) = items.get(target) else { continue };
+                let own = (key.restype == ResType::UTI).then_some(key.resref);
+                for (item, through) in carried_found(*target, own, &items, &bags) {
+                    let place = format!("{place}{through}");
+                    for m in &items[&item] {
+                        hits.push(Hit {
+                            key: *key,
+                            path: path.clone(),
+                            place: place.clone(),
+                            matched: m.clone(),
+                            object: ResType::UTI,
+                            carried: Some(item),
+                            spawned: None,
+                        });
+                    }
+                }
+            }
+        }
+        // The creature blueprints found, in the encounters that spawn them.
+        let creatures: HashMap<ResRef, Vec<String>> = (found.iter().zip(&by_key))
+            .filter(|((k, _), h)| k.restype == ResType::UTC && !h.is_empty())
+            .map(|((k, _), h)| {
+                let direct = h.iter().filter(|h| h.carried.is_none() && h.object == ResType::UTC);
+                (k.resref, direct.map(|h| h.matched.clone()).collect())
+            })
+            .collect();
+        for ((key, f), hits) in found.iter().zip(&mut by_key) {
+            for (path, target, place) in &f.spawns {
+                let Some(matched) = creatures.get(target) else { continue };
                 for m in matched {
                     hits.push(Hit {
                         key: *key,
                         path: path.clone(),
                         place: place.clone(),
                         matched: m.clone(),
-                        object: ResType::UTI,
-                        carried: Some(*target),
+                        object: ResType::UTC,
+                        carried: None,
+                        spawned: Some(*target),
                     });
                 }
             }
         }
     }
     by_key.into_iter().flatten().collect()
+}
+
+/// Whether a creature blueprint named at `path` of a resource of type
+/// `restype` is one an encounter spawns: in an encounter blueprint's
+/// `CreatureList`, or a placed encounter's (not a placed creature's
+/// `TemplateResRef`).
+fn spawned_at(restype: ResType, path: &str) -> bool {
+    let steps: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let listed = |s: &str| item(s).is_some_and(|(l, _)| l == "CreatureList");
+    match (restype, steps.as_slice()) {
+        (ResType::UTE, [list, ..]) => listed(list),
+        (ResType::GIT, [placed, list, ..]) => {
+            item(placed).is_some_and(|(l, _)| l == "Encounter List") && listed(list)
+        }
+        _ => false,
+    }
+}
+
+/// How many bags in bags a found item blueprint is followed up through.
+const BAGS_DEEP: usize = 8;
+
+/// The item blueprints found (`items`) that carrying `target` carries: it,
+/// if it was found, and those found in what it carries as a bag
+/// (`bags`), down to [`BAGS_DEEP`] bags, each once and not back into the
+/// carrier (`own`, an item blueprint's); with each, the rest of its place
+/// (` › carries sword.uti`, for one in a bag).
+fn carried_found(
+    target: ResRef,
+    own: Option<ResRef>,
+    items: &HashMap<ResRef, Vec<String>>,
+    bags: &HashMap<ResRef, &[(String, ResRef, String)]>,
+) -> Vec<(ResRef, String)> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<ResRef> = own.into_iter().collect();
+    let mut walk = vec![(target, String::new())];
+    while let Some((at, through)) = walk.pop() {
+        if !seen.insert(at) {
+            continue;
+        }
+        if items.contains_key(&at) {
+            out.push((at, through.clone()));
+        }
+        if through.matches(" › ").count() >= BAGS_DEEP {
+            continue;
+        }
+        for (_, inner, _) in bags.get(&at).copied().unwrap_or_default().iter().rev() {
+            let step = format!("{through} › carries {}.uti", inner.to_lowercase());
+            walk.push((*inner, step));
+        }
+    }
+    out
 }
 
 /// The choices of a table, named as the game names them: a talk-table
@@ -1184,6 +1417,41 @@ mod tests {
         assert_eq!(search(&m, &blueprints, None, Codepage::WINDOWS_1252).len(), 2);
     }
 
+    /// With `regex`, a name or text is a regular expression, found
+    /// anywhere unless anchored; one that isn't is said by `check`, and a
+    /// search asked again as one is read again (`Kept`).
+    #[test]
+    fn names_and_texts_by_a_regular_expression() {
+        let m = module();
+        let regex = |s: Search| Query { regex: true, ..Query::new(s) };
+        let v = |name: &str, value: Option<&str>| Search::Variable {
+            name: name.into(),
+            kind: None,
+            value: value.map(str::to_string),
+        };
+        let all = |q: &Query| search(&m, q, None, Codepage::WINDOWS_1252);
+        assert_eq!(all(&regex(v("deidad", None))).len(), 5, "anywhere in the name");
+        let exact = all(&Query::new(v("sdeidad", None)));
+        assert_eq!(all(&regex(v("^sdeidad$", None))), exact, "case ignored, as a pattern does");
+        assert!(all(&regex(v("^deidad", None))).is_empty());
+        assert_eq!(all(&regex(v("deidad", Some("^(ezra|103)$")))).len(), 3);
+        // As a * pattern, the same text finds nothing.
+        assert!(all(&Query::new(v("^sdeidad$", None))).is_empty());
+        let text = Search::Field { label: None, value: Some(FieldValue::Text("ez.a".into())) };
+        assert!(!all(&regex(text.clone())).is_empty());
+        assert!(all(&Query::new(text)).is_empty());
+        // Not one: said.
+        let bad = regex(v("dei(dad", None));
+        assert!(bad.check().unwrap_err().contains("dei(dad"));
+        assert!(Query::new(v("dei(dad", None)).check().is_ok());
+        // Kept: asked as a pattern, then as an expression, read again.
+        let mut kept = Kept::default();
+        let q = Query::new(v("^sdeidad$", None));
+        assert!(kept.search(&m, &q, None, Codepage::WINDOWS_1252).is_empty());
+        let q = Query { regex: true, ..q };
+        assert_eq!(kept.search(&m, &q, None, Codepage::WINDOWS_1252), exact);
+    }
+
     #[test]
     fn item_properties_by_type_subtype_and_value() {
         let m = module();
@@ -1349,6 +1617,193 @@ mod tests {
         );
         assert_eq!(places(&value("1.5")), [("keep (area)", "Value = 1.5")]);
         assert_eq!(value("100..").len(), 1, "the guard's 103");
+    }
+
+    /// Conditions any of which is met, and conditions left out: a NOT
+    /// leaves out exactly what an AND of it keeps, by the same objects
+    /// (the same, one holding it, one held by it).
+    #[test]
+    fn any_of_the_conditions_and_those_not_met() {
+        let m = module();
+        let ask = |first: Search, and: Vec<Search>, any: bool, not: Vec<Search>| {
+            let q = Query { and, any, not, ..Query::new(first) };
+            search(&m, &q, None, Codepage::WINDOWS_1252)
+        };
+        let and = |first: Search, also: Search| ask(first, vec![also], false, Vec::new());
+        let not = |first: Search, out: Search| ask(first, Vec::new(), false, vec![out]);
+        let var = |name: &str| Search::Variable { name: name.into(), kind: None, value: None };
+        let bonus = Search::ItemProperty { property: 52, subtype: None, value: None, param: None };
+        let chest = Search::Appearance { of: AppearanceOf::Placeable, row: 103 };
+
+        // Fighters without the variable: the blueprint, not the placed
+        // guard who has it; with a feat they all have, none.
+        assert_eq!(
+            places(&not(Search::Class(4), var("sdeidad"))),
+            [("guard.utc", "Class: row 4, level 5")]
+        );
+        assert!(not(Search::Class(4), Search::Feat(0)).is_empty());
+        // An object holding what the condition finds is left out too (the
+        // guard holds an item with the variable), and one held by it (the
+        // item a fighter holds), and a blueprint carrying an item found
+        // (the chest carries the sword).
+        assert_eq!(
+            places(&not(Search::Feat(0), var("nDeidadBonus")))[..],
+            [("guard.utc", "Feat: row 0")]
+        );
+        assert_eq!(
+            places(&not(bonus.clone(), Search::Class(4))),
+            [
+                ("chest.utp › carries sword.uti", "Property 52 (subtype 3, value 5)"),
+                ("sword.uti", "Property 52 (subtype 3, value 5)"),
+            ]
+        );
+        assert_eq!(and(chest.clone(), bonus.clone()).len(), 1);
+        assert!(not(chest, bonus.clone()).is_empty());
+        // What a NOT leaves is what its AND doesn't keep.
+        for (first, other) in [
+            (Search::Class(4), var("*deidad*")),
+            (bonus.clone(), Search::Class(4)),
+            (var("*"), Search::Feat(0)),
+            (Search::Field { label: Some("Tag".into()), value: None }, var("AREA_*")),
+        ] {
+            let all = find(&m, first.clone()).len();
+            let kept = and(first.clone(), other.clone()).len();
+            assert_eq!(kept + not(first, other).len(), all);
+        }
+
+        // Any of them: each one's, resource by resource.
+        let either = ask(Search::Class(4), vec![var("AREA_*")], true, Vec::new());
+        assert_eq!(
+            places(&either),
+            [
+                ("guard.utc", "Class: row 4, level 5"),
+                ("keep (area)", "AREA_DEIDAD (float) = 1.5"),
+                ("keep › creature GUARD_01", "Class: row 4, level 5"),
+            ]
+        );
+        // A place two of them find, once, telling each (a text both find
+        // once).
+        let both = ask(var("sdeidad"), vec![var("*deidad"), var("x")], true, Vec::new());
+        assert_eq!(places(&both), places(&find(&m, var("*deidad"))));
+        let typed = Search::Variable { name: "s*".into(), kind: Some(VarType::Int), value: None };
+        let both = ask(typed, vec![var("sdeidad")], true, Vec::new());
+        let guard = both.iter().find(|h| h.place == "keep › creature GUARD_01").unwrap();
+        assert_eq!(guard.matched, "sdeidad (int) = 103", "told once");
+        assert_eq!(both.len(), 3, "the sword, the chest carrying it, the guard");
+        // Any of them, less what is in an area or on a creature with the
+        // variable.
+        let some = ask(Search::Class(4), vec![var("AREA_*")], true, vec![var("sdeidad")]);
+        assert_eq!(places(&some), [("guard.utc", "Class: row 4, level 5")]);
+        // Kept to what is looked at, as ever.
+        let q = Query {
+            and: vec![var("AREA_*")],
+            any: true,
+            placed: Some(true),
+            ..Query::new(Search::Class(4))
+        };
+        assert_eq!(search(&m, &q, None, Codepage::WINDOWS_1252).len(), 1);
+        // A regular expression in a condition left out is checked too.
+        let q = Query { regex: true, not: vec![var("(")], ..Query::new(Search::Class(4)) };
+        assert!(q.check().is_err());
+    }
+
+    /// An item blueprint found is followed up through bags in bags: a crate
+    /// holding a bag that holds the sword lists it, its place said step by
+    /// step; a bag holding itself (or a ring of bags) is walked once.
+    #[test]
+    fn a_found_item_is_followed_through_bags_in_bags() {
+        let mut m = module();
+        let holding = |what: &[&str]| {
+            let held = |r: &&str| {
+                let mut s = Struct::new(0);
+                s.set("InventoryRes", Value::resref(rr(r)));
+                s
+            };
+            Value::List(what.iter().map(held).collect())
+        };
+        let mut bag = Gff::new(*b"UTI ");
+        bag.root = item("BAG", Vec::new(), Vec::new());
+        bag.root.set("ItemList", holding(&["sword", "pouch"]));
+        m.set_gff(ResKey::parse("bag", ResType::UTI).unwrap(), &bag).unwrap();
+        let mut pouch = Gff::new(*b"UTI ");
+        pouch.root = item("POUCH", Vec::new(), Vec::new());
+        pouch.root.set("ItemList", holding(&["bag"]));
+        m.set_gff(ResKey::parse("pouch", ResType::UTI).unwrap(), &pouch).unwrap();
+        let mut crate_ = Gff::new(*b"UTP ");
+        crate_.root.set("Tag", Value::String(b"CRATE".to_vec()));
+        crate_.root.set("ItemList", holding(&["pouch"]));
+        m.set_gff(ResKey::parse("crate", ResType::UTP).unwrap(), &crate_).unwrap();
+        let v = Search::Variable { name: "sDeidad".into(), kind: None, value: None };
+        let hits = find(&m, v);
+        let ezra = "sDeidad (string) = \"Ezra\"";
+        assert_eq!(
+            places(&hits),
+            [
+                ("bag.uti › carries sword.uti", ezra),
+                ("chest.utp › carries sword.uti", ezra),
+                ("crate.utp › carries pouch.uti › carries bag.uti › carries sword.uti", ezra),
+                ("keep › creature GUARD_01", "sdeidad (int) = 103"),
+                ("pouch.uti › carries bag.uti › carries sword.uti", ezra),
+                ("sword.uti", ezra),
+            ]
+        );
+        // What is found is the sword, held by the crate.
+        let crate_hit = &hits[2];
+        assert_eq!(crate_hit.carried, Some(rr("sword")));
+        assert_eq!(crate_hit.path, "/ItemList[0]/InventoryRes", "where the crate names the pouch");
+        let objects: Vec<String> = crate_hit.objects().iter().map(|o| o.key.to_string()).collect();
+        assert_eq!(objects, ["sword.uti", "crate.utp"]);
+    }
+
+    /// A creature blueprint found is followed into the encounters that
+    /// spawn it: an encounter blueprint's creatures, and a placed
+    /// encounter's (named as placed, its area after it).
+    #[test]
+    fn a_found_creature_is_followed_into_the_encounters_that_spawn_it() {
+        let mut m = Module::new();
+        let mut utc = Gff::new(*b"UTC ");
+        utc.root = creature("BOSS");
+        utc.root.set("VarTable", Value::List(vec![var("MG_BOSS", Value::Int(1))]));
+        m.set_gff(ResKey::parse("boss", ResType::UTC).unwrap(), &utc).unwrap();
+        let spawning = |what: &str| {
+            let mut c = Struct::new(0);
+            c.set("ResRef", Value::resref(rr(what)));
+            Value::List(vec![c])
+        };
+        let mut ute = Gff::new(*b"UTE ");
+        ute.root.set("Tag", Value::String(b"CAMP".to_vec()));
+        ute.root.set("CreatureList", spawning("boss"));
+        m.set_gff(ResKey::parse("camp", ResType::UTE).unwrap(), &ute).unwrap();
+        let mut other = Gff::new(*b"UTE ");
+        other.root.set("CreatureList", spawning("rat"));
+        m.set_gff(ResKey::parse("rats", ResType::UTE).unwrap(), &other).unwrap();
+        let mut git = Gff::new(*b"GIT ");
+        let mut placed = Struct::new(7);
+        placed.set("Tag", Value::String(b"CAMP_01".to_vec()));
+        placed.set("CreatureList", spawning("boss"));
+        git.root.set("Encounter List", Value::List(vec![placed]));
+        m.set_gff(ResKey::parse("keep", ResType::GIT).unwrap(), &git).unwrap();
+        let v = Search::Variable { name: "MG_BOSS".into(), kind: None, value: None };
+        let hits = find(&m, v);
+        let boss = "MG_BOSS (int) = 1";
+        assert_eq!(
+            places(&hits),
+            [
+                ("boss.utc", boss),
+                ("camp.ute › spawns boss.utc", boss),
+                ("keep › encounter CAMP_01 › spawns boss.utc", boss),
+            ]
+        );
+        assert_eq!(hits[1].spawned, Some(rr("boss")));
+        assert_eq!(hits[1].object, ResType::UTC);
+        let objects = |h: &Hit| {
+            h.objects().into_iter().map(|o| format!("{} {}", o.key, o.path)).collect::<Vec<_>>()
+        };
+        assert_eq!(objects(&hits[1]), ["boss.utc /", "camp.ute /"]);
+        assert_eq!(objects(&hits[2]), ["boss.utc /", "keep.git /Encounter List[0]", "keep.are /"]);
+        // Not for a search of fields, which finds fields.
+        let tag = Search::Field { label: Some("Tag".into()), value: None };
+        assert!(find(&m, tag).iter().all(|h| h.spawned.is_none()));
     }
 
     #[test]

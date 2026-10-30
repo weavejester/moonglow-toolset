@@ -35,7 +35,7 @@ fn conversation_editor_builds_and_links() {
     app.settings.dialog_no_text_popup = true;
     app.open_module(&path);
     app.new_dialog = Some("capdlg".into());
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.get_by_label("Create").click();
     h.run();
@@ -233,7 +233,7 @@ fn the_conversation_editor_s_text_has_its_own_size() {
     let mut app = app_with(Vec::new());
     app.open_module(&path);
     app.actions.push(mg_ui::Action::OpenTab(Tab::Dialog(key)));
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let heights = |h: &Harness<'_, Moonglow>| {
         let line = h.get_by_label_contains("Hello there.").rect().height();
@@ -266,7 +266,7 @@ fn conversation_search_bookmarks_and_test() {
     let mut app = app_with(Vec::new());
     app.open_module(&path);
     app.actions.push(mg_ui::Action::OpenTab(Tab::Dialog(key)));
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let click = |h: &mut Harness<'_, Moonglow>, label: &str| {
         h.get_by_label(label).click();
@@ -293,6 +293,17 @@ fn conversation_search_bookmarks_and_test() {
     click(&mut h, "Find");
     let results = h.state().dialog_views[&key].search.results.clone();
     assert_eq!(results.len(), 1);
+    // Match Case, ticked in the pane, is what Find and Replace All go by
+    // (the script editor's options): "Traveller" finds nothing with it.
+    h.state_mut().dialog_views.get_mut(&key).unwrap().search.find = "Traveller".into();
+    click(&mut h, "Match Case");
+    assert!(h.state().dialog_views[&key].search.options.match_case);
+    click(&mut h, "Find");
+    assert!(h.state().dialog_views[&key].search.results.is_empty(), "Match Case");
+    click(&mut h, "Match Case");
+    click(&mut h, "Find");
+    let results = h.state().dialog_views[&key].search.results.clone();
+    assert_eq!(results.len(), 1, "case set aside");
     click(&mut h, &format!("Entry {}: A traveller.", results[0].2));
     let selected = h.state().dialog_views[&key].selected.unwrap();
     assert_eq!(selected.parent, Parent::Node(Kind::Reply, who));
@@ -391,8 +402,7 @@ fn add_popup_text_gives_a_placeable_a_one_line_conversation() {
         eprintln!("skipped: no game install");
         return;
     };
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut rng = fastrand::Rng::with_seed(6);
     let mut m = new_module(&game, "Barrel", &mut rng).unwrap();
     let spec = AreaSpec {
@@ -415,7 +425,7 @@ fn add_popup_text_gives_a_placeable_a_one_line_conversation() {
     let path = mg_testkit::scratch_dir("ui-popup-text").join("barrel.mod");
     m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
 
-    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    let mut app = game_app(&root, None);
     app.open_module(&path);
     app.popup_text = Some(mg_ui::store_wizard::PopupText {
         area,
@@ -423,7 +433,7 @@ fn add_popup_text_gives_a_placeable_a_one_line_conversation() {
         text: "Just an old barrel.".into(),
         name: "mg_popup".into(),
     });
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.get_by_label("OK").click();
     h.run();
@@ -451,7 +461,7 @@ fn conversation_lines_without_speaker_names_when_chosen() {
     app.settings.dialog_hide_names = true; // Options › Conversation Editor
     app.open_module(&path);
     app.actions.push(mg_ui::Action::OpenTab(Tab::Dialog(key)));
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.get_by_label("Hello there");
     assert!(h.query_by_label("[OWNER] - Hello there").is_none());
@@ -538,14 +548,21 @@ fn conversations_export_and_import() {
     app.actions.push(mg_ui::Action::OpenTab(Tab::Dialog(key)));
     let mut h = harness(app, 1100.0, 800.0);
     h.run();
+    // Options › Language French (this test thread's): the CSV has a
+    // column for it, to be translated into.
+    mg_ui::set_edit_language(mg_core::Language::FRENCH);
     for format in ["Twine (Twee)…", "CSV…"] {
         h.get_by_label("Export").click();
         h.run();
         h.get_by_label(format).click();
         h.run();
     }
+    mg_ui::set_edit_language(mg_core::Language::ENGLISH);
     assert!(std::fs::read_to_string(&twee).unwrap().contains("[[Sorry.->END]]"));
-    let edited = std::fs::read_to_string(&csv).unwrap().replace("Halt!", "Stop right there!");
+    let exported = std::fs::read_to_string(&csv).unwrap();
+    assert!(exported.starts_with("id,speaker,text,condition,action,parent,comment,text_fr\r\n"));
+    let edited = (exported.replace("Halt!", "Stop right there!"))
+        .replace("start,,\r\n", "start,,Halte-là !\r\n");
     std::fs::write(&csv, edited).unwrap();
     h.state_mut().dialogs = Box::new(NoDialogs { open: vec![csv], ..Default::default() });
     h.get_by_label("Import Lines…").click();
@@ -555,6 +572,10 @@ fn conversations_export_and_import() {
         text(&nodes(&g, Kind::Entry)[0])
     };
     assert_eq!(line(&mut h, key), "Stop right there!");
+    let g = h.state_mut().ws.as_mut().unwrap().doc(&key).unwrap().clone();
+    let french = nodes(&g, Kind::Entry)[0].locstring("Text").unwrap().clone();
+    let french = french.text(mg_core::Language::FRENCH, mg_core::Gender::Male).unwrap();
+    assert_eq!(french, "Halte-là !");
     // An Ink story, as a new conversation named after its file.
     let ink = dir.join("Night Watch.ink");
     std::fs::write(&ink, "-> gate\n=== gate ===\nWho goes there?\n+ [A friend.] -> END\n").unwrap();
@@ -574,8 +595,7 @@ fn speaker_tags_come_from_the_module_s_creatures() {
         eprintln!("skipped: no game install");
         return;
     };
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut rng = fastrand::Rng::with_seed(8);
     let mut m = new_module(&game, "Speakers", &mut rng).unwrap();
     let spec = AreaSpec {
@@ -603,7 +623,7 @@ fn speaker_tags_come_from_the_module_s_creatures() {
     let path = mg_testkit::scratch_dir("ui-speaker-tags").join("speakers.mod");
     m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
 
-    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    let mut app = game_app(&root, None);
     // (The module opens on its Properties, not on an area.)
     app.settings.no_last_area = true;
     app.open_module(&path);
@@ -635,7 +655,7 @@ fn conversation_options_popup_link_directions_drag_and_backup() {
     app.open_module(&path);
     app.conversation_backups = dir.join("backups");
     app.new_dialog = Some("optdlg".into());
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.get_by_label("Create").click();
     h.run();
@@ -1742,4 +1762,40 @@ fn a_letter_typed_in_a_tree_leaves_the_area_camera() {
     h.run_steps(2);
     hold(&mut h, egui::Key::W, "w");
     assert!((target(&h) - start).length() > 0.1, "W moves the view");
+}
+
+/// GitHub issue 18, in the conversation editor: Ctrl+Z with a line's text
+/// typed in is the text's own, not the module's Undo (the conversation's
+/// earlier change stays); the field left, it is the module's again.
+#[test]
+fn undo_in_a_conversation_line_s_text_is_the_text_s() {
+    let (mut h, key) = dialog_from_tree("ui-dialog-undo-in-text", &branching_dialog());
+    // An earlier change of the conversation: Delete on a line.
+    delete_line(&mut h, key, "Bye. [END DIALOGUE]", 0, DeleteBy::Key);
+    let earlier = dialog_lines(&mut h, key);
+    assert_eq!(earlier.len(), 6);
+    h.get_by_label("[OWNER] - Go away.").click();
+    h.run();
+    let text = egui::accesskit::Role::MultilineTextInput;
+    h.get_all_by_role(text).next().unwrap().click();
+    h.run();
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text(" Now".into()));
+    h.run_steps(2);
+    assert!(h.ctx.egui_wants_keyboard_input());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Y);
+    h.run_steps(2);
+    let lines = dialog_lines(&mut h, key);
+    assert_eq!(lines.len(), 6, "the delete is not undone: {lines:?}");
+    // The field left: Ctrl+Z is the module's, back past the delete.
+    h.get_by_label("Root").click();
+    h.run_steps(2);
+    assert!(!h.ctx.egui_wants_keyboard_input());
+    for _ in 0..3 {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        h.run_steps(2);
+    }
+    assert_eq!(dialog_lines(&mut h, key), BRANCHING, "the module's undo, down to the delete");
 }

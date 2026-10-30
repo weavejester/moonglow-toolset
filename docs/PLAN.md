@@ -3,7 +3,7 @@ type: Reference
 title: 'Moonglow Toolset: Architecture and Record of the Phases'
 description: What Moonglow Toolset reproduces of Aurora, the landscape, its principles, crate architecture and key designs, a record of the phases it was built in with the tests that hold each, the testing strategy and licensing. The plan it began as, kept as the description of what was built.
 tags: [architecture, testing, parity, phases, plan]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T04:48:31Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T13:45:00Z }
 ---
 
 # Moonglow Toolset: Architecture and Record of the Phases
@@ -153,7 +153,7 @@ in this list (test code may also use `mg-testkit`). All of these exist.
 | `mg-plugin` | plugins: manifests, and a sandboxed Luau runtime in which a plugin's commands and checks read a module and hand back edits and findings (the API in `docs/manual/17-plugin-api.md`; the decisions in `docs/plugin-proposal.md`) |
 | `mg-serve` | the game's headless server run on a module: private unless asked, a user directory of the caller's, its log followed, its console on a pipe (`mg serve`, `mg test`, the engine tests) |
 | `mg-render` | renderer: scene, materials and maps, EE lighting (matched to the client), offscreen mode, animation, skinning, animated and dangly meshes, particles |
-| `mg-preview` | blueprint previews: part-based and single-model creatures with equipment, wings and tails, PLT colors; items; placeables; doors (the renderer's half, `compose`, is the default feature `render`: without it, no mg-render) |
+| `mg-preview` | blueprint previews: part-based and single-model creatures with equipment, wings and tails, PLT colors; items; placeables; doors (the renderer's half, `compose`, is the default feature `render`: without it, no mg-render); what a module uses of its haks, the walk from its resources (`usage`, the feature `usage`: it reads modules, with mg-module and mg-ssf; `mg` and the window turn it on, the viewer leaves it off) |
 | `mg-area` | areas as the area editor shows them: tiles with their lights and animation loops, placed objects with their previews and outlines, sun, moon and fog; the renderer's scene of an area; picking, arranging, reshaping and the walkmesh |
 | `mg-ui` | egui widgets and editors |
 | `apps/mg` | the command line: 44 commands (`mg --help`; the manual's `11-command-line.md`), each able to answer in JSON; `mg nui render` and `mg nui layout` (mg-ui, wgpu) are the default feature `nui-preview`, and the rest builds without the GPU stack |
@@ -228,7 +228,9 @@ maps, fog, skyboxes, emitters and water; and an area's grass, which Aurora
 draws none of, grown on the tiles' walkmeshes as the game grows it and
 drawn wherever the view shows grass ground (the client draws it within 30 m
 of its camera by default), thinned far off (`mg_area::grass_view`); and the sun's and moon's shadows,
-a shadow map standing in for the game's stencil volumes, laid as its shadow
+a shadow map standing in for the game's stencil volumes (Shadows quality
+Fast, the default) or the stencil volumes themselves (High:
+`mg_render::volume`), laid as its shadow
 plane lays them (`mg_render::shadow`; what is left of them is on the
 [deferred list](deferred.md)). Editor overlays (grid, selection, trigger
 polygons, walkmeshes) are drawn over the scene. Toggles like Aurora's "use area lighting" and day/night stay.
@@ -421,6 +423,19 @@ files run side by side; at most eight servers run at once
 `MG_TEST_GPUS`).
 How this came about, with the timings before and after, is in the
 [test review](test-review.md).
+
+**CI.** `.github/workflows/ci.yml` runs on Linux, Windows and macOS, two
+jobs on each side by side: Lint (`cargo fmt --check` and the three clippy
+commands of `CLAUDE.md`) and Test (`cargo test --workspace --lib --bins
+--tests`, the corpus tests skipping without a game, then the doc tests).
+The tests are built without debug information
+(`CARGO_PROFILE_TEST_DEBUG=0`); the build's `--timings` report is each
+Test job's artifact, to read where the time went (Windows builds every
+unit about 1.8 times as long as Linux, compile and link alike, so its
+Test job is the long pole; `rust-lld` there didn't shorten it). The dependencies' builds are
+cached (rust-cache), saved by `develop` alone: a branch or pull request
+starts from develop's cache and saves none, so a branch that changes
+the dependencies builds the changed ones on each of its runs.
 
 When an oracle tool disagrees with Moonglow, an engine test decides and the
 divergence is recorded (see `CLAUDE.md`). So far: `nwn_twoda` drops `""` 2DA

@@ -27,6 +27,8 @@ pub enum Group {
     Conversation,
     /// In the NUI designer, outside text fields and menus.
     Nui,
+    /// In the module tree or a palette, while it has the keys.
+    Panes,
     /// The enabled plugins' commands (anywhere in the window).
     Plugins,
     /// The open project's commands (`[commands]`, anywhere in the
@@ -42,6 +44,7 @@ impl Group {
             Group::Script => "Script Editor",
             Group::Conversation => "Conversation Editor",
             Group::Nui => "NUI Creator",
+            Group::Panes => "Module Tree and Palettes",
             Group::Plugins => "Plugins",
             Group::Project => "Project Commands",
         }
@@ -124,14 +127,21 @@ pub enum Cmd {
     DialogFindNext,
     /// File › Close.
     Close,
+    /// File › Exit.
+    Exit,
     CloseTab,
     NextTab,
     PreviousTab,
     ReopenTab,
+    MaximizeWindow,
     /// The keys to the next pane (the module tree, the middle, the
     /// palettes), or the one before.
     NextPane,
     PreviousPane,
+    /// The module tree's and the palettes' Expand All and Collapse All,
+    /// while the pane has the keys.
+    ExpandAll,
+    CollapseAll,
     ToggleTree,
     TogglePalettes,
     ToggleLog,
@@ -151,7 +161,7 @@ const SHIFT: Modifiers = Modifiers::SHIFT;
 const NONE: Modifiers = Modifiers::NONE;
 
 impl Cmd {
-    pub const ALL: [Cmd; 75] = [
+    pub const ALL: [Cmd; 79] = [
         Cmd::NewModule,
         Cmd::OpenModule,
         Cmd::Save,
@@ -209,12 +219,16 @@ impl Cmd {
         Cmd::DialogFind,
         Cmd::DialogFindNext,
         Cmd::Close,
+        Cmd::Exit,
         Cmd::CloseTab,
         Cmd::NextTab,
         Cmd::PreviousTab,
         Cmd::ReopenTab,
+        Cmd::MaximizeWindow,
         Cmd::NextPane,
         Cmd::PreviousPane,
+        Cmd::ExpandAll,
+        Cmd::CollapseAll,
         Cmd::ToggleTree,
         Cmd::TogglePalettes,
         Cmd::ToggleLog,
@@ -292,12 +306,16 @@ impl Cmd {
             Cmd::DialogFind => ("dialog-find", "Find and Replace", Conversation),
             Cmd::DialogFindNext => ("dialog-find-next", "Find Next", Conversation),
             Cmd::Close => ("close", "Close", General),
+            Cmd::Exit => ("exit", "Exit", General),
             Cmd::CloseTab => ("close-tab", "Close Tab", General),
             Cmd::NextTab => ("next-tab", "Next Tab", General),
             Cmd::PreviousTab => ("previous-tab", "Previous Tab", General),
             Cmd::ReopenTab => ("reopen-tab", "Reopen Closed Tab", General),
+            Cmd::MaximizeWindow => ("maximize-window", "Maximize Window", General),
             Cmd::NextPane => ("next-pane", "Next Pane", General),
             Cmd::PreviousPane => ("previous-pane", "Previous Pane", General),
+            Cmd::ExpandAll => ("expand-all", "Expand All", Panes),
+            Cmd::CollapseAll => ("collapse-all", "Collapse All", Panes),
             Cmd::ToggleTree => ("view-tree", "Module Tree", General),
             Cmd::TogglePalettes => ("view-palettes", "Palettes Panel", General),
             Cmd::ToggleLog => ("view-log", "Log", General),
@@ -401,13 +419,20 @@ impl Cmd {
             Cmd::DialogFindNext => vec![k(NONE, Key::F3)],
             // (No key at first: Ctrl+F4, Aurora's for it, closes a tab.)
             Cmd::Close => Vec::new(),
+            // Aurora's.
+            Cmd::Exit => vec![k(Modifiers::ALT, Key::X)],
             // A browser's, both.
             Cmd::CloseTab => vec![k(CTRL, Key::W), k(CTRL, Key::F4)],
             Cmd::NextTab => vec![k(CTRL, Key::Tab), k(CTRL, Key::PageDown)],
             Cmd::PreviousTab => vec![k(CTRL | SHIFT, Key::Tab), k(CTRL, Key::PageUp)],
             Cmd::ReopenTab => vec![k(CTRL | SHIFT, Key::T)],
+            Cmd::MaximizeWindow => vec![k(CTRL | SHIFT, Key::M)],
             Cmd::NextPane => vec![k(NONE, Key::F6)],
             Cmd::PreviousPane => vec![k(SHIFT, Key::F6)],
+            // (Right and Left open and close a row; with Ctrl+Shift,
+            // every one. Ctrl and + or -, egui's zoom, are the window's.)
+            Cmd::ExpandAll => vec![k(CTRL | SHIFT, Key::ArrowRight)],
+            Cmd::CollapseAll => vec![k(CTRL | SHIFT, Key::ArrowLeft)],
             Cmd::ToggleTree => vec![k(CTRL | Modifiers::ALT, Key::Num1)],
             Cmd::TogglePalettes => vec![k(CTRL | Modifiers::ALT, Key::Num2)],
             Cmd::ToggleLog => vec![k(CTRL | Modifiers::ALT, Key::Num3)],
@@ -681,6 +706,12 @@ impl Keymap {
             !this
         });
         hit
+    }
+
+    /// Whether `e` presses a key some command was given (a plugin's or a
+    /// project's too): Alt and a letter is a menu's only where none was.
+    pub fn bound(&self, e: &Event) -> bool {
+        self.keys.values().chain(self.defaults.values()).flatten().any(|s| is(e, s))
     }
 
     /// Whether `e` presses a key of a command of `group`: a list's own key

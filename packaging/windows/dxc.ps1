@@ -1,4 +1,4 @@
-# Puts Microsoft's DirectX Shader Compiler (DXC) beside Moonglow's programs:
+# Puts Microsoft's DirectX Shader Compiler (DXC) beside Moonscar's programs:
 # dxcompiler.dll, x64, of the release pinned here, which Direct3D 12 compiles
 # shaders with where it lies beside the program (crates/mg-render/src/dx12.rs;
 # FXC, which can't compile the game's normal-mapped lit programs, elsewhere).

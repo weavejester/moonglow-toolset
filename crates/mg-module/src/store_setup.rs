@@ -26,11 +26,9 @@ pub const NO: &str = "No, thanks.";
 /// The first `stem001`, `stem002`, ... the module has no `restype` of
 /// (by the builder's code, in a project with one: `ab_stem001`).
 pub fn next_name(module: &Module, stem: &str, restype: ResType) -> ResRef {
-    let naming = module.project_file.naming_for(restype);
-    (1..1000)
-        .filter_map(|n| naming.resref(stem, &format!("{n:03}")))
-        .find(|r| !module.contains(&ResKey::new(*r, restype)))
-        .unwrap_or(ResRef::EMPTY)
+    let taken =
+        |s: &str| ResRef::from_str(s).is_ok_and(|r| module.contains(&ResKey::new(r, restype)));
+    module.project_file.naming_for(restype).numbered(stem, 1, &taken).unwrap_or(ResRef::EMPTY)
 }
 
 /// The script that opens the store with `tag` for the PC speaker (with
@@ -99,12 +97,7 @@ pub fn merchant(factions: Option<&Factions>) -> u32 {
 /// does (its orientation's bearing, less the quarter turn the instance's
 /// facing adds).
 pub fn store_placement(creature: &Struct) -> crate::instances::Placement {
-    let f = |l: &str| creature.float(l).unwrap_or(0.0);
-    let rotation = f("YOrientation").atan2(f("XOrientation")) - std::f32::consts::FRAC_PI_2;
-    crate::instances::Placement {
-        position: [f("XPosition"), f("YPosition"), f("ZPosition")],
-        rotation,
-    }
+    crate::placement::Placement::read(mg_rules::ObjectKind::Creature, creature)
 }
 
 #[cfg(test)]

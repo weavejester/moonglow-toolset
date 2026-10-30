@@ -32,14 +32,20 @@ pub const PLACEABLE_DEFAULT_ENV_MAP: &str = "chrome1";
 /// creature's appearance.2da `ENVMAP` `default` reflect. Read from the
 /// client: in a `tin01` interior, whose map is a copper brown, a sphere
 /// of each drawn with the map bound to it (`area_env_map_look` with
-/// `MG_ENV_PAINT`, `MG_ENV_SHAPE=sphere` and `MG_ENV_CREATURE`).
+/// `MG_ENV_PAINT`, `MG_ENV_SHAPE=sphere` and `MG_ENV_CREATURE`). A
+/// texture of its own whose TXI says `envmaptexture default` reflects the
+/// area's, as on any object whose map isn't named (read from the client:
+/// `program_choice_in_the_client` with `MG_LYING_ENVD=1
+/// MG_REFLECTION=default`): [`Part::env_map_default`].
 pub fn placeable(game: &GameData, utp: &Struct) -> Result<Preview, PreviewError> {
     let table = game.table("placeables")?;
     let (r, model) = appearance(game, ObjectKind::Placeable, utp)?;
     let mut base = Part::new(model.unwrap_or_default());
     let is_static = utp.integer("Static").is_some_and(|v| v != 0);
     if !is_static {
-        base.env_map = env_map(cell(&table, r, "Reflection"))
+        let reflection = env_map(cell(&table, r, "Reflection"));
+        base.env_map_default = reflection.as_deref() == Some("default");
+        base.env_map = reflection
             .map(|e| if e == "default" { PLACEABLE_DEFAULT_ENV_MAP.to_string() } else { e });
     }
     let mut lights = Vec::new();
@@ -72,19 +78,14 @@ pub fn placeable(game: &GameData, utp: &Struct) -> Result<Preview, PreviewError>
 }
 
 /// A waypoint (UTW fields): the flag of its `Appearance`, waypoint.2da
-/// `RESREF` (blue, red, green, yellow).
+/// `RESREF` (blue, red, green, yellow), by [`mg_rules::appearance`] as
+/// Verify judges it.
 pub fn waypoint(game: &GameData, utw: &Struct) -> Result<Preview, PreviewError> {
-    let lk = Lookup { game };
-    let table = game.table("waypoint")?;
-    let row = utw.integer("Appearance").unwrap_or(0);
-    let model = usize::try_from(row)
-        .ok()
-        .and_then(|r| cell(&table, r, "RESREF"))
-        .map(str::to_ascii_lowercase)
-        .ok_or(PreviewError::NoRow { table: "waypoint", row })?;
-    if !lk.has_model(&model) {
-        return Err(PreviewError::NoModel(model));
+    if utw.get("Appearance").is_none() {
+        return Err(PreviewError::NoRow { table: "waypoint", row: 0 });
     }
+    let (_, model) = crate::appearance(game, mg_rules::ObjectKind::Waypoint, utw)?;
+    let model = model.ok_or_else(|| PreviewError::NoModel("waypoint".into()))?;
     Ok(Preview::model(&model))
 }
 

@@ -175,18 +175,6 @@ pub fn default_factions() -> Gff {
     g
 }
 
-fn int(v: Option<&Value>) -> Option<i64> {
-    Some(match v? {
-        Value::Byte(x) => i64::from(*x),
-        Value::Char(x) => i64::from(*x),
-        Value::Word(x) => i64::from(*x),
-        Value::Short(x) => i64::from(*x),
-        Value::Dword(x) => i64::from(*x),
-        Value::Int(x) => i64::from(*x),
-        _ => return None,
-    })
-}
-
 /// Sort key of Windows' default ("word sort") string comparison, which
 /// Aurora uses for its lists: case and accents set aside (`Árboles` beside
 /// `arboles`: [`mg_core::text::fold`]), hyphens and apostrophes ignored
@@ -213,7 +201,7 @@ pub fn custom_palette_in(skeleton: &Gff, name: impl Fn(u32) -> String, by_name: 
     fn nodes(list: &[Struct], name: &dyn Fn(u32) -> String, by_name: bool) -> Vec<Struct> {
         let mut out: Vec<((String, String), Struct)> = list
             .iter()
-            .filter(|n| !matches!(int(n.get("TYPE")), Some(0 | 1)))
+            .filter(|n| !matches!(n.integer("TYPE"), Some(0 | 1)))
             .map(|n| {
                 // Aurora writes STRREF, ID, LIST in that order.
                 let mut s = Struct::new(0);
@@ -225,11 +213,15 @@ pub fn custom_palette_in(skeleton: &Gff, name: impl Fn(u32) -> String, by_name: 
                 if let Some(Value::List(children)) = n.get("LIST") {
                     s.set("LIST", Value::List(nodes(children, name, by_name)));
                 }
+                // A name written out beside a StrRef is not the one shown:
+                // Aurora's Refresh Palette writes the StrRef alone.
+                let named =
+                    matches!(crate::palette::node_name(n), crate::palette::PaletteName::StrRef(_));
                 for f in &n.fields {
-                    if !matches!(
-                        f.label.as_bytes(),
-                        b"STRREF" | b"ID" | b"LIST" | b"TYPE" | b"DELETE_ME"
-                    ) {
+                    let label = f.label.as_bytes();
+                    if !matches!(label, b"STRREF" | b"ID" | b"LIST" | b"TYPE" | b"DELETE_ME")
+                        && !(named && label == b"NAME")
+                    {
                         s.fields.push(f.clone());
                     }
                 }
@@ -238,16 +230,17 @@ pub fn custom_palette_in(skeleton: &Gff, name: impl Fn(u32) -> String, by_name: 
                 // in BioWare's older field alone (`DELETE_ME`, with no
                 // StrRef: a builder's Spanish palettes) keeps those names,
                 // as `NAME`: the palette built here would have none.
-                let strref = int(n.get("STRREF")).unwrap_or(-1);
+                let strref = n.integer("STRREF").unwrap_or(-1);
                 let older = n
                     .string("DELETE_ME")
                     .filter(|_| n.string("NAME").is_none() && u32::try_from(strref).is_err());
                 if let Some(text) = older {
                     s.set("NAME", Value::String(text.to_vec()));
                 }
-                let shown = match n.string("NAME").or(older) {
-                    Some(text) => crate::palette::written(text),
-                    None => u32::try_from(strref).map(name).unwrap_or_default(),
+                // (Its StrRef first, as Aurora reads a node's name.)
+                let shown = match crate::palette::node_name(n) {
+                    crate::palette::PaletteName::StrRef(s) => name(s),
+                    crate::palette::PaletteName::Text(text) => crate::palette::written(&text),
                 };
                 (word_sort_key(&shown), s)
             })
@@ -356,8 +349,7 @@ pub struct Scheme {
 }
 
 /// A tile's light fields, as a scheme sets them ([`Scheme::tile_fields`]).
-pub const TILE_LIGHT_FIELDS: [&str; 4] =
-    ["Tile_MainLight1", "Tile_MainLight2", "Tile_SrcLight1", "Tile_SrcLight2"];
+pub use crate::lighting::TILE_LIGHT_FIELDS;
 
 impl Scheme {
     /// The environment.2da row `text` names: its number, its `LABEL`, or
@@ -451,9 +443,12 @@ impl Scheme {
     /// (both source fields alike, as the Area Wizard writes them) picked
     /// at random ([`tile_lights`](Self::tile_lights)).
     pub fn tile_fields(&self, rng: &mut fastrand::Rng) -> [(&'static str, Value); 4] {
-        let [main1, main2, source] = self.tile_lights(rng);
-        let [a, b, c, d] = TILE_LIGHT_FIELDS;
-        [(a, main1), (b, main2), (c, source), (d, source)].map(|(l, v)| (l, Value::Byte(v)))
+        crate::lighting::pick_tile_fields(&self.lights, rng)
+    }
+
+    /// The colors its tiles' lights are picked from.
+    pub fn tile_colors(&self) -> crate::lighting::TileColors {
+        self.lights
     }
 }
 
@@ -700,7 +695,35 @@ impl AreaDefaults {
 
 #[cfg(test)]
 mod tests {
+    use mg_gff::{Gff, Struct, Value};
+
     use super::word_sort_key;
+
+    /// The build's placeholder and engine categories (`TYPE` 0 and 1) are
+    /// left out whatever whole number type holds it, the 64-bit ones too.
+    #[test]
+    fn a_skeleton_s_types_are_read_in_any_width() {
+        let node = |id: u8, ty: Value| {
+            let mut s = Struct::new(0);
+            s.set("STRREF", Value::Dword64(6687 + u64::from(id)));
+            s.set("ID", Value::Byte(id));
+            s.set("TYPE", ty);
+            s
+        };
+        let mut skeleton = Gff::new(*b"ITP ");
+        let main = vec![
+            node(1, Value::Dword64(0)),
+            node(2, Value::Int64(1)),
+            node(3, Value::Byte(1)),
+            node(4, Value::Int64(2)),
+            node(5, Value::Word(2)),
+        ];
+        skeleton.root.set("MAIN", Value::List(main));
+        let built = super::custom_palette(&skeleton, |s| format!("c{s}"));
+        let ids: Vec<i64> =
+            built.root.list("MAIN").unwrap().iter().filter_map(|n| n.integer("ID")).collect();
+        assert_eq!(ids, [4, 5]);
+    }
 
     #[test]
     fn the_word_sort_sets_case_accents_and_hyphens_aside() {

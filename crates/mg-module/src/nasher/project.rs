@@ -11,16 +11,15 @@ use mg_gff::Gff;
 use mg_resman::ResKey;
 use mg_schema::{ExoString, StructExt, ifo};
 
-use super::{Conversion, Package, Settings, Target, is_json_type};
+use super::{Conversion, Form, Package, Settings, Target, is_json_type};
 use crate::ModuleError;
 
 /// A resource's source file, as last read or written.
 #[derive(Debug, Clone)]
 struct Source {
     path: Arc<Path>,
-    /// Whether the file is JSON (a GFF kept as text) rather than the
-    /// resource itself.
-    json: bool,
+    /// Whether the file is the resource itself or a GFF kept as text.
+    form: Form,
     /// The file's bytes.
     file: Arc<[u8]>,
     /// The resource's bytes they stand for.
@@ -148,7 +147,7 @@ pub struct Outside {
     pub resource: Option<Arc<[u8]>>,
     /// The file's bytes now.
     file: Option<Arc<[u8]>>,
-    json: bool,
+    form: Form,
     /// The file's bytes as they were known when it was looked at (`None`:
     /// a file new to the module): the change stands while they still are
     /// ([`crate::outside::stands`]).
@@ -167,7 +166,7 @@ impl Outside {
         was: Option<Arc<[u8]>>,
         stamp: Option<Stamp>,
     ) -> Outside {
-        Outside { key, path, file: resource.clone(), resource, json: false, was, stamp }
+        Outside { key, path, file: resource.clone(), resource, form: Form::Plain, was, stamp }
     }
 
     /// The time and size the file had when it was read.
@@ -196,13 +195,16 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ModuleError + '_ {
 
 /// The name of a resource's source file (lowercase, as nasher's unpack
 /// names files).
-fn source_name(key: &ResKey, json: bool) -> String {
+fn source_name(key: &ResKey, form: Form) -> String {
     let name = key.to_string().to_ascii_lowercase();
-    if json { format!("{name}.json") } else { name }
+    match form.extension() {
+        Some(ext) => format!("{name}.{ext}"),
+        None => name,
+    }
 }
 
-/// The resource a source file name stands for, and whether the file is
-/// JSON; `None` if it isn't a resource.
+/// The resource a source file name stands for, and the form the file keeps
+/// it in; `None` if it isn't a resource.
 /// The folder an include looks in, relative to the project (the part
 /// before its first wildcard): `src/**/*.nss` looks in `src`. `None` for one
 /// that looks outside the project's folder, or in all of it.
@@ -238,12 +240,9 @@ fn left_out_kinds(files: &[PathBuf]) -> Vec<String> {
     kinds
 }
 
-fn resource_of(file_name: &str) -> Option<(ResKey, bool)> {
-    let (name, json) = match file_name.strip_suffix(".json") {
-        Some(inner) => (inner, true),
-        None => (file_name, false),
-    };
-    crate::folder_key(name).map(|k| (k, json))
+fn resource_of(file_name: &str) -> Option<(ResKey, Form)> {
+    let (name, form) = Form::of(file_name);
+    crate::folder_key(name).map(|k| (k, form))
 }
 
 impl Project {
@@ -254,9 +253,9 @@ impl Project {
         let settings = Settings::read(root);
         let cfg = Package::config_path(root).display().to_string();
         let bad = |message: String| ModuleError::Source { name: cfg.clone(), message };
-        if settings.gff_format != "json" {
+        if Form::for_gff_format(&settings.gff_format).is_none() {
             return Err(bad(format!(
-                "the project keeps GFF files as {}; Moonglow reads JSON trees only",
+                "gffFormat {:?}: nasher keeps GFF files as json or nwnt",
                 settings.gff_format
             )));
         }
@@ -280,12 +279,12 @@ impl Project {
         let mut resources = IndexMap::new();
         for path in t.source_files(root).map_err(bad)? {
             let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if file_name.ends_with(".nwnt") {
-                return Err(bad(format!(
-                    "{file_name}: NWNT files aren't supported yet; use gffFormat json"
-                )));
+            // (A file half written when Moonglow stopped: not the
+            // builder's, and gone once it is old.)
+            if crate::left_writing(&path) {
+                continue;
             }
-            let Some((key, json)) = resource_of(&file_name) else {
+            let Some((key, form)) = resource_of(&file_name) else {
                 project.warnings.push(format!("{}: not a resource; left alone", path.display()));
                 continue;
             };
@@ -293,13 +292,14 @@ impl Project {
             // and packs the table into the module, as `packed` does. A
             // target of its own that packs it too has it read with the
             // module's talk table, `nasher::talk_tables`.)
-            if json && key.restype == ResType::TLK {
+            if form == Form::Json && key.restype == ResType::TLK {
                 continue;
             }
-            if json && !is_json_type(key.restype) {
+            if form.is_text() && !is_json_type(key.restype) {
                 project.warnings.push(format!(
-                    "{}: only GFF files are read as JSON; left alone",
-                    path.display()
+                    "{}: only GFF files are read as {}; left alone",
+                    path.display(),
+                    if form == Form::Nwnt { "NWNT" } else { "JSON" }
                 ));
                 continue;
             }
@@ -336,7 +336,7 @@ impl Project {
             let file: Arc<[u8]> = Arc::from(std::fs::read(&path).map_err(io(&path))?);
             // A file that can't be read (JSON broken by a merge, say) is
             // left out, and said: the rest of the project opens.
-            let resource = match resource_from(conv, &path, json, &file) {
+            let resource = match resource_from(conv, &path, form, &file) {
                 Ok(resource) => resource,
                 Err(e) => {
                     project.warnings.push(format!(
@@ -351,7 +351,7 @@ impl Project {
                 project.spellings.insert(key, twin);
             }
             resources.insert(key, resource.clone());
-            project.sources.insert(key, Source { path: path.into(), json, file, resource, stamp });
+            project.sources.insert(key, Source { path: path.into(), form, file, resource, stamp });
         }
         if super::kept_as(&project.settings).is_none()
             && project.package.targets.iter().any(Target::is_talk_table)
@@ -412,14 +412,14 @@ impl Project {
         if !key.resref.is_file_name() {
             return None;
         }
-        let json = is_json_type(key.restype);
+        let form = self.new_form(key);
         let folder = self.target().rule_folder(&key.to_string().to_ascii_lowercase());
         let folder = match folder.as_deref() {
             Some("/dev/null") => return None,
             Some(f) => f.to_string(),
             None => "unknown".to_string(),
         };
-        Some(self.root().join(folder).join(source_name(key, json)))
+        Some(self.root().join(folder).join(source_name(key, form)))
     }
 
     /// The files of `keys` that the target's sources would leave out: those
@@ -633,7 +633,8 @@ impl Project {
     /// Makes a project at `root` for a module that isn't in one: a
     /// `nasher.cfg` like `nasher init --default` writes, packing `file`
     /// (kept if there is one already), and no sources yet. Its sources take
-    /// in scripts and GFF files kept as JSON, as nasher's do, and the files
+    /// in scripts and GFF files kept as JSON (as NWNT where nasher's
+    /// settings say `gffFormat = nwnt`), as nasher's do, and the files
     /// of the other kinds of `extensions` (a module's 2DAs, pictures) and
     /// NUI windows (`jui`, `txt`): with nasher's alone, a window saved into
     /// the project was neither read back nor packed (a builder's report).
@@ -641,7 +642,8 @@ impl Project {
         let cfg = Package::config_path(root);
         if !cfg.exists() {
             std::fs::create_dir_all(root).map_err(io(root))?;
-            let mut kinds: Vec<String> = ["nss", "json", "jui", "txt"].map(String::from).to_vec();
+            let gff = Conversion::of(&Settings::read(root)).gff.extension().unwrap_or("json");
+            let mut kinds: Vec<String> = ["nss", gff, "jui", "txt"].map(String::from).to_vec();
             for e in extensions {
                 let e = e.to_ascii_lowercase();
                 if !kinds.contains(&e) {
@@ -690,7 +692,13 @@ impl Project {
 
     /// How GFF files convert in this project.
     pub fn conversion(&self) -> Conversion {
-        Conversion { codepage: self.settings.codepage, float_places: self.settings.truncate_floats }
+        Conversion::of(&self.settings)
+    }
+
+    /// The form a resource new to the project is kept in: a GFF as the
+    /// project's `gffFormat` says, anything else as itself.
+    fn new_form(&self, key: &ResKey) -> Form {
+        if is_json_type(key.restype) { self.conversion().gff } else { Form::Plain }
     }
 
     /// The source file a resource is kept in, if it has one yet.
@@ -724,21 +732,42 @@ impl Project {
     /// What is known of the source files, to look at them anywhere
     /// ([`OutsideScan::run`]).
     pub(crate) fn outside_scan(&self) -> OutsideScan {
-        let files = (self.sources.iter())
-            .map(|(key, src)| Known {
-                key: *key,
-                path: src.path.clone(),
-                json: src.json,
-                file: src.file.clone(),
-                stamp: src.stamp,
-            })
-            .collect();
-        let kind = crate::outside::Kind::Project {
+        let files = (self.sources.iter()).map(|(key, src)| Self::known(*key, src)).collect();
+        OutsideScan { files, kind: self.scan_kind(), only: None }
+    }
+
+    fn known(key: ResKey, src: &Source) -> Known {
+        Known {
+            key,
+            path: src.path.clone(),
+            form: src.form,
+            file: src.file.clone(),
+            stamp: src.stamp,
+        }
+    }
+
+    fn scan_kind(&self) -> crate::outside::Kind {
+        crate::outside::Kind::Project {
             root: self.root().to_path_buf(),
             target: Box::new(self.target().clone()),
             conversion: self.conversion(),
-        };
-        OutsideScan { files, kind }
+        }
+    }
+
+    /// [`Project::outside_scan`] of these files alone: what is known of
+    /// the resources they are, by their names (a file moved is a known
+    /// resource at a new path).
+    pub(crate) fn outside_scan_of(&self, paths: &[PathBuf]) -> OutsideScan {
+        let mut keys: Vec<ResKey> = (paths.iter())
+            .filter_map(|p| resource_of(&p.file_name()?.to_string_lossy()).map(|(k, _)| k))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let files = (keys.iter())
+            .filter_map(|k| self.sources.get(k).map(|src| Self::known(*k, src)))
+            .collect();
+        let only = Some(paths.iter().cloned().collect());
+        OutsideScan { files, kind: self.scan_kind(), only }
     }
 
     /// Takes what [`OutsideScan::run`] found: the times of the files found
@@ -789,7 +818,7 @@ impl Project {
                     change.key,
                     Source {
                         path: change.path.as_path().into(),
-                        json: change.json,
+                        form: change.form,
                         file: file.clone(),
                         resource: resource.clone(),
                         // (Its time when it was read, not now: a write
@@ -810,7 +839,7 @@ impl Project {
     /// areas the tree doesn't have: they may be in a hak (Kingmaker's are).
     /// The change counts as read, so it is written only with other changes
     /// to `module.ifo`.
-    fn settle_area_list(&mut self, resources: &mut Resources) {
+    pub(crate) fn settle_area_list(&mut self, resources: &mut Resources) {
         if !self.settings.remove_unused_areas {
             return;
         }
@@ -855,21 +884,21 @@ impl Project {
     fn source_bytes(
         &self,
         key: &ResKey,
-        json: bool,
+        form: Form,
         resource: &[u8],
         file: Option<&[u8]>,
     ) -> Result<Vec<u8>, ModuleError> {
-        if !json {
+        if !form.is_text() {
             return Ok(resource.to_vec());
         }
         let mut gff = Gff::read(resource)
             .map_err(|e| ModuleError::Source { name: key.to_string(), message: e.to_string() })?;
         if key.restype == ResType::GIT && crate::locks::has_locks(&gff) {
             let name = key.to_string();
-            let before = file.and_then(|f| self.conversion().from_source(&name, f).ok());
+            let before = file.and_then(|f| self.conversion().from_text(form, &name, f).ok());
             crate::locks::strip(&mut gff, before.as_ref());
         }
-        Ok(self.conversion().to_source(key.restype, &gff)?.into_bytes())
+        self.conversion().to_text(form, key.restype, resource, Some(&gff))
     }
 
     /// Counts `resource` as what a source file stands for: the file's own
@@ -890,9 +919,9 @@ impl Project {
     /// since it was read: the error lists those files.
     pub fn save(&mut self, resources: &Resources) -> Result<SaveReport, ModuleError> {
         enum Step {
-            Write(ResKey, PathBuf, bool, Vec<u8>),
+            Write(ResKey, PathBuf, Form, Vec<u8>),
             Remove(ResKey, PathBuf),
-            Adopt(ResKey, PathBuf, bool, Vec<u8>),
+            Adopt(ResKey, PathBuf, Form, Vec<u8>),
         }
         let root = self.root().to_path_buf();
         let disk = |p: &Path| std::fs::read(p).ok();
@@ -908,29 +937,29 @@ impl Project {
                 _ if built(key, resources) => {}
                 Some(src) if src.resource[..] == bytes[..] => {}
                 Some(src) => {
-                    let text = self.source_bytes(key, src.json, bytes, Some(&src.file))?;
+                    let text = self.source_bytes(key, src.form, bytes, Some(&src.file))?;
                     let current = disk(&src.path);
                     if text[..] == src.file[..] || current.as_deref() == Some(&text[..]) {
-                        steps.push(Step::Adopt(*key, src.path.to_path_buf(), src.json, text));
+                        steps.push(Step::Adopt(*key, src.path.to_path_buf(), src.form, text));
                     } else if current.as_deref() != Some(&src.file[..]) {
                         conflicts.push(src.path.to_path_buf());
                     } else {
-                        steps.push(Step::Write(*key, src.path.to_path_buf(), src.json, text));
+                        steps.push(Step::Write(*key, src.path.to_path_buf(), src.form, text));
                     }
                 }
                 None => {
                     let Some(path) = self.new_file(key) else { continue };
-                    let json = is_json_type(key.restype);
+                    let form = self.new_form(key);
                     if !self.target().covers(&root, &path) {
                         uncovered.push(path.clone());
                     }
-                    let text = self.source_bytes(key, json, bytes, None)?;
+                    let text = self.source_bytes(key, form, bytes, None)?;
                     match disk(&path) {
                         Some(existing) if existing == text => {
-                            steps.push(Step::Adopt(*key, path, json, text))
+                            steps.push(Step::Adopt(*key, path, form, text))
                         }
                         Some(_) => conflicts.push(path),
-                        None => steps.push(Step::Write(*key, path, json, text)),
+                        None => steps.push(Step::Write(*key, path, form, text)),
                     }
                 }
             }
@@ -975,7 +1004,7 @@ impl Project {
         let mut report = SaveReport::default();
         for step in steps {
             match step {
-                Step::Write(key, path, json, text) => {
+                Step::Write(key, path, form, text) => {
                     if let Some(dir) = path.parent() {
                         std::fs::create_dir_all(dir).map_err(io(dir))?;
                     }
@@ -987,7 +1016,7 @@ impl Project {
                         key,
                         Source {
                             path: path.as_path().into(),
-                            json,
+                            form,
                             file: Arc::from(text),
                             resource,
                             stamp: None,
@@ -995,13 +1024,13 @@ impl Project {
                     );
                     report.written.push(path);
                 }
-                Step::Adopt(key, path, json, text) => {
+                Step::Adopt(key, path, form, text) => {
                     let resource = resources[&key].clone();
                     self.sources.insert(
                         key,
                         Source {
                             path: path.into(),
-                            json,
+                            form,
                             file: Arc::from(text),
                             resource,
                             stamp: None,
@@ -1108,7 +1137,7 @@ impl Project {
         };
         for path in t.source_files(self.root()).map_err(bad)? {
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
-            let Some((key, true)) = resource_of(&name) else { continue };
+            let Some((key, Form::Json)) = resource_of(&name) else { continue };
             if key.restype != ResType::TLK {
                 continue;
             }
@@ -1130,14 +1159,14 @@ impl Project {
 fn resource_from(
     conversion: Conversion,
     path: &Path,
-    json: bool,
+    form: Form,
     file: &Arc<[u8]>,
 ) -> Result<Arc<[u8]>, ModuleError> {
-    if !json {
+    if !form.is_text() {
         return Ok(file.clone());
     }
     let name = path.display().to_string();
-    let gff = conversion.from_source(&name, file)?;
+    let gff = conversion.from_text(form, &name, file)?;
     let bytes = gff.to_bytes().map_err(|e| ModuleError::Source { name, message: e.to_string() })?;
     Ok(Arc::from(bytes))
 }
@@ -1149,14 +1178,20 @@ pub(crate) fn scan(
     root: &Path,
     target: &Target,
     conversion: Conversion,
+    only: Option<&std::collections::HashSet<PathBuf>>,
 ) -> OutsideFound {
     let mut found = OutsideFound { project: true, ..Default::default() };
     let mut changes = Vec::new();
     for k in files {
+        if only.is_some_and(|o| !o.contains(&*k.path)) {
+            continue;
+        }
         // (Its time and size before it is read: a write after the read
         // gives it others, and it is read again.)
         let now = stamp(&k.path);
-        if now.is_some() && k.stamp == now {
+        // (One the system named is read whatever its time: a change within
+        // the clock's grain keeps it.)
+        if now.is_some() && k.stamp == now && only.is_none() {
             continue;
         }
         let gone = || Outside {
@@ -1164,7 +1199,7 @@ pub(crate) fn scan(
             path: k.path.to_path_buf(),
             resource: None,
             file: None,
-            json: k.json,
+            form: k.form,
             was: Some(k.file.clone()),
             stamp: None,
         };
@@ -1177,7 +1212,7 @@ pub(crate) fn scan(
             found.settled.extend(now.map(|s| (k.key, k.file.clone(), s)));
             continue;
         }
-        match resource_from(conversion, &k.path, k.json, &file) {
+        match resource_from(conversion, &k.path, k.form, &file) {
             Ok(resource) => changes.push(Outside {
                 resource: Some(resource),
                 file: Some(file),
@@ -1191,19 +1226,30 @@ pub(crate) fn scan(
     let known: std::collections::HashSet<&Path> = files.iter().map(|k| &*k.path).collect();
     let by_key: HashMap<ResKey, &Known> = files.iter().map(|k| (k.key, k)).collect();
     let mut added: Vec<Outside> = Vec::new();
-    for path in target.source_files(root).unwrap_or_default() {
+    // (Of the files named, those the sources take in: the tree isn't
+    // walked.)
+    let sources = match only {
+        Some(only) => {
+            let mut paths: Vec<PathBuf> =
+                only.iter().filter(|p| p.is_file() && target.covers(root, p)).cloned().collect();
+            paths.sort();
+            paths
+        }
+        None => target.source_files(root).unwrap_or_default(),
+    };
+    for path in sources {
         if known.contains(path.as_path()) {
             continue;
         }
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let Some((key, json)) = resource_of(&name) else { continue };
+        let Some((key, form)) = resource_of(&name) else { continue };
         // A resource whose file is gone and is found elsewhere in the
         // tree was moved there (in the project's folder, by hand): it
         // is read from there now, rather than taken for deleted (a
         // builder's NUI window, moved, was not found).
         let was = by_key.get(&key);
         let moved = was.is_some_and(|k| !k.path.exists());
-        if (json && !is_json_type(key.restype))
+        if (form.is_text() && !is_json_type(key.restype))
             || (was.is_some() && !moved)
             || added.iter().any(|a| a.key == key)
         {
@@ -1214,13 +1260,13 @@ pub(crate) fn scan(
         }
         let now = stamp(&path);
         let Some(file) = std::fs::read(&path).ok().map(Arc::<[u8]>::from) else { continue };
-        match resource_from(conversion, &path, json, &file) {
+        match resource_from(conversion, &path, form, &file) {
             Ok(resource) => added.push(Outside {
                 key,
                 path,
                 resource: Some(resource),
                 file: Some(file),
-                json,
+                form,
                 was: was.map(|k| k.file.clone()),
                 stamp: now,
             }),
@@ -1259,8 +1305,8 @@ fn left_out_of(root: &Path, target: &Target) -> Vec<PathBuf> {
                 continue;
             }
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let Some((key, json)) = resource_of(&name) else { continue };
-            if json && !is_json_type(key.restype) {
+            let Some((key, form)) = resource_of(&name) else { continue };
+            if form.is_text() && !is_json_type(key.restype) {
                 continue;
             }
             if key.restype == ResType::TXT && !path.with_extension("jui").is_file() {
@@ -1390,6 +1436,70 @@ mod tests {
         let (changes, _) = m.outside().unwrap();
         let again = changes.iter().find(|c| c.key == script).unwrap();
         assert_eq!(again.resource.as_deref(), Some(&b"void main() { int four, more; }\n"[..]));
+    }
+
+    /// Where the system named the files that changed (a watch), only they
+    /// are looked at: a file changed and not named isn't found (until a
+    /// look at all), one named is, as are one added and one deleted; one
+    /// named that the sources don't take in, or moved to where they do,
+    /// is as a whole look finds it.
+    #[test]
+    fn a_look_at_the_files_named_looks_at_them_alone() {
+        let root = scratch("outside-named");
+        module().save_as(&project_location(&root)).unwrap();
+        let mut m = Module::open(&root).unwrap();
+        let nss = root.join("src/on_load.nss");
+        let are = root.join("src/a1.are.json");
+        let look = |m: &mut Module, paths: &[PathBuf]| {
+            let found = m.outside_scan_of(paths).unwrap().run();
+            let (changes, problems) = m.outside_found(found);
+            assert!(problems.is_empty(), "{problems:?}");
+            let mut names: Vec<String> = changes.iter().map(|c| c.key.to_string()).collect();
+            names.sort();
+            names
+        };
+        std::fs::write(&nss, "void main() { int outside; }\n").unwrap();
+        let was = std::fs::read(&are).unwrap();
+        std::fs::write(&are, String::from_utf8(was).unwrap().replace('{', "{ ")).unwrap();
+        std::fs::write(root.join("src/fresh.nss"), "void main() {}\n").unwrap();
+        std::fs::remove_file(root.join("src/a1.git.json")).unwrap();
+        std::fs::write(root.join("notes.nss"), "void main() {}\n").unwrap();
+        let named = [
+            nss.clone(),
+            root.join("src/fresh.nss"),
+            root.join("src/a1.git.json"),
+            root.join("notes.nss"),
+        ];
+        assert_eq!(look(&mut m, &named), ["a1.git", "fresh.nss", "on_load.nss"]);
+        // (The area's file changed too, and wasn't named: a whole look
+        // finds it.)
+        let (all, _) = m.outside().unwrap();
+        let all: Vec<String> = all.iter().map(|c| c.key.to_string()).collect();
+        assert!(all.contains(&"a1.are".to_string()), "{all:?}");
+        // A file moved where the sources take it in: read from there.
+        let mut m = Module::open(&root).unwrap();
+        std::fs::create_dir_all(root.join("src/scripts")).unwrap();
+        std::fs::rename(&nss, root.join("src/scripts/on_load.nss")).unwrap();
+        let named = [nss.clone(), root.join("src/scripts/on_load.nss")];
+        let found = m.outside_scan_of(&named).unwrap().run();
+        let (changes, _) = m.outside_found(found);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(changes[0].path.ends_with("src/scripts/on_load.nss") && changes[0].was().is_some());
+        // A change that keeps the file's time and size (within the clock's
+        // grain): a whole look passes over it, one that names it doesn't.
+        let mut m = Module::open(&root).unwrap();
+        let file = root.join("src/scripts/on_load.nss");
+        let when = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let same_length = text.replace("theirs", "THEIRS").replace("outside", "OUTSIDE");
+        assert_eq!(same_length.len(), text.len());
+        assert_ne!(same_length, text);
+        std::fs::write(&file, &same_length).unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(when).unwrap();
+        assert!(m.outside().unwrap().0.is_empty(), "the time and size are as they were");
+        let found = m.outside_scan_of(std::slice::from_ref(&file)).unwrap().run();
+        let (changes, _) = m.outside_found(found);
+        assert_eq!(changes.len(), 1, "{changes:?}");
     }
 
     #[test]
@@ -1724,18 +1834,110 @@ mod tests {
         );
     }
 
+    /// A project keeping its GFF files as NWNT (`gffFormat = nwnt`, nasher's
+    /// with WilliamDraco's `nwn_nwnt`): a module saved into it is written
+    /// as `.nwnt` files, as `nasher unpack` writes them (without the
+    /// module's `Mod_ID` and the area's `Version`), and reopens the same; a
+    /// change rewrites only its own file; a file kept as JSON in it is read
+    /// and written as JSON still.
     #[test]
-    fn nwnt_trees_are_refused() {
+    fn a_project_keeping_nwnt_is_read_and_saved() {
         let root = scratch("nwnt");
+        std::fs::create_dir_all(root.join(".nasher")).unwrap();
+        std::fs::write(root.join(".nasher/user.cfg"), "gffFormat = \"nwnt\"\n").unwrap();
+        let mut m = module();
+        m.save_as(&project_location(&root)).unwrap();
+        let cfg = std::fs::read_to_string(root.join("nasher.cfg")).unwrap();
+        assert!(cfg.contains("src/**/*.{nss,nwnt,"), "{cfg}");
+        let src = root.join("src");
+        let mut files: Vec<String> = std::fs::read_dir(&src)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["a1.are.nwnt", "a1.git.nwnt", "module.ifo.nwnt", "on_load.nss"]);
+        let are = std::fs::read_to_string(src.join("a1.are.nwnt")).unwrap();
+        assert_eq!(are, "data_type = ARE\r\nTag$CExoString = A1\r\n");
+        let ifo = std::fs::read_to_string(src.join("module.ifo.nwnt")).unwrap();
+        assert!(ifo.starts_with("data_type = IFO\r\n") && !ifo.contains("Mod_ID"), "{ifo}");
+        assert!(ifo.contains("Mod_Area_list[].Area_Name$ResRef = a1\r\n"), "{ifo}");
+
+        let back = Module::open(&root).unwrap();
+        assert!(back.project.as_ref().unwrap().warnings.is_empty());
+        assert_eq!(back.areas().unwrap(), [ResRef::from_str("a1").unwrap()]);
+        let git = back.gff(&key("a1", ResType::GIT)).unwrap().unwrap();
+        assert_eq!(git.root.list("Creature List").unwrap()[0].id, 4);
+
+        // A file kept as JSON (from before the project changed its format)
+        // and taken in by the sources is read as JSON and keeps it.
+        let cfg = cfg.replace("{nss,nwnt,", "{nss,nwnt,json,");
+        std::fs::write(root.join("nasher.cfg"), cfg).unwrap();
+        let mut uti = Gff::new(*b"UTI ");
+        uti.root.set("Tag", Value::String(b"sword".to_vec()));
+        let conv = Conversion::default();
+        let json = conv.to_source(ResType::UTI, &uti).unwrap();
+        std::fs::write(src.join("sword.uti.json"), &json).unwrap();
+        let mut back = Module::open(&root).unwrap();
+        assert_eq!(
+            back.gff(&key("sword", ResType::UTI)).unwrap().unwrap().root.string("Tag"),
+            Some(&b"sword"[..])
+        );
+
+        // Changed, an area writes its own file only, as NWNT; the item, as
+        // JSON; a new item is NWNT.
+        let mut are_gff = back.gff(&key("a1", ResType::ARE)).unwrap().unwrap();
+        are_gff.root.set("Tag", Value::String(b"A one\nline two".to_vec()));
+        back.set_gff(key("a1", ResType::ARE), &are_gff).unwrap();
+        uti.root.set("Tag", Value::String(b"blade".to_vec()));
+        back.set_gff(key("sword", ResType::UTI), &uti).unwrap();
+        back.set_gff(key("axe", ResType::UTI), &uti).unwrap();
+        back.save().unwrap();
+        let are = std::fs::read_to_string(src.join("a1.are.nwnt")).unwrap();
+        assert_eq!(are, "data_type = ARE\r\nTag$CExoString = A one\\nline two\r\n");
+        assert!(std::fs::read_to_string(src.join("sword.uti.json")).unwrap().contains("blade"));
+        assert!(
+            std::fs::read_to_string(src.join("axe.uti.nwnt"))
+                .unwrap()
+                .contains("Tag$CExoString = blade")
+        );
+        assert!(!src.join("sword.uti.nwnt").exists());
+        assert_eq!(std::fs::read_to_string(src.join("module.ifo.nwnt")).unwrap(), ifo);
+        let again = Module::open(&root).unwrap();
+        assert_eq!(
+            again.gff(&key("a1", ResType::ARE)).unwrap().unwrap().root.string("Tag"),
+            Some(&b"A one\nline two"[..])
+        );
+    }
+
+    /// A file of NWNT that can't be read is left out and said, as broken
+    /// JSON is; a format nasher doesn't have is refused.
+    #[test]
+    fn a_broken_nwnt_file_is_left_out_and_an_unknown_format_refused() {
+        let root = scratch("nwnt-broken");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("nasher.cfg"),
             "[package]\n  [package.sources]\n  include = \"src/*\"\n[target]\nname = \"m\"\nfile = \"m.mod\"\n",
         )
         .unwrap();
-        std::fs::write(root.join("src/module.ifo.nwnt"), "x").unwrap();
+        std::fs::write(
+            root.join("src/module.ifo.nwnt"),
+            "data_type = IFO\r\nMod_Name$CExoLocString = -1\r\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/a1.are.nwnt"), "data_type = ARE\nS.X$Byte = 1\n").unwrap();
+        let m = Module::open(&root).unwrap();
+        let warnings = &m.project.as_ref().unwrap().warnings;
+        assert!(
+            warnings.iter().any(|w| w.contains("a1.are.nwnt") && w.contains("line 2")),
+            "{warnings:?}"
+        );
+        assert!(m.contains(&key("module", ResType::IFO)));
+        std::fs::create_dir_all(root.join(".nasher")).unwrap();
+        std::fs::write(root.join(".nasher/user.cfg"), "gffFormat = \"yaml\"\n").unwrap();
         let err = Module::open(&root).unwrap_err().to_string();
-        assert!(err.contains("NWNT"), "{err}");
+        assert!(err.contains("json or nwnt"), "{err}");
     }
 
     /// A compiled script without its source (a module's, from before its
@@ -1816,6 +2018,41 @@ mod tests {
         let (_, bytes) = m.target_archive().unwrap().unwrap();
         let erf = mg_erf::Erf::read(&bytes).unwrap();
         assert!(erf.entries.iter().all(|e| e.restype != ResType::TLK));
+    }
+
+    /// Pack compiles the project's models kept as text where its project
+    /// file says `[pack] compile_models = true` (each against its
+    /// supermodel, found through the lookup), and packs them as text where
+    /// it doesn't.
+    #[test]
+    fn pack_compiles_the_models_where_the_project_file_says() {
+        let root = scratch("pack-models");
+        let text = "newmodel kid\nsetsupermodel kid base\nbeginmodelgeom kid\n\
+            node dummy kid\n  parent NULL\nendnode\nendmodelgeom kid\ndonemodel kid\n";
+        let base = text.replace("kid", "base").replace("setsupermodel base base", "");
+        let mut m = module();
+        m.set(key("kid", ResType::MDL), text.as_bytes());
+        m.save_as(&project_location(&root)).unwrap();
+        let lookup = |n: &str, t: ResType| {
+            (n == "base" && t == ResType::MDL).then(|| base.clone().into_bytes())
+        };
+        let packed = |m: &Module| {
+            let (_, bytes, models) = m.target_archive_with(&lookup).unwrap().unwrap();
+            let erf = mg_erf::Erf::read(&bytes).unwrap();
+            let entry = erf.entries.iter().find(|e| e.restype == ResType::MDL).unwrap();
+            (erf.data(entry).unwrap().to_vec(), models)
+        };
+        let (data, models) = packed(&Module::open(&root).unwrap());
+        assert_eq!(data, text.as_bytes(), "not asked: as text");
+        assert!(models.is_empty());
+        std::fs::write(root.join("moonglow.toml"), "[pack]\ncompile_models = true\n").unwrap();
+        let (data, models) = packed(&Module::open(&root).unwrap());
+        assert!(mg_mdl::is_binary(&data), "asked: compiled");
+        assert_eq!(models.len(), 1);
+        assert!(models[0].result.is_ok(), "{:?}", models[0].result);
+        // (target_archive packs what the project holds, as it is.)
+        let (_, bytes) = Module::open(&root).unwrap().target_archive().unwrap().unwrap();
+        assert!(mg_erf::Erf::read(&bytes).is_ok());
     }
 
     /// A new talk table made in a project goes into it as nasher keeps one:

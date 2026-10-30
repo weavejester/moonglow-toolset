@@ -1,6 +1,6 @@
-//! Game images in the UI (portraits, icons): a texture, the module's or the
-//! game's (DDS over TGA, as the engine prefers), decoded once and kept as
-//! an egui texture.
+//! Game images in the UI (portraits, icons): a texture found as the game
+//! finds it (DDS over TGA, as the engine prefers, the module being edited
+//! below its haks), decoded once and kept as an egui texture.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use mg_edit::Workspace;
 use mg_gff::Struct;
 use mg_resman::ResKey;
 use mg_rules::GameData;
+use mg_rules::items::{ARMOR_ICON, icon_names as item_icon_names};
 
 use crate::Moonglow;
 use egui::Ui;
@@ -44,16 +45,6 @@ pub(crate) struct Loader<'a> {
     pub game: &'a GameData,
 }
 
-/// Armor icon parts, bottom first: (field, icon part).
-const ARMOR_ICON: [(&str, &str); 6] = [
-    ("ArmorPart_Pelvis", "pelvis"),
-    ("ArmorPart_Torso", "chest"),
-    ("ArmorPart_Belt", "belt"),
-    ("ArmorPart_LShoul", "shol"),
-    ("ArmorPart_RShoul", "shor"),
-    ("ArmorPart_Robe", "robe"),
-];
-
 /// The PLT layers' colours an item gives (metal, cloth and leather; skin,
 /// hair and tattoos the first colour).
 pub(crate) fn item_colors(item: &Struct) -> [u8; 10] {
@@ -65,44 +56,41 @@ pub(crate) fn item_colors(item: &Struct) -> [u8; 10] {
     colors
 }
 
+/// The PLT layers' colours an armor's part `part` (an index of
+/// [`mg_rules::items::ARMOR_PARTS`]) is drawn in: the part's own where it
+/// has them (EE), else the armor's. The game's inventory icon draws each
+/// part's layer so (seen in the client: `reading_inventory_icons`).
+pub(crate) fn part_colors(item: &Struct, part: usize) -> [u8; 10] {
+    let mut colors = item_colors(item);
+    for channel in mg_rules::items::ArmorChannel::ALL {
+        if let Some(c) = mg_rules::items::armor_part_color(item, part, channel) {
+            colors[channel.plt_layer()] = c;
+        }
+    }
+    colors
+}
+
+/// The armor part (an index of [`mg_rules::items::ARMOR_PARTS`]) each
+/// layer of an armor's icon is ([`item_icon_names`]'s, bottom first).
+fn armor_icon_parts(item: &Struct) -> Vec<usize> {
+    ARMOR_ICON
+        .iter()
+        .filter(|(l, _)| part(item, l) > 0)
+        .filter_map(|(l, _)| mg_rules::items::ARMOR_PARTS.iter().position(|(f, _)| f == l))
+        .collect()
+}
+
 /// A model or part number: the EE twin (`xModelPart1`) where there is one.
 fn part(item: &Struct, label: &str) -> i64 {
     mg_rules::items::part_number(item, label).unwrap_or(0)
 }
 
-/// The names of an item's inventory icon layers, bottom first (nwn.wiki,
-/// baseitems.2da): `i<ItemClass>_<model>` for simple and layered items
-/// (`_m_` between for gender-specific ones), a composite weapon's bottom,
-/// middle and top (`_b_`, `_m_`, `_t_`), an armor's pelvis, chest, belt,
-/// shoulders and robe (`ipm_<part><number>`). Where `female`, the icons a
-/// woman's inventory shows (`ipf_`, `_f_`), for the items that have both.
-pub(crate) fn item_icon_names(game: &GameData, item: &Struct, female: bool) -> Vec<String> {
-    let g = if female { 'f' } else { 'm' };
-    let Ok(t) = game.table("baseitems") else { return Vec::new() };
-    let Ok(row) = usize::try_from(item.integer("BaseItem").unwrap_or(-1)) else {
-        return Vec::new();
-    };
-    let class = t.get(row, "ItemClass").unwrap_or_default().to_ascii_lowercase();
-    match t.get_int(row, "ModelType").unwrap_or(0) {
-        2 => [("ModelPart1", "b"), ("ModelPart2", "m"), ("ModelPart3", "t")]
-            .iter()
-            .map(|(l, p)| format!("i{class}_{p}_{:03}", part(item, l)))
-            .collect(),
-        3 => ARMOR_ICON
-            .iter()
-            .map(|(l, p)| (part(item, l), p))
-            .filter(|(n, _)| *n > 0)
-            .map(|(n, p)| format!("ip{g}_{p}{n:03}"))
-            .collect(),
-        _ => {
-            let gender = if t.get_int(row, "GenderSpecific") == Some(1) {
-                format!("{g}_")
-            } else {
-                String::new()
-            };
-            vec![format!("i{class}_{gender}{:03}", part(item, "ModelPart1"))]
-        }
-    }
+/// Whether an item's icon is an armor's, of parts (baseitems.2da
+/// `ModelType` 3).
+fn is_armor(game: &GameData, item: &Struct) -> bool {
+    let Ok(t) = game.table("baseitems") else { return false };
+    usize::try_from(item.integer("BaseItem").unwrap_or(-1))
+        .is_ok_and(|row| t.get_int(row, "ModelType") == Some(3))
 }
 
 /// Where a resource comes from in the load order, as a builder names it,
@@ -129,21 +117,69 @@ pub(crate) fn origin_name(layer: &str) -> String {
     }
 }
 
-/// The two halves of a loading screen's square texture (rows from the
-/// bottom, as stored), side by side.
-fn stitched(whole: &mg_image::Rgba) -> Option<mg_image::Rgba> {
-    let n = whole.width as usize;
-    if n < 2 || whole.height as usize != n || whole.data.len() != n * n * 4 {
+/// The part of a loading screen's texture each mesh of `pnl_loadscreen`
+/// shows, left to right: its texture coordinates' rectangle `[u0, v0, u1,
+/// v1]`.
+type ScreenParts = Vec<[f32; 4]>;
+
+/// The game's own `pnl_loadscreen`'s: the left half of the picture in the
+/// texture's lower half from its left edge, the right half in its upper
+/// half up to its right edge, each 25/32 of its width.
+const STOCK_SCREEN: [[f32; 4]; 2] = [[0.0, 0.0, 0.781_25, 0.5], [0.218_75, 0.5, 1.0, 1.0]];
+
+/// How a `pnl_loadscreen` model (`model`, the one the game loads: a hak's
+/// own, else the game's) lays the loading screen out: each mesh drawn with
+/// `gui_replace01`, the texture the game puts the screen's picture in, as
+/// the rectangle of its texture coordinates, by where the mesh stands
+/// from the left. `None` where none is drawn so.
+fn screen_parts(model: &[u8]) -> Option<ScreenParts> {
+    let model = mg_mdl::Model::read(model).ok()?;
+    let mut parts: Vec<(f32, [f32; 4])> = Vec::new();
+    for node in &model.nodes {
+        let Some(mesh) = node.mesh() else { continue };
+        let replaced = mesh.textures[0].as_deref().is_some_and(|t| t == "gui_replace01");
+        if !replaced || mesh.uvs[0].is_empty() {
+            continue;
+        }
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for uv in &mesh.uvs[0] {
+            for i in 0..2 {
+                lo[i] = lo[i].min(uv[i].clamp(0.0, 1.0));
+                hi[i] = hi[i].max(uv[i].clamp(0.0, 1.0));
+            }
+        }
+        let left = mesh.vertices.iter().map(|v| v[0]).fold(f32::MAX, f32::min);
+        parts.push((node.position[0] + left, [lo[0], lo[1], hi[0], hi[1]]));
+    }
+    parts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let parts: ScreenParts = parts.into_iter().map(|(_, r)| r).collect();
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// A loading screen's picture from its texture (rows from the bottom, as
+/// stored), its `parts` side by side ([`screen_parts`]): each as many
+/// pixels as it covers of the texture, as high as the lowest of them.
+fn stitched(whole: &mg_image::Rgba, parts: &[[f32; 4]]) -> Option<mg_image::Rgba> {
+    let (w, h) = (whole.width as usize, whole.height as usize);
+    if w < 2 || h < 2 || whole.data.len() != w * h * 4 || parts.is_empty() {
         return None;
     }
-    let (w, h) = (n * 25 / 32, n / 2);
-    let mut data = Vec::with_capacity(2 * w * h * 4);
-    for y in 0..h {
-        let row = |y: usize, from: usize| &whole.data[(y * n + from) * 4..(y * n + from + w) * 4];
-        data.extend_from_slice(row(y, 0));
-        data.extend_from_slice(row(n - h + y, n - w));
+    let px = |f: f32, n: usize| ((f * n as f32).round() as usize).min(n);
+    let rects: Vec<[usize; 4]> =
+        parts.iter().map(|p| [px(p[0], w), px(p[1], h), px(p[2], w), px(p[3], h)]).collect();
+    let height = rects.iter().map(|r| r[3].saturating_sub(r[1])).min()?;
+    let width: usize = rects.iter().map(|r| r[2].saturating_sub(r[0])).sum();
+    if height == 0 || width == 0 {
+        return None;
     }
-    Some(mg_image::Rgba { width: (2 * w) as u32, height: h as u32, data })
+    let mut data = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for r in &rects {
+            let row = (r[1] + y) * w;
+            data.extend_from_slice(&whole.data[(row + r[0]) * 4..(row + r[2]) * 4]);
+        }
+    }
+    Some(mg_image::Rgba { width: width as u32, height: height as u32, data })
 }
 
 /// A texture as pixels no more than `side` across: its first mip level that
@@ -184,24 +220,30 @@ fn small(texture: &mg_image::Texture, side: u32) -> mg_image::Rgba {
 }
 
 impl Loader<'_> {
-    /// A resource's bytes: the module's, else the game's.
+    /// A resource's bytes as the game reads them: the module being edited
+    /// (its unsaved changes too) in its place in the load order, below its
+    /// haks and over `override/` (`ResMan::get_over`).
     fn data(&self, key: ResKey) -> Option<Arc<[u8]>> {
-        let module = self.ws.and_then(|ws| ws.module.get(&key)).map(Arc::from);
-        module.or_else(|| self.game.resman.get(&key).ok().map(|d| Arc::from(&*d)))
+        let rm = &self.game.resman;
+        let Some(ws) = self.ws else { return rm.get(&key).ok().map(|d| Arc::from(&*d)) };
+        let module = |k: &ResKey| ws.module.get(k).map(std::borrow::Cow::Borrowed);
+        rm.get_over(&key, module).map(|(d, _)| Arc::from(&*d))
     }
 
-    /// A texture's type and bytes: the module's (DDS, then TGA), else the
-    /// game's as the engine prefers.
+    /// A texture's type and bytes as the game finds it (DDS over TGA in a
+    /// class of layers, the module being edited among the ERFs below its
+    /// haks: `ResMan::texture_over`). A portrait both the module and a hak
+    /// have is the hak's, as in the game.
     fn texture(&self, name: ResRef) -> Option<(ResType, Arc<[u8]>)> {
-        let module = self.ws.and_then(|ws| {
-            [ResType::DDS, ResType::TGA]
-                .into_iter()
-                .find_map(|t| ws.module.get(&ResKey::new(name, t)).map(|d| (t, Arc::from(d))))
-        });
-        module.or_else(|| {
-            let (t, data) = self.game.resman.texture(name)?;
-            Some((t, Arc::from(&*data)))
-        })
+        let rm = &self.game.resman;
+        let found = match self.ws {
+            Some(ws) => {
+                let module = |k: &ResKey| ws.module.get(k).map(std::borrow::Cow::Borrowed);
+                rm.texture_over(name, module).map(|(t, d, _)| (t, d))
+            }
+            None => rm.texture(name),
+        };
+        found.map(|(t, d)| (t, Arc::from(&*d)))
     }
 
     fn keep(
@@ -272,22 +314,30 @@ impl Loader<'_> {
         self.keep(ctx, key, rgba)
     }
 
-    /// A loading screen's picture as the game shows it, loaded once. The
-    /// texture is square and holds the wide picture in two halves, as the
-    /// game's `pnl_loadscreen` model maps them: the left half in the
-    /// texture's lower half from its left edge, the right half in its
-    /// upper half up to its right edge, each 25/32 of its width. A texture
-    /// that isn't square is shown as it is.
+    /// A loading screen's picture as the game shows it, loaded once: the
+    /// parts of its texture the `pnl_loadscreen` model the game loads (a
+    /// hak's own, else the game's) maps, side by side ([`screen_parts`];
+    /// the game's own model's where none is read: [`STOCK_SCREEN`]). A
+    /// texture not found has the small preview Aurora shows in its place
+    /// (`<name>s`), as it is, where there is one.
     pub(crate) fn load_screen(&mut self, ctx: &egui::Context, name: &str) -> Option<Picture> {
         let key = format!("{}#loadscreen", name.to_ascii_lowercase());
         if let Some(p) = self.pictures.get(&key) {
             return p.clone();
         }
-        let rgba = ResRef::from_str(name).ok().and_then(|r| {
+        let model = ResRef::from_str("pnl_loadscreen").ok().map(|r| ResKey::new(r, ResType::MDL));
+        let parts = model.and_then(|k| self.data(k)).and_then(|m| screen_parts(&m));
+        let parts = parts.unwrap_or_else(|| STOCK_SCREEN.to_vec());
+        let read = |r: ResRef| -> Option<mg_image::Rgba> {
             let (t, data) = self.texture(r)?;
-            let whole = mg_image::read(t, &data).ok()?.to_rgba();
-            Some(stitched(&whole).unwrap_or(whole))
-        });
+            Some(mg_image::read(t, &data).ok()?.to_rgba())
+        };
+        let rgba = ResRef::from_str(name)
+            .ok()
+            .and_then(read)
+            .map(|whole| stitched(&whole, &parts).unwrap_or(whole));
+        let small = || ResRef::from_str(&format!("{name}s")).ok().and_then(read);
+        let rgba = rgba.or_else(small);
         self.keep(ctx, key, rgba)
     }
 
@@ -306,11 +356,7 @@ impl Loader<'_> {
         let rgba = ResRef::from_str(name).ok().and_then(|r| {
             let plt = mg_image::plt::Plt::read(&self.data(ResKey::new(r, ResType::PLT))?).ok()?;
             // (The ten palettes, read once for every colouring.)
-            let palettes: Vec<Option<Arc<mg_image::Rgba>>> =
-                mg_image::plt::PALETTES.iter().map(|p| self.palette(p)).collect();
-            let refs: [Option<&mg_image::Rgba>; 10] =
-                std::array::from_fn(|i| palettes[i].as_deref());
-            Some(plt.colorize(&refs, colors))
+            Some(plt.colorize_by(|p| self.palette(p), colors))
         });
         self.keep(ctx, key, rgba)
     }
@@ -358,13 +404,20 @@ impl Loader<'_> {
         let names = item_icon_names(self.game, item, female);
         let his = if female { item_icon_names(self.game, item, false) } else { Vec::new() };
         let colors = item_colors(item);
-        let one =
-            |l: &mut Self, n: &str| l.plt_picture(ctx, n, colors).or_else(|| l.picture(ctx, n));
+        // (An armor's layers each in its part's colors: its own where it
+        // has them.)
+        let parts = if is_armor(self.game, item) { armor_icon_parts(item) } else { Vec::new() };
+        let colors_of = |i: usize| parts.get(i).map_or(colors, |&p| part_colors(item, p));
+        let one = |l: &mut Self, n: &str, colors| {
+            l.plt_picture(ctx, n, colors).or_else(|| l.picture(ctx, n))
+        };
         let mut layers: Vec<Picture> = names
             .iter()
             .enumerate()
             .filter_map(|(i, n)| {
-                one(self, n).or_else(|| his.get(i).filter(|m| *m != n).and_then(|m| one(self, m)))
+                let c = colors_of(i);
+                one(self, n, c)
+                    .or_else(|| his.get(i).filter(|m| *m != n).and_then(|m| one(self, m, c)))
             })
             .collect();
         if layers.is_empty() {
@@ -407,6 +460,20 @@ impl Moonglow {
         })
     }
 
+    /// [`Moonglow::loader`], and the thumbnails made to look up beside it.
+    pub(crate) fn loader_and_thumbnails(
+        &mut self,
+    ) -> Option<(Loader<'_>, &crate::model_view::Thumbnails)> {
+        let game = self.game.as_deref()?;
+        let loader = Loader {
+            pictures: &mut self.pictures,
+            palettes: &mut self.palettes,
+            ws: self.ws.as_ref(),
+            game,
+        };
+        Some((loader, &self.thumbnails))
+    }
+
     /// The image named `name` (a texture resref), loaded once; `None` if
     /// there is none or it does not decode.
     pub fn picture(&mut self, ctx: &egui::Context, name: &str) -> Option<Picture> {
@@ -417,6 +484,18 @@ impl Moonglow {
     /// armor is shown on one (Options › General).
     pub fn item_icon(&mut self, ctx: &egui::Context, item: &Struct) -> Vec<Picture> {
         let female = self.settings.armor_on_woman;
+        self.item_icon_of(ctx, item, female)
+    }
+
+    /// An item's inventory icon as a woman's inventory shows it, where
+    /// `female`, else as a man's: a creature's own (the game shows a
+    /// woman's armor with her `ipf_` icons, seen in the client).
+    pub fn item_icon_of(
+        &mut self,
+        ctx: &egui::Context,
+        item: &Struct,
+        female: bool,
+    ) -> Vec<Picture> {
         self.loader().map(|mut l| l.item_icon_on(ctx, item, female)).unwrap_or_default()
     }
 }
@@ -502,29 +581,6 @@ pub(crate) fn cropped(ui: &mut egui::Ui, p: &Picture, most: f32, alt: &str) -> e
     response
 }
 
-/// A palette colour's tones (its row, `index` counted from the top, at four
-/// grey levels), as the colour chooser shows them.
-pub(crate) fn tones(palette: &mg_image::Rgba, index: u8) -> [egui::Color32; 4] {
-    let rows = palette.height.max(1);
-    let y = rows - 1 - u32::from(index).min(rows - 1);
-    [64u32, 128, 192, 250].map(|x| {
-        let [r, g, b, _] = palette.pixel(x.min(palette.width.saturating_sub(1)), y);
-        egui::Color32::from_rgb(r, g, b)
-    })
-}
-
-/// Paints a swatch: the tones side by side.
-pub(crate) fn swatch(ui: &Ui, rect: egui::Rect, tones: &[egui::Color32; 4]) {
-    let w = rect.width() / tones.len() as f32;
-    for (i, c) in tones.iter().enumerate() {
-        let r = egui::Rect::from_min_size(
-            rect.min + egui::vec2(w * i as f32, 0.0),
-            egui::vec2(w, rect.height()),
-        );
-        ui.painter().rect_filled(r, 0.0, *c);
-    }
-}
-
 /// The part of an image that isn't transparent, in texture coordinates
 /// (rows top first); all of it when none is.
 fn drawn(rgba: &mg_image::Rgba) -> egui::Rect {
@@ -594,6 +650,116 @@ mod tests {
     use mg_gff::Value;
 
     use super::*;
+
+    /// A texture whose every pixel says where it is (red its column, green
+    /// its row).
+    fn where_texture(w: u32, h: u32) -> mg_image::Rgba {
+        let data = (0..h).flat_map(|y| (0..w).flat_map(move |x| [x as u8, y as u8, 0, 255]));
+        mg_image::Rgba { width: w, height: h, data: data.collect() }
+    }
+
+    /// The game's own layout: the left half of the picture is the
+    /// texture's first rows from its left edge, the right half its last
+    /// rows up to its right edge, 25/32 of its width each.
+    #[test]
+    fn a_loading_screen_is_put_together_as_the_stock_model_lays_it_out() {
+        let n = 64;
+        let out = stitched(&where_texture(n, n), &STOCK_SCREEN).unwrap();
+        assert_eq!((out.width, out.height), (100, 32));
+        let at =
+            |x: usize, y: usize| (out.data[(y * 100 + x) * 4], out.data[(y * 100 + x) * 4 + 1]);
+        assert_eq!(at(0, 0), (0, 0));
+        assert_eq!(at(49, 31), (49, 31), "the left half's last pixel");
+        assert_eq!(at(50, 0), (14, 32), "the right half: the upper rows, from 7/32 across");
+        assert_eq!(at(99, 31), (63, 63));
+        // A texture of nothing, or parts of nothing: none.
+        assert!(stitched(&where_texture(1, 1), &STOCK_SCREEN).is_none());
+        assert!(stitched(&where_texture(8, 8), &[[0.5, 0.5, 0.5, 1.0]]).is_none());
+        // The game's own model, read as a hak's would be, gives the same.
+        let Some(root) = mg_testkit::nwn_root() else { return };
+        let install = mg_resman::GameInstall::new(&root, None, "en");
+        let rm = mg_resman::ResMan::for_game(&install).unwrap();
+        let key = ResKey::parse("pnl_loadscreen", ResType::MDL).unwrap();
+        let parts = screen_parts(&rm.get(&key).unwrap()).unwrap();
+        assert_eq!(parts.len(), 2);
+        for (got, want) in parts.iter().zip(STOCK_SCREEN) {
+            assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-4), "{got:?}");
+        }
+    }
+
+    /// A hak's own `pnl_loadscreen` (written here: three panels of a wide
+    /// texture, listed out of their order on screen, and a frame drawn
+    /// with another texture) is laid out as it maps the texture.
+    #[test]
+    fn a_loading_screen_follows_a_hak_s_own_model() {
+        let quad = |name: &str, x: f32, bitmap: &str, uv: [f32; 4]| {
+            let [u0, v0, u1, v1] = uv;
+            format!(
+                "node trimesh {name}\n  parent screen\n  bitmap {bitmap}\n  verts 4\n    -1 1 0\n    \
+                 -1 -1 0\n    1 1 0\n    1 -1 0\n  tverts 4\n    {u0} {v1} 0\n    {u0} {v0} 0\n    \
+                 {u1} {v1} 0\n    {u1} {v0} 0\n  faces 2\n    0 1 2 1 0 1 2 1\n    \
+                 3 2 1 1 3 2 1 1\n  position {x} 0 0\nendnode\n"
+            )
+        };
+        let text = format!(
+            "newmodel screen\nsetsupermodel screen NULL\nbeginmodelgeom screen\nnode dummy screen\n  \
+             parent NULL\nendnode\n{}{}{}{}endmodelgeom screen\ndonemodel screen\n",
+            quad("right", 2.0, "gui_replace01", [0.5, 0.5, 1.0, 1.0]),
+            quad("frame", 0.0, "gui_boxes_ingame", [0.0, 0.0, 0.1, 0.1]),
+            quad("left", -2.0, "gui_replace01", [0.0, 0.0, 0.5, 0.5]),
+            quad("middle", 0.0, "gui_replace01", [0.5, 0.0, 1.0, 0.5]),
+        );
+        let parts = screen_parts(text.as_bytes()).unwrap();
+        assert_eq!(parts, [[0.0, 0.0, 0.5, 0.5], [0.5, 0.0, 1.0, 0.5], [0.5, 0.5, 1.0, 1.0]]);
+        let out = stitched(&where_texture(64, 32), &parts).unwrap();
+        assert_eq!((out.width, out.height), (96, 16));
+        let at = |x: usize| (out.data[x * 4], out.data[x * 4 + 1]);
+        assert_eq!([at(0), at(32), at(64)], [(0, 0), (32, 0), (32, 16)]);
+        // A model with no such mesh, or not a model: the stock layout.
+        let bare = "newmodel x\nbeginmodelgeom x\nnode dummy x\n  parent NULL\nendnode\n\
+                    endmodelgeom x\ndonemodel x\n";
+        assert!(screen_parts(bare.as_bytes()).is_none());
+        assert!(screen_parts(b"\0\0garbage").is_none());
+    }
+
+    /// A picture both the module being edited and one of its haks have is
+    /// the hak's, as the game reads it (`mg which`: the hak, the module
+    /// overridden); one only the module has is its unsaved copy.
+    #[test]
+    fn a_picture_a_hak_and_the_module_both_have_is_the_hak_s() {
+        let tga = |level: u8| {
+            let mut t = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 32, 8];
+            t.extend([level, level, level, 255]);
+            t
+        };
+        let key = |n: &str| ResKey::parse(n, ResType::TGA).unwrap();
+        let mut hak = mg_resman::MemContainer::new();
+        hak.insert(key("po_bothm"), tga(10));
+        let mut saved = mg_resman::MemContainer::new();
+        saved.insert(key("po_bothm"), tga(20));
+        let mut rm = mg_resman::ResMan::new();
+        rm.add(
+            mg_resman::priority::MODULE,
+            mg_resman::MODULE_LABEL,
+            mg_resman::LayerClass::Erf,
+            saved,
+        );
+        rm.add(mg_resman::priority::HAK, "hak:pics", mg_resman::LayerClass::Erf, hak);
+        let game = GameData::new(rm, mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let mut m = mg_module::Module::new();
+        m.set(key("po_bothm"), tga(30));
+        m.set(key("po_modm"), tga(40));
+        let ws = Workspace::new(m);
+        let (mut pictures, mut palettes) = (Pictures::new(), Palettes::new());
+        let loader =
+            Loader { pictures: &mut pictures, palettes: &mut palettes, ws: Some(&ws), game: &game };
+        let level = |name: &str| {
+            let (t, d) = loader.texture(ResRef::from_str(name).unwrap()).unwrap();
+            mg_image::read(t, &d).unwrap().to_rgba().data[0]
+        };
+        assert_eq!(level("po_bothm"), 10);
+        assert_eq!(level("po_modm"), 40);
+    }
 
     #[test]
     fn a_thumbnail_is_a_small_mip_level_or_scaled_down() {

@@ -1,6 +1,7 @@
 //! The tileset editor (Tools › Tilesets): a `.set` file on disk, edited in
 //! place line by line (`mg_set::edit`), with undo: its general settings,
-//! terrains and crossers, tiles and groups. It also makes the tileset's
+//! terrains and crossers, painting rules, tiles (and their door hooks) and
+//! groups. It also makes the tileset's
 //! palette beside it and checks it with the content doctor.
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ pub enum Page {
     #[default]
     General,
     Terrain,
+    Rules,
     Tiles,
     Groups,
 }
@@ -46,6 +48,9 @@ pub struct TilesetDoc {
     /// index, and the name typed.
     pub renaming: Option<(bool, usize, String)>,
     pub findings: Option<Vec<mg_module::doctor::Finding>>,
+    /// The tile the list was last scrolled to or clicked: a tile chosen
+    /// otherwise (a check's finding, Add Tile) is scrolled into sight.
+    scrolled_to: Option<usize>,
 }
 
 impl TilesetDoc {
@@ -66,7 +71,24 @@ impl TilesetDoc {
             new_type: String::new(),
             renaming: None,
             findings: None,
+            scrolled_to: None,
         }
+    }
+
+    /// Shows the page named `page` (as [`page_name`] names it), the tile
+    /// and the group, as a session kept them (those past the file's end
+    /// left out).
+    pub(crate) fn show(&mut self, page: Option<&str>, tile: Option<usize>, group: Option<usize>) {
+        let pages = [Page::General, Page::Terrain, Page::Rules, Page::Tiles, Page::Groups];
+        if let Some(p) = pages.into_iter().find(|p| Some(page_name(*p)) == page) {
+            self.page = p;
+        }
+        let (tiles, groups) = match &self.set {
+            Ok(t) => (t.tiles.len(), t.groups.len()),
+            Err(_) => (0, 0),
+        };
+        self.tile = tile.filter(|&t| t < tiles);
+        self.group = group.filter(|&g| g < groups);
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -196,11 +218,14 @@ fn read(file: &SetFile) -> Result<Arc<Tileset>, String> {
 pub fn new_tileset(app: &mut Moonglow) {
     let suggested = PathBuf::from("zzz01.set");
     let Some(path) = app.dialogs.save_file(FileKind::Tileset, Some(&suggested)) else { return };
-    let name = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if name.is_empty() || name.len() > 16 {
-        app.log.error("A tileset's name has 1 to 16 characters");
-        return;
-    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = match mg_core::ResRef::new_name(&stem) {
+        Ok(name) => name.to_string_lossy(),
+        Err(e) => {
+            app.log.error(format!("{stem}: a tileset's name: {e}"));
+            return;
+        }
+    };
     let file = edit::skeleton(&name);
     if let Err(e) = std::fs::write(&path, file.text()) {
         app.log.error(format!("{}: {e}", path.display()));
@@ -237,6 +262,11 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui, id: u32) {
         ui.label("This tileset was closed.");
         return;
     };
+    // OK and Cancel, as the other editors have: a tileset is saved when
+    // asked.
+    if crate::side_doc::ok_cancel(app, ui, &crate::Tab::Tileset(id), false, |_| {}) {
+        return;
+    }
     // The doc is taken out while drawn (its fields edit through the app's
     // buffers), and put back.
     let mut doc = app.tilesets.remove(i);
@@ -261,6 +291,7 @@ fn draw(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc) {
         for (page, name) in [
             (Page::General, "General"),
             (Page::Terrain, "Terrains and Crossers"),
+            (Page::Rules, "Painting Rules"),
             (Page::Tiles, "Tiles"),
             (Page::Groups, "Groups"),
         ] {
@@ -305,7 +336,7 @@ fn draw(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc) {
             .on_disabled_hover_text("Rendering needs a GPU")
             .clicked()
         {
-            render_minimaps(app, d, 32);
+            render_minimaps(app, d);
         }
     });
     if let Err(e) = &d.set {
@@ -332,6 +363,7 @@ fn draw(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc) {
         Page::General => general(app, ui, d),
         Page::Terrain => terrain(ui, d),
         Page::Tiles => tiles(app, ui, d),
+        Page::Rules => rules(ui, d),
         Page::Groups => groups(app, ui, d),
     }
 }
@@ -456,8 +488,64 @@ fn general(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc) {
     });
 }
 
+/// A page's name, as its tab shows it (and a session keeps it).
+pub(crate) fn page_name(page: Page) -> &'static str {
+    match page {
+        Page::General => "General",
+        Page::Terrain => "Terrains and Crossers",
+        Page::Rules => "Painting Rules",
+        Page::Tiles => "Tiles",
+        Page::Groups => "Groups",
+    }
+}
+
+/// Why tile `i` is a hole, as the game reads the tileset (it draws such a
+/// tile as nothing, with no walkmesh; `engine_tileset_holes`): no section
+/// of its own, or no model in it. `None` for a whole tile.
+pub fn tile_hole(t: &Tileset, i: usize) -> Option<String> {
+    let section = format!("TILE{i}");
+    if t.missing_sections.contains(&section) {
+        Some(format!("no [{section}] section"))
+    } else if t.tiles.get(i).is_some_and(|x| x.model.trim().is_empty()) {
+        Some("no Model=".into())
+    } else {
+        None
+    }
+}
+
+/// The holes of the lists whose sections begin with one of `prefixes`
+/// (`TERRAIN`, `PRIMARY RULE`), said under a page: the game leaves each
+/// out, and the numbers the page gives count the entries there are.
+fn list_holes(ui: &mut Ui, t: &Tileset, prefixes: &[&str]) {
+    let gone: Vec<&String> = (t.missing_sections.iter())
+        .filter(|s| {
+            prefixes.iter().any(|p| {
+                s.strip_prefix(p)
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .collect();
+    if gone.is_empty() {
+        return;
+    }
+    let names: Vec<String> = gone.iter().take(12).map(|s| format!("[{s}]")).collect();
+    let more =
+        if gone.len() > 12 { format!(" and {} more", gone.len() - 12) } else { String::new() };
+    ui.add_space(crate::widgets::SECTION_GAP);
+    ui.add(
+        egui::Label::new(egui::RichText::new(format!(
+            "Holes: the file has no {}{more}. The game leaves them out, and the numbers here count \
+             the entries the file has.",
+            names.join(", ")
+        ))
+        .color(ui.visuals().warn_fg_color))
+        .wrap(),
+    );
+}
+
 fn terrain(ui: &mut Ui, d: &mut TilesetDoc) {
     let Ok(t) = d.set.clone() else { return };
+    list_holes(ui, &t, &["TERRAIN", "CROSSER"]);
     ui.columns(2, |cols| {
         for (col, crosser) in [(0, false), (1, true)] {
             let ui = &mut cols[col];
@@ -567,6 +655,133 @@ fn rename_refused(t: &Tileset, crosser: bool, index: usize, typed: &str) -> Opti
     }
 }
 
+/// The painting rules, primary and secondary: what the area view's
+/// terrain brush changes beside the corners it paints.
+fn rules(ui: &mut Ui, d: &mut TilesetDoc) {
+    // (Scrolled: a game tileset's are a hundred or more.)
+    egui::ScrollArea::vertical()
+        .id_salt(("set-rules", d.id))
+        .auto_shrink([false, false])
+        .show(ui, |ui| rules_in(ui, d));
+}
+
+fn rules_in(ui: &mut Ui, d: &mut TilesetDoc) {
+    let Ok(t) = d.set.clone() else { return };
+    let terrains: Vec<String> = t.terrains.iter().map(|x| x.name.clone()).collect();
+    let note = "Painting a corner Placed beside one Adjacent turns that one into Changed, each at \
+                its height. The terrain brush follows the primary rules.";
+    ui.add(egui::Label::new(egui::RichText::new(note).weak()).wrap());
+    list_holes(ui, &t, &["PRIMARY RULE", "SECONDARY RULE"]);
+    for secondary in [false, true] {
+        let (_, each) = edit::rule_sections(secondary);
+        let list = if secondary { &t.secondary_rules } else { &t.primary_rules };
+        ui.add_space(crate::widgets::SECTION_GAP);
+        crate::widgets::section_heading(
+            ui,
+            if secondary { "Secondary rules" } else { "Primary rules" },
+        );
+        egui::Grid::new(("set-rules", d.id, secondary)).num_columns(7).spacing([10.0, 4.0]).show(
+            ui,
+            |ui| {
+                for head in ["", "Placed", "height", "Adjacent", "height", "Changed", "height"] {
+                    crate::widgets::field_label(ui, head);
+                }
+                ui.end_row();
+                for i in 0..list.len() {
+                    let section = format!("{each}{i}");
+                    ui.monospace(format!("{i:>3}"));
+                    for key in ["Placed", "Adjacent", "Changed"] {
+                        name_key(ui, d, &section, key, &terrains, false);
+                        int_key(ui, d, &section, &format!("{key}Height"), -1..=4);
+                    }
+                    ui.end_row();
+                }
+            },
+        );
+        if list.is_empty() {
+            ui.weak("None.");
+        }
+        ui.horizontal(|ui| {
+            let first = terrains.first().cloned().unwrap_or_default();
+            if ui
+                .add_enabled(!terrains.is_empty(), egui::Button::new("Add Rule"))
+                .on_hover_text("A rule at the end, each terrain the first, at height 0")
+                .on_disabled_hover_text("The tileset has no terrains to name")
+                .clicked()
+            {
+                d.change(|f| {
+                    edit::add_rule(f, secondary, &first, &first, &first);
+                });
+            }
+            if ui.add_enabled(!list.is_empty(), egui::Button::new("Remove Last Rule")).clicked() {
+                d.change(|f| {
+                    edit::remove_last_rule(f, secondary);
+                });
+            }
+        });
+    }
+}
+
+/// The chosen tile's door hooks: where a door placed on the tile stands,
+/// of which `doortypes.2da` row.
+fn door_hooks(app: &Moonglow, ui: &mut Ui, d: &mut TilesetDoc, i: usize) {
+    crate::widgets::section_heading(ui, "Doors");
+    let doors = d.file.doors(i);
+    let types = app.game.as_deref().and_then(|g| g.table("doortypes").ok());
+    egui::Grid::new(("set-doors", d.id, i)).num_columns(7).spacing([10.0, 4.0]).show(ui, |ui| {
+        for head in ["", "Type", "", "X", "Y", "Z", "Orientation (°)"] {
+            crate::widgets::field_label(ui, head);
+        }
+        ui.end_row();
+        for (n, section) in &doors {
+            ui.monospace(format!("{n:>3}"));
+            int_key(ui, d, section, "Type", 0..=i32::MAX);
+            // (Its row's label, where the game data has the table.)
+            let row = d.file.get(section, "Type").and_then(|v| v.trim().parse::<usize>().ok());
+            let label = row.zip(types.as_ref()).and_then(|(r, t)| t.get(r, "Label"));
+            ui.weak(label.unwrap_or_default());
+            for key in ["X", "Y", "Z", "Orientation"] {
+                float_key(ui, d, section, key);
+            }
+            ui.end_row();
+        }
+    });
+    if doors.is_empty() {
+        ui.weak("None: a door can't be placed on this tile.");
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .button("Add Door")
+            .on_hover_text("A door hook at the tile's middle, doortypes.2da row 0: move it below")
+            .clicked()
+        {
+            d.change(|f| {
+                edit::add_door(f, i, 0);
+            });
+        }
+        if ui.add_enabled(!doors.is_empty(), egui::Button::new("Remove Last Door")).clicked() {
+            d.change(|f| {
+                edit::remove_last_door(f, i);
+            });
+        }
+    });
+}
+
+/// A number with a fraction (meters, degrees), committed when it changes
+/// (a drag: when released), written as the game's files write one
+/// (`5.0`).
+fn float_key(ui: &mut Ui, d: &mut TilesetDoc, section: &str, key: &str) {
+    let current =
+        d.file.get(section, key).and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0);
+    if let Some(v) = crate::widgets::commit_number(ui, current, -10_000.0..=10_000.0) {
+        let mut text = v.to_string();
+        if !text.contains('.') {
+            text.push_str(".0");
+        }
+        d.change(|f| f.set(section, key, &text));
+    }
+}
+
 fn tiles(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc) {
     let Ok(t) = d.set.clone() else { return };
     ui.horizontal(|ui| {
@@ -623,31 +838,36 @@ fn tiles(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc) {
         })
         .collect();
     let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-    egui::ScrollArea::vertical().id_salt(("set-tiles", d.id)).max_height(260.0).show_rows(
-        ui,
-        row_height,
-        rows.len(),
-        |ui, range| {
-            for &i in &rows[range] {
-                let tile = &t.tiles[i];
-                let corners: Vec<&str> = tile.corners.iter().map(|(c, _)| c.as_str()).collect();
-                let edges: Vec<&str> =
-                    tile.edges.iter().map(|e| if e.is_empty() { "-" } else { e }).collect();
-                let text = format!(
+    let mut list = egui::ScrollArea::vertical().id_salt(("set-tiles", d.id)).max_height(260.0);
+    if d.tile != d.scrolled_to {
+        d.scrolled_to = d.tile;
+        if let Some(at) = d.tile.and_then(|t| rows.iter().position(|&r| r == t)) {
+            let each = row_height + ui.spacing().item_spacing.y;
+            list = list.vertical_scroll_offset((at as f32 * each - 100.0).max(0.0));
+        }
+    }
+    list.show_rows(ui, row_height, rows.len(), |ui, range| {
+        for &i in &rows[range] {
+            let tile = &t.tiles[i];
+            let corners: Vec<&str> = tile.corners.iter().map(|(c, _)| c.as_str()).collect();
+            let edges: Vec<&str> =
+                tile.edges.iter().map(|e| if e.is_empty() { "-" } else { e }).collect();
+            let text = match tile_hole(&t, i) {
+                Some(why) => egui::RichText::new(format!("{i:>4}  a hole: {why}"))
+                    .color(ui.visuals().warn_fg_color),
+                None => egui::RichText::new(format!(
                     "{i:>4}  {:<16}  {}  [{}]",
                     tile.model,
                     corners.join("/"),
                     edges.join("/")
-                );
-                if ui
-                    .selectable_label(d.tile == Some(i), egui::RichText::new(text).monospace())
-                    .clicked()
-                {
-                    d.tile = Some(i);
-                }
+                )),
+            };
+            if ui.selectable_label(d.tile == Some(i), text.monospace()).clicked() {
+                d.tile = Some(i);
+                d.scrolled_to = Some(i);
             }
-        },
-    );
+        }
+    });
     ui.separator();
     let Some(i) = d.tile.filter(|&i| i < t.tiles.len()) else {
         ui.weak("Choose a tile to edit it.");
@@ -681,6 +901,18 @@ fn tile_details(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc, t: &Tileset
             app.actions.push(Action::OpenTab(Tab::Model(k)));
         }
     });
+    if let Some(why) = tile_hole(t, i) {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "A hole: {why}. The game draws the tile as nothing, with no walkmesh, and \
+                     painting never chooses it; a model typed here fills it in."
+                ))
+                .color(ui.visuals().warn_fg_color),
+            )
+            .wrap(),
+        );
+    }
     egui::Grid::new(("set-tile", d.id)).num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
         for (key, label) in [
             ("Model", "Model"),
@@ -692,7 +924,7 @@ fn tile_details(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc, t: &Tileset
             text_key(app, ui, d, &section, key, 160.0);
             ui.end_row();
         }
-        ui.label("Orientation");
+        crate::widgets::field_label(ui, "Orientation");
         // Degrees, a quarter turn at a time.
         let current = d
             .file
@@ -707,16 +939,15 @@ fn tile_details(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc, t: &Tileset
             d.change(|f| f.set(&section, "Orientation", &chosen.to_string()));
         }
         ui.end_row();
-        for (n, corner) in CORNERS.iter().enumerate() {
-            ui.label(*corner);
+        for corner in CORNERS {
+            crate::widgets::field_label(ui, corner);
             name_key(ui, d, &section, corner, &terrains, false);
             ui.label("height");
             int_key(ui, d, &section, &format!("{corner}Height"), -1..=4);
             ui.end_row();
-            let _ = n;
         }
         for edge in EDGES {
-            ui.label(format!("{edge} edge"));
+            crate::widgets::field_label(ui, format!("{edge} edge"));
             name_key(ui, d, &section, edge, &crossers, true);
             ui.end_row();
         }
@@ -734,6 +965,8 @@ fn tile_details(app: &mut Moonglow, ui: &mut Ui, d: &mut TilesetDoc, t: &Tileset
             flag_key(ui, d, &section, key, key);
         }
     });
+    ui.add_space(crate::widgets::SECTION_GAP);
+    door_hooks(app, ui, d, i);
     ui.separator();
     // What the tile's model draws, as the game data has it (as Preview
     // shows it).
@@ -845,10 +1078,13 @@ fn make_palette(app: &mut Moonglow, d: &mut TilesetDoc) {
     }
 }
 
-/// Renders every tile's minimap picture into the `.set`'s folder, its
-/// models found there or in the game data. Tiles without a picture's name
-/// get `mi_<model>` (one undoable change).
-pub fn render_minimaps(app: &mut Moonglow, d: &mut TilesetDoc, size: u32) {
+/// How wide and high a minimap picture is rendered, in pixels.
+pub const MINIMAP_SIZE: u32 = 32;
+
+/// Renders every tile's minimap picture ([`MINIMAP_SIZE`] square) into the
+/// `.set`'s folder, its models found there or in the game data. Tiles
+/// without a picture's name get `mi_<model>` (one undoable change).
+pub fn render_minimaps(app: &mut Moonglow, d: &mut TilesetDoc) {
     let Ok(t) = d.set.clone() else { return };
     let dir = d.path.parent().map(PathBuf::from).unwrap_or_default();
     // Unnamed pictures named after their models.
@@ -890,7 +1126,7 @@ pub fn render_minimaps(app: &mut Moonglow, d: &mut TilesetDoc, size: u32) {
         if !done.insert(name.to_lowercase()) {
             continue;
         }
-        match crate::model_view::render_tile_from_above(app, &tile.model, size) {
+        match crate::model_view::render_tile_from_above(app, &tile.model, MINIMAP_SIZE) {
             Some(image) => {
                 let path = dir.join(format!("{}.tga", name.to_lowercase()));
                 match std::fs::write(&path, mg_image::write_tga(&image)) {

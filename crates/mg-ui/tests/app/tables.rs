@@ -2,6 +2,70 @@
 
 use crate::common::*;
 
+/// File dialogs that answer nothing and note what they were asked for.
+struct Asked(std::rc::Rc<std::cell::RefCell<Vec<(mg_ui::FileKind, bool)>>>);
+
+impl mg_ui::Dialogs for Asked {
+    fn open_file(
+        &mut self,
+        kind: mg_ui::FileKind,
+        _: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        self.0.borrow_mut().push((kind, false));
+        None
+    }
+    fn save_file(
+        &mut self,
+        kind: mg_ui::FileKind,
+        _: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        self.0.borrow_mut().push((kind, true));
+        None
+    }
+    fn pick_folder(&mut self, _: &str, _: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// The 2DA and talk table editors' file dialogs are of their own kinds
+/// (titled for them, showing their files), not any file's.
+#[test]
+fn tables_and_talk_tables_ask_for_their_own_files() {
+    use mg_ui::FileKind;
+    let asked = std::rc::Rc::default();
+    let mut h =
+        harness(Moonglow::new(None, Box::new(Asked(std::rc::Rc::clone(&asked)))), 900.0, 700.0);
+    mg_ui::table_view::open_file(h.state_mut());
+    let asks = |h: &mut Harness<'_, Moonglow>, actions: Vec<mg_ui::Action>| {
+        for a in actions {
+            h.state_mut().actions.push(a);
+            h.run_steps(1);
+        }
+    };
+    asks(&mut h, vec![mg_ui::Action::TalkFile(false), mg_ui::Action::TalkFile(true)]);
+    // (Its lines, of a table open.)
+    let dir = mg_testkit::scratch_dir("ui-talk-kinds");
+    h.state_mut().talk =
+        Some(mg_module::talk::Table::create("kinds", &dir, mg_core::Language::ENGLISH, false));
+    let lines = [true, false].map(mg_ui::Action::TalkCsv).into_iter();
+    asks(&mut h, lines.chain([mg_ui::Action::TalkJson(false)]).collect());
+    let lines = |json| FileKind::TalkLines { json };
+    assert_eq!(
+        *asked.borrow(),
+        [
+            (FileKind::Table, false),
+            (FileKind::TalkTable, false),
+            (FileKind::TalkTable, true),
+            (lines(false), false),
+            (lines(false), true),
+            (lines(true), true),
+        ]
+    );
+    assert_eq!(FileKind::Table.filter(false), Some(("2DA tables", &["2da"][..])));
+    assert_eq!(FileKind::TalkTable.title(true), "New Talk Table");
+    assert_eq!(lines(true).filter(true), Some(("JSON", &["json"][..])));
+}
+
 /// The Talk Table editor makes and opens a `.tlk` file on its own, with no
 /// module open.
 /// A line of the talk table is chosen by a click anywhere on its row, the
@@ -284,8 +348,7 @@ fn a_talk_table_file_is_made_and_opened_on_its_own() {
 fn a_talk_table_that_cannot_be_read_is_tried_once() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-talk-bad");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("tlk")).unwrap();
+    let user = user_folder(&dir, &["tlk"]);
     std::fs::write(user.join("tlk/mg_bad.tlk"), b"not a talk table").unwrap();
     let path = sample_module(&dir);
     let mut m = mg_module::Module::open(&path).unwrap();
@@ -315,15 +378,13 @@ fn a_talk_table_that_cannot_be_read_is_tried_once() {
 fn talk_table_made_edited_saved_and_used_by_strings() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-talk-table");
-    let user = dir.join("user");
-    std::fs::create_dir_all(&user).unwrap();
+    let user = user_folder(&dir, &[]);
     let path = sample_module(&dir);
-    let install = mg_resman::GameInstall::new(&root, Some(user.clone()), "en");
     // (Export CSV and Import CSV are answered with the same file.)
     let csv = dir.join("lines.csv");
     let dialogs =
         NoDialogs { open: vec![csv.clone(); 2], save: vec![csv.clone(); 2], ..Default::default() };
-    let mut app = Moonglow::new(Some(install), Box::new(dialogs));
+    let mut app = game_app_with(&root, Some(user.clone()), dialogs);
     // (The module opens on its Properties, not on an area.)
     app.settings.no_last_area = true;
     app.open_module(&path);
@@ -372,6 +433,26 @@ fn talk_table_made_edited_saved_and_used_by_strings() {
     h.get_by_label("Redo").click();
     h.run();
     assert_eq!(line(&h).feminine.as_deref(), Some("Greetings, lady"));
+    // In the line's text, typed in: Ctrl+Z is the field's, not the
+    // table's (GitHub issue 18): the feminine text stays.
+    let typed = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.value().as_deref() == Some("Greetings")
+            && matches!(
+                n.role(),
+                egui::accesskit::Role::TextInput | egui::accesskit::Role::MultilineTextInput
+            )
+    };
+    h.get(egui_kittest::kittest::by().predicate(typed)).click();
+    h.run();
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text(" friend".into()));
+    h.run_steps(2);
+    assert!(h.ctx.egui_wants_keyboard_input());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!(line(&h).feminine.as_deref(), Some("Greetings, lady"), "not the table's undo");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
 
     // The lines go out as CSV; changed in a spreadsheet, they come back.
     h.get_by_label("Export CSV…").click();
@@ -417,8 +498,11 @@ fn talk_table_made_edited_saved_and_used_by_strings() {
     assert_eq!((line(&h).text.as_str(), h.state().talk.as_ref().unwrap().len()), ("Greetings", 1));
 
     // Saving the module saves the table, and the game data reads it.
+    // (What the watches hear of the save is taken now: on a busy machine,
+    // heard and read again in the frames of a later step, it made more of
+    // them than a run's.)
     h.state_mut().actions.push(mg_ui::Action::Save);
-    h.run();
+    settle(&mut h);
     assert!(!h.state().talk.as_ref().unwrap().is_dirty());
     let game = h.state().game.as_deref().unwrap();
     assert_eq!(game.string(mg_core::StrRef(16_777_216)).as_deref(), Some("Greetings"));
@@ -448,21 +532,50 @@ fn talk_table_made_edited_saved_and_used_by_strings() {
     assert_eq!((name.strref.0, name.strings.len()), (16_777_217, 0));
     let t = h.state().talk.as_ref().unwrap();
     assert_eq!((t.line(1).text.as_str(), t.is_dirty()), ("The Keep", true));
+
+    // Palette › Categories… moves a category's name into it too: the
+    // category named by the new line, to be translated there.
+    {
+        let app = h.state_mut();
+        app.actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+        app.palette.kind = mg_module::palette::BlueprintKind::Placeable;
+        app.palette.tiles = false;
+        app.palette.custom = true;
+    }
+    h.run();
+    h.get_by_label("More").click();
+    h.run();
+    h.get_by_label("Categories…").click();
+    h.run();
+    type_into_hint(&mut h, "a category's or group's name", "Ruins");
+    h.get_by_label("Add Category").click();
+    h.run();
+    h.get_by_label("Move Name to Talk Table").click();
+    h.run();
+    let w = h.state().palette_categories.as_ref().unwrap();
+    assert_eq!(w.strref, "16777218");
+    let path = w.selected.clone().unwrap();
+    let mut node = &w.skeleton.root.list("MAIN").unwrap()[path[0]];
+    for i in &path[1..] {
+        node = &node.list("LIST").unwrap()[*i];
+    }
+    let named = mg_module::palette::node_name(node);
+    assert_eq!(named, mg_module::palette::PaletteName::StrRef(16_777_218));
+    assert!(node.get("NAME").is_none() && node.get("DELETE_ME").is_none(), "no name written out");
+    assert_eq!(h.state().talk.as_ref().unwrap().line(2).text, "Ruins");
 }
 
 #[test]
 fn two_da_view_shows_where_rows_come_from() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-2da-layers");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("override")).unwrap();
+    let user = user_folder(&dir, &["override"]);
     // The game's ambientmusic.2da with a row changed and one added, in
     // override.
-    let game =
-        mg_resman::ResMan::for_game(&mg_resman::GameInstall::new(&root, None, "en")).unwrap();
+    let game = game_data(&root);
     let key = ResKey::parse("ambientmusic", ResType::TWODA).unwrap();
     let cp = mg_core::Codepage::default();
-    let t = mg_2da::TwoDa::parse(&game.get(&key).unwrap(), cp).unwrap();
+    let t = mg_2da::TwoDa::parse(&game.resman.get(&key).unwrap(), cp).unwrap();
     let resource = t.column("Resource").unwrap();
     let mut rows: Vec<Vec<String>> = (0..t.len())
         .map(|r| (0..t.columns().len()).map(|c| t.cell(r, c).unwrap_or("****").into()).collect())
@@ -548,6 +661,125 @@ fn a_table_s_row_list_opens_at_the_row_named() {
     assert_eq!(table_of(&h, id).get(0, "Spell"), Some("302"));
 }
 
+/// A flags cell's list of ticks by the keys (GitHub issue 7): once its
+/// box is clicked, Down opens it, the arrows move along the flags and
+/// Space ticks the one there (the list staying open).
+#[test]
+fn a_flags_list_is_ticked_by_the_keys() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = mg_testkit::scratch_dir("ui-table-flags-keys");
+    std::fs::write(dir.join("nasher.cfg"), "").unwrap();
+    let file = dir.join("my_flags.2da");
+    std::fs::write(&file, "2DA V2.0\r\n\r\n  Label Mask\r\n0 One 0x1\r\n").unwrap();
+    let toml = "[columns.Mask]\nkind = \"flags\"\nvalues = { Red = 1, Green = 2, Blue = 4 }\n";
+    std::fs::write(dir.join("my_flags.2da.toml"), toml).unwrap();
+    let app = game_app(&root, None);
+    let mut h = harness(app, 1280.0, 800.0);
+    h.run_steps(3);
+    let id = mg_ui::table_view::open_path(h.state_mut(), &file).unwrap();
+    h.run_steps(4);
+    h.state_mut().tables.iter_mut().find(|d| d.id == id).unwrap().go_to(0, 1);
+    h.run_steps(3);
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    let at = h
+        .query_all(combo)
+        .find(|n| n.accesskit_node().value().as_deref() == Some("Red"))
+        .map(|n| n.rect().center())
+        .expect("the flags' list");
+    h.hover_at(at);
+    h.run_steps(1);
+    // Opened and closed by clicks: the box keeps the keys.
+    for _ in 0..2 {
+        press(&h, at, true, egui::Modifiers::NONE);
+        press(&h, at, false, egui::Modifiers::NONE);
+        h.run_steps(3);
+    }
+    assert!(h.query_by_label("Blue  (4)").is_none(), "closed");
+    for key in [egui::Key::ArrowDown, egui::Key::ArrowDown, egui::Key::ArrowDown] {
+        h.key_press(key);
+        h.run_steps(2);
+    }
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    assert_eq!(table_of(&h, id).get(0, "Mask"), Some("0x5"), "Blue ticked");
+    assert!(h.query_by_label("Blue  (4)").is_some(), "still open");
+    h.key_press(egui::Key::ArrowUp);
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(table_of(&h, id).get(0, "Mask"), Some("0x7"), "Green ticked");
+}
+
+/// A talk table kept in the module (a `.tlk` among its resources) is
+/// edited and saved with it: into the module, not a file of its own.
+#[test]
+fn a_talk_table_kept_in_the_module_is_edited_and_saved_with_it() {
+    use mg_module::talk::{Line, Source};
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = mg_testkit::scratch_dir("ui-talk-in-module");
+    let user = user_folder(&dir, &[]);
+    let path = sample_module(&dir);
+    let key = ResKey::parse("mg_inmod", ResType::TLK).unwrap();
+    let mut m = Module::open(&path).unwrap();
+    let mut info = m.info().unwrap();
+    info.root.write(&ifo::MOD_CUSTOM_TLK, ExoString::from("mg_inmod"));
+    m.set_info(&info).unwrap();
+    let mut t = mg_module::talk::Table::create("mg_inmod", &dir, Language::ENGLISH, false);
+    let line = |text: &str| Line {
+        text: text.into(),
+        feminine: None,
+        sound: String::new(),
+        sound_length: 0.0,
+    };
+    t.add_line(&line("Old words")).unwrap();
+    m.set(key, t.tlk.to_bytes().unwrap());
+    m.save().unwrap();
+    let mut app = game_app(&root, Some(user.clone()));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    app.open_palette = false;
+    let mut h = harness(app, 1000.0, 800.0);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::TalkTable));
+    h.run();
+    h.run();
+    let talk = h.state().talk.as_ref().expect("the module's table open");
+    assert_eq!((&talk.source, talk.editable()), (&Source::Module, true));
+    assert!(h.query_by_label_contains("This table is in a hak").is_none(), "not read-only");
+    h.get_by_label("16777216").click();
+    h.run();
+    h.get_all_by_value("Old words")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::MultilineTextInput)
+        .unwrap()
+        .click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::End);
+    h.event(egui::Event::Text(", new".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().talk.as_ref().unwrap().line(0).text, "Old words, new");
+    // Saving the module saves the table into it; the game data reads it,
+    // and nothing is written to the tlk folder.
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    h.run();
+    assert!(!h.state().talk.as_ref().unwrap().is_dirty());
+    assert!(!h.state().has_unsaved_work(), "the module's step saved too");
+    let game = h.state().game.as_deref().unwrap();
+    assert_eq!(game.string(mg_core::StrRef(16_777_216)).as_deref(), Some("Old words, new"));
+    assert!(!user.join("tlk/mg_inmod.tlk").exists());
+    let saved = Module::open(&path).unwrap();
+    let tlk = mg_tlk::Tlk::read(saved.get(&key).unwrap()).unwrap();
+    assert_eq!(tlk.text(mg_core::StrRef(0)).as_deref(), Some("Old words, new"));
+    let said = h.state().log.entries.iter().any(|(_, e)| e.contains("put into the module"));
+    assert!(said, "{:?}", h.state().log.entries);
+}
+
 #[test]
 fn premium_campaigns_find_their_talk_tables_in_the_install() {
     // Tyrants of the Moonsea names `tyrants`, which the game ships in
@@ -563,6 +795,16 @@ fn premium_campaigns_find_their_talk_tables_in_the_install() {
     let loaded = app.log.entries.iter().any(|(_, e)| e == "Custom talk table tyrants loaded");
     assert!(loaded, "{:?}", app.log.entries);
     assert!(app.game.as_deref().unwrap().custom_tlk().is_some());
+    // Opened in the editor, the game's own table is read only: its Save
+    // never writes into the install.
+    let mut h = harness(app, 1000.0, 800.0);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::TalkTable));
+    h.run();
+    h.run();
+    let t = h.state().talk.as_ref().expect("the campaign's table open");
+    assert!(!t.editable(), "{}", t.source);
+    assert!(t.source.to_string().starts_with("the game's files ("), "{}", t.source);
+    assert!(h.query_by_label_contains("This table is in the game's files").is_some());
 }
 
 /// The talk table editor's split is kept for each table in Moonglow's
@@ -623,6 +865,59 @@ fn the_talk_table_s_split_is_kept_for_each_table() {
     let fresh = strref(&session(mg_ui::Settings::default(), "other"));
     let h = session(settings, "other");
     assert!((strref(&h) - fresh).abs() < 1.5, "its own: {} {fresh}", strref(&h));
+}
+
+/// A drag selecting cells past the grid's foot scrolls the table on, the
+/// selection reaching the rows that come into sight, as a spreadsheet's;
+/// past its top, back.
+#[test]
+fn a_drag_past_the_grid_s_edge_scrolls_it() {
+    let dir = mg_testkit::scratch_dir("ui-table-edge-drag");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let key = ResKey::parse("longone", ResType::TWODA).unwrap();
+    let mut text = String::from("2DA V2.0\r\n\r\n   Label   Cost\r\n");
+    for r in 0..300 {
+        text.push_str(&format!("{r}  Row{r}  {r}\r\n"));
+    }
+    app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "A table",
+        vec![mg_edit::Edit::SetResource { key, data: Some(text.into_bytes()) }],
+    )));
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run_steps(3);
+    let id = mg_ui::table_view::open_in_module(h.state_mut(), key).unwrap();
+    h.run_steps(4);
+    let from = h.get_by_label("Row0").rect().center();
+    h.hover_at(from);
+    press(&h, from, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    // Held under the window's foot for a while.
+    let below = egui::pos2(from.x, 699.0);
+    h.hover_at(below);
+    h.run_steps(30);
+    let doc = || h.state().tables.iter().find(|d| d.id == id).unwrap();
+    let reached = doc().area().map(|a| a.1).unwrap();
+    assert!(doc().scrolled().y > 200.0, "scrolled on: {}", doc().scrolled().y);
+    assert!(reached > 40, "the selection reaches the rows come into sight: {reached}");
+    assert_eq!(doc().area().map(|a| a.0), Some(0), "from where it began");
+    // Back up past the top: scrolled back, the selection to the top.
+    let above = egui::pos2(from.x, 1.0);
+    h.hover_at(above);
+    h.run_steps(60);
+    let doc = || h.state().tables.iter().find(|d| d.id == id).unwrap();
+    assert!(doc().scrolled().y < 1.0, "back to the top: {}", doc().scrolled().y);
+    press(&h, above, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    let doc = || h.state().tables.iter().find(|d| d.id == id).unwrap();
+    assert_eq!(doc().area().map(|a| (a.0, a.1)), Some((0, 0)));
+    // Let go: no more scrolling.
+    let at = doc().scrolled().y;
+    h.hover_at(below);
+    h.run_steps(10);
+    assert_eq!(h.state().tables.iter().find(|d| d.id == id).unwrap().scrolled().y, at);
 }
 
 /// The 2DA editor's cells are selected several at a time (Shift and the
@@ -835,6 +1130,15 @@ fn a_rebound_undo_key_reaches_a_table_s_grid() {
     h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z);
     h.run_steps(2);
     assert_eq!(table_of(&h, id).get(0, "Label"), None, "redone");
+    // Edit › Undo is the table's, names its step, and takes it.
+    h.get_by_label("Edit").click();
+    h.run_steps(2);
+    let undo = h.get_by_label_contains("Undo ").accesskit_node().label().unwrap_or_default();
+    assert!(undo.starts_with("Undo Empty 1 cell"), "{undo}");
+    h.get_by_label_contains("Undo Empty 1 cell").click();
+    h.run_steps(2);
+    assert_eq!(table_of(&h, id).get(0, "Label"), Some("Bread"), "the table's undo, from the menu");
+    assert_eq!(module_step(&h).as_deref(), Some("A table"), "not the module's");
 }
 
 /// The 2DA editor on a table of the module's: a cell typed in, rows
@@ -894,6 +1198,19 @@ fn a_module_s_table_is_edited_cell_by_cell() {
     h.run_steps(2);
     key_(&mut h, egui::Key::Escape);
     assert_eq!(table_of(&h, id).get(0, "Cost"), None, "Escape: not kept");
+    // A digit or letter typed begins typing, in place of what the cell
+    // held, as in a spreadsheet: Cheese's cost 2 typed over as 42.
+    key_(&mut h, egui::Key::ArrowDown);
+    h.event(egui::Event::Text("4".into()));
+    h.run_steps(2);
+    h.event(egui::Event::Text("2".into()));
+    h.run_steps(2);
+    key_(&mut h, egui::Key::Enter);
+    assert_eq!(table_of(&h, id).get(1, "Cost"), Some("42"), "typed over");
+    h.get_by_label("Undo").click();
+    h.run_steps(2);
+    key_(&mut h, egui::Key::ArrowUp);
+    assert_eq!(at(&h), Some((0, 1)));
     // Add Row puts one at the end; Empty Row empties the selected one,
     // which stays.
     h.get_by_label("Add Row").click();
@@ -1063,14 +1380,13 @@ fn a_hak_s_table_and_a_file_s_are_saved_where_they_live() {
 fn the_game_s_own_wrong_cells_are_not_said_in_a_copy() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-table-game-s-own");
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let key = ResKey::parse("appearance", ResType::TWODA).unwrap();
     let file = dir.join("appearance.2da");
     std::fs::write(&file, game.resman.get(&key).unwrap()).unwrap();
     let footsteps = game.table("appearance").unwrap().column("FOOTSTEPTYPE").unwrap();
     assert_eq!(game.table("appearance").unwrap().cell(562, footsteps), Some("30"));
-    let app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    let app = game_app(&root, None);
     let mut h = harness(app, 1280.0, 800.0);
     h.run_steps(3);
     let id = mg_ui::table_view::open_path(h.state_mut(), &file).unwrap();
@@ -1094,8 +1410,7 @@ fn the_game_s_own_wrong_cells_are_not_said_in_a_copy() {
 fn a_table_s_cells_are_checked_and_rows_taken_from_another_copy() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-table-kinds");
-    let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data(&root);
     let mut t = (*game.table("feat").unwrap()).clone();
     let whole = t.len();
     let (prereq, label) = (t.column("PREREQFEAT1").unwrap(), t.column("LABEL").unwrap());
@@ -1103,7 +1418,7 @@ fn a_table_s_cells_are_checked_and_rows_taken_from_another_copy() {
     t.set(5, label, Some("MyOwnShot".into())).unwrap();
     let file = dir.join("feat.2da");
     std::fs::write(&file, t.to_bytes(mg_core::Codepage::default()).unwrap()).unwrap();
-    let app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    let app = game_app(&root, None);
     let mut h = harness(app, 1280.0, 800.0);
     h.run_steps(3);
     let id = mg_ui::table_view::open_path(h.state_mut(), &file).unwrap();
@@ -1168,10 +1483,9 @@ fn a_game_table_is_edited_as_a_copy() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-table-copy");
     let path = sample_module(&dir);
-    let install = mg_resman::GameInstall::new(&root, None, "en");
     let file = dir.join("skills.2da");
     let dialogs = NoDialogs { save: vec![file.clone()], ..Default::default() };
-    let mut app = Moonglow::new(Some(install), Box::new(dialogs));
+    let mut app = game_app_with(&root, None, dialogs);
     app.settings.no_last_area = true;
     app.open_module(&path);
     let mut h = harness(app, 1280.0, 800.0);
@@ -1367,4 +1681,95 @@ fn a_game_table_read_only_scrolls() {
     assert!(acid < label - 300.0, "the rows went sideways with the names: {acid}");
     // The rows' numbers stay in sight at the left.
     assert!(numbers(&h).contains(&0), "{:?}", numbers(&h));
+}
+
+/// GitHub issue 18, in the 2DA editor: Ctrl+Z with a cell's text typed in
+/// is the cell's own, not the table's Undo (its earlier change stays).
+#[test]
+fn undo_in_a_table_cell_being_typed_is_the_cell_s() {
+    let dir = mg_testkit::scratch_dir("ui-table-undo-in-cell");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let key = ResKey::parse("mystore", ResType::TWODA).unwrap();
+    app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "A table",
+        vec![mg_edit::Edit::SetResource { key, data: Some(SMALL_TABLE.to_vec()) }],
+    )));
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run_steps(3);
+    let id = mg_ui::table_view::open_in_module(h.state_mut(), key).unwrap();
+    h.run_steps(4);
+    // An earlier change: a cell typed and kept.
+    h.get_by_label("Cheese").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::F2);
+    h.run_steps(3);
+    h.event(egui::Event::Text("y".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(table_of(&h, id).get(1, "Label"), Some("Cheesey"));
+    // Another cell typed in, and Ctrl+Z: the typing's, not the table's.
+    h.key_press(egui::Key::ArrowUp);
+    h.run_steps(2);
+    h.key_press(egui::Key::F2);
+    h.run_steps(3);
+    h.event(egui::Event::Text("zz".into()));
+    h.run_steps(2);
+    assert!(h.ctx.egui_wants_keyboard_input());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!(table_of(&h, id).get(1, "Label"), Some("Cheesey"), "not the table's Undo");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.ctx.egui_wants_keyboard_input());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!(table_of(&h, id).get(1, "Label"), Some("Cheese"), "the table's, once left");
+}
+
+/// Next Pane (F6) gives the middle's keys to what its tab in front has (GitHub
+/// issue 12): a table's cells, at its first cell where none is selected,
+/// then the arrows move through them; Shift+F6 goes back to the tree.
+#[test]
+fn next_pane_gives_the_keys_to_a_table_in_the_middle() {
+    let dir = mg_testkit::scratch_dir("ui-table-next-pane");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let key = ResKey::parse("mystore", ResType::TWODA).unwrap();
+    app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "A table",
+        vec![mg_edit::Edit::SetResource { key, data: Some(SMALL_TABLE.to_vec()) }],
+    )));
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run_steps(3);
+    let id = mg_ui::table_view::open_in_module(h.state_mut(), key).unwrap();
+    h.run_steps(4);
+    let at =
+        |h: &Harness<'_, Moonglow>| h.state().tables.iter().find(|d| d.id == id).unwrap().selected;
+    assert_eq!(at(&h), None);
+    let key_ = |h: &mut Harness<'_, Moonglow>, m: egui::Modifiers, k: egui::Key| {
+        h.key_press_modifiers(m, k);
+        h.run_steps(2);
+    };
+    let none = egui::Modifiers::NONE;
+    // From the middle's: the log (no palettes here), the tree, then the
+    // middle: the table's first cell.
+    key_(&mut h, none, egui::Key::F6);
+    assert!(h.state().tree_cursor.is_none(), "the log has the keys");
+    key_(&mut h, none, egui::Key::F6);
+    assert!(h.state().tree_cursor.is_some(), "the tree has the keys");
+    key_(&mut h, none, egui::Key::F6);
+    assert_eq!(at(&h), Some((0, 0)));
+    key_(&mut h, none, egui::Key::ArrowDown);
+    assert_eq!(at(&h), Some((1, 0)), "the arrows are the table's");
+    let tree = h.state().tree_cursor;
+    key_(&mut h, egui::Modifiers::SHIFT, egui::Key::F6);
+    key_(&mut h, none, egui::Key::ArrowDown);
+    assert_eq!(at(&h), Some((1, 0)), "the table's keys left");
+    assert_ne!(h.state().tree_cursor, tree, "the tree's again");
 }

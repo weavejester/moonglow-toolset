@@ -5,6 +5,7 @@
 use mg_core::ResRef;
 use mg_gff::{Struct, Value};
 use mg_rules::GameData;
+use mg_rules::models;
 
 use crate::{Lookup, Part, Preview, PreviewError, cell, cell_int, env_map, item_colors};
 
@@ -31,11 +32,36 @@ pub fn item_on(game: &GameData, uti: &Struct, female: bool) -> Result<Preview, P
     Ok(Preview { base: first, parts: parts.collect(), idle: None, lights: Vec::new() })
 }
 
+/// One of an armor's parts alone, as [`item_on`] has it worn (its model
+/// for the body, man's or woman's, in its colors, on the bones of the
+/// body, which has no mesh of its own): `pieces`, the part's name in its
+/// models' (`chest` of `pmh0_chest012`; both legs' `legl` and `legr`).
+/// For choosing among a part's models by their pictures. An armor's part
+/// 0 is the wearer's own there, as the game has it.
+pub fn armor_part(
+    game: &GameData,
+    uti: &Struct,
+    female: bool,
+    pieces: &[&str],
+) -> Result<Preview, PreviewError> {
+    let mut p = item_on(game, uti, female)?;
+    let of = |model: &str| {
+        let after = model.split_once('_').map_or("", |(_, rest)| rest);
+        after.trim_end_matches(|c: char| c.is_ascii_digit()).to_string()
+    };
+    p.parts.retain(|part| pieces.contains(&of(&part.model).as_str()));
+    if p.parts.is_empty() {
+        return Err(PreviewError::NoModel(pieces.join(", ")));
+    }
+    Ok(p)
+}
+
 /// An item as it lies in an area, as Aurora draws it there. Armour,
 /// which is its wearer's body parts, is the game's model of armour
-/// dropped (`gi_armor01`…`04`, by its weight); a cloak, which hangs from
-/// shoulders, is the game's model of a cloak dropped (`gi_cloak01`, folded,
-/// in the cloak's colors); every other item is its own model, as [`item`]
+/// dropped (`gi_armor01`…`04`, by its weight); the game's cloak, which
+/// hangs from shoulders, is the game's model of a cloak dropped
+/// (`gi_cloak01`, folded, in the cloak's colors), a cloak of a base item
+/// of a module's own its `DefaultModel`; every other item is its own model, as [`item`]
 /// shows it. Where the game's model is not there, the base item's
 /// `DefaultModel`, then the bag the game drops things as (`it_bag`). How
 /// each is turned there: [`ground_turn`].
@@ -65,10 +91,11 @@ pub fn item_placed(game: &GameData, uti: &Struct) -> Result<Preview, PreviewErro
     let default = cell(&baseitems, row, "DefaultModel").map(str::to_ascii_lowercase);
     if armor {
         // The game's own models of armor lying on the ground, by how
-        // heavy it is (its torso's parts_chest.2da `ACBONUS`): cloth,
-        // leather, chain, plate. Which model is which weight is told by
-        // their looks; the base item's `DefaultModel` where one is not
-        // there.
+        // heavy it is (its torso's parts_chest.2da `ACBONUS`): cloth (0
+        // and 1), leather (2 and 3), chain (4 and 5), plate, as Aurora
+        // lays the game's armors of each (captured 2026-10-30,
+        // `captures/wave2/before.mod`); the base item's `DefaultModel`
+        // where one is not there.
         let torso = mg_rules::items::part_number(uti, "ArmorPart_Torso").unwrap_or(0);
         let parts = game.table("parts_chest")?;
         let ac = usize::try_from(torso)
@@ -76,8 +103,8 @@ pub fn item_placed(game: &GameData, uti: &Struct) -> Result<Preview, PreviewErro
             .and_then(|row| crate::cell_f32(&parts, row, "ACBONUS"))
             .unwrap_or(0.0);
         let by_weight = match ac as i32 {
-            ..=0 => "gi_armor01",
-            1..=3 => "gi_armor04",
+            ..=1 => "gi_armor01",
+            2..=3 => "gi_armor04",
             4..=5 => "gi_armor03",
             _ => "gi_armor02",
         };
@@ -88,10 +115,21 @@ pub fn item_placed(game: &GameData, uti: &Struct) -> Result<Preview, PreviewErro
         }
     }
     if !armor {
-        let model = std::iter::once(CLOAK.to_string()).chain(default).find(|m| lk.has_model(m));
+        // The game's cloak (base item 80) lies as its model of a cloak
+        // dropped; a base item of cloaks of a module's own as its
+        // `DefaultModel` (seen in the client: one naming a torch lay as
+        // the torch, one naming the bag as the bag:
+        // `reading_custom_cloak_base_item` in `client_render.rs`).
+        let game_s = (base == CLOAK_BASE).then(|| CLOAK.to_string());
+        let model = game_s.into_iter().chain(default).find(|m| lk.has_model(m));
         if let Some(model) = model {
-            let row = mg_rules::items::part_number(uti, "ModelPart1").unwrap_or(0).max(0) as usize;
-            let env = game.table("cloakmodel").ok().and_then(|t| env_map(cell(&t, row, "ENVMAP")));
+            let env = if model == CLOAK {
+                let row =
+                    mg_rules::items::part_number(uti, "ModelPart1").unwrap_or(0).max(0) as usize;
+                game.table("cloakmodel").ok().and_then(|t| env_map(cell(&t, row, "ENVMAP")))
+            } else {
+                None
+            };
             return Ok(one(Part::new(model), env));
         }
     }
@@ -116,6 +154,10 @@ const BAG: &str = "it_bag";
 
 /// The game's model of a cloak lying on the ground.
 const CLOAK: &str = "gi_cloak01";
+
+/// The game's base item of cloaks (baseitems.2da), which alone lies as
+/// [`CLOAK`].
+const CLOAK_BASE: i64 = 80;
 
 /// The models of an item, at its origin (held items hang all of them from
 /// the hand). Colours for layered items start from `colors` (the wearer's
@@ -142,13 +184,25 @@ pub(crate) fn item_parts(
         p
     };
     let parts = match cell_int(&baseitems, row, "ModelType").unwrap_or(0) {
-        // Composite: bottom, middle, top.
-        2 => ["b", "m", "t"]
+        // Composite: bottom, middle, top. A placed item's part scopes
+        // transform them as the client does (`client_render.rs`'s
+        // `reading_item_part_scopes`: a longsword's 255 the whole sword,
+        // 254 its guard, 253 its blade; 252 and 251 nothing).
+        2 => models::COMPOSITE
             .iter()
-            .zip(["ModelPart1", "ModelPart2", "ModelPart3"])
-            .map(|(p, f)| format!("{class}_{p}_{:03}", n(f)))
-            .filter(|m| lk.has_model(m))
-            .map(part)
+            .zip([None, Some(254), Some(253)])
+            .map(|((p, f), scope)| (models::composite_model(&class, p, n(f)), scope))
+            .filter(|(m, _)| lk.has_model(m))
+            .map(|(m, scope)| {
+                let mut p = part(m);
+                let whole = crate::scope_matrix(uti, 255);
+                let own = scope.and_then(|s| crate::scope_matrix(uti, s));
+                p.local = match (whole, own) {
+                    (Some(w), Some(o)) => Some(w * o),
+                    (w, o) => w.or(o),
+                };
+                p
+            })
             .collect(),
         // Layered: helmets; cloaks shown as worn by a human (a man, or a
         // woman where `female` and the cloak has her model).
@@ -156,11 +210,11 @@ pub(crate) fn item_parts(
             let cloaks = game.table("cloakmodel")?;
             let r = n("ModelPart1").max(0) as usize;
             let number = cell_int(&cloaks, r, "MODEL").unwrap_or(1);
-            let hers = format!("pfh0_cloak_{number:03}");
+            let hers = models::cloak_model(true, number);
             let model = if female && lk.has_model(&hers) {
                 hers
             } else {
-                format!("pmh0_cloak_{number:03}")
+                models::cloak_model(false, number)
             };
             if lk.has_model(&model) {
                 let mut p = part(model);
@@ -175,7 +229,7 @@ pub(crate) fn item_parts(
             }
         }
         1 => {
-            let model = format!("{class}_{:03}", n("ModelPart1"));
+            let model = models::item_model(&class, n("ModelPart1"));
             if lk.has_model(&model) {
                 let mut p = part(model);
                 p.colors = Some(item_colors(uti, colors));
@@ -185,7 +239,7 @@ pub(crate) fn item_parts(
             }
         }
         _ => {
-            let model = format!("{class}_{:03}", n("ModelPart1"));
+            let model = models::item_model(&class, n("ModelPart1"));
             if lk.has_model(&model) { vec![part(model)] } else { Vec::new() }
         }
     };
@@ -210,5 +264,5 @@ fn armor(game: &GameData, uti: &Struct, female: bool) -> Result<Preview, Preview
     let mut worn = uti.clone();
     worn.id = 0x2;
     utc.set("Equip_ItemList", Value::List(vec![worn]));
-    crate::creature(game, &utc, &|_: ResRef| None)
+    crate::creature::dressed(game, &utc, &|_: ResRef| None, false)
 }

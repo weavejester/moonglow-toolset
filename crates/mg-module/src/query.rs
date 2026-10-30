@@ -2,7 +2,7 @@
 //! `mg info`): its blueprints and the objects placed in its areas, by type,
 //! tag, name, resref, area and field values; and what the module is.
 
-use mg_core::{Gender, Language, ResRef, ResType};
+use mg_core::{Language, LocString, ResRef, ResType};
 use mg_gff::{Struct, Value};
 use mg_resman::ResKey;
 use mg_rules::ObjectKind;
@@ -18,7 +18,8 @@ pub struct Found {
     /// (`TemplateResRef`, a store's `ResRef`), if it names one.
     pub resref: Option<ResRef>,
     pub tag: String,
-    /// The name in English (a creature's first and last names).
+    /// The name as lists show it (a creature's first and last names): see
+    /// [`find_named`].
     pub name: String,
     /// The area and the index in its GIT list, for a placed object.
     pub placed: Option<(ResRef, usize)>,
@@ -43,6 +44,45 @@ pub struct Query {
     /// Fields that must have these values (`*` as in tags), or exist
     /// (`None`).
     pub fields: Vec<(String, Option<String>)>,
+    /// Fields whose value depends on the object's type (a row given by
+    /// its name: `Appearance` is a placeables.2da row for a placeable, a
+    /// doortypes.2da row for a door): the label, and the value it must
+    /// have for each type. An object of a type not listed doesn't match.
+    pub typed_fields: Vec<(String, Vec<(ResType, String)>)>,
+}
+
+/// Whether `text` matches `pattern`: as [`glob`], or with `regex` as a
+/// regular expression (`regex-lite`'s: anywhere in the text unless
+/// anchored with `^…$`, letters A to Z in either case). An expression
+/// that isn't one matches nothing ([`check_regex`] says why).
+pub fn like(pattern: &str, text: &str, regex: bool) -> bool {
+    if !regex {
+        return glob(pattern, text);
+    }
+    // (Made once a thread for each expression: a search asks it of every
+    // field.)
+    thread_local! {
+        static MADE: std::cell::RefCell<std::collections::HashMap<String, Option<regex_lite::Regex>>> =
+            Default::default();
+    }
+    MADE.with(|made| {
+        let mut made = made.borrow_mut();
+        if made.len() > 64 {
+            made.clear();
+        }
+        let re = made.entry(pattern.to_string()).or_insert_with(|| made_regex(pattern).ok());
+        re.as_ref().is_some_and(|re| re.is_match(text))
+    })
+}
+
+/// A pattern as a regular expression [`like`] matches by: why it isn't
+/// one, if it isn't.
+pub fn check_regex(pattern: &str) -> Result<(), String> {
+    made_regex(pattern).map(|_| ())
+}
+
+fn made_regex(pattern: &str) -> Result<regex_lite::Regex, String> {
+    regex_lite::Regex::new(&format!("(?i){pattern}")).map_err(|e| format!("{pattern}: {e}"))
 }
 
 /// Whether `text` matches `pattern`, ignoring case and accents, `*`
@@ -72,54 +112,59 @@ pub fn glob(pattern: &str, text: &str) -> bool {
     true
 }
 
+/// A localized string's text where there is no game: its English, else
+/// another language's ([`LocString::shown_in`]).
 fn english(v: Option<&Value>) -> String {
+    shown_by(v, &|ls| ls.shown_in(Language::ENGLISH, mg_core::Codepage::WINDOWS_1252))
+}
+
+fn shown_by(v: Option<&Value>, name: Namer<'_>) -> String {
     match v {
-        Some(Value::LocString(ls)) => {
-            ls.text(Language::ENGLISH, Gender::Male).map(|t| t.into_owned()).unwrap_or_default()
-        }
+        Some(Value::LocString(ls)) => name(ls),
         Some(Value::String(b)) => String::from_utf8_lossy(b).into_owned(),
         _ => String::new(),
     }
 }
 
+/// How a name's localized string is read as text.
+pub type Namer<'a> = &'a dyn Fn(&LocString) -> String;
+
 /// A field's value as text, for comparing: numbers as written, strings and
-/// resrefs as they are, a localized string's English.
+/// resrefs as they are, a localized string's English (else another
+/// language's).
 pub fn field_text(v: &Value) -> Option<String> {
+    if let Some(number) = v.number_text() {
+        return Some(number);
+    }
     Some(match v {
-        Value::Byte(x) => x.to_string(),
-        Value::Char(x) => x.to_string(),
-        Value::Word(x) => x.to_string(),
-        Value::Short(x) => x.to_string(),
-        Value::Dword(x) => x.to_string(),
-        Value::Int(x) => x.to_string(),
-        Value::Dword64(x) => x.to_string(),
-        Value::Int64(x) => x.to_string(),
-        Value::Float(x) => x.to_string(),
-        Value::Double(x) => x.to_string(),
         Value::String(b) | Value::ResRef(b) => String::from_utf8_lossy(b).into_owned(),
         Value::LocString(_) => english(Some(v)),
         _ => return None,
     })
 }
 
-fn describe(s: &Struct, restype: ResType, placed: Option<(ResRef, usize)>) -> Found {
+fn describe(
+    s: &Struct,
+    restype: ResType,
+    placed: Option<(ResRef, usize)>,
+    named: Namer<'_>,
+) -> Found {
+    let text = |label: &str| shown_by(s.get(label), named);
     let name = if restype == ResType::UTC {
-        let parts = [english(s.get("FirstName")), english(s.get("LastName"))];
+        let parts = [text("FirstName"), text("LastName")];
         parts.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" ")
     } else {
-        let n = english(s.get("LocalizedName"));
-        if n.is_empty() { english(s.get("LocName")) } else { n }
+        let n = text("LocalizedName");
+        if n.is_empty() { text("LocName") } else { n }
     };
     let template = ObjectKind::resref_field_of(restype);
     let resref = s.resref(template).filter(|r| !r.is_empty());
-    let float = |l: &str| s.float(l);
-    let position = match (float("X"), float("Y"), float("Z")) {
-        (Some(x), Some(y), Some(z)) => Some([x, y, z]),
-        _ => match (float("XPosition"), float("YPosition"), float("ZPosition")) {
-            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
-            _ => None,
-        },
-    };
+    // (Where it stands, as its kind keeps it: all three of the fields.)
+    let at = ObjectKind::from_restype(restype).map(crate::placement::position_fields);
+    let position = at.and_then(|labels| {
+        let [x, y, z] = labels.map(|l| s.float(l));
+        Some([x?, y?, z?])
+    });
     Found {
         restype,
         resref,
@@ -142,11 +187,26 @@ fn matches(q: &Query, s: &Struct, f: &Found) -> bool {
             (Some(_), None) => true,
             (Some(v), Some(w)) => field_text(v).is_some_and(|t| glob(w, &t)),
         })
+        && q.typed_fields.iter().all(|(label, wants)| {
+            let want = wants.iter().find(|(t, _)| *t == f.restype).map(|(_, w)| w);
+            match (s.get(label), want) {
+                (Some(v), Some(w)) => field_text(v).is_some_and(|t| glob(w, &t)),
+                _ => false,
+            }
+        })
 }
 
 /// Blueprints, then placed objects (area by area, list by list), that the
-/// query matches.
+/// query matches; names read without the game (English, else another
+/// language's, in Windows-1252).
 pub fn find(m: &Module, q: &Query) -> Vec<Found> {
+    find_named(m, q, &|ls| ls.shown_in(Language::ENGLISH, mg_core::Codepage::WINDOWS_1252))
+}
+
+/// [`find`] with names read by `named`: with the game's data, as lists
+/// show them (`mg_rules::shown`: the talk table's string where a name has
+/// none of its own).
+pub fn find_named(m: &Module, q: &Query, named: Namer<'_>) -> Vec<Found> {
     let wanted = |t: ResType| q.types.is_empty() || q.types.contains(&t);
     let mut out = Vec::new();
     if q.placed != Some(true) && q.area.is_none() {
@@ -158,7 +218,7 @@ pub fn find(m: &Module, q: &Query) -> Vec<Found> {
         keys.sort();
         for k in keys {
             let Some(Ok(g)) = m.gff(&k) else { continue };
-            let mut f = describe(&g.root, k.restype, None);
+            let mut f = describe(&g.root, k.restype, None, named);
             f.resref = Some(k.resref);
             if matches(q, &g.root, &f) {
                 out.push(f);
@@ -166,7 +226,7 @@ pub fn find(m: &Module, q: &Query) -> Vec<Found> {
         }
     }
     if q.placed != Some(false) {
-        for area in m.areas().unwrap_or_default() {
+        for area in crate::areas::every(m) {
             if q.area.is_some_and(|a| a != area) {
                 continue;
             }
@@ -177,7 +237,7 @@ pub fn find(m: &Module, q: &Query) -> Vec<Found> {
                 }
                 let Some(Value::List(items)) = git.root.get(list) else { continue };
                 for (i, s) in items.iter().enumerate() {
-                    let f = describe(s, restype, Some((area, i)));
+                    let f = describe(s, restype, Some((area, i)), named);
                     if matches(q, s, &f) {
                         out.push(f);
                     }
@@ -196,7 +256,11 @@ pub struct Info {
     pub tag: String,
     pub description: String,
     pub entry_area: Option<ResRef>,
+    /// The areas its area list names (`Mod_Area_list`), in its order:
+    /// those the game loads.
     pub areas: Vec<ResRef>,
+    /// The AREs the module has that its area list leaves out.
+    pub unlisted_areas: Vec<ResRef>,
     pub haks: Vec<String>,
     pub custom_tlk: Option<String>,
     pub min_game_version: String,
@@ -204,21 +268,33 @@ pub struct Info {
     pub resources: Vec<(String, usize)>,
 }
 
+/// [`info_in`] the module's text read as Windows-1252.
 pub fn info(m: &Module) -> Result<Info, crate::ModuleError> {
+    info_in(m, mg_core::Codepage::WINDOWS_1252)
+}
+
+/// What a module is, its text (name, tag, description) read in `codepage`:
+/// the module's (`mg_rules::text_codepage`; Windows-1252, or the table of
+/// an `encoding.2da` in its haks).
+pub fn info_in(m: &Module, codepage: mg_core::Codepage) -> Result<Info, crate::ModuleError> {
     let ifo = m.info()?;
     let r = &ifo.root;
-    let text =
-        |l: &str| r.string(l).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+    let text = |l: &str| r.string(l).map(|b| codepage.decode(b).into_owned()).unwrap_or_default();
+    let localized = |l: &str| match r.get(l) {
+        Some(Value::LocString(ls)) => ls.shown_in(Language::ENGLISH, codepage),
+        _ => String::new(),
+    };
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
     for k in m.keys() {
         *counts.entry(k.restype.extension().unwrap_or("?").to_string()).or_default() += 1;
     }
     Ok(Info {
-        name: english(r.get("Mod_Name")),
+        name: localized("Mod_Name"),
         tag: text("Mod_Tag"),
-        description: english(r.get("Mod_Description")),
+        description: localized("Mod_Description"),
         entry_area: r.resref("Mod_Entry_Area").filter(|a| !a.is_empty()),
         areas: m.areas()?,
+        unlisted_areas: crate::areas::unlisted(m),
         haks: m.haks()?,
         custom_tlk: m.custom_tlk()?,
         min_game_version: text("Mod_MinGameVer"),
@@ -229,6 +305,7 @@ pub fn info(m: &Module) -> Result<Info, crate::ModuleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mg_core::Gender;
     use mg_gff::Gff;
 
     #[test]
@@ -289,10 +366,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(find(&m, &q).len(), 1);
+        // A value for each type: a creature's here; a type not listed
+        // doesn't match.
+        let typed = |values: Vec<(ResType, String)>| Query {
+            typed_fields: vec![("Appearance_Type".into(), values)],
+            placed: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(find(&m, &typed(vec![(ResType::UTC, "6".into())])).len(), 1);
+        assert!(find(&m, &typed(vec![(ResType::UTC, "7".into())])).is_empty());
+        assert!(find(&m, &typed(vec![(ResType::UTP, "6".into())])).is_empty());
         let q = Query { types: vec![ResType::UTP], ..Default::default() };
         assert!(find(&m, &q).is_empty());
         let i = info(&m).unwrap();
         assert_eq!((i.tag.as_str(), i.areas.len()), ("MOD", 1));
         assert!(i.resources.contains(&("utc".to_string(), 1)));
+    }
+
+    /// A name in French alone is found and shown by it, without the game;
+    /// with a namer that reads the talk table, a name of a talk-table
+    /// string is found by the string's text.
+    #[test]
+    fn names_as_lists_show_them() {
+        let mut m = Module::new();
+        let mut utc = Gff::new(*b"UTC ");
+        utc.root = creature("GARDE", "");
+        let mut french = mg_core::LocString::default();
+        french.set(Language::FRENCH, Gender::Male, b"Garde du ch\xe2teau".to_vec());
+        utc.root.set("FirstName", Value::LocString(french));
+        m.set_gff(ResKey::parse("garde", ResType::UTC).unwrap(), &utc).unwrap();
+        let mut utc = Gff::new(*b"UTC ");
+        utc.root = creature("TALKER", "");
+        let strref = mg_core::LocString::from_strref(mg_core::StrRef(7));
+        utc.root.set("FirstName", Value::LocString(strref));
+        m.set_gff(ResKey::parse("talker", ResType::UTC).unwrap(), &utc).unwrap();
+
+        let q = Query { name: Some("château".into()), ..Default::default() };
+        let found = find(&m, &q);
+        assert_eq!(found.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Garde du château"]);
+        let q = Query { name: Some("innkeeper".into()), ..Default::default() };
+        assert!(find(&m, &q).is_empty());
+        let table = |ls: &LocString| match ls.strref.0 {
+            7 => "Old Innkeeper".to_string(),
+            _ => ls.shown_in(Language::ENGLISH, mg_core::Codepage::WINDOWS_1252),
+        };
+        let found = find_named(&m, &q, &table);
+        assert_eq!(found.iter().map(|f| f.tag.as_str()).collect::<Vec<_>>(), ["TALKER"]);
     }
 }

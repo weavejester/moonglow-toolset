@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use egui::Ui;
-use mg_core::{ResType, StrRef};
+use mg_core::ResType;
 use mg_edit::{Command, Edit};
 use mg_gff::{FieldType, Struct, Value};
 use mg_module::palette::BlueprintKind;
@@ -40,7 +40,7 @@ pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
         "Appearance" => with_game(f, |f, game| {
             let fields =
                 |f: &mut Form<'_>, ui: &mut Ui, beside: bool| appearance(f, ui, game, beside);
-            super::situated::beside_model(f, ui, APPEARANCE_SIDE, false, fields);
+            super::situated::beside_model(f, ui, APPEARANCE_SIDE, fields);
         }),
         "Properties" => with_game(f, |f, game| properties(f, ui, game)),
         "Visuals" => super::visuals::page(f, ui, true),
@@ -103,10 +103,6 @@ fn worn_by_either(game: &GameData, row: usize) -> bool {
 fn on_woman(f: &Form<'_>) -> bool {
     f.app.settings.armor_on_woman
         && f.app.game.as_deref().is_some_and(|g| worn_by_either(g, base_row(f)))
-}
-
-fn strref(game: &GameData, v: Option<i32>) -> Option<String> {
-    v.and_then(|s| game.string(StrRef(s as u32))).filter(|s| !s.is_empty())
 }
 
 /// The base item's statistics as Aurora shows them: (label, value).
@@ -185,8 +181,12 @@ fn general(f: &mut Form<'_>, ui: &mut Ui) {
         .and_then(|g| {
             let t = g.table("baseitems").ok()?;
             let row = base_row(f);
-            let name = strref(g, t.get_int(row, "Name"))
-                .or_else(|| t.get(row, "label").map(str::to_string))?;
+            let rows = mg_rules::rows::RowTable {
+                table: "baseitems",
+                name: Some("Name"),
+                label: Some("label"),
+            };
+            let name = g.row_name(&rows, row as i64)?;
             Some((name, t.get_int(row, "Stacking").unwrap_or(1).max(1)))
         })
         .unwrap_or_else(|| (format!("({})", f.int("BaseItem")), 1));
@@ -199,7 +199,7 @@ fn general(f: &mut Form<'_>, ui: &mut Ui) {
                     f.locstring(ui, "Name", "LocalizedName");
                     ui.end_row();
                     crate::widgets::field_label(ui, "Tag");
-                    f.text(ui, "Tag", "Tag", 32);
+                    f.tag(ui, "Tag", "Tag");
                     ui.end_row();
                     crate::widgets::field_label(ui, "Blueprint ResRef");
                     f.blueprint_resref(ui);
@@ -257,8 +257,21 @@ fn general(f: &mut Form<'_>, ui: &mut Ui) {
     });
 }
 
-/// The numbers `nnn` for which a model `{prefix}{nnn:03}` exists, cached.
-fn model_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
+/// The number a model or icon `name` is numbered with after `prefix`, as
+/// the game names them (`{prefix}{n:03}`): three digits, and from 1000 on
+/// four or five (EE's part numbers past 255, in the WORD twins).
+fn number_after(name: &str, prefix: &str) -> Option<u16> {
+    let rest = name.strip_prefix(prefix)?;
+    let named = rest.len() == 3 || (rest.len() > 3 && !rest.starts_with('0'));
+    if !named || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+/// The numbers `nnn` for which a model `{prefix}{nnn:03}` exists, cached:
+/// an item's parts, and a part-based creature's body parts (`pmh0_chest`).
+pub(super) fn model_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
     let id = egui::Id::new(("model-numbers", prefix));
     if let Some(v) = ui.data(|d| d.get_temp::<Arc<Vec<u16>>>(id)) {
         return v;
@@ -267,11 +280,7 @@ fn model_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
         .resman
         .list(ResType::MDL)
         .iter()
-        .filter_map(|r| {
-            let name = r.to_string();
-            let rest = name.strip_prefix(prefix)?;
-            (rest.len() == 3).then(|| rest.parse().ok()).flatten()
-        })
+        .filter_map(|r| number_after(&r.to_string(), prefix))
         .collect();
     v.sort_unstable();
     v.dedup();
@@ -308,11 +317,7 @@ fn icon_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
     let mut v: Vec<u16> = [ResType::TGA, ResType::DDS, ResType::PLT]
         .into_iter()
         .flat_map(|t| game.resman.list(t))
-        .filter_map(|r| {
-            let name = r.to_string();
-            let rest = name.strip_prefix(&icon)?;
-            (rest.len() == 3).then(|| rest.parse().ok()).flatten()
-        })
+        .filter_map(|r| number_after(&r.to_string(), &icon))
         .collect();
     v.sort_unstable();
     v.dedup();
@@ -321,8 +326,9 @@ fn icon_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
     v
 }
 
-/// Sets a model or body part number: the BYTE field and its EE twin.
-fn set_part(f: &mut Form<'_>, what: &str, labels: &[&str], v: i64) {
+/// Sets a model or body part number: the BYTE field and its EE twin (an
+/// item's, a creature's body part's).
+pub(super) fn set_part(f: &mut Form<'_>, what: &str, labels: &[&str], v: i64) {
     let mut fields = Vec::new();
     for label in labels {
         fields.push((label.to_string(), v.min(255), FieldType::Byte));
@@ -374,10 +380,14 @@ fn pictured(
     let female = on_woman(f);
     let key = f.key;
     let (app, root) = (&mut *f.app, &f.root);
+    // (An armor's part: that part alone too.)
+    let pieces = (ARMOR_PARTS.iter().chain(&LOWER_PARTS))
+        .position(|(_, fields, _)| fields[0] == labels[0])
+        .map(|i| PART_PIECES[i]);
     let mut shown = move |ui: &mut Ui, row: usize| {
         let n = part(row as i64).clamp(0, i64::from(u16::MAX)) as u16;
         let item = labels.iter().fold(root.clone(), |item, label| with_model(&item, label, n));
-        super::item_picture(app, ui, &item, female);
+        super::item_part_picture(app, ui, &item, female, pieces);
     };
     let list = super::situated::pick_list(key, name, choices, current, PART_WIDTH).ordered();
     let list = if wheel { list.wheel() } else { list };
@@ -418,7 +428,7 @@ fn colors(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
         for (i, channel) in mg_rules::items::ArmorChannel::ALL.into_iter().enumerate() {
             let (text, label, palette) = (channel.name(), channel.field(), channel.palette());
             crate::widgets::field_label(ui, text);
-            f.palette_color(ui, Some(game), text, label, palette);
+            f.palette_color(ui, game, text, label, palette);
             if i % 2 == 1 {
                 ui.end_row();
             }
@@ -468,8 +478,7 @@ fn part_colors(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
                     // Without one of its own: the armor's, as it shows.
                     let shown = color.unwrap_or(f.int(channel.field()).clamp(0, 175) as u8);
                     let text = color.is_none().then_some("Default");
-                    if let Some(v) =
-                        f.palette_pick(ui, Some(game), &what, &label, palette, shown, text)
+                    if let Some(v) = f.palette_pick(ui, game, &what, &label, palette, shown, text)
                         && Some(v) != color
                     {
                         f.set(&what, &label, Value::Byte(v));
@@ -629,6 +638,115 @@ fn part_grid(
 
 /// `beside`: the model is shown beside these fields (a wide window). In a
 /// narrower one it is shown here, to the right of the icon.
+/// Each armor part's models' names (its pieces: [`mg_preview::armor_part`]),
+/// in the order of [`ARMOR_PARTS`] and [`LOWER_PARTS`].
+const PART_PIECES: [&[&str]; 16] = [
+    &["neck"],
+    &["chest"],
+    &["belt"],
+    &["pelvis"],
+    &["shor"],
+    &["shol"],
+    &["bicepr"],
+    &["bicepl"],
+    &["forer"],
+    &["forel"],
+    &["handr"],
+    &["handl"],
+    &["legl", "legr"],
+    &["shinl", "shinr"],
+    &["footl", "footr"],
+    &["robe"],
+];
+
+/// The choices of an armor part (`table`, its parts_*.2da): its rows with
+/// an armor class, a torso's with it said, and 0 as well, which most of
+/// the game's tables leave out: no part, so the wearer's own shows there,
+/// as in the game (a builder's report).
+fn armor_part_choices(game: &GameData, table: &str) -> Vec<Choice> {
+    let t = game.table(table).ok();
+    let numbers: Vec<u16> = t.as_ref().map_or_else(Vec::new, |t| {
+        (0..t.len()).filter(|&r| t.get(r, "ACBONUS").is_some()).map(|r| r as u16).collect()
+    });
+    let ac_of = |n: u16| t.as_ref().and_then(|t| t.get_float(n as usize, "ACBONUS")).unwrap_or(0.0);
+    if table == "parts_chest" {
+        super::situated::part_choices(&numbers, |n| format!("{n} (AC {})", ac_of(n).round()))
+    } else {
+        super::situated::part_choices(&numbers, |n| n.to_string())
+    }
+}
+
+/// The pictures of an armor's part, each of its models alone (as the body
+/// the page shows wears it, in the armor's colors): the part chosen above
+/// them, a click gives the armor that one. Only the rows in sight are
+/// made.
+fn armor_part_gallery(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
+    const SIDE: f32 = 96.0;
+    const GAP: f32 = 4.0;
+    let id = egui::Id::new(("uti-part-gallery", f.key));
+    let all: Vec<&(&str, &[&str], &str)> = ARMOR_PARTS.iter().chain(&LOWER_PARTS).collect();
+    let mut at: usize = ui.data(|d| d.get_temp(id)).unwrap_or(1).min(all.len() - 1);
+    ui.horizontal_wrapped(|ui| {
+        crate::widgets::field_label(ui, "Pictures of");
+        for (i, (text, ..)) in all.iter().enumerate() {
+            if ui.selectable_label(at == i, *text).clicked() {
+                at = i;
+            }
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(id, at));
+    let &(text, labels, table) = all[at];
+    let choices = armor_part_choices(game, table);
+    let current = part_number(&f.root, labels[0]).unwrap_or(0);
+    let (female, pieces) = (on_woman(f), PART_PIECES[at]);
+    let room = ui.available_width() - ui.spacing().scroll.bar_width - 10.0;
+    let (per_row, side) = crate::appearance_gallery::fitted(room, SIDE, GAP);
+    let tall = side + crate::widgets::tile_label_height(ui);
+    let (mut keys, mut chosen) = (Vec::new(), None);
+    let rows = choices.len().div_ceil(per_row);
+    let mut area = egui::ScrollArea::vertical()
+        .id_salt(id.with(at))
+        .max_height(2.0 * tall + 3.0 * ui.spacing().item_spacing.y)
+        .auto_shrink([false, true]);
+    // Opened at the part the armor has (once for each part, once it is in
+    // sight: scrolled out of it, the offset was not kept).
+    let placed = id.with(("placed", at));
+    let in_sight =
+        ui.is_rect_visible(ui.available_rect_before_wrap().with_max_y(ui.cursor().top() + tall));
+    if in_sight && !ui.data(|d| d.get_temp::<bool>(placed).unwrap_or(false)) {
+        ui.data_mut(|d| d.insert_temp(placed, true));
+        if let Some(i) = choices.iter().position(|c| c.row as i64 == current) {
+            let height = tall + ui.spacing().item_spacing.y;
+            area = area.vertical_scroll_offset((i / per_row) as f32 * height);
+        }
+    }
+    area.show_rows(ui, tall, rows, |ui, lines| {
+        ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+        for line in lines {
+            ui.horizontal(|ui| {
+                for c in choices.iter().skip(line * per_row).take(per_row) {
+                    let n = c.row as u16;
+                    let item = labels.iter().fold(f.root.clone(), |i, l| with_model(&i, l, n));
+                    let key = f.app.thumbnails.item_part(&item, female, Some(pieces));
+                    let made = f.app.thumbnails.made(key);
+                    let here = i64::from(n) == current;
+                    let (r, seen) = crate::widgets::picture_tile(ui, side, &c.text, here, made);
+                    if seen {
+                        keys.push(key);
+                    }
+                    if r.on_hover_text(format!("{text} {}", c.text)).clicked() {
+                        chosen = Some(n);
+                    }
+                }
+            });
+        }
+    });
+    f.app.thumbnails.show(keys);
+    if let Some(n) = chosen.filter(|&n| i64::from(n) != current) {
+        set_part(f, text, labels, i64::from(n));
+    }
+}
+
 fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
     let Ok(t) = game.table("baseitems") else { return };
     let row = base_row(f);
@@ -744,33 +862,8 @@ fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
                         .spacing([12.0, 4.0])
                         .show(ui, |ui| {
                             for (text, labels, table) in parts {
-                                let numbers: Vec<u16> = game
-                                    .table(table)
-                                    .map(|t| {
-                                        (0..t.len())
-                                            .filter(|&r| t.get(r, "ACBONUS").is_some())
-                                            .map(|r| r as u16)
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let ac_of = |n: u16| {
-                                    game.table(table)
-                                        .ok()
-                                        .and_then(|t| t.get_float(n as usize, "ACBONUS"))
-                                        .unwrap_or(0.0)
-                                };
                                 crate::widgets::field_label(ui, *text);
-                                // (0 as well, which most of the game's
-                                // tables leave out: no part, so the
-                                // wearer's own shows there, as in the
-                                // game. A builder's report.)
-                                let choices = if *table == "parts_chest" {
-                                    super::situated::part_choices(&numbers, |n| {
-                                        format!("{n} (AC {})", ac_of(n).round())
-                                    })
-                                } else {
-                                    super::situated::part_choices(&numbers, |n| n.to_string())
-                                };
+                                let choices = armor_part_choices(game, table);
                                 pick_part(f, ui, text, labels, &choices);
                                 ui.end_row();
                             }
@@ -780,6 +873,8 @@ fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
                 cols[1].separator();
                 part_colors(f, &mut cols[1], game);
             });
+            ui.separator();
+            armor_part_gallery(f, ui, game);
         }
         // Simple and layered: one model (layered ones take colours).
         kind => {
@@ -848,7 +943,10 @@ fn properties(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
                 |ui| {
                     let mut found = 0;
                     for t in &available {
-                        let mut subtypes = game.property_subtypes(t, base);
+                        // A kind's choices by name, as Aurora's tree has
+                        // them (Specific Alignment's Chaotic Evil first,
+                        // where its table begins with Lawful Good).
+                        let mut subtypes = mg_rules::by_name(game.property_subtypes(t, base));
                         // (A kind found by its own name shows all of its
                         // choices; else those found.)
                         if !needle.is_empty() && !has(&t.name) {
@@ -1015,9 +1113,11 @@ fn property_editor(
                 ui.end_row();
             }
             if p.param1 != 255 {
+                // In the table's order, as Aurora lists them (iprp_damagetype's
+                // Bludgeoning to Sonic: captured 2026-10-30).
                 let params = game.property_params(p.param1);
                 crate::widgets::field_label(ui, "Parameter 1");
-                if let Some(v) = super::situated::pick(
+                if let Some(v) = super::situated::pick_ordered(
                     ui,
                     f.key,
                     "prop-param",
@@ -1059,7 +1159,7 @@ fn description(f: &mut Form<'_>, ui: &mut Ui) {
         let text = game
             .table("baseitems")
             .ok()
-            .and_then(|t| strref(game, t.get_int(row, "Description")))
+            .and_then(|t| game.cell_string(&t, row, t.column("Description")?))
             .unwrap_or_default();
         crate::widgets::field_label(ui, "Item Type Description");
         ui.weak(text);
@@ -1072,4 +1172,24 @@ fn description(f: &mut Form<'_>, ui: &mut Ui) {
     ui.separator();
     f.variables(ui);
     f.update_instances(ui);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::number_after;
+
+    /// Three digits, and past 999 the number as it is (a hak's it_gem_1000):
+    /// nwn-issues 658's appearances of 100 and more are listed.
+    #[test]
+    fn models_are_numbered_by_three_digits_and_more() {
+        assert_eq!(number_after("it_gem_007", "it_gem_"), Some(7));
+        assert_eq!(number_after("it_gem_150", "it_gem_"), Some(150));
+        assert_eq!(number_after("it_gem_1000", "it_gem_"), Some(1000));
+        assert_eq!(number_after("it_gem_65535", "it_gem_"), Some(65535));
+        for not in
+            ["it_gem_07", "it_gem_0150", "it_gem_15a", "it_gem_+15", "it_gem_99999", "it_ge_150"]
+        {
+            assert_eq!(number_after(not, "it_gem_"), None, "{not}");
+        }
+    }
 }

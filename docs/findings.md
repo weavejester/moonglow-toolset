@@ -3,7 +3,7 @@ type: Finding
 title: Findings
 description: What Moonglow's authors learned about NWN:EE that is undocumented or documented wrongly - item costs, creatures, areas and tiles, talk tables and 2DAs, haks, GFF fields, what Aurora writes - each saying how it was checked, where Moonglow implements it and what nwn.wiki says.
 tags: [findings, engine, aurora, gff, 2da, nwn-wiki]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-29T09:42:01Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T03:45:00Z }
 sources:
   - id: engine
     resource: The game itself (NWN:EE 89.8193.37) - a private nwserver, and the game client read back by screenshot; tests engine_* and client_* in crates/mg-corpus-tests/tests
@@ -287,9 +287,15 @@ asked for has them, and so the modifiers and the saves.
   save equal to the Statistics page's.
 - **Moonglow:** `crates/mg-rules/src/creatures.rs` (`creature_stats`).
   The stored maximum hit points stay Aurora's (the Constitution the
-  blueprint has, without the Great Constitution feats); whether the
-  game adds those feats' hit points itself, as it adds Epic
-  Toughness's, was not measured.
+  blueprint has, without the Great Constitution feats). The game adds
+  those feats' hit points to the maximum itself, as it adds Epic
+  Toughness's, but works out the hit points a creature starts with
+  from `CurrentHitPoints` and the Constitution without them: a fighter
+  30 with four of them, `CurrentHitPoints` its base as Aurora writes
+  it, starts at 249 of 309. Moonglow writes the base and the feats'
+  hit points there (`CreatureStats::current_hit_points`), and it starts
+  whole (`engine_saves.rs`
+  `great_constitution_s_hit_points_are_the_engine_s_to_add`).
 - **Wiki:** missing.
 
 ### Aurora's Levelup Wizard
@@ -846,7 +852,10 @@ finds it by its tag (`GetObjectByTag`) and among the area's objects
 whatever its file's `Plot` says. (The client merges it into the area's
 tiles, so what scripts do to it is not seen.) Of two objects with one
 tag in one area, `GetObjectByTag` took the one placed second, and `nNth`
-1 the first.
+1 the first. Of several across areas and kinds, it takes the one loaded
+last and `nNth` counts back from it: the areas in the module's order, an
+area's placeables before its waypoints, each kind in the order placed
+(`engine_object_by_tag.rs`).
 
 - **Checked:** engine (`engine_static_placeables.rs`: a static and a
   dynamic barrel with a variable each, and two with one tag).
@@ -1050,7 +1059,9 @@ appearance.2da's `ENVMAP` (a creature's) it is the area's, its tileset's
 mirror that isn't static is silver; the armoire's texture with
 `envmaptexture default`, and a bone golem, are copper. (Up to 2.5.2
 Moonglow drew the mirror copper too: a builder's armor stand, Heed's
-report.)
+report.) A texture's `envmaptexture default` on a placeable is the map
+the placeable names, else the area's: on a placeable whose `Reflection`
+is `default` too, the area's, not `chrome1`.
 
 - **Checked:** `area_env_map_look` with `MG_ENV_SHAPE=sphere`,
   `MG_ENV_PAINT` and `MG_ENV_CREATURE=24` (2026-10-25): spheres of a gray
@@ -1059,10 +1070,14 @@ report.)
   the map bound to it by the game's `inc_standard` in the scratch
   override; in `tin01` and `tic01`, static and not. Flat cards facing the
   camera, as first tried, reflect one dark spot of any map: they can't
-  tell the maps apart.
+  tell the maps apart. A texture's `default` on a placeable:
+  `program_choice_in_the_client` with `MG_LYING_ENVD=1` and
+  `MG_REFLECTION` `default` (the lying square's `texUnitEnv` the
+  floor's, `tcn01__ref01`) and `plc_g_env` (`plc_g_env`'s), 2026-10-29.
 - **Moonglow:** `crates/mg-preview/src/object.rs`
-  (`PLACEABLE_DEFAULT_ENV_MAP`); a texture's and a creature's `default`
-  in `crates/mg-render/src/renderer.rs`.
+  (`PLACEABLE_DEFAULT_ENV_MAP`, `Part::env_map_default`); a texture's
+  and a creature's `default` in `crates/mg-render/src/renderer.rs`
+  (`Instance::env_map_default`).
 - **Wiki:** missing.
 
 ### The game's shaders and Moonglow's own in stock interiors
@@ -1241,10 +1256,34 @@ unlit: as bright in an area lit 0x101010 as by day.
 A texel is cut out where its alpha is 0.2 or less (`fAlphaDiscardValue`),
 whatever the TXI says and with an MTR or without. What is left of a
 `blending punchthrough` texture is drawn solid; of any other, blended.
+A cut-out whose mesh's alpha is under 1 is drawn solid and cut all the
+same (a disc of `alpha 0.5` opaque, a quarter lighter than the plain
+one: `reading_see_through_cut_out`, 2026-10-30); a transparency hint
+changes nothing.
 
 - **Checked:** `cutouts_look`; the cut with `MG_DISCARD=1`, which paints
   each surface with the value through a patched `inc_standard.shd`.
 - **Moonglow:** `crates/mg-render/src/renderer.rs` (`Slots::twosided`).
+- **Wiki:** not compared.
+
+### A compiled mesh's index list is drawn, and tiles fade about the player
+
+Where a compiled mesh's index list has more triangles than its face
+list, the game draws the list (its first triangles are the faces): most
+of Forest - Facelift's cliff tiles (`ttf02`) are whole only so, their
+faces alone leaving holes in the ground the client doesn't have. The
+client also fades a tile's `tilefade` meshes (black caps, high cliffs,
+canopies) about the player as it plays, a few tiles round them, showing
+the sky through cliffs beside the player that it draws whole from 14 m
+off. The toolset's Fade Geometry is not that: it leaves out every
+fading mesh or none, as Aurora's does.
+
+- **Checked:** `reading_facelift_cliffs` (2026-10-29, 89.8193.37):
+  ttf02's tiles 0 to 3 beside the player, and with `MG_PC_Y=6` the
+  player 14 m south of them, beside Moonglow's area view (`MG_FADE=1`
+  with Fade Geometry on).
+- **Moonglow:** `crates/mg-mdl/src/binary.rs` (`Mesh::drawn`); Fade
+  Geometry in `crates/mg-area/src/scene.rs`.
 - **Wiki:** not compared.
 
 ### Particles: kept, flip-books and ribbons
@@ -1276,11 +1315,98 @@ view matches the client's picture within 1 px each way.
   and in `particles.rs`'s `an_upright_particle_turns_to_the_eye`. The
   client's scripted camera takes effect only when set a second after
   the player enters: `SetCameraFacing` in the module's OnClientEnter
-  itself left the client's own camera (so `particles_look`'s closer
-  camera was likely never the one drawn).
+  itself left the client's own camera (`particles_look`'s closer
+  camera, `grass_and_sky_look`'s `MG_CLOSE` and `grass_overrides_look`'s
+  `MG_DISTANCE` and `MG_PITCH` are given a second after since
+  2026-10-30, and `particles_look`'s numbers were taken again with it).
 - **Moonglow:** `crates/mg-render/src/particles.rs` (`batches`).
 - **Wiki:** MDL ASCII Emitter Nodes says the particles "face sideways
   from ground plane"; that they turn to the camera is missing.
+
+### Motion-blurred, spinning and newborn particles
+
+A `Motion_Blur` particle is twice its size across and streaks back
+along its path from its head, brightest there and faded out at its
+tail; the tail follows the particle about `0.76 × blurlength` seconds
+behind, so that a streak grows with its age towards `speed × 0.76 ×
+blurlength` (a 2 m/s particle 1.3 m long at 0.9 s with `blurlength` 1,
+0.56 m with 0.25); with `blurlength` 0 none is drawn. A Fountain's
+`birthrate` under 1 makes no particle at all (0.5 and 0.667, in an
+ASCII model or one compiled by nwnmdlcomp), 1.5 makes one and a half a
+second. A spinning particle (`particleRot`) starts upright and turns
+that many radians a second, anticlockwise as seen. An emitter's
+particles are drawn in the order they were born, the newest over the
+older, whichever is nearer the eye (a rising and a falling column
+alike). A lightning bolt and a `Linked` ribbon are soft as other
+particles, `particleSoftness` 10 over the size.
+
+- **Checked:** game client, `client_render.rs`'s `batch4.rs`
+  (2026-10-30, EE 89.8193.37): `reading_motion_blur_length`, `_rule`
+  and `_single` (columns of 12 cm squares at several speeds, birthrates
+  and blur lengths, seen from the side beside green dots a metre
+  apart), `reading_particle_turn_and_birth`,
+  `reading_particle_spin_and_order` (the four-color texture) and
+  `reading_soft_particles_of_lightning_and_linked` (the marked
+  `fsparticle`). The blur's 0.76 is fitted to those streaks (within
+  0.1 m but for the youngest particles), not taken from the client's
+  code.
+- **Moonglow:** `crates/mg-render/src/particles.rs` (`motion_blur`,
+  `BLUR_SECONDS`, the Fountain's spawn, `batches`).
+- **Wiki:** MDL ASCII Emitter Nodes: `blurlength` "how much a motion
+  blur particles stretches"; the rule, the birthrate's floor and the
+  spin's unit are missing.
+
+### A part's own visual transform, and an item's
+
+A creature's head (scope 254), wings (252) and cloak (243) transformed
+alone are drawn as the whole object's transform is, about the node the
+part hangs from (`head_g`, the wings' dummy; the cloak about the
+creature's feet): scaled, turned about each axis and moved alike in the
+client and Moonglow's area view; a creature of one model (the bandit)
+with its head scaled is drawn unchanged. A weapon of three models
+lying in an area takes 255 as the whole item, 254 as its middle model
+(a sword's guard) and 253 as its top (the blade); 252 and 251 change
+nothing there.
+
+- **Checked:** game client, `batch4.rs`'s `reading_part_scopes` (with
+  `MG_B4_SCOPE` 254, 252 and 243) and `reading_item_part_scopes`
+  (2026-10-30), beside Moonglow's area view.
+- **Moonglow:** `crates/mg-preview/src/creature.rs` and `item.rs`
+  (`scope_matrix`, `Part::local`).
+- **Wiki:** missing.
+
+### A static placeable plays no animation
+
+The client plays no animation of a static placeable: a model whose
+`default` animation keys a card's position and self-illumination and a
+light node's color stood still, static, where a dynamic copy beside it
+played them (its light cycling red and blue over the floor). A static
+placeable's emitters run (a brazier's fire and smoke, either way).
+
+- **Checked:** game client, `batch4.rs`'s
+  `reading_static_placeable_default_animation` (five pictures half a
+  second apart) and `reading_static_placeable_emitters` (2026-10-30).
+- **Moonglow:** `crates/mg-area/src/scene.rs` (`object_time`).
+- **Wiki:** missing.
+
+### A helmet without its model, and bare skin over nothing
+
+A helmet whose `helm_NNN` model isn't there is drawn as its base item's
+`DefaultModel` (the bag, `it_bag`) in the head's place, and no head
+under it. An armor's part 1 (bare skin) shows the wearer's own part,
+and where the wearer has none (no `BodyPart_*` field: a creature of one
+model given a part-based appearance) nothing: a commoner made a human
+in his clothes, whose arms are part 1, has no arms. (A helmet's model
+number is its EE twin `xModelPart1` first, as other part numbers.)
+
+- **Checked:** game client, `batch4.rs`'s
+  `reading_missing_helmet_model` (helmets of `ModelPart1` 1, 2 and 250
+  and none) and `reading_part_scopes` (2026-10-30), beside Moonglow's
+  area view.
+- **Moonglow:** `crates/mg-preview/src/creature.rs`; tests
+  `a_helmet_without_its_model_is_the_bag` and
+  `a_creature_s_own_parts_show_where_its_armor_is_bare`.
+- **Wiki:** missing.
 
 ## Talk tables and 2DAs
 
@@ -1628,7 +1754,10 @@ the feat).
 - **Moonglow:** `crates/mg-ui/src/blueprint/creature_lists.rs`
   (`equip_edits`: what the slot held goes to the backpack as it is, in
   the same step; up to 2.5.6 it was deleted). A weapon dropped on the
-  secondary slot stays there (recorded in deferred.md).
+  secondary slot while the primary is free goes in the primary, the
+  primary's own dragged there too (Aurora, 2026-10-30, with a dagger, a
+  hand axe and a longsword; a torch stays in the secondary:
+  `a_weapon_dropped_on_the_secondary_slot_takes_a_free_primary`).
 - **Wiki:** missing.
 
 ### Conversation script parameters
@@ -1740,6 +1869,54 @@ sound's volume are lost.
 - **Moonglow:** `crates/mg-module/src/instances.rs` (`update`).
 - **Wiki:** says only that it updates objects "to match the blueprint".
 
+### Update Instances and held items
+
+Asked "even those inside a container (creature, placeable object,
+store)?", Aurora's Update Instances makes the items placed objects hold
+again from their blueprint too: name, charges and cost are the
+blueprint's, and so is `StackSize` (a chest's three and a creature's
+two became one); the place in the grid, `Dropable`, `Pickpocketable`
+and a store's `Infinite` stay.
+
+- **Checked:** Aurora, the captures `wave1/update-held.mod` and
+  `wave1/pal2-update.mod` (`tools/aurora/capture_wave1.py`).
+- **Moonglow:** `crates/mg-module/src/instances.rs` (`update_held`).
+- **Wiki:** missing.
+
+### A tile's replacement texture, and the value that crashes the client
+
+A tile's `Tile_ReplaceTex` draws its model's `replace_tex` texture with a
+`replacetexture.2da` row: the row before the value's (1 draws row 0, 2
+row 1), row 0 for a tile without the field. A value of 0, or one past the
+table (3, 255 with the game's two rows), crashes the client as it loads
+the area, in `CNWCTile::SetReplaceTexture` (`AurTextureReplaceTileReferences`),
+on a tile whose model has a `replace_tex` texture: the game's one such
+model is `tms01_c08_01`, which no tileset uses, and neither `replace_tex`
+nor the table's `T_Flag02` is in the game.
+
+- **Checked:** the client, `reading_tile_replacement_texture` in
+  `crates/mg-corpus-tests/tests/client_render/readings.rs` (an area's
+  tiles made `tms01_c08_01`, the textures and rows given colors of their
+  own; the crash report in the scratch user directory).
+- **Moonglow:** the area view draws the rows so
+  (`mg_area::replacement_row`); Tile Properties has no field for it.
+- **Wiki:** BioWare's unused functionality ("Replacing Simple
+  Textures"); the rule and the crash are missing.
+
+### What Aurora drops when it saves an area or a blueprint
+
+An area's own grass (`GrassDefDisabled`, `GrassOverrides` in the GIT's
+`AreaProperties`) is gone from an area Aurora saves; so is the visual
+transform (`VisTransformList`) of a static placed placeable, while a
+dynamic one's stays. A blueprint written by its Edit and OK has no
+`VisTransformList`, static or not (Aurora's blueprints have none).
+
+- **Checked:** Aurora, the captures `wave1/area-saved.mod` (the probe
+  `wave1/before.mod`), `wave1/static-bp.mod`, `wave1/pal2-vtdyn.mod`.
+- **Moonglow:** keeps what the files have; Verify warns of a static
+  object with a visual transform. The manual warns of the grass.
+- **Wiki:** missing.
+
 ### Add to Palette naming
 
 The new resref is the template without `nw_` and its trailing number; from
@@ -1799,6 +1976,22 @@ same name; Delete takes out the entry alone.
   where the builder changed something.
 - **Wiki:** "Toolset Palette ITP" says the toolset makes the `palcus.itp`
   from the module's blueprints at every save; Aurora 89.8193.37 doesn't.
+
+A module's own skeleton (`<type>pal.itp`) is what Select Category and
+Refresh Palette read: its new and renamed categories, a node's name its
+`STRREF` before a `NAME` written out, `DELETE_ME` where there is
+neither, written into the `palcus.itp` as `NAME` (or the `STRREF`
+alone). The custom palette shown is the `palcus.itp`'s own nodes and
+names, each level by name, whatever order the file has; Save As writes
+it back in that order, and gives every creature entry its blueprint's
+`CR` and `FACTION`, stale or not. A blueprint whose category the
+palette lacks (a `PaletteID` of 200, 255, a category the `palcus.itp`
+hasn't) is left out by Refresh Palette, and put in the first category
+(Battlefield) by Edit and OK.
+
+- **Checked:** Aurora, the captures `wave1/saveas.mod`,
+  `wave1/refresh-items.mod`, `wave1/pal2-refresh2.mod`,
+  `wave1/pal2-newcat.mod` and `wave1/pal2-saveas.mod`.
 
 ### Build › Compile › Encounters
 

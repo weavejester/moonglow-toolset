@@ -16,7 +16,7 @@ use mg_module::script_wizard::{
 };
 use mg_resman::ResKey;
 
-use crate::{Moonglow, Tab};
+use crate::Moonglow;
 
 /// The condition pages: the first page's checkbox and the page's question.
 const CONDITION_PAGES: [(&str, &str); 11] = [
@@ -495,7 +495,9 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
                             c.label().to_string()
                         });
                     });
-                    ui.add_enabled(*on, egui::DragValue::new(value).range(0..=255));
+                    ui.add_enabled_ui(*on, |ui| {
+                        crate::widgets::spin_draft(ui, value, 0..=255, 1.0, |d| d);
+                    });
                     ui.end_row();
                 }
             });
@@ -512,10 +514,9 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
                     ui.radio_value(&mut w.specific_level, false, "Any level");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut w.specific_level, true, "Specific level");
-                        ui.add_enabled(
-                            w.specific_level,
-                            egui::DragValue::new(&mut w.level).range(1..=60),
-                        );
+                        ui.add_enabled_ui(w.specific_level, |ui| {
+                            crate::widgets::spin_draft(ui, &mut w.level, 1..=60, 1.0, |d| d);
+                        });
                     });
                 });
                 if ui.button("Add").clicked() {
@@ -622,7 +623,14 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
         5 => {
             ui.horizontal(|ui| {
                 crate::widgets::field_label(ui, "Filter");
-                ui.text_edit_singleline(&mut w.filter);
+                crate::widgets::SearchField::new(
+                    egui::Id::new("script-wizard-feats"),
+                    &mut w.filter,
+                )
+                .hint("Find a feat")
+                .width(200.0)
+                .find_over()
+                .show(ui);
             });
             move_lists(
                 ui,
@@ -730,9 +738,10 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
         }
         _ => {
             ui.label("Has the chance of appearing of");
-            ui.add(egui::DragValue::new(&mut w.random.0).range(1..=w.random.1.max(1)));
+            let most = w.random.1.max(1);
+            crate::widgets::spin_draft(ui, &mut w.random.0, 1..=most, 1.0, |d| d);
             ui.label("in");
-            ui.add(egui::DragValue::new(&mut w.random.1).range(1..=10_000));
+            crate::widgets::spin_draft(ui, &mut w.random.1, 1..=10_000, 1.0, |d| d);
             w.random.0 = w.random.0.min(w.random.1);
         }
     }
@@ -894,86 +903,79 @@ pub(crate) fn window(app: &mut Moonglow, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     let mut close = false;
     let mut finish = false;
-    egui::Window::new("Script Wizard")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(&ctx, |ui| {
-            ui.set_min_width(520.0);
-            let pages = w.page_list();
-            let question = match w.step {
-                Step::Choose if w.condition => "What conditions would you like to test for?",
-                Step::Choose => "What actions would you like to perform?",
-                Step::Page(i) => pages[i].1,
-                Step::Name => "Congratulations!",
-            };
-            ui.heading(question);
-            ui.separator();
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                ui.set_min_height(300.0);
-                match w.step {
-                    Step::Choose => {
-                        ui.columns(2, |cols| {
-                            let half = if w.condition { 8 } else { pages.len() };
-                            for (i, (label, _)) in pages.iter().enumerate() {
-                                let col = usize::from(i >= half);
-                                cols[col].checkbox(&mut w.pages[i], *label);
-                            }
-                        });
-                    }
-                    Step::Page(i) if w.condition => condition_page(ui, &mut w, i),
-                    Step::Page(i) => action_page(app, ui, &mut w, i),
-                    Step::Name => {
-                        ui.label("Enter the script name");
-                        let field = ui.add(
-                            egui::TextEdit::singleline(&mut w.name)
-                                .char_limit(16)
-                                .id_salt("wiz-name"),
-                        );
-                        crate::widgets::autofocus(ui, &field);
-                        let exists = ResRef::from_str(w.name.trim()).ok().is_some_and(|r| {
-                            app.ws
-                                .as_ref()
-                                .is_some_and(|ws| ws.module.contains(&ResKey::new(r, ResType::NSS)))
-                        });
-                        if exists {
-                            ui.colored_label(
-                                ui.visuals().warn_fg_color,
-                                "The module has a script of this name; it will be replaced.",
-                            );
+    crate::widgets::modal(&ctx, "Script Wizard").show(&ctx, |ui| {
+        ui.set_min_width(520.0);
+        let pages = w.page_list();
+        let question = match w.step {
+            Step::Choose if w.condition => "What conditions would you like to test for?",
+            Step::Choose => "What actions would you like to perform?",
+            Step::Page(i) => pages[i].1,
+            Step::Name => "Congratulations!",
+        };
+        ui.heading(question);
+        ui.separator();
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            ui.set_min_height(300.0);
+            match w.step {
+                Step::Choose => {
+                    ui.columns(2, |cols| {
+                        let half = if w.condition { 8 } else { pages.len() };
+                        for (i, (label, _)) in pages.iter().enumerate() {
+                            let col = usize::from(i >= half);
+                            cols[col].checkbox(&mut w.pages[i], *label);
                         }
-                        ui.checkbox(&mut w.open_editor, "Start the script editor");
+                    });
+                }
+                Step::Page(i) if w.condition => condition_page(ui, &mut w, i),
+                Step::Page(i) => action_page(app, ui, &mut w, i),
+                Step::Name => {
+                    ui.label("Enter the script name");
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut w.name).char_limit(16).id_salt("wiz-name"),
+                    );
+                    crate::widgets::autofocus(ui, &field);
+                    let exists = ResRef::from_str(w.name.trim()).ok().is_some_and(|r| {
+                        app.ws
+                            .as_ref()
+                            .is_some_and(|ws| ws.module.contains(&ResKey::new(r, ResType::NSS)))
+                    });
+                    if exists {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "The module has a script of this name; it will be replaced.",
+                        );
                     }
+                    ui.checkbox(&mut w.open_editor, "Start the script editor");
                 }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                let valid_name =
-                    ResRef::from_str(w.name.trim()).ok().is_some_and(|r| !r.is_empty());
-                if ui.add_enabled(w.step != Step::Choose, egui::Button::new("< Back")).clicked() {
-                    w.step = w.back();
-                    w.selected = None;
-                    w.entry.clear();
-                }
-                if ui.add_enabled(w.step != Step::Name, egui::Button::new("Next >")).clicked()
-                    || (w.step != Step::Name && crate::widgets::enter(ui))
-                {
-                    w.step = w.next();
-                    w.selected = None;
-                    w.entry.clear();
-                }
-                if ui
-                    .add_enabled(w.step == Step::Name && valid_name, egui::Button::new("Finish"))
-                    .clicked()
-                    || (w.step == Step::Name && valid_name && crate::widgets::enter(ui))
-                {
-                    finish = true;
-                }
-                if crate::widgets::cancel(ui) {
-                    close = true;
-                }
-            });
+            }
         });
+        ui.separator();
+        ui.horizontal(|ui| {
+            let valid_name = ResRef::from_str(w.name.trim()).ok().is_some_and(|r| !r.is_empty());
+            if ui.add_enabled(w.step != Step::Choose, egui::Button::new("< Back")).clicked() {
+                w.step = w.back();
+                w.selected = None;
+                w.entry.clear();
+            }
+            if ui.add_enabled(w.step != Step::Name, egui::Button::new("Next >")).clicked()
+                || (w.step != Step::Name && crate::widgets::enter(ui))
+            {
+                w.step = w.next();
+                w.selected = None;
+                w.entry.clear();
+            }
+            if ui
+                .add_enabled(w.step == Step::Name && valid_name, egui::Button::new("Finish"))
+                .clicked()
+                || (w.step == Step::Name && valid_name && crate::widgets::enter(ui))
+            {
+                finish = true;
+            }
+            if crate::widgets::cancel(ui) {
+                close = true;
+            }
+        });
+    });
     if finish {
         finish_wizard(app, &w);
         close = true;
@@ -1006,7 +1008,7 @@ fn finish_wizard(app: &mut Moonglow, w: &ScriptWizard) {
     app.actions.push(crate::Action::Apply(Command::new(format!("Script Wizard: {name}"), edits)));
     app.log.info(format!("Script Wizard: wrote {nss}"));
     if w.open_editor {
-        app.actions.push(crate::Action::OpenTab(Tab::Script(nss)));
+        app.actions.push(crate::Action::OpenResource(nss));
     }
 }
 

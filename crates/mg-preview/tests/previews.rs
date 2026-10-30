@@ -125,6 +125,132 @@ fn blueprints_assemble() {
     assert_eq!(d.base.model, door_types.get(1, "Model").unwrap().to_ascii_lowercase());
 }
 
+/// `of_object`, the one preview of an object the area view, a blueprint's
+/// view and `mg model-files` make, is each kind's own with its
+/// replacements, an item as it is shown alone or as it lies placed.
+#[test]
+fn an_object_s_preview_is_its_kind_s() {
+    use mg_preview::{Shown, of_object, replaced};
+    use mg_rules::ObjectKind as K;
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let items = items(&game);
+    let of = |kind, s: &mg_gff::Struct, shown| of_object(&game, kind, s, &items, shown).unwrap();
+    let alone = Shown::Alone { female: false };
+    let utc = blueprint(&game, "nw_hen_bod_05", ResType::UTC).root;
+    assert_eq!(of(K::Creature, &utc, alone).unwrap(), creature(&game, &utc, &items).unwrap());
+    let utp = blueprint(&game, "plc_armoire", ResType::UTP).root;
+    assert_eq!(of(K::Placeable, &utp, alone).unwrap(), placeable(&game, &utp).unwrap());
+    let utd = blueprint(&game, "nw_door_ttr_01", ResType::UTD).root;
+    assert_eq!(of(K::Door, &utd, Shown::Placed).unwrap(), door(&game, &utd).unwrap());
+    // (The game's waypoint blueprints have no appearance, and no flag.)
+    let mut utw = blueprint(&game, "nw_waypoint001", ResType::UTW).root;
+    assert!(of(K::Waypoint, &utw, alone).is_err());
+    utw.set("Appearance", mg_gff::Value::Byte(2));
+    assert_eq!(of(K::Waypoint, &utw, alone).unwrap().base.model, "gi_waypoint02");
+    // Armor: a body wearing it alone, a woman's where asked; the game's
+    // armor lying on the ground placed.
+    let uti = blueprint(&game, "nw_aarcl001", ResType::UTI).root;
+    assert_eq!(of(K::Item, &uti, alone).unwrap().base.model, "pmh0");
+    let on_her = of(K::Item, &uti, Shown::Alone { female: true }).unwrap();
+    assert_eq!(on_her.base.model, "pfh0");
+    let lying = of(K::Item, &uti, Shown::Placed).unwrap();
+    assert!(lying.base.model.starts_with("gi_armor0"), "{lying:?}");
+    // The replacements are applied.
+    let mut replacing = utp.clone();
+    let mut entry = mg_gff::Struct::new(0);
+    let old = placeable(&game, &utp).unwrap();
+    let texture = mg_preview::replaceable::textures(&game, &old).into_iter().next().unwrap();
+    entry.set("OldTexture", mg_gff::Value::resref(ResRef::from_str(&texture.name).unwrap()));
+    entry.set("NewTexture", mg_gff::Value::resref(ResRef::from_str("mg_new").unwrap()));
+    let mut outer = mg_gff::Struct::new(0);
+    outer.set("TextureReplaceLi", mg_gff::Value::List(vec![entry]));
+    replacing.set("TextureReplace", mg_gff::Value::Struct(outer));
+    let replaced_one = of(K::Placeable, &replacing, alone).unwrap();
+    assert_eq!(replaced_one, replaced(old, &replacing));
+    assert_ne!(replaced_one, placeable(&game, &utp).unwrap(), "a texture replaced");
+    // Encounters and triggers have no model.
+    assert!(of_object(&game, K::Trigger, &utp, &items, alone).is_none());
+}
+
+/// An item the creature may not wear is not drawn on it, as the game
+/// takes it off as it loads the creature (`engine_equipped_items.rs`): a
+/// commoner in the cloak the client showed taken off (limited to bards,
+/// sorcerers and wizards), and in the same cloak without its properties,
+/// which it wears. An armor's own preview is a body that wears it
+/// whatever. Both drawn to `target/test-output/previews-worn/commoner_cloak_*.png`.
+#[test]
+fn what_a_creature_may_not_wear_is_not_drawn() {
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    // (A human's body of parts with the commoner's class, feats, race and
+    // alignment: the commoner's own appearance is a model of its own,
+    // which wears no cloak.)
+    let own = blueprint(&game, "nw_commale", ResType::UTC).root;
+    let mut commoner = CreatureLook::new(6).to_utc();
+    for label in ["ClassList", "FeatList", "Race", "GoodEvil", "LawfulChaotic"] {
+        commoner.set(label, own.get(label).unwrap().clone());
+    }
+    let wearing = |cloak: &mg_gff::Struct| {
+        let mut utc = commoner.clone();
+        let mut worn = cloak.clone();
+        worn.id = 0x40;
+        utc.set("Equip_ItemList", mg_gff::Value::List(vec![worn]));
+        utc
+    };
+    let limited = blueprint(&game, "nw_aarcl013", ResType::UTI).root;
+    let mut plain = limited.clone();
+    plain.set("PropertiesList", mg_gff::Value::List(Vec::new()));
+    let cloaked = |p: &Preview| p.parts.iter().any(|x| x.model.contains("_cloak_"));
+    let worn = creature(&game, &wearing(&plain), &|_| None).unwrap();
+    let off = creature(&game, &wearing(&limited), &|_| None).unwrap();
+    assert!(cloaked(&worn), "{:?}", models(&worn));
+    assert!(!cloaked(&off), "{:?}", models(&off));
+    // Heavy armor on the armor's own body, which has no proficiency.
+    let plate = blueprint(&game, "nw_aarcl007", ResType::UTI).root;
+    assert!(item(&game, &plate).unwrap().parts.iter().any(|x| x.model.contains("chest")));
+
+    mg_testkit::gpu::hold();
+    let Some(gpu) = Gpu::headless() else {
+        eprintln!("skipped: no GPU");
+        return;
+    };
+    let rm = &game.resman;
+    let load = |name: &str| -> Option<Arc<Model>> {
+        let data = rm.get_named(name, ResType::MDL).ok()?;
+        Model::read(&data).ok().map(Arc::new)
+    };
+    let dir = mg_testkit::scratch_dir("previews-worn");
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+    for (name, preview) in [("worn", &worn), ("off", &off)] {
+        let c = Composed::new(&gpu, preview, &load).unwrap();
+        let (min, max) = c.bounds();
+        let radius = ((max - min).length() * 0.5).max(0.1);
+        // (From behind: the cloak hangs there.)
+        let camera = Camera::orbit(
+            (min + max) * 0.5,
+            radius / 20f32.to_radians().sin() * 1.1,
+            (-90f32).to_radians(),
+            15f32.to_radians(),
+        );
+        let scene = Scene {
+            instances: c.instances(c.idle.as_deref(), 0.5, Mat4::IDENTITY),
+            area: AreaLight::default(),
+            background: [0.2, 0.25, 0.3],
+            ..Default::default()
+        };
+        let img = r.render_image(&gpu, rm, &scene, &camera, 256, 256);
+        let file = std::fs::File::create(dir.join(format!("commoner_cloak_{name}.png"))).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), img.width, img.height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.write_header().unwrap().write_image_data(&img.data).unwrap();
+    }
+}
+
 /// A part whose model names a texture that doesn't exist takes the texture
 /// of its own name, as the game does: `pfh0_belt063` names `beltmerged`.
 #[test]
@@ -385,6 +511,48 @@ fn a_creature_s_own_parts_show_where_its_armor_is_bare() {
     assert!(models.contains(&"pmh0_bicepr002"), "the creature's own arm: {models:?}");
     assert!(models.contains(&"pmh0_bicepl001"), "{models:?}");
     assert!(models.contains(&"pmh0_chest005"), "the armor's chest: {models:?}");
+    // Where the creature has no part of its own (no field: a commoner made
+    // a human), the armor's bare skin shows none, as in the client
+    // (`client_render.rs`'s `reading_part_scopes`: no arms).
+    utc.remove("BodyPart_RBicep");
+    utc.remove("BodyPart_LBicep");
+    let bare = creature(&game, &utc, &armor).unwrap();
+    let models = self::models(&bare);
+    assert!(
+        !models.iter().any(|m| m.starts_with("pmh0_bicep")),
+        "no arms where neither has one: {models:?}"
+    );
+    assert!(models.contains(&"pmh0_chest005"), "{models:?}");
+}
+
+/// A helmet whose model isn't there is drawn as its base item's
+/// `DefaultModel` (the bag) in the head's place, as the client draws it
+/// (`client_render.rs`'s `reading_missing_helmet_model`); one that is
+/// there, as itself.
+#[test]
+fn a_helmet_without_its_model_is_the_bag() {
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let mut utc = CreatureLook::new(6).to_utc();
+    let mut worn = mg_gff::Struct::new(1);
+    worn.set("EquippedRes", mg_gff::Value::resref("worn".parse().unwrap()));
+    utc.set("Equip_ItemList", mg_gff::Value::List(vec![worn]));
+    for (part, want) in [(2u8, "helm_002"), (250, "it_bag")] {
+        let helmet = |_: ResRef| -> Option<Gff> {
+            let mut g = Gff::new(*b"UTI ");
+            g.root.set("BaseItem", mg_gff::Value::Int(17));
+            g.root.set("ModelPart1", mg_gff::Value::Byte(part));
+            Some(g)
+        };
+        let preview = creature(&game, &utc, &helmet).unwrap();
+        let models = models(&preview);
+        assert!(models.contains(&want), "helmet {part}: {models:?}");
+        assert!(!models.iter().any(|m| m.contains("_head")), "no head under it: {models:?}");
+        let p = preview.parts.iter().find(|p| p.model == want).unwrap();
+        assert_eq!(p.attach.as_deref(), Some("head_g"));
+    }
 }
 
 /// A cloak moves with the bones of the body wearing it: on an elf (whose
@@ -459,6 +627,35 @@ fn a_dragon_s_box_is_around_its_pause_not_its_rest() {
     // Its wings are skinned: folded in its pause, they are counted where
     // their bones put them, not spread as they were bound.
     assert!(pause.z < rest.z * 0.8, "lower than with wings spread: {pause:?} against {rest:?}");
+    // And a click is tried against it as it stands, where its box is (it
+    // was tried against its rest, which lies far out of the box): rays
+    // straight down over both boxes, a grid of them.
+    let stance = c.stance(c.idle.as_deref(), 0.0);
+    let (posed_box, rest_box) = (c.bounds_of(&stance), c.bounds());
+    let (low, high) = (posed_box.0.min(rest_box.0), posed_box.1.max(rest_box.1));
+    let inside = |p: glam::Vec3, (min, max): (glam::Vec3, glam::Vec3)| {
+        p.x >= min.x - 0.01 && p.x <= max.x + 0.01 && p.y >= min.y - 0.01 && p.y <= max.y + 0.01
+    };
+    let (mut posed_hits, mut rest_outside) = (0, 0);
+    for i in 0..40 {
+        for j in 0..40 {
+            let at = glam::Vec3::new(
+                low.x + (high.x - low.x) * (i as f32 + 0.5) / 40.0,
+                low.y + (high.y - low.y) * (j as f32 + 0.5) / 40.0,
+                high.z + 1.0,
+            );
+            let down = glam::Vec3::NEG_Z;
+            if c.ray_hit_in(&stance, at, down).is_some() {
+                posed_hits += 1;
+                assert!(inside(at, posed_box), "a hit at {at:?} out of the box {posed_box:?}");
+            }
+            if c.ray_hit(at, down).is_some() && !inside(at, posed_box) {
+                rest_outside += 1;
+            }
+        }
+    }
+    assert!(posed_hits > 20, "the dragon as it stands is met: {posed_hits}");
+    assert!(rest_outside > 20, "at rest it lies out of the box: {rest_outside}");
 }
 
 /// A look at creatures of custom content (GitHub issue 5): `MG_PROBE_USER`
@@ -544,6 +741,54 @@ fn probe_custom_creatures() {
     }
 }
 
+/// A cloak of a base item of a module's own lies as that base item's
+/// `DefaultModel`, the game's model of a cloak dropped being its own
+/// cloaks' alone (seen in the client: `reading_custom_cloak_base_item` in
+/// `client_render.rs`): two copies of the cloak's row, one naming a torch
+/// and one the bag.
+#[test]
+fn a_cloak_of_a_base_item_of_its_own_lies_as_its_model() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let table = base.resman.get_named("baseitems", ResType::TWODA).unwrap();
+    let mut table = String::from_utf8_lossy(&table).into_owned();
+    let row: Vec<String> = table
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("80"))
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let header: Vec<&str> = table.lines().nth(2).unwrap().split_whitespace().collect();
+    let column = header.iter().position(|c| *c == "DefaultModel").unwrap() + 1;
+    let next = table.lines().count() - 3;
+    if !table.ends_with('\n') {
+        table.push('\n');
+    }
+    for (i, model) in ["it_torch_000", "it_bag"].into_iter().enumerate() {
+        let mut new = row.clone();
+        new[0] = (next + i).to_string();
+        new[column] = model.into();
+        table += &(new.join(" ") + "\n");
+    }
+    let user = mg_testkit::scratch_dir("preview_custom_cloak");
+    std::fs::create_dir_all(user.join("override")).unwrap();
+    std::fs::write(user.join("override/baseitems.2da"), table).unwrap();
+    let game = GameData::open(&GameInstall::new(&root, Some(user), "en")).unwrap();
+    let mut cloak = blueprint(&game, "nw_maarcl055", ResType::UTI).root;
+    let mut lying = |base_item: usize| {
+        cloak.set("BaseItem", mg_gff::Value::Int(base_item as i32));
+        let p = mg_preview::item_placed(&game, &cloak).unwrap();
+        models(&p).into_iter().map(str::to_string).collect::<Vec<_>>()
+    };
+    assert_eq!(lying(80), ["gi_cloak01"], "the game's own");
+    assert_eq!(lying(next), ["it_torch_000"], "its DefaultModel");
+    assert_eq!(lying(next + 1), ["it_bag"], "the bag it names");
+}
+
 /// Armour and a cloak lying in an area are the game's models of them
 /// dropped, not what a wearer shows (a builder's area showed a man
 /// standing where a tunic lay, and a cloak hanging from nothing); a sword
@@ -562,10 +807,16 @@ fn what_is_only_worn_lies_in_an_area_as_aurora_shows_it() {
     // leather, chain, plate), no body.
     let dropped =
         |name: &str| models(&placed(name)).into_iter().map(str::to_string).collect::<Vec<_>>();
+    // (As Aurora lays one of each torso ACBONUS, 0 to 8: captured
+    // 2026-10-30.)
     assert_eq!(dropped("nw_cloth001"), ["gi_armor01"]);
-    assert_eq!(dropped("nw_aarcl001"), ["gi_armor04"], "leather");
-    assert_eq!(dropped("nw_aarcl004"), ["gi_armor03"], "chain");
-    assert_eq!(dropped("nw_aarcl007"), ["gi_armor02"], "full plate");
+    assert_eq!(dropped("nw_aarcl009"), ["gi_armor01"], "padded (1): the tunic");
+    assert_eq!(dropped("nw_aarcl001"), ["gi_armor04"], "leather (2)");
+    assert_eq!(dropped("nw_aarcl002"), ["gi_armor04"], "3");
+    assert_eq!(dropped("nw_aarcl012"), ["gi_armor03"], "4");
+    assert_eq!(dropped("nw_aarcl004"), ["gi_armor03"], "chain (5)");
+    assert_eq!(dropped("nw_aarcl011"), ["gi_armor02"], "6");
+    assert_eq!(dropped("nw_aarcl007"), ["gi_armor02"], "full plate (8)");
     // A cloak: the game's model of a cloak dropped, folded, in the
     // cloak's colors.
     let cloak = placed("nw_aarcl013");
@@ -780,6 +1031,58 @@ fn an_object_casts_its_models_lights() {
     assert_eq!(c.row_lights(at).len(), 1);
 }
 
+/// A light node's keys play with the animation it stands in (the deferred
+/// list's flicker: the client plays a dynamic placeable's `default`, a
+/// light's colour keyed red, blue, red over 2 s, the floor lit with it,
+/// `reading_static_placeable_default_animation`): `point_lights_at` takes
+/// the keys at the time asked for, `point_lights` the light as it stands;
+/// and a mesh's self-illumination keyed in its idle animation plays.
+#[test]
+fn a_light_node_s_keys_play_with_its_animation() {
+    mg_testkit::gpu::hold();
+    let Some(gpu) = Gpu::headless() else {
+        eprintln!("skipped: no GPU");
+        return;
+    };
+    let text = "newmodel mg_flicker\nsetsupermodel mg_flicker NULL\nclassification placeable\n\
+                beginmodelgeom mg_flicker\nnode dummy mg_flicker\n  parent NULL\nendnode\n\
+                node trimesh square\n  parent mg_flicker\n  bitmap NULL\n  verts 3\n    0 0 0\n    \
+                1 0 0\n    0 1 0\n  faces 1\n    0 1 2 1 0 0 0 0\nendnode\n\
+                node light lamp\n  parent mg_flicker\n  position 0 0 2\n  color 1 0 0\n  \
+                radius 5\n  multiplier 1\nendnode\nendmodelgeom mg_flicker\n\
+                newanim default mg_flicker\n  length 2\n  transtime 0\n  animroot mg_flicker\n\
+                node dummy mg_flicker\n  parent NULL\nendnode\n\
+                node light lamp\n  parent mg_flicker\n  colorkey 3\n    0 1 0 0\n    1 0 0 1\n    \
+                2 1 0 0\nendnode\nnode trimesh square\n  parent mg_flicker\n  \
+                selfillumcolorkey 3\n    0 1 0 0\n    1 0 0 1\n    2 1 0 0\nendnode\n\
+                doneanim default mg_flicker\ndonemodel mg_flicker\n";
+    let model = Arc::new(Model::read(text.as_bytes()).unwrap());
+    let load = |name: &str| (name == "mg_flicker").then(|| model.clone());
+    let mut p = Preview::model("mg_flicker");
+    p.idle = Some("default".into());
+    let c = Composed::new(&gpu, &p, &load).unwrap();
+    let color = |lights: Vec<mg_render::PointLight>| {
+        assert_eq!(lights.len(), 1, "{lights:#?}");
+        lights[0].color
+    };
+    let at = |t: f32| color(c.point_lights_at(Some("default"), t, Mat4::IDENTITY));
+    assert_eq!(color(c.point_lights(Mat4::IDENTITY)), glam::Vec3::X, "as it stands");
+    assert_eq!(at(0.0), glam::Vec3::X);
+    assert_eq!(at(1.0), glam::Vec3::Z, "blue a second in");
+    let between = at(0.5);
+    assert!(between.x > 0.0 && between.z > 0.0 && between.y == 0.0, "{between}");
+    // (No animation: as it stands.)
+    assert_eq!(color(c.point_lights_at(None, 1.0, Mat4::IDENTITY)), glam::Vec3::X);
+    // The mesh's self-illumination, keyed alike, plays with the pose.
+    let glow = |t: f32| {
+        let drawn = c.instances(Some("default"), t, Mat4::IDENTITY);
+        drawn[0].state.as_ref().and_then(|s| s.meshes[0].selfillum)
+    };
+    assert_eq!(glow(0.0), Some(glam::Vec3::X));
+    assert_eq!(glow(1.0), Some(glam::Vec3::Z));
+    assert_eq!(c.instances(None, 1.0, Mat4::IDENTITY)[0].state, None);
+}
+
 /// **Illuminated** off (`LightState` 0) leaves out a placeable's
 /// appearance light, as the client does; absent or 1, it is there
 /// (`model_light_uniforms` in `client_render.rs`). And a static placeable
@@ -816,4 +1119,41 @@ fn a_placeable_s_light_and_reflection_follow_the_client() {
     assert_eq!(env(utp(428, None, 1)), None, "static");
     // The large treasure: a named map, as it is.
     assert_eq!(env(utp(191, None, 0)).as_deref(), Some("plc_g_env"));
+    // Only the mirror's stands for its `default`, which a texture's own
+    // `envmaptexture default` passes over for the area's.
+    let default = |s| placeable(&game, &s).unwrap().base.env_map_default;
+    assert!(default(utp(428, None, 0)));
+    assert!(!default(utp(191, None, 0)) && !default(utp(0, None, 0)));
+}
+
+/// A placed composite item's part scopes transform its models as the
+/// client's (`client_render.rs`'s `reading_item_part_scopes`): 255 the
+/// whole item, 254 its middle (a sword's guard), 253 its top (the blade);
+/// 252 and 251 none of them.
+#[test]
+fn an_item_s_part_scopes_transform_its_parts() {
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let sword = Gff::read(&game.resman.get_named("nw_wswls001", ResType::UTI).unwrap()).unwrap();
+    let which = |scope: i32| -> Vec<String> {
+        let mut uti = sword.root.clone();
+        let mut entry = mg_gff::Struct::new(6);
+        entry.set("Scope", mg_gff::Value::Int(scope));
+        let mut axis = mg_gff::Struct::new(0);
+        axis.set("ValueTo", mg_gff::Value::Float(2.0));
+        entry.set("ScaleX", mg_gff::Value::Struct(axis));
+        uti.set("VisTransformList", mg_gff::Value::List(vec![entry]));
+        let p = item(&game, &uti).unwrap();
+        std::iter::once(&p.base)
+            .chain(&p.parts)
+            .filter(|part| part.local.is_some())
+            .map(|part| part.model.clone())
+            .collect()
+    };
+    assert_eq!(which(255).len(), 3, "the whole sword");
+    assert_eq!(which(254), vec!["wswls_m_011".to_string()]);
+    assert_eq!(which(253), vec!["wswls_t_011".to_string()]);
+    assert!(which(252).is_empty() && which(251).is_empty());
 }

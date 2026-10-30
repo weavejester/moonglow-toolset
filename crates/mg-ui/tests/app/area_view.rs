@@ -31,9 +31,12 @@ fn alt_and_a_drag_off_the_selection_moves_the_camera() {
     };
     let (before, changed) = (orbit(&h), revision(&h));
     // Nothing selected, on bare ground: the ground follows the pointer.
-    drag(&mut h, Vec3::new(10.0, 10.0, 0.0), Vec3::new(14.0, 10.0, 0.0));
+    // (Six steps of more than egui's drag threshold, 6 points, each: a
+    // first step under it is no drag yet, and is lost. Four meters were
+    // about 6 points a step, and passed or not as the toolbar wrapped.)
+    drag(&mut h, Vec3::new(10.0, 10.0, 0.0), Vec3::new(16.0, 10.0, 0.0));
     let moved = orbit(&h).target - before.target;
-    assert!((moved.x + 4.0).abs() < 0.6 && moved.y.abs() < 0.6, "panned: {moved:?}");
+    assert!((moved.x + 6.0).abs() < 0.6 && moved.y.abs() < 0.6, "panned: {moved:?}");
     assert_eq!(revision(&h), changed, "nothing in the area moved");
     // A waypoint selected, the drag begun off it: the camera again, and
     // the waypoint stays.
@@ -99,6 +102,11 @@ fn a_sideways_scroll_pans_the_area_view() {
     let shifted = orbit(&h);
     assert!(shifted.distance < before.distance - 0.1, "zoomed: {}", shifted.distance);
     assert!((shifted.target - before.target).length() < 0.05, "not panned");
+    // A pinch on a touchpad zooms, no Ctrl held.
+    h.event(egui::Event::Zoom(1.25));
+    h.run_steps(3);
+    let pinched = orbit(&h);
+    assert!(pinched.distance < shifted.distance - 0.1, "pinched: {}", pinched.distance);
 }
 
 /// A middle click on the area view, with `modifiers` held.
@@ -577,6 +585,138 @@ fn area_viewer_fills_a_rectangle_with_placeables() {
     assert!(placeables(&mut h).is_empty(), "one fill, one command");
 }
 
+/// The placeable brush's Lock, Erase and a row of two legs: what Lock
+/// paints is locked; Erase takes the chosen blueprint's placeables out of
+/// its circle as one step, not locked ones nor another blueprint's; a
+/// row begun at the last row's end goes on from it.
+#[test]
+fn area_viewer_erases_locks_and_goes_on_from_a_row() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("paint-erase") else { return };
+    let placeables = |h: &mut Harness<'_, Moonglow>| -> Vec<mg_gff::Struct> {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let git = ws.doc(&ResKey::new(area, ResType::GIT)).unwrap();
+        git.root.list("Placeable List").unwrap_or(&[]).to_vec()
+    };
+    let tree = ResKey::parse("plc_tree", ResType::UTP).unwrap();
+    let shrub = ResKey::parse("plc_shrub", ResType::UTP).unwrap();
+    let choose = |h: &mut Harness<'_, Moonglow>, key: ResKey, s: mg_ui::settings::PaintSettings| {
+        let app = h.state_mut();
+        app.palette.tiles = false;
+        app.palette.kind = mg_module::palette::BlueprintKind::Placeable;
+        app.palette.selected = Some(key);
+        app.palette.chosen.clear();
+        app.paint = true;
+        app.settings.paint = s;
+        h.run_steps(2);
+    };
+    let scatter = mg_ui::settings::PaintSettings {
+        radius_cm: 300,
+        density: 40,
+        spacing_cm: 100,
+        flow: 100,
+        ..Default::default()
+    };
+    // (Where on the screen as the view is now: the strip above it is as
+    // tall as the brush's settings make it.)
+    let spot = Vec3::new(20.0, 20.0, 0.0);
+    let click = |h: &mut Harness<'_, Moonglow>, p: Vec3| {
+        let at = screen(h, area, p);
+        h.hover_at(at);
+        h.run_steps(1);
+        press(h, at, true, egui::Modifiers::NONE);
+        press(h, at, false, egui::Modifiers::NONE);
+        h.run_steps(3);
+    };
+    let of = |list: &[mg_gff::Struct], key: ResKey| {
+        list.iter().filter(|p| p.resref("TemplateResRef") == Some(key.resref)).count()
+    };
+    let locked = |p: &mg_gff::Struct| p.integer(mg_area::LOCKED) == Some(1);
+
+    // Shrubs, locked; then trees, not.
+    choose(&mut h, shrub, mg_ui::settings::PaintSettings { lock: true, ..scatter });
+    h.get_by_label("Lock");
+    click(&mut h, spot);
+    let shrubs = placeables(&mut h);
+    assert!(!shrubs.is_empty() && shrubs.iter().all(locked), "painted locked");
+    choose(&mut h, tree, mg_ui::settings::PaintSettings { count_all: false, ..scatter });
+    click(&mut h, spot);
+    let both = placeables(&mut h);
+    let trees = of(&both, tree);
+    assert!(trees > 0 && both.iter().filter(|p| !locked(p)).count() == trees);
+
+    // Erase, from the strip: the trees in the circle go, as one step; the
+    // shrubs (locked, and of another blueprint) stay.
+    h.get_by_label("Erase").click();
+    h.run_steps(2);
+    assert!(h.state().settings.paint.erase);
+    h.get_by_label_contains("Erasing plc_tree");
+    click(&mut h, spot);
+    let left = placeables(&mut h);
+    assert_eq!((of(&left, tree), of(&left, shrub)), (0, shrubs.len()), "the trees went");
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Erase Placeables"));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!(of(&placeables(&mut h), tree), trees, "one Undo brings them back");
+    // A look, from nearer and lower: the eraser's circle over the trees,
+    // each it would take out marked.
+    let dir = mg_testkit::output_dir("ui-area-paint-erase");
+    let orbit = h.state().area_views[&area].orbit;
+    if let Some(o) = &mut h.state_mut().area_views.get_mut(&area).unwrap().orbit {
+        (o.target, o.distance, o.pitch) = (Vec3::new(20.0, 22.0, 0.0), 18.0, 0.8);
+    }
+    h.run_steps(2);
+    h.hover_at(screen(&h, area, spot));
+    h.run_steps(2);
+    h.render().expect("render").save(dir.join("erase.png")).unwrap();
+    h.state_mut().area_views.get_mut(&area).unwrap().orbit = orbit;
+    h.run_steps(2);
+    // The locked shrubs, chosen: the eraser passes them by.
+    choose(&mut h, shrub, mg_ui::settings::PaintSettings { erase: true, ..scatter });
+    click(&mut h, spot);
+    assert_eq!(of(&placeables(&mut h), shrub), shrubs.len(), "locked ones stay");
+
+    // A row east, then one begun at its end, north: the second's first
+    // piece's back at the first's end.
+    let statue = ResKey::parse("plc_statue1", ResType::UTP).unwrap();
+    choose(&mut h, statue, mg_ui::settings::PaintSettings { row: true, ..Default::default() });
+    let before = placeables(&mut h).len();
+    let drag = |h: &mut Harness<'_, Moonglow>, from: Vec3, to: Vec3| {
+        let (a, b) = (screen(h, area, from), screen(h, area, to));
+        h.hover_at(a);
+        h.run_steps(1);
+        press(h, a, true, egui::Modifiers::NONE);
+        for k in 1..=6 {
+            h.hover_at(a + (b - a) * (k as f32 / 6.0));
+        }
+        h.run_steps(1);
+        press(h, b, false, egui::Modifiers::NONE);
+        h.run_steps(3);
+    };
+    drag(&mut h, Vec3::new(8.0, 32.0, 0.0), Vec3::new(16.0, 32.0, 0.0));
+    let end = h.state().area_views[&area].paint.row_end.expect("the row's end");
+    assert!((end.y - 32.0).abs() < 0.05 && end.x >= 16.0, "{end}");
+    let first = placeables(&mut h).len() - before;
+    // (Pressed half a meter off the end: it goes on from the end itself.)
+    drag(&mut h, end + Vec3::new(0.4, -0.3, 0.0), Vec3::new(end.x, 40.0, 0.0));
+    let all = placeables(&mut h);
+    let leg = &all[before + first..];
+    assert!(!leg.is_empty());
+    let x = |p: &mg_gff::Struct| p.float("X").unwrap();
+    assert!(leg.iter().all(|p| (x(p) - end.x).abs() < 0.05), "north from the end");
+    let y0 = leg.iter().map(|p| p.float("Y").unwrap()).fold(f32::MAX, f32::min);
+    assert!(y0 > end.y && y0 < end.y + 3.0, "beginning at the end: {y0}");
+    // A look: the two legs, and the second's end, ringed, where a third
+    // would go on from.
+    if let Some(o) = &mut h.state_mut().area_views.get_mut(&area).unwrap().orbit {
+        (o.target, o.distance, o.pitch) = (Vec3::new(16.0, 36.0, 0.0), 20.0, 0.9);
+    }
+    h.run_steps(2);
+    h.hover_at(screen(&h, area, Vec3::new(10.0, 38.0, 0.0)));
+    h.run_steps(2);
+    h.render().expect("render").save(dir.join("row-legs.png")).unwrap();
+}
+
 #[test]
 fn area_viewer_places_draws_boxes_and_turns() {
     use glam::Vec3;
@@ -786,6 +926,78 @@ fn placed_objects_open_their_properties() {
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
     h.run_steps(2);
     assert_eq!(tag_of(&mut h, 1), tag);
+}
+
+/// The arrow `glyph` (⏶ or ⏷) after the field on the row of the label
+/// `label`: the nearest one right of it.
+fn arrow_beside(h: &Harness<'_, Moonglow>, label: &str, glyph: &str) -> egui::Pos2 {
+    let at = h.get_by_label(label).rect();
+    h.query_all_by_label(glyph)
+        .map(|n| n.rect().center())
+        .filter(|c| (c.y - at.center().y).abs() < 12.0 && c.x > at.right())
+        .min_by(|a, b| a.x.total_cmp(&b.x))
+        .unwrap_or_else(|| panic!("no {glyph} beside {label}"))
+}
+
+/// A click at `at`, pressed and let go in one frame.
+fn click_at(h: &mut Harness<'_, Moonglow>, at: egui::Pos2) {
+    h.hover_at(at);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(2);
+}
+
+/// Adjust Location's and Resize Area's numbers have Aurora's arrows after
+/// them (a position a tenth of a meter a click, a bearing a degree, rows
+/// one), and Up and Down in the field step too.
+#[test]
+fn adjust_location_and_resize_area_have_arrows() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("adjust-arrows") else { return };
+    let at = screen(&h, area, Vec3::new(20.0, 20.0, 0.02));
+    h.hover_at(at);
+    let right = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(right(true));
+    h.event(right(false));
+    h.run_steps(3);
+    h.get_by_label("Adjust Location…").click();
+    h.run_steps(3);
+    let x = h.state().adjust.as_ref().unwrap().position.x;
+    let up = arrow_beside(&h, "X", "⏶");
+    click_at(&mut h, up);
+    click_at(&mut h, up);
+    let down = arrow_beside(&h, "Bearing (°)", "⏷");
+    let bearing = h.state().adjust.as_ref().unwrap().bearing;
+    click_at(&mut h, down);
+    let a = h.state().adjust.as_ref().unwrap();
+    assert!((a.position.x - (x + 0.2)).abs() < 1e-4, "{} from {x}", a.position.x);
+    assert!((a.bearing - (bearing - 1.0).max(0.0)).abs() < 1e-4, "{}", a.bearing);
+    assert_eq!(a.changed, [true, false, false, bearing > 0.0], "what the arrows changed");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+
+    h.get_by_label("Edit").click();
+    h.run_steps(2);
+    h.get_by_label("Resize Area…").click();
+    h.run_steps(6);
+    let d = h.state().resize_area.as_ref().unwrap();
+    let (rows, columns) = (d.rows, d.columns);
+    let (up, down) = (arrow_beside(&h, "Rows", "⏶"), arrow_beside(&h, "Columns", "⏷"));
+    click_at(&mut h, up);
+    click_at(&mut h, down);
+    let d = h.state().resize_area.as_ref().unwrap();
+    assert_eq!((d.rows, d.columns), (rows + 1, columns - 1));
 }
 
 #[test]
@@ -1443,6 +1655,105 @@ fn a_paste_that_doubles_a_tag_offers_retag() {
     assert_eq!(tags(&mut h).len(), 5);
 }
 
+/// A tag given otherwise than by a paste is weighed as a paste's is
+/// (`tag_clash::made_by`, as each command is applied): typed in
+/// Properties (the `SetField` its Tag field makes once the keyboard leaves
+/// it), an object placed from the palette (its blueprint's tag: only
+/// where the project warns of any tag), Create Set's waypoints (named
+/// apart from the other waypoints, not from the area's other objects).
+/// An Undo asks nothing, nor a tag set to what it was.
+#[test]
+fn tags_typed_placed_or_named_by_create_set_are_weighed_as_a_paste_s() {
+    use glam::Vec3;
+    use mg_area::ObjectKind;
+    let Some((mut h, area)) = area_harness("tags-given") else { return };
+    h.state_mut().settings.warn_duplicate_tags = true;
+    let git = ResKey::new(area, ResType::GIT);
+    let set_tag = |h: &mut Harness<'_, Moonglow>, list: &str, index: usize, tag: &str| {
+        h.state_mut().tag_clash = None;
+        let edit = mg_edit::Edit::SetField {
+            key: git,
+            path: mg_edit::GffPath::root().item(list, index),
+            label: "Tag".into(),
+            value: Some(mg_gff::Value::String(tag.as_bytes().to_vec())),
+        };
+        h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Tag", vec![edit])));
+        h.run_steps(2);
+        h.state().tag_clash.clone()
+    };
+    // Typed: the second waypoint given the first's tag, once the first has
+    // one of its own.
+    assert_eq!(set_tag(&mut h, "WaypointList", 0, "KZ_GATE"), None, "the only one");
+    let clash = set_tag(&mut h, "WaypointList", 1, "KZ_GATE").expect("typed twice");
+    assert_eq!(clash.clashes[0].sentence(), "KZ_GATE is now on two objects");
+    assert_eq!(clash.what, "“Tag”");
+    assert!(h.query_by_label("“Tag” put tags on more than one object of the module:").is_some());
+    h.get_by_label("Keep Tags").click();
+    h.run_steps(2);
+    assert_eq!(set_tag(&mut h, "WaypointList", 1, "KZ_GATE"), None, "the tag it had");
+    // An Undo asks nothing.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert!(h.state().tag_clash.is_none());
+    // Placed from the palette: its blueprint's tag asks nothing by the
+    // builder's option; where the project warns of any tag, the second.
+    let place = |h: &mut Harness<'_, Moonglow>, at: Vec3| {
+        h.state_mut().tag_clash = None;
+        h.state_mut().palette.selected = ResKey::parse("plc_barrel", ResType::UTP);
+        let over = screen(h, area, at);
+        h.hover_at(over);
+        h.run_steps(2);
+        press(h, over, true, egui::Modifiers::NONE);
+        press(h, over, false, egui::Modifiers::NONE);
+        h.run_steps(3);
+        h.state_mut().palette.selected = None;
+        h.run_steps(1);
+        h.state().tag_clash.clone()
+    };
+    assert_eq!(place(&mut h, Vec3::new(10.0, 30.0, 0.0)), None);
+    assert_eq!(place(&mut h, Vec3::new(14.0, 30.0, 0.0)), None, "the blueprint's tag");
+    h.state_mut().ws.as_mut().unwrap().module.project_file.tags.paste_warning =
+        Some(mg_module::project_file::PasteWarning::Any);
+    let clash = place(&mut h, Vec3::new(18.0, 30.0, 0.0)).expect("any tag twice");
+    assert!(clash.clashes[0].sentence().ends_with("is now on three objects"), "{clash:?}");
+    assert!(clash.what.starts_with("“Place"), "{}", clash.what);
+    h.state_mut().ws.as_mut().unwrap().module.project_file.tags.paste_warning = None;
+    // Create Set names its waypoints apart from the other waypoints: a
+    // barrel tagged Patrol_01 is another object with the first's tag.
+    assert_eq!(set_tag(&mut h, "Placeable List", 0, "Patrol_01"), None);
+    h.state_mut().tag_clash = None;
+    h.state_mut().area_views.get_mut(&area).unwrap().selection =
+        vec![(ObjectKind::Waypoint, 0), (ObjectKind::Waypoint, 1)];
+    let over = screen(&h, area, Vec3::new(20.0, 20.0, 0.9));
+    h.hover_at(over);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: over,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(3);
+    h.get_by_label("Create Set…").click();
+    h.run_steps(2);
+    type_into_hint(&mut h, "set name", "Patrol");
+    h.run_steps(1);
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let clash = h.state().tag_clash.clone().expect("Create Set's first waypoint");
+    let said: Vec<String> = clash.clashes.iter().map(|c| c.sentence()).collect();
+    assert_eq!(said, ["Patrol_01 is now on two objects"]);
+    // Retag gives the waypoint, not the barrel, a tag of its own.
+    h.get_by_label("Retag").click();
+    h.run_steps(2);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let g = ws.doc(&git).unwrap();
+    let tag = |list: &str, i: usize| g.root.list(list).unwrap()[i].string("Tag").unwrap().to_vec();
+    assert_eq!(tag("Placeable List", 0), b"Patrol_01");
+    assert_eq!(tag("WaypointList", 0), b"Patrol_03", "Patrol_02 is the second's");
+}
+
 #[test]
 fn the_area_view_plays_the_area_s_sounds() {
     use mg_ui::audio::{Channel, Silence};
@@ -1619,6 +1930,92 @@ fn a_placeable_dragged_over_the_area_shows_its_model_where_it_would_go() {
         .max_by_key(|o| o.index)
         .expect("the chest is placed");
     assert!((placed.rotation - turned).abs() < 1e-3, "placed at {}", placed.rotation.to_degrees());
+}
+
+/// Sound Ranges draw a sound's random range as Aurora does: a rectangle
+/// its `RandomRangeX` wide and `RandomRangeY` deep, about the sound (half
+/// each way). Aurora's capture of 2026-10-29: a sound of ranges 6 and 2,
+/// distances 3 and 12, had a rectangle 6.2 by 2.1 m about it. The picture
+/// goes to `target/test-output/sound-range/` (`MG_SHOT` names it).
+#[test]
+fn a_sound_s_random_range_is_drawn_its_ranges_wide() {
+    use glam::Vec3;
+    use mg_module::instances::{Placement, Placing, instance};
+    let at = Vec3::new(20.0, 20.0, 1.5);
+    let prepare = |m: &mut mg_module::Module, game: &mg_rules::GameData, area: ResRef| {
+        let key = ResKey::parse("animalcriesday", ResType::UTS).unwrap();
+        let bp = Gff::read(&game.resman.get(&key).unwrap()).unwrap();
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        let place = Placement { position: [at.x, at.y, at.z], rotation: 0.0 };
+        let mut sound = instance(&placing, ResType::UTS, &bp.root, place, &[]).unwrap();
+        for (label, v) in [
+            ("RandomRangeX", 6.0),
+            ("RandomRangeY", 2.0),
+            ("MinDistance", 3.0),
+            ("MaxDistance", 12.0),
+        ] {
+            sound.set(label, mg_gff::Value::Float(v));
+        }
+        sound.set("RandomPosition", mg_gff::Value::Byte(1));
+        sound.set("Positional", mg_gff::Value::Byte(1));
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        git.root.set("SoundList", mg_gff::Value::List(vec![sound]));
+        m.set_gff(git_key, &git).unwrap();
+    };
+    let Some((mut h, area)) = area_harness_with("sound-range", "ttr01", None, 4, None, &prepare)
+    else {
+        return;
+    };
+    {
+        let view = h.state_mut().area_views.get_mut(&area).unwrap();
+        view.sound_ranges = true;
+        if let Some(o) = &mut view.orbit {
+            o.target = Vec3::new(at.x, at.y, 0.0);
+            (o.pitch, o.yaw, o.distance) = (89f32.to_radians(), -90f32.to_radians(), 34.0);
+        }
+    }
+    h.run_steps(4);
+    let image = h.render().expect("render");
+    let name = std::env::var("MG_SHOT").unwrap_or_else(|_| "after".into());
+    image.save(mg_testkit::output_dir("sound-range").join(format!("{name}.png"))).unwrap();
+    // The rectangle's orange (240, 150, 60, over the ground) near a point.
+    let ppp = h.ctx.pixels_per_point();
+    let orange_near = |p: Vec3| {
+        let s = screen(&h, area, p);
+        let (cx, cy) = ((s.x * ppp) as i64, (s.y * ppp) as i64);
+        (-3..=3).any(|dy| {
+            (-3..=3).any(|dx| {
+                let (x, y) = (cx + dx, cy + dy);
+                (0..i64::from(image.width())).contains(&x)
+                    && (0..i64::from(image.height())).contains(&y)
+                    && {
+                        let px = image.get_pixel(x as u32, y as u32);
+                        let [r, g, b] = [px[0], px[1], px[2]].map(i32::from);
+                        r > 150 && r - g > 35 && r - b > 80
+                    }
+            })
+        })
+    };
+    // On its long edges, between the sound's marker and its inner circle.
+    for side in [1.0, -1.0] {
+        let edge = at + Vec3::new(1.5, side, 0.0);
+        assert!(orange_near(edge), "the rectangle 2 m deep: an edge 1 m {side} of the sound");
+        let twice = at + Vec3::new(1.5, 2.0 * side, 0.0);
+        assert!(!orange_near(twice), "not twice as deep ({side})");
+    }
+    for side in [3.0, -3.0] {
+        let wide = at + Vec3::new(2.0 * side, 0.0, 0.0);
+        assert!(!orange_near(wide), "not twice as wide ({side})");
+    }
+    // Pitched, as Aurora's second picture: each distance a dotted sphere.
+    if let Some(o) = &mut h.state_mut().area_views.get_mut(&area).unwrap().orbit {
+        (o.pitch, o.yaw, o.distance) = (25f32.to_radians(), -90f32.to_radians(), 40.0);
+    }
+    h.run_steps(4);
+    let image = h.render().expect("render");
+    image.save(mg_testkit::output_dir("sound-range").join(format!("{name}-pitched.png"))).unwrap();
 }
 
 #[test]
@@ -2750,6 +3147,114 @@ fn adjust_location_says_an_uneven_scale_is_kept() {
     assert!(v.scale.x != 0.5 && v.scale == Vec3::splat(v.scale.x), "{v:?}");
 }
 
+/// Adjust Location shows what an object's visual transforms have beside
+/// what it sets (xtul's report): its animation speed, set here too, a
+/// lerp in progress (a script's, as the engine saves it) and another
+/// scope's transform. A speed set alone keeps the lerp; the notes say
+/// what is kept. Picture: `target/test-output/ui-adjust-kept/noted.png`.
+#[test]
+fn adjust_location_shows_speed_lerps_and_other_scopes() {
+    use glam::Vec3;
+    use mg_module::instances::{Placement, Placing, instance};
+    let Some((mut h, area)) = area_harness("adjust-kept") else { return };
+    let git_key = ResKey::new(area, ResType::GIT);
+    let axis = |v: f32| {
+        let mut a = mg_gff::Struct::new(0);
+        a.set("TimerType", mg_gff::Value::Int(0));
+        a.set("ValueTo", mg_gff::Value::Float(v));
+        a.set("LerpType", mg_gff::Value::Int(0));
+        a
+    };
+    // As the engine saved one (`the_engine_keeps_part_scopes_animation_speed_and_lerps`).
+    let mut lerp = axis(90.0);
+    lerp.set("TimerType", mg_gff::Value::Int(1));
+    lerp.set("LerpType", mg_gff::Value::Int(1));
+    lerp.set("ValueFrom", mg_gff::Value::Float(0.0));
+    lerp.set("LerpProgress", mg_gff::Value::Float(0.25));
+    lerp.set("LerpDuration", mg_gff::Value::Float(60.0));
+    lerp.set("BehaviorFlags", mg_gff::Value::Int(0));
+    lerp.set("RepeatsRemaining", mg_gff::Value::Int(0));
+    {
+        let app = h.state_mut();
+        let game = app.game.as_deref().unwrap();
+        let key = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+        let chest = Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        let at = Placement { position: [12.0, 30.0, 0.0], rotation: 0.0 };
+        let mut item = instance(&placing, ResType::UTP, &chest, at, &[]).unwrap();
+        item.set("Static", mg_gff::Value::Byte(0));
+        let mg_gff::Value::List(mut list) =
+            mg_area::edit::visual_transform_list(Default::default())
+        else {
+            unreachable!()
+        };
+        list[0].set("AnimationSpeed", mg_gff::Value::Struct(axis(2.0)));
+        list[0].set("RotateX", mg_gff::Value::Struct(lerp.clone()));
+        let mut other = list[0].clone();
+        other.set("Scope", mg_gff::Value::Int(7));
+        other.set("ScaleX", mg_gff::Value::Struct(axis(3.0)));
+        other.set("RotateX", mg_gff::Value::Struct(axis(0.0)));
+        list.push(other);
+        item.set("VisTransformList", mg_gff::Value::List(list));
+        let edit = mg_edit::Edit::InsertItem {
+            key: git_key,
+            path: mg_edit::GffPath::root(),
+            list: "Placeable List".into(),
+            index: 0,
+            item,
+        };
+        app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", vec![edit])));
+    }
+    h.run_steps(3);
+    let entry = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let chest = &ws.doc(&git_key).unwrap().root.list("Placeable List").unwrap()[0];
+        chest.list("VisTransformList").unwrap()[0].clone()
+    };
+    let at = screen(&h, area, Vec3::new(12.0, 30.0, 0.3));
+    h.hover_at(at);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(3);
+    h.get_by_label("Adjust Location…").click();
+    h.run_steps(3);
+    let a = h.state().adjust.clone().unwrap();
+    assert_eq!(a.speed, 2.0);
+    assert_eq!(a.visual.rotate.x, 90.0, "the lerp's end");
+    assert_eq!(a.kept.len(), 2, "{:?}", a.kept);
+    assert!(a.kept[0].starts_with("Its X rotation is changing"), "{}", a.kept[0]);
+    assert!(a.kept[0].contains("from 0 to 90 over 60 s, 25% along"), "{}", a.kept[0]);
+    assert!(
+        a.kept[1].starts_with("Its scope 7 has a visual transform of its own (scale 3"),
+        "{}",
+        a.kept[1]
+    );
+    for note in &a.kept {
+        assert!(h.query_by_label(note).is_some(), "the window says so: {note}");
+    }
+    h.get_by_label("Animation Speed");
+    let dir = mg_testkit::output_dir("ui-adjust-kept");
+    let _ = std::fs::remove_file(dir.join("noted.png"));
+    h.render().expect("render").save(dir.join("noted.png")).unwrap();
+    // The speed alone: set, the lerp kept.
+    let a = h.state_mut().adjust.as_mut().unwrap();
+    a.speed = 0.5;
+    a.speed_changed = true;
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let e = entry(&mut h);
+    assert_eq!(e.child("AnimationSpeed").and_then(|x| x.float("ValueTo")), Some(0.5));
+    assert_eq!(e.child("RotateX"), Some(&lerp), "the lerp kept");
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Adjust location"));
+}
+
 /// Placed objects edited together have no pages of lists of their own
 /// (those changed only the first object), as several blueprints have
 /// none: an inventory is edited one object at a time. A field is set on
@@ -3218,9 +3723,142 @@ fn the_start_location_is_dragged_and_turned_in_the_view() {
     assert_eq!(entry(&mut h).0, x, "not moved");
 }
 
+/// The palette's Start Location (Aurora's Paint Start Location): chosen,
+/// the start location's marker follows the pointer over the view, and a
+/// click puts the module's start location there, in this area, and lets
+/// it go; Escape puts it down unplaced. Picture:
+/// `target/test-output/ui-area-start-palette/placing.png`.
+#[test]
+fn the_palette_s_start_location_is_placed_with_a_click() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("start-palette") else { return };
+    let ifo = ResKey::parse("module", ResType::IFO).unwrap();
+    let entry = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let r = ws.doc(&ifo).unwrap().root.clone();
+        let f = |label: &str| r.float(label).unwrap();
+        (r.resref("Mod_Entry_Area").unwrap(), f("Mod_Entry_X"), f("Mod_Entry_Y"))
+    };
+    let was = entry(&mut h);
+    h.get_by_label("🏁").click();
+    h.run_steps(3);
+    assert!(h.state().palette.start && h.state().palette.placing_start);
+    assert!(h.query_by_label("Place the Start Location").is_some());
+    // Escape over the view: put down, nothing set.
+    let at = screen(&h, area, Vec3::new(14.0, 26.0, 0.0));
+    h.hover_at(at);
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().palette.placing_start);
+    assert_eq!(entry(&mut h), was);
+    // Again, and a click.
+    h.get_by_label("Place the Start Location").click();
+    h.run_steps(2);
+    h.hover_at(at);
+    h.run_steps(3);
+    h.render()
+        .expect("render")
+        .save(mg_testkit::output_dir("ui-area-start-palette").join("placing.png"))
+        .unwrap();
+    click_pos(&h, at);
+    h.run_steps(3);
+    let (in_area, x, y) = entry(&mut h);
+    assert_eq!(in_area, area);
+    assert!((x - 14.0).abs() < 0.1 && (y - 26.0).abs() < 0.1, "at {x}, {y}");
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Set start location"));
+    assert!(!h.state().palette.placing_start, "let go once placed");
+    assert!(h.state().area_views[&area].start_selected, "and selected");
+}
+
+/// The start location's marker, selected, takes what an object does: Q
+/// and E turn it, and its menu's Adjust Location sets its position and
+/// bearing; the pointer is a hand over it.
+#[test]
+fn the_selected_start_location_takes_the_keys_and_adjust_location() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("keys-start") else { return };
+    let ifo = ResKey::parse("module", ResType::IFO).unwrap();
+    {
+        let set = |label: &str, value: mg_gff::Value| mg_edit::Edit::SetField {
+            key: ifo,
+            path: mg_edit::GffPath::root(),
+            label: label.into(),
+            value: Some(value),
+        };
+        let edits = vec![
+            set("Mod_Entry_Area", mg_gff::Value::resref(area)),
+            set("Mod_Entry_X", mg_gff::Value::Float(12.0)),
+            set("Mod_Entry_Y", mg_gff::Value::Float(31.0)),
+            set("Mod_Entry_Dir_X", mg_gff::Value::Float(1.0)),
+            set("Mod_Entry_Dir_Y", mg_gff::Value::Float(0.0)),
+        ];
+        h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", edits)));
+    }
+    h.run_steps(3);
+    let entry = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let r = ws.doc(&ifo).unwrap().root.clone();
+        let f = |label: &str| r.float(label).unwrap();
+        (f("Mod_Entry_X"), f("Mod_Entry_Y"), f("Mod_Entry_Dir_Y").atan2(f("Mod_Entry_Dir_X")))
+    };
+    let cursor = |h: &Harness<'_, Moonglow>| h.output().platform_output.cursor_icon;
+    // A hand over its ring, none beside it.
+    let ring = screen(&h, area, Vec3::new(11.0, 31.0, 0.0));
+    h.hover_at(screen(&h, area, Vec3::new(18.0, 31.0, 0.0)));
+    h.run_steps(2);
+    assert_eq!(cursor(&h), egui::CursorIcon::Default);
+    h.hover_at(ring);
+    h.run_steps(2);
+    assert_eq!(cursor(&h), egui::CursorIcon::Grab);
+    // Selected by a click; Q turns it by the snapping angle (15° when
+    // free), E back.
+    click_pos(&h, ring);
+    h.run_steps(2);
+    assert!(h.state().area_views[&area].start_selected);
+    h.key_press(egui::Key::Q);
+    h.run_steps(2);
+    let (_, _, facing) = entry(&mut h);
+    assert!((facing - 15f32.to_radians()).abs() < 1e-3, "turned to {}", facing.to_degrees());
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Turn Start Location"));
+    h.key_press(egui::Key::E);
+    h.run_steps(2);
+    assert!(entry(&mut h).2.abs() < 1e-3);
+    // Its menu (a right click on it) has Adjust Location, for it: its
+    // bearing as an object's (facing east is 270°).
+    h.hover_at(ring);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: ring,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(3);
+    h.get_by_label("Adjust Location…").click();
+    h.run_steps(3);
+    let adjust = h.state().adjust.clone().expect("the window");
+    assert!(adjust.start && adjust.objects.is_empty());
+    assert!((adjust.bearing - 270.0).abs() < 1e-3, "bearing {}", adjust.bearing);
+    assert!(h.query_by_label("The module's start location").is_some());
+    // X to 20, the bearing to 0 (north), and OK.
+    let mut a = adjust;
+    (a.position.x, a.bearing, a.changed) = (20.0, 0.0, [true, false, false, true]);
+    h.state_mut().adjust = Some(a);
+    h.run_steps(1);
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let (x, y, facing) = entry(&mut h);
+    assert!((x - 20.0).abs() < 1e-3 && (y - 31.0).abs() < 1e-3, "at {x}, {y}");
+    assert!((facing - std::f32::consts::FRAC_PI_2).abs() < 1e-3, "faces {facing}");
+    assert!(h.state().adjust.is_none());
+}
+
 /// What the area view's toolbar hides stays hidden in every area view,
 /// as in Aurora (a builder's report): in the other open ones, and in one
-/// opened later (from the settings, so in the next run too).
+/// opened later; not in the next run, as Aurora shows every kind again
+/// when it starts.
 #[test]
 fn what_the_area_toolbar_hides_is_hidden_in_every_area() {
     use mg_area::ObjectKind;
@@ -3250,13 +3888,17 @@ fn what_the_area_toolbar_hides_is_hidden_in_every_area() {
     assert!(!shown(&h, first, ObjectKind::Trigger), "and in the other open area");
     assert!(shown(&h, first, ObjectKind::Encounter), "the rest shown");
     assert_eq!(h.state().settings.hidden_in_areas, ["Triggers"]);
+    // Not kept for the next run.
+    let saved = serde_json::to_string(&h.state().settings).unwrap();
+    let next: mg_ui::settings::Settings = serde_json::from_str(&saved).unwrap();
+    assert!(next.hidden_in_areas.is_empty(), "the next run shows every kind");
     // An area view made anew (closed and opened again) hides them too.
     h.state_mut().area_views.remove(&first);
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Area(first)));
     h.run_steps(3);
     assert!(!shown(&h, first, ObjectKind::Trigger));
     // Show All: everywhere, and nothing kept hidden.
-    h.get_by_label("All").click();
+    h.get_by_label("☑ All").click();
     h.run_steps(2);
     assert!(shown(&h, first, ObjectKind::Trigger) && shown(&h, second, ObjectKind::Trigger));
     assert!(h.state().settings.hidden_in_areas.is_empty());
@@ -3651,6 +4293,106 @@ fn a_drag_in_a_window_over_the_area_moves_nothing_there() {
     assert_eq!((waypoint(&mut h, area, 0), waypoint(&mut h, area, 1)), before);
 }
 
+/// A creature whose head and wings alone have visual transforms (scopes
+/// 254 and 252, as `SetObjectVisualTransform(...,
+/// OBJECT_VISUAL_TRANSFORM_DATA_SCOPE_CREATURE_HEAD)` saves them): its head
+/// is drawn twice the size on its neck and its wings half as large again
+/// on its back, and the rest of it as it is (the engine reads its scope 0
+/// as untransformed; it was drawn whole at the head's scale). Two winged
+/// humans side by side, the one at x 19 transformed. Picture:
+/// `target/test-output/ui-area-head-scope/heads.png`.
+#[test]
+fn a_creature_s_head_scope_is_drawn_on_its_head() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("head-scope") else { return };
+    h.set_size(egui::vec2(1400.0, 1000.0));
+    // A bandit made a human of parts (appearance 6, head 1), with wings.
+    let bandit = {
+        let game = h.state().game.as_deref().unwrap();
+        let key = ResKey::parse("nw_bandit001", ResType::UTC).unwrap();
+        let mut c = Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+        let look = mg_preview::CreatureLook { wings: 2, ..mg_preview::CreatureLook::new(6) };
+        for f in look.to_utc().fields {
+            c.set(&f.label.to_string_lossy(), f.value);
+        }
+        c
+    };
+    let axis = |v: f32| {
+        let mut a = mg_gff::Struct::new(0);
+        a.set("TimerType", mg_gff::Value::Int(0));
+        a.set("ValueTo", mg_gff::Value::Float(v));
+        a.set("LerpType", mg_gff::Value::Int(0));
+        mg_gff::Value::Struct(a)
+    };
+    let scoped = |scope: i32, scale: f32| {
+        let mut e = mg_gff::Struct::new(6);
+        e.set("Scope", mg_gff::Value::Int(scope));
+        for label in ["ScaleX", "ScaleY", "ScaleZ"] {
+            e.set(label, axis(scale));
+        }
+        e
+    };
+    let parts = vec![scoped(254, 2.0), scoped(252, 1.5)];
+    let mut edits = Vec::new();
+    for (i, x) in [19.0f32, 21.0].into_iter().enumerate() {
+        let mut c = bandit.clone();
+        for (label, v) in [("XPosition", x), ("YPosition", 20.0), ("ZPosition", 0.0)] {
+            c.set(label, mg_gff::Value::Float(v));
+        }
+        c.set("XOrientation", mg_gff::Value::Float(0.0));
+        c.set("YOrientation", mg_gff::Value::Float(1.0));
+        if i == 0 {
+            c.set("VisTransformList", mg_gff::Value::List(parts.clone()));
+        }
+        edits.push(mg_edit::Edit::InsertItem {
+            key: ResKey::new(area, ResType::GIT),
+            path: mg_edit::GffPath::root(),
+            list: "Creature List".into(),
+            index: i,
+            item: c,
+        });
+    }
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Place", edits)));
+    h.run_steps(5);
+    // From the north, looking at their faces.
+    let orbit = mg_ui::area_view::Orbit {
+        target: Vec3::new(20.0, 20.0, 1.3),
+        yaw: std::f32::consts::FRAC_PI_2,
+        pitch: 0.12,
+        distance: 6.0,
+    };
+    set_orbit(&mut h, area, orbit);
+    h.run_steps(5);
+    let out = mg_testkit::output_dir("ui-area-head-scope");
+    let _ = std::fs::remove_file(out.join("heads.png"));
+    h.render().expect("render").save(out.join("heads.png")).unwrap();
+    let view = h.state().area_views.get(&area).unwrap();
+    let model = view.model.as_ref().unwrap();
+    let creature = |x: f32| {
+        let i = model.objects.iter().position(|o| {
+            o.kind == mg_area::ObjectKind::Creature && (o.position.x - x).abs() < 0.1
+        });
+        view.box_of(i.unwrap()).expect("a box")
+    };
+    let whole = |x: f32| {
+        let o = model.objects.iter().find(|o| (o.position.x - x).abs() < 0.1).unwrap();
+        o.visual
+    };
+    assert_eq!(whole(19.0), None, "the whole of it has no visual transform");
+    let scaled_parts = |x: f32| -> Vec<String> {
+        let o = model.objects.iter().find(|o| (o.position.x - x).abs() < 0.1).unwrap();
+        let p = o.preview.as_ref().unwrap();
+        p.parts.iter().filter(|p| p.local.is_some()).map(|p| p.model.clone()).collect()
+    };
+    let scaled = scaled_parts(19.0);
+    assert!(scaled.len() == 2 && scaled.iter().any(|m| m.contains("wing")), "{scaled:?}");
+    assert!(scaled_parts(21.0).is_empty());
+    let (scaled, plain) = (creature(19.0), creature(21.0));
+    let tall = |b: (Vec3, Vec3)| b.1.z - b.0.z;
+    assert!(tall(scaled) < tall(plain) * 1.4, "not the whole of it: {scaled:?} {plain:?}");
+    assert!(tall(scaled) > tall(plain) + 0.1, "its head larger: {scaled:?} {plain:?}");
+}
+
 /// The game's invisible object is selected by the box its model holds
 /// undrawn (0.6 m across, 0.18 m tall), as Aurora outlines it: it was a
 /// marker's, a metre each way.
@@ -3740,9 +4482,198 @@ fn a_light_is_added_from_the_area_s_menu_and_recolored() {
     assert_eq!(placed(&mut h)[0].integer("Appearance"), Some(15111), "Light, Red");
 }
 
+/// The palette's Lights (beside the area's menu's Add Light Here): a
+/// light chosen there is put where the view is clicked, as the menu puts
+/// one, and let go; with Shift held, more of them; Escape stops. Picture:
+/// `target/test-output/ui-area-palette-lights/placed.png`.
+#[test]
+fn a_light_is_placed_from_the_palette() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("palette-lights") else { return };
+    h.set_size(egui::vec2(1400.0, 1000.0));
+    h.run_steps(3);
+    let git_key = ResKey::new(area, ResType::GIT);
+    let placed = |h: &mut Harness<'_, Moonglow>| -> Vec<mg_gff::Struct> {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let git = ws.doc(&git_key).unwrap();
+        git.root.list("Placeable List").map(<[_]>::to_vec).unwrap_or_default()
+    };
+    h.get_by_label("☀").click();
+    h.run_steps(3);
+    assert!(h.state().palette.lights);
+    h.get_by_label("Blue").click();
+    h.run_steps(2);
+    let blue = h.state().palette.placing_light.expect("about to be placed");
+    let at = screen(&h, area, Vec3::new(14.0, 26.0, 0.0));
+    click_pos(&h, at);
+    h.run_steps(3);
+    let lights = placed(&mut h);
+    assert_eq!(lights.len(), 1);
+    assert_eq!(lights[0].integer("Appearance"), Some(blue as i64));
+    let (x, y, z) = (
+        lights[0].float("X").unwrap(),
+        lights[0].float("Y").unwrap(),
+        lights[0].float("Z").unwrap(),
+    );
+    assert!(
+        (x - 14.0).abs() < 0.2 && (y - 26.0).abs() < 0.2 && (z - 1.5).abs() < 0.3,
+        "{x} {y} {z}"
+    );
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Add Light, Blue"));
+    assert_eq!(h.state().palette.placing_light, None, "let go once placed");
+    // With Shift: placed, and still about to be placed; Escape stops.
+    h.get_by_label("Red").click();
+    h.run_steps(2);
+    let shift = egui::Modifiers::SHIFT;
+    h.event(egui::Event::ModifiersChanged(shift));
+    for x in [20.0, 24.0] {
+        let at = screen(&h, area, Vec3::new(x, 20.0, 0.0));
+        h.hover_at(at);
+        h.run_steps(1);
+        for pressed in [true, false] {
+            let button = egui::PointerButton::Primary;
+            h.event(egui::Event::PointerButton { pos: at, button, pressed, modifiers: shift });
+        }
+        h.run_steps(3);
+    }
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(2);
+    assert_eq!(placed(&mut h).len(), 3);
+    assert!(h.state().palette.placing_light.is_some(), "Shift: still placing");
+    h.hover_at(screen(&h, area, Vec3::new(30.0, 30.0, 0.0)));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().palette.placing_light, None);
+    h.render()
+        .expect("render")
+        .save(mg_testkit::output_dir("ui-area-palette-lights").join("placed.png"))
+        .unwrap();
+}
+
+/// Custom Light (the lights proposal's way B, behind an option off by
+/// default): with the option off the area's menu offers the game's lights
+/// alone; on, **Custom Light…** opens a window that writes nothing until
+/// a hak is chosen, says what it writes where and that the module's
+/// players must have the hak, then writes a model and a placeables.2da
+/// row into it (here a new hak, put at the top of the module's list),
+/// and places a light of that row, which lights the view by its model's
+/// light; Change Light… gives it other settings. Pictures in
+/// `target/test-output/ui-custom-light-pictures/`: `menu.png`, `window.png`,
+/// `placed.png`.
+#[test]
+fn a_custom_light_is_written_into_a_chosen_hak_and_placed() {
+    use glam::Vec3;
+    let user = mg_testkit::scratch_dir("ui-custom-light-user");
+    let Some((mut h, area)) =
+        area_harness_with("custom-light", "ttr01", None, 4, Some(user.clone()), &|_, _, _| {})
+    else {
+        return;
+    };
+    h.set_size(egui::vec2(1400.0, 1000.0));
+    h.run_steps(3);
+    let out = mg_testkit::output_dir("ui-custom-light-pictures");
+    for f in ["menu.png", "window.png", "placed.png"] {
+        let _ = std::fs::remove_file(out.join(f));
+    }
+    let right_click = |h: &mut Harness<'_, Moonglow>, at: egui::Pos2| {
+        h.hover_at(at);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        h.run_steps(3);
+    };
+    let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
+    // Off (the default): the game's lights alone.
+    assert!(!h.state().settings.generated_lights);
+    right_click(&mut h, at);
+    h.get_by_label_contains("Add Light Here").hover();
+    h.run_steps(3);
+    assert!(h.query_by_label("Custom Light…").is_none(), "nothing of it with the option off");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.state_mut().settings.generated_lights = true;
+    right_click(&mut h, at);
+    h.get_by_label_contains("Add Light Here").hover();
+    h.run_steps(3);
+    h.render().expect("render").save(out.join("menu.png")).unwrap();
+    h.get_by_label("Custom Light…").click();
+    h.run_steps(3);
+    {
+        let d = h.state_mut().light_draft.as_mut().expect("the window");
+        d.spec.color = [255, 40, 10];
+        d.spec.radius = 10.0;
+    }
+    h.run_steps(2);
+    // No hak chosen: nothing to write.
+    h.get_by_label("Choose the hak the light goes into");
+    assert!(h.get_by_label("Write and Place").accesskit_node().is_disabled());
+    h.get_by_label("A new hak:").click();
+    h.run_steps(2);
+    h.get_all_by_role(egui::accesskit::Role::TextInput).last().unwrap().type_text("mg_lights");
+    h.run_steps(3);
+    let hak = user.join("hak/mg_lights.hak");
+    let said = format!("Writes into {}", hak.display());
+    h.get_by_label_contains(&said);
+    h.get_by_label_contains("The module's players must have this hak");
+    assert!(!hak.exists(), "nothing written yet");
+    h.render().expect("render").save(out.join("window.png")).unwrap();
+    h.get_by_label("Write and Place").click();
+    h.run_steps(6);
+    assert!(hak.is_file(), "the hak written");
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let info = ws.doc(&ResKey::parse("module", ResType::IFO).unwrap()).unwrap();
+    assert_eq!(mg_module::haks_of(&info.root).first().map(String::as_str), Some("mg_lights"));
+    let git_key = ResKey::new(area, ResType::GIT);
+    let placed = ws.doc(&git_key).unwrap().root.list("Placeable List").unwrap().to_vec();
+    assert_eq!(placed.len(), 1);
+    let row = placed[0].integer("Appearance").unwrap() as usize;
+    let game = h.state().game.clone().unwrap();
+    let table = game.table("placeables").unwrap();
+    let model = table.get(row, "ModelName").unwrap().to_string();
+    assert!(mg_module::lights::is_generated(&model), "{model}");
+    assert!(
+        game.resman
+            .origin(&ResKey::parse(&model, ResType::MDL).unwrap())
+            .is_some_and(|o| o.contains("mg_lights"))
+    );
+    // It is a light in the view: a sun, its reach its model's (radius 10:
+    // 20 m, as the game's own lights).
+    let view = h.state().area_views.get(&area).unwrap();
+    let light = view.bare_light(mg_area::ObjectKind::Placeable, 0).expect("a bare light");
+    assert!(!light.stock && (light.reach - 20.0).abs() < 0.01, "{light:?}");
+    {
+        let view = h.state_mut().area_views.get_mut(&area).unwrap();
+        view.night = true;
+        view.selection = vec![(mg_area::ObjectKind::Placeable, 0)];
+    }
+    h.run_steps(5);
+    h.render().expect("render").save(out.join("placed.png")).unwrap();
+    // Change Light…: another row, the same hak.
+    let on_it = screen(&h, area, Vec3::new(15.0, 15.0, 1.5));
+    right_click(&mut h, on_it);
+    h.get_by_label("Change Light…").click();
+    h.run_steps(3);
+    h.state_mut().light_draft.as_mut().unwrap().spec.color = [40, 80, 255];
+    h.run_steps(2);
+    h.get_by_label("mg_lights.hak").click();
+    h.run_steps(3);
+    h.get_by_label("Write and Change").click();
+    h.run_steps(6);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let placed = ws.doc(&git_key).unwrap().root.list("Placeable List").unwrap().to_vec();
+    assert_eq!(placed[0].integer("Appearance"), Some(row as i64 + 1), "the next row");
+    assert_eq!(ws.can_undo(), Some("Change light"));
+}
+
 /// With Shift held, a selected placeable has a handle that scales its
 /// model about its feet: pulled twice as far from the object, twice the
-/// size, in one undoable step; Escape drops the drag.
+/// size, in one undoable step, the handle following the pointer; Escape
+/// drops the drag.
 #[test]
 fn a_scale_handle_scales_a_placeable_s_model_while_shift_is_held() {
     use glam::Vec3;
@@ -3810,6 +4741,22 @@ fn a_scale_handle_scales_a_placeable_s_model_while_shift_is_held() {
         if shot {
             let img = h.render().expect("render");
             img.save(mg_testkit::scratch_dir("ui-area-scale").join("scale_handle.png")).unwrap();
+            // The handle follows the pointer: its white square is drawn
+            // where the pointer is (left of the pointer's arrow), not
+            // where it was taken.
+            let ppp = img.width() as f32 / h.ctx.content_rect().width();
+            let white = |at: egui::Pos2, dx: std::ops::RangeInclusive<i32>| {
+                let mut n = 0;
+                for x in dx {
+                    for y in 1..=4 {
+                        let (px, py) = ((at.x + x as f32) * ppp, (at.y + y as f32) * ppp);
+                        let p = img.get_pixel(px as u32, py as u32);
+                        n += usize::from(p[0] > 225 && p[1] > 225 && p[2] > 225);
+                    }
+                }
+                n
+            };
+            assert!(white(to, -5..=-2) >= 12, "the handle's square at the pointer");
         }
         if escape {
             h.key_press(egui::Key::Escape);
@@ -3835,6 +4782,223 @@ fn a_scale_handle_scales_a_placeable_s_model_while_shift_is_held() {
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
     h.run_steps(2);
     assert_eq!(scale(&mut h), None, "an undo each");
+}
+
+/// An area another builder holds, in a project that keeps those
+/// read-only (the builders' proposal, C6): looked at and selected in,
+/// its tools off, nothing in it changed and nothing refused in the log.
+/// Its objects are picked, not moved, turned or deleted; with Shift held
+/// there are no handles; its menu offers what looks at it; Paint and
+/// Select Tiles are off; its Properties and its objects' are gray, what
+/// is typed in them dropped.
+#[test]
+fn a_read_only_area_is_looked_at_and_its_tools_are_off() {
+    use glam::Vec3;
+    use mg_area::ObjectKind;
+    let Some((mut h, area)) = read_only_area_harness("read-only") else { return };
+    let refused = |h: &Harness<'_, Moonglow>| {
+        h.state().log.entries.iter().find(|e| e.1.contains("not changed")).map(|e| e.1.clone())
+    };
+    {
+        let view = h.state_mut().area_views.get_mut(&area).unwrap();
+        let o = view.orbit.as_mut().unwrap();
+        (o.target, o.yaw, o.pitch, o.distance) = (Vec3::new(16.0, 20.0, 0.0), 0.3, 0.5, 18.0);
+    }
+    h.run_steps(2);
+    h.get_by_label_contains("read-only here. Ask them to release it");
+    let (x0, y0, turn) = waypoint(&mut h, area, 0).unwrap();
+    // A click selects the waypoint.
+    let on = screen(&h, area, Vec3::new(20.0, 20.0, 0.9));
+    h.hover_at(on);
+    press(&h, on, true, egui::Modifiers::NONE);
+    press(&h, on, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    assert_eq!(h.state().area_views[&area].selection, [(ObjectKind::Waypoint, 0)]);
+    // Dragged, it stays where it is; Q, E and Delete do nothing.
+    let on = screen(&h, area, Vec3::new(20.0, 20.0, 0.02));
+    let to = screen(&h, area, Vec3::new(25.0, 20.0, 0.02));
+    press(&h, on, true, egui::Modifiers::NONE);
+    for k in 1..=4 {
+        h.hover_at(on + (to - on) * (k as f32 / 4.0));
+        h.run_steps(1);
+    }
+    press(&h, to, false, egui::Modifiers::NONE);
+    h.run_steps(3);
+    h.hover_at(on);
+    h.key_press(egui::Key::Q);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(3);
+    assert_eq!(waypoint(&mut h, area, 0), Some((x0, y0, turn)), "not moved, turned or deleted");
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), None);
+    assert_eq!(refused(&h), None);
+    // The chest, selected with Shift held: no rings, arrows or scale
+    // handle to take (the picture), and a drag on it moves nothing.
+    let chest = screen(&h, area, Vec3::new(12.0, 20.0, 0.3));
+    h.hover_at(chest);
+    press(&h, chest, true, egui::Modifiers::NONE);
+    press(&h, chest, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    assert_eq!(h.state().area_views[&area].selection, [(ObjectKind::Placeable, 0)]);
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+    h.run_steps(2);
+    let img = h.render().expect("render");
+    img.save(mg_testkit::scratch_dir("ui-area-read-only-shot").join("read_only.png")).unwrap();
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(1);
+    // Paint and Select Tiles are off.
+    for tool in [" Paint", " Select Tiles"] {
+        let named = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+            n.label().is_some_and(|l| l.ends_with(tool))
+        };
+        let node = h.get(egui_kittest::kittest::by().predicate(named));
+        assert!(node.accesskit_node().is_disabled(), "{tool} is off");
+    }
+    // Its menu: what looks at it, nothing that changes it.
+    h.hover_at(chest);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: chest,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(3);
+    h.get_by_label(&format!("{area} is claimed by cd since 2026-10-20: read-only here"));
+    for item in ["Delete", "Adjust Location…", "Make Static", "Variables…"] {
+        assert!(h.query_by_label(item).is_none(), "no {item}");
+    }
+    h.get_by_label("Properties").click();
+    h.run_steps(3);
+    // The chest's Properties: gray, Close alone, what is typed dropped.
+    // (And settled: a gray form keeps no frames coming.)
+    h.run();
+    h.get_by_label_contains("read-only here, shown to look at");
+    assert!(h.query_by_label("OK").is_none());
+    let tag = {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let git = ws.doc(&ResKey::new(area, ResType::GIT)).unwrap();
+        let chest = &git.root.list("Placeable List").unwrap()[0];
+        String::from_utf8_lossy(chest.string("Tag").unwrap()).into_owned()
+    };
+    typed_name(&h, &tag).click();
+    h.run_steps(1);
+    h.event(egui::Event::Text("X".into()));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), None);
+    assert_eq!(refused(&h), None);
+    // The area's Properties too.
+    h.get_by_label("Close").click();
+    h.run_steps(2);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AreaProperties(area)));
+    h.run_steps(3);
+    h.run();
+    h.get_by_label_contains("read-only here, shown to look at");
+    h.get_by_label("Close");
+    assert_eq!(refused(&h), None);
+}
+
+/// The toolbar's Minimap: the area's map in the view's corner, as the
+/// game's map draws it, with where the camera looks; a click on it moves
+/// the camera's target there and leaves the selection be, and the switch
+/// is kept for the views opened after.
+#[test]
+fn the_minimap_shows_the_area_and_a_click_on_it_looks_there() {
+    use mg_area::ObjectKind;
+    let Some((mut h, area)) = area_harness("minimap") else { return };
+    h.state_mut().area_views.get_mut(&area).unwrap().selection = vec![(ObjectKind::Waypoint, 0)];
+    h.run_steps(2);
+    assert_eq!(h.state().area_views[&area].map_rect, None, "off at first");
+    let named = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.label().is_some_and(|l| l.ends_with(" Minimap"))
+    };
+    h.get(egui_kittest::kittest::by().predicate(named)).click();
+    h.run_steps(3);
+    assert!(h.state().settings.area_minimap, "kept");
+    let rect = h.state().area_views[&area].map_rect.expect("the map is shown");
+    let view = h.state().area_views[&area].rect;
+    assert!((rect.width() - rect.height()).abs() < 0.5, "a 4 by 4 area's is square");
+    assert!(view.contains_rect(rect) && rect.right() > view.center().x, "in the view's corner");
+    let img = h.render().expect("render");
+    img.save(mg_testkit::scratch_dir("ui-area-minimap-shot").join("minimap.png")).unwrap();
+    // The tiles' pictures, not the black of a tile without one.
+    let ppp = img.width() as f32 / h.ctx.content_rect().width();
+    let p = img.get_pixel(((rect.left() + 4.0) * ppp) as u32, ((rect.top() + 4.0) * ppp) as u32);
+    assert!(p[0] as u32 + p[1] as u32 + p[2] as u32 > 60, "a tile's picture: {p:?}");
+    // A click toward its south-east corner: the camera looks at 35, 5.
+    let at = rect.min + egui::vec2(rect.width() * 0.875, rect.height() * 0.875);
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(3);
+    let target = h.state().area_views[&area].orbit.unwrap().target;
+    assert!((target.x - 35.0).abs() < 0.5 && (target.y - 5.0).abs() < 0.5, "{target}");
+    assert_eq!(h.state().area_views[&area].selection, [(ObjectKind::Waypoint, 0)]);
+    assert!(h.ctx.memory(|m| m.focused().is_none()), "the keys stay the view's");
+}
+
+/// Setup Area Transition picks the door or waypoint a transition leads
+/// to on its area's map, as Aurora's `TdlgAreaTransition` does: a click
+/// on a waypoint's dot takes it, OK sets Destination Tag and its type;
+/// what is clicked in the lists and canceled changes nothing.
+#[test]
+fn setup_area_transition_picks_on_the_target_area_s_map() {
+    let prepare = |m: &mut Module, game: &mg_rules::GameData, area: ResRef| {
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        for (w, tag) in
+            git.root.list_mut("WaypointList").unwrap().iter_mut().zip(["WP_WEST", "WP_EAST"])
+        {
+            w.set("Tag", mg_gff::Value::String(tag.as_bytes().to_vec()));
+        }
+        m.set_gff(git_key, &git).unwrap();
+        let resref = ResRef::from_str("transit").unwrap();
+        let mut utt = mg_module::blueprints::trigger(game, resref, "Transit", 0);
+        utt.root.set("Type", mg_gff::Value::Int(1));
+        m.set_gff(ResKey::new(resref, ResType::UTT), &utt).unwrap();
+    };
+    let Some((mut h, _)) = area_harness_with("transition", "ttr01", None, 4, None, &prepare) else {
+        return;
+    };
+    let key = ResKey::parse("transit", ResType::UTT).unwrap();
+    let linked = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let root = &ws.doc(&key).unwrap().root;
+        let tag = String::from_utf8_lossy(root.string("LinkedTo").unwrap_or_default()).into_owned();
+        (tag, root.integer("LinkedToFlags").unwrap_or(0))
+    };
+    let before = linked(&mut h);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Blueprint(key)));
+    h.run_steps(3);
+    h.get_all_by_label("Area Transition").next().unwrap().click();
+    h.run_steps(2);
+    // Clicked in a list and canceled: nothing changes.
+    h.get_by_label("Setup Area Transition…").click();
+    h.run_steps(3);
+    h.get_by_label("WP_WEST").click();
+    h.run_steps(1);
+    h.get_by_label("Leads to the waypoint tagged WP_WEST");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run_steps(3);
+    assert_eq!(linked(&mut h), before);
+    // On the map: the east waypoint, at 30, 20 of the area's 40 by 40 m.
+    h.get_by_label("Setup Area Transition…").click();
+    h.run_steps(3);
+    let map = h.get_by_label("The area's map").rect();
+    let east = egui::pos2(map.left() + map.width() * 0.75, map.bottom() - map.height() * 0.5);
+    h.hover_at(east);
+    h.run_steps(2);
+    let img = h.render().expect("render");
+    img.save(mg_testkit::scratch_dir("ui-transition-shot").join("setup_transition.png")).unwrap();
+    press(&h, east, true, egui::Modifiers::NONE);
+    press(&h, east, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    h.get_by_label("Leads to the waypoint tagged WP_EAST");
+    h.get_all_by_label("OK").last().unwrap().click();
+    h.run_steps(3);
+    assert_eq!(linked(&mut h), ("WP_EAST".to_string(), 2));
+    assert!(h.query_by_label("The area's map").is_none(), "closed");
 }
 
 /// A look (`MG_SHOT=1`): a dragon selected in an area, its box around it
@@ -3881,9 +5045,9 @@ fn a_dragon_s_box_in_an_area() {
 /// Ctrl + wheel over the view scales the selected placeable's model, as
 /// Aurora's does: shown as the wheel turns, one command when Ctrl is let
 /// go, and Undo takes it back whole (or drops it while it is under way).
-/// A static placeable takes no scale, and with nothing selected that
-/// does the wheel zooms, as it did; so does it with the pointer off the
-/// selection (a builder's report: the view moved with Ctrl + drag, the
+/// A static placeable takes no scale; with nothing selected the wheel
+/// does nothing, as Aurora's; with the pointer off the selection it
+/// zooms (a builder's report: the view moved with Ctrl + drag, the
 /// wheel turned to zoom scaled the placeable selected).
 #[test]
 fn ctrl_and_the_wheel_scale_what_is_selected() {
@@ -3938,11 +5102,11 @@ fn ctrl_and_the_wheel_scale_what_is_selected() {
     let over = screen(&h, area, pivot);
     h.hover_at(over);
     h.run_steps(2);
-    // Nothing selected: the wheel zooms, slowly.
+    // Nothing selected: the wheel does nothing, as Aurora's.
     let far = distance(&h);
     turn(&mut h, 200.0);
     let_go(&mut h);
-    assert!(distance(&h) < far, "zoomed in");
+    assert_eq!(distance(&h), far, "the view stays");
     assert_eq!(scale(&mut h), None);
     // The chest selected, the pointer off it: the wheel zooms still.
     h.state_mut().area_views.get_mut(&area).unwrap().selection = vec![(ObjectKind::Placeable, 0)];
@@ -4131,6 +5295,66 @@ fn replaced_objects_keep_their_outline_and_transform() {
     h.state_mut().actions.push(mg_ui::Action::Undo);
     h.run_steps(3);
     assert_eq!(placed(&mut h, "TriggerList"), trigger, "and one for the trigger");
+}
+
+/// With Onto Objects on (the toolbar), the see-through copy of what is
+/// about to be placed lies on the placeable under the pointer, and is
+/// placed there; off, on the ground under it (a builder's report on
+/// 1.31.0: the copy lay under the table Drop onto Object would set it
+/// on). Pictures in `target/test-output/ui-area-onto/`.
+#[test]
+fn onto_objects_places_on_the_placeable_under_the_pointer() {
+    use mg_module::instances::{Placement, Placing, instance};
+    let Some((mut h, area)) = area_harness("onto") else { return };
+    let git = ResKey::new(area, ResType::GIT);
+    let chest = {
+        let game = h.state().game.clone().unwrap();
+        let bp = game.resman.get(&ResKey::parse("plc_chest1", ResType::UTP).unwrap()).unwrap();
+        let bp = Gff::read(&bp).unwrap();
+        let none = |_: ResRef| None;
+        let placing = Placing { game: &game, item: &none };
+        let at = Placement { position: [25.0, 25.0, 0.0], rotation: 0.0 };
+        instance(&placing, ResType::UTP, &bp.root, at, &[]).unwrap()
+    };
+    let insert = mg_edit::Edit::InsertItem {
+        key: git,
+        path: mg_edit::GffPath::root(),
+        list: "Placeable List".into(),
+        index: 0,
+        item: chest,
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", vec![insert])));
+    h.run_steps(6);
+    if let Some(o) = &mut h.state_mut().area_views.get_mut(&area).unwrap().orbit {
+        o.target = glam::Vec3::new(25.0, 25.0, 0.5);
+        (o.pitch, o.yaw, o.distance) = (45f32.to_radians(), -60f32.to_radians(), 6.0);
+    }
+    h.state_mut().palette.selected = Some(ResKey::parse("plc_chest1", ResType::UTP).unwrap());
+    h.run_steps(2);
+    let dir = mg_testkit::output_dir("ui-area-onto");
+    // On the chest's top, near its middle.
+    let at = screen(&h, area, glam::Vec3::new(25.0, 25.0, 0.6));
+    let shown_z = |h: &mut Harness<'_, Moonglow>, name: &str| {
+        h.hover_at(at);
+        h.run_steps(3);
+        h.render().expect("render").save(dir.join(name)).unwrap();
+        h.state().area_views[&area].ghost_shown.as_ref().expect("the copy").position.z
+    };
+    let off = shown_z(&mut h, "off.png");
+    assert!(off.abs() < 0.1, "off: on the ground, {off}");
+    h.state_mut().settings.place_onto_objects = true;
+    let on = shown_z(&mut h, "on.png");
+    assert!(on > 0.3 && on < 2.0, "on: on the chest, {on}");
+    // Placed where it showed.
+    click_pos(&h, at);
+    h.run_steps(3);
+    let placed = {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let list = ws.doc(&git).unwrap().root.list("Placeable List").unwrap().to_vec();
+        list.iter().map(|p| p.float("Z").unwrap()).collect::<Vec<_>>()
+    };
+    assert_eq!(placed.len(), 2, "{placed:?}");
+    assert!(placed.iter().any(|z| (z - on).abs() < 0.05), "placed at {placed:?}, shown at {on}");
 }
 
 /// Drop onto Object (Shift+G) sets the selection on the placeable below
@@ -4369,4 +5593,100 @@ fn the_shadows_button_held_opens_the_kinds_to_choose() {
     h.get_by_label("◑ Shadows").click();
     h.run();
     assert_eq!(kinds(&h), [true, false, false]);
+}
+
+/// The shadows' quality: Fast (the shadow map) unless chosen; High in the
+/// Shadows button's menu (as in Options › Area) is kept in the settings,
+/// and the view is drawn again with the stencil volumes; Fast again, with
+/// the map.
+#[test]
+fn the_shadows_quality_is_chosen_in_the_shadows_menu() {
+    use mg_ui::settings::ShadowQuality;
+    let Some((mut h, _area)) = area_harness("shadow-quality") else { return };
+    let volumes = |h: &Harness<'_, Moonglow>| {
+        h.state().viewport.as_ref().map(|vp| vp.renderer.shadow_volumes)
+    };
+    h.run_steps(2);
+    assert_eq!(h.state().settings.shadow_quality, ShadowQuality::Fast);
+    assert_eq!(volumes(&h), Some(false), "the map by default");
+    h.get_by_label("◑ Shadows").click_secondary();
+    h.run();
+    h.get_by_label("High").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.shadow_quality, ShadowQuality::High);
+    assert_eq!(volumes(&h), Some(true), "drawn again with the volumes");
+    h.get_by_label("Fast").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.shadow_quality, ShadowQuality::Fast);
+    assert_eq!(volumes(&h), Some(false));
+}
+
+/// What follows the pointer over the view (the coordinates in its corner,
+/// the outline of tiles about to be pasted) is not drawn while the
+/// pointer is over a window in front of the view: the ground under the
+/// window is not where the pointer is. Pictures in
+/// `target/test-output/ui-area-under-window/`.
+#[test]
+fn what_follows_the_pointer_stops_under_a_window() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness_on("under-window", "tic01", None) else { return };
+    // The palette in a window of its own, out of the way for now (the
+    // view as wide as it will be).
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    h.run_steps(3);
+    let size = egui::vec2(300.0, 260.0);
+    own_window(&mut h, &Tab::Palette, egui::pos2(10.0, 400.0), size);
+    h.run();
+    // A tile copied and about to be pasted.
+    h.get_by_label("⛶ Select Tiles").click();
+    h.run_steps(2);
+    let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
+    click_pos(&h, at);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::C);
+    h.run_steps(1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::V);
+    h.run_steps(1);
+    assert!(h.state().area_views[&area].tile_pasting);
+    // The pasted tile's gold outline: how much of it is in a picture.
+    let gold = |img: &image::RgbaImage| {
+        img.pixels()
+            .filter(|p| {
+                let [r, g, b, _] = p.0;
+                r.abs_diff(240) < 24 && g.abs_diff(200) < 24 && b.abs_diff(60) < 40
+            })
+            .count()
+    };
+    let dir = mg_testkit::output_dir("ui-area-under-window");
+    // Over the bare view: the outline and the coordinates follow.
+    let centre = screen(&h, area, Vec3::new(25.0, 25.0, 0.0));
+    h.hover_at(centre);
+    h.run_steps(3);
+    let img = h.render().expect("render");
+    img.save(dir.join("over-the-view.png")).unwrap();
+    assert!(gold(&img) > 50, "the outline over the view");
+    assert!(h.state().area_views[&area].pointer.is_some(), "the coordinates over the view");
+    // The window moved over the view, the pointer on it near its left
+    // edge: the tile under the pointer lies partly outside the window.
+    own_window(&mut h, &Tab::Palette, centre - egui::vec2(20.0, size.y / 2.0), size);
+    h.run();
+    h.hover_at(centre + egui::vec2(10.0, 0.0));
+    h.run_steps(3);
+    h.run();
+    let img = h.render().expect("render");
+    img.save(dir.join("under-a-window.png")).unwrap();
+    assert!(h.state().area_views[&area].pointer.is_none(), "no coordinates under a window");
+    // (A few of the start location's marker's pixels are near gold.)
+    let left = gold(&img);
+    assert!(left < 20, "no outline under a window: {left} pixels of it");
+    // Escape over the window is not the view's; over the view it puts
+    // the paste down (`area_view::cancelled`, as a right click does).
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().area_views[&area].tile_pasting, "Escape over the window");
+    h.hover_at(centre - egui::vec2(60.0, 0.0));
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().area_views[&area].tile_pasting, "Escape over the view");
 }

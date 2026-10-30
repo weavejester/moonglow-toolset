@@ -52,14 +52,28 @@ use common::{SETTINGS, client_capture, client_screenshot, compile, save_png};
 
 #[path = "client_render/armourer.rs"]
 mod armourer;
+#[path = "client_render/batch2.rs"]
+mod batch2;
+#[path = "client_render/batch3.rs"]
+mod batch3;
+#[path = "client_render/batch4.rs"]
+mod batch4;
+#[path = "client_render/batch5.rs"]
+mod batch5;
 #[path = "client_render/ee_visuals.rs"]
 mod ee_visuals;
 #[path = "client_render/heads.rs"]
 mod heads;
 #[path = "client_render/heed.rs"]
 mod heed;
+#[path = "client_render/joined.rs"]
+mod joined;
+#[path = "client_render/nui.rs"]
+mod nui;
 #[path = "client_render/programs.rs"]
 mod programs;
+#[path = "client_render/readings.rs"]
+mod readings;
 #[path = "client_render/shadows.rs"]
 mod shadows;
 #[path = "client_render/soft_particles.rs"]
@@ -99,6 +113,24 @@ void main()
     DelayCommand(4.0, Log("MG_READY"));
 }
 "#;
+
+/// [`ENTER`] with the camera `SetCameraFacing(90, distance, pitch)` given a
+/// second after the player enters, which the client takes (given at once
+/// it keeps its own camera, but for the reference scenes' 12 and 45:
+/// [findings](../../../docs/findings.md), "An upright particle turns to the
+/// eye").
+fn enter_with_camera(distance: &str, pitch: &str) -> String {
+    let at_once =
+        "AssignCommand(pc, SetCameraFacing(90.0, 12.0, 45.0, CAMERA_TRANSITION_TYPE_SNAP));";
+    assert!(ENTER.contains(at_once));
+    ENTER.replace(
+        at_once,
+        &format!(
+            "DelayCommand(1.0, AssignCommand(pc, SetCameraFacing(90.0, {distance}, {pitch}, \
+             CAMERA_TRANSITION_TYPE_SNAP)));"
+        ),
+    )
+}
 
 /// Regions compared (fractions of the image, top-left origin), clear of the
 /// game's GUI, with the largest mean difference allowed per channel. Most
@@ -628,6 +660,8 @@ float MgValue(int k)
         if (j == 4) return c.a < 0.0 ? 1.0 : 0.0;
         return 0.0;
     }
+    // The direction towards the sun or moon (view space), from −1 to 1.
+    if (k >= 96 && k < 99) return lightAreaDiffuseDirection[k - 96] * 0.5 + 0.5;
     return 0.0;
 }
 void MgDebug(inout vec4 c)
@@ -707,15 +741,25 @@ void main()
 
 /// The time uniforms' units (`docs/research/notes_shaders.md` §B.4):
 /// `worldtimerTimeOfDay` and `sceneCurrentFrame` read back through the
-/// debug shader in five screenshots 3 seconds apart (each screenshot's
+/// debug shader in eight screenshots 2 seconds apart (each screenshot's
 /// time measured), beside the module's clock, which the entry script logs,
 /// in modules starting at other hours and days and with other minutes an
 /// hour. Seen on 2026-10-21 (89.8193.37-17): the timer counts real
 /// milliseconds (999-1000 a second, at 2 and at 10 minutes an hour), the
 /// frame counter the client's frames (54-55 a second here, about 370 some
 /// 7 seconds after entering the area). The timer's value follows neither
-/// the module's hour nor its day: about 424,800 there at 2 minutes an
-/// hour, 3,304,900 at 10 (six game hours' worth more), its origin unknown. Needs the game, a GPU and the off-screen display;
+/// the module's hour nor its day nor its dawn: it is a count taken within
+/// the module's day (24 of its hours in real milliseconds), which the
+/// first shot is held to. On 2026-10-29 until after 12:09 (local time)
+/// the count was about 17,697,400 as the player entered the area, in 16
+/// runs (seven seconds in: 424,400 at 1, 2, 3, 4 and 6 minutes an hour,
+/// 3,304,400 at 5 and 10, 6,184,400 at 8, the count itself from 15 up;
+/// the same at 2 and 10 as on 2026-10-21), and by 13:11 two hours more
+/// (24,897,600): what moves it was not found. Eight shots, so that three
+/// distinct frames are left where the window shows a frame again (with
+/// five it failed now and then).
+/// `MG_TIME_CASES` gives other cases (`hour:minutes:day:dawn`, comma
+/// separated). Needs the game, a GPU and the off-screen display;
 /// run by hand (`--ignored`).
 #[test]
 #[ignore]
@@ -727,7 +771,25 @@ fn time_uniforms_in_the_client() {
     // (Modules starting at other hours and days, with another number of
     // minutes an hour: what the timer depends on.) (start hour, minutes an
     // hour, start day)
-    for (hour, minutes, day) in [(13u8, 2u8, 1u8), (6, 2, 1), (13, 10, 1), (13, 2, 15)] {
+    let mut cases = vec![
+        (13u8, 2u8, 1u8, 6u8),
+        (6, 2, 1, 6),
+        (13, 10, 1, 6),
+        (13, 2, 15, 6),
+        (13, 2, 1, 8),
+        (13, 8, 1, 6),
+        (13, 30, 1, 6),
+    ];
+    if let Ok(v) = std::env::var("MG_TIME_CASES") {
+        cases = v
+            .split(',')
+            .map(|c| {
+                let n: Vec<u8> = c.split(':').map(|x| x.parse().unwrap()).collect();
+                (n[0], n[1], n[2], n[3])
+            })
+            .collect();
+    }
+    for (hour, minutes, day, dawn) in cases {
         let dir = scratch_dir(&format!("client_time_{hour}_{minutes}_{day}"));
         let light =
             Lighting { ambient: 0x404040, diffuse: 0x808080, main_light: 0, only_tile: None };
@@ -740,12 +802,14 @@ fn time_uniforms_in_the_client() {
         info.root.write(&ifo::MOD_START_HOUR, hour);
         info.root.write(&ifo::MOD_MIN_PER_HOUR, minutes);
         info.root.write(&ifo::MOD_START_DAY, day);
+        info.root.write(&ifo::MOD_DAWN_HOUR, dawn);
+        info.root.write(&ifo::MOD_DUSK_HOUR, dawn.max(12) + 6);
         m.set_info(&info).unwrap();
         std::fs::create_dir_all(dir.join("user/override")).unwrap();
         std::fs::write(dir.join("user/settings.tml"), SETTINGS).unwrap();
         std::fs::write(dir.join("user/override/inc_standard.shd"), &shader).unwrap();
         m.save_as(&ModuleLocation::Archive(dir.join("user/modules/MgScene.mod"))).unwrap();
-        let shots = common::client_screenshots(&dir, "MgScene", 5, Duration::from_secs(3))
+        let shots = common::client_screenshots(&dir, "MgScene", 8, Duration::from_secs(2))
             .unwrap_or_else(|| {
                 panic!("the client did not reach the scene (see {})", dir.display())
             });
@@ -784,11 +848,15 @@ fn time_uniforms_in_the_client() {
              sceneCurrentFrame {frame_rate:.1} a second ({} shots)",
             rows.len()
         );
-        assert!(rows.len() >= 2 && dt > 5.0, "{rows:?}");
+        assert!(rows.len() >= 3 && dt > 5.0, "{rows:?}");
         // Milliseconds of real time, whatever the module's minutes per hour.
         assert!((timer_rate - 1000.0).abs() < 50.0, "{timer_rate}");
         // A frame count (as fast as the client draws).
         assert!(frame_rate > 10.0, "{frame_rate}");
+        // Within the module's day (24 of its hours, in real
+        // milliseconds), whatever its origin.
+        let day_length = 24 * 60_000 * i64::from(minutes);
+        assert!((0..day_length).contains(&first.1), "{} past a day of {day_length}", first.1);
     }
 }
 
@@ -1092,10 +1160,10 @@ fn grass_and_sky_look() {
         );
     assert!(settings.contains("mode = 2") && settings.contains("enabled = true"));
     std::fs::write(dir.join("user/settings.tml"), settings).unwrap();
-    // MG_CLOSE=1: the camera low and close, to see the client's grass.
+    // MG_CLOSE=1: the camera low and close, to see the client's grass
+    // (given a second after entry: the fifth client batch).
     if std::env::var_os("MG_CLOSE").is_some() {
-        let enter =
-            ENTER.replace("SetCameraFacing(90.0, 12.0, 45.0", "SetCameraFacing(90.0, 3.0, 80.0");
+        let enter = enter_with_camera("3.0", "80.0");
         let ncs = compile(&dir, "mg_enter", &enter);
         m.set(ResKey::parse("mg_enter", ResType::NCS).unwrap(), ncs);
     }
@@ -1186,10 +1254,14 @@ fn grass_overrides_look() {
         let settings =
             SETTINGS.replace("[graphics.grass]\n\t\tmode = 0", "[graphics.grass]\n\t\tmode = 2");
         std::fs::write(dir.join("user/settings.tml"), settings).unwrap();
-        let camera = format!("SetCameraFacing(90.0, {distance}, {pitch}");
-        let enter = ENTER
-            .replace("SetCameraFacing(90.0, 12.0, 45.0", &camera)
-            .replace("CreateObject(", "if (FALSE) CreateObject(");
+        // (Another camera than the reference's is given a second after
+        // entry, which the client takes: the fifth client batch.)
+        let enter = if (distance.as_str(), pitch.as_str()) == ("12.0", "45.0") {
+            ENTER.to_string()
+        } else {
+            enter_with_camera(&distance, &pitch)
+        };
+        let enter = enter.replace("CreateObject(", "if (FALSE) CreateObject(");
         let ncs = compile(&dir, "mg_enter", &enter);
         m.set(ResKey::parse("mg_enter", ResType::NCS).unwrap(), ncs);
         m.save_as(&ModuleLocation::Archive(dir.join("user/modules/MgScene.mod"))).unwrap();
@@ -1577,9 +1649,9 @@ fn particles_look() {
         }
     }
     std::fs::write(user.join("settings.tml"), SETTINGS).unwrap();
-    // From the side, closer and lower than the reference scenes.
-    let enter =
-        ENTER.replace("SetCameraFacing(90.0, 12.0, 45.0", "SetCameraFacing(90.0, 9.0, 80.0");
+    // From the side, closer and lower than the reference scenes (given a
+    // second after entry: the fifth client batch).
+    let enter = enter_with_camera("9.0", "80.0");
     let ncs = compile(&dir, "mg_enter", &enter);
     m.set(ResKey::parse("mg_enter", ResType::NCS).unwrap(), ncs);
     m.save_as(&ModuleLocation::Archive(user.join("modules/MgScene.mod"))).unwrap();
@@ -2553,6 +2625,71 @@ fn tdod_custom_shaders_look() {
         let c = mean(&client, *r);
         let (a, b) = (mean(&off, *r), mean(&on, *r));
         eprintln!("{name}: client {c:.1?}, own {a:.1?}, game's {b:.1?}");
+    }
+    // `MG_FIT_WALL=1`: the camera fitted to the far wall and floor (rows a
+    // quarter to two fifths down, the dark wall's edge across them) a
+    // tenth of a degree and centimetres about the fitted one, and the far
+    // floor measured again from it (the fifth client batch).
+    if std::env::var_os("MG_FIT_WALL").is_some() {
+        let model = mg_area::AreaModel::read(&game, &are.root, &git.root, tileset.as_ref());
+        let area_scene = mg_area::AreaScene::new(&gpu, &game, &model);
+        let view = mg_area::View { fog: false, time: 4.0, ..mg_area::View::of(&model) };
+        let scene = area_scene.scene(&model, &view);
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+        let grey = |img: &Rgba, x: usize, y: usize| {
+            let i = (y * img.width as usize + x) * 4;
+            (img.data[i] as f32 + img.data[i + 1] as f32 + img.data[i + 2] as f32) / 3.0
+        };
+        let (wu, hu) = (w as usize, h as usize);
+        let error = |img: &Rgba| {
+            let (mut e, mut n) = (0.0f32, 0.0f32);
+            for y in (hu / 4..hu * 2 / 5).step_by(2) {
+                for x in (wu * 3 / 10..wu * 7 / 10).step_by(2) {
+                    e += (grey(img, x, y) - grey(&client, x, y)).abs();
+                    n += 1.0;
+                }
+            }
+            e / n
+        };
+        let pc = Vec3::new(20.0, 20.0, 0.0);
+        let mut best = (f32::MAX, [FIT_FOV, FIT_FOCUS, FIT_DISTANCE, FIT_PITCH]);
+        for dp in -3..=3 {
+            for dd in -4..=4 {
+                for df in -1..=1 {
+                    for dv in -1..=1 {
+                        let p = [
+                            FIT_FOV + dv as f32 * 0.3,
+                            FIT_FOCUS + df as f32 * 0.03,
+                            FIT_DISTANCE + dd as f32 * 0.1,
+                            FIT_PITCH + dp as f32 * 0.2,
+                        ];
+                        let cam = fitted_camera(pc, p[0], p[1], p[2], p[3]);
+                        let e = error(&r.render_image(&gpu, &game.resman, &scene, &cam, w, h));
+                        if e < best.0 {
+                            best = (e, p);
+                        }
+                    }
+                }
+            }
+        }
+        let fitted = fitted_camera(pc, FIT_FOV, FIT_FOCUS, FIT_DISTANCE, FIT_PITCH);
+        let before = error(&r.render_image(&gpu, &game.resman, &scene, &fitted, w, h));
+        let cam = fitted_camera(pc, best.1[0], best.1[1], best.1[2], best.1[3]);
+        let off = r.render_image(&gpu, &game.resman, &scene, &cam, w, h);
+        r.game_shaders = true;
+        let on = r.render_image(&gpu, &game.resman, &scene, &cam, w, h);
+        save_png(&off, &dir.join("moonglow_off_wall.png"));
+        save_png(&on, &dir.join("moonglow_on_wall.png"));
+        eprintln!(
+            "fitted to the wall: fov, focus, distance, pitch {:?}, error {:.2} (the reference \
+             camera's {before:.2})",
+            best.1, best.0
+        );
+        for (name, r, _) in REGIONS.iter().filter(|(n, ..)| n.contains("floor")) {
+            let c = mean(&client, *r);
+            let (a, b) = (mean(&off, *r), mean(&on, *r));
+            eprintln!("{name} (wall's camera): client {c:.1?}, own {a:.1?}, game's {b:.1?}");
+        }
     }
 }
 

@@ -7,8 +7,7 @@ use crate::common::*;
 fn reload_resources_picks_up_new_files_in_override() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-reload");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("override")).unwrap();
+    let user = user_folder(&dir, &["override"]);
     let path = sample_module(&dir);
     let mut app = game_app(&root, Some(user.clone()));
     app.open_module(&path);
@@ -30,8 +29,7 @@ fn reload_resources_picks_up_new_files_in_override() {
 fn a_file_new_to_the_override_is_seen_by_the_watch() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-reload-watch");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("override")).unwrap();
+    let user = user_folder(&dir, &["override"]);
     let mut app = game_app(&root, Some(user.clone()));
     let key = ResKey::parse("mg_watch_test", ResType::TWODA).unwrap();
     // (The watch begins; what it says at its start finds nothing changed.)
@@ -58,13 +56,12 @@ fn browse_view_and_copy_a_game_resource() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-browser");
     let path = sample_module(&dir);
-    let install = mg_resman::GameInstall::new(&root, None, "en");
     let out = dir.join("out");
     std::fs::create_dir_all(&out).unwrap();
     let dialogs = NoDialogs { folders: vec![out.clone()], ..Default::default() };
-    let mut app = Moonglow::new(Some(install), Box::new(dialogs));
+    let mut app = game_app_with(&root, None, dialogs);
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Resources));
     h.run();
     // Those listed go out as loose files.
@@ -122,6 +119,82 @@ fn module_with_two_tables(dir: &std::path::Path, user: &std::path::Path) -> std:
     path
 }
 
+/// A hak's table is edited by the window's own buttons and menus, on a
+/// module with two haks that have it: the lower copy's Edit in its hak,
+/// the hak editor's Edit Table, Take Rows from the other hak's copy, and
+/// the copy the game reads by Edit… › The Table of its hak.
+#[test]
+fn a_hak_s_table_is_edited_by_the_window_s_own_buttons() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-hak-table-buttons");
+    let user = dir.join("user");
+    let path = module_with_two_tables(&dir, &user);
+    let mut app = game_app(&root, Some(user.clone()));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = harness(app, 1400.0, 900.0);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Resources));
+    h.state_mut().browser.filter = "portraits".into();
+    h.state_mut().browser.restype = Some(ResType::TWODA);
+    h.run();
+    let key = ResKey::parse("portraits", ResType::TWODA).unwrap();
+    let hak_of = |h: &Harness<'_, Moonglow>, name: &str| {
+        let file = user.join(format!("hak/{name}.hak"));
+        h.state().haks.iter().find(|d| d.hak.path.as_deref() == Some(&file)).map(|d| d.id)
+    };
+    let table_in = |h: &Harness<'_, Moonglow>, hak: u32| {
+        let home = mg_ui::table_view::Home::Hak(hak);
+        h.state().tables.iter().find(|d| d.key == key && d.home == home).map(|d| d.id)
+    };
+
+    // The lower hak's copy, opened from its row: Edit in mg_low.hak opens
+    // the hak in the hak editor and its table in the 2DA editor.
+    let rows: Vec<_> = h.get_all_by_label("portraits.2da").collect();
+    rows[1].click_secondary();
+    h.run();
+    h.get_by_label("Open").click();
+    h.run();
+    h.get_by_label("Edit in mg_low.hak").click();
+    h.run_steps(3);
+    let low = hak_of(&h, "mg_low").expect("mg_low in the hak editor");
+    let id = table_in(&h, low).expect("its table in the 2DA editor");
+    assert_eq!(table_of(&h, id).get(0, "LABEL"), Some("mg_low"));
+    // Closed, and opened again by the hak editor's Edit Table.
+    h.state_mut().actions.push(mg_ui::Action::CloseTabs(vec![Tab::Table(id)]));
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Hak(low)));
+    h.run_steps(3);
+    assert!(table_in(&h, low).is_none());
+    h.get_all_by_label("portraits.2da").last().expect("the hak's row").click_secondary();
+    h.run();
+    h.get_by_label("Edit Table").click();
+    h.run_steps(3);
+    let id = table_in(&h, low).expect("opened by Edit Table");
+
+    // Take Rows from the other hak's copy (the first offered): its row 0,
+    // changed in both against the game's, ticked and taken.
+    h.get_by_label("Take Rows…").click();
+    h.run_steps(3);
+    // (mg_top's copy has one row: nothing new.)
+    h.get_by_label_contains("0 new, 0 changed there, 1 changed in both");
+    h.get_by_label("Row 0").click();
+    h.run_steps(2);
+    h.get_by_label("Take 1 Rows").click();
+    h.run_steps(3);
+    assert_eq!(table_of(&h, id).get(0, "LABEL"), Some("mg_top"), "taken from mg_top's copy");
+
+    // The copy the game reads (mg_top's), opened: Edit… › The Table of
+    // mg_top.hak.
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Resource(key)));
+    h.run_steps(3);
+    h.get_by_label("Edit…").click();
+    h.run();
+    h.get_by_label("The Table of mg_top.hak").click();
+    h.run_steps(3);
+    let top = hak_of(&h, "mg_top").expect("mg_top in the hak editor");
+    let id = table_in(&h, top).expect("its table in the 2DA editor");
+    assert_eq!(table_of(&h, id).get(0, "LABEL"), Some("mg_top"));
+}
+
 /// The resource browser lists every copy of a resource: the one the game
 /// reads, and under it those it overrides, each opened, copied to the
 /// module and saved as its layer has it (a builder's report: of a
@@ -133,9 +206,13 @@ fn the_browser_lists_the_copies_a_higher_layer_overrides() {
     let user = dir.join("user");
     let path = module_with_two_tables(&dir, &user);
     let saved = dir.join("saved.2da");
-    let install = mg_resman::GameInstall::new(&root, Some(user), "en");
-    let dialogs = NoDialogs { save: vec![saved.clone()], ..Default::default() };
-    let mut app = Moonglow::new(Some(install), Box::new(dialogs));
+    let exported = dir.join("exported");
+    let dialogs = NoDialogs {
+        save: vec![saved.clone()],
+        folders: vec![exported.clone()],
+        ..Default::default()
+    };
+    let mut app = game_app_with(&root, Some(user), dialogs);
     app.settings.no_last_area = true;
     app.open_module(&path);
     let mut h = harness(app, 1200.0, 800.0);
@@ -162,6 +239,13 @@ fn the_browser_lists_the_copies_a_higher_layer_overrides() {
     let key = ResKey::parse("portraits", ResType::TWODA).unwrap();
     let tab = Tab::ResourceCopy { key, layer: "hak:mg_low".into() };
     assert!(h.state().dock.find_tab(&tab).is_some());
+    // A plugin sees it open, with its layer, once it is in front (a click
+    // in it).
+    let at = h.get_by_label("mg_low").rect().center();
+    click_pos(&h, at);
+    h.run_steps(2);
+    let copy = mg_plugin::Selected::Copy { key, layer: "hak:mg_low".into() };
+    assert_eq!(h.state().plugin_open(), Some(copy));
     h.get_by_label("mg_low");
     assert!(h.query_by_label("mg_top").is_none(), "the lower hak's copy, not the higher's");
     h.get_by_label("Overridden by hak:mg_top, whose copy the game reads.");
@@ -175,6 +259,22 @@ fn the_browser_lists_the_copies_a_higher_layer_overrides() {
     h.run();
     assert!(std::fs::read_to_string(&saved).unwrap().contains("mg_low"));
 
+    // Exported as files: the copy the game reads, and each it overrides
+    // in a folder of its layer's.
+    close_tab(h.state_mut(), &tab);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Resources));
+    h.run();
+    h.get_by_label_contains("as Files…").click();
+    h.run();
+    let read = |p: &str| std::fs::read_to_string(exported.join(p)).unwrap_or_default();
+    assert!(read("portraits.2da").contains("mg_top"), "the one the game reads");
+    assert!(read("hak_mg_low/portraits.2da").contains("mg_low"), "the lower hak's");
+    let folders =
+        std::fs::read_dir(&exported).unwrap().filter(|e| e.as_ref().unwrap().path().is_dir());
+    assert_eq!(folders.count(), game, "a folder a copy overridden");
+    let said = format!("{game} overridden copies in folders of their layers");
+    assert!(h.state().log.entries.iter().any(|(_, m)| m.contains(&said)), "said");
+
     // Without the overridden copies: the one the game reads.
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Resources));
     h.state_mut().browser.show_copies = false;
@@ -182,6 +282,80 @@ fn the_browser_lists_the_copies_a_higher_layer_overrides() {
     assert_eq!(h.query_all_by_label_contains(", overridden by ").count(), 0);
     h.get_by_label("hak:mg_top");
     h.get_by_label_contains("1 of ");
+}
+
+/// The resource browser's Preview shows an overridden copy as its layer
+/// has it: the game's own model under one of ours in override (a builder's
+/// report on 2.0.0: Preview showed only the copy the game reads).
+#[test]
+fn an_overridden_copy_is_previewed_as_its_layer_has_it() {
+    let root = mg_testkit::corpus!();
+    let Some(rs) = gpu() else { return };
+    let dir = mg_testkit::scratch_dir("ui-preview-copy");
+    let user = user_folder(&dir, &["override"]);
+    // Ours: a dummy and two quads.
+    let quad = |name: &str, x: f32| {
+        format!(
+            "node trimesh {name}\n  parent plc_a01\n  bitmap white\n  verts 4\n    -1 1 0\n    \
+             -1 -1 0\n    1 1 0\n    1 -1 0\n  tverts 4\n    0 1 0\n    0 0 0\n    1 1 0\n    \
+             1 0 0\n  faces 2\n    0 1 2 1 0 1 2 1\n    3 2 1 1 3 2 1 1\n  position {x} 0 0\n\
+             endnode\n"
+        )
+    };
+    let ours = format!(
+        "newmodel plc_a01\nsetsupermodel plc_a01 NULL\nclassification character\n\
+         beginmodelgeom plc_a01\nnode dummy plc_a01\n  parent NULL\nendnode\n{}{}\
+         endmodelgeom plc_a01\ndonemodel plc_a01\n",
+        quad("left", -1.0),
+        quad("right", 1.0)
+    );
+    std::fs::write(user.join("override/plc_a01.mdl"), ours).unwrap();
+    let path = sample_module(&dir);
+    let mut app = game_app(&root, Some(user));
+    app.set_render_state(rs.clone());
+    app.settings.game_shaders = Some(false);
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let key = ResKey::parse("plc_a01", ResType::MDL).unwrap();
+    let rm = &app.game.as_deref().unwrap().resman;
+    assert_eq!(rm.origin(&key), Some("override"));
+    let game_layer = rm.copies(&key).into_iter().nth(1).map(|i| rm.layers()[i].label.clone());
+    let game_layer = game_layer.expect("the game's own under it");
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Resources));
+    app.browser.filter = "plc_a01".into();
+    app.browser.restype = Some(ResType::MDL);
+    let mut h = gpu_harness(app, rs, 1100.0, 800.0);
+    h.run();
+    // The game's copy's row, under ours: its menu has Preview.
+    let rows: Vec<_> = h.get_all_by_label("plc_a01.mdl").collect();
+    assert!(rows.len() >= 2, "ours and the game's");
+    rows[1].click_secondary();
+    h.run();
+    h.get_by_label("Preview").click();
+    h.run();
+    let tab = Tab::ModelCopy { key, layer: game_layer.clone() };
+    assert!(h.state().dock.find_tab(&tab).is_some(), "the copy's viewer");
+    // A plugin sees it open, with its layer, once it is in front.
+    let at = h.query_all_by_label_contains(" nodes, ").next().unwrap().rect().center();
+    click_pos(&h, at);
+    h.run_steps(2);
+    let copy = mg_plugin::Selected::Copy { key, layer: game_layer.clone() };
+    assert_eq!(h.state().plugin_open(), Some(copy), "a plugin sees it open, with its layer");
+    // (What the viewer says of the model: `PLC_A01: 22 nodes, 12 meshes`.)
+    let said = |h: &Harness<'_, Moonglow>| -> Vec<String> {
+        let node = |n: egui_kittest::Node<'_>| n.accesskit_node().value();
+        h.query_all_by_label_contains(" nodes, ").filter_map(node).collect()
+    };
+    let ours = |h: &Harness<'_, Moonglow>| {
+        said(h).iter().any(|s| s.to_lowercase() == "plc_a01: 3 nodes, 2 meshes")
+    };
+    assert_eq!(said(&h).len(), 1, "a model shown");
+    assert!(!ours(&h), "the game's model, not ours: {:?}", said(&h));
+    assert!(h.state().model_views.keys().any(|s| s.to_string().ends_with(&game_layer))); // The model the game reads, ours, in the viewer of the resource.
+    close_tab(h.state_mut(), &tab);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
+    h.run();
+    assert!(ours(&h), "ours, which overrides it");
 }
 
 /// Whether `app`'s game data has the two haks of [`module_with_two_tables`]
@@ -323,6 +497,146 @@ fn a_module_s_haks_are_layered_after_one_closed_while_its_area_was_read() {
     has_the_two_haks(h.state()).unwrap();
 }
 
+/// An older module's single hak (`Mod_Hak`, and no list) is layered, as
+/// `mg` layers it, and Module Properties says so rather than that the
+/// module has none.
+#[test]
+fn an_older_module_s_single_hak_is_layered_and_said() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-hak-older");
+    let user = user_folder(&dir, &["hak"]);
+    let mut hak = mg_erf::ErfWriter::new(*b"HAK ");
+    let key = ResKey::parse("mg_older_hak", ResType::TWODA).unwrap();
+    hak.add(key.resref, key.restype, b"2DA V2.0\n".to_vec()).unwrap();
+    std::fs::write(user.join("hak/older.hak"), hak.to_bytes().unwrap()).unwrap();
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let mut info = m.info().unwrap();
+    info.root.write(&ifo::MOD_HAK, ExoString::from("older"));
+    m.set_info(&info).unwrap();
+    m.save().unwrap();
+    let mut app = game_app(&root, Some(user));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    app.open_palette = false;
+    assert!(app.game.as_ref().unwrap().resman.contains(&key), "the hak is layered");
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run();
+    h.get_by_label("Custom Content").click();
+    h.run();
+    h.get_by_label("Hak Files (0)");
+    h.get_by_label_contains("names its hak, older, in the older single field (Mod_Hak)");
+    assert!(h.query_by_label_contains("uses the game's own resources").is_none());
+}
+
+/// A hak's name is its file's bytes, as the game opens it
+/// (`engine_hak_names`): a module naming `mg_ñhak` in Windows-1252 (0xF1)
+/// has the hak whose file name has that byte layered, and Module
+/// Properties shows the name it layered, found; a hak whose file is named
+/// `ñ` in UTF-8 is offered by Add hak… under the name of those bytes and
+/// added by them (both were `ñ` and 0xF1: the window wrote a name the
+/// game doesn't open, and the layering read 0xF1 as no character).
+#[cfg(unix)]
+#[test]
+fn a_hak_s_name_is_its_file_s_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-hak-name-bytes");
+    let user = user_folder(&dir, &["hak"]);
+    let key = ResKey::parse("mg_cp_hak", ResType::TWODA).unwrap();
+    let mut hak = mg_erf::ErfWriter::new(*b"HAK ");
+    hak.add(key.resref, key.restype, b"2DA V2.0\n".to_vec()).unwrap();
+    let file = std::ffi::OsStr::from_bytes(b"mg_\xf1hak.hak");
+    std::fs::write(user.join("hak").join(file), hak.to_bytes().unwrap()).unwrap();
+    let empty = mg_erf::ErfWriter::new(*b"HAK ").to_bytes().unwrap();
+    std::fs::write(user.join("hak/mg_ñutf.hak"), empty).unwrap();
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let mut info = m.info().unwrap();
+    let mut item = ifo::MOD_HAK_LIST.new_item();
+    item.write(&ifo::mod_hak_list::MOD_HAK, ExoString(b"mg_\xf1hak".to_vec()));
+    info.root.items_mut(&ifo::MOD_HAK_LIST).push(item);
+    m.set_info(&info).unwrap();
+    m.save().unwrap();
+    let mut app = game_app(&root, Some(user));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    app.open_palette = false;
+    assert!(app.game.as_ref().unwrap().resman.contains(&key), "{:?}", app.log.entries);
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run();
+    h.get_by_label("Custom Content").click();
+    h.run_steps(3);
+    h.get_by_label("Hak Files (1)");
+    h.get_by_label("mg_ñhak");
+    assert_eq!(h.query_all_by_label("not found").count(), 0);
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    let add = (h.query_all(combo))
+        .find(|n| n.accesskit_node().value().as_deref() == Some("Add hak…"))
+        .map(|n| n.rect().center())
+        .expect("Add hak…");
+    h.hover_at(add);
+    press(&h, add, true, egui::Modifiers::NONE);
+    press(&h, add, false, egui::Modifiers::NONE);
+    h.run_steps(3);
+    h.get_by_label("mg_Ã±utf").click();
+    h.run_steps(3);
+    let info_key = ResKey::parse("module", ResType::IFO).unwrap();
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let root = ws.doc(&info_key).unwrap().root.clone();
+    let names: Vec<Vec<u8>> = (root.items(&ifo::MOD_HAK_LIST).iter())
+        .map(|i| i.read(&ifo::mod_hak_list::MOD_HAK).as_bytes().to_vec())
+        .collect();
+    assert_eq!(names, [b"mg_\xf1hak".to_vec(), "mg_ñutf".as_bytes().to_vec()]);
+    h.run_steps(2);
+    h.get_by_label("Hak Files (2)");
+    assert_eq!(h.query_all_by_label("not found").count(), 0, "both are there");
+}
+
+/// The game opens a hak only by its exact name (`engine_hak_names`): on
+/// Linux a module naming `MG_PLAIN` where the hak folder has
+/// `mg_plain.hak` has it not found, and Module Properties and the log say
+/// which file is there; Add hak… offers that file.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hak_named_in_another_case_is_not_found_on_linux() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-hak-name-case");
+    let user = user_folder(&dir, &["hak"]);
+    let empty = mg_erf::ErfWriter::new(*b"HAK ").to_bytes().unwrap();
+    std::fs::write(user.join("hak/mg_plain.hak"), empty).unwrap();
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let mut info = m.info().unwrap();
+    let mut item = ifo::MOD_HAK_LIST.new_item();
+    item.write(&ifo::mod_hak_list::MOD_HAK, ExoString::from("MG_PLAIN"));
+    info.root.items_mut(&ifo::MOD_HAK_LIST).push(item);
+    m.set_info(&info).unwrap();
+    m.save().unwrap();
+    let mut app = game_app(&root, Some(user));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    app.open_palette = false;
+    let said = (app.log.entries.iter()).find(|(_, m)| m.starts_with("Hak MG_PLAIN not found"));
+    let said = said.map(|(_, m)| m.clone()).unwrap_or_default();
+    assert!(said.contains("exact name") && said.contains("mg_plain.hak"), "{said}");
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run();
+    h.get_by_label("Custom Content").click();
+    h.run_steps(3);
+    h.get_by_label("not found: the file is mg_plain.hak");
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    let add = (h.query_all(combo))
+        .find(|n| n.accesskit_node().value().as_deref() == Some("Add hak…"))
+        .map(|n| n.rect().center())
+        .expect("Add hak…");
+    h.hover_at(add);
+    press(&h, add, true, egui::Modifiers::NONE);
+    press(&h, add, false, egui::Modifiers::NONE);
+    h.run_steps(3);
+    assert!(h.query_by_label("mg_plain").is_some(), "the file in its own case is offered");
+}
+
 /// Module Properties › Custom Content: the module's haks in a list of
 /// their own, numbered from the one that overrides the others. Rows are
 /// chosen (Ctrl and Shift for more) and moved by the keys, the arrows
@@ -332,8 +646,7 @@ fn a_module_s_haks_are_layered_after_one_closed_while_its_area_was_read() {
 fn the_hak_list_is_reordered_by_keys_buttons_and_a_drag() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-hak-list");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let user = user_folder(&dir, &["hak"]);
     for name in ["alpha", "bravo", "charlie"] {
         let empty = mg_erf::ErfWriter::new(*b"HAK ").to_bytes().unwrap();
         std::fs::write(user.join(format!("hak/{name}.hak")), empty).unwrap();
@@ -456,6 +769,18 @@ fn the_hak_list_is_reordered_by_keys_buttons_and_a_drag() {
     h.get_by_label("gone").click_modifiers(egui::Modifiers::COMMAND);
     h.run();
     assert_eq!(chosen(&h), [2, 3]);
+    // Ctrl + Shift + click adds the rows from the one clicked last, as
+    // every list of several does (it was a Ctrl + click here once).
+    h.get_by_label("bravo").click();
+    h.run();
+    h.get_by_label("alpha").click_modifiers(egui::Modifiers::COMMAND);
+    h.run();
+    h.get_by_label("gone").click_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+    h.run();
+    assert_eq!(chosen(&h), [0, 2, 3]);
+    h.get_by_label("bravo").click_modifiers(egui::Modifiers::COMMAND);
+    h.run();
+    assert_eq!(chosen(&h), [2, 3]);
     h.key_press(egui::Key::Delete);
     h.run();
     assert_eq!(haks(&mut h), ["bravo", "charlie"]);
@@ -471,6 +796,153 @@ fn the_hak_list_is_reordered_by_keys_buttons_and_a_drag() {
     assert_eq!(haks(&mut h), ["charlie", "alpha", "gone"]);
 }
 
+/// Add Haks and Talk Table takes content as it was downloaded, a 7z or a
+/// RAR archive (mg-module's fixtures): its haks and talk table are listed
+/// from it, put in order, copied into the user folder and attached; the
+/// same content in another archive is already there; one with a password
+/// is refused, said why.
+#[test]
+fn content_downloaded_as_7z_or_rar_is_attached_from_the_archive() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-attach-archives");
+    let user = user_folder(&dir, &[]);
+    let fixture = |name: &str| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../mg-module/tests/fixtures/archives")
+            .join(name)
+    };
+    let path = sample_module(&dir);
+    let dialogs = NoDialogs {
+        // (The last first.)
+        open_many: vec![
+            vec![fixture("locked.rar")],
+            vec![fixture("content-rar4.rar")],
+            vec![fixture("content.7z")],
+        ],
+        ..Default::default()
+    };
+    let mut app = game_app_with(&root, Some(user.clone()), dialogs);
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    app.open_palette = false;
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run();
+    let info = ResKey::parse("module", ResType::IFO).unwrap();
+    let haks = |h: &mut Harness<'_, Moonglow>| -> Vec<String> {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let root = ws.doc(&info).unwrap().root.clone();
+        root.items(&ifo::MOD_HAK_LIST)
+            .iter()
+            .map(|i| {
+                String::from_utf8_lossy(i.read(&ifo::mod_hak_list::MOD_HAK).as_bytes()).into_owned()
+            })
+            .collect()
+    };
+    let log = |h: &Harness<'_, Moonglow>| {
+        h.state().log.entries.iter().map(|e| e.1.clone()).collect::<Vec<_>>()
+    };
+    let add = |h: &mut Harness<'_, Moonglow>| {
+        h.get_by_label("Add Haks and Talk Table…").click();
+        h.run();
+    };
+    h.get_by_label("Custom Content").click();
+    h.run();
+
+    // The 7z: listed from it, the second hak moved up, attached.
+    add(&mut h);
+    assert!(h.state().attach.is_some(), "{:?}", log(&h));
+    for file in ["z_one.hak", "z_text.tlk", "z_two.hak"] {
+        h.get_by_label(file);
+    }
+    assert_eq!(h.query_all_by_label_contains("copied to your").count(), 3);
+    h.get_all_by_label("Move Up").last().unwrap().click();
+    h.run();
+    h.get_all_by_label("OK").last().unwrap().click();
+    h.run();
+    assert!(h.state().attach.is_none());
+    assert_eq!(haks(&mut h), ["z_two", "z_one"]);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let tlk = ws.doc(&info).unwrap().root.read(&ifo::MOD_CUSTOM_TLK);
+    assert_eq!(tlk.as_bytes(), b"z_text");
+    let one = std::fs::read_to_string(user.join("hak/z_one.hak")).unwrap();
+    assert!(one.starts_with("one line 0: Moonglow's archive fixture"), "{one}");
+    assert!(user.join("hak/z_two.HAK").is_file() && user.join("tlk/z_text.tlk").is_file());
+
+    // The RAR (RAR 4) holds the same: already there, nothing copied.
+    add(&mut h);
+    assert_eq!(h.query_all_by_label_contains("already in your").count(), 3, "{:?}", log(&h));
+    h.get_all_by_label("OK").last().unwrap().click();
+    h.run();
+    assert!(log(&h).iter().any(|m| m.contains("Copied 0 files")), "{:?}", log(&h));
+
+    // One with a password: refused, said why.
+    add(&mut h);
+    assert!(h.state().attach.is_none());
+    assert!(
+        log(&h).iter().any(|m| m.contains("locked.rar") && m.contains("password")),
+        "{:?}",
+        log(&h)
+    );
+}
+
+/// Module Properties' Add hak… by the keys (GitHub issue 7): once its box
+/// is clicked, Down opens it at its first hak, Down and Up move along
+/// them, Enter adds the one there and closes the list.
+#[test]
+fn add_hak_takes_the_arrow_keys() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-add-hak-keys");
+    let user = user_folder(&dir, &["hak"]);
+    for name in ["alpha", "bravo", "charlie"] {
+        let empty = mg_erf::ErfWriter::new(*b"HAK ").to_bytes().unwrap();
+        std::fs::write(user.join(format!("hak/{name}.hak")), empty).unwrap();
+    }
+    let path = sample_module(&dir);
+    let mut app = game_app(&root, Some(user));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    app.open_palette = false;
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run();
+    let info = ResKey::parse("module", ResType::IFO).unwrap();
+    h.get_by_label("Custom Content").click();
+    h.run_steps(3);
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    let add = |h: &Harness<'_, Moonglow>| {
+        h.query_all(combo.clone())
+            .find(|n| n.accesskit_node().value().as_deref() == Some("Add hak…"))
+            .map(|n| n.rect().center())
+            .expect("Add hak…")
+    };
+    // A click opens it, another closes it, the box keeping the keys.
+    let at = add(&h);
+    h.hover_at(at);
+    for _ in 0..2 {
+        press(&h, at, true, egui::Modifiers::NONE);
+        press(&h, at, false, egui::Modifiers::NONE);
+        h.run_steps(3);
+    }
+    assert!(h.query_by_label("bravo").is_none(), "closed");
+    for key in
+        [egui::Key::ArrowDown, egui::Key::ArrowDown, egui::Key::ArrowDown, egui::Key::ArrowUp]
+    {
+        h.key_press(key);
+        h.run_steps(2);
+    }
+    assert!(h.query_by_label("charlie").is_some(), "open");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let root = ws.doc(&info).unwrap().root.clone();
+    let haks: Vec<String> = root
+        .items(&ifo::MOD_HAK_LIST)
+        .iter()
+        .map(|i| String::from_utf8_lossy(i.read(&ifo::mod_hak_list::MOD_HAK).as_bytes()).into())
+        .collect();
+    assert_eq!(haks, ["bravo"], "the second, Down twice from the first and Up once");
+    assert!(h.query_by_label("charlie").is_none(), "the list closed");
+}
+
 /// A hak dragged to the bottom edge of a list longer than its frame
 /// scrolls the list (GitHub issue 17), and is let go among the rows that
 /// came into sight.
@@ -478,8 +950,7 @@ fn the_hak_list_is_reordered_by_keys_buttons_and_a_drag() {
 fn a_hak_dragged_to_the_list_s_edge_scrolls_it() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-hak-list-scroll");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let user = user_folder(&dir, &["hak"]);
     let path = sample_module(&dir);
     let mut app = game_app(&root, Some(user));
     app.settings.no_last_area = true;
@@ -596,7 +1067,8 @@ fn files_a_hak_already_has_are_asked_about_before_they_are_replaced() {
     h.get_by_label("Files Already in the Hak");
     assert!(h.query_by_label_contains("already has 1 of the 2 files").is_some());
     assert_eq!(sizes(&h).len(), 1, "nothing added before the answer");
-    h.get_by_label("Cancel").click();
+    // (The question's, not the hak editor's own.)
+    h.get_all_by_label("Cancel").last().unwrap().click();
     h.run();
     assert_eq!(sizes(&h), [("mg_one.2da".to_string(), was)]);
     // Skip Those: the other is added, the hak's own stays.
@@ -648,7 +1120,7 @@ fn closing_two_changed_haks_asks_of_both() {
     // The second is asked of too.
     h.get_by_label("Save changes to second.hak?");
     assert!(h.query_by_label_contains("more tab").is_none());
-    h.get_by_label("Cancel").click();
+    h.get_all_by_label("Cancel").last().unwrap().click();
     h.run();
     assert!(h.query_by_label("Save changes to second.hak?").is_none());
     assert!(h.state().dock.find_tab(&Tab::Hak(ids[1])).is_some(), "kept open");
@@ -695,6 +1167,21 @@ fn undo_over_a_hak_editor_is_the_hak_s() {
     let ctrl = egui::Modifiers::COMMAND;
     h.hover_at(h.get_by_label("Add Files…").rect().center());
     h.run();
+    // Edit › Undo is the hak's, the pointer gone from the editor to the
+    // menu, and names its step; so is the toolbar's.
+    h.get_by_label("Edit").click();
+    h.run();
+    h.get_by_label_contains("Undo Add files").click();
+    h.run();
+    assert_eq!(items(&h), 0, "the hak's step undone from the menu");
+    assert_eq!(module_step(&h).as_deref(), Some("A table"), "not the module's");
+    h.hover_at(h.get_by_label("Add Files…").rect().center());
+    h.run();
+    h.get_by_label("Redo").click();
+    h.run();
+    assert_eq!(items(&h), 1, "redone by the toolbar's Redo");
+    h.hover_at(h.get_by_label("Add Files…").rect().center());
+    h.run();
     h.key_press_modifiers(ctrl, egui::Key::Z);
     h.run();
     assert_eq!(items(&h), 0, "the hak's step undone");
@@ -706,6 +1193,28 @@ fn undo_over_a_hak_editor_is_the_hak_s() {
     h.key_press_modifiers(ctrl | egui::Modifiers::SHIFT, egui::Key::Z);
     h.run();
     assert_eq!(items(&h), 1, "redone");
+    // Its Find field clicked, not typed in: nothing of its own to take
+    // back, so Undo is the hak's, as a field elsewhere passes it to the
+    // module's (GitHub issue 18's rule). Typed in, the field's own.
+    let find =
+        egui_kittest::kittest::by().predicate(|n: &egui_kittest::kittest::AccessKitNode<'_>| {
+            n.placeholder() == Some("name or .type")
+        });
+    h.get(find.clone()).click();
+    h.run();
+    h.key_press_modifiers(ctrl, egui::Key::Z);
+    h.run();
+    assert_eq!(items(&h), 0, "the hak's step, from its Find field");
+    h.key_press_modifiers(ctrl | egui::Modifiers::SHIFT, egui::Key::Z);
+    h.run();
+    assert_eq!(items(&h), 1);
+    h.get(find).type_text("mg");
+    h.run();
+    h.key_press_modifiers(ctrl, egui::Key::Z);
+    h.run();
+    assert_eq!(items(&h), 1, "the field's typing, not the hak's step");
+    h.key_press(egui::Key::Escape);
+    h.run();
     // Away from the editor (over the module tree), the module's.
     h.hover_at(h.get_by_label("Areas (1)").rect().center());
     h.run();
@@ -713,6 +1222,82 @@ fn undo_over_a_hak_editor_is_the_hak_s() {
     h.run();
     assert_eq!(items(&h), 1);
     assert_ne!(module_step(&h).as_deref(), Some("A table"), "the module's step undone");
+}
+
+/// The hak editor's View shows a picture as a picture, a sound with Play,
+/// a 2DA as rows and columns, and the rest as the resource browser does
+/// (a model not in the load order as its text).
+#[test]
+fn the_hak_editor_shows_pictures_sounds_and_tables() {
+    let dir = mg_testkit::scratch_dir("ui-hak-view");
+    let mut image = mg_image::Rgba::new(8, 4);
+    image.data.fill(200);
+    let samples: Vec<u8> = [0i16; 800].iter().flat_map(|s| s.to_le_bytes()).collect();
+    let mut wav = b"RIFF".to_vec();
+    wav.extend((36 + samples.len() as u32).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    wav.extend(16u32.to_le_bytes());
+    for n in [1u16, 1] {
+        wav.extend(n.to_le_bytes());
+    }
+    for n in [8000u32, 16000] {
+        wav.extend(n.to_le_bytes());
+    }
+    for n in [2u16, 16] {
+        wav.extend(n.to_le_bytes());
+    }
+    wav.extend(b"data");
+    wav.extend((samples.len() as u32).to_le_bytes());
+    wav.extend(samples);
+    let files = [
+        ("mg_pic.tga", mg_image::write_tga(&image)),
+        ("mg_snd.wav", wav),
+        (
+            "mg_tab.2da",
+            b"2DA V2.0\n\n   Label    Model\n0  first    mg_a\n1  second   mg_b\n".to_vec(),
+        ),
+        ("mg_note.txt", b"just a note".to_vec()),
+    ];
+    let mut hak = mg_module::hak_edit::Hak::new();
+    let sources = files
+        .iter()
+        .map(|(n, d)| {
+            let key = ResKey::from_filename(n).unwrap();
+            (key, mg_module::hak_edit::Source::Bytes(d.clone().into()))
+        })
+        .collect();
+    hak.add_sources(sources).unwrap();
+    let path = dir.join("mg_view.hak");
+    hak.save(Some(&path)).unwrap();
+    let mut h = harness(app_with(Vec::new()), 1400.0, 900.0);
+    h.run();
+    mg_ui::hak_view::open_at(h.state_mut(), &path);
+    h.run();
+    let view = |h: &mut Harness<'_, Moonglow>, name: &str| {
+        h.get_by_label(name).click_secondary();
+        h.run();
+        h.get_all_by_label("View").last().unwrap().click();
+        h.run();
+        h.run();
+        let shown = h.state().haks[0].viewing().unwrap();
+        assert_eq!(shown.0.to_string(), name);
+        shown.1
+    };
+    assert_eq!(view(&mut h, "mg_pic.tga"), "picture");
+    h.get_by_label_contains("8 by 4 pixels");
+    assert_eq!(view(&mut h, "mg_snd.wav"), "sound");
+    h.get_by_label("Play").click();
+    h.run();
+    h.get_by_label("Stop");
+    assert_eq!(view(&mut h, "mg_tab.2da"), "table");
+    // (Its columns' names over its cells.)
+    h.get_by_label("Model");
+    h.get_by_label("second");
+    assert_eq!(view(&mut h, "mg_note.txt"), "plain");
+    h.get_by_label_contains("just a note");
+    h.get_by_label("Close").click();
+    h.run();
+    assert!(h.state().haks[0].viewing().is_none());
 }
 
 /// The hak editor's Compile Models compiles the hak's models kept as
@@ -787,7 +1372,6 @@ fn hak_built_from_a_folder_attached_edited_and_reloaded() {
     let tlk = mg_tlk::Tlk::new(Language::ENGLISH).to_bytes().unwrap();
     std::fs::write(download.join("mg_ui.tlk"), tlk).unwrap();
     let path = sample_module(&dir);
-    let install = mg_resman::GameInstall::new(&root, Some(user.clone()), "en");
     let hak = user.join("hak/mg_ui_hak.hak");
     let dialogs = NoDialogs {
         folders: vec![content.clone()],
@@ -795,7 +1379,7 @@ fn hak_built_from_a_folder_attached_edited_and_reloaded() {
         open_many: vec![vec![hak.clone(), download.join("mg_ui.tlk")]],
         open: vec![hak.clone()],
     };
-    let mut app = Moonglow::new(Some(install), Box::new(dialogs));
+    let mut app = game_app_with(&root, Some(user.clone()), dialogs);
     // (The module opens on its Properties, not on an area.)
     app.settings.no_last_area = true;
     app.open_module(&path);
@@ -907,6 +1491,8 @@ fn hak_built_from_a_folder_attached_edited_and_reloaded() {
     let mut have = names(&h);
     have.sort();
     assert_eq!(have, ["mg_ui_new.2da", "mg_ui_other.2da", "mg_ui_test.2da"]);
+    // (One step to undo, not two.)
+    assert_eq!(h.state().haks[0].hak.undo_label(), Some("Update from Folder"));
     // By size, the largest is listed first.
     h.state_mut().haks[0].sort = mg_ui::hak_view::Sort::Size;
     h.run();
@@ -917,17 +1503,147 @@ fn hak_built_from_a_folder_attached_edited_and_reloaded() {
             .fold((f32::MAX, None), |best, row| if row.0 < best.0 { row } else { best })
     };
     assert_eq!(first(&h).1.as_deref(), Some("mg_ui_new.2da"));
-    // View (or a double click) shows a resource under the list.
-    assert!(h.query_by_label_contains("a longer one").is_none());
+    // View (or a double click) shows a resource under the list: a table
+    // as its rows and columns.
+    assert!(h.state().haks[0].viewing().is_none());
     h.get_by_label("mg_ui_new.2da").click_secondary();
     h.run();
     // (The row's View: the menu bar has a View too.)
     h.get_all_by_label("View").last().unwrap().click();
     h.run();
-    assert!(h.query_by_label_contains("a longer one").is_some(), "its text is shown");
+    h.run();
+    assert_eq!(h.state().haks[0].viewing().map(|v| v.1), Some("table"));
+    assert!(h.query_by_label("Label").is_some(), "its column is shown");
     h.get_by_label("Close").click();
     h.run();
-    assert!(h.query_by_label_contains("a longer one").is_none());
+    assert!(h.state().haks[0].viewing().is_none());
+    // A model of the hak the game reads (the module's hak, saved) is
+    // drawn in the model viewer; changed and not saved, it is its text.
+    let model = ResKey::parse("plc_a01", ResType::MDL).unwrap();
+    let bytes = h.state().game.as_deref().unwrap().resman.get(&model).unwrap().into_owned();
+    std::fs::write(content.join("mg_ui_box.mdl"), &bytes).unwrap();
+    h.get_by_label("Update from Folder").click();
+    h.run();
+    h.get_by_label("Save").click();
+    h.run();
+    let shown_as = |h: &mut Harness<'_, Moonglow>| {
+        h.get_by_label("mg_ui_box.mdl").click_secondary();
+        h.run();
+        h.get_all_by_label("View").last().unwrap().click();
+        h.run();
+        h.state().haks[0].viewing().map(|v| v.1)
+    };
+    assert_eq!(shown_as(&mut h), Some("model"));
+    // Changed and not saved, it is drawn from the hak as it is now
+    // (`a_model_of_a_hak_the_game_doesn_t_read_is_drawn`); one that can't
+    // be read is its text.
+    std::fs::write(content.join("mg_ui_box.mdl"), &bytes[..bytes.len() - 1]).unwrap();
+    h.get_by_label("Update from Folder").click();
+    h.run();
+    assert_eq!(shown_as(&mut h), Some("model"));
+    std::fs::write(content.join("mg_ui_box.mdl"), b"not a model").unwrap();
+    h.get_by_label("Update from Folder").click();
+    h.run();
+    assert_eq!(shown_as(&mut h), Some("plain"));
+}
+
+/// A model of a hak the game doesn't read (no module lists it) is drawn
+/// in the hak editor, from the hak as it is now over the load order: its
+/// supermodel and a texture from the hak, a texture from the game; and
+/// changed there, not saved, drawn as changed. The pictures go to
+/// `target/test-output/ui-hak-view-model/`.
+#[test]
+fn a_model_of_a_hak_the_game_doesn_t_read_is_drawn() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let Some(rs) = gpu() else { return };
+    let dir = mg_testkit::scratch_dir("ui-hak-view-model");
+    let quad = |name: &str, bitmap: &str, x: f32| {
+        format!(
+            "node trimesh {name}\n  parent mg_hak_box\n  bitmap {bitmap}\n  ambient 1 1 1\n  \
+             diffuse 1 1 1\n  verts 4\n    {x} 0 0\n    {x1} 0 0\n    {x1} 0 1\n    {x} 0 1\n  \
+             tverts 4\n    0 0 0\n    1 0 0\n    1 1 0\n    0 1 0\n  \
+             faces 2\n    0 2 1 1 0 2 1 0\n    0 3 2 1 0 3 2 0\nendnode\n",
+            x1 = x + 1.0
+        )
+    };
+    let model = |red: &str| {
+        format!(
+            "newmodel mg_hak_box\nsetsupermodel mg_hak_box mg_hak_super\nclassification \
+             placeable\nbeginmodelgeom mg_hak_box\nnode dummy mg_hak_box\n  parent NULL\n\
+             endnode\n{}{}endmodelgeom mg_hak_box\ndonemodel mg_hak_box\n",
+            quad("red", red, -1.0),
+            quad("floor", "tic01_floor01", 0.0)
+        )
+    };
+    let supermodel = "newmodel mg_hak_super\nsetsupermodel mg_hak_super NULL\nclassification \
+                      placeable\nbeginmodelgeom mg_hak_super\nnode dummy mg_hak_super\n  parent \
+                      NULL\nendnode\nendmodelgeom mg_hak_super\nnewanim mg_wave mg_hak_super\n  \
+                      length 1.0\n  transtime 0.25\n  animroot mg_hak_super\nnode dummy \
+                      mg_hak_super\n  parent NULL\nendnode\ndoneanim mg_wave mg_hak_super\n\
+                      donemodel mg_hak_super\n";
+    // A red picture, 4 by 4 (a TGA of 32 bits, its rows from the top).
+    let tga = |bgra: [u8; 4]| {
+        let mut t = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 4, 0, 32, 0x28];
+        for _ in 0..16 {
+            t.extend(bgra);
+        }
+        t
+    };
+    let mut w = mg_erf::ErfWriter::new(*b"HAK ");
+    let r = |s: &str| ResRef::from_str(s).unwrap();
+    w.add(r("mg_hak_box"), ResType::MDL, model("mg_hak_red").into_bytes()).unwrap();
+    w.add(r("mg_hak_super"), ResType::MDL, supermodel.as_bytes().to_vec()).unwrap();
+    w.add(r("mg_hak_red"), ResType::TGA, tga([0, 0, 255, 255])).unwrap();
+    w.add(r("mg_hak_blue"), ResType::TGA, tga([255, 0, 0, 255])).unwrap();
+    let hak = dir.join("mg_view.hak");
+    std::fs::write(&hak, w.to_bytes().unwrap()).unwrap();
+    let file = dir.join("mg_hak_box.mdl");
+    let dialogs = NoDialogs { open: vec![hak], open_many: vec![vec![file]], ..Default::default() };
+    let mut app = game_app_with(&root, None, dialogs);
+    app.set_render_state(rs.clone());
+    app.open_palette = false;
+    mg_ui::hak_view::open_hak(&mut app);
+    let mut h = gpu_harness(app, rs, 1100.0, 800.0);
+    h.run_steps(2);
+    let view = |h: &mut Harness<'_, Moonglow>| {
+        h.get_by_label("mg_hak_box.mdl").click_secondary();
+        h.run();
+        h.get_all_by_label("View").last().unwrap().click();
+        h.run_steps(4);
+        h.state().haks[0].viewing().map(|v| v.1)
+    };
+    let shown = view(&mut h);
+    h.run_steps(10);
+    h.render().expect("render").save(dir.join("drawn.png")).unwrap();
+    assert_eq!(shown, Some("model"));
+    assert!(h.query_by_label_contains("not found or not readable").is_none(), "drawn");
+    // Its supermodel's animation, from the hak, is among its animations.
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    let at = h
+        .query_all(combo)
+        .find(|n| n.accesskit_node().value().is_some_and(|v| v.contains("rest pose")))
+        .map(|n| n.rect().center())
+        .expect("the Animation dropdown");
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    assert!(h.query_by_label("mg_wave").is_some(), "the supermodel's animation");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // Changed, not saved: its red side made blue (Add Files…, the hak's
+    // replaced), drawn so.
+    std::fs::write(dir.join("mg_hak_box.mdl"), model("mg_hak_blue")).unwrap();
+    h.get_by_label("Add Files…").click();
+    h.run_steps(2);
+    h.get_by_label("Replace 1").click();
+    h.run_steps(2);
+    assert_eq!(view(&mut h), Some("model"));
+    assert!(h.state().haks[0].hak.is_dirty());
+    h.render().expect("render").save(dir.join("changed.png")).unwrap();
 }
 
 /// Export as Files and Copy to Scratch Folder: a script goes out with its
@@ -946,7 +1662,7 @@ fn resources_are_exported_as_files() {
     let folders = vec![scratch.clone(), chosen.clone()];
     let mut app = Moonglow::new(None, Box::new(NoDialogs { folders, ..Default::default() }));
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // Compiled again in the toolset, not saved: what is exported.
     let edit = mg_edit::Edit::SetResource { key: ncs, data: Some(b"NCS new".to_vec()) };
@@ -995,13 +1711,12 @@ fn compiled_models_are_saved_as_text() {
     for d in [&plain, &text] {
         std::fs::create_dir_all(d).unwrap();
     }
-    let install = mg_resman::GameInstall::new(&root, None, "en");
     let dialogs = NoDialogs {
         save: vec![dir.join("one.mdl")],
         folders: vec![text.clone(), plain.clone()],
         ..Default::default()
     };
-    let mut app = Moonglow::new(Some(install), Box::new(dialogs));
+    let mut app = game_app_with(&root, None, dialogs);
     let key = ResKey::parse("plc_a01", ResType::MDL).unwrap();
     let is_text = |p: &std::path::Path| {
         let data = std::fs::read(p).unwrap();
@@ -1009,10 +1724,10 @@ fn compiled_models_are_saved_as_text() {
     };
     app.run(mg_ui::Action::SaveModelText(key, None));
     assert!(is_text(&dir.join("one.mdl")));
-    app.run(mg_ui::Action::SaveResources(vec![key]));
+    app.run(mg_ui::Action::SaveResources(vec![(key, None)]));
     assert!(!is_text(&plain.join("plc_a01.mdl")), "as it is, unless asked");
     app.browser.models_as_text = true;
-    app.run(mg_ui::Action::SaveResources(vec![key]));
+    app.run(mg_ui::Action::SaveResources(vec![(key, None)]));
     assert!(is_text(&text.join("plc_a01.mdl")));
     assert!(app.log.entries.iter().any(|(_, m)| m.contains("1 compiled models as text")));
 }
@@ -1044,6 +1759,146 @@ fn raw_fields_name_their_2da_rows() {
         let name = game.row_name(&table, props.integer(field).unwrap()).expect(field);
         assert!(shown.contains(&name), "{field} is shown as {name:?}: {shown:?}");
     }
+}
+
+/// The raw fields view names what else a number stands for: a creature's
+/// faction (the module's `repute.fac`, its own included), a conversation
+/// line's animation, a store's pages by their structs' ids; and, with the
+/// game's data, an item property's subtype and value, of the tables its
+/// other fields name. Each but the pages in a list to choose another by
+/// name.
+#[test]
+fn raw_fields_name_factions_animations_pages_and_property_parts() {
+    use egui_kittest::kittest::Queryable;
+    let dir = mg_testkit::scratch_dir("ui-raw-names");
+    let mut m = mg_module::Module::new();
+    m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
+    let mut fac = mg_module::factions::Factions::of_module(&m);
+    let smugglers = fac.add("Smugglers", false, 1);
+    m.set_gff(ResKey::parse("repute", ResType::FAC).unwrap(), &fac.to_gff()).unwrap();
+    let mut utc = mg_gff::Gff::new(*b"UTC ");
+    utc.root.set("FactionID", mg_gff::Value::Word(smugglers as u16));
+    m.set_gff(ResKey::parse("smuggler", ResType::UTC).unwrap(), &utc).unwrap();
+    let mut dlg = mg_gff::Gff::new(*b"DLG ");
+    let mut line = mg_gff::Struct::new(0);
+    line.set("Animation", mg_gff::Value::Dword(35));
+    dlg.root.set("EntryList", mg_gff::Value::List(vec![line]));
+    m.set_gff(ResKey::parse("hello", ResType::DLG).unwrap(), &dlg).unwrap();
+    let mut utm = mg_gff::Gff::new(*b"UTM ");
+    let pages = vec![mg_gff::Struct::new(0), mg_gff::Struct::new(4)];
+    utm.root.set("StoreList", mg_gff::Value::List(pages));
+    m.set_gff(ResKey::parse("shop", ResType::UTM).unwrap(), &utm).unwrap();
+    let mut uti = mg_gff::Gff::new(*b"UTI ");
+    let mut p = mg_gff::Struct::new(0);
+    for (l, v) in [("PropertyName", 0u16), ("Subtype", 0), ("CostValue", 2)] {
+        p.set(l, mg_gff::Value::Word(v));
+    }
+    p.set("CostTable", mg_gff::Value::Byte(1));
+    p.set("Param1", mg_gff::Value::Byte(255));
+    uti.root.set("PropertiesList", mg_gff::Value::List(vec![p]));
+    m.set_gff(ResKey::parse("ring", ResType::UTI).unwrap(), &uti).unwrap();
+    let path = dir.join("names.mod");
+    m.save_as(&mg_module::ModuleLocation::Archive(path.clone())).unwrap();
+    let root = mg_testkit::nwn_root();
+    // (Each in a window of its own: the fields view's first list opened.)
+    let open = |name: &str, t: ResType, items: bool| {
+        let app = match &root {
+            Some(root) => game_app(root, None),
+            None => app_with(Vec::new()),
+        };
+        let mut h = harness(app, 1000.0, 700.0);
+        h.state_mut().actions.push(mg_ui::Action::OpenModule(path.clone()));
+        h.run_steps(2);
+        h.state_mut()
+            .actions
+            .push(mg_ui::Action::OpenTab(Tab::Gff(ResKey::parse(name, t).unwrap())));
+        h.run_steps(3);
+        if items {
+            h.get_all_by_label_contains(" items").next().unwrap().click();
+            h.run_steps(2);
+        }
+        h
+    };
+    let shown = |h: &Harness<'_, Moonglow>| -> Vec<String> {
+        h.query_all_by_role(egui::accesskit::Role::ComboBox)
+            .filter_map(|n| n.accesskit_node().value())
+            .collect()
+    };
+    let h = open("smuggler", ResType::UTC, false);
+    assert!(shown(&h).contains(&"Smugglers".to_string()), "{:?}", shown(&h));
+    let mut h = open("hello", ResType::DLG, true);
+    h.get_all_by_label_contains("struct").last().unwrap().click();
+    h.run_steps(2);
+    assert!(shown(&h).contains(&"Bow".to_string()), "{:?}", shown(&h));
+    let h = open("shop", ResType::UTM, true);
+    h.get_by_label("[0] struct 0  Armor");
+    h.get_by_label("[1] struct 4  Weapons");
+    let Some(_) = root else {
+        eprintln!("skipped the item property's parts: no game install");
+        return;
+    };
+    let mut h = open("ring", ResType::UTI, true);
+    h.get_all_by_label_contains("struct").last().unwrap().click();
+    h.run_steps(2);
+    let game = h.state().game.clone().unwrap();
+    let name = |table: &str, row: usize| {
+        let t = game.table(table).unwrap();
+        game.string(mg_core::StrRef(t.get_int(row, "Name").unwrap() as u32)).unwrap()
+    };
+    let cost = game.table("iprp_costtable").unwrap().get(1, "Name").unwrap().to_lowercase();
+    for want in [name("iprp_abilities", 0), name(&cost, 2)] {
+        assert!(shown(&h).contains(&want), "{want:?} in {:?}", shown(&h));
+    }
+}
+
+/// The raw fields view says an object's faction field of 0 puts it in the
+/// PC faction, as Verify warns of it: a creature blueprint's, a placed
+/// door's; not another faction's, nor a placed trigger's (the owner's
+/// decision).
+#[test]
+fn raw_fields_warn_of_the_pc_faction() {
+    use egui_kittest::kittest::Queryable;
+    let dir = mg_testkit::scratch_dir("ui-raw-pc-faction");
+    let mut m = mg_module::Module::new();
+    m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
+    let blueprint = |faction: u16| {
+        let mut g = mg_gff::Gff::new(*b"UTC ");
+        g.root.set("FactionID", mg_gff::Value::Word(faction));
+        g
+    };
+    m.set_gff(ResKey::parse("guard", ResType::UTC).unwrap(), &blueprint(0)).unwrap();
+    m.set_gff(ResKey::parse("hostile", ResType::UTC).unwrap(), &blueprint(1)).unwrap();
+    let mut area = mg_gff::Gff::new(*b"GIT ");
+    let placed = |faction: u32| {
+        let mut s = mg_gff::Struct::new(1);
+        s.set("Faction", mg_gff::Value::Dword(faction));
+        s
+    };
+    area.root.set("Door List", mg_gff::Value::List(vec![placed(0)]));
+    area.root.set("TriggerList", mg_gff::Value::List(vec![placed(0)]));
+    m.set_gff(ResKey::parse("area", ResType::GIT).unwrap(), &area).unwrap();
+    let path = dir.join("pcfac.mod");
+    m.save_as(&mg_module::ModuleLocation::Archive(path.clone())).unwrap();
+    let warned = |name: &str, t: ResType, open: &[usize]| {
+        let mut h = harness(app_with(Vec::new()), 1000.0, 700.0);
+        h.state_mut().actions.push(mg_ui::Action::OpenModule(path.clone()));
+        h.run_steps(2);
+        let key = ResKey::parse(name, t).unwrap();
+        h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Gff(key)));
+        h.run_steps(3);
+        for &i in open {
+            h.get_all_by_label_contains(" items").nth(i).unwrap().click();
+            h.run_steps(2);
+            h.get_all_by_label_contains("struct").last().unwrap().click();
+            h.run_steps(2);
+        }
+        h.query_all_by_label_contains("The PC faction").count()
+    };
+    assert_eq!(warned("guard", ResType::UTC, &[]), 1);
+    assert_eq!(warned("hostile", ResType::UTC, &[]), 0);
+    // The GIT's lists in their order: the doors', then the triggers'.
+    assert_eq!(warned("area", ResType::GIT, &[0]), 1, "a placed door");
+    assert_eq!(warned("area", ResType::GIT, &[1]), 0, "a placed trigger");
 }
 
 /// Build › Compile Models compiles the module's own models kept as text,

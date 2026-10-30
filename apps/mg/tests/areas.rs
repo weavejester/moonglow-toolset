@@ -247,6 +247,38 @@ fn make_static_follows_the_project_file() {
     );
 }
 
+/// `--where FIELD=VALUE`, `--where-var NAME=VALUE` and `--music ROW`
+/// choose the areas by what they hold (their ARE's fields, their GIT's
+/// music and variables), with the other filters, to list or to change.
+#[test]
+fn areas_are_chosen_by_what_they_hold() {
+    let dir = mg_testkit::scratch_dir("mg-areas-where");
+    let path = dir.join("caves.mod");
+    module(&path);
+    let run = |args: &[&str]| {
+        let out = crate::mg().arg("areas").arg(&path).args(args).output().unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let listed: Vec<String> = (text(&out.stdout).lines())
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect();
+        (out.status.success(), listed, text(&out.stderr))
+    };
+    let (ok, _, notes) = run(&["cave2", "--set", "MusicDay=57", "--var", "kz_bears=4"]);
+    assert!(ok, "{notes}");
+    assert_eq!(run(&["--music", "57"]).1, ["cave2"]);
+    assert_eq!(run(&["--music", "3"]).1, ["cave1", "inn"]);
+    assert_eq!(run(&["--where", "musicday=57"]).1, ["cave2"], "a label in any case");
+    assert_eq!(run(&["--where", "SunFog*=2", "--underground"]).1, ["cave1", "cave2"]);
+    assert_eq!(run(&["--where-var", "kz_*"]).1, ["cave2"]);
+    assert!(run(&["--where-var", "kz_bears=5"]).1.is_empty());
+    // A filter of its own: what is chosen changes.
+    let (ok, changed, notes) = run(&["--where-var", "kz_bears=4", "--set", "SunFogAmount=7"]);
+    assert!(ok, "{notes}");
+    assert_eq!(changed, ["cave2"]);
+    let (ok, _, notes) = run(&["--where-var", "=4"]);
+    assert!(!ok && notes.contains("name a variable"), "{notes}");
+}
+
 /// `--grass`, `--remove-grass` and `--tileset-grass`: the areas' own grass
 /// set in their GITs' AreaProperties, where the game reads it.
 #[test]
@@ -331,8 +363,8 @@ fn a_lighting_scheme_is_given_to_the_areas() {
     m.set_gff(are_key, &are).unwrap();
     m.save().unwrap();
     let run = |args: &[&str]| {
-        let mut cmd = crate::mg();
-        cmd.args(["--root", root.to_str().unwrap(), "--no-user-dir", "areas"]);
+        let mut cmd = crate::mg_on(&root, None);
+        cmd.arg("areas");
         let out = cmd.arg(&path).args(args).output().unwrap();
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         (out.status.success(), text(&out.stdout), text(&out.stderr))
@@ -384,8 +416,8 @@ fn a_lighting_scheme_is_given_to_the_areas() {
     std::fs::copy(&path, &a).unwrap();
     std::fs::copy(&path, &b).unwrap();
     let run_on = |module: &std::path::Path, args: &[&str]| {
-        let mut cmd = crate::mg();
-        cmd.args(["--root", root.to_str().unwrap(), "--no-user-dir", "areas"]);
+        let mut cmd = crate::mg_on(&root, None);
+        cmd.arg("areas");
         let out = cmd.arg(module).args(args).output().unwrap();
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         assert!(out.status.success(), "{}", text(&out.stderr));
@@ -403,6 +435,70 @@ fn a_lighting_scheme_is_given_to_the_areas() {
         are.root.list("Tile_List").unwrap().to_vec()
     };
     assert_eq!(tiles(&a), tiles(&b), "the same number, the same picks");
+}
+
+/// `--lighting`: lighting kept in Moonglow (Saved Lighting), by its name
+/// in the data folder or by its file, gives the areas its fields, the
+/// tiles' lights left as they are, and with `--tile-lights` each tile its
+/// lights from the colors kept; one not kept changes nothing.
+#[test]
+fn kept_lighting_is_given_to_the_areas() {
+    let dir = mg_testkit::scratch_dir("mg-areas-lighting");
+    let path = dir.join("caves.mod");
+    module(&path);
+    let are_key = key("cave1", ResType::ARE);
+    let mut m = Module::open(&path).unwrap();
+    let mut are = m.gff(&are_key).unwrap().unwrap();
+    let tile = || {
+        let mut t = Struct::new(1);
+        for l in ["Tile_MainLight1", "Tile_MainLight2", "Tile_SrcLight1", "Tile_SrcLight2"] {
+            t.set(l, Value::Byte(0));
+        }
+        t
+    };
+    are.root.set("Tile_List", Value::List(vec![tile(), tile(), tile()]));
+    m.set_gff(are_key, &are).unwrap();
+    m.save().unwrap();
+    let data = dir.join("data");
+    let kept = data.join("lighting");
+    std::fs::create_dir_all(&kept).unwrap();
+    let text = r#"{ "lighting": { "SunFogAmount": 14, "MoonFogColor": 657930 },
+        "tile_lights": { "main1": [27, 27, 4, 4], "main2": [0, 0, 0, 0], "source": [2, 2, 2, 2] } }"#;
+    std::fs::write(kept.join("Damp Crypt.lighting.json"), text).unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = crate::mg();
+        let out = cmd.env("MOONGLOW_DATA_DIR", &data).arg("areas").arg(&path).args(args).output();
+        let out = out.unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        (out.status.success(), text(&out.stdout), text(&out.stderr))
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    for bad in [&["cave1", "--lighting", "Nothing Kept"][..], &["cave1", "--seed", "3"]] {
+        let (ok, _, err) = run(bad);
+        assert!(!ok, "{bad:?}: {err}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "a refusal changes nothing");
+    let (ok, out, err) = run(&["cave1", "--lighting", "Damp Crypt", "--dry-run"]);
+    assert!(ok && out.contains("cave1\tlighting\t") && !out.contains("lights of"), "{out}{err}");
+    let (ok, _, err) = run(&["cave1", "--tile-lights"]);
+    assert!(!ok, "--tile-lights without --lighting: {err}");
+    let lighting = ["cave1", "--lighting", "Damp Crypt", "--tile-lights", "--seed", "1"];
+    let (ok, out, err) = run(&[&lighting[..], &["--set", "SunFogAmount=5"]].concat());
+    assert!(ok, "{err}");
+    assert!(out.contains("cave1\tlighting\t(none) -> Damp Crypt"), "{out}");
+    assert!(out.contains("cave1\tlights of 3 tiles\ttheir own -> Damp Crypt's"), "{out}");
+    let are = Module::open(&path).unwrap().gff(&are_key).unwrap().unwrap().root;
+    assert_eq!(are.integer("MoonFogColor"), Some(657930));
+    assert_eq!(are.integer("SunFogAmount"), Some(5), "--set after the lighting");
+    for t in are.list("Tile_List").unwrap() {
+        assert!(matches!(t.integer("Tile_MainLight1"), Some(27 | 4)), "{t:?}");
+        assert_eq!(t.integer("Tile_SrcLight1"), Some(2));
+        assert_eq!(t.integer("Tile_SrcLight2"), Some(2));
+    }
+    // By its file, anywhere.
+    let file = kept.join("Damp Crypt.lighting.json");
+    let (ok, out, err) = run(&["inn", "--lighting", file.to_str().unwrap(), "--dry-run"]);
+    assert!(ok && out.contains("inn\tlighting\t(none) -> "), "{out}{err}");
 }
 
 /// A `.mod` named to `mg` with its module folder beside it (Aurora's
@@ -436,4 +532,57 @@ fn a_mod_s_folder_beside_it_is_said() {
     let (ok, json, _) = run(&["--json", "areas", p]);
     let json: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(ok && json["notes"].to_string().contains("has its module folder beside it"), "{json}");
+}
+
+/// The areas as the module tree has them: every ARE, the one the module's
+/// area list (`Mod_Area_list`) leaves out said (the game doesn't load it:
+/// `engine_area_list.rs`), and names as lists show them: one in French
+/// alone by its French, one of a talk-table string by the string.
+#[test]
+fn areas_its_list_leaves_out_are_said_and_names_shown_as_the_tree_shows_them() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("mg-areas-unlisted");
+    let path = dir.join("caves.mod");
+    module(&path);
+    let mut m = Module::open(&path).unwrap();
+    let mut info = m.info().unwrap();
+    let listed = ["cave1", "inn"].map(|a| {
+        let mut s = Struct::new(6);
+        s.set("Area_Name", Value::resref(ResRef::from_str(a).unwrap()));
+        s
+    });
+    info.root.set("Mod_Area_list", Value::List(listed.to_vec()));
+    m.set_info(&info).unwrap();
+    let mut french = LocString::default();
+    french.set(Language::FRENCH, Gender::Male, b"Auberge de la Pomme".to_vec());
+    let strref = mg_core::StrRef(5);
+    for (area, name) in [("inn", french), ("cave2", LocString::from_strref(strref))] {
+        let mut are = m.gff(&key(area, ResType::ARE)).unwrap().unwrap();
+        are.root.set("Name", Value::LocString(name));
+        m.set_gff(key(area, ResType::ARE), &are).unwrap();
+    }
+    m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let tlk = mg_tlk::Tlk::read(&std::fs::read(root.join("lang/en/data/dialog.tlk")).unwrap());
+    let said = tlk.unwrap().text(strref).unwrap();
+    assert!(!said.is_empty());
+
+    let out = crate::mg_on(&root, None).args(["--json", "areas"]).arg(&path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let areas = json["areas"].as_array().unwrap();
+    let of = |r: &str| areas.iter().find(|a| a["resref"] == r).unwrap().clone();
+    assert_eq!(
+        (of("cave1")["listed"].clone(), of("cave2")["listed"].clone()),
+        (true.into(), false.into())
+    );
+    assert_eq!(of("inn")["name"], "Auberge de la Pomme");
+    assert_eq!(of("cave2")["name"], said.as_str());
+    let notes = json["notes"].to_string();
+    assert!(notes.contains("area cave2 is not in the module's area list"), "{notes}");
+    assert!(!notes.contains("area cave1 is not"), "{notes}");
+
+    let out = crate::mg_on(&root, None).args(["--json", "info"]).arg(&path).output().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["unlisted_areas"], serde_json::json!(["cave2"]), "{json}");
+    assert_eq!(json["areas"], serde_json::json!(["cave1", "inn"]), "{json}");
 }

@@ -3,7 +3,7 @@ type: Manual Page
 title: The main window
 description: The main window - menus, keyboard shortcuts, the module tree, tabs and windows, the palette, the resource browser, the model viewer, the log, and screen readers and desktop agents.
 tags: [manual, window, shortcuts]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T10:53:37Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-29T21:07:10Z }
 ---
 
 # The main window
@@ -19,19 +19,21 @@ The toolbar's buttons (New, Open, Save, Undo, Redo, Properties, New
 Area, Start, Resources, Palettes, Preview, Compile, Verify) each show an
 icon and a word. To save room, **Tools › Options › General › Toolbar
 buttons: Icons only** shows the icons alone, as Aurora's toolbar does
-(the area view's toolbar too): rest the pointer on one and its tip names
-it, with its key.
+(the area view's and the editors' toolbars too): rest the pointer on one
+and its tip names it, with its key. Each icon is one command's: ℹ is
+Module Properties, the area view's Area Properties is 🔧, and 🏃 Start
+is the area view's Go to Start Location too (the same command).
 
 ## Menus
 
 | Menu | Commands |
 | --- | --- |
 | File | New Module…, Open Module…, Open Folder…, Recent Modules, Save, Save As…, Save As nasher Project…, Project ([the project's commands](03-modules.md#the-projects-commands): its update and submit), Import…, Export…, Import Conversation…, Close, Exit |
-| Edit | Undo, Redo (each names the module's step it takes; with the keyboard in a script's editor they are the script's own and say plain Undo and Redo: see [Scripts](07-scripts.md)), Module Properties, Builder Code… ([your code](03-modules.md#your-builder-code), for a module folder or a nasher project), Resize Area…, Rotate Area…, Find Instance…, Prefabs, Edit Areas Together…, Find and Replace Text…, Find References…, Advanced Search…, Convert Indentation to Tabs, Convert Indentation to Spaces (the script in front: see [Scripts](07-scripts.md)) |
+| Edit | Undo, Redo (each names the module's step it takes, or, from a hak's or a 2DA's editor, that editor's: see Undo and redo under [Tabs and windows](#tabs-and-windows); with the keyboard in a script's editor they are the script's own and say plain Undo and Redo: see [Scripts](07-scripts.md)), Module Properties, Builder Code… ([your code](03-modules.md#your-builder-code), for a module folder or a nasher project), Claims Table… ([whose each area is](03-modules.md#claimed-areas), in a project that keeps claims), Resize Area…, Rotate Area…, Find Instance…, Prefabs, Edit Areas Together…, Find and Replace Text…, Find References…, Advanced Search…, Convert Indentation to Tabs, Convert Indentation to Spaces (the script in front: see [Scripts](07-scripts.md)) |
 | View | Module Tree, Palettes Panel, Log (each ticked while shown), Copy Log, Save Log…, Clear Log, Hide All Panels, Reset Layout |
 | Wizards | Area Wizard…, Creature Wizard…, and a wizard for each other blueprint type (Door, Encounter, Item, Placeable, Sound, Store, Trigger, Waypoint) |
 | Tools | New Conversation…, Faction Editor, Journal Editor, Talk Table, 2DA File…, New Script…, Palettes, Appearance Gallery…, Resource Browser, Tilesets (New Tileset…, Open Tileset…), Haks (New Hak, Open Hak…, Build Hak from Folder…), Reload Resources, Options… |
-| Build | Compile All Scripts, Compile Models, Build Module…, Publish to NWSync…, Verify Module, Test Module, Test Module, Choose Character, Pack *file* (nasher projects), Area Statistics |
+| Build | Compile All Scripts, Compile Models, Build Module…, Publish to NWSync…, Verify Module, Round-Trip Check, Test Module, Test Module, Choose Character, Pack *file* (nasher projects), Area Statistics |
 | Plugins | the commands of the plugins you have enabled, Manage Plugins…, Install Plugin from File… ([Plugins](15-plugins.md)) |
 | Help | User Manual, Command Palette…, Check for Updates…, About Moonglow Toolset |
 
@@ -46,7 +48,9 @@ Escape closes the submenu the keys are in, else the menus. With a menu
 open, the pointer over another menu's name opens that one. Alt and a
 menu's first letter (underlined: Alt+F for File, Alt+V for View) opens
 that menu, and with a menu open a letter goes to the next row that
-begins with it.
+begins with it. A command given Alt and a menu's letter in Options ›
+Keyboard has that key instead of the menu; AltGr and a letter (another
+layout's character) opens none.
 
 **Help › Command Palette…** (Ctrl+Shift+P) finds a command by its name:
 type part of it (or of its menu's name), choose with the arrow keys, and
@@ -97,11 +101,13 @@ changes them; the menus show the current keys.
 | Ctrl+Alt+C | Creature Wizard |
 | Ctrl+Alt+I | Item Wizard |
 | F11 | Full screen |
+| Alt+X | Exit (File › Exit, Aurora's key) |
 | Ctrl+W, Ctrl+F4 | Close the tab in front |
 | Ctrl+Tab, Ctrl+Page Down | Next tab |
 | Ctrl+Shift+Tab, Ctrl+Page Up | Previous tab |
 | Ctrl+Shift+T | Reopen the tab closed last |
-| F6, Shift+F6 | The arrow keys to the next pane (the module tree, the middle, the palettes), or the one before |
+| Ctrl+Shift+M | Maximize the window of the tab in front, or put it back |
+| F6, Shift+F6 | The arrow keys to the next pane (the module tree, the middle, the palettes, the log), or the one before: to what the pane's tab in front has (in the middle a talk table's lines, a 2DA's cells, at its first cell if none is selected, the resource browser's list, else an area's view; a palette at its first row). In the log (also after a click in it) they scroll it: Up and Down a line, Page Up and Page Down a page, Home and End to its start and end; Escape hands them back |
 | Ctrl+Alt+1, Ctrl+Alt+2, Ctrl+Alt+3 | Show or fold away the module tree, the palettes, the log |
 | Ctrl+Alt+0 | Hide all three, or show them all |
 | Ctrl+Shift+P | Command Palette |
@@ -156,7 +162,7 @@ Placeables, Sounds, Stores, Triggers, Waypoints) and the journal and factions;
 rows with every word typed in their name or ResRef, in any order, case
 and accents aside (`arbol` finds `Árbol`, `sword iron` finds `Iron
 Sword`, as every Filter and Find field of names does: the palettes', the
-resource browser's, a list's; × clears it); it and Expand All / Collapse All stay in sight
+resource browser's, a list's, a wizard's; × clears it); it and Expand All / Collapse All stay in sight
 while the tree scrolls, and Home and End go to the tree's top and bottom
 with the pointer over it. A name too long for the pane goes on past
 its edge, and the tree scrolls sideways to it (Shift and the mouse
@@ -165,11 +171,22 @@ wheel, or the scroll bar under it), as Aurora's does.
 Resources are listed by their ResRefs, as in Aurora. With **Tools ›
 Options › General › List areas and blueprints by name**, areas and
 blueprints are listed by their names instead (in the names' order,
-case and accents aside, so `Árboles` stands beside `arboles`; one
-without a name keeps its ResRef), areas' tabs are titled by name, the
+case and accents aside, so `Árboles` stands beside `arboles`, as
+polytonic Greek's `Ἀθῆναι` beside `Αθηναι` and Russian's `ёлка` beside
+`елка`; one without a name keeps its ResRef), areas' tabs are titled by name, the
 filter finds either, and the ResRef shows when the pointer rests on one.
 **Show ResRefs beside names** adds it in parentheses, `Name (resref)`,
 there and in the palettes: for telling apart resources of one name.
+A name is shown in the language you edit (**Options › Language**), else
+as the game shows it (its talk-table string), else in another language,
+English first; `mg areas` and `mg find` name them the same way.
+
+**An area the module's area list leaves out** (an ARE the module holds
+that its `Mod_Area_list` doesn't name, as a copy made outside the toolset
+can be) is marked *(not in the area list)*: the game loads only the
+areas the list names, so nothing in the game reaches it. Its right-click
+menu's **Add to the Module's Area List** lists it (one Undo takes it
+away again); `mg areas` and `mg info` say the same of it.
 
 **What is placed in an area:** the arrow before an area opens it out to
 its objects, kind by kind as Aurora lists them (Creatures, Doors,
@@ -204,8 +221,12 @@ A double click on a script opens its editor (and, with **Tools › Options
 too).
 
 **Expand All** and **Collapse All** (⏷ and ⏶, under the Filter, as
-in the Palettes pane) open and close every group at once; beside them is
-how many resources the module has. The Filter says what it looks in,
+in the Palettes pane) open and close every group at once; with the keys
+in the tree (or a palette), **Ctrl+Shift+Right** and **Ctrl+Shift+Left**
+do the same (Options › Keyboard, under Module Tree and Palettes). Collapse All
+also closes every area opened out to its objects, and the kinds under
+it; Expand All leaves them closed (an area's objects can be hundreds of
+rows). Beside them is how many resources the module has. The Filter says what it looks in,
 and has a × to clear it.
 
 A double click opens a resource in its editor. A blueprint dragged onto an
@@ -222,8 +243,9 @@ clicked before to it, as listed; they are marked. A right click on one
 of them offers what is done to them all: **Edit N Together** (blueprints
 of one kind, or areas: one Properties window, what you change set on
 each), **Export…**, **Export as Files…**, **Copy to Scratch Folder**,
-for areas **Make Placeables Static** and **Dynamic**, and the plugins'
-commands for them. A click alone chooses one row again.
+**Delete…** (and the Delete key on one of them), for areas **Make
+Placeables Static** and **Dynamic**, and the plugins' commands for them.
+A click alone chooses one row again.
 
 **Copy…** makes a copy in the module under a ResRef you give (a free one
 is offered), and for a blueprint or an area a Tag. An area is copied with
@@ -238,7 +260,15 @@ scripts. A script that goes whose editor holds unsaved text is named
 when it asks: the text goes as typed, and Undo brings it back so. The
 area the module's start location is in can't be deleted: set the start
 location in another area first. Nothing
-that names what is deleted is changed (check **Find References** first).
+that names what is deleted is changed, and the window says what does,
+before you answer: the places that name it (a creature's OnSpawn, a
+door's conversation, an object placed from a blueprint, the module's
+events), strings in scripts that spell its name, and for an area the
+doors and triggers of other areas that lead to its objects (by a tag no
+other area's object has); **Find References** there opens the whole
+list. Of several chosen, the window lists them and deletes them as one
+step; the start area, and a protected area of a project (delete it
+alone, to be asked), stay out of it, said so.
 
 A right click on a group (Areas, Scripts, Creatures…) or on one of its
 resources offers **New …**: the group's wizard, or the New Script or New
@@ -248,9 +278,20 @@ The raw fields view lists every field of a resource, each editable. A
 number that is a row of one of the game's tables is shown with the row's
 name beside it, in a list to choose another by name: an area's music and
 ambient sounds, a creature's race, classes, feats and spells, an item's
-base item and properties, an object's appearance, a trap's type, a loading
-screen. A creature's skills are named in their list, and a talk-table
-string's text is shown beside its number.
+base item and properties, an item property's subtype, cost table, value,
+parameter and its value (each of the table the property's other fields
+name: Ability Bonus, Strength, +2), an object's appearance, a trap's type,
+a loading screen, the base items a store buys or won't. So is an object's
+faction (by the module's own factions), and a conversation line's
+animation (as the Other Actions page lists them). A creature's skills
+and a store's pages are named in their lists, and a talk-table string's
+text is shown beside its number, a palette's `STRREF` too. An object's faction of 0 (a
+blueprint's, or one an area places) is marked as the PC faction, the
+players' alone, which Verify warns of (a trigger's, no). From a
+terminal, `mg gff --names` names them the same way (a faction with
+`--module`), and `mg find
+--where` and `mg areas --set` take a row's label or name in place of its
+number.
 
 **The panes beside the middle** (the module tree on the left, the
 palettes on the right, the log below) fold away to give the area's view
@@ -307,15 +348,21 @@ and Journal Editors, the resource browser, this manual) opens in a window
 of its own over the area, sized for what it shows, so the area view stays
 put. Drag a window by its tab into the main pane, or beside another, to
 dock it; drag a tab out to float it again. The palettes keep their pane on
-the right. **Escape** closes the window in front: a dialog (as its Cancel
-or close button does), then a Properties window as its **Cancel** does,
+the right. A dialog (a question, a picker such as Select Portrait, a
+wizard) opens in the middle of the main window and is moved by its
+title. **Escape** closes the window in front: a dialog (as its Cancel
+or close button does; a picker opened from a Properties window closes
+alone, and the window stays), then a Properties window as its **Cancel** does,
 as in Aurora: what was changed in it is set back (Tile Properties with
 changes asks first, as its close button does); a model's window while the
 pointer is over it. In a text or number field too, Escape is the
 window's Cancel at once, as in Aurora (what was typed there is set back
-with the rest); in a search field (an inventory's or a list's Find, the
-Options' Find a Command) it clears what is typed, then leaves the field,
-and the next Escape is the window's. With something in hand in the area (a blueprint to place, a paste, a
+with the rest); in a search field of a Properties window (an inventory's
+or a list's Find) it clears what is typed, then leaves the field, and
+the next Escape is the window's. In a dialog's search field (Open
+Script's name, a wizard's Find, Open 2DA, the Area chooser, the Command
+Palette, a long dropdown's Filter) Escape clears what is typed, and the
+next Escape closes the dialog (or the list). With something in hand in the area (a blueprint to place, a paste, a
 terrain brush) and the pointer over the area, Escape lets go of that and
 leaves the window open. Right-click a tab for **Eject** and **Close**,
 for **Close Others**, **Close Tabs to the Right** and **Close All** (the
@@ -362,10 +409,17 @@ click: the panes beside it keep their widths.
 
 A window opens as large as one of its kind was last left: resize a
 conversation's window, and the next conversation opens at that size (each
-kind of editor has its own). **Double-click a window's tab** to maximize
+kind of editor has its own, and each type of blueprint: a waypoint's
+Properties opens at the size the last waypoint's was left, not an
+encounter's), and a size dragged at its edge or corner is kept so.
+**Double-click a window's tab** (or the bar beside it) to maximize
 it over the whole of Moonglow's window under the toolbar, and again to
 put it back; **Maximize** and
-**Restore** are on the tab's right-click menu too. **The module tree
+**Restore** are on the tab's right-click menu too, and the button at the
+right of the window's bar, before its ✕, does it and shows which it is:
+🗖 Maximize, 🗗 Restore. **Ctrl+Shift+M** (Maximize Window in Options ›
+Keyboard) does it for the window of the tab in front. A maximized
+window stays over the whole of Moonglow's window as that is resized. **The module tree
 follows the tab chosen**: a tab clicked, reached by the keys (Ctrl+Tab,
 Ctrl+Page Down, Ctrl and a digit) or opened (from the tree, a script
 field's Edit, Find References…) marks its resource's row in the tree as
@@ -402,9 +456,10 @@ window to its bar.
 conversations, side editors and tools open when it was closed, in the
 same panes and windows (split as they were, where they were moved to),
 each pane's tab in front in front, and each view as it was left: an
-area's camera, a script's scroll and cursor, a conversation's selected
-line, bookmarks and folded branches, a Properties window's page
-(Options › General; see [Modules](03-modules.md)).
+area's camera, a script's scroll, cursor and bookmarks, a
+conversation's selected line, bookmarks and folded branches, the talk
+table's line, a Properties window's page (Options › General; see
+[Modules](03-modules.md)).
 
 Closing a tab or window never loses work: every change is part of the
 module (and undoable) the moment you make it. **Save** writes the module.
@@ -415,10 +470,18 @@ The editors of files of their own (a hak, a 2DA, a tileset, the talk
 table) keep their own steps: Undo and Redo, by their keys (Ctrl+Z,
 Ctrl+Y and Ctrl+Shift+Z, or those set in Options › Keyboard), are that
 editor's with the pointer over it (and a 2DA's while the keys are in
-its grid), and never the module's last change there. A script's editor
+its grid), and never the module's last change there. So are Edit ›
+Undo and Redo and the toolbar's, the pointer gone from the editor
+straight to them: they name the step where the editor names its steps
+("Undo Add files" over a hak's, "Undo Empty 1 cell" over a 2DA's; a
+tileset's and the talk table's say plain Undo). A text field in one of
+these editors (its Find field) takes back its own typing once you have
+typed in it; clicked into and not typed in, it has nothing of its own,
+and Undo is the editor's, as a field elsewhere leaves Undo to the
+module's. A script's editor
 keeps its own steps of its text: while it has the keyboard, Ctrl+Z and
-Ctrl+Y, Edit › Undo and Redo and the toolbar's are all the script's
-(see [Scripts](07-scripts.md)).
+Ctrl+Y, the keys set in Options › Keyboard, Edit › Undo and Redo and
+the toolbar's are all the script's (see [Scripts](07-scripts.md)).
 
 **Colors.** A color's swatch (an area's lighting, a light, a NUI color,
 the Options' colors) opens a picker. Its 📋 copies the color's values
@@ -434,7 +497,11 @@ row of icons at its top),
 **Standard** (the game's blueprints) or **Custom** (the module's), and a
 blueprint from the categories. Click in an area to place the chosen
 blueprint (see [Areas](04-areas.md)). With an area's terrain mode on, the
-palette shows the tileset's brushes instead. **Preview** (toolbar) shows
+palette shows the tileset's brushes instead. The row's last three are
+**Prefabs**, **Lights** (☀: the game's invisible lights, one chosen and
+then put where an area is clicked) and **Start Location** (where a
+player's character enters the module: chosen, a click in an area puts
+it there). **Preview** (toolbar) shows
 the chosen blueprint in a window of its own. After a click in it, the
 arrow keys move through its rows and open and close its categories (see
 [Blueprints](05-blueprints.md)).
@@ -460,10 +527,14 @@ the game reads, and under it, set in and dimmed, each copy that copy
 overrides: "hak:low, overridden by hak:top". Open one of those to view
 it as its layer has it (a 2DA from that copy down, with the layers below
 it), copy it into the module or save it (**Save As…**, also on its
-right-click menu); for a table in one of your own haks, **Edit in
+right-click menu), or see a model or blueprint of it in the 3D viewer
+(**Preview** on its right-click menu: that copy, drawn with the rest of
+the load order as the game reads it; the viewer's Export Files… is left
+out there, as what it gathers is the game's); for a table in one of your own haks, **Edit in
 name.hak** opens it there. With **Overridden copies** (at the top) unticked, it lists
 the copy the game reads alone. **Export N as Files…** writes the copies
-the game reads, not those they override. `mg which NAME.EXT --module
+the game reads into the folder chosen, and each overridden copy listed
+into a folder of its layer's under it (`hak_low/portraits.2da`). `mg which NAME.EXT --module
 MODULE` says the same on the command line.
 
 Its **Name** field has the side panes' keys: Ctrl+F, with the pointer
@@ -474,7 +545,27 @@ gives the list the keys too. The **Find** fields of the hak editor, the
 tileset editor, the 2DA editor and the Appearance Gallery take Ctrl+F
 and Escape the same way, with the pointer over them. Ctrl+F is
 **Find** in **Options › Keyboard** (under Script Editor): the keys given to it there go to
-every search field.
+every search field (the wizards', Open Script's, Open 2DA's and the
+Area chooser's with the pointer over their window; not the script
+editor's side lists, where they are the script's Find).
+
+Every search field finds a row with every word typed, in any order,
+in any one of the row's fields; what those are differs by list:
+
+| List | Looks in |
+|---|---|
+| The module tree | a resource's name and ResRef; a placed object's name and tag |
+| The palettes, the item picker | name, ResRef and tag (with nothing that has every word, the palettes show close matches: letters in order) |
+| Find Instance | the tag and the blueprint, each field its own words |
+| The resource browser, the hak editor, Transfer | the ResRef or the file name |
+| The tileset editor | the model and its terrains |
+| A 2DA | every cell, and a cell's value by its name |
+| The Area chooser | ResRef and name (not the tag) |
+
+Down leaves the field for its list where the list has keys of its own
+(the module tree, the palettes, the resource browser; in Open Script
+and the Command Palette, Up and Down choose while you type); elsewhere
+Down is the field's.
 
 A 2DA shows the copy the game reads, read-only, with its StrRef columns
 (Name, Description, StrRef and the like) as their text; **StrRefs as
@@ -500,8 +591,12 @@ Models open in the model viewer from the resource browser, and blueprints
 the module tree, a blueprint's window; a placed object, as it is placed,
 from its right-click menu in the area or the module tree, or its
 Properties. Drag to turn
-the model (right or middle button to move it), use the wheel to zoom, and
-play its animations, including those from its supermodels. **Lights**
+the model (right or middle button to move it), use the wheel to zoom
+(finer with Shift or Ctrl held, or pinch on a touchpad; a sideways
+scroll moves it left and right, as in the area view), and play its
+animations, including those from its supermodels. An item modeled lying
+(a sword, an axe) is stood on its end, its broad side to you: a blade
+shows its flat, not its edge. **Lights**
 lights it with its own light nodes. **Shaders** draws it with the game's
 own shaders, a material's custom ones among them (wind-swayed leaves move
 while the viewer plays): the same switch as the area view's toolbar

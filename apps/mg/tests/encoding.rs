@@ -20,13 +20,7 @@ fn guard(module: &Path) -> Struct {
 }
 
 fn mg(root: &Path, user: Option<&Path>, args: &[&str]) -> (bool, Json) {
-    let mut c = crate::mg();
-    c.args(["--json", "--root", root.to_str().unwrap()]);
-    match user {
-        Some(u) => c.args(["--user-dir", u.to_str().unwrap()]),
-        None => c.arg("--no-user-dir"),
-    };
-    let out = c.args(args).output().unwrap();
+    let out = crate::mg_on(root, user).arg("--json").args(args).output().unwrap();
     let json = serde_json::from_slice(&out.stdout).unwrap_or(Json::Null);
     (out.status.success(), json)
 }
@@ -84,6 +78,35 @@ fn a_module_s_encoding_table_is_the_text_of_its_commands() {
     let first = guard(&path).locstring("FirstName").unwrap().clone();
     assert_eq!(first.get(Language::ENGLISH, Gender::Male).unwrap(), b"Ya\xf0");
 
+    // A lone file of the module's by its table, given the module: as JSON
+    // and back.
+    let lone = dir.join("guard.utc");
+    let bytes = Module::open(&path).unwrap().get(&key("guard.utc")).unwrap().to_vec();
+    std::fs::write(&lone, &bytes).unwrap();
+    let lone_path = lone.to_str().unwrap();
+    let (ok, json) = mg(&root, Some(&user), &["gff", lone_path, "--module", module]);
+    assert!(ok, "{json}");
+    assert!(json.to_string().contains("Yağ"), "{json}");
+    let (ok, json) = mg(&root, Some(&user), &["gff", lone_path]);
+    assert!(ok && json.to_string().contains("Yað"), "without the module: {json}");
+    let (text, back) = (dir.join("guard.utc.json"), dir.join("back.utc"));
+    let (text, back) = (text.to_str().unwrap(), back.to_str().unwrap());
+    let (ok, _) = mg(&root, Some(&user), &["gff", lone_path, "--module", module, "-o", text]);
+    assert!(ok);
+    let (ok, _) = mg(&root, Some(&user), &["gff", text, "--module", module, "-o", back]);
+    assert!(ok);
+    assert_eq!(std::fs::read(back).unwrap(), bytes, "the same bytes back");
+
+    // Its name published to NWSync in the table's letters.
+    let repository = dir.join("nwsync");
+    let (ok, made) =
+        mg(&root, Some(&user), &["nwsync", module, repository.to_str().unwrap(), "--with-module"]);
+    assert!(ok, "{made}");
+    let sha = made["sha1"].as_str().unwrap();
+    let manifest = std::fs::read(repository.join(format!("manifests/{sha}.json"))).unwrap();
+    let manifest: Json = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(manifest["module_name"], "Yağ Evi", "{manifest}");
+
     // Without it (the hak not found): Windows-1252, as ever.
     let (ok, info) = mg(&root, None, &["info", module]);
     assert!(ok);
@@ -93,4 +116,51 @@ fn a_module_s_encoding_table_is_the_text_of_its_commands() {
     let (ok, _) = mg(&root, None, &["set", module, "guard.utc", "Tag=ð"]);
     assert!(ok);
     assert_eq!(guard(&path).string("Tag").unwrap(), b"\xf0");
+
+    // A talk table for the module, through `--module`: its text written
+    // and read by the table; without, as Windows-1252.
+    let (tlk, csv) = (dir.join("turkish.tlk"), dir.join("lines.csv"));
+    std::fs::write(&csv, "StrRef,Text\n16777216,Dağ\n").unwrap();
+    let (t, c) = (tlk.to_str().unwrap(), csv.to_str().unwrap());
+    let (ok, r) = mg(&root, Some(&user), &["tlk-import", t, c, "--module", module]);
+    assert!(ok, "{r}");
+    let read = mg_tlk::Tlk::read(&std::fs::read(&tlk).unwrap()).unwrap();
+    assert_eq!(read.entries[0].text, b"Da\xf0");
+    let out = dir.join("out.csv");
+    let o = out.to_str().unwrap();
+    assert!(mg(&root, Some(&user), &["tlk-export", t, o, "--module", module]).0);
+    assert!(std::fs::read_to_string(&out).unwrap().contains("16777216,Dağ,"));
+    assert!(mg(&root, Some(&user), &["tlk-export", t, o]).0);
+    assert!(std::fs::read_to_string(&out).unwrap().contains("16777216,Dað,"));
+}
+
+/// The lines `mg refs` shows of a module's scripts are read in the
+/// codepage the game client reads them in (GitHub issue 27): a Polish
+/// game's (its settings.tml's language) Windows-1250, where 0xB9 is "ą";
+/// Windows-1252 without one. The scripts' bytes are never changed.
+#[test]
+fn mg_refs_reads_a_script_s_line_in_the_game_s_codepage() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("mg-refs-codepage");
+    let user = dir.join("user");
+    std::fs::create_dir_all(&user).unwrap();
+    let settings = "[game]\n\t[game.language]\n\t\tcodepage = \"\"\n\t\toverride = \"pl\"\n";
+    std::fs::write(user.join("settings.tml"), settings).unwrap();
+    let mut m = Module::new();
+    m.set_info(&Gff::new(*b"IFO ")).unwrap();
+    let source = b"void main() { SpeakString(\"Id\xb9\"); ExecuteScript(\"next_one\"); }\n";
+    m.set(key("polish.nss"), source.to_vec());
+    let path = dir.join("polish.mod");
+    m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let module = path.to_str().unwrap();
+    let line = |user: Option<&Path>| {
+        let (ok, refs) = mg(&root, user, &["refs", module, "next_one.nss"]);
+        assert!(ok, "{refs}");
+        refs["script_strings"][0]["text"].as_str().unwrap_or_default().to_string()
+    };
+    let polish = "void main() { SpeakString(\"Idą\"); ExecuteScript(\"next_one\"); }";
+    assert_eq!(line(Some(&user)), polish);
+    let western = "void main() { SpeakString(\"Id¹\"); ExecuteScript(\"next_one\"); }";
+    assert_eq!(line(None), western);
+    assert_eq!(Module::open(&path).unwrap().get(&key("polish.nss")), Some(&source[..]));
 }

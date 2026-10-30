@@ -53,7 +53,7 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
         f.locstring(ui, "Name", "LocalizedName");
         ui.end_row();
         crate::widgets::field_label(ui, "Tag");
-        f.text(ui, "Tag", "Tag", 32);
+        f.tag(ui, "Tag", "Tag");
         ui.end_row();
         crate::widgets::field_label(ui, "Trigger Type");
         f.choice(ui, "Trigger type", "Type", &types, FieldType::Int);
@@ -94,7 +94,7 @@ fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
         situated::portrait(f, ui);
         ui.end_row();
         crate::widgets::field_label(ui, "Highlight Height");
-        f.spin_float(ui, "Highlight height", "HighlightHeight", 0.0..=100.0, 0.1, 1.0);
+        f.spin_float(ui, "Highlight height", "HighlightHeight", 0.0..=10.0, 0.1, 1.0);
         ui.end_row();
         crate::widgets::field_label(ui, "Variables");
         f.variables(ui);

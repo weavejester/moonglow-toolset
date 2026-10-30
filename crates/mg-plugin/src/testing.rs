@@ -477,7 +477,7 @@ impl Fixture {
         let haks = module.haks().unwrap_or_default();
         if let Some(folder) = folder {
             for name in &haks {
-                let path = folder.join("hak").join(format!("{name}.hak"));
+                let path = folder.join("hak").join(mg_resman::named_file(name, "hak"));
                 if !path.is_file() {
                     continue;
                 }
@@ -513,14 +513,14 @@ impl Fixture {
                 DirContainer::open(folder),
             );
         }
-        if let Some(name) = module.custom_tlk().ok().flatten()
-            && let Some(found) =
-                mg_module::talk::find_any(&module, &g.resman, &[], &name, Some(g.language))
-        {
-            match found.tlk() {
-                Ok(tlk) => g.set_custom_tlk(Some(tlk)),
-                Err(e) => notes.push(format!("the module's talk table {e}")),
+        // (No user's tlk folder: a fixture's table is its own.)
+        let found = mg_module::talk::of_module(&module, &g.resman, &[], Some(g.language));
+        match found.read() {
+            (_, Some(tlk)) => g.set_custom_tlk(Some(tlk)),
+            (mg_module::talk::Custom::Unreadable { error, .. }, None) => {
+                notes.push(format!("the module's talk table {error}"))
             }
+            _ => {}
         }
         // (With a game, `mg` says which it did not find.)
         let lacked: Vec<&str> = (haks.iter())
@@ -766,6 +766,9 @@ fn held(
     let mut selection = Selection::default();
     for s in &t.select {
         match Selected::parse(s) {
+            Ok(Selected::Copy { .. }) => {
+                return vec![format!("select: {s}: a layer's copy is only `open`")];
+            }
             Ok(s) => selection.selected.push(s),
             Err(e) => return vec![format!("select: {e}")],
         }
@@ -1026,7 +1029,7 @@ fn uncounted(b: &Builtins, fixture: &Fixture, from: &GameFrom) -> Option<(String
 /// the fixes Verify offers. A talk table the test's game data has not is
 /// not counted (none of its strings is said to be missing).
 fn run_builtin(b: &Builtins, module: &Module, fixture: &Fixture) -> Vec<Found> {
-    use mg_module::doctor::{Group, TalkTables, Timings, examine_groups};
+    use mg_module::doctor::{Check, Group, Skip, TalkTables, Timings, examine_groups};
     let g = &fixture.data;
     let custom = match g.custom_tlk() {
         Some(t) => Some(t.entries.len()),
@@ -1036,12 +1039,12 @@ fn run_builtin(b: &Builtins, module: &Module, fixture: &Fixture) -> Vec<Found> {
         None => None,
     };
     let tlk = TalkTables { base: if fixture.talk { g.tlk().entries.len() } else { 0 }, custom };
-    // (Only their groups' checks run: the others are most of a Verify's
-    // time.)
-    let skip: Vec<Group> =
-        (Group::ALL.into_iter()).filter(|g| !b.checks.iter().any(|c| c.group() == *g)).collect();
+    // (Only these checks run: the others are most of a Verify's time.)
+    let others = (Check::ALL.into_iter()).filter(|c| !b.checks.contains(c)).map(Check::id);
+    let skip = Skip::parse(&others.chain([Group::Plugins.id()]).collect::<Vec<_>>())
+        .expect("the checks' ids");
     let findings: Vec<mg_module::doctor::Finding> =
-        examine_groups(module, &g.resman, tlk, &skip, &mut Timings::default())
+        examine_groups(module, &g.resman, tlk, &skip, &mut Timings::default(), None)
             .into_iter()
             .filter(|f| b.checks.iter().any(|c| f.check == c.id()))
             .collect();

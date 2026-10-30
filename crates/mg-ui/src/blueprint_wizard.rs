@@ -250,14 +250,22 @@ impl BlueprintWizard {
 }
 
 /// The type's palette categories, as Aurora's wizards list them: by name,
-/// without the empty "assign" branch.
+/// those of the custom palette, without the skeleton's nodes of `TYPE` 0
+/// and 1 (the empty "assign" branch, and the creatures' Familiars and
+/// Summoned Monsters: Aurora's Creature Wizard offers Monsters, NPCs,
+/// Special and Tutorial, captured 2026-10-30).
 pub(crate) fn categories(game: &GameData, kind: BlueprintKind) -> Vec<PaletteNode> {
     let skeleton = game
         .resman
         .get_named(&format!("{}pal", kind.name()), ResType::ITP)
         .ok()
         .and_then(|d| mg_gff::Gff::read(&d).ok())
-        .map(|g| Palette::read(&g))
+        .map(|mut g| {
+            if let Some(main) = g.root.list_mut("MAIN") {
+                main.retain(|n| !matches!(n.integer("TYPE"), Some(0 | 1)));
+            }
+            Palette::read(&g)
+        })
         .unwrap_or_default();
     fn sorted(nodes: &[PaletteNode], game: &GameData) -> Vec<PaletteNode> {
         let mut out: Vec<PaletteNode> = nodes
@@ -362,7 +370,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     let mut close = false;
     let mut finish = false;
     let title = format!("{} Wizard", w.kind.label().trim_end_matches('s'));
-    crate::widgets::window(&title).show(&ctx, |ui| {
+    crate::widgets::modal(&ctx, &title).show(&ctx, |ui| {
         ui.set_min_width(420.0);
         let key_taken = |app: &Moonglow, r: &ResRef| {
             app.ws.as_ref().is_some_and(|ws| ws.module.contains(&ResKey::new(*r, w.kind.restype())))
@@ -388,15 +396,12 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                     ui.text_edit_singleline(&mut w.name);
                     ui.end_row();
                     crate::widgets::field_label(ui, "Appearance");
-                    let looks = app
-                        .game
-                        .as_ref()
-                        .expect("checked")
-                        .choices(
-                            "waypoint",
-                            mg_rules::ChoiceColumns { name: Some("STRREF"), label: Some("LABEL") },
-                        )
-                        .unwrap_or_default();
+                    let looks = crate::widgets::table_choices(
+                        app.game.as_deref(),
+                        "waypoint",
+                        Some("STRREF"),
+                        Some("LABEL"),
+                    );
                     let id = egui::Id::new("wizard-waypoint-look");
                     let current = i64::from(w.appearance);
                     if let Some(row) = crate::widgets::row_choice(id, &looks, current).show(ui) {

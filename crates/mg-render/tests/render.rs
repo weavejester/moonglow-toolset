@@ -7,16 +7,12 @@ use std::sync::Arc;
 use glam::{Mat4, Vec3};
 use mg_mdl::{Face, Mesh, Model, Node, NodeKind};
 use mg_render::{
-    AreaLight, Camera, DEPTH_FORMAT, Gpu, GpuModel, Instance, NoAssets, Renderer, Scene, Targets,
+    AreaLight, Camera, DEPTH_FORMAT, Gpu, GpuModel, Instance, LineCopy, LineShape, NoAssets,
+    Renderer, Scene, Targets,
 };
 
 fn gpu() -> Option<Gpu> {
-    mg_testkit::gpu::hold();
-    let g = Gpu::headless();
-    if g.is_none() {
-        eprintln!("skipped: no GPU adapter");
-    }
-    g
+    mg_testkit::gpu::open(Gpu::headless)
 }
 
 /// A 2×2 quad on the ground, facing up, untextured.
@@ -119,12 +115,7 @@ fn framing(model: &GpuModel) -> Camera {
     let pose = mg_render::rest_pose(&model.model);
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for m in &model.meshes {
-        for corner in 0..8 {
-            let p = Vec3::new(
-                if corner & 1 == 0 { m.min.x } else { m.max.x },
-                if corner & 2 == 0 { m.min.y } else { m.max.y },
-                if corner & 4 == 0 { m.min.z } else { m.max.z },
-            );
+        for p in mg_render::box_corners(m.min, m.max) {
             let w = pose[m.node].transform_point3(p);
             min = min.min(w);
             max = max.max(w);
@@ -474,7 +465,6 @@ impl mg_render::Assets for TestAssets {
         Some(mg_render::LoadedTexture {
             texture: self.textures.get(name)?.clone(),
             txi: self.txis.get(name).cloned().unwrap_or_default(),
-            mtr: None,
         })
     }
 
@@ -938,6 +928,82 @@ fn environment_maps_reflect() {
     }
 }
 
+/// A texture's `envmaptexture default` reflects the object's map where the
+/// object names one, else the area's: on a placeable whose `Reflection`
+/// is `default` (its map `chrome1`, `Instance::env_map_default`), the
+/// area's, as the client draws it (`program_choice_in_the_client` with
+/// `MG_LYING_ENVD=1 MG_REFLECTION=default`); its other meshes reflect
+/// `chrome1`.
+#[test]
+fn a_texture_s_default_map_is_the_area_s_unless_the_object_names_one() {
+    let Some(gpu) = gpu() else { return };
+    let mut assets = TestAssets::default();
+    let txi = |text: &str| mg_image::txi::Txi::parse(text.as_bytes());
+    // Two cube maps, red and blue above (the reflected view points up).
+    for (name, up) in [("area_env", [255, 0, 0]), ("chrome1", [0, 0, 255])] {
+        for i in 0..6 {
+            let c = if i == 4 { up } else { [40, 40, 40] };
+            assets.solid(&format!("{name}{i}"), [c[0], c[1], c[2], 255]);
+        }
+        assets.txis.insert(name.into(), txi("cube 1\nfilerange 6\n"));
+    }
+    assets.solid("mirror_default", [128, 128, 128, 0]);
+    assets.txis.insert("mirror_default".into(), txi("envmaptexture default\n"));
+    assets.solid("plain_clear", [128, 128, 128, 0]);
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.8, 4.0),
+        target: Vec3::ZERO,
+        fov_y: 0.6,
+        near: 0.1,
+        far: 100.0,
+    };
+    let quad_with = |bitmap: &str| {
+        let mut m = quad();
+        let NodeKind::Mesh(mesh) = &mut m.nodes[1].kind else { unreachable!() };
+        mesh.textures[0] = Some(bitmap.into());
+        Arc::new(GpuModel::new(&gpu, Arc::new(m)))
+    };
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    let lit =
+        AreaLight { ambient: Vec3::splat(0.05), diffuse: Vec3::splat(0.05), direction: Vec3::Z };
+    let mut shot = |texture: &str, env: Option<&str>, default: bool| {
+        let inst = Instance {
+            env_map: env.map(str::to_string),
+            env_map_default: default,
+            ..Instance::new(quad_with(texture), Mat4::IDENTITY)
+        };
+        let scene = Scene {
+            instances: vec![inst],
+            area: lit,
+            background: [0.0, 1.0, 0.0],
+            env_map: Some("area_env".into()),
+            ..Default::default()
+        };
+        r.render_image(&gpu, &assets, &scene, &camera, 64, 64).pixel(32, 32)
+    };
+    let red = |p: [u8; 4]| p[0] > p[2] + 8;
+    let blue = |p: [u8; 4]| p[2] > p[0] + 8;
+    // A placeable's `default`: the texture's `default` is the area's, its
+    // plain texture the placeable's `chrome1`.
+    let placeable = shot("mirror_default", Some("chrome1"), true);
+    let plain = shot("plain_clear", Some("chrome1"), true);
+    // A map the object names (here also `chrome1`): the texture's
+    // `default` is it.
+    let named = shot("mirror_default", Some("chrome1"), false);
+    // No map of the object's, or its `default` (a creature's): the area's.
+    let none = shot("mirror_default", None, false);
+    let creature = shot("mirror_default", Some("default"), false);
+    eprintln!(
+        "texture default on: a placeable's default {placeable:?} (its plain texture {plain:?}), \
+         a named map {named:?}, none {none:?}, a creature's default {creature:?}"
+    );
+    assert!(red(placeable), "{placeable:?}");
+    assert!(blue(plain), "{plain:?}");
+    assert!(blue(named), "{named:?}");
+    assert!(red(none), "{none:?}");
+    assert!(red(creature), "{creature:?}");
+}
+
 #[test]
 fn the_sky_is_behind_everything_beyond_the_far_plane_and_unfogged() {
     let Some(gpu) = gpu() else { return };
@@ -970,6 +1036,46 @@ fn the_sky_is_behind_everything_beyond_the_far_plane_and_unfogged() {
     // The quad, in front of it: fogged red.
     let px = img.pixel(32, 32);
     assert!(px[0] > 200 && px[1] < 60 && px[2] < 60, "{px:?}");
+}
+
+/// The horizon's fade is its colour times its texture, laid over the sky by
+/// the texture's alpha, as the client's `fst` draws `skyfade1` (the
+/// deferred sprint's fifth client batch, `reading_sky_fade`: the band of
+/// `skyblurpoly` it shows is white, its alpha falling off; taken by its
+/// red, the band was solid).
+#[test]
+fn the_sky_fade_is_laid_over_the_sky_by_its_alpha() {
+    let Some(gpu) = gpu() else { return };
+    let mut assets = TestAssets::default();
+    // White, a quarter opaque.
+    assets.solid("fade", [255, 255, 255, 64]);
+    let quad_with = |bitmap: Option<&str>| {
+        let mut m = quad();
+        let NodeKind::Mesh(mesh) = &mut m.nodes[1].kind else { unreachable!() };
+        mesh.textures[0] = bitmap.map(Into::into);
+        Arc::new(GpuModel::new(&gpu, Arc::new(m)))
+    };
+    // A white sky far below the camera, the fade in front of it.
+    let far = |z: f32| {
+        Mat4::from_translation(Vec3::new(0.0, 0.0, z)) * Mat4::from_scale(Vec3::splat(2000.0))
+    };
+    let scene = Scene {
+        area: AreaLight { ambient: Vec3::ONE, diffuse: Vec3::ZERO, direction: Vec3::Z },
+        sky: Some(Instance::new(quad_with(None), far(-500.0))),
+        sky_fade: Some((Instance::new(quad_with(Some("fade")), far(-400.0)), Vec3::X)),
+        ..Default::default()
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.5, 4.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    let px = r.render_image(&gpu, &assets, &scene, &camera, 64, 64).pixel(32, 32);
+    // Red over white by a quarter: (255, 191, 191).
+    assert!(px[0] > 245 && (180..205).contains(&px[1]) && (180..205).contains(&px[2]), "{px:?}");
 }
 
 /// The scene's depths stay in the depth buffer: what a caller draws after
@@ -1114,6 +1220,73 @@ fn lines_hide_behind_meshes_but_not_under_the_ground_they_lie_on() {
     assert!(red_near(Vec3::new(2.0, 0.0, 0.0)));
     // Under the board: hidden.
     assert!(!red_near(Vec3::new(0.0, 0.0, 0.0)));
+}
+
+/// A line shape's copies (`Scene::line_shapes`, Sound Ranges' spheres)
+/// draw what their lines would, moved and scaled, given one by one; the
+/// shape's lines kept on the GPU from frame to frame, and another shape
+/// in their place drawn as it is.
+#[test]
+fn a_line_shape_s_copies_draw_what_their_lines_would() {
+    let Some(gpu) = gpu() else { return };
+    let model = Arc::new(GpuModel::new(&gpu, Arc::new(quad())));
+    let ground = Instance::new(model, Mat4::from_scale(Vec3::new(4.0, 4.0, 1.0)));
+    let area = AreaLight { ambient: Vec3::splat(0.3), ..Default::default() };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -5.0, 6.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    // (Halves, quarters and whole metres: the ends where they are drawn
+    // are the same numbers either way.)
+    let star: Arc<[[Vec3; 2]]> = Arc::new([
+        [Vec3::new(-0.5, 0.0, 0.0), Vec3::new(0.5, 0.0, 0.0)],
+        [Vec3::new(0.0, -0.5, 0.0), Vec3::new(0.0, 0.5, 0.0)],
+        [Vec3::new(-0.25, -0.25, 0.5), Vec3::new(0.25, 0.25, 0.5)],
+    ]);
+    let square: Arc<[[Vec3; 2]]> = Arc::new([
+        [Vec3::new(-0.5, -0.5, 0.0), Vec3::new(0.5, -0.5, 0.0)],
+        [Vec3::new(0.5, -0.5, 0.0), Vec3::new(0.5, 0.5, 0.0)],
+        [Vec3::new(0.5, 0.5, 0.0), Vec3::new(-0.5, 0.5, 0.0)],
+        [Vec3::new(-0.5, 0.5, 0.0), Vec3::new(-0.5, -0.5, 0.0)],
+    ]);
+    let copies = vec![
+        LineCopy { offset: Vec3::new(-2.0, 0.0, 0.0), scale: 2.0, color: [1.0, 0.0, 0.0, 1.0] },
+        LineCopy { offset: Vec3::new(1.0, 1.0, 0.0), scale: 1.0, color: [0.0, 1.0, 0.0, 1.0] },
+        LineCopy { offset: Vec3::new(1.5, -1.5, 0.25), scale: 0.5, color: [1.0, 1.0, 0.0, 0.5] },
+    ];
+    let given = |shape: &Arc<[[Vec3; 2]]>| -> Vec<mg_render::Line> {
+        copies
+            .iter()
+            .flat_map(|c| {
+                shape.iter().map(|[a, b]| mg_render::Line {
+                    from: c.offset + *a * c.scale,
+                    to: c.offset + *b * c.scale,
+                    color: c.color,
+                })
+            })
+            .collect()
+    };
+    let (w, h) = (160, 128);
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+    let base = Scene { instances: vec![ground], area, ..Default::default() };
+    let mut shot = |scene: &Scene| r.render_image(&gpu, &NoAssets, scene, &camera, w, h);
+    let bare = shot(&base);
+    for shape in [&star, &square] {
+        let lines = shot(&Scene { lines: given(shape), ..base.clone() });
+        let shapes = Scene {
+            line_shapes: vec![LineShape { lines: shape.clone(), copies: copies.clone() }],
+            ..base.clone()
+        };
+        let (first, again) = (shot(&shapes), shot(&shapes));
+        assert!(lines.data != bare.data, "the lines are drawn");
+        assert!(first.data == lines.data, "copies of a shape draw its lines");
+        assert!(again.data == lines.data, "and again, its lines kept");
+    }
+    // Drawn no more: nothing of it.
+    assert!(shot(&base).data == bare.data);
 }
 
 #[test]
@@ -1318,6 +1491,133 @@ fn meshes_out_of_the_camera_s_sight_are_left_out() {
     assert!(lit(32), "the quad in the middle: {:?}", image.pixel(32, 32));
     assert!(!lit(50), "between the two: {:?}", image.pixel(50, 32));
     assert!(lit(62), "the quad across the edge: {:?}", image.pixel(62, 32));
+}
+
+/// A 2×2 quad on the ground at `x`, skinned to its one bone (node 1).
+fn skinned_quad(x: f32) -> Model {
+    let mut model = quad();
+    let mut bone = Node::new("bone", NodeKind::Dummy);
+    bone.parent = Some(0);
+    model.nodes[0].children = vec![1, 2];
+    let mut skin = model.nodes.remove(1);
+    if let NodeKind::Mesh(m) = &mut skin.kind {
+        for v in &mut m.vertices {
+            v[0] += x;
+        }
+        m.extra = mg_mdl::MeshExtra::Skin(mg_mdl::Skin {
+            bones: vec![1],
+            weights: vec![[(0, 1.0), (0, 0.0), (0, 0.0), (0, 0.0)]; 4],
+            inverse_bind: Vec::new(),
+        });
+    }
+    model.nodes.insert(1, bone);
+    model.nodes.push(skin);
+    model
+}
+
+/// A skin's face with a vertex no valid bone weighs is not drawn, as the
+/// game's programs collapse such a vertex (MDL-SKIN-030) and the client
+/// shows nothing of its faces; a skin none of whose bones is a node draws
+/// nothing (the stock `c_wings2`'s right wing, `reading_wings_without_bones`
+/// in `client_render.rs`). The quad's two faces: one with a vertex
+/// unweighed, then a skin of no bones.
+#[test]
+fn a_skin_s_faces_with_a_vertex_no_bone_weighs_are_not_drawn() {
+    let Some(gpu) = gpu() else { return };
+    let mut model = skinned_quad(0.0);
+    let NodeKind::Mesh(m) = &mut model.nodes[2].kind else { unreachable!() };
+    let mg_mdl::MeshExtra::Skin(skin) = &mut m.extra else { unreachable!() };
+    // (Faces 0 1 2 and 0 2 3: vertex 3 is the second's alone.)
+    skin.weights[3] = [(0, 0.0); 4];
+    let one = GpuModel::new(&gpu, Arc::new(model.clone()));
+    assert_eq!(one.meshes[0].index_count, 3, "the face of the weighed vertices alone");
+    let NodeKind::Mesh(m) = &mut model.nodes[2].kind else { unreachable!() };
+    m.extra = mg_mdl::MeshExtra::Skin(mg_mdl::Skin {
+        bones: Vec::new(),
+        weights: vec![[(0, 0.0); 4]; 4],
+        inverse_bind: Vec::new(),
+    });
+    let none = GpuModel::new(&gpu, Arc::new(model));
+    assert_eq!(none.meshes[0].index_count, 0, "no bones: nothing drawn");
+}
+
+/// A skinned mesh, and one whose vertices an animation replaces, are left
+/// out where the camera can't see them as they are now, not as they were
+/// bound: one bound in sight, carried out of it by its bone (or its
+/// vertices), is left out; one bound out of sight, carried into it, is
+/// drawn where it is carried to. (They were never left out: an off-screen
+/// creature was posed and drawn.)
+#[test]
+fn skinned_and_animated_meshes_out_of_sight_are_left_out() {
+    let Some(gpu) = gpu() else { return };
+    // From above: the ground from -3.4 to 3.4 each way is in the picture.
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.01, 8.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    let mut shot = |instance: Instance| {
+        let scene = Scene {
+            instances: vec![instance],
+            area: AreaLight { ambient: Vec3::splat(0.5), ..Default::default() },
+            ..Default::default()
+        };
+        let image = r.render_image(&gpu, &NoAssets, &scene, &camera, 64, 64);
+        (r.drawn, image.pixel(32, 32)[0] > 40)
+    };
+    // Skinned: bound at x, its bone carried by `by` along x.
+    let posed = |x: f32, by: f32| {
+        let model = Arc::new(GpuModel::new(&gpu, Arc::new(skinned_quad(x))));
+        assert!(model.meshes[0].skin.is_some());
+        let pose = vec![Mat4::IDENTITY, Mat4::from_translation(Vec3::X * by), Mat4::IDENTITY];
+        Instance { pose: Some(Arc::new(pose)), ..Instance::new(model, Mat4::IDENTITY) }
+    };
+    let (drawn, lit) = shot(posed(0.0, 0.0));
+    assert_eq!((drawn.meshes, drawn.hidden, lit), (1, 0, true), "bound and posed in sight");
+    let (drawn, lit) = shot(posed(0.0, 20.0));
+    assert_eq!((drawn.meshes, drawn.hidden, lit), (0, 1, false), "carried out of sight");
+    let (drawn, lit) = shot(posed(20.0, -20.0));
+    assert_eq!((drawn.meshes, drawn.hidden, lit), (1, 0, true), "carried into sight");
+    // Animated: the quad's vertices moved by `by` along x.
+    let plain = Arc::new(GpuModel::new(&gpu, Arc::new(quad())));
+    let moved = |model: &Arc<GpuModel>, by: f32| {
+        let mut state = mg_render::MeshState::new(model);
+        let corners = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        let vertices = corners
+            .iter()
+            .map(|[x, y]| mg_render::model::Vertex {
+                pos: [x + by, *y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0; 2],
+                tangent: [0.0; 4],
+                color: [255; 4],
+                uv1: [0.0; 2],
+                uv2: [0.0; 2],
+                uv3: [0.0; 2],
+            })
+            .collect();
+        state.meshes[0].vertices = Some(vertices);
+        Instance { state: Some(Arc::new(state)), ..Instance::new(model.clone(), Mat4::IDENTITY) }
+    };
+    let (drawn, lit) = shot(moved(&plain, 20.0));
+    assert_eq!((drawn.meshes, drawn.hidden, lit), (0, 1, false), "moved out of sight");
+    let far = Arc::new(GpuModel::new(&gpu, Arc::new(skinless_at(20.0))));
+    let (drawn, lit) = shot(moved(&far, 0.0));
+    assert_eq!((drawn.meshes, drawn.hidden, lit), (1, 0, true), "moved into sight");
+}
+
+/// A [`quad`] at `x`.
+fn skinless_at(x: f32) -> Model {
+    let mut model = quad();
+    if let NodeKind::Mesh(m) = &mut model.nodes[1].kind {
+        for v in &mut m.vertices {
+            v[0] += x;
+        }
+    }
+    model
 }
 
 /// Each draw takes its own values (they lie in one list, a draw's found by
@@ -1823,6 +2123,109 @@ fn the_game_path_draws_opengl_s_clip_space_right() {
     assert!(differ <= 8, "{differ} pixels differ in what they show");
 }
 
+/// Two meshes of one pipeline and material lying in one plane are drawn
+/// by the game's programs in the order of the scene's instances, whatever
+/// their meshes' addresses: one wins where they meet the same each run
+/// (ordered by address, 8 of Tyrants of the Moonsea's 140 areas differed
+/// from run to run by a few pixels). Two quads standing in the same place,
+/// one texture (red on its left, blue on its right) each showing one half.
+#[test]
+fn coplanar_meshes_of_one_material_keep_the_scene_s_order() {
+    let Some(gpu) = gpu() else { return };
+    let mut assets = clip_space_assets();
+    let mut halves = Vec::new();
+    for _ in 0..4 {
+        for x in 0..4 {
+            halves.extend(if x < 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] });
+        }
+    }
+    let t = mg_image::Rgba { width: 4, height: 4, data: halves }.into_texture(false);
+    assets.textures.insert("halves".into(), t);
+    let (_, camera) = clip_space_scene(&gpu);
+    let half = |u: f32| {
+        let mut model = quad();
+        if let NodeKind::Mesh(m) = &mut model.nodes[1].kind {
+            m.textures[0] = Some("halves".into());
+            m.uvs[0] = vec![[u, 0.5]; 4];
+        }
+        let model = Arc::new(GpuModel::new(&gpu, Arc::new(model)));
+        let t = Mat4::from_translation(Vec3::new(0.0, 0.0, 1.0))
+            * Mat4::from_rotation_x(90f32.to_radians())
+            * Mat4::from_scale(Vec3::splat(3.0));
+        Instance::new(model, t)
+    };
+    // (Texel centres: the second, red, and the third, blue.)
+    let (red, blue) = (half(0.375), half(0.625));
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    r.game_shaders = true;
+    let mut shot = |instances: Vec<Instance>| {
+        let scene = Scene { instances, background: [0.0, 0.0, 0.0], ..Default::default() };
+        r.render_image(&gpu, &assets, &scene, &camera, 64, 64).pixel(32, 32)
+    };
+    let red_first = shot(vec![red.clone(), blue.clone()]);
+    let blue_first = shot(vec![blue, red]);
+    assert_eq!(r.game_shader_failures(), &[]);
+    assert_eq!(r.drawn.game, 2, "{:?}", r.drawn);
+    eprintln!("red first {red_first:?}, blue first {blue_first:?}");
+    assert_ne!(red_first, blue_first, "the order of the scene's instances decides");
+    assert!(
+        (red_first, blue_first) == ([255, 0, 0, 255], [0, 0, 255, 255])
+            || (red_first, blue_first) == ([0, 0, 255, 255], [255, 0, 0, 255]),
+        "{red_first:?} {blue_first:?}"
+    );
+}
+
+/// The authored include and pair of
+/// [`an_authored_glsl_pair_draws_on_this_platform_s_gpu`], written as the
+/// engine's shaders are.
+const PLATFORM_INC: &str = r#"
+#ifndef INC_PLATFORM
+#define INC_PLATFORM
+uniform mat4 m_mv;
+uniform mat4 m_proj;
+uniform mat4 m_texture;
+uniform vec4 screenParams;
+uniform vec4 materialFrontDiffuse;
+uniform int texture0Bound;
+uniform int numLights;
+uniform vec4 lightColor[MAX_NUM_LIGHTS];
+varying vec2 vUv;
+varying vec4 vTint;
+#endif
+"#;
+const PLATFORM_VS: &str = r#"
+#define SHADER_TYPE 1
+#include "inc_platform"
+attribute vec4 vPos;
+attribute vec2 vTcIn;
+// (The engine's baked light: Moonglow has none, its zeros.)
+attribute vec4 vColor;
+void main ()
+{
+    vUv = mat2(m_texture) * vTcIn;
+    vTint = materialFrontDiffuse + vColor;
+    gl_Position = m_proj * (m_mv * vPos);
+}
+"#;
+const PLATFORM_FS: &str = r#"
+#define SHADER_TYPE 2
+#include "inc_platform"
+uniform sampler2D texUnit0;
+vec3 Sample(sampler2D tex, vec2 uv)
+{
+    return texture2D(tex, uv).rgb * float(texture0Bound);
+}
+void main ()
+{
+    vec3 c = Sample(texUnit0, vUv) * vTint.rgb;
+    for (int i = 0; i < numLights; i++)
+        c += lightColor[i].rgb;
+    // (The frame's block: the picture's width, 64 pixels.)
+    c.b += screenParams.x / 64.0;
+    gl_FragColor = vec4(c, 1.0);
+}
+"#;
+
 /// The game path on whatever GPU the platform has (CI's Windows runner
 /// draws it with Direct3D 12, its macOS one with Metal, as no game install
 /// is there for the stock programs): an authored pair written as the
@@ -1843,53 +2246,7 @@ fn an_authored_glsl_pair_draws_on_this_platform_s_gpu() {
     let info = gpu.device.adapter_info();
     let mut assets = TestAssets::default();
     assets.opaque("red", [255, 0, 0]);
-    let inc = r#"
-#ifndef INC_PLATFORM
-#define INC_PLATFORM
-uniform mat4 m_mv;
-uniform mat4 m_proj;
-uniform mat4 m_texture;
-uniform vec4 screenParams;
-uniform vec4 materialFrontDiffuse;
-uniform int texture0Bound;
-uniform int numLights;
-uniform vec4 lightColor[MAX_NUM_LIGHTS];
-varying vec2 vUv;
-varying vec4 vTint;
-#endif
-"#;
-    let vs = r#"
-#define SHADER_TYPE 1
-#include "inc_platform"
-attribute vec4 vPos;
-attribute vec2 vTcIn;
-// (The engine's baked light: Moonglow has none, its zeros.)
-attribute vec4 vColor;
-void main ()
-{
-    vUv = mat2(m_texture) * vTcIn;
-    vTint = materialFrontDiffuse + vColor;
-    gl_Position = m_proj * (m_mv * vPos);
-}
-"#;
-    let fs = r#"
-#define SHADER_TYPE 2
-#include "inc_platform"
-uniform sampler2D texUnit0;
-vec3 Sample(sampler2D tex, vec2 uv)
-{
-    return texture2D(tex, uv).rgb * float(texture0Bound);
-}
-void main ()
-{
-    vec3 c = Sample(texUnit0, vUv) * vTint.rgb;
-    for (int i = 0; i < numLights; i++)
-        c += lightColor[i].rgb;
-    // (The frame's block: the picture's width, 64 pixels.)
-    c.b += screenParams.x / 64.0;
-    gl_FragColor = vec4(c, 1.0);
-}
-"#;
+    let (inc, vs, fs) = (PLATFORM_INC, PLATFORM_VS, PLATFORM_FS);
     assets.shaders.insert("inc_platform".into(), inc.into());
     assets.shaders.insert("vslit".into(), vs.into());
     assets.shaders.insert("fslit".into(), fs.into());
@@ -3162,6 +3519,61 @@ fn the_game_s_programs_draw_an_additive_mesh_added() {
     assert!(off[0] == 255 && off[1] > 100, "Moonglow's own: {off:?}");
 }
 
+/// An additive mesh is added as much as its texture's alpha (source alpha
+/// and one), whole where its texture has none, with either shader: the
+/// client's card of an alpha rising from 0 to 1 adds 0 to 24 of 255 and
+/// its opaque card 24 (`reading_additive_blending` in `client_render.rs`;
+/// Moonglow added the ramp 36 to 26). A glow of alpha a half over red,
+/// beside the same glow opaque.
+#[test]
+fn an_additive_mesh_is_added_by_its_alpha() {
+    let Some(gpu) = gpu() else { return };
+    let mut assets = TestAssets::default();
+    authored_lit_pair(&mut assets);
+    // (The authored `fslit` giving its texture's alpha, as the game's do.)
+    let fs = assets.shaders["fslit"].replace("vec4(c, 1.0)", "vec4(c, texture2D(texUnit0, vUv).a)");
+    assets.shaders.insert("fslit".into(), fs);
+    assets.opaque("red", [255, 0, 0]);
+    assets.opaque("glow", [0, 80, 0]);
+    assets.solid("half_glow", [0, 80, 0, 128]);
+    for glow in ["glow", "half_glow"] {
+        assets.txis.insert(glow.into(), mg_image::txi::Txi::parse(b"blending additive\n"));
+    }
+    let camera = Camera {
+        eye: Vec3::new(0.0, -10.0, 1.0),
+        target: Vec3::new(0.0, 0.0, 1.0),
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    for on in [false, true] {
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+        r.game_shaders = on;
+        let mut green = |glow: &str| {
+            let scene = Scene {
+                instances: vec![
+                    standing_quad(&gpu, "red", Vec3::new(0.0, 0.0, 1.0), 3.0),
+                    standing_quad(&gpu, glow, Vec3::new(0.0, -2.0, 1.0), 1.0),
+                ],
+                area: AreaLight { ambient: Vec3::ONE, diffuse: Vec3::ZERO, direction: Vec3::Z },
+                background: [0.0, 0.0, 0.0],
+                ..Default::default()
+            };
+            f32::from(r.render_image(&gpu, &assets, &scene, &camera, 64, 64).pixel(32, 32)[1])
+        };
+        let (whole, half) = (green("glow"), green("half_glow"));
+        eprintln!("the game's programs {on}: opaque adds {whole}, alpha a half {half}");
+        assert!(whole > 40.0 && whole < 250.0, "{whole}");
+        if on {
+            assert!((half / whole - 0.5).abs() < 0.06, "{half} of {whole}");
+        } else {
+            // (Moonglow's own keeps a see-through surface's specular light
+            // whole, as its blending would: its texture's color by half.)
+            assert!(half / whole > 0.4 && half / whole < 0.8, "{half} of {whole}");
+        }
+    }
+}
+
 /// An additive mesh lying on another (a glow on a body) adds to all of it
 /// when the body is drawn by the game's programs and the glow by Moonglow's
 /// shader (it ripples: `proceduretype arturo`), seen from afar. Their
@@ -3229,6 +3641,100 @@ fn a_glow_on_a_mesh_drawn_by_the_other_shader_covers_it() {
         missed.len(),
         &missed[..missed.len().min(8)]
     );
+}
+
+/// A texture the GPU won't take (wider than it holds, or of no pixels) is
+/// drawn as one that is missing, and said once, read in the frame or
+/// apart: wgpu's error ended the program (a test's device keeps wgpu's
+/// panic, so one that came through would end this test).
+#[test]
+fn a_texture_the_gpu_refuses_is_left_out_and_said() {
+    let Some(gpu) = gpu() else { return };
+    // (Alone: what the GPU refused is the process's list, which the next
+    // test takes from too.)
+    mg_testkit::gpu::alone();
+    let wide = gpu.device.limits().max_texture_dimension_2d + 1;
+    let assets = || {
+        let mut assets = TestAssets::default();
+        let data = [255, 0, 0, 255].repeat(wide as usize);
+        let t = mg_image::Rgba { width: wide, height: 1, data }.into_texture(false);
+        assets.textures.insert("c_too_wide".into(), t);
+        let empty = mg_image::Rgba { width: 0, height: 0, data: Vec::new() }.into_texture(false);
+        assets.textures.insert("c_no_pixels".into(), empty);
+        assets.opaque("missing_not", [0, 0, 255]);
+        assets
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -8.0, 1.0),
+        target: Vec3::new(0.0, 0.0, 1.0),
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let scene = Scene {
+        instances: vec![
+            standing_quad(&gpu, "c_too_wide", Vec3::new(-2.0, 0.0, 1.0), 0.8),
+            standing_quad(&gpu, "c_no_pixels", Vec3::new(0.0, 0.0, 1.0), 0.8),
+            standing_quad(&gpu, "missing_not", Vec3::new(2.0, 0.0, 1.0), 0.8),
+        ],
+        area: AreaLight { ambient: Vec3::ONE, diffuse: Vec3::ZERO, direction: Vec3::Z },
+        background: [0.0, 0.0, 0.0],
+        ..Default::default()
+    };
+    let refused = |said: &[String]| {
+        ["c_too_wide", "c_no_pixels"]
+            .map(|t| said.iter().filter(|e| e.starts_with(&format!("the texture {t}: "))).count())
+    };
+    // In the frame.
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    let image = r.render_image(&gpu, &assets(), &scene, &camera, 96, 64);
+    save(&image, &mg_testkit::output_dir("render").join("texture_refused.png"));
+    let said = mg_render::guard::take_gpu_errors();
+    assert_eq!(refused(&said), [1, 1], "{said:?}");
+    assert!(said.iter().any(|e| e.contains(&format!("{wide} by 1 pixels"))), "{said:?}");
+    // (Drawn untextured, white; the texture it takes, blue.)
+    let at = |x: f32| image.pixel((48.0 + x * 48.0 / 6.0) as u32, 32);
+    assert!(at(-2.0)[..3].iter().all(|c| *c > 200), "untextured: {:?}", at(-2.0));
+    assert!(at(0.0)[..3].iter().all(|c| *c > 200), "untextured: {:?}", at(0.0));
+    assert!(at(2.0)[2] > 200 && at(2.0)[0] < 100, "its texture: {:?}", at(2.0));
+    // Apart: the same, said again by a renderer of its own.
+    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+    let apart: Arc<dyn mg_render::Assets + Send + Sync> = Arc::new(assets());
+    r.read_textures_apart(&gpu, Some(apart));
+    r.textures_apart = true;
+    let started = std::time::Instant::now();
+    let mut read = r.render_image(&gpu, &NoAssets, &scene, &camera, 96, 64);
+    while r.drawn.textures_pending > 0 {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "never read");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        read = r.render_image(&gpu, &NoAssets, &scene, &camera, 96, 64);
+    }
+    assert_eq!(read.data, image.data, "as read in the frame");
+    assert_eq!(refused(&mg_render::guard::take_gpu_errors()), [0, 0], "said once");
+}
+
+/// On a device whose errors are noted (the application's), what the GPU
+/// refuses outside the renderer's own checks is said, and the program goes
+/// on: wgpu's default ends it.
+#[test]
+fn the_application_s_device_notes_what_the_gpu_refuses() {
+    let Some(gpu) = gpu() else { return };
+    mg_testkit::gpu::alone();
+    mg_render::guard::note_gpu_errors(&gpu.device);
+    let _refused = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("c_refused_texture"),
+        size: wgpu::Extent3d { width: 0, height: 4, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let said = mg_render::guard::take_gpu_errors();
+    let ours: Vec<&String> = said.iter().filter(|e| e.contains("c_refused_texture")).collect();
+    assert_eq!(ours.len(), 1, "{said:?}");
+    assert!(ours[0].starts_with("drawing: ") && !ours[0].contains('\n'), "{ours:?}");
 }
 
 /// `vsgrass`/`fsgrass` standing in for the game's: cyan.
@@ -3804,7 +4310,8 @@ fn shadows_darken_what_receives_them_by_the_opacity() {
         mg_resman::ResMan::for_game(&mg_resman::GameInstall::new(&root, None, "en")).ok()
     });
     let grey = |p: [u8; 4]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
-    for samples in [1, 4] {
+    // (Fast, the shadow map, and High, the stencil volumes, alike.)
+    for (samples, volumes) in [(1, false), (4, false), (1, true), (4, true)] {
         for shaders in [false, true] {
             let assets: &dyn mg_render::Assets = match (&game, shaders) {
                 (Some(rm), true) => rm,
@@ -3813,6 +4320,7 @@ fn shadows_darken_what_receives_them_by_the_opacity() {
             };
             let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, samples);
             r.game_shaders = shaders;
+            r.shadow_volumes = volumes;
             let mut draw = |s: &Scene| r.render_image(&gpu, assets, s, &camera, 64, 64);
             let bare = draw(&scene(true, None));
             let half = draw(&scene(true, Some(0.5)));
@@ -3820,14 +4328,14 @@ fn shadows_darken_what_receives_them_by_the_opacity() {
             let elsewhere = draw(&scene(false, Some(0.5)));
             // (With the switch on, the ground by the game's programs.)
             assert_eq!(r.drawn.game > 0, shaders, "{samples} samples");
-            save(&half, &dir.join(format!("shadows_{samples}_{shaders}.png")));
+            save(&half, &dir.join(format!("shadows_{samples}_{shaders}_{volumes}.png")));
             // (The plate's shadow is the middle of the picture; the ground
             // reaches past it.)
             let (under, beside) = ((32, 32), (32, 6));
             let lit = grey(bare.pixel(under.0, under.1));
             assert!(lit > 40.0, "the ground is lit: {lit}");
             let at = |img: &mg_image::Rgba, (x, y): (u32, u32)| grey(img.pixel(x, y));
-            let context = format!("{samples} samples, game shaders {shaders}");
+            let context = format!("{samples} samples, game shaders {shaders}, volumes {volumes}");
             assert!(
                 (at(&half, under) - lit * 0.5).abs() <= 2.0,
                 "{context}: {} of {lit}",
@@ -3836,6 +4344,101 @@ fn shadows_darken_what_receives_them_by_the_opacity() {
             assert!(at(&whole, under) <= 1.0, "{context}: {}", at(&whole, under));
             assert!((at(&half, beside) - at(&bare, beside)).abs() <= 1.0, "{context}: beside");
             assert!((at(&elsewhere, under) - lit).abs() <= 1.0, "{context}: not received");
+        }
+    }
+}
+
+/// A material that samples the framebuffer (its MTR's `sample_framebuffer
+/// 2`, as The Domains of Dread's flow materials, whose programs read
+/// nothing of it) is drawn late, after the framebuffer's copy and after
+/// the shadows, as the engine draws it: [`shadows_darken_what_receives_them_by_the_opacity`]'s
+/// ground of such a material is not darkened under the plate, with the
+/// game's shaders and the targets' copies; drawn without the copies
+/// (`Renderer::render`), or by Moonglow's own shader, as before. The
+/// pictures: `target/test-output/render/late_*.png`.
+#[test]
+fn a_material_that_samples_the_framebuffer_is_drawn_after_the_shadows() {
+    let Some(gpu) = gpu() else { return };
+    let Some(root) = mg_testkit::nwn_root() else { return };
+    let game =
+        mg_resman::ResMan::for_game(&mg_resman::GameInstall::new(&root, None, "en")).unwrap();
+    let dir = mg_testkit::output_dir("render");
+    let mut assets = WithGameShaders { own: TestAssets::default(), game: &game };
+    assets.own.solid("mgflat", [200, 200, 200, 255]);
+    let mtr = |s: &str| mg_image::mtr::Mtr::parse(s.as_bytes());
+    assets.own.materials.insert("mgflow".into(), mtr("texture0 mgflat\nsample_framebuffer 2\n"));
+    assets.own.materials.insert("mgplain".into(), mtr("texture0 mgflat\n"));
+    let ground = |material: &str| {
+        let mut m = quad();
+        if let NodeKind::Mesh(mesh) = &mut m.nodes[1].kind {
+            mesh.uvs[0] = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+            mesh.material = Some(material.into());
+        }
+        Arc::new(GpuModel::new(&gpu, Arc::new(m)))
+    };
+    let plate = Arc::new(GpuModel::new(&gpu, Arc::new(shadow_plate())));
+    let scene = |ground: &Arc<GpuModel>| Scene {
+        instances: vec![
+            Instance {
+                receives_shadows: true,
+                ..Instance::new(ground.clone(), Mat4::from_scale(Vec3::splat(5.0)))
+            },
+            Instance::new(
+                plate.clone(),
+                Mat4::from_scale_rotation_translation(
+                    Vec3::splat(0.5),
+                    glam::Quat::IDENTITY,
+                    Vec3::new(0.0, 0.0, 1.0),
+                ),
+            ),
+        ],
+        area: AreaLight {
+            ambient: Vec3::splat(0.2),
+            diffuse: Vec3::splat(0.6),
+            direction: Vec3::Z,
+        },
+        shadows: Some(mg_render::SunShadows { opacity: 1.0, fade_limit: 45.0 }),
+        ..Default::default()
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.01, 12.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let grey = |p: [u8; 4]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
+    let (under, beside) = ((32, 32), (32, 6));
+    for samples in [1, 4] {
+        for (shaders, copies) in [(true, true), (true, false), (false, true)] {
+            for material in ["mgflow", "mgplain"] {
+                let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, samples);
+                r.game_shaders = shaders;
+                let targets =
+                    mg_render::Targets::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, samples, 64, 64);
+                let s = scene(&ground(material));
+                if copies {
+                    r.render_targets(&gpu, &assets, &s, &camera, &targets);
+                } else {
+                    let (view, resolve) = (targets.render_view(), targets.resolve_view());
+                    r.render(&gpu, &assets, &s, &camera, view, resolve, &targets.depth, (64, 64));
+                }
+                let img = gpu.read_rgba(&targets.color);
+                assert_eq!(r.game_shader_failures(), &[]);
+                assert_eq!(r.drawn.game > 0, shaders, "{:?}", r.drawn);
+                let name = format!("late_{material}_{samples}_{shaders}_{copies}.png");
+                save(&img, &dir.join(name));
+                let (lit, shaded) =
+                    (grey(img.pixel(beside.0, beside.1)), grey(img.pixel(under.0, under.1)));
+                let context =
+                    format!("{material}, {samples} samples, shaders {shaders}, copies {copies}");
+                assert!(lit > 40.0, "{context}: the ground is lit: {lit}");
+                if material == "mgflow" && shaders && copies {
+                    assert!((shaded - lit).abs() <= 2.0, "{context}: no shadow: {shaded} of {lit}");
+                } else {
+                    assert!(shaded <= 1.0, "{context}: in the shadow: {shaded}");
+                }
+            }
         }
     }
 }
@@ -3978,21 +4581,202 @@ fn a_creature_s_shadow_falls_away_from_its_light() {
         far: 100.0,
     };
     let grey = |p: [u8; 4]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
-    let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
-    let mut draw = |s: &Scene| r.render_image(&gpu, &NoAssets, s, &camera, 64, 64);
-    let (cast, off, unflagged) =
-        (draw(&scene(true, true)), draw(&scene(false, true)), draw(&scene(true, false)));
-    save(&cast, &mg_testkit::output_dir("render").join("shadows_light.png"));
-    // From 4 m up and 3 m west, the plate (a metre across, 1 m up) throws
-    // its shadow from 0.33 m to 1.67 m east of its middle; at 6.3 pixels a
-    // metre, the pixel 3 east of the middle is in it, the one 3 west lit.
-    let (east, west) = ((35, 32), (29, 32));
-    let lit = grey(off.pixel(east.0, east.1));
-    assert!(lit > 40.0, "{lit}");
-    let at = |img: &mg_image::Rgba, (x, y): (u32, u32)| grey(img.pixel(x, y));
-    assert!((at(&cast, east) - lit * 0.5).abs() <= 2.0, "{} of {lit}", at(&cast, east));
-    assert!((at(&cast, west) - at(&off, west)).abs() <= 1.0, "west");
-    assert!((at(&unflagged, east) - lit).abs() <= 1.0, "a light that casts none");
+    // (Fast, the lights' maps, and High, their stencil volumes, alike.)
+    for volumes in [false, true] {
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+        r.shadow_volumes = volumes;
+        let mut draw = |s: &Scene| r.render_image(&gpu, &NoAssets, s, &camera, 64, 64);
+        let (cast, off, unflagged) =
+            (draw(&scene(true, true)), draw(&scene(false, true)), draw(&scene(true, false)));
+        let name = format!("shadows_light{}.png", if volumes { "_high" } else { "" });
+        save(&cast, &mg_testkit::output_dir("render").join(name));
+        // From 4 m up and 3 m west, the plate (a metre across, 1 m up)
+        // throws its shadow from 0.33 m to 1.67 m east of its middle; at
+        // 6.3 pixels a metre, the pixel 3 east of the middle is in it, the
+        // one 3 west lit.
+        let (east, west) = ((35, 32), (29, 32));
+        let lit = grey(off.pixel(east.0, east.1));
+        assert!(lit > 40.0, "{lit}");
+        let at = |img: &mg_image::Rgba, (x, y): (u32, u32)| grey(img.pixel(x, y));
+        let context = format!("volumes {volumes}");
+        assert!(
+            (at(&cast, east) - lit * 0.5).abs() <= 2.0,
+            "{context}: {} of {lit}",
+            at(&cast, east)
+        );
+        assert!((at(&cast, west) - at(&off, west)).abs() <= 1.0, "{context}: west");
+        assert!((at(&unflagged, east) - lit).abs() <= 1.0, "{context}: a light that casts none");
+    }
+}
+
+/// A unit cube from 0 to 1, each face's vertices its own (as a model's
+/// are where its texture coordinates part), wound outwards.
+fn cube() -> Model {
+    let faces: [([[f32; 3]; 4], [f32; 3]); 6] = [
+        ([[0., 0., 1.], [1., 0., 1.], [1., 1., 1.], [0., 1., 1.]], [0., 0., 1.]),
+        ([[0., 0., 0.], [0., 1., 0.], [1., 1., 0.], [1., 0., 0.]], [0., 0., -1.]),
+        ([[0., 0., 0.], [1., 0., 0.], [1., 0., 1.], [0., 0., 1.]], [0., -1., 0.]),
+        ([[1., 1., 0.], [0., 1., 0.], [0., 1., 1.], [1., 1., 1.]], [0., 1., 0.]),
+        ([[0., 1., 0.], [0., 0., 0.], [0., 0., 1.], [0., 1., 1.]], [-1., 0., 0.]),
+        ([[1., 0., 0.], [1., 1., 0.], [1., 1., 1.], [1., 0., 1.]], [1., 0., 0.]),
+    ];
+    let mut mesh = Mesh {
+        diffuse: [1.0; 3],
+        ambient: [1.0; 3],
+        render: true,
+        shadow: true,
+        ..Default::default()
+    };
+    for (corners, normal) in faces {
+        let n = mesh.vertices.len() as u32;
+        mesh.vertices.extend(corners);
+        mesh.normals.extend([normal; 4]);
+        mesh.uvs[0].extend([[0.0, 0.0]; 4]);
+        mesh.faces.extend([
+            Face { vertices: [n, n + 1, n + 2], material: 0 },
+            Face { vertices: [n, n + 2, n + 3], material: 0 },
+        ]);
+    }
+    mesh.source = (0..mesh.vertices.len() as u32).collect();
+    let mut root = Node::new("cube", NodeKind::Dummy);
+    root.children = vec![1];
+    let mut m = Node::new("box", NodeKind::Mesh(Box::new(mesh)));
+    m.parent = Some(0);
+    Model { name: "cube".into(), animation_scale: 1.0, nodes: vec![root, m], ..Default::default() }
+}
+
+/// Shadows of High quality (`Renderer::shadow_volumes`: the game's
+/// stencil volumes): a cube a metre over a ground, both receiving (as a
+/// static placeable on a tile), the sun from the north-east and high, seen
+/// from straight above (where the shadow plane fades nothing). Every
+/// pixel of the ground in the cube's shadow (found by a ray from the
+/// ground to the sun through the cube) is darkened by the opacity, every
+/// other one not at all, but at the shadow's edges (a pixel whose corners
+/// disagree); the cube's top, lit, not at all; with one sample a pixel
+/// and four (the stencil counted per sample: the edges' pixels partly
+/// darkened, smooth, where with one they are in or out).
+#[test]
+fn high_shadows_darken_exactly_the_volume_s_footprint() {
+    let Some(gpu) = gpu() else { return };
+    let ground = Arc::new(GpuModel::new(&gpu, Arc::new(quad())));
+    let cube = Arc::new(GpuModel::new(&gpu, Arc::new(cube())));
+    let sun = Vec3::new(0.8, 0.6, 1.0).normalize();
+    let (low, high) = (Vec3::new(-0.5, -0.5, 1.0), Vec3::new(0.5, 0.5, 2.0));
+    let scene = |opacity: Option<f32>| Scene {
+        instances: vec![
+            Instance {
+                receives_shadows: true,
+                ..Instance::new(ground.clone(), Mat4::from_scale(Vec3::splat(8.0)))
+            },
+            Instance {
+                receives_shadows: true,
+                ..Instance::new(cube.clone(), Mat4::from_translation(low))
+            },
+        ],
+        area: AreaLight { ambient: Vec3::splat(0.2), diffuse: Vec3::splat(0.6), direction: sun },
+        shadows: opacity.map(|opacity| mg_render::SunShadows { opacity, fade_limit: 45.0 }),
+        ..Default::default()
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, -0.01, 12.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let (w, h) = (96u32, 96u32);
+    let inverse = (camera.projection(w as f32 / h as f32) * camera.view()).inverse();
+    // (Where a ray meets the box, if it does: the distance along it.)
+    let hits = |from: Vec3, ray: Vec3| {
+        let (mut near, mut far) = (0.0f32, f32::MAX);
+        for k in 0..3 {
+            if ray[k].abs() < 1e-9 {
+                if from[k] < low[k] || from[k] > high[k] {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((low[k] - from[k]) / ray[k], (high[k] - from[k]) / ray[k]);
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+        }
+        (near <= far).then_some(near)
+    };
+    // What a point of the picture (in pixels) sees: the cube's top, or
+    // the ground in shadow or lit.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Seen {
+        Top,
+        Shadowed,
+        Lit,
+    }
+    let seen = |x: f32, y: f32| {
+        let ndc = Vec3::new(x / w as f32 * 2.0 - 1.0, 1.0 - y / h as f32 * 2.0, 0.0);
+        let near = inverse.project_point3(ndc);
+        let ray = (inverse.project_point3(ndc.with_z(0.5)) - near).normalize();
+        if hits(near, ray).is_some() {
+            return Seen::Top;
+        }
+        let on = near + ray * (-near.z / ray.z);
+        if hits(on, sun).is_some() { Seen::Shadowed } else { Seen::Lit }
+    };
+    let grey = |p: [u8; 4]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
+    let dir = mg_testkit::output_dir("render");
+    for samples in [1, 4] {
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, samples);
+        let bare = r.render_image(&gpu, &NoAssets, &scene(None), &camera, w, h);
+        r.shadow_volumes = true;
+        let high = r.render_image(&gpu, &NoAssets, &scene(Some(0.5)), &camera, w, h);
+        save(&high, &dir.join(format!("shadows_high_{samples}.png")));
+        let (mut shadowed, mut lit, mut top, mut wrong) = (0, 0, 0, Vec::new());
+        // (The ground's pixels at the shadow's edge, partly darkened: with
+        // a stencil of four samples a pixel, some; with one, none.)
+        let (mut edges, mut partly) = (0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f32, y as f32);
+                let corners = [(fx, fy), (fx + 1.0, fy), (fx, fy + 1.0), (fx + 1.0, fy + 1.0)];
+                let kinds = corners.map(|(a, b)| seen(a, b));
+                let (was, now) = (grey(bare.pixel(x, y)), grey(high.pixel(x, y)));
+                if kinds.iter().any(|k| *k != kinds[0]) {
+                    if !kinds.contains(&Seen::Top) {
+                        edges += 1;
+                        partly += usize::from(now > was * 0.5 + 4.0 && now < was - 4.0);
+                    }
+                    continue;
+                }
+                let right = match kinds[0] {
+                    Seen::Shadowed => {
+                        shadowed += 1;
+                        (now - was * 0.5).abs() <= 2.0
+                    }
+                    Seen::Lit => {
+                        lit += 1;
+                        (now - was).abs() <= 1.0
+                    }
+                    Seen::Top => {
+                        top += 1;
+                        (now - was).abs() <= 1.0
+                    }
+                };
+                if !right {
+                    wrong.push((x, y, kinds[0], was, now));
+                }
+            }
+        }
+        assert!(shadowed > 100 && lit > 1000 && top > 50, "{shadowed} {lit} {top}");
+        if samples == 1 {
+            assert_eq!(partly, 0, "one sample: an edge pixel is in or out");
+        } else {
+            assert!(partly * 3 > edges, "four samples: smooth edges, {partly} of {edges}");
+        }
+        assert!(
+            wrong.is_empty(),
+            "{samples} samples: {} wrong, {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(12)]
+        );
+    }
 }
 
 /// What the lights' shadows cost at their most: as many creatures as cast
@@ -4626,5 +5410,94 @@ fn fxc_refuses_the_loop_and_dxc_compiles_it() {
         None => {
             eprintln!("DXC not run: MOONGLOW_DXC names no folder of dxc.exe and dxcompiler.dll")
         }
+    }
+}
+
+/// A material naming a geometry program alone (`customshaderGS`, no
+/// `customshaderVS` and `FS`) is drawn as if it named none, by the stock
+/// pair, as the client draws it (`program_choice_in_the_client`'s "mtr gs
+/// alone", 2026-10-29); beside a pair the client runs it (one that emits
+/// nothing hid its card there), which wgpu has no stage for: reported, and
+/// drawn with Moonglow's own shader.
+#[test]
+fn a_geometry_program_named_alone_is_ignored_as_the_client_ignores_it() {
+    let Some(gpu) = gpu() else { return };
+    let mut assets = TestAssets::default();
+    assets.opaque("red", [255, 0, 0]);
+    assets.shaders.insert("inc_platform".into(), PLATFORM_INC.into());
+    for name in ["vslit", "vsmine"] {
+        assets.shaders.insert(name.into(), PLATFORM_VS.into());
+    }
+    for name in ["fslit", "fsmine"] {
+        assets.shaders.insert(name.into(), PLATFORM_FS.into());
+    }
+    let camera = Camera {
+        eye: Vec3::new(0.0, -10.0, 1.0),
+        target: Vec3::new(0.0, 0.0, 1.0),
+        fov_y: 0.8,
+        near: 0.1,
+        far: 100.0,
+    };
+    let scene = Scene {
+        instances: vec![standing_quad(&gpu, "red", Vec3::new(0.0, 0.0, 1.0), 1.0)],
+        background: [0.0, 0.0, 0.0],
+        ..Default::default()
+    };
+    let mut draw = |mtr_text: &str| {
+        assets.materials.insert("red".into(), mg_image::mtr::Mtr::parse(mtr_text.as_bytes()));
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+        r.game_shaders = true;
+        r.render_image(&gpu, &assets, &scene, &camera, 64, 64);
+        (r.drawn.game, r.game_shader_failures().to_vec())
+    };
+    let (game, failures) = draw("texture0 red\ncustomshaderGS gsnothing\n");
+    assert_eq!((game, failures), (1, vec![]), "alone: the stock pair");
+    let (game, failures) = draw(
+        "texture0 red\ncustomshaderVS vsmine\ncustomshaderFS fsmine\ncustomshaderGS gsnothing\n",
+    );
+    assert_eq!(game, 0, "beside a pair: Moonglow's own shader");
+    assert!(failures.iter().any(|(what, _)| what == "gsnothing"), "{failures:?}");
+}
+
+/// A cut-out (`blending punchthrough`) whose mesh's alpha is under 1 is
+/// drawn solid and cut, not blended, as the client draws one
+/// (`client_render.rs`'s `reading_see_through_cut_out`: a disc of `alpha
+/// 0.5` opaque, the floor not showing through), whichever shader draws
+/// it; an instance drawn see-through still is.
+#[test]
+fn a_cut_out_s_mesh_alpha_does_not_blend_it() {
+    let Some(gpu) = gpu() else { return };
+    let mut assets = TestAssets::default();
+    assets.solid("cut", [200, 200, 200, 255]);
+    assets.txis.insert("cut".into(), mg_image::txi::Txi::parse(b"blending punchthrough\n"));
+    let area = AreaLight { ambient: Vec3::splat(0.5), diffuse: Vec3::ZERO, ..Default::default() };
+    for game in [false, true] {
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 1);
+        r.game_shaders = game;
+        let mut shot = |alpha: f32, opacity: f32| {
+            let mut m = quad();
+            let NodeKind::Mesh(mesh) = &mut m.nodes[1].kind else { unreachable!() };
+            mesh.textures[0] = Some("cut".into());
+            m.nodes[1].controllers.push(mg_mdl::Controller::constant("alpha", &[alpha]));
+            let model = Arc::new(GpuModel::new(&gpu, Arc::new(m)));
+            let camera = Camera {
+                eye: Vec3::new(0.0, -0.5, 4.0),
+                target: Vec3::ZERO,
+                fov_y: 0.8,
+                near: 0.1,
+                far: 100.0,
+            };
+            let instance = Instance { opacity, ..Instance::new(model, Mat4::IDENTITY) };
+            let scene = Scene {
+                instances: vec![instance],
+                area,
+                background: [1.0, 0.0, 0.0],
+                ..Default::default()
+            };
+            r.render_image(&gpu, &assets, &scene, &camera, 32, 32).pixel(16, 16)
+        };
+        let solid = shot(1.0, 1.0);
+        assert_eq!(shot(0.5, 1.0), solid, "mesh alpha 0.5: solid (game's programs: {game})");
+        assert_ne!(shot(1.0, 0.5), solid, "an instance at half opacity is blended ({game})");
     }
 }

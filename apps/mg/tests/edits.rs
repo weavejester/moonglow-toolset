@@ -37,7 +37,7 @@ fn guard(module: &Path) -> Struct {
 }
 
 fn mg(args: &[&str]) -> (bool, Json) {
-    let out = crate::mg().args(["--no-user-dir", "--json"]).args(args).output().unwrap();
+    let out = crate::mg_alone().arg("--json").args(args).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.trim().is_empty(), "{args:?}: stderr {stderr}");
     let json = serde_json::from_slice(&out.stdout)
@@ -155,4 +155,153 @@ fn apply_takes_all_of_a_file_or_none() {
     assert!(!ok);
     assert!(failed["error"].as_str().unwrap().contains("edits[0]: no \"field\""), "{failed}");
     let _ = before;
+}
+
+/// Setting an object's faction to 0, the PC faction, or taking its faction
+/// field away (which the game reads as 0) is done, and warned of as Verify
+/// warns of it after; another faction is not; nor a trigger's 0.
+#[test]
+fn set_warns_of_the_pc_faction() {
+    let dir = mg_testkit::scratch_dir("mg-set-pc-faction");
+    let path = module(&dir);
+    let m = path.to_str().unwrap();
+    let notes = |out: &Json| -> Vec<String> {
+        let notes = out["notes"].as_array().cloned().unwrap_or_default();
+        let notes = notes.iter().filter_map(|n| n.as_str().map(str::to_string));
+        notes.filter(|n| n.starts_with("warning:")).collect()
+    };
+    let (ok, out) = mg(&["set", m, "guard.utc", "FactionID=2"]);
+    assert!(ok, "{out}");
+    assert!(notes(&out).is_empty(), "{out}");
+    let (ok, out) = mg(&["set", m, "guard.utc", "FactionID=0"]);
+    assert!(ok, "{out}");
+    assert_eq!(guard(&path).get("FactionID"), Some(&Value::Word(0)));
+    let said = notes(&out);
+    assert_eq!(said.len(), 1, "{out}");
+    assert!(said[0].contains("guard.utc /FactionID: puts it in the PC faction (0)"), "{said:?}");
+    assert!(said[0].contains("pc-faction"), "{said:?}");
+    let (ok, out) = mg(&["set", m, "guard.utc", "--remove", "FactionID"]);
+    assert!(ok, "{out}");
+    assert!(notes(&out)[0].contains("leaves it no faction"), "{out}");
+    // A placed trigger of faction 0 is the owner's decision: not warned of.
+    let mut module = Module::open(&path).unwrap();
+    let mut area = Gff::new(*b"GIT ");
+    let mut trigger = Struct::new(1);
+    trigger.set("Faction", Value::Dword(2));
+    let mut door = Struct::new(8);
+    door.set("Faction", Value::Dword(2));
+    area.root.set("TriggerList", Value::List(vec![trigger]));
+    area.root.set("Door List", Value::List(vec![door]));
+    module.set_gff(key("area.git"), &area).unwrap();
+    module.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let (ok, out) = mg(&["set", m, "area.git", "/TriggerList[0]/Faction=0"]);
+    assert!(ok && notes(&out).is_empty(), "{out}");
+    let (ok, out) = mg(&["set", m, "area.git", "/Door List[0]/Faction=0"]);
+    assert!(ok, "{out}");
+    assert!(notes(&out)[0].contains("area.git /Door List[0]/Faction"), "{out}");
+}
+
+/// A tag `mg set`, `mg apply` or `mg areas --set` gives an object that
+/// another object of the module has is warned of, as the window's
+/// Duplicate Tags says it (the project's `[tags]`, else each tag a
+/// command sets); the change is made.
+#[test]
+fn a_tag_set_twice_is_warned_of() {
+    let dir = mg_testkit::scratch_dir("mg-set-tag-twice");
+    let path = module(&dir);
+    let m = path.to_str().unwrap();
+    let mut module = Module::open(&path).unwrap();
+    let mut area = Gff::new(*b"ARE ");
+    area.root.set("Tag", Value::String(b"INN".to_vec()));
+    area.root.set("ResRef", Value::resref(mg_core::ResRef::from_str("inn").unwrap()));
+    module.set_gff(key("inn.are"), &area).unwrap();
+    // (In the module's area list: one it leaves out is warned of too.)
+    let mut info = module.info().unwrap();
+    let mut listed = Struct::new(6);
+    listed.set("Area_Name", Value::resref(mg_core::ResRef::from_str("inn").unwrap()));
+    info.root.set("Mod_Area_list", Value::List(vec![listed]));
+    module.set_info(&info).unwrap();
+    let mut placed = Gff::new(*b"GIT ");
+    let waypoint = |tag: &[u8]| {
+        let mut w = Struct::new(5);
+        w.set("Tag", Value::String(tag.to_vec()));
+        w
+    };
+    placed.root.set("WaypointList", Value::List(vec![waypoint(b"WP_DOOR"), waypoint(b"WP_BAR")]));
+    module.set_gff(key("inn.git"), &placed).unwrap();
+    module.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let warnings = |out: &Json| -> Vec<String> {
+        let notes = out["notes"].as_array().cloned().unwrap_or_default();
+        let notes = notes.iter().filter_map(|n| n.as_str().map(str::to_string));
+        notes.filter(|n| n.starts_with("warning:")).collect()
+    };
+    let twice = |tag: &str| {
+        format!(
+            "warning: {tag} is now on two objects: a script finds one of them by it \
+             (GetObjectByTag)"
+        )
+    };
+    let (ok, out) = mg(&["set", m, "inn.git", "/WaypointList[1]/Tag=WP_STAGE"]);
+    assert!(ok && warnings(&out).is_empty(), "{out}");
+    let (ok, out) = mg(&["set", m, "inn.git", "/WaypointList[1]/Tag=WP_DOOR", "--dry-run"]);
+    assert!(ok, "{out}");
+    assert_eq!(warnings(&out), [twice("WP_DOOR")]);
+    // mg apply placing a third with WP_STAGE: its blueprint is not the
+    // module's, so its tag is taken as the blueprint's, and not a
+    // builder's (which only the project's paste_warning = "any" says).
+    let file = dir.join("place.json");
+    let edits = json!({ "label": "Place", "edits": [
+        { "op": "insert_item", "resource": "inn.git", "list": "/WaypointList", "index": 2,
+          "item": { "__struct_id": 5, "Tag": { "type": "cexostring", "value": "WP_STAGE" } } },
+    ]});
+    std::fs::write(&file, edits.to_string()).unwrap();
+    let (ok, out) = mg(&["apply", m, file.to_str().unwrap(), "--dry-run"]);
+    assert!(ok && warnings(&out).is_empty(), "{out}");
+    std::fs::write(dir.join("keep.moonglow.toml"), "[tags]\npaste_warning = \"any\"\n").unwrap();
+    let (ok, out) = mg(&["apply", m, file.to_str().unwrap(), "--dry-run"]);
+    assert!(ok, "{out}");
+    assert_eq!(warnings(&out), [twice("WP_STAGE")]);
+    std::fs::remove_file(dir.join("keep.moonglow.toml")).unwrap();
+    // An area given a waypoint's tag by mg areas.
+    let (ok, out) = mg(&["areas", m, "inn", "--set", "Tag=WP_DOOR", "--dry-run"]);
+    assert!(ok, "{out}");
+    assert_eq!(warnings(&out), [twice("WP_DOOR")], "{out}");
+    // And by mg replace in tags, by a regular expression, of a dry run.
+    let (ok, out) =
+        mg(&["replace", m, "^WP_(STAGE)$", "WP_DOOR", "--regex", "--only", "tags", "--dry-run"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["strings"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(warnings(&out), [twice("WP_DOOR")], "{out}");
+}
+
+/// `mg replace --only` takes the plain fields (tags, resrefs, variables,
+/// fields, or all) beside the players' text, which is what it looks in
+/// without; `--regex` replaces by a regular expression and its groups,
+/// and one that isn't one is an error.
+#[test]
+fn replace_takes_plain_fields_and_regular_expressions() {
+    let dir = mg_testkit::scratch_dir("mg-replace-fields");
+    let path = module(&dir);
+    let m = path.to_str().unwrap();
+    let (ok, out) = mg(&["replace", m, "guard", "warden", "--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(out["strings"].as_array().unwrap().is_empty(), "the tag isn't players' text: {out}");
+    let (ok, out) = mg(&["replace", m, "^(g)uard$", "${1}ate", "--regex", "--only", "tags"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["replaced"], json!(1), "{out}");
+    assert_eq!(guard(&path).get("Tag"), Some(&Value::String(b"gate".to_vec())));
+    let (ok, out) = mg(&["replace", m, "dr(aft", "x", "--regex", "--only", "all"]);
+    assert!(!ok);
+    assert!(out["error"].as_str().unwrap().contains("dr(aft"), "{out}");
+    let (ok, out) = mg(&["replace", m, "draft", "final", "--only", "fields"]);
+    assert!(ok, "{out}");
+    assert_eq!(guard(&path).get("Comment"), Some(&Value::String(b"final".to_vec())));
+    // The start of one kind's name names it (as before the plain kinds).
+    let (ok, out) = mg(&["replace", m, "final", "draft", "--only", "fie", "--dry-run"]);
+    assert!(ok && out["strings"].as_array().unwrap().len() == 1, "{out}");
+    let (ok, out) = mg(&["replace", m, "x", "y", "--only", "tagz"]);
+    assert!(!ok && out["error"].as_str().unwrap().contains("tagz: not names"), "{out}");
+    // (`all` is named whole: `a` names nothing.)
+    let (ok, out) = mg(&["replace", m, "x", "y", "--only", "a"]);
+    assert!(!ok, "{out}");
 }

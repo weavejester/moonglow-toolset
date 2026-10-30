@@ -1,6 +1,7 @@
 //! The Advanced Search tab (Edit › Advanced Search…): the module's
 //! blueprints, placed objects, areas and the rest found by what they hold
-//! (`mg_module::search`), by one condition or several together, listed by
+//! (`mg_module::search`), by one condition or several together (all of
+//! them met, or any; and those ticked Not, not met), listed by
 //! place as Find References lists them; a click opens the object. What is
 //! found (all of it, or what is ticked) can be changed in one step (a
 //! variable set or removed, an event's script, a field: `mg_edit::found`),
@@ -47,6 +48,21 @@ impl Kind {
         Kind::Field,
     ];
 
+    /// Its name as a session keeps it.
+    fn id(self) -> &'static str {
+        match self {
+            Kind::Variable => "variable",
+            Kind::ItemProperty => "item-property",
+            Kind::Class => "class",
+            Kind::Feat => "feat",
+            Kind::Spell => "spell",
+            Kind::Skill => "skill",
+            Kind::Appearance => "appearance",
+            Kind::Script => "script",
+            Kind::Field => "field",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Kind::Variable => "Variables",
@@ -62,21 +78,20 @@ impl Kind {
     }
 }
 
-/// The kinds of object a search may be kept to.
-const OBJECTS: [(ResType, &str); 12] = [
-    (ResType::UTC, "Creatures"),
-    (ResType::UTI, "Items"),
-    (ResType::UTP, "Placeables"),
-    (ResType::UTD, "Doors"),
-    (ResType::UTT, "Triggers"),
-    (ResType::UTE, "Encounters"),
-    (ResType::UTM, "Stores"),
-    (ResType::UTS, "Sounds"),
-    (ResType::UTW, "Waypoints"),
-    (ResType::ARE, "Areas"),
-    (ResType::DLG, "Conversations"),
-    (ResType::IFO, "The module"),
-];
+/// What else a search may be kept to, beside the placed objects' kinds.
+const OTHERS: [(ResType, &str); 3] =
+    [(ResType::ARE, "Areas"), (ResType::DLG, "Conversations"), (ResType::IFO, "The module")];
+
+/// The kinds of object a search may be kept to: the blueprints' types,
+/// then areas, conversations and the module.
+fn objects() -> impl Iterator<Item = (ResType, &'static str)> {
+    ObjectKind::ALL.into_iter().map(|k| (k.restype(), k.label())).chain(OTHERS)
+}
+
+/// What a search kept to `object` is called (`None`: everything).
+fn object_label(object: Option<ResType>) -> &'static str {
+    objects().find(|(t, _)| Some(*t) == object).map_or("Everything", |o| o.1)
+}
 
 /// The highest class level a condition's range reaches.
 const TOP_LEVEL: u8 = 60;
@@ -104,6 +119,9 @@ pub struct Condition {
     pub of: AppearanceOf,
     /// The item property type's parts, for the type they are of.
     pub parts: Option<((usize, Option<usize>), PropertyParts)>,
+    /// What is found must not meet it (one of the conditions with the
+    /// first; the first's is not asked).
+    pub not: bool,
 }
 
 impl Default for Condition {
@@ -122,6 +140,7 @@ impl Default for Condition {
             levels: (1, TOP_LEVEL),
             of: AppearanceOf::Creature,
             parts: None,
+            not: false,
         }
     }
 }
@@ -286,17 +305,124 @@ impl ActDraft {
     }
 }
 
+/// What an appearance is of, as a session keeps it.
+const APPEARANCES: [(AppearanceOf, &str); 6] = [
+    (AppearanceOf::Creature, "creature"),
+    (AppearanceOf::Placeable, "placeable"),
+    (AppearanceOf::Door, "door"),
+    (AppearanceOf::GenericDoor, "generic-door"),
+    (AppearanceOf::Waypoint, "waypoint"),
+    (AppearanceOf::Item, "item"),
+];
+
+/// A condition as a session keeps it (Options › General's tabs opened
+/// again), as text: the kind, what it names and its rows, parts and ranges.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct KeptCondition {
+    kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    name: String,
+    /// A variable's type, as the game numbers it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    var_type: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    value: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    number: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subtype: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param: Option<usize>,
+    min_rank: u8,
+    levels: [u8; 2],
+    of: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    not: bool,
+}
+
+/// The Advanced Search window's question, as a session keeps it.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct KeptSearch {
+    /// The first condition, then those the objects must also meet (or,
+    /// with `any`, may meet instead; those `not`, must not).
+    conditions: Vec<KeptCondition>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    any: bool,
+    /// The kind of object looked at (its extension); none: all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placed: Option<bool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    regex: bool,
+}
+
+impl Condition {
+    fn kept(&self) -> KeptCondition {
+        KeptCondition {
+            kind: self.kind.id().into(),
+            name: self.name.clone(),
+            var_type: self.var_type.map(|t| t as i64),
+            value: self.value.clone(),
+            number: self.number,
+            row: self.row,
+            subtype: self.subtype,
+            cost: self.cost,
+            param: self.param,
+            min_rank: self.min_rank,
+            levels: [self.levels.0, self.levels.1],
+            of: APPEARANCES.iter().find(|(a, _)| *a == self.of).map_or("", |a| a.1).into(),
+            not: self.not,
+        }
+    }
+
+    /// The condition kept (`None`: a kind not known).
+    fn from_kept(k: &KeptCondition) -> Option<Condition> {
+        let d = Condition::default();
+        Some(Condition {
+            kind: Kind::ALL.into_iter().find(|kind| kind.id() == k.kind)?,
+            name: k.name.clone(),
+            var_type: k.var_type.and_then(VarType::of),
+            value: k.value.clone(),
+            number: k.number,
+            row: k.row,
+            subtype: k.subtype,
+            cost: k.cost,
+            param: k.param,
+            min_rank: k.min_rank.max(1),
+            levels: match k.levels {
+                [0, 0] => d.levels,
+                [a, b] => (a.clamp(1, TOP_LEVEL), b.clamp(1, TOP_LEVEL)),
+            },
+            of: APPEARANCES.iter().find(|(_, n)| *n == k.of).map_or(d.of, |a| a.0),
+            parts: None,
+            not: k.not,
+        })
+    }
+}
+
 /// The Advanced Search window's state.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AdvancedSearch {
     /// What is looked for.
     pub first: Condition,
-    /// And what the same objects must also hold.
+    /// And what the same objects must also hold (or, with `any`, may hold
+    /// instead; those ticked `not`, must not hold).
     pub and: Vec<Condition>,
+    /// Objects meeting any of the conditions, not all of them.
+    pub any: bool,
     /// The kind of object looked at; none: all.
     pub object: Option<ResType>,
     /// Only placed objects, only blueprints.
     pub placed: Option<bool>,
+    /// Names and texts are regular expressions (not `*` patterns).
+    pub regex: bool,
     /// What was found, for the query in `searched`.
     pub hits: Vec<Hit>,
     pub searched: Option<Query>,
@@ -309,15 +435,58 @@ pub struct AdvancedSearch {
 }
 
 impl AdvancedSearch {
+    /// Its question, as a session keeps it (`None`: none asked, the
+    /// window as it opens).
+    pub(crate) fn kept(&self) -> Option<KeptSearch> {
+        let fresh = AdvancedSearch::default();
+        let asked = self.first != fresh.first
+            || !self.and.is_empty()
+            || self.object.is_some()
+            || self.placed.is_some()
+            || self.any
+            || self.regex;
+        asked.then(|| KeptSearch {
+            conditions: std::iter::once(&self.first)
+                .chain(&self.and)
+                .map(Condition::kept)
+                .collect(),
+            any: self.any,
+            object: self.object.and_then(|t| t.extension()).map(str::to_string),
+            placed: self.placed,
+            regex: self.regex,
+        })
+    }
+
+    /// Asks the question a session kept again (what it found is not: a
+    /// search of a large module takes a while).
+    pub(crate) fn ask_again(&mut self, k: &KeptSearch) {
+        let mut conditions = k.conditions.iter().filter_map(Condition::from_kept);
+        let Some(first) = conditions.next() else { return };
+        self.first = first;
+        self.and = conditions.collect();
+        self.any = k.any;
+        self.object = k.object.as_deref().and_then(ResType::from_extension);
+        self.placed = k.placed;
+        self.regex = k.regex;
+    }
+
     /// The query the window asks, or what it still needs.
     pub fn query(&self) -> Result<Query, String> {
-        let and = self.and.iter().map(Condition::search).collect::<Result<_, _>>()?;
-        Ok(Query {
+        let (not, and): (Vec<&Condition>, Vec<&Condition>) = self.and.iter().partition(|c| c.not);
+        let searches = |cs: Vec<&Condition>| -> Result<Vec<Search>, String> {
+            cs.into_iter().map(Condition::search).collect()
+        };
+        let q = Query {
             search: self.first.search()?,
-            and,
+            and: searches(and)?,
+            any: self.any,
+            not: searches(not)?,
             types: self.object.into_iter().collect(),
             placed: self.placed,
-        })
+            regex: self.regex,
+        };
+        q.check().map_err(|e| format!("Not a regular expression: {e}"))?;
+        Ok(q)
     }
 
     /// The hits ticked.
@@ -392,12 +561,26 @@ impl Moonglow {
 
 /// A row of a table, chosen by name (a long list has a filter); `any`
 /// names the choice of none. With no names (no game data), a number.
-fn row_picker(
+pub(crate) fn row_picker(
     ui: &mut Ui,
     id: &str,
     choices: &[Choice],
     row: &mut Option<usize>,
     any: Option<&str>,
+) {
+    row_picker_in(ui, id, choices, row, any, false);
+}
+
+/// [`row_picker`], in the order given where `ordered` (an item
+/// property's values, as the item editor's Cost Parameter has them: +2
+/// before +10).
+fn row_picker_in(
+    ui: &mut Ui,
+    id: &str,
+    choices: &[Choice],
+    row: &mut Option<usize>,
+    any: Option<&str>,
+    ordered: bool,
 ) {
     if choices.is_empty() {
         let mut on = row.is_some() || any.is_none();
@@ -414,9 +597,12 @@ fn row_picker(
         ui.label(format!("Row {row}"));
     };
     let current = row.map(|r| r as i64);
-    let list = crate::widgets::row_choice(egui::Id::new(id), choices, current)
+    let mut list = crate::widgets::row_choice(egui::Id::new(id), choices, current)
         .width(260.0)
         .about(&mut number);
+    if ordered {
+        list = list.ordered();
+    }
     let list = match any {
         Some(any) => list.none(any),
         None => list.unset("Choose…"),
@@ -427,7 +613,7 @@ fn row_picker(
 }
 
 /// The choices of a table, as the game names them.
-fn choices(game: Option<&GameData>, table: &mg_rules::rows::RowTable) -> Vec<Choice> {
+pub(crate) fn choices(game: Option<&GameData>, table: &mg_rules::rows::RowTable) -> Vec<Choice> {
     let Some(game) = game else { return Vec::new() };
     let columns = ChoiceColumns { name: table.name, label: table.label };
     game.choice_list(table.table, columns).map(|c| c.to_vec()).unwrap_or_default()
@@ -488,7 +674,10 @@ fn condition_ui(ui: &mut Ui, c: &mut Condition, game: Option<&GameData>, salt: &
             ] {
                 if all || !choices.is_empty() {
                     crate::widgets::field_label(ui, label);
-                    row_picker(ui, &id(label), choices, row, Some("Any"));
+                    // (Each in the item editor's order: the values as the
+                    // cost table has them, the others by name.)
+                    let ordered = label == "Value";
+                    row_picker_in(ui, &id(label), choices, row, Some("Any"), ordered);
                     ui.end_row();
                 }
             }
@@ -586,11 +775,23 @@ fn search_ui(ui: &mut Ui, d: &mut AdvancedSearch, game: Option<&GameData>) -> bo
         ui.end_row();
         find |= condition_ui(ui, &mut d.first, game, "");
         for (i, c) in d.and.iter_mut().enumerate() {
-            crate::widgets::field_label(ui, "And").on_hover_text(
-                "Objects that hold this too (or hold, or are held by, one that does)",
-            );
+            let (label, hover) = match (c.not, d.any) {
+                (true, _) => (
+                    "Not",
+                    "Objects that don't hold this (nor hold, nor are held by, one that does)",
+                ),
+                (false, true) => {
+                    ("Or", "Objects that hold this instead (each found where it is found)")
+                }
+                (false, false) => {
+                    ("And", "Objects that hold this too (or hold, or are held by, one that does)")
+                }
+            };
+            crate::widgets::field_label(ui, label).on_hover_text(hover);
             ui.horizontal(|ui| {
                 kind_choice(ui, c, &format!("advanced-search-kind-{i}"));
+                ui.checkbox(&mut c.not, "Not")
+                    .on_hover_text("Leave out the objects that meet this condition");
                 if ui.small_button("Remove").clicked() {
                     remove = Some(i);
                 }
@@ -599,25 +800,38 @@ fn search_ui(ui: &mut Ui, d: &mut AdvancedSearch, game: Option<&GameData>) -> bo
             find |= condition_ui(ui, c, game, &format!("-{i}"));
         }
         ui.label("");
-        if ui
-            .button("And…")
-            .on_hover_text("Another condition the objects found must meet")
-            .clicked()
-        {
+        let (more, hover) = match d.any {
+            false => ("And…", "Another condition the objects found must meet"),
+            true => ("Or…", "Another condition the objects found may meet instead"),
+        };
+        if ui.button(more).on_hover_text(hover).clicked() {
             d.and.push(Condition { kind: Kind::Feat, ..Default::default() });
         }
         ui.end_row();
+        if !d.and.is_empty() {
+            crate::widgets::field_label(ui, "Find objects");
+            let meeting = |any: &bool| match any {
+                false => "meeting all of the conditions",
+                true => "meeting any of the conditions",
+            };
+            crate::widgets::dropdown("advanced-search-any")
+                .selected_text(meeting(&d.any))
+                .width(260.0)
+                .show(ui, &mut d.any, &[false, true], meeting)
+                .on_hover_text(
+                    "All: what the first finds, where the same object meets the others. Any: \
+                     what each finds. Either way, less the objects meeting a condition ticked \
+                     Not",
+                );
+            ui.end_row();
+        }
         crate::widgets::field_label(ui, "Look at");
         ui.horizontal(|ui| {
-            let object =
-                OBJECTS.iter().find(|(t, _)| Some(*t) == d.object).map_or("Everything", |o| o.1);
             let objects: Vec<_> =
-                std::iter::once(None).chain(OBJECTS.iter().map(|o| Some(o.0))).collect();
+                std::iter::once(None).chain(objects().map(|o| Some(o.0))).collect();
             crate::widgets::dropdown("advanced-search-object")
-                .selected_text(object)
-                .show(ui, &mut d.object, &objects, |t| {
-                    OBJECTS.iter().find(|o| Some(o.0) == *t).map_or("Everything", |o| o.1)
-                })
+                .selected_text(object_label(d.object))
+                .show(ui, &mut d.object, &objects, |t| object_label(*t))
                 .on_hover_text("Items include those in inventories, equipment and stores");
             let placed = match d.placed {
                 None => "blueprints and placed objects",
@@ -635,6 +849,13 @@ fn search_ui(ui: &mut Ui, d: &mut AdvancedSearch, game: Option<&GameData>) -> bo
                 },
             );
         });
+        ui.end_row();
+        ui.label("");
+        ui.checkbox(&mut d.regex, "Regular expressions").on_hover_text(
+            "Names and texts (a variable's name and value, a script's name, a field's label \
+             and text) are regular expressions, not * patterns: found anywhere unless \
+             anchored (^kz_(rent|own)$), letters A to Z in either case",
+        );
         ui.end_row();
     });
     if let Some(i) = remove {
@@ -921,4 +1142,52 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         });
     }
     app.advanced_search = draft;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A search is kept to each placed object kind by its type and the
+    /// name the toolset calls it by, then to areas, conversations and the
+    /// module.
+    #[test]
+    fn a_search_is_kept_to_each_kind_of_object() {
+        let listed: Vec<_> = objects().collect();
+        assert_eq!(listed.len(), ObjectKind::ALL.len() + 3);
+        for k in ObjectKind::ALL {
+            assert_eq!(object_label(Some(k.restype())), k.label());
+        }
+        assert_eq!(object_label(Some(ResType::UTM)), "Stores");
+        assert_eq!(object_label(Some(ResType::IFO)), "The module");
+        assert_eq!(object_label(None), "Everything");
+    }
+
+    /// The conditions ticked Not are those the query leaves out, the
+    /// others its `and` (any of them, with `any`); a session keeps both.
+    #[test]
+    fn conditions_not_met_and_any_of_them_are_asked_and_kept() {
+        let feat =
+            |row, not| Condition { kind: Kind::Feat, row: Some(row), not, ..Default::default() };
+        let d = AdvancedSearch {
+            first: Condition { kind: Kind::Class, row: Some(4), ..Default::default() },
+            and: vec![feat(0, true), feat(1, false), feat(2, true)],
+            any: true,
+            ..Default::default()
+        };
+        let q = d.query().unwrap();
+        assert_eq!((q.search, q.any), (Search::Class(4), true));
+        assert_eq!(q.and, [Search::Feat(1)]);
+        assert_eq!(q.not, [Search::Feat(0), Search::Feat(2)]);
+        let mut again = AdvancedSearch::default();
+        again.ask_again(&d.kept().unwrap());
+        assert_eq!((again.first, again.and, again.any), (d.first, d.and, true));
+        // (A session from before keeps none of them.)
+        let old: KeptSearch =
+            serde_json::from_str(r#"{"conditions":[{"kind":"feat","row":3}]}"#).unwrap();
+        let mut again = AdvancedSearch::default();
+        again.ask_again(&old);
+        assert!(!again.any && !again.first.not);
+        assert!(AdvancedSearch { any: true, ..Default::default() }.kept().is_some());
+    }
 }

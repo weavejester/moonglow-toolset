@@ -7,8 +7,7 @@ use crate::common::*;
 fn welcome_then_open_a_module_through_the_dialog() {
     let dir = mg_testkit::scratch_dir("ui-open");
     let path = sample_module(&dir);
-    let mut h =
-        Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app_with(vec![path.clone()]));
+    let mut h = window_harness(app_with(vec![path.clone()]));
     h.run();
     h.get_by_label("Open Module…").click();
     h.run();
@@ -28,7 +27,7 @@ fn edit_undo_save_reopen() {
     // (The module opens on its Properties, not on an area.)
     app.settings.no_last_area = true;
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
 
     // Change the tag through the text field (commits when focus leaves).
@@ -91,7 +90,7 @@ fn closing_with_unsaved_changes_asks_first() {
     let path = sample_module(&dir);
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     set_tag(h.state_mut(), "EDITED");
     h.run();
 
@@ -173,13 +172,10 @@ fn a_first_save_builds_once_and_not_when_called_off() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-first-save");
     let path = dir.join("fresh.mod");
-    let install = mg_resman::GameInstall::new(&root, None, "en");
     // The first Save As is called off, the second answered.
-    let app = Moonglow::new(
-        Some(install),
-        Box::new(NoDialogs { save: vec![path.clone()], ..Default::default() }),
-    );
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let app =
+        game_app_with(&root, None, NoDialogs { save: vec![path.clone()], ..Default::default() });
+    let mut h = window_harness(app);
     h.run();
     h.state_mut().actions.push(mg_ui::Action::NewModule("Fresh".into()));
     h.run();
@@ -208,7 +204,7 @@ fn new_module_and_area_through_the_wizards() {
     let path = dir.join("wizard.mod");
     let app =
         game_app_with(&root, None, NoDialogs { save: vec![path.clone()], ..Default::default() });
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
 
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
@@ -281,7 +277,7 @@ fn recent_modules_reopen_from_the_welcome_page() {
     app.open_module(&path);
     assert_eq!(app.settings.recent, std::slice::from_ref(&path));
     app.close();
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // (Its name, and the folder it is in.)
     let place = dir.file_name().unwrap().to_string_lossy().into_owned();
@@ -304,9 +300,11 @@ fn export_lists_a_kind() {
     let mut app = app_with(Vec::new());
     app.settings.no_last_area = true;
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.state_mut().actions.push(mg_ui::Action::ExportDialog(Vec::new()));
     h.run();
+    let draft = h.state().export.clone().unwrap();
+    assert!(draft.dependencies);
     // Every kind, each under its heading, the tree's kinds first.
     assert!(h.query_by_label("Areas (.are)").is_some());
     assert!(h.query_by_label("Scripts (.nss)").is_some());
@@ -333,6 +331,54 @@ fn export_lists_a_kind() {
     assert!(!left.contains(&ResKey::parse("mg_two", ResType::NSS).unwrap()));
 }
 
+/// An Export to an archive that is there asks what Aurora's asks, in its
+/// words: Yes adds the resources to it (what it held stays), No replaces
+/// it, Cancel writes nothing (Aurora's Export, captured 2026-10-29).
+#[test]
+fn export_to_an_archive_that_is_there_asks_to_append_overwrite_or_cancel() {
+    let dir = mg_testkit::scratch_dir("ui-export-ask");
+    let source = sample_module(&dir);
+    let erf = dir.join("kept.erf");
+    let area = ResKey::parse("start", ResType::ARE).unwrap();
+    let keep = ResKey::parse("w1_keep", ResType::NSS).unwrap();
+    let held = |path: &std::path::Path| -> Vec<ResKey> {
+        let bytes = std::fs::read(path).unwrap();
+        let archive = mg_erf::Erf::read(&bytes).unwrap();
+        archive.entries.iter().map(|e| ResKey::new(e.resref, e.restype)).collect()
+    };
+    let answer = |label: &str| {
+        // The archive there, holding one script.
+        let mut old = mg_erf::ErfWriter::new(*b"ERF ");
+        old.add(keep.resref, keep.restype, b"void main() {}\n".to_vec()).unwrap();
+        std::fs::write(&erf, old.to_bytes().unwrap()).unwrap();
+        let mut app = Moonglow::new(
+            None,
+            Box::new(NoDialogs { save: vec![erf.clone()], ..Default::default() }),
+        );
+        app.open_module(&source);
+        let mut h = window_harness(app);
+        h.state_mut().actions.push(mg_ui::Action::ExportDialog(vec![area]));
+        h.run();
+        h.get_by_label("Export 1…").click();
+        h.run();
+        // Asked first: nothing written yet.
+        assert_eq!(held(&erf), [keep], "asked before anything is written");
+        h.get_by_label_contains("already exists. Do you wish to append to it?");
+        h.get_by_label("Click YES to append to the file.");
+        h.get_by_label("Click NO to overwrite the file.");
+        h.get_by_label("Click CANCEL to do nothing.");
+        h.get_by_label(label).click();
+        h.run();
+        assert!(h.state().export_ask.is_none(), "answered");
+        held(&erf)
+    };
+    let appended = answer("Yes");
+    assert!(appended.contains(&keep) && appended.contains(&area), "{appended:?}");
+    let replaced = answer("No");
+    assert!(!replaced.contains(&keep) && replaced.contains(&area), "{replaced:?}");
+    assert_eq!(answer("Cancel"), [keep], "nothing written");
+}
+
 #[test]
 fn export_then_import_into_another_module() {
     let dir = mg_testkit::scratch_dir("ui-transfer");
@@ -350,7 +396,7 @@ fn export_then_import_into_another_module() {
         }),
     );
     app.open_module(&source);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.state_mut().actions.push(mg_ui::Action::ExportDialog(vec![area]));
     h.run();
     h.get_by_label("Export 1…").click();
@@ -398,7 +444,7 @@ fn an_area_exported_alone_takes_its_git_and_gic() {
     let dialogs = NoDialogs { save: vec![erf.clone()], ..Default::default() };
     let mut app = Moonglow::new(None, Box::new(dialogs));
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     let area = ResKey::parse("start", ResType::ARE).unwrap();
     h.state_mut().actions.push(mg_ui::Action::ExportDialog(vec![area]));
     h.run();
@@ -429,7 +475,7 @@ fn a_folder_module_is_saved_as_a_mod_beside_it() {
         let ws = app.ws.as_mut().unwrap();
         ws.save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
     }
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     assert!(!h.state().settings.no_mod_beside_folder, "on unless switched off");
     h.state_mut().settings.no_mod_beside_folder = true;
@@ -460,8 +506,7 @@ fn a_mod_with_its_folder_beside_it_asks_which_to_open() {
     let path = sample_module(&dir);
     let folder = dir.join("sample");
     Module::open(&path).unwrap().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
-    let mut h =
-        Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app_with(vec![path.clone()]));
+    let mut h = window_harness(app_with(vec![path.clone()]));
     h.run();
     let location = |h: &Harness<'_, Moonglow>| h.state().ws.as_ref()?.module.location.clone();
     // File › Open Module… (the welcome page's button): asked first.
@@ -538,7 +583,7 @@ fn the_welcome_page_tells_a_folder_from_its_mod() {
     let mut app = app_with(Vec::new());
     app.settings.recent = vec![folder.clone(), path.clone()];
     app.settings.module_folders = mg_ui::settings::ModuleFolders::Folder;
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let place = dir.file_name().unwrap().to_string_lossy().into_owned();
     h.get_by_label(&format!("sample.mod  in {place}"));
@@ -557,8 +602,7 @@ fn a_mod_s_folder_in_another_case_is_found() {
     let path = sample_module(&dir);
     let folder = dir.join("Sample");
     Module::open(&path).unwrap().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
-    let mut h =
-        Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app_with(vec![path.clone()]));
+    let mut h = window_harness(app_with(vec![path.clone()]));
     h.run();
     h.state_mut().actions.push(mg_ui::Action::OpenModule(path.clone()));
     h.run();
@@ -585,7 +629,7 @@ fn module_name_in_every_language_and_variables() {
     // (The module opens on its Properties, not on an area.)
     app.settings.no_last_area = true;
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let info = |app: &mut Moonglow| {
         let ws = app.ws.as_mut().unwrap();
@@ -649,8 +693,7 @@ fn module_name_in_every_language_and_variables() {
 fn published_to_nwsync_from_the_build_menu() {
     let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("ui-nwsync");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let user = user_folder(&dir, &["hak"]);
     let mut w = mg_erf::ErfWriter::new(*b"HAK ");
     let table = b"2DA V2.0\n\n   Label\n0  synced\n".to_vec();
     w.add(ResRef::from_str("mg_synced").unwrap(), ResType::TWODA, table.clone()).unwrap();
@@ -662,6 +705,7 @@ fn published_to_nwsync_from_the_build_menu() {
     m.set_info(&info).unwrap();
     m.save().unwrap();
     let mut app = game_app(&root, Some(user));
+    app.background_jobs = true;
     app.open_module(&path);
     let mut h = harness(app, 1200.0, 800.0);
     h.run();
@@ -670,17 +714,36 @@ fn published_to_nwsync_from_the_build_menu() {
     h.get_by_label("Publish to NWSync…").click();
     h.run();
     let repo = dir.join("repo");
+    let _ = std::fs::remove_dir_all(&repo);
     h.state_mut().publish.as_mut().unwrap().folder = repo.display().to_string();
     h.run();
-    h.get_by_label("Publish").click();
-    // It runs in the background.
-    for _ in 0..200 {
-        h.run_steps(2);
-        if h.state().publish.as_ref().is_some_and(|p| p.written.is_some() || p.error.is_some()) {
-            break;
+    // It runs as a job (its window, with Cancel), the window behind it
+    // showing what it wrote.
+    let until_done = |h: &mut Harness<'_, Moonglow>| {
+        let started = std::time::Instant::now();
+        while h.state().busy() {
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(started.elapsed().as_secs() < 30, "the job never ended");
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+        h.run_steps(2);
+    };
+    // Uploaded after: a stand-in command that writes each part's name, in
+    // turn (nothing goes anywhere but this folder).
+    let order = dir.join("order.txt");
+    let _ = std::fs::remove_file(&order);
+    let log = mg_module::nwsync::shell_quoted(&order);
+    h.state_mut().settings.nwsync_upload = Some(format!("echo {{part}}>> {log}"));
+    h.state_mut().settings.nwsync_upload_after = true;
+    let sent = || -> Vec<String> {
+        let text = std::fs::read_to_string(&order).unwrap_or_default();
+        text.lines().map(|l| l.trim().to_string()).collect()
+    };
+    h.get_by_label("Publish").click();
+    h.run_steps(1);
+    until_done(&mut h);
+    until_done(&mut h);
+    assert_eq!(sent(), ["data", "manifests", "latest"], "{:?}", h.state().log.entries);
     let p = h.state().publish.as_ref().unwrap();
     assert_eq!(p.error, None);
     let written = p.written.clone().expect("published");
@@ -692,6 +755,29 @@ fn published_to_nwsync_from_the_build_menu() {
     assert_eq!(entries[0].1, mg_core::sha1::sha1(&table));
     assert!(h.get_all_by_label_contains(&written.sha1).count() >= 1);
     assert_eq!(h.state().settings.nwsync_repository.as_deref(), Some(repo.as_path()));
+
+    // Remove Unused Data: a data file no manifest names, older than two
+    // weeks, goes; the manifest's own stays.
+    let unused = repo.join("data/sha1/ab/cd").join("ab".repeat(20));
+    std::fs::create_dir_all(unused.parent().unwrap()).unwrap();
+    std::fs::write(&unused, b"left by a manifest taken away").unwrap();
+    let month_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    let file = std::fs::File::options().write(true).open(&unused).unwrap();
+    file.set_modified(month_ago).unwrap();
+    drop(file);
+    h.get_by_label("Remove Unused Data").click();
+    h.run_steps(1);
+    until_done(&mut h);
+    until_done(&mut h);
+    // And uploaded after: the manifests before the data (a command that
+    // deletes takes a manifest away before its data); `latest` as it was.
+    assert_eq!(sent(), ["data", "manifests", "latest", "manifests", "data"]);
+    assert!(!unused.exists() && !repo.join("data/sha1/ab").exists());
+    let h1 = mg_core::sha1::hex(&mg_core::sha1::sha1(&table));
+    assert!(repo.join("data/sha1").join(&h1[..2]).join(&h1[2..4]).join(&h1).is_file());
+    let pruned = h.state().publish.as_ref().unwrap().pruned.clone().expect("pruned");
+    assert_eq!((pruned.manifests, pruned.removed.len()), (1, 1));
+    h.get_by_label_contains("Removed 1 unused data file (");
 }
 
 #[test]
@@ -700,7 +786,7 @@ fn faction_editor_adds_and_removes_factions() {
     let path = sample_module(&dir);
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Factions));
     h.run();
     let factions =
@@ -737,7 +823,7 @@ fn journal_editor_builds_what_aurora_builds() {
     let path = sample_module(&dir);
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Journal));
     h.run();
     // As Aurora was driven: two categories, two entries in the first, one
@@ -787,8 +873,7 @@ fn turkish_harness(name: &str, table: bool) -> Option<(Harness<'static, Moonglow
         return None;
     };
     let dir = mg_testkit::scratch_dir(name);
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let user = user_folder(&dir, &["hak"]);
     let mut rows = String::from("2DA V2.0\n\n     Codepoint\n");
     let own = mg_core::Codepage::WINDOWS_1252.chars().unwrap();
     for (b, c) in own.iter().enumerate() {
@@ -862,7 +947,11 @@ fn a_hak_s_encoding_table_reads_and_writes_the_module_s_text() {
     assert!(game.codepage().encode("ð").is_none());
     drop(game);
 
-    // The hak taken off the module: the game's own codepage again.
+    // The hak taken off the module while the tag is being typed in: the
+    // field reads its bytes again by the game's own codepage, and left
+    // untouched, the tag keeps its bytes.
+    h.get_all_by_value("Işık dağı é").find(is_input).expect("the tag").click();
+    h.run();
     let edit = mg_edit::Edit::SetField {
         key: ResKey::parse("module", ResType::IFO).unwrap(),
         path: mg_edit::GffPath::root(),
@@ -873,6 +962,9 @@ fn a_hak_s_encoding_table_reads_and_writes_the_module_s_text() {
     h.run();
     assert!(!h.state().game.as_deref().unwrap().codepage().is_table());
     assert!(h.query_all_by_value("Iþýk daðý é").any(|n| is_input(&n)));
+    h.key_press(egui::Key::Tab);
+    h.run();
+    assert_eq!(field(&mut h, &key).string("Tag").unwrap(), b"I\xfe\xfdk da\xf0\xfd \xe9");
 }
 
 /// Without the table all is as it was: Windows-1252.
@@ -1025,7 +1117,7 @@ fn saving_keeps_the_module_as_it_was_as_a_backup() {
         vec![mg_edit::Edit::SetResource { key, data: Some(b"void main() {}".to_vec()) }],
     )));
     app.actions.push(mg_ui::Action::Save);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // Aurora's name: <module>.BackupMod, the module before the save.
     let backup = path.with_extension("BackupMod");
@@ -1064,7 +1156,7 @@ fn an_import_warns_of_what_it_shadows() {
     }
     w.add(ResRef::from_str("mg_mine").unwrap(), ResType::NSS, b"void main() {}".to_vec()).unwrap();
     std::fs::write(&erf, w.to_bytes().unwrap()).unwrap();
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.state_mut().actions.push(mg_ui::Action::ImportDialog);
     h.run();
     h.get_by_label("Import").click();
@@ -1106,7 +1198,7 @@ fn unsaved_work_survives_a_crash() {
             value: Some(mg_gff::Value::String(b"RECOVERED".to_vec())),
         };
         app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new("tag", vec![edit])));
-        let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+        let mut h = window_harness(app);
         h.run();
         let copy = h.state_mut().write_recovery().unwrap();
         assert!(copy.starts_with(&recovery) && copy.is_file());
@@ -1117,7 +1209,7 @@ fn unsaved_work_survives_a_crash() {
     app.find_recoveries();
     assert_eq!(app.recoveries.len(), 1);
     assert_eq!(app.recoveries[0].note.module.as_deref(), Some(path.as_path()));
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     h.get_by_label("Recover Unsaved Work");
     h.get_by_label("Recover").click();
@@ -1145,7 +1237,7 @@ fn a_panic_keeps_the_unsaved_work() {
     let mut app = app_with(Vec::new());
     app.recovery_dir = Some(recovery.clone());
     app.open_module(&path);
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     // (Its message is printed: the test's own.)
     let panics = |app: &mut Moonglow| {
@@ -1228,7 +1320,7 @@ fn verify_says_errors_first_and_gone_blueprints_once_each() {
         },
         category: Category::Placeables,
         uncompiled: false,
-        only_userpatch: false,
+        only_local: None,
     };
     let utp = RefKind::Blueprint(ResType::UTP);
     let list = [
@@ -1268,7 +1360,7 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
         app.settings.scratch_dir = Some(scratch.into());
         app.open_module(module);
         app.actions.push(mg_ui::Action::OpenTab(Tab::Script(key)));
-        let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+        let mut h = window_harness(app);
         h.run();
         h
     };
@@ -1285,6 +1377,35 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
     };
     let said = texts(&h);
     assert!(said.iter().any(|t| t.contains("copied hello.nss, hello.ncs to")), "{said:?}");
+    // Compiled without debug information: the debug file of an older
+    // compile is removed, and another program's spelling of the compiled
+    // script too (where the file system tells cases apart, a file of its
+    // own the game could read in its place).
+    std::fs::write(scratch.join("hello.ndb"), b"NDB older").unwrap();
+    let other_spelling = scratch.join("HELLO.NCS");
+    let apart = !other_spelling.exists();
+    if apart {
+        std::fs::write(&other_spelling, b"NCS V1.0 older").unwrap();
+    }
+    h.get_by_label("To Scratch").click();
+    h.run_steps(3);
+    assert!(std::fs::read(scratch.join("hello.ncs")).unwrap().starts_with(b"NCS V1.0"));
+    assert!(!scratch.join("hello.ndb").exists(), "no debug file of an older compile");
+    let said = texts(&h);
+    let removed = match apart {
+        true => "removed HELLO.NCS, hello.ndb, left by an earlier copy (the game would still run",
+        false => "removed hello.ndb, left by an earlier copy (made by an older compile)",
+    };
+    assert!(said.iter().any(|t| t.contains(removed)), "{said:?}");
+    if apart {
+        assert!(!other_spelling.exists());
+    }
+    // With debug information: the debug file made goes with it.
+    h.state_mut().settings.debug_info = true;
+    h.get_by_label("To Scratch").click();
+    h.run_steps(3);
+    assert!(scratch.join("hello.ndb").exists(), "{:?}", texts(&h));
+    h.state_mut().settings.debug_info = false;
     // A script with an error: its source copied, and the compiler's error
     // said; the compiled script the module has from before is not.
     let broken_path = sample_module(&dir.join("broken"));
@@ -1397,6 +1518,37 @@ fn a_stale_compiled_script_is_compiled_before_it_goes_out() {
     assert!(said(&h, "No longer compiles (the .ncs written is older than the script): hello"));
 }
 
+/// Without the game's data nothing can be compiled: a script goes out
+/// with the compiled script the module has, and the log says it may be
+/// older than its source.
+#[test]
+fn without_game_data_a_script_goes_out_with_the_module_s_compiled_script() {
+    let dir = mg_testkit::scratch_dir("ui-no-game-export");
+    let path = sample_module(&dir);
+    let key = ResKey::parse("hello", ResType::NSS).unwrap();
+    let mut m = Module::open(&path).unwrap();
+    m.set(ResKey::new(key.resref, ResType::NCS), b"NCS V1.0 old".to_vec());
+    m.save().unwrap();
+    let mut app = app_with(Vec::new());
+    app.open_module(&path);
+    let scratch = dir.join("scratch");
+    app.settings.scratch_dir = Some(scratch.clone());
+    app.actions.push(mg_ui::Action::ExportFiles {
+        keys: vec![key],
+        dependencies: false,
+        scratch: true,
+    });
+    let mut h = window_harness(app);
+    h.run_steps(3);
+    assert_eq!(std::fs::read(scratch.join("hello.ncs")).unwrap(), b"NCS V1.0 old");
+    let log = &h.state().log.entries;
+    let warned = "No game data to compile with: the scripts go out with the compiled scripts";
+    assert!(
+        log.iter().any(|(l, m)| *l == mg_ui::Level::Warning && m.starts_with(warned)),
+        "{log:?}"
+    );
+}
+
 /// The area view's To Scratch: the area as it is now (its .are, .git and
 /// .gic) copied into the scratch folder, with what of the module's it
 /// uses (its OnEnter script, compiled), not only the area.
@@ -1416,13 +1568,13 @@ fn an_area_goes_to_the_scratch_folder() {
         return;
     };
     // No scratch folder yet, and none chosen when asked: nothing is copied.
-    h.get_by_label("To Scratch").click();
+    h.get_by_label("📤 To Scratch").click();
     h.run_steps(2);
     assert_eq!(h.state().settings.scratch_dir, None);
     let scratch = mg_testkit::scratch_dir("ui-area-scratch").join("scratch");
     h.state_mut().settings.scratch_dir = Some(scratch.clone());
     h.run_steps(2);
-    h.get_by_label("To Scratch").click();
+    h.get_by_label("📤 To Scratch").click();
     h.run_steps(3);
     let mut names: Vec<String> = std::fs::read_dir(&scratch)
         .unwrap()
@@ -1511,6 +1663,62 @@ fn a_module_folder_s_files_changed_outside_are_read_again() {
     assert!(script(&h, "fresh").is_none());
 }
 
+/// A field typed in and not left (Module Properties' description) when
+/// the module's files are read again, changed outside: it sets what was
+/// typed first, which makes the file one changed here and outside both,
+/// asked about, with what was typed kept. (Read again under it, the field
+/// showed the file's text and what was typed went: a builder's report,
+/// October 2026.)
+#[test]
+fn a_field_typed_in_sets_its_text_before_files_changed_outside_are_read() {
+    use mg_module::ModuleLocation;
+    let dir = mg_testkit::scratch_dir("ui-folder-outside-typed");
+    let folder = dir.join("module");
+    let mut m = Module::open(&sample_module(&dir)).unwrap();
+    m.save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.settings.no_mod_beside_folder = true;
+    app.open_module(&folder);
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run_steps(3);
+    h.get_by_label("Description").click();
+    h.run_steps(3);
+    let memo = egui_kittest::kittest::by().role(egui::accesskit::Role::MultilineTextInput);
+    let at = h.get(memo).rect().center();
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(2);
+    h.event(egui::Event::Text("Typed here. ".into()));
+    h.run_steps(2);
+    let ifo = ResKey::parse("module", ResType::IFO).unwrap();
+    let has = |h: &mut Harness<'_, Moonglow>, text: &str| {
+        let root = h.state_mut().ws.as_mut().unwrap().doc(&ifo).unwrap().root.clone();
+        let d = root.locstring("Mod_Description").cloned().unwrap_or_default();
+        d.strings.iter().any(|(_, t)| String::from_utf8_lossy(t).contains(text))
+    };
+    assert!(!has(&mut h, "Typed here. "), "not set while it is typed");
+    assert!(h.ctx.egui_wants_keyboard_input());
+    // Another program changes the module's IFO (its tag), and the look
+    // at the files is taken as the window's frames go on.
+    let path = folder.join("module.ifo");
+    let mut outside = mg_gff::Gff::read(&std::fs::read(&path).unwrap()).unwrap();
+    outside.root.set("Mod_Tag", mg_gff::Value::String(b"CHANGED_OUTSIDE".to_vec()));
+    std::fs::write(&path, outside.to_bytes().unwrap()).unwrap();
+    h.state_mut().look_outside();
+    let started = std::time::Instant::now();
+    while h.state().looking_outside() {
+        assert!(started.elapsed().as_secs() < 30, "the look ends");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.run_steps(2);
+    assert!(has(&mut h, "Typed here. "), "what was typed is set and kept");
+    assert_eq!(h.state().outside_conflicts(), [path], "and the file changed outside asked about");
+    assert!(!h.ctx.egui_wants_keyboard_input(), "the keyboard left the field");
+}
+
 /// The window's own close button asks before Moonglow closes where there
 /// is nothing unsaved to ask about; with the option off it closes, and
 /// with unsaved work (a table's here) the question is about that.
@@ -1554,4 +1762,162 @@ fn closing_the_window_asks_first() {
     h.state_mut().actions.push(mg_ui::Action::Quit);
     h.run_steps(3);
     assert!(h.state().quit_requested);
+    // Nor does its key, Alt+X, Aurora's.
+    h.state_mut().quit_requested = false;
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::X);
+    h.run_steps(3);
+    assert!(h.state().quit_requested, "Alt+X exits");
+}
+
+/// Test Module and a game running that Moonglow did not start (GitHub
+/// issue 6): one started on the module stops the test (the module would be
+/// written under it), as one Moonglow started does; another is warned of
+/// and the test goes on. Never stopped. (Stand-ins named as the client: a
+/// shell for the game running, `true` for the client the test starts.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_game_moonglow_did_not_start_is_known_before_a_test() {
+    let dir = mg_testkit::scratch_dir("ui-other-game");
+    let (root, user, elsewhere) = (dir.join("root"), dir.join("user"), dir.join("elsewhere"));
+    let client = root.join("bin/linux-x86/nwmain-linux");
+    for d in [client.parent().unwrap(), &user.join("modules"), &elsewhere] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let (Some(sh), Some(truth)) = (which("sh"), true_program()) else { return };
+    std::fs::copy(&truth, &client).unwrap();
+    let running = elsewhere.join("nwmain-linux");
+    std::fs::copy(&sh, &running).unwrap();
+    let path = sample_module(&dir);
+    // (Named for this process: a run of these tests beside it has its own
+    // stand-in game running on its own module, which this one would find.)
+    let name = format!("mgtest{}", std::process::id());
+    let file = user.join(format!("modules/{name}.mod"));
+    std::fs::copy(&path, &file).unwrap();
+    let game = |module: &str| {
+        std::process::Command::new(&running)
+            .args(["-c", "sleep 30; true", "nwmain-linux", "+TestNewModule", module])
+            .spawn()
+            .unwrap()
+    };
+    let mut app = game_app_with(&root, Some(user.clone()), NoDialogs::default());
+    app.settings.no_last_area = true;
+    app.open_module(&file);
+    let mut h = window_harness(app);
+    h.run_steps(2);
+    let test = |h: &mut Harness<'_, Moonglow>| {
+        let from = h.state().log.entries.len();
+        h.state_mut().actions.push(mg_ui::Action::TestModule);
+        h.run_steps(3);
+        h.state().log.entries[from..].iter().map(|(_, m)| m.clone()).collect::<Vec<_>>()
+    };
+    // On the module: no test.
+    let mut on_it = game(&name);
+    let said = test(&mut h);
+    on_it.kill().unwrap();
+    on_it.wait().unwrap();
+    let refused =
+        format!("A game is running on {name} (process {}), not started by Moonglow", on_it.id());
+    assert!(said.iter().any(|m| m.starts_with(&refused)), "{said:?}");
+    assert!(!said.iter().any(|m| *m == format!("Testing {name}")), "{said:?}");
+    // F9 looks before Test Module's save: the module's file is not
+    // written under that game.
+    let before = std::fs::read(&file).unwrap();
+    let edit = mg_edit::Edit::SetResource {
+        key: ResKey::parse("added", ResType::NSS).unwrap(),
+        data: Some(b"void main() { }\n".to_vec()),
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Add", vec![edit])));
+    h.run_steps(2);
+    let mut on_it = game(&name);
+    h.key_press(egui::Key::F9);
+    h.run_steps(3);
+    on_it.kill().unwrap();
+    on_it.wait().unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), before, "not saved under the game");
+    assert!(h.state().has_unsaved_work());
+    let log = &h.state().log.entries;
+    assert!(log.iter().any(|(_, m)| m.contains(&format!("(process {})", on_it.id()))), "{log:?}");
+    // On another: warned of, and the test goes on.
+    let mut other = game("elsewhere");
+    let said = test(&mut h);
+    other.kill().unwrap();
+    other.wait().unwrap();
+    let warned = "A game is running that Moonglow did not start (process ";
+    assert!(
+        said.iter().any(|m| m.starts_with(warned) && m.contains(&other.id().to_string())),
+        "{said:?}"
+    );
+    assert!(said.iter().any(|m| *m == format!("Testing {name}")), "{said:?}");
+}
+
+/// A program on `PATH`.
+#[cfg(target_os = "linux")]
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// Build › Round-Trip Check runs `mg roundtrip`'s check on the module as
+/// it is in the window, unsaved changes too, as a job, and says what it
+/// found in the log; the module's file is not touched.
+#[test]
+fn the_round_trip_check_runs_from_the_build_menu() {
+    let dir = mg_testkit::scratch_dir("ui-round-trip");
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    m.set(ResKey::parse("broken", ResType::UTP).unwrap(), b"not a gff".to_vec());
+    m.save().unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut app = app_with(Vec::new());
+    app.open_module(&path);
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run();
+    h.get_by_label("Build").click();
+    h.run();
+    h.get_by_label("Round-Trip Check").click();
+    h.run();
+    h.run();
+    let log: Vec<String> = h.state().log.entries.iter().map(|(_, e)| e.clone()).collect();
+    let summary = log.iter().find(|e| e.starts_with("Round trip: ") && e.contains("resources"));
+    let summary = summary.unwrap_or_else(|| panic!("{log:?}"));
+    assert!(summary.ends_with("written anew: all the same"), "{summary}");
+    assert!(log.iter().any(|e| e.starts_with("Round trip: broken.utp cannot be read")), "{log:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "the module's file is not touched");
+}
+
+/// Module Properties' Check for Conflicts, and in its window What the
+/// Module Uses: each hak's resources by what the module reaches of them
+/// (a blueprint a script names, its script), as `mg haks --usage` says it.
+#[test]
+fn check_for_conflicts_says_what_the_module_uses_of_its_haks() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-hak-usage");
+    let user = user_folder(&dir, &["hak"]);
+    let mut w = mg_erf::ErfWriter::new(*b"HAK ");
+    let mut utp = Gff::new(*b"UTP ");
+    utp.root.set("OnUsed", mg_gff::Value::resref(ResRef::from_str("mg_hak_used").unwrap()));
+    w.add(ResRef::from_str("mg_named").unwrap(), ResType::UTP, utp.to_bytes().unwrap()).unwrap();
+    w.add(ResRef::from_str("mg_hak_used").unwrap(), ResType::NCS, b"NCS".to_vec()).unwrap();
+    w.add(ResRef::from_str("mg_unused").unwrap(), ResType::UTP, utp.to_bytes().unwrap()).unwrap();
+    std::fs::write(user.join("hak/mg_content.hak"), w.to_bytes().unwrap()).unwrap();
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let mut info = m.info().unwrap();
+    info.root.set("Mod_HakList", mg_module::attach::hak_list(&info.root, &["mg_content".into()]));
+    m.set_info(&info).unwrap();
+    let spawn = b"void main() { CreateObject(64, \"mg_named\", GetLocation(OBJECT_SELF)); }";
+    m.set(ResKey::parse("spawn", ResType::NSS).unwrap(), spawn.to_vec());
+    m.save().unwrap();
+    let mut app = game_app(&root, Some(user));
+    app.open_module(&path);
+    let mut h = harness(app, 1200.0, 800.0);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::HakReport);
+    h.run();
+    assert!(h.state().hak_report.is_some());
+    h.get_by_label("What the Module Uses").click();
+    h.run();
+    let used = h.state().hak_usage.clone().expect("the walk ran");
+    assert!(used.contains("mg_content\t2 of 3 used"), "{used}");
+    assert!(used.contains("1 unused"), "{used}");
+    assert!(h.query_by_label_contains("What the module uses (in the game a player has)").is_some());
 }

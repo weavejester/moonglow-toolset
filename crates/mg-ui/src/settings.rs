@@ -60,6 +60,19 @@ pub enum ModuleFolders {
     Module,
 }
 
+/// Options › Area › Shadows quality (and the area view's Shadows menu):
+/// how the area view draws the game's shadows. Fast, a shadow map (its
+/// edges as fine as the map's texels: blocky up close), cheap in every
+/// area; High, stencil shadow volumes as the game casts them (edges as
+/// sharp as the picture's, anti-aliased with it), dearer in the largest
+/// areas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShadowQuality {
+    #[default]
+    Fast,
+    High,
+}
+
 /// Options › General › Graphics backend: what Moonglow draws with, read
 /// at its start (`apps/moonglow`, before the window has a device;
 /// [`mg_render::backend::pick_adapter`]). Automatic is wgpu's choice, but
@@ -243,13 +256,25 @@ pub struct PaintSettings {
     /// The room between pieces of a row or a fill (overlap, if less than
     /// zero), in centimeters.
     pub gap_cm: i16,
+    /// The circle takes the chosen blueprints' placeables out of the area
+    /// (Erase), rather than painting them.
+    pub erase: bool,
+    /// What it puts down is locked (the area editor's Lock): later clicks
+    /// and boxes pass through it.
+    pub lock: bool,
+    /// Density counts every placeable in the circle, not only the chosen
+    /// blueprints'.
+    pub count_all: bool,
+    /// Spacing is kept between the placeables' sides (each one's size
+    /// by its model's box), rather than between their middles.
+    pub by_size: bool,
 }
 
 impl PaintSettings {
     /// Whether a drag lays the pieces (Row, Fill), rather than a brush
-    /// dabbing them (Scatter).
+    /// dabbing them (Scatter) or taking them out (Erase).
     pub fn by_drag(&self) -> bool {
-        self.row || self.fill
+        !self.erase && (self.row || self.fill)
     }
 }
 
@@ -267,6 +292,10 @@ impl Default for PaintSettings {
             scale_max: 100,
             lift_cm: 0,
             gap_cm: 0,
+            erase: false,
+            lock: false,
+            count_all: false,
+            by_size: false,
         }
     }
 }
@@ -294,9 +323,14 @@ pub struct Settings {
     /// The area view's Light Shadows (in the Shadows button's menu) are
     /// off, in views opened from now on.
     pub no_light_shadows: bool,
+    /// Options › Area › Shadows quality (also in the Shadows button's
+    /// menu): every area view's.
+    pub shadow_quality: ShadowQuality,
     /// The area view's Sound Ranges switch is on, in views opened from
     /// now on.
     pub sound_ranges: bool,
+    /// The area view's Minimap switch is on, in views opened from now on.
+    pub area_minimap: bool,
     /// The area view's Animations switch is off: creatures and other
     /// placed objects hold still.
     pub still_objects: bool,
@@ -312,10 +346,14 @@ pub struct Settings {
     /// `Encounters`…, as [`mg_area::ObjectKind::label`] names them, and
     /// `Start` for the start location's marker; `Merchants`, as 1.35 and
     /// earlier wrote it, is read as `Stores`): every area view, the open
-    /// ones and those opened from now on, hides them, as in Aurora.
+    /// ones and those opened from now on, hides them, as in Aurora. For
+    /// this run only, as Aurora's (it shows every kind again when it
+    /// starts: captured 2026-10-29), so an area never opens looking empty.
+    #[serde(skip)]
     pub hidden_in_areas: Vec<String>,
-    /// Options › Verify: the groups Verify Module leaves out of its report
-    /// (by [`mg_module::doctor::Group::id`]).
+    /// Options › Verify: what Verify Module leaves out of its report, by
+    /// the words [`mg_module::doctor::Skip`] reads (groups, checks,
+    /// categories of missing references, haks, folders, resources).
     pub verify_skip: Vec<String>,
     /// The folder each hak was built from (the hak's path, the folder's),
     /// most recent first: Update from Folder reads it again.
@@ -401,6 +439,12 @@ pub struct Settings {
     /// `None`: none chosen yet (a module opens on its tiles).
     pub palette_type: Option<String>,
     pub palette_custom: bool,
+    /// What was typed in the palettes' search, as last left.
+    pub palette_search: String,
+    /// The palettes' categories left open: each a blueprint type's
+    /// extension, `custom` or `standard`, and the category's place in its
+    /// palette (`utc/standard/2.0`). They open so at the next start.
+    pub palette_open: Vec<String>,
     /// How large the galleries' pictures are, points (their slider's;
     /// `None`: the usual size).
     pub gallery_tile: Option<u16>,
@@ -461,7 +505,7 @@ pub struct Settings {
     /// Options > General: Keep recovery copies of unsaved work, off (on by
     /// default; Moonglow's, Aurora has none).
     pub no_autosave: bool,
-    /// Every so many minutes (`None`: 5).
+    /// Every so many minutes (`None`: [`AUTOSAVE_MINUTES`]).
     pub autosave_minutes: Option<u32>,
     /// Options > General: Reload haks, override and development when they
     /// change, off (on by default; Moonglow's).
@@ -571,6 +615,10 @@ pub struct Settings {
     /// Options > Area: Show the turning and tilt rings around selected
     /// objects is off.
     pub no_turn_ring: bool,
+    /// Options > Area: Lights of any color and reach, as content written
+    /// into a hak ([`mg_module::lights`]); off by default (the project
+    /// file's `[lights] generated` wins).
+    pub generated_lights: bool,
     /// Options > Language: the language text is shown and edited in
     /// (language.2da row); `None`: the default, English.
     pub edit_language: Option<u32>,
@@ -589,6 +637,15 @@ pub struct Settings {
     pub key_bindings: std::collections::BTreeMap<String, Vec<String>>,
     /// Build › Publish to NWSync: the repository folder last written.
     pub nwsync_repository: Option<PathBuf>,
+    /// Options › Folders: the command that sends the NWSync repository to
+    /// the web server, once for each part (`{folder}`, `{part}`), where
+    /// the project names none (`[nwsync] upload`).
+    pub nwsync_upload: Option<String>,
+    /// It reads what the builder types (as a project command's `input`).
+    pub nwsync_upload_input: bool,
+    /// Publish to NWSync: upload after publishing and after Remove Unused
+    /// Data.
+    pub nwsync_upload_after: bool,
     /// Options > Conversation Editor: NPC and player text colours (sRGB);
     /// `None`: Moonglow's red and blue.
     pub dialog_npc_color: Option<[u8; 3]>,
@@ -611,6 +668,11 @@ pub struct Settings {
     /// itself.
     #[serde(default)]
     pub turn_together: bool,
+    /// The area view: what is placed goes onto the top of a placeable or
+    /// door under the pointer (the toolbar's Onto Objects), as Drop onto
+    /// Object sets it after; off, on the ground.
+    #[serde(default)]
+    pub place_onto_objects: bool,
     /// The area view's placeable brush (Paint): its strip's settings.
     #[serde(default)]
     pub paint: PaintSettings,
@@ -631,7 +693,7 @@ pub struct Settings {
     /// Options > Conversation Editor: Automatically backup the conversation
     /// files, off (Aurora's default: on).
     pub dialog_no_backup: bool,
-    /// The backup interval in minutes (`None`: Aurora's 5).
+    /// The backup interval in minutes (`None`: [`DIALOG_BACKUP_MINUTES`], Aurora's).
     pub dialog_backup_minutes: Option<u32>,
     /// Options › Updates: Check for updates automatically, off (on by
     /// default: GitHub is asked for the latest release once a day at most).
@@ -650,7 +712,26 @@ pub struct Settings {
 /// kept on disk). A builder's own choice is kept whatever this says.
 pub const GAME_SHADERS_BY_DEFAULT: bool = true;
 
+/// Recovery copies of unsaved work every so many minutes, where
+/// `autosave_minutes` is unset.
+pub const AUTOSAVE_MINUTES: u32 = 5;
+
+/// A conversation's backup every so many minutes, where
+/// `dialog_backup_minutes` is unset (Aurora's 5).
+pub const DIALOG_BACKUP_MINUTES: u32 = 5;
+
 impl Settings {
+    /// The minutes between recovery copies ([`AUTOSAVE_MINUTES`] unset).
+    pub fn autosave_every(&self) -> u32 {
+        self.autosave_minutes.unwrap_or(AUTOSAVE_MINUTES)
+    }
+
+    /// The minutes between a conversation's backups
+    /// ([`DIALOG_BACKUP_MINUTES`] unset).
+    pub fn dialog_backup_every(&self) -> u32 {
+        self.dialog_backup_minutes.unwrap_or(DIALOG_BACKUP_MINUTES)
+    }
+
     /// The settings kept under `key` in eframe's settings file (`app.ron`:
     /// a RON map of keys to RON text), read before eframe opens it, or
     /// `None` without the file or the key, or where they can't be read.
@@ -766,15 +847,19 @@ mod tests {
     fn the_shadow_kinds_default_and_are_kept() {
         let old: Settings = serde_json::from_str(r#"{"no_shadows":false}"#).unwrap();
         assert!(!old.no_shadows && !old.no_creature_shadows && !old.no_light_shadows);
+        // (Fast, the shadow map, unless High is chosen.)
+        assert_eq!(old.shadow_quality, ShadowQuality::Fast);
         let chosen = Settings {
             no_shadows: true,
             no_creature_shadows: true,
             no_light_shadows: true,
+            shadow_quality: ShadowQuality::High,
             ..Settings::default()
         };
         let back: Settings =
             serde_json::from_str(&serde_json::to_string(&chosen).unwrap()).unwrap();
         assert!(back.no_shadows && back.no_creature_shadows && back.no_light_shadows);
+        assert_eq!(back.shadow_quality, ShadowQuality::High);
     }
 
     #[test]
@@ -804,23 +889,36 @@ mod tests {
         assert_eq!(language(None), "en");
         // (A language the game has no folder for.)
         assert_eq!(language(Some(131)), "en");
-        if root.join("lang/pl/data/dialog.tlk").is_file() {
-            assert_eq!(language(Some(5)), "pl");
-            // A description named by StrRef reads in Polish then (the
-            // drow's, string 64101).
-            let text = |edit: Option<u32>| {
-                let s = Settings {
-                    game_root: Some(root.clone()),
-                    edit_language: edit,
-                    ..Default::default()
-                };
-                let game = mg_rules::GameData::open(&s.install().unwrap()).unwrap();
-                game.string(mg_core::StrRef(64101)).unwrap()
+        // A description named by StrRef reads in the language then (the
+        // drow's, string 64101), and the language's own archives
+        // (`lang/<code>/data/nwn_base_loc.key`: its voices and
+        // conversations) are read: each of the EE's languages installed.
+        let game = |edit: Option<u32>| {
+            let s = Settings {
+                game_root: Some(root.clone()),
+                edit_language: edit,
+                ..Default::default()
             };
-            let (english, polish) = (text(None), text(Some(5)));
-            assert!(english.contains("drow"), "{english}");
-            assert_ne!(english, polish, "another language's text");
+            mg_rules::GameData::open(&s.install().unwrap()).unwrap()
+        };
+        let english = game(None).string(mg_core::StrRef(64101)).unwrap();
+        assert!(english.contains("drow"), "{english}");
+        let mut seen = 0;
+        for id in 1..=5 {
+            let code = mg_core::Language(id).short_code().unwrap();
+            if !root.join("lang").join(code).join("data/dialog.tlk").is_file() {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(language(Some(id)), code);
+            let game = game(Some(id));
+            let text = game.string(mg_core::StrRef(64101)).unwrap();
+            assert_ne!(english, text, "{code}: another language's text");
+            let localized = game.resman.layers().iter().any(|l| l.label == "key:nwn_base_loc");
+            let lang_key = root.join("lang").join(code).join("data/nwn_base_loc.key");
+            assert_eq!(localized, lang_key.is_file(), "{code}: its own archives");
         }
+        eprintln!("{seen} languages besides English");
     }
 
     /// `moonglow --user-dir DIR` chooses this run's user folder, over the

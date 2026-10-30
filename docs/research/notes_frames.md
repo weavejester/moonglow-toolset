@@ -1,9 +1,9 @@
 ---
 type: Research Note
 title: 'Frames at 144 a second: where a frame''s time went'
-description: Frame times against a 144 fps budget (6.94 ms) on the development machine - how each view is timed, what an area's picture, the galleries and the lists cost before and after October 2026's work, a dense area seen whole and an area's opening (27 October), what the profile found, and what is left.
+description: Frame times against a 144 fps budget (6.94 ms) on the development machine - how each view is timed, what an area's picture, the galleries and the lists cost before and after October 2026's work, a dense area seen whole and an area's opening (27 October), the largest stock area seen whole taken apart (30 October), what the profile found, and what is left.
 tags: [performance, frames, renderer, area-view, galleries]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-27T07:08:40Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T11:30:00Z }
 sources:
   - id: frame-perf
     resource: crates/mg-ui/tests/frame_perf.rs
@@ -17,6 +17,9 @@ sources:
   - id: woods
     resource: crates/mg-ui/tests/frame_perf.rs
     title: 'game_shaders_frames_at_144 with the builder''s haks: TDoD''s woods, area092 and the water area, before and after (27 October 2026)'
+  - id: area084
+    resource: crates/mg-corpus-tests/examples/render_area.rs
+    title: 'render_area MG_TIME_RENDER on Tyrants of the Moonsea''s area084, its stacks sampled with eu-stack (30 October 2026)'
 ---
 
 # Frames at 144 a second: where a frame's time went
@@ -197,7 +200,11 @@ own frames. Its times are to be taken with nothing else drawing.)
   had read every area's ARE) and three render targets were made. The
   flush is now once a revision, the targets shared, and pictures are made
   for 2 ms a frame (`THUMBNAIL_TIME`; one at least). How the 8 ms
-  divided was not measured.
+  divided was not measured. Since 2026-10-29 a flush writes only the
+  documents edited since the last one: with 300 GITs of 200 creatures
+  read (5 MB), it was 5.0 ms of writing them out and is now nothing
+  (0.5 µs; 19 µs with one of them edited; release, the machine at a load
+  of 11).
 - **All pictures were let go at once** when there were more than 192, or
   when the module changed at all. A gallery over a wide window shows more
   than 192: it made them again three a frame without end. Now those in
@@ -208,11 +215,52 @@ own frames. Its times are to be taken with nothing else drawing.)
   the picture's memory (1.8 MB each). A picture is now its own texture
   alone (0.2 MB).
 
+### A slow picture, read apart (29 October 2026)
+
+What was left of a gallery's frames was the picture that took one: a
+model with large textures, read, uploaded and drawn on the window's
+thread in one frame. Timed in `frames_at_144` (`FRAME_VIEW=Gallery
+FRAME_DETAIL=1`, release, the machine at a load of 6 to 16 from other
+builds), the frames the wheel turns the palette's Gallery in, three
+runs each way in turn: made in the frame, the slowest 16 to 20 ms (the
+smallest pictures', 11 to 13) and one to three frames over the budget a
+run; read apart, the slowest 1.8 to 3.2 ms and none over it.
+
+Where the frame went, taken apart: the models' reading (`Model::read`
+of the model and its supermodels) and their upload; the textures' reading,
+decoding and mipmaps; and, the most of the slowest pictures (13 to 27 ms
+of `tnp_balc_a02`'s), the game's programs a picture was the first to
+draw with, made while the frame waited. Now, where the window keeps going
+(`background_jobs`, the desktop app), a picture's models are read and
+uploaded by two threads of their own (`PictureReader` in `model_view.rs`,
+from the module's models as they were then and the game's), its textures
+are read apart as the area view's are, and the game's programs made apart
+as the area view makes them (`game_background`); the picture is drawn in
+the frame after they are, and kept only once nothing it draws waited. The
+jobs waiting are let go of with the game data
+(`Moonglow::release_game_data`). Tests that make pictures with it off make
+them in the frame, as before.
+
+The galleries' pictures are the same, pixel for pixel, read either way
+(`frames_at_144` with `FRAME_SHOTS=1`, the palette's Gallery at both
+sizes; and `a_gallery_s_pictures_are_read_apart_and_look_the_same`).
+
 ### Smaller things
 
 - The area's sounds copied the area's whole GIT every frame
   (`area_audio.rs`): now only its sound properties and placed sounds.
 - The debug log's per-frame lines cost nothing measurable.
+- **A tile's animations were bound to its model by name each time it
+  was posed**, three times a frame (its pose, its lights, its meshes),
+  every node's name lower-cased. They are bound once, as the model is
+  loaded (`anim::Binding`, kept in the area's `Loaded`), and their keys
+  gathered once for the three (`anim::Playing`). The scene's making
+  (`render_area`'s `MG_TIME=400`, the median; each binary run twice in
+  turn, the machine at a load of 26 to 31 from other builds): area092
+  0.30 and 0.43 ms, now 0.13 and 0.12; area075 1.65 and 1.72, now 0.60
+  and 0.41; area074 1.45 and 1.39, now 0.59; Elmwood (its objects
+  posed too) 5.4 and 2.8, now 1.9 and 1.4. The pictures are the same,
+  every pixel.
 
 ## A dense area seen whole, and opening an area (27 October 2026)
 
@@ -317,14 +365,74 @@ renderer's part.
   left is per draw: some 25,000 draws whose meshes are mostly of one
   instance each (the area has each tile model four times), each a draw
   call; and the chunks the draws switch between.
-- **While an area fills in,** its picture is drawn again as textures
+- ~~**While an area fills in,** its picture is drawn again as textures
   arrive: those frames cost what the view costs drawn whole (13 to 22 ms
   for the woods). The frame an area is first shown in looks up its
   materials (MTRs) on the window's thread: 19 to 30 ms for the woods,
-  23 ms for the water area, not taken apart.
+  23 ms for the water area, not taken apart.~~ Taken apart on 29
+  October: the harness stepped its clock a quarter of a second a frame,
+  so every frame of the opening was an animation step's, its picture
+  drawn whole. At a 144th of a second a step, as the window's frames go
+  (`frame_perf`'s harness since), the woods open with one frame in six
+  drawn (the animations' steps, 25 a second, as an open view's are),
+  each costing what the view costs drawn whole (15 to 21 ms off, 17 to
+  26 on, more as more textures are in), the others under a millisecond
+  and a half: 22 frames over the budget in 1.45 s. The frame it is first
+  shown in is 11 ms, and its materials are not what it costs: the 298
+  meshes' slots (their MTRs looked up and read) took 0.6 to 1.1 ms of it.
+  An edit, read in the frame, costs a millisecond besides its picture
+  (14.2 ms off, 17.8 on, against 13 and 18 drawn alone); Reload Resources
+  reads the area again on a thread. What is left is the picture's cost
+  seen whole, in "The largest areas in full view".
 - A program that moves its vertices farther than a meter (TDoD's grass
   lifted by `fTilesetMeshOffsetZ`, 2 m) may be blended in another order
   where it reaches past its grown box.
+
+## The largest stock area seen whole, taken apart (30 October 2026)
+
+Tyrants of the Moonsea's area084 (676 tiles, 549 objects) with the
+wheel zooming over all of it is over the budget: 9.8 ms a frame, 10.8
+turning (`sound_ranges_frames_at_144`, the machine at a load of 1 to
+2), all of it the window's thread, the GPU's 1.2 to 1.7 ms. Drawn alone
+at the frame test's size with the game's shaders (`render_area`'s new
+`MG_TIME_RENDER`, the median of 500 frames, the camera turning a little
+each): the scene made in 0.5 ms, its draws encoded in 8.0 ms, the GPU's
+2.6 ms; 16,651 meshes in 9,680 draws of 1,606 materials and 278
+pipelines in turn, 942 out of sight, 4,779 casting the sun's
+shadows.[^area084]
+
+| Where the encoding went (221 stacks) | Share |
+| --- | --- |
+| wgpu's `finish`: each draw's groups and buffers bound, their uses and initialized ranges tracked, the driver's calls | 33% |
+| The game's draws' values worked out and written (`GameShaders::push`, `upload`, `fill_member`, `write_buffer`) | 20% |
+| The lights each mesh takes (`ReachCache::reaching`), most of it moving kept choices between two maps | 9% |
+| The batcher (`Batcher::place`) | 9% |
+| The sun's shadows: their plan and map (1.3 ms with them off) | 6% |
+| Sorting, the light sets' map growing, the screen boxes | 8% |
+
+The lights a mesh took are now kept in one map with the frame that last
+took them, and the light sets' map keeps its room from frame to frame:
+encoded in 7.5 ms (four runs in turn with the build before, 8.0), the
+picture the same to the bit.
+
+What would not do it:
+
+- **Leaving out what is too small to see.** Of the 12,149 meshes in
+  sight, 47 are under a pixel across and 632 under two: the area's
+  meshes are tile-sized.
+- **Merging far tiles' meshes.** Each draw lights its mesh with the 32
+  lights that matter most to it; a merged mesh would take 32 for the
+  whole, and the picture would change where more reach it.
+- **Keeping the draws' values while only the camera moves.** The game's
+  programs take `m_mv` and `m_mvp` a draw and the lights in view space:
+  every value block is written anew as the camera moves, and a wheel's
+  zoom moves it every frame. The sun's map is fitted to the view, so it
+  is drawn anew as well.
+
+What is left is wgpu's work for each of some 10,000 draws: fewer draws
+(one material's meshes of many tiles drawn as one, each mesh's lights
+found by its vertices), or render bundles recorded once for what doesn't
+move, which wgpu replays without tracking each draw again.
 
 ## Not covered
 
@@ -335,9 +443,9 @@ In short:
   zooming out; TDoD's woods, 33,000 meshes in sight, 13 ms (16 with the
   game's shaders) and 21 (28) turned to the horizon. Close up they are
   within it.
-- **Opening an area** no longer holds the window; the frames that draw
-  it as it fills in cost what the view costs, and the frame it is first
-  shown in looks its materials up (19 to 30 ms for the woods).
+- **Opening an area** no longer holds the window, nor does Reload
+  Resources; the frames that draw it as it fills in are the animations'
+  steps and cost what the view costs drawn whole.
 - **A slow picture** (a model with large textures) still takes a frame
   of 7 to 9 ms in a gallery.
 - **The module tree** at persistent-world sizes is as it was. (The
@@ -348,4 +456,5 @@ In short:
 
 [^frame-perf]: The frame-time test (release build, Tyrants of the Moonsea and the persistent world)
 [^budget]: The budget: a steady 144 frames a second on the development machine (7 October 2026)
+[^area084]: render_area MG_TIME_RENDER on Tyrants of the Moonsea's area084, its stacks sampled with eu-stack (30 October 2026)
 [^woods]: game_shaders_frames_at_144 with the builder's haks: TDoD's woods, area092 and the water area, before and after (27 October 2026)

@@ -40,32 +40,13 @@ pub(crate) fn game_for(
         out.note("no game install found: a plugin's game data is empty (--root, or NWN_ROOT)");
         return None;
     };
-    match GameData::open(gi) {
-        Ok(game) => Some(Arc::new(layered(game, gi, m, out))),
+    match crate::game_data_in(gi, m, out) {
+        Ok(game) => Some(Arc::new(game)),
         Err(e) => {
-            out.note(format!("the game data could not be read: {e}"));
+            out.note(format!("warning: the game data could not be read: {e:#}"));
             None
         }
     }
-}
-
-/// The game's data with the module's haks and the module layered in, and
-/// its custom talk table.
-fn layered(mut game: GameData, gi: &GameInstall, m: &Module, out: &mut Output) -> GameData {
-    let (missing, wrong) = m.stack_onto(&mut game.resman, gi);
-    missing.iter().for_each(|h| out.note(format!("warning: hak {h} not found")));
-    if let Some(e) = wrong {
-        out.note(format!("warning: the module's haks: {e}"));
-    }
-    let language = Some(game.language);
-    if let Some(name) = m.custom_tlk().ok().flatten()
-        && let Some(found) =
-            mg_module::talk::find_any(m, &game.resman, &gi.tlk_dirs(), &name, language)
-        && let Ok(tlk) = found.tlk()
-    {
-        game.set_custom_tlk(Some(tlk));
-    }
-    game
 }
 
 /// The command line as a plugin's host: the log kept for the output, a
@@ -485,8 +466,7 @@ pub(crate) fn test(gi: Option<&GameInstall>, dir: &Path, module: Option<&Path>) 
                     .into());
             }
             let gi = GameInstall::new(root, gi.and_then(|g| g.user_dir.clone()), "en");
-            let game = GameData::open(&gi).map_err(|e| e.to_string())?;
-            return Ok(Some(layered(game, &gi, m, &mut said)));
+            return crate::game_data_in(&gi, m, &mut said).map(Some).map_err(|e| format!("{e:#}"));
         }
         let Some(gi) = gi else {
             // (Said once: without a game, a plugin's ctx.game is empty, but
@@ -502,10 +482,10 @@ pub(crate) fn test(gi: Option<&GameInstall>, dir: &Path, module: Option<&Path>) 
             }
             return Ok(None);
         };
-        match GameData::open(gi) {
-            Ok(game) => Ok(Some(layered(game, gi, m, &mut said))),
+        match crate::game_data_in(gi, m, &mut said) {
+            Ok(game) => Ok(Some(game)),
             Err(e) => {
-                said.note(format!("the game data could not be read: {e}"));
+                said.note(format!("warning: the game data could not be read: {e:#}"));
                 Ok(None)
             }
         }
@@ -759,14 +739,21 @@ pub(crate) fn run(
     let game = game_for(gi, &m, &mut notes);
     // (The edits are shown in the module's own letters, as the plugin
     // wrote them.)
-    let codepage = game.as_ref().map_or(mg_core::Codepage::WINDOWS_1252, |game| {
-        game.codepage().for_language(mg_core::Language::ENGLISH)
-    });
+    let codepage = game.as_ref().map_or(mg_core::Codepage::WINDOWS_1252, |g| g.text_codepage());
     let host = Rc::new(host);
     // What it is run on is the module's (a blueprint may be the game's).
     let named = what.selection.selected.iter().chain(&what.selection.open);
     for s in named {
         let (key, _) = s.place();
+        if let Some(layer) = s.layer() {
+            // (A layer's copy: that layer of the game's load order has it.)
+            let rm = game.as_ref().map(|g| &g.resman);
+            let at = rm.and_then(|rm| rm.layers().iter().position(|l| l.label == layer));
+            if !at.is_some_and(|i| rm.is_some_and(|rm| rm.get_in(i, &key).is_ok())) {
+                bail!("{layer} has no {key} (`mg which {key}` lists the layers that have it)");
+            }
+            continue;
+        }
         let game_has = game.as_ref().is_some_and(|g| g.resman.get(&key).is_ok());
         if !m.contains(&key) && !(matches!(s, mg_plugin::Selected::Blueprint(_)) && game_has) {
             bail!("{key} is not in the module");
@@ -832,7 +819,7 @@ pub(crate) fn run(
     // Its haks first: the module's edits may name them.
     let hak_dir = hak_dir
         .map(Path::to_path_buf)
-        .or_else(|| gi.and_then(|gi| gi.user_dir.as_ref().map(|u| u.join("hak"))));
+        .or_else(|| gi.and_then(mg_resman::GameInstall::user_hak_dir));
     for hak in &outcome.haks {
         let Some(dir) = &hak_dir else {
             bail!("the plugin writes the hak {}: say where haks go (--hak-dir DIR)", hak.name);
@@ -927,12 +914,13 @@ fn project_plugins(m: &Module, all: bool, named: &[Plugin], out: &mut Output) ->
 }
 
 /// The findings of every check of the plugins chosen, for `mg verify`,
-/// each with its fix if the check gave it one.
-/// A check that fails is itself a finding, an error.
+/// each with its fix if the check gave it one (a check `--skip` names
+/// isn't run). A check that fails is itself a finding, an error.
 pub(crate) fn findings(
     gi: &GameInstall,
     m: &Module,
     chosen: &Chosen<'_>,
+    skip: &mg_module::doctor::Skip,
     out: &mut Output,
 ) -> Result<Vec<mg_plugin::Found>> {
     let mut all = Vec::new();
@@ -956,6 +944,9 @@ pub(crate) fn findings(
         for plugin in plugins {
             let settings = settings_for(&plugin, m, &[], out)?;
             for check in &plugin.manifest.checks {
+                if skip.plugin_check(&plugin.check_id(&check.id)) {
+                    continue;
+                }
                 let host = Rc::new(CliHost::default());
                 let input = Input {
                     settings: Some(settings.clone()),

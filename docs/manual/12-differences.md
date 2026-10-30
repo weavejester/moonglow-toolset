@@ -3,7 +3,7 @@ type: Manual Page
 title: Differences from Aurora
 description: Where Moonglow deliberately departs from Aurora.
 tags: [manual, aurora, differences]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-26T13:41:32Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T03:31:49Z }
 ---
 
 # Differences from Aurora
@@ -11,9 +11,15 @@ generated: { by: claude-code/claude-opus-5-5, at: 2026-10-26T13:41:32Z }
 Moonglow aims to do what Aurora does and write what Aurora writes. Where
 it differs, it is on purpose:
 
-- **Edits apply as you make them.** Property windows are tabs with no
-  OK or Cancel; every change is one undoable step, and **undo is
-  unlimited** (Aurora's area undo has a set number of levels).
+- **Edits apply as you make them**, each one undoable step, and **undo
+  is unlimited** (Aurora's area undo has a set number of levels). The
+  editors' windows (a blueprint's Properties, a placed object's, Module
+  and Area Properties, a conversation, the journal, the factions) still
+  have **OK** and **Cancel** as Aurora's do: Cancel sets back what was
+  changed in the window since it was opened, as one step. A 2DA, a hak,
+  a tileset, the talk table and a script are saved when you ask, so
+  their OK saves and closes, and their Cancel closes as last saved
+  (after asking).
 - **Tabs and windows, not dialogs**: every editor is a tab or a window
   that stays open beside the others; areas stay in the main pane.
 - **The Welcome tab** is the start page, not a dialog at start.
@@ -41,14 +47,26 @@ it differs, it is on purpose:
 - **userpatch.ini's haks** (the HD Pack and the like) and **Steam
   Workshop content** can be read as the game reads them (Options ›
   General, both off by default as in Aurora, which can't read them);
-  Verify warns of a reference only userpatch.ini's haks satisfy.
+  Verify warns of a reference only they or your `override` folder
+  satisfy.
 - **Environment maps** on creatures and items are always drawn, as the
   game draws them.
 - **Grass** is drawn in the area viewer, which Aurora does not draw: the
   tileset's and the area's own (Area Properties › Grass, which Aurora
-  hasn't), on the tiles within 30 m of where the view looks, whatever
-  its distance (the game draws it within about 24 m of its camera). Its
-  tufts are spread evenly, where the game's gather in patches.
+  hasn't), wherever the view shows grass ground, thinner far off (the
+  game draws it within 30 m of its camera by default, fading it out from
+  about 22 m; its Grass Far Render Distance, in square meters, takes it
+  farther: 3,600 is 60 m). It sways in the wind as far and as fast as
+  the game's, measured in the game in a strong and a weak wind: how a
+  swing runs between its ends is taken to be even, it sways north and
+  south as measured (whether the area's wind turns it was not read), in
+  no wind it stands
+  still (the game's was not measured there), and grass past 180 m (drawn
+  there, not in the game) stands still. Its tufts gather in clumps with bare ground between them,
+  as the game's do (fitted to the game's picture of a field), as dense
+  near the camera as the game's; the game's sparse grass lies a tuft at
+  a time, where Moonglow's lies in twos and threes. Aurora drops an area's own grass when it
+  saves the area ([Areas](04-areas.md#grass)).
 - **Waypoints** are the flags of their appearance (blue, red, green,
   yellow), **sounds** the game's markers for them (a note: heard from
   where it stands, from a random position, or everywhere in the area)
@@ -75,8 +93,7 @@ it differs, it is on purpose:
 - **The Item Wizard's Magical** gives only properties the base item can
   have: Aurora's tables give ranged weapons Vampiric Regeneration and
   throwing weapons Freedom of Movement, which itemprops.2da doesn't allow
-  them. Gems and gauntlets aren't offered Magical (Aurora offers it, and
-  gives them no properties but makes them unidentified). Its random
+  them. Its random
   choices are Moonglow's own, made as Aurora's made items show (the same
   tables, strengths, number of properties and most an item is worth),
   not draw for draw.

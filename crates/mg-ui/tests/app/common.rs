@@ -62,6 +62,38 @@ pub(crate) fn harness(app: Moonglow, width: f32, height: f32) -> Harness<'static
         .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app)
 }
 
+/// The game's data at `root`, in English, with no user folder: read
+/// before an application is (to make a module for it).
+pub(crate) fn game_data(root: &std::path::Path) -> mg_rules::GameData {
+    game_data_in(root, None)
+}
+
+/// [`game_data`] with `user` as the game's user folder (its haks and
+/// override read as the application given it reads them).
+pub(crate) fn game_data_in(
+    root: &std::path::Path,
+    user: Option<std::path::PathBuf>,
+) -> mg_rules::GameData {
+    mg_rules::GameData::open(&mg_resman::GameInstall::new(root, user, "en")).unwrap()
+}
+
+/// [`harness`] at kittest's own size, 800 by 600 points: the window as
+/// most of its tests draw it.
+pub(crate) fn window_harness(app: Moonglow) -> Harness<'static, Moonglow> {
+    harness(app, 800.0, 600.0)
+}
+
+/// A scratch user folder for the game: `dir`'s `user`, with `subfolders`
+/// (`hak`, `override`, `tlk`...) made in it.
+pub(crate) fn user_folder(dir: &std::path::Path, subfolders: &[&str]) -> std::path::PathBuf {
+    let user = dir.join("user");
+    std::fs::create_dir_all(&user).unwrap();
+    for sub in subfolders {
+        std::fs::create_dir_all(user.join(sub)).unwrap();
+    }
+    user
+}
+
 /// The GPU for a test that draws (the area view, a model view, a
 /// preview): takes it for the rest of the test (`mg_testkit::gpu::hold`,
 /// a few devices open at a time in this binary) and makes a render state
@@ -69,10 +101,7 @@ pub(crate) fn harness(app: Moonglow, width: f32, height: f32) -> Harness<'static
 /// [`gpu_harness`]; `None`, said, without a GPU adapter.
 pub(crate) fn gpu() -> Option<egui_wgpu::RenderState> {
     mg_testkit::gpu::hold();
-    // (Asked once: a device opened to ask it was a second device for
-    // every test that draws.)
-    static ADAPTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ADAPTER.get_or_init(|| mg_render::Gpu::headless().is_some()) {
+    if !adapter() {
         eprintln!("skipped: no GPU adapter");
         return None;
     }
@@ -80,6 +109,18 @@ pub(crate) fn gpu() -> Option<egui_wgpu::RenderState> {
         mg_ui::graphics_setup(egui_kittest::wgpu::default_wgpu_setup()),
         egui_wgpu::RendererOptions::PREDICTABLE,
     ))
+}
+
+/// Whether this machine has a GPU adapter (CI's Linux runner has none):
+/// a test whose pictures are only to look at takes them when it has.
+/// (Asked once: a device opened to ask it was a second device for every
+/// test that draws.)
+pub(crate) fn adapter() -> bool {
+    static ADAPTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ADAPTER.get_or_init(|| {
+        mg_testkit::gpu::hold();
+        mg_render::Gpu::headless().is_some()
+    })
 }
 
 /// [`harness`] drawn on the GPU's render state `rs` (from [`gpu`], given
@@ -233,15 +274,17 @@ pub(crate) fn palette_type(h: &mut Harness<'_, Moonglow>, glyph: &str, name: &st
         PALETTE_TYPES.iter().any(|glyph| value.starts_with(glyph))
     };
     h.query_all(combo).find(is_type).expect("the palette's type dropdown").click();
-    h.run();
+    settle(h);
     // (The last of them are below the dropdown's edge until scrolled to.)
     h.get_by_label(&format!("{glyph} {name}")).scroll_to_me();
-    h.run();
+    settle(h);
     h.get_by_label(&format!("{glyph} {name}")).click();
-    h.run();
+    settle(h);
 }
 
-/// Types into the text field with placeholder `hint` (a live filter).
+/// Types into the text field with placeholder `hint` (a live filter), and
+/// waits for what it shows ([`settle`]: a gallery's pictures, made a few
+/// milliseconds' worth a frame).
 pub(crate) fn type_into_hint(h: &mut Harness<'_, Moonglow>, hint: &str, text: &str) {
     // ("Find" is a list's search: the palette's says what it looks in.)
     let palette = "🔍 Search name, tag, resref";
@@ -252,23 +295,39 @@ pub(crate) fn type_into_hint(h: &mut Harness<'_, Moonglow>, hint: &str, text: &s
     let hint = if hint == "Find" && !has(h, hint) { palette } else { hint };
     let by_hint = |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some(hint);
     h.get(egui_kittest::kittest::by().predicate(by_hint)).click();
-    h.run();
+    settle(h);
     h.get(egui_kittest::kittest::by().predicate(by_hint)).type_text(text);
-    h.run();
+    settle(h);
 }
 
 pub(crate) const ANIMATIONS: (&str, &str, &str, &str) =
     ("AnimationReplace", "AnimationReplace", "OldAnimation", "NewAnimation");
 
-/// Frames until the UI stops asking for more (a gallery makes its pictures
-/// a few milliseconds' worth a frame).
+/// How long [`settle`] waits for the window to settle: far longer than
+/// any of its work takes on a busy machine, short of a test that hangs.
+pub(crate) const SETTLE_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Frames until the UI stops asking for more and the window's own work is
+/// done ([`Moonglow::under_way`]: a gallery makes its pictures a few
+/// milliseconds' worth a frame, fewer on a busy machine; a look at the
+/// module's files runs on a thread, which takes longer on Windows), with a
+/// little time between tries, for at most [`SETTLE_TIME`].
 pub(crate) fn settle(h: &mut Harness<'_, Moonglow>) {
-    for _ in 0..100 {
-        if h.try_run().is_ok() {
+    let started = std::time::Instant::now();
+    loop {
+        let ran = h.try_run();
+        let under_way = h.state().under_way();
+        if ran.is_ok() && under_way.is_none() {
             return;
         }
+        if started.elapsed() > SETTLE_TIME {
+            match (ran, under_way) {
+                (Err(e), _) => panic!("the UI keeps repainting: {e}"),
+                (Ok(_), what) => panic!("the window's work never ended: {}", what.unwrap()),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    panic!("the UI keeps repainting");
 }
 
 /// The sample module with the game's data (`None` without the game).
@@ -402,6 +461,45 @@ pub(crate) fn area_app(
     Some((app, rs, area))
 }
 
+/// [`area_harness`]'s area with a chest at 12, 20, in a project folder
+/// whose claims table says `cd` holds the area and whose moonglow.toml
+/// keeps others' areas read-only, the builder `ab`: an area read-only
+/// here.
+pub(crate) fn read_only_area_harness(name: &str) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    let chest = |m: &mut Module, game: &mg_rules::GameData, area: ResRef| {
+        use mg_module::instances::{Placement, Placing, instance};
+        let key = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+        let bp = Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        let at = Placement { position: [12.0, 20.0, 0.0], rotation: 0.0 };
+        let item = instance(&placing, ResType::UTP, &bp, at, &[]).unwrap();
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        git.root.set("Placeable List", mg_gff::Value::List(vec![item]));
+        m.set_gff(git_key, &git).unwrap();
+    };
+    let (mut app, rs, area) = area_app(name, "ttr01", None, 4, None, &chest)?;
+    // The same module as a project folder that names a claims table.
+    let mut m = app.ws.as_ref()?.module.clone();
+    let dir = mg_testkit::scratch_dir(&format!("ui-area-{name}-project"));
+    m.save_as(&ModuleLocation::Folder(dir.clone())).unwrap();
+    let rules = "[claims]\nfile = \"claims.2da\"\nothers = \"read-only\"\n";
+    std::fs::write(dir.join("moonglow.toml"), rules).unwrap();
+    let table = format!(
+        "2DA V2.0\n\n    Area             Builder  Status   Date        Tag\n\
+         0   {:<16} cd       claimed  2026-10-20  ****\n",
+        area.to_string()
+    );
+    std::fs::write(dir.join("claims.2da"), table).unwrap();
+    mg_module::project_file::ProjectFile::set_builder_code(&dir, Some("ab")).unwrap();
+    app.open_module(&dir);
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Area(area)));
+    let mut h = area_gpu_harness(app, rs, 1100.0, 800.0);
+    h.run_steps(3);
+    Some((h, area))
+}
+
 /// A waypoint's position in the workspace's GIT.
 pub(crate) fn waypoint(
     h: &mut Harness<'_, Moonglow>,
@@ -426,6 +524,17 @@ pub(crate) fn press(
 ) {
     let button = egui::PointerButton::Primary;
     h.event_modifiers(egui::Event::PointerButton { pos, button, pressed, modifiers }, modifiers);
+}
+
+/// The text field holding `value`, of a window that asks for a name.
+pub(crate) fn typed_name<'h>(
+    h: &'h Harness<'_, Moonglow>,
+    value: &'h str,
+) -> egui_kittest::Node<'h> {
+    let field = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some(value)
+    };
+    h.get(egui_kittest::kittest::by().predicate(field))
 }
 
 /// A `true` program to stand in for an external editor: the first on

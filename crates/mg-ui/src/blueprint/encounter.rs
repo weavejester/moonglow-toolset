@@ -49,7 +49,7 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
         f.locstring(ui, "Name", "LocalizedName");
         ui.end_row();
         crate::widgets::field_label(ui, "Tag");
-        f.text(ui, "Tag", "Tag", 32);
+        f.tag(ui, "Tag", "Tag");
         ui.end_row();
         crate::widgets::field_label(ui, "Difficulty");
         // The index, and the difficulty value it stands for.
@@ -71,15 +71,46 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
         f.choice(ui, "Spawn option", "SpawnOption", &spawn, FieldType::Int);
         ui.end_row();
         crate::widgets::field_label(ui, "Minimum Creatures");
-        f.spin(ui, "Minimum creatures", "RecCreatures", 1..=100);
+        minimum_creatures(f, ui);
         ui.end_row();
         crate::widgets::field_label(ui, "Maximum Creatures");
-        f.spin(ui, "Maximum creatures", "MaxCreatures", 1..=100);
+        f.spin(ui, "Maximum creatures", "MaxCreatures", 1..=8);
         ui.end_row();
         crate::widgets::field_label(ui, "Category");
         f.category(ui, BlueprintKind::Encounter);
         ui.end_row();
     });
+}
+
+/// Minimum Creatures, which raises Maximum Creatures to a minimum typed
+/// above it, as Aurora's does, in one command (each encounter edited
+/// together by its own: one whose maximum is higher keeps it).
+fn minimum_creatures(f: &mut Form<'_>, ui: &mut Ui) {
+    f.mark_mixed(ui, "RecCreatures");
+    let Some(v) = crate::widgets::spin_number(ui, f.int("RecCreatures"), 1..=8) else { return };
+    let restype = f.restype();
+    let ty = |label| mg_schema::root_field_type(restype, label).unwrap_or(FieldType::Int);
+    let (rec_type, max_type) = (ty("RecCreatures"), ty("MaxCreatures"));
+    let targets: Vec<_> = f.targets().map(|(k, p)| (k, p.clone())).collect();
+    let mut edits = Vec::new();
+    for (key, path) in targets {
+        let fields = f.app.ws.as_mut().and_then(|ws| {
+            let s = path.get(&ws.doc(&key).ok()?.root)?;
+            Some((s.get("RecCreatures").cloned(), s.get("MaxCreatures").cloned()))
+        });
+        let (rec, max) = fields.unwrap_or_default();
+        let set = |label: &str, old: Option<Value>, t| Edit::SetField {
+            key,
+            path: path.clone(),
+            label: label.to_string(),
+            value: Some(super::integer(old.as_ref(), v, t)),
+        };
+        if max.as_ref().and_then(Value::as_integer).is_none_or(|m| m < v) {
+            edits.push(set("MaxCreatures", max, max_type));
+        }
+        edits.push(set("RecCreatures", rec, rec_type));
+    }
+    f.app.actions.push(Action::Apply(Command::new("Minimum creatures", edits)));
 }
 
 /// An encounter's entry for a creature blueprint: its appearance and
@@ -205,14 +236,14 @@ fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
         let respawns = f.check(ui, "Encounter Respawns", "Reset");
         ui.end_row();
         ui.add_enabled_ui(respawns, |ui| ui.label("Respawn Time (seconds)"));
-        ui.add_enabled_ui(respawns, |ui| f.spin(ui, "Respawn time", "ResetTime", 0..=100_000));
+        ui.add_enabled_ui(respawns, |ui| f.spin(ui, "Respawn time", "ResetTime", 1..=32_000));
         ui.end_row();
         let count = f.int("Respawns");
         let infinite = count == -1;
         ui.add_enabled_ui(respawns, |ui| ui.label("Number of times to respawn"));
         ui.add_enabled_ui(respawns, |ui| {
             ui.horizontal(|ui| {
-                ui.add_enabled_ui(!infinite, |ui| f.spin(ui, "Respawns", "Respawns", 1..=100));
+                ui.add_enabled_ui(!infinite, |ui| f.spin(ui, "Respawns", "Respawns", 0..=32_000));
                 let mut inf = infinite;
                 if ui.checkbox(&mut inf, "Infinite Respawn").changed() {
                     f.set_int(

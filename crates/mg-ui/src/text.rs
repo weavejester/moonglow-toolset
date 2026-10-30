@@ -18,9 +18,16 @@ thread_local! {
 }
 
 /// The codepage of the game's text other than a localized string's: a
-/// module's own table, else Windows-1252.
+/// module's own table, else Windows-1252 (`GameData::text_codepage`, as
+/// `mg` and plugins read it).
 pub(crate) fn game_codepage() -> Codepage {
     GAME_CODEPAGE.with(Cell::get).unwrap_or_default().for_language(Language::ENGLISH)
+}
+
+/// The open module's game's codepage as it stands (a module's own table,
+/// which [`Codepage::for_language`] takes for each language it is for).
+pub(crate) fn game_table() -> Codepage {
+    GAME_CODEPAGE.with(Cell::get).unwrap_or_default()
 }
 
 /// The codepage of a language's text in the open module's game.
@@ -40,6 +47,19 @@ pub(crate) fn entry_codepage(language: Language) -> Codepage {
     match own == Codepage::WINDOWS_1252 && edited == Codepage::WINDOWS_1250 {
         true => edited,
         false => own,
+    }
+}
+
+/// Text in a field being typed in, read by the game's codepage `was`
+/// (`encoding.2da`), as the codepage `now` reads the bytes it stands for:
+/// what the field shows once the module's haks change the table, so that
+/// it is the same bytes, shown as the game will read them now. Text with a
+/// letter `was` has no byte for stays as it is.
+pub(crate) fn read_again(typed: &str, was: Codepage, now: Codepage) -> String {
+    let (was, now) = (was.for_language(Language::ENGLISH), now.for_language(Language::ENGLISH));
+    match was.encode(typed) {
+        Some(bytes) => now.decode(&bytes).into_owned(),
+        None => typed.to_owned(),
     }
 }
 
@@ -70,11 +90,7 @@ pub(crate) fn edited_text(ls: &LocString) -> String {
 /// A localized string's text for a list or a title: in the editing
 /// language, else, where it has none in it, in another (English first).
 pub(crate) fn shown_text(ls: &LocString) -> String {
-    let text = edited_text(ls);
-    if !text.is_empty() {
-        return text;
-    }
-    elsewhere(ls).map(|(_, text)| text).unwrap_or_default()
+    ls.shown_in(edit_language(), game_table())
 }
 
 /// A localized string's text in another language than the editing one
@@ -167,8 +183,13 @@ pub(crate) fn codepage_name(codepage: Codepage) -> String {
     }
     // (`windows-1250` as `Windows-1250`.)
     let debug = format!("{codepage:?}");
-    let name = debug.trim_start_matches("Codepage(").trim_end_matches(')');
-    let mut chars = name.chars();
+    capitalized(debug.trim_start_matches("Codepage(").trim_end_matches(')'))
+}
+
+/// `text` with a capital first letter: what a tool says after `warning: `,
+/// as the window's log says it.
+pub(crate) fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
     chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
@@ -180,10 +201,16 @@ pub(crate) fn for_windows_1252(text: &str) -> String {
     game_codepage().spelled_in(text, Codepage::WINDOWS_1252).into_owned()
 }
 
-/// Text that code read as Windows-1252 (a conversation's export), as the
-/// module's own table reads the same bytes.
-pub(crate) fn from_windows_1252(text: &str) -> String {
-    Codepage::WINDOWS_1252.spelled_in(text, game_codepage()).into_owned()
+/// Names in a line: all of them where there are `room` or fewer, else the
+/// first and how many more, in `room` places ("a, b, c and 3 more" for
+/// four): never "and 1 more".
+pub(crate) fn some_of(names: &[impl AsRef<str>], room: usize) -> String {
+    let all = || names.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+    if names.len() <= room.max(1) {
+        return all().join(", ");
+    }
+    let shown = room.max(2) - 1;
+    format!("{} and {} more", all()[..shown].join(", "), names.len() - shown)
 }
 
 /// Text for an editor: CRLF line ends shown as plain newlines (a `\r`
@@ -449,6 +476,16 @@ pub(crate) fn with_english(mut s: LocString, text: &str) -> LocString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_few_names_and_how_many_more() {
+        assert_eq!(some_of(&["a", "b"], 4), "a, b");
+        assert_eq!(some_of(&["a", "b", "c", "d"], 4), "a, b, c, d");
+        assert_eq!(some_of(&["a", "b", "c", "d", "e", "f"], 4), "a, b, c and 3 more");
+        assert_eq!(some_of(&["a", "b", "c"], 1), "a and 2 more");
+        assert_eq!(some_of(&[String::from("a")], 0), "a");
+        assert_eq!(some_of(&[] as &[&str], 4), "");
+    }
 
     /// Scripts are read in the editing language's codepage: Polish's
     /// letters round trip in Windows-1250, byte for byte, and those it
@@ -731,11 +768,21 @@ mod tests {
         );
         let text = line.locstring("Text").unwrap();
         assert_eq!(text.get(Language::ENGLISH, Gender::Male).unwrap(), b"Da\xf0 \xe9 ?");
-        assert_eq!(from_windows_1252("Dað"), "Dağ");
+        // A conversation's export reads its lines by the table, every
+        // format's (the CSV's other languages too).
+        let mut g = mg_module::dialog::new_dialog();
+        mg_module::dialog::add_node(
+            &mut g,
+            mg_module::dialog::Parent::Root,
+            &for_windows_1252("Dağ"),
+        );
+        for f in mg_module::dialog_io::Format::ALL {
+            let out = f.write_in(&g, "t", game_table(), &[Language::GERMAN]);
+            assert!(out.contains("Dağ"), "{}: {out}", f.name());
+        }
         // Without it, all is as it was: Polish in its own codepage.
         set_game_codepage(None);
         assert_eq!(for_windows_1252("Dağ é ð"), "Dağ é ð");
-        assert_eq!(from_windows_1252("Dað"), "Dað");
         assert_eq!(decode(b"da\xf0"), "dað");
         set_edit_language(Language::POLISH);
         let s = with_english(LocString::default(), "Kryształowa czaszka");

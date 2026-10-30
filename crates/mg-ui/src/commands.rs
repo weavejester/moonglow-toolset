@@ -31,6 +31,8 @@ pub enum Id {
     Redo,
     ModuleProperties,
     BuilderCode,
+    /// Edit › Claims Table…: whose each area is.
+    ClaimsTable,
     ResizeArea,
     RotateArea,
     FindInstance,
@@ -70,6 +72,8 @@ pub enum Id {
     BuildModule,
     PublishNwsync,
     Verify,
+    /// The module saved to a copy and read back (`mg roundtrip`).
+    RoundTrip,
     /// The area the module starts in, opened at the start location.
     GoToStart,
     TestModule,
@@ -96,6 +100,9 @@ pub enum Id {
     NextTab,
     PreviousTab,
     ReopenTab,
+    /// The window of the tab in front made to fill Moonglow's window, or
+    /// put back (as its bar's button, a double click on it, its menu).
+    MaximizeWindow,
     /// The arrow keys given to the next pane, or the one before.
     NextPane,
     PreviousPane,
@@ -164,6 +171,7 @@ pub const MENUS: [(&str, &[Item]); 8] = [
             Separator,
             Do(Id::ModuleProperties),
             Do(Id::BuilderCode),
+            Do(Id::ClaimsTable),
             Separator,
             Do(Id::ResizeArea),
             Do(Id::RotateArea),
@@ -224,6 +232,7 @@ pub const MENUS: [(&str, &[Item]); 8] = [
             Do(Id::BuildModule),
             Do(Id::PublishNwsync),
             Do(Id::Verify),
+            Do(Id::RoundTrip),
             Do(Id::TestModule),
             Do(Id::TestChoose),
             Do(Id::PackTarget),
@@ -271,6 +280,12 @@ pub const TOOLBAR: [Option<(Id, &str, &str, &str)>; 16] = [
 ];
 
 impl Id {
+    /// The Wizards menu's command that makes a new blueprint of `kind`:
+    /// the Creature Wizard for creatures, a blueprint wizard otherwise.
+    pub(crate) fn new_blueprint(kind: BlueprintKind) -> Id {
+        if kind == BlueprintKind::Creature { Id::CreatureWizard } else { Id::Wizard(kind) }
+    }
+
     /// Every command, in the menus' order, then those no menu has.
     pub fn all() -> Vec<Id> {
         fn walk(items: &[Item], out: &mut Vec<Id>) {
@@ -295,6 +310,7 @@ impl Id {
         }
         out.extend([Id::PreviewWindow, Id::FullScreen]);
         out.extend([Id::CloseTab, Id::NextTab, Id::PreviousTab, Id::ReopenTab]);
+        out.push(Id::MaximizeWindow);
         out.extend([Id::NextPane, Id::PreviousPane]);
         out
     }
@@ -337,6 +353,12 @@ impl Id {
                 "Builder Code…",
                 "Your own code, which the ResRefs proposed for new areas, blueprints and copies \
                  begin with (kept in the project, out of version control)",
+            ),
+            Id::ClaimsTable => (
+                "claims-table",
+                "Claims Table…",
+                "Whose each area is (the project's claims table): claim, release, hand on or take \
+                 over a claim",
             ),
             Id::ResizeArea => ("resize-area", "Resize Area…", ""),
             Id::RotateArea => ("rotate-area", "Rotate Area…", ""),
@@ -433,6 +455,12 @@ impl Id {
                 "The module's haks and talk table, for players' games to download",
             ),
             Id::Verify => ("verify", "Verify Module", ""),
+            Id::RoundTrip => (
+                "round-trip",
+                "Round-Trip Check",
+                "Save a copy of the module, read it back and write each GFF and 2DA anew: what \
+                 doesn't come back as it was is said in the log (the module is not touched)",
+            ),
             Id::GoToStart => (
                 "go-to-start",
                 "Go to Start Location",
@@ -479,6 +507,11 @@ impl Id {
             Id::PreviewWindow => ("preview-window", "Preview Window", ""),
             Id::FullScreen => ("full-screen", "Full Screen", ""),
             Id::CloseTab => ("close-tab", "Close Tab", "The tab in front"),
+            Id::MaximizeWindow => (
+                "maximize-window",
+                "Maximize Window",
+                "The window of the tab in front over the whole of Moonglow's, or back",
+            ),
             Id::NextTab => ("next-tab", "Next Tab", ""),
             Id::PreviousTab => ("previous-tab", "Previous Tab", ""),
             Id::ReopenTab => ("reopen-tab", "Reopen Closed Tab", "The tab closed last"),
@@ -519,53 +552,9 @@ impl Id {
         self.text().1.trim_end_matches('…').to_string()
     }
 
-    /// The key command it shares its keys with, where it had keys before
-    /// every command could (its id and its defaults are that one's).
-    fn key(self) -> Option<keys::Cmd> {
-        use keys::Cmd;
-        Some(match self {
-            Id::NewModule => Cmd::NewModule,
-            Id::OpenModule => Cmd::OpenModule,
-            Id::Save => Cmd::Save,
-            Id::Undo => Cmd::Undo,
-            Id::Redo => Cmd::Redo,
-            Id::ReplaceText => Cmd::ReplaceText,
-            Id::AreaWizard => Cmd::AreaWizard,
-            Id::CreatureWizard => Cmd::CreatureWizard,
-            Id::Wizard(BlueprintKind::Item) => Cmd::ItemWizard,
-            Id::NewConversation => Cmd::NewConversation,
-            Id::Factions => Cmd::Factions,
-            Id::Journal => Cmd::Journal,
-            Id::NewScript => Cmd::NewScript,
-            Id::CompileAll => Cmd::CompileAll,
-            Id::TestModule => Cmd::TestModule,
-            Id::TestChoose => Cmd::TestChoose,
-            Id::Manual => Cmd::Manual,
-            Id::CommandPalette => Cmd::CommandPalette,
-            Id::FullScreen => Cmd::FullScreen,
-            Id::Close => Cmd::Close,
-            Id::CloseTab => Cmd::CloseTab,
-            Id::NextTab => Cmd::NextTab,
-            Id::PreviousTab => Cmd::PreviousTab,
-            Id::ReopenTab => Cmd::ReopenTab,
-            Id::NextPane => Cmd::NextPane,
-            Id::PreviousPane => Cmd::PreviousPane,
-            Id::ViewTree => Cmd::ToggleTree,
-            Id::ViewPalettes => Cmd::TogglePalettes,
-            Id::ViewLog => Cmd::ToggleLog,
-            Id::HidePanels => Cmd::HidePanels,
-            _ => return None,
-        })
-    }
-
     /// The id its keys are kept under in the settings.
     pub fn id(self) -> String {
         self.text().0.into_owned()
-    }
-
-    /// Moonglow's keys for it.
-    pub fn defaults(self) -> Vec<egui::KeyboardShortcut> {
-        self.key().map(keys::Cmd::defaults).unwrap_or_default()
     }
 
     /// Its name in a menu as things are: Undo names what it would undo, a
@@ -573,13 +562,17 @@ impl Id {
     fn label(self, app: &Moonglow) -> String {
         let ws = app.ws.as_ref();
         match self {
-            // (A script's step, with the keys in its editor, or a side
-            // editor's, with the keys in its grid: not the module's to
-            // name.)
-            Id::Undo | Id::Redo
-                if app.undo_script.is_some() || app.local_can_undo(self == Id::Redo).is_some() =>
-            {
-                self.text().1.into_owned()
+            // (A script's step, with the keys in its editor: not the
+            // module's to name, nor one it has a name for.)
+            Id::Undo | Id::Redo if app.undo_script.is_some() => self.text().1.into_owned(),
+            // (A side editor's, with the pointer over it or the keys in its
+            // grid: named where the editor names its steps, a hak's and a
+            // 2DA's.)
+            Id::Undo | Id::Redo if app.local_can_undo(self == Id::Redo).is_some() => {
+                match app.local_step_name(self == Id::Redo) {
+                    Some(step) => format!("{} {step}", self.text().1),
+                    None => self.text().1.into_owned(),
+                }
             }
             Id::Undo => match ws.and_then(|ws| ws.can_undo()) {
                 Some(what) => format!("Undo {what}"),
@@ -649,6 +642,7 @@ impl Id {
             Id::ViewTree | Id::HidePanels => open,
             Id::ViewPalettes => open && app.game.is_some(),
             Id::CloseTab => app.front_tab().is_some(),
+            Id::MaximizeWindow => app.front_window_tab().is_some(),
             Id::ReopenTab => !app.closed_tabs.is_empty(),
             Id::InstallPlugin => app.plugin_dir.is_some(),
             // (A script's, with the keys in its editor: as its Ctrl+Z,
@@ -669,6 +663,7 @@ impl Id {
             // (A project's or a module folder's: a .mod's folder holds
             // other modules too.)
             Id::BuilderCode => crate::builder_code::root(app).is_some(),
+            Id::ClaimsTable => crate::claims::kept(app),
             Id::TakeInLeftOut => (app.ws.as_ref())
                 .and_then(|ws| ws.module.project.as_ref())
                 .is_some_and(|p| !p.left_out.is_empty()),
@@ -698,6 +693,7 @@ impl Id {
             | Id::BuildModule
             | Id::PublishNwsync
             | Id::Verify
+            | Id::RoundTrip
             | Id::GoToStart
             | Id::TestModule
             | Id::TestChoose => open,
@@ -740,6 +736,10 @@ impl Id {
             Id::CompileAll => Action::CompileScripts,
             Id::CompileModels => Action::CompileModels,
             Id::Verify => Action::Verify,
+            Id::RoundTrip => Action::RoundTrip,
+            // (The games running looked at before the save writes the
+            // module under one.)
+            Id::TestModule | Id::TestChoose if !app.test_may_start() => return,
             Id::TestModule => Action::SaveThen(Box::new(Action::TestModule)),
             Id::TestChoose => Action::SaveThen(Box::new(Action::TestModuleChoose)),
             Id::PackTarget => Action::PackTarget,
@@ -778,7 +778,11 @@ impl Id {
             }
             Id::IndentToTabs | Id::IndentToSpaces => {
                 let tabs = self == Id::IndentToTabs;
-                app.script_tools.convert_indent = script_in_front(app).map(|k| (k, tabs));
+                // (The lines selected, where the script had the keys as the
+                // menu was opened: the selection was there to see.)
+                let keys = app.undo_script;
+                app.script_tools.convert_indent =
+                    script_in_front(app).map(|k| (k, tabs, keys == Some(k)));
                 return;
             }
             Id::CreatureWizard => {
@@ -786,6 +790,7 @@ impl Id {
                 return;
             }
             Id::BuilderCode => return crate::builder_code::open(app),
+            Id::ClaimsTable => return crate::claims::open_table(app),
             Id::Wizard(kind) => {
                 app.blueprint_wizard = Some(crate::blueprint_wizard::BlueprintWizard::new(kind));
                 return;
@@ -849,6 +854,10 @@ impl Id {
                 Some(tab) => Action::CloseTabs(vec![tab]),
                 None => return,
             },
+            Id::MaximizeWindow => match app.front_window_tab() {
+                Some(tab) => Action::ToggleMaximize(tab),
+                None => return,
+            },
             Id::NextTab => return app.step_tab(1),
             Id::PreviousTab => return app.step_tab(-1),
             Id::ReopenTab => return app.reopen_tab(),
@@ -904,6 +913,51 @@ pub fn name_of(id: &str) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
+/// A command asked for by its key while a text field that sets its text
+/// when the keyboard leaves it held what was typed: the keyboard leaves
+/// it, and the command is run a frame on, with what was typed set.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AfterText {
+    /// One of the window's own.
+    Command(Id),
+    /// A plugin's (it reads the module as the command begins).
+    Plugin { plugin: String, command: String },
+    /// The project's (`moonglow.toml`'s `[commands]`).
+    Project(String),
+}
+
+/// Asks for `after` to be run now, or a frame on if a text field typed in
+/// holds the keyboard (see [`AfterText`]).
+fn run_after_text(app: &mut Moonglow, ui: &Ui, after: AfterText) {
+    if crate::widgets::leave_text(ui.ctx()) {
+        app.command_after_text = Some(after);
+        ui.ctx().request_repaint();
+    } else {
+        run_after(app, ui, after);
+    }
+}
+
+fn run_after(app: &mut Moonglow, ui: &Ui, after: AfterText) {
+    match after {
+        AfterText::Command(id) => {
+            if id.enabled(app) {
+                id.run(app, ui.ctx());
+            }
+        }
+        // (Begun with the frame's actions, after the fields are drawn:
+        // egui says a field lost the keyboard in two frames, and one whose
+        // text a plugin's edits changed before it was drawn would set what
+        // was typed again, over them.)
+        AfterText::Plugin { plugin, command } => {
+            if app.ws.is_some() {
+                let selected = app.plugin_selection();
+                app.actions.push(Action::RunPluginCommand { plugin, command, selected });
+            }
+        }
+        AfterText::Project(name) => app.actions.push(Action::ProjectCommand(name)),
+    }
+}
+
 /// The commands whose key was pressed, run (a key pressed for a command
 /// that cannot be chosen now is still used up).
 pub(crate) fn keys_pressed(app: &mut Moonglow, ui: &Ui) {
@@ -938,12 +992,20 @@ pub(crate) fn keys_pressed(app: &mut Moonglow, ui: &Ui) {
     let in_text = (app.text_typed.is_some() && ui.ctx().egui_wants_keyboard_input())
         || crate::script_view::has_keys(app, ui.ctx());
     // A command kept from the frame before (see below): run now.
-    if let Some(id) = app.command_after_text.take()
-        && id.enabled(app)
-    {
-        id.run(app, ui.ctx());
+    if let Some(after) = app.command_after_text.take() {
+        run_after(app, ui, after);
     }
+    // (Undo and Redo's keys of Options › Keyboard in a script's editor:
+    // its own history's, as the menu's are. Taken before the editor is
+    // drawn, so that its own Ctrl+Z doesn't take a second step.)
+    let script = crate::script_view::with_keys(app, ui.ctx());
     for id in Id::all() {
+        if let (Some(key), Id::Undo | Id::Redo) = (script, id) {
+            if ui.input_mut(|i| app.keymap.consume_outside_text(i, &id.id(), typing)) {
+                crate::script_view::undo(app, ui.ctx(), key, id == Id::Redo);
+            }
+            continue;
+        }
         if in_text && matches!(id, Id::Undo | Id::Redo) {
             continue;
         }
@@ -965,20 +1027,17 @@ pub(crate) fn keys_pressed(app: &mut Moonglow, ui: &Ui) {
             // command is run a frame on: one that closes the field's tab,
             // goes to another or saves would else be done without what
             // was typed.
-            if crate::widgets::leave_text(ui.ctx()) {
-                app.command_after_text = Some(id);
-                ui.ctx().request_repaint();
-            } else {
-                id.run(app, ui.ctx());
-            }
+            run_after_text(app, ui, AfterText::Command(id));
         }
     }
     // The plugins' commands, after the window's own: a key both have is
-    // the window's.
+    // the window's. (They too wait for a field typed in to set its text:
+    // a plugin reads the module as its command begins.)
     for c in app.plugin_commands() {
         let pressed = ui.input_mut(|i| app.keymap.consume_outside_text(i, &c.key_id, typing));
         if pressed && app.ws.is_some() {
-            app.run_plugin_command(&c.plugin, &c.command);
+            let after = AfterText::Plugin { plugin: c.plugin, command: c.command };
+            run_after_text(app, ui, after);
         }
     }
     // And the project's.
@@ -987,7 +1046,7 @@ pub(crate) fn keys_pressed(app: &mut Moonglow, ui: &Ui) {
         let id = crate::project_commands::key_id(&c.name);
         let pressed = ui.input_mut(|i| app.keymap.consume_outside_text(i, &id, typing));
         if pressed && c.run.is_some() {
-            app.actions.push(Action::ProjectCommand(c.name));
+            run_after_text(app, ui, AfterText::Project(c.name));
         }
     }
 }
@@ -1077,9 +1136,11 @@ impl MenuKeys {
 pub(crate) fn menu_bar(app: &mut Moonglow, ui: &mut Ui) {
     use egui::{Key, Modifiers, Popup};
     let ctx = ui.ctx().clone();
-    // A letter pressed: with Alt alone held, a menu's; with a menu open
-    // and nothing held, a row's. Taken from the frame's keys, with the
-    // text it typed.
+    // A letter pressed: with Alt alone held, a menu's (unless a command
+    // was given Alt and that letter in Options › Keyboard: the command's
+    // then); with a menu open and nothing held, a row's. Taken from the
+    // frame's keys, with the text it typed.
+    let keymap = &app.keymap;
     let letter = |alt: bool| {
         ctx.input_mut(|i| {
             let m = i.modifiers;
@@ -1087,7 +1148,9 @@ pub(crate) fn menu_bar(app: &mut Moonglow, ui: &mut Ui) {
                 return None;
             }
             let found = i.events.iter().find_map(|e| match e {
-                egui::Event::Key { key, pressed: true, repeat: false, .. } => {
+                egui::Event::Key { key, pressed: true, repeat: false, .. }
+                    if !(alt && keymap.bound(e)) =>
+                {
                     let name = key.name();
                     let c = name.chars().next().filter(|c| name.len() == 1 && c.is_alphabetic())?;
                     Some((*key, c.to_ascii_lowercase()))
@@ -1264,6 +1327,16 @@ pub(crate) fn menu_bar(app: &mut Moonglow, ui: &mut Ui) {
     app.menu_keys.choose = false;
     app.menu_keys.close_sub = false;
     app.menu_open = tops.iter().position(|(id, _)| Popup::is_id_open(&ctx, *id));
+    // A menu opened from a script's editor and closed with nothing chosen
+    // (Escape, Alt or F10, a click on its name) gives the keys back to the
+    // editor, so that Ctrl+Z after it is the script's still. (A click
+    // elsewhere is a click outside the editor: the keys stay nowhere.)
+    let unused = ctx.input(|i| i.key_pressed(Key::Escape))
+        || toggle
+        || tops.iter().any(|(_, r)| r.clicked());
+    if was_open.is_some() && app.menu_open.is_none() && unused {
+        crate::script_view::give_keys_back(app, &ctx);
+    }
 }
 
 /// The letter a menu's or a row's name begins with (past a tick or
@@ -1418,6 +1491,17 @@ fn menu(app: &mut Moonglow, ui: &mut Ui, items: &[Item], level: usize) {
                             app.actions.push(Action::ProjectCommand(c.name));
                             egui::Popup::close_all(ui.ctx());
                         }
+                    }
+                    ui.separator();
+                    let name = "Command Output";
+                    let can = crate::project_commands::has_output(app);
+                    let (entry, chosen) = row(app, level + 1, name, egui::Button::new(name), can);
+                    let r = ui
+                        .add_enabled(can, entry)
+                        .on_hover_text("The last command's output, all of it, and how it ended");
+                    if r.clicked() || chosen {
+                        app.project_commands.show = true;
+                        egui::Popup::close_all(ui.ctx());
                     }
                 })
                 .on_disabled_hover_text(
@@ -1602,16 +1686,23 @@ pub(crate) fn palette_window(app: &mut Moonglow, ctx: &egui::Context) {
             let n = matches.len();
             finder.selected = (finder.selected + usize::from(down) + (n - usize::from(up))) % n;
         }
-        let field = ui.add(
-            egui::TextEdit::singleline(&mut finder.filter)
-                .hint_text("Type a command's name")
-                .desired_width(f32::INFINITY),
-        );
+        // (Escape clears the name typed, then closes the palette.)
+        let before = finder.filter.len();
+        let searched = crate::widgets::SearchField::new(
+            egui::Id::new("command-palette-find"),
+            &mut finder.filter,
+        )
+        .hint("Type a command's name")
+        .show(ui);
+        let field = searched.response;
         if !std::mem::replace(&mut finder.focused, true) {
             field.request_focus();
         }
-        if field.changed() {
+        if field.changed() || finder.filter.len() != before {
             finder.selected = 0;
+        }
+        if searched.left == Some(crate::widgets::FilterLeft::Escape) {
+            ui.close();
         }
         ui.separator();
         if matches.is_empty() {
@@ -1672,8 +1763,11 @@ pub(crate) fn toolbar(app: &mut Moonglow, ui: &mut Ui) {
                 ui.separator();
                 continue;
             };
+            // (Undo and Redo say the step they take, as the Edit menu does.)
+            let tip =
+                if matches!(id, Id::Undo | Id::Redo) { id.label(app) } else { tip.to_string() };
             let tip = match app.keymap.label_of(&id.id(), ui.ctx()) {
-                k if k.is_empty() => tip.to_string(),
+                k if k.is_empty() => tip,
                 k => format!("{tip} ({k})"),
             };
             let clicked = if id == Id::PreviewWindow {
@@ -1711,12 +1805,6 @@ mod tests {
         assert_eq!(Id::Wizard(BlueprintKind::Item).id(), "item-wizard");
         assert_eq!(Id::Save.id(), "save");
         assert_eq!(Id::SaveAsProject.id(), "save-as-project");
-        // A command that had keys before keeps the id they are kept under.
-        for c in &all {
-            if let Some(cmd) = c.key() {
-                assert_eq!(c.id(), cmd.id());
-            }
-        }
         assert_eq!(Id::TestChoose.id(), "test-choose");
     }
 

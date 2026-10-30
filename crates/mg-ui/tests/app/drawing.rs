@@ -32,6 +32,70 @@ fn model_viewer_plays_animations() {
     assert!(img.width() > 0);
 }
 
+/// The model viewer's wheel is the area view's: the wheel zooms, Shift
+/// and Ctrl with it zoom finer, a pinch zooms, and a sideways scroll pans
+/// (it had the wheel alone, and Shift or Ctrl with it did nothing).
+#[test]
+fn the_model_viewer_s_wheel_is_the_area_view_s() {
+    let root = mg_testkit::corpus!();
+    let Some(rs) = gpu() else { return };
+    let mut app = game_app(&root, None);
+    app.set_render_state(rs.clone());
+    app.settings.game_shaders = Some(false);
+    let key = ResKey::parse("plc_a01", ResType::MDL).unwrap();
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
+    let mut h = gpu_harness(app, rs, 900.0, 700.0);
+    h.run_steps(2);
+    let source = mg_ui::model_view::Source::Resource(key);
+    let orbit = |h: &Harness<'_, Moonglow>| h.state().model_views[&source].orbit;
+    let rect = h
+        .state()
+        .dock
+        .iter_leaves()
+        .find(|(_, l)| l.tabs.contains(&Tab::Model(key)))
+        .map(|(_, l)| l.viewport)
+        .unwrap();
+    h.hover_at(rect.center() + egui::vec2(0.0, 40.0));
+    h.run_steps(2);
+    // An event with `modifiers` held through the frames it is spread over.
+    let send = |h: &mut Harness<'_, Moonglow>, event: egui::Event, modifiers: egui::Modifiers| {
+        h.event(egui::Event::ModifiersChanged(modifiers));
+        h.event(event);
+        h.run_steps(30);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        h.run_steps(1);
+    };
+    let wheel = |delta: egui::Vec2, modifiers: egui::Modifiers| egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta,
+        phase: egui::TouchPhase::Move,
+        modifiers,
+    };
+    let up = egui::vec2(0.0, 120.0);
+    let mut was = orbit(&h);
+    let mut zoomed = |h: &mut Harness<'_, Moonglow>, what: &str| {
+        let now = orbit(h);
+        assert!(now.distance < was.distance * 0.97, "{what} zoomed: {now:?} from {was:?}");
+        assert!((now.target - was.target).length() < 1e-4, "{what}: not panned");
+        let by = was.distance / now.distance;
+        was = now;
+        by
+    };
+    send(&mut h, wheel(up, egui::Modifiers::NONE), egui::Modifiers::NONE);
+    let plain = zoomed(&mut h, "the wheel");
+    send(&mut h, wheel(up, egui::Modifiers::SHIFT), egui::Modifiers::SHIFT);
+    let shifted = zoomed(&mut h, "Shift and the wheel");
+    assert!(shifted < plain, "finer with Shift: {shifted} against {plain}");
+    send(&mut h, wheel(up, egui::Modifiers::COMMAND), egui::Modifiers::COMMAND);
+    zoomed(&mut h, "Ctrl and the wheel");
+    send(&mut h, egui::Event::Zoom(1.25), egui::Modifiers::NONE);
+    zoomed(&mut h, "a pinch");
+    send(&mut h, wheel(egui::vec2(120.0, 0.0), egui::Modifiers::NONE), egui::Modifiers::NONE);
+    let now = orbit(&h);
+    assert!((now.distance - was.distance).abs() < 1e-4, "a sideways scroll: no zoom");
+    assert!((now.target - was.target).length() > 0.01, "a sideways scroll pans: {now:?}");
+}
+
 /// The model view's Shaders switch is the area view's (one setting for
 /// every 3D view): on by default, the game's lit shaders drawing the model
 /// once its programs are made; off, Moonglow's own; on again.
@@ -288,6 +352,103 @@ fn an_area_read_apart_looks_as_one_read_in_the_frame() {
     let differ = here.pixels().zip(failed.pixels()).filter(|(a, b)| a != b).count();
     assert!(differ > 0, "the tile is left out");
     assert!(h.state().area_views[&area].error.is_none());
+}
+
+/// A tile's texture the GPU won't take (a builder's, 16384 pixels wide,
+/// which Moonglow reads and the test's device, as many GPUs, doesn't
+/// hold: it takes 8192) is left out, the tiles drawn without it, and the
+/// log says so once: the area stays open. (It ended Moonglow.)
+#[test]
+fn a_texture_the_gpu_refuses_is_left_out_and_told() {
+    let dir = mg_testkit::scratch_dir("ui-gpu-refused");
+    let user = user_folder(&dir, &["override"]);
+    // A TGA 16384 pixels wide and one high, gray (uncompressed, 24 bits).
+    let width: u16 = 16384;
+    let mut tga = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    tga.extend(width.to_le_bytes());
+    tga.extend(1u16.to_le_bytes());
+    tga.extend([24, 0]);
+    tga.extend([128u8; 3].repeat(usize::from(width)));
+    // (The rural tiles' ground, whichever a tile draws.)
+    for texture in ["ttr01_grass02", "ttr01_dirt01", "ttr01_splotch01", "ttr01_grassrim01"] {
+        std::fs::write(user.join("override").join(format!("{texture}.tga")), &tga).unwrap();
+    }
+    // (What the GPU refused is the process's list, which other windows
+    // take from, and each is said once in it.)
+    mg_testkit::gpu::alone();
+    let Some((mut h, area)) =
+        area_harness_with("gpu-refused", "ttr01", None, 4, Some(user), &|_, _, _| {})
+    else {
+        return;
+    };
+    h.run_steps(6);
+    let told: Vec<&String> = h
+        .state()
+        .log
+        .entries
+        .iter()
+        .map(|(_, m)| m)
+        .filter(|m| m.starts_with("The GPU refused part of what is drawn"))
+        .collect();
+    assert!(!told.is_empty(), "{:?}", h.state().log.entries);
+    assert!(told.iter().any(|m| m.contains("(the texture ttr01_")), "{told:?}");
+    let said = told.len();
+    h.run_steps(6);
+    let again = h.state().log.entries.iter().filter(|(_, m)| m.starts_with("The GPU refused"));
+    assert_eq!(again.count(), said, "said once");
+    let picture = view_picture(&mut h, area);
+    picture.save(dir.join("refused.png")).unwrap();
+    assert!(picture.pixels().any(|p| p[0] > 40), "the area is drawn");
+    assert!(h.state().area_views[&area].error.is_none());
+}
+
+/// Reload Resources reads an open area's models and textures again on a
+/// thread of its own, as its first reading is (where the window is kept
+/// going): frames go on meanwhile, the view saying it is reading, and
+/// once read it looks as before, its camera where it was.
+#[test]
+fn reload_resources_reads_an_area_again_on_a_thread() {
+    let dir = mg_testkit::scratch_dir("ui-reload-apart");
+    let user = user_folder(&dir, &["override"]);
+    let Some((app, rs, area)) =
+        area_app("reload-apart", "ttr01", None, 4, Some(user.clone()), &|_, _, _| {})
+    else {
+        return;
+    };
+    let mut h = area_gpu_harness(app, rs, 1100.0, 800.0);
+    h.run_steps(6);
+    let here = view_picture(&mut h, area);
+    let camera = h.state().area_views[&area].orbit;
+    h.state_mut().background_jobs = true;
+    std::fs::write(user.join("override/mg_reload_test.2da"), "2DA V2.0\n\n   Label\n0  x\n")
+        .unwrap();
+    h.state_mut().reload_resources(true);
+    let entries = &h.state().log.entries;
+    assert!(entries.iter().any(|(_, m)| m == "Reloaded override"), "{entries:?}");
+    h.run_steps(1);
+    assert!(
+        h.query_by_label_contains("Reading area").is_some(),
+        "a frame went by while the area was read again"
+    );
+    let started = std::time::Instant::now();
+    loop {
+        let app = h.state();
+        let view = &app.area_views[&area];
+        let pending = app.viewport.as_ref().map_or(0, |v| v.renderer.drawn.textures_pending);
+        if h.query_by_label_contains("Reading area").is_none() && view.pictures > 0 && pending == 0
+        {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "not read");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.run_steps(1);
+    }
+    h.run_steps(6);
+    h.state_mut().background_jobs = false;
+    assert_eq!(h.state().area_views[&area].orbit, camera, "the camera stays");
+    let again = view_picture(&mut h, area);
+    let differ = here.pixels().zip(again.pixels()).filter(|(a, b)| a != b).count();
+    assert_eq!(differ, 0, "{differ} pixels differ");
 }
 
 /// Another module with an area of the same name shows its own area, not
@@ -657,8 +818,7 @@ fn tdod_s_wind_shaders_move_in_the_area_view() {
     };
     let Some(rs) = gpu() else { return };
     let dir = mg_testkit::scratch_dir("ui-area-tdod-shaders");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let user = user_folder(&dir, &["hak"]);
     let names = ["tdod_shaders", "tdod_t_tap"];
     for name in names {
         let file = format!("{name}.hak");
@@ -666,8 +826,7 @@ fn tdod_s_wind_shaders_move_in_the_area_view() {
     }
     // A module on a stock tileset, made Medieval Rural's field of TDoD's
     // `mst04` tiles 42 and 48 (trees and plants of the wind shaders).
-    let install = mg_resman::GameInstall::new(&root, Some(user.clone()), "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data_in(&root, Some(user.clone()));
     let mut rng = fastrand::Rng::with_seed(7);
     let mut m = new_module(&game, "Wind", &mut rng).unwrap();
     let spec = AreaSpec {
@@ -694,7 +853,7 @@ fn tdod_s_wind_shaders_move_in_the_area_view() {
     let path = dir.join("wind.mod");
     m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
 
-    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    let mut app = game_app(&root, Some(user.clone()));
     app.set_render_state(rs.clone());
     // (Off first, as the test compares the two.)
     app.settings.game_shaders = Some(false);
@@ -764,14 +923,12 @@ fn tdod_s_inc_lighting_changes_the_area_view_through_the_load_order() {
         return;
     }
     let dir = mg_testkit::scratch_dir("ui-area-tdod-lighting");
-    let user = dir.join("user");
-    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let user = user_folder(&dir, &["hak"]);
     for name in ["tdod_shaders", "tdod_t_tap"] {
         let file = format!("{name}.hak");
         mg_testkit::link_or_copy(&haks.join(&file), &user.join("hak").join(&file)).unwrap();
     }
-    let install = mg_resman::GameInstall::new(&root, Some(user.clone()), "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
+    let game = game_data_in(&root, Some(user.clone()));
     // The area: 4 by 4 of mst04's first tiles, in a module listing the
     // haks given.
     let module = |haks: &[&str], file: &str| {
@@ -810,7 +967,7 @@ fn tdod_s_inc_lighting_changes_the_area_view_through_the_load_order() {
             mg_ui::graphics_setup(egui_kittest::wgpu::default_wgpu_setup()),
             egui_wgpu::RendererOptions::PREDICTABLE,
         );
-        let mut app = Moonglow::new(Some(install.clone()), Box::new(NoDialogs::default()));
+        let mut app = game_app(&root, Some(user.clone()));
         app.set_render_state(rs.clone());
         app.settings.game_shaders = Some(on);
         app.open_module(path);
@@ -1058,16 +1215,46 @@ fn helmets_and_shields_preview_as_worn() {
         let key = ResKey::parse(name, ResType::UTI).unwrap();
         app.actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
     }
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    let mut h = window_harness(app);
     h.run();
     let view = |name: &str| {
         let key = ResKey::parse(name, ResType::UTI).unwrap();
         let v = &h.state().model_views[&mg_ui::model_view::Source::Resource(key)];
-        (v.stood(), v.yaw.to_degrees().round())
+        (v.stood(), v.orbit.yaw.to_degrees().round())
     };
     assert_eq!(view("nw_wswls001"), (true, 60.0), "a sword stood up");
     assert_eq!(view("nw_arhe001"), (false, 60.0), "a helmet as worn");
     assert_eq!(view("nw_ashsw001"), (false, 240.0), "a shield as worn, from its front");
+}
+
+/// An item stood up in its viewer shows its broad side: a sword and a
+/// dagger their flats, not their edges (turned a quarter about their
+/// length from how they stood before), a battleaxe its blades; a bow,
+/// broad side on as it lies, is stood as it was (GitHub issue 7).
+#[test]
+fn an_item_stood_up_shows_its_broad_side() {
+    let root = mg_testkit::corpus!();
+    let Some(rs) = gpu() else { return };
+    let mut app = game_app(&root, None);
+    app.set_render_state(rs.clone());
+    let names = ["nw_wswls001", "nw_wswdg001", "nw_waxbt001", "nw_wbwln001"];
+    for name in names {
+        let key = ResKey::parse(name, ResType::UTI).unwrap();
+        app.actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
+    }
+    let mut h = gpu_harness(app, rs, 900.0, 700.0);
+    h.run_steps(2);
+    let plain = glam::Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    for name in names {
+        let key = ResKey::parse(name, ResType::UTI).unwrap();
+        let v = &h.state().model_views[&mg_ui::model_view::Source::Resource(key)];
+        assert!(v.stood(), "{name} stood up");
+        let stand = v.stand();
+        // (Its length up either way.)
+        assert!(stand.transform_vector3(glam::Vec3::Y).abs_diff_eq(glam::Vec3::Z, 1e-5), "{name}");
+        let turned = !stand.abs_diff_eq(plain, 1e-5);
+        assert_eq!(turned, name != "nw_wbwln001", "{name} turned about its length");
+    }
 }
 
 /// A placeable that is only an effect (flames, magic sparks: models with
@@ -1208,8 +1395,30 @@ fn grass_is_set_in_area_properties_and_grown_in_the_view() {
     // Grass of the area's own on dirt: the tileset's, as a start.
     h.get_by_label("Add Grass to…").click();
     h.run_steps(2);
+    // The materials the area's tiles have first (ttr01's field: grass,
+    // stone, and its edges' nonwalk), the others after, below the line
+    // (no dirt or lava in this field). Picture:
+    // `target/test-output/ui-area-grass/add-grass-to.png`.
+    let y = |h: &Harness<'_, Moonglow>, label: &str| h.get_by_label(label).rect().center().y;
+    let line = y(&h, "Not on this area's tiles (nothing grows until a tile has it)");
+    h.render()
+        .expect("render")
+        .save(mg_testkit::output_dir("ui-area-grass").join("add-grass-to.png"))
+        .unwrap();
+    assert!(y(&h, "Grass (3)") < line && y(&h, "Stone (4)") < line);
+    assert!(y(&h, "Grass (3)") < y(&h, "Stone (4)"), "the most of the ground first");
+    assert!(y(&h, "Dirt (1)") > line && y(&h, "Lava (15)") > line);
     h.get_by_label("Dirt (1)").click();
     h.run_steps(3);
+    // Grass on dirt, which no tile has: said so.
+    assert!(
+        h.query_by_label("No face of this area's tiles is of this material: nothing grows here.")
+            .is_some()
+    );
+    h.render()
+        .expect("render")
+        .save(mg_testkit::output_dir("ui-area-grass").join("own-grass.png"))
+        .unwrap();
     let now = stored(&mut h);
     assert_eq!(now.overrides.len(), 1);
     assert_eq!(now.overrides[0].material, 1);
@@ -1257,6 +1466,99 @@ fn grass_is_set_in_area_properties_and_grown_in_the_view() {
     let saved = AreaGrass::read(&back.gff(&git).unwrap().unwrap().root);
     assert_eq!(saved, stored(&mut h));
     assert!(saved.default_disabled && saved.overrides[0].material == 1);
+}
+
+/// A field of one grass tile model, every tile turned alike, seen from
+/// high over it: the grass and what it changes in the picture (four times
+/// as bright), in `target/test-output/ui-area-grass-repeat/`, to look at
+/// (each tile grew the same clumps, a pattern tile by tile, before the
+/// tiles of one model grew a few kinds of grass by their places).
+#[test]
+#[ignore = "a look at grass over a field of one tile model"]
+fn grass_over_a_field_of_one_tile_looks() {
+    let one_model = |m: &mut mg_module::Module, _: &mg_rules::GameData, area: ResRef| {
+        let key = ResKey::new(area, ResType::ARE);
+        let mut are = m.gff(&key).unwrap().unwrap();
+        let tiles = are.root.list_mut("Tile_List").unwrap();
+        let id = tiles[0].integer("Tile_ID").unwrap();
+        for t in tiles.iter_mut() {
+            t.set("Tile_ID", mg_gff::Value::Int(id as i32));
+            t.set("Tile_Orientation", mg_gff::Value::Int(0));
+        }
+        m.set_gff(key, &are).unwrap();
+    };
+    let Some((mut h, area)) =
+        area_harness_with("grass-repeat", "ttr01", None, 12, None, &one_model)
+    else {
+        return;
+    };
+    h.state_mut().area_views.get_mut(&area).unwrap().grid = false;
+    if let Some(o) = &mut h.state_mut().area_views.get_mut(&area).unwrap().orbit {
+        o.target = glam::Vec3::new(60.0, 60.0, 0.0);
+        (o.pitch, o.yaw, o.distance) = (1.2, -std::f32::consts::FRAC_PI_2, 70.0);
+    }
+    let dir = mg_testkit::output_dir("ui-area-grass-repeat");
+    h.state_mut().settings.no_grass = false;
+    h.run_steps(12);
+    let with = h.render().expect("render");
+    with.save(dir.join("with.png")).unwrap();
+    h.state_mut().settings.no_grass = true;
+    h.run_steps(12);
+    let mut grass = h.render().expect("render");
+    for (p, w) in grass.pixels_mut().zip(with.pixels()) {
+        for c in 0..3 {
+            p[c] = (w[c].abs_diff(p[c]) as u32 * 4).min(255) as u8;
+        }
+    }
+    grass.save(dir.join("grass.png")).unwrap();
+}
+
+/// Dense grass (30 tufts a square meter) seen across a field, the camera
+/// led forward a meter at a time over the distance where the view begins
+/// to draw fewer of its tufts (45 m: `mg_area::grass::LEVELS`): pictures
+/// in `target/test-output/ui-area-grass-band/`, to look at (the tufts
+/// thinned at once at a tile's edge, a band, before they thinned over a
+/// stretch of the field).
+#[test]
+#[ignore = "a look at grass thinned with distance"]
+fn grass_thinned_with_distance_looks() {
+    use mg_area::grass::{GRASS_MATERIAL, GrassOverride, set_override};
+    let Some((mut h, area)) = area_harness_sized("grass-band", "ttr01", None, 12) else { return };
+    let git = ResKey::new(area, ResType::GIT);
+    let edits = {
+        let app = h.state_mut();
+        let game = app.game.clone().unwrap();
+        let set = mg_area::tileset(&game, ResRef::from_str("ttr01").unwrap()).ok();
+        let mut o = GrassOverride::new(GRASS_MATERIAL, set.as_ref());
+        o.look.density = 30.0;
+        let root = app.ws.as_mut().unwrap().doc(&git).unwrap().root.clone();
+        set_override(git, &root, &o)
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Dense", edits)));
+    h.run_steps(4);
+    h.state_mut().area_views.get_mut(&area).unwrap().grid = false;
+    let dir = mg_testkit::output_dir("ui-area-grass-band");
+    for step in 0..4 {
+        if let Some(o) = &mut h.state_mut().area_views.get_mut(&area).unwrap().orbit {
+            o.target = glam::Vec3::new(50.0 + 2.0 * step as f32, 60.0, 0.0);
+            (o.pitch, o.yaw, o.distance) = (0.75, std::f32::consts::PI, 50.0);
+        }
+        h.state_mut().settings.no_grass = false;
+        h.run_steps(12);
+        let with = h.render().expect("render");
+        with.save(dir.join(format!("step-{step}.png"))).unwrap();
+        // What the grass changes, four times as bright: how dense it is
+        // drawn, over the field.
+        h.state_mut().settings.no_grass = true;
+        h.run_steps(12);
+        let mut grass = h.render().expect("render");
+        for (p, w) in grass.pixels_mut().zip(with.pixels()) {
+            for c in 0..3 {
+                p[c] = (w[c].abs_diff(p[c]) as u32 * 4).min(255) as u8;
+            }
+        }
+        grass.save(dir.join(format!("grass-{step}.png"))).unwrap();
+    }
 }
 
 /// The area view's grass covers what the view shows, not a reach around
@@ -1324,22 +1626,89 @@ fn grass_covers_the_whole_view() {
                 view.rect.shrink(20.0).contains(at),
                 "{name}: {p} at {at:?} is out of the view"
             );
-            let (x0, y0) = (at.x as u32 - 20, at.y as u32 - 20);
-            let changed = (x0..x0 + 40)
-                .flat_map(|x| (y0..y0 + 40).map(move |y| (x, y)))
+            // (Close, a square of a few meters: grass grows in clumps, and
+            // one of 40 pixels may fall between two.)
+            let half = if name == "close" { 80 } else { 20 };
+            let (x0, y0) = (at.x as u32 - half, at.y as u32 - half);
+            let changed = (x0..x0 + 2 * half)
+                .flat_map(|x| (y0..y0 + 2 * half).map(move |y| (x, y)))
                 .filter(|&(x, y)| {
                     let (a, b) = (shots[0].get_pixel(x, y), shots[1].get_pixel(x, y));
                     (0..3).any(|c| a[c].abs_diff(b[c]) > 12)
                 })
                 .count();
-            let off = p.distance(eye);
-            if changed <= 40 {
+            let (off, all) = (p.distance(eye), 4 * half * half);
+            if changed <= all as usize / 40 {
                 bare.push(format!(
                     "{name}: the grass at {p} ({off:.0} m from the eye) changed {changed} of \
-                     1600 pixels"
+                     {all} pixels"
                 ));
             }
         }
     }
     assert!(bare.is_empty(), "{bare:#?}");
+}
+
+/// Grass sways in the wind, as the client's does (`mg_area::grass::sway`):
+/// in a rural area of `WindPower` 2, seen low and close, the grass moves
+/// between two moments a second apart, with Moonglow's shader and with
+/// the game's; in one of 0 it stands still (only what else moves,
+/// nothing at all here, changes). The pictures (the first moment, the
+/// second, and what changed, four times as bright) are in
+/// `target/test-output/ui-area-grass-sway/`.
+#[test]
+fn grass_sways_in_the_wind_with_either_shader() {
+    let dir = mg_testkit::output_dir("ui-area-grass-sway");
+    let mut moved = Vec::new();
+    for wind in [0, 2] {
+        let windy = |m: &mut mg_module::Module, _: &mg_rules::GameData, area: ResRef| {
+            let key = ResKey::new(area, ResType::ARE);
+            let mut are = m.gff(&key).unwrap().unwrap();
+            are.root.set("WindPower", mg_gff::Value::Int(wind));
+            m.set_gff(key, &are).unwrap();
+        };
+        let name = format!("grass-sway-{wind}");
+        let Some((mut h, area)) = area_harness_with(&name, "ttr01", None, 4, None, &windy) else {
+            return;
+        };
+        let view = h.state_mut().area_views.get_mut(&area).unwrap();
+        view.grid = false;
+        if let Some(o) = &mut view.orbit {
+            o.target = glam::Vec3::new(20.0, 20.0, 0.0);
+            (o.pitch, o.yaw, o.distance) = (0.25, -std::f32::consts::FRAC_PI_2, 6.0);
+        }
+        h.state_mut().settings.no_grass = false;
+        for game in [false, true] {
+            h.state_mut().settings.game_shaders = Some(game);
+            if game {
+                until_the_game_draws(&mut h);
+            }
+            h.run_steps(12);
+            let a = h.render().expect("render");
+            // (A second on: a quarter of the swing.)
+            h.run_steps(60);
+            let b = h.render().expect("render");
+            let shader = if game { "game" } else { "own" };
+            a.save(dir.join(format!("wind{wind}-{shader}-a.png"))).unwrap();
+            b.save(dir.join(format!("wind{wind}-{shader}-b.png"))).unwrap();
+            let mut changed = a.clone();
+            let mut count = 0;
+            for (p, q) in changed.pixels_mut().zip(b.pixels()) {
+                count += usize::from((0..3).any(|c| p[c].abs_diff(q[c]) > 8));
+                for c in 0..3 {
+                    p[c] = (q[c].abs_diff(p[c]) as u32 * 4).min(255) as u8;
+                }
+            }
+            changed.save(dir.join(format!("wind{wind}-{shader}-moved.png"))).unwrap();
+            moved.push((wind, shader, count, a.width() as usize * a.height() as usize));
+        }
+    }
+    eprintln!("pixels changed (wind, shader, changed, of): {moved:?}");
+    for (wind, shader, count, all) in moved {
+        if wind == 0 {
+            assert_eq!(count, 0, "still without wind, {shader}'s shader");
+        } else {
+            assert!(count > all / 100, "the grass sways in wind {wind}, {shader}'s: {count}");
+        }
+    }
 }

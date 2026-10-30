@@ -5,8 +5,9 @@
 //! clock moving on by a 144th of a second a frame), at the development
 //! machine's screen (3440×1440): with the pointer moving over it, with the
 //! wheel turning, and left alone (where it says how soon it asks to be
-//! drawn again). Timing only; the views over the budget are named at the
-//! end. (An area's picture is kept between its animations' steps, so its
+//! drawn again). The views over the budget are named at the end, and a
+//! test fails where one is over it by more than [`MARGIN`] and not among
+//! those the deferred list holds ([`KNOWN_OVER`]). (An area's picture is kept between its animations' steps, so its
 //! view's usual frame is short and the frame that draws it is the worst:
 //! "spikes" says that one is over the budget.) Needs the game (Tyrants of the Moonsea) and a GPU; run in release:
 //! `cargo test --release -p mg-ui --test frame_perf -- --ignored --nocapture`.
@@ -18,7 +19,9 @@
 //! does while an assistive client is connected (a screen reader, a desktop
 //! agent), and `FRAME_TARGET=<width>x<height>` sizes the pictures of the areas
 //! taken apart at the end, and `FRAME_SHADOWS=sun,creatures,lights`
-//! (any of them, or `off`) draws those kinds of shadow in every area. (With another program drawing, the game say,
+//! (any of them, or `off`) draws those kinds of shadow in every area, and
+//! `FRAME_SHADOW_QUALITY=high` draws them as stencil volumes (Options ›
+//! Area › Shadows quality High). (With another program drawing, the game say,
 //! the GPU's times are as much that program's: close it for those.)
 
 #[allow(dead_code)]
@@ -37,6 +40,24 @@ const SCREEN: egui::Vec2 = egui::vec2(3440.0, 1400.0);
 const FPS: f64 = 144.0;
 const BUDGET: Duration = Duration::from_micros(6_944);
 const FRAMES: usize = 72;
+/// How far past the budget a view's median goes before the test fails:
+/// the same build's times move from run to run (a tenth, and more with
+/// other programs busy).
+const MARGIN: f64 = 1.25;
+/// Views known to be over the budget, by a part of their names, and the
+/// entry of `docs/deferred.md` that holds each: named, but not failed.
+const KNOWN_OVER: &[(&str, &str)] = &[
+    // 13 to 16 ms seen whole, 21 to 28 turning, 2026-10-27.
+    ("area woods (", "A dense area seen whole is still slower with the switch on"),
+    // The wheel zooming over the whole of area084 (16,000 meshes drawn):
+    // 9.6 to 11.7 ms, 2026-10-30.
+    ("549 objects) (Sound Ranges off), overview (wheel)", LARGEST),
+    ("549 objects) (Sound Ranges off), turning (wheel)", LARGEST),
+    ("549 objects) (Sound Ranges on), overview (wheel)", LARGEST),
+    ("549 objects) (Sound Ranges on), turning (wheel)", LARGEST),
+];
+/// The entry of `docs/deferred.md` for the largest areas' frames.
+const LARGEST: &str = "The largest areas in full view";
 
 const CAMPAIGN: &str = "Neverwinter Nights - Tyrants of the Moonsea.nwm";
 
@@ -51,10 +72,15 @@ enum Pointer {
     Scrolls,
     /// Away from the window: nothing happens.
     Away,
+    /// Pressed at the first point, moved to the second and let go at the
+    /// last frame: a drag (of a selection, in an area's view).
+    Drags(egui::Pos2, egui::Pos2),
 }
 
 struct Report {
     over: Vec<String>,
+    /// Those over by more than [`MARGIN`] and not [`KNOWN_OVER`].
+    failed: Vec<String>,
     shots: bool,
     /// `FRAME_VIEW`: only the views with this in their name are timed.
     only: Option<String>,
@@ -70,11 +96,42 @@ impl Report {
         let var = |name: &str| std::env::var(name).ok();
         Report {
             over: Vec::new(),
+            failed: Vec::new(),
             shots: var("FRAME_SHOTS").is_some(),
             only: var("FRAME_VIEW"),
             count: var("FRAME_COUNT").and_then(|n| n.parse().ok()).unwrap_or(FRAMES),
             detail: var("FRAME_DETAIL").is_some(),
         }
+    }
+
+    /// `what` took `took` a frame: named if it is over the budget, failed
+    /// if by more than [`MARGIN`] and not [`KNOWN_OVER`].
+    fn took(&mut self, what: String, took: Duration) {
+        if took <= BUDGET {
+            return;
+        }
+        let known = KNOWN_OVER.iter().find(|(name, _)| what.contains(name));
+        let line = format!("{what}: {:.2} ms", ms(took));
+        match known {
+            Some((_, entry)) => self.over.push(format!("{line} (known: \"{entry}\")")),
+            None if took > BUDGET.mul_f64(MARGIN) => {
+                self.over.push(line.clone());
+                self.failed.push(line);
+            }
+            None => self.over.push(line),
+        }
+    }
+
+    /// Names the views over the budget, and fails for those over it by
+    /// more than [`MARGIN`] that aren't known.
+    fn end(&self) {
+        println!("over the budget:\n  {}", self.over.join("\n  "));
+        assert!(
+            self.failed.is_empty(),
+            "over the budget ({:.2} ms) by more than {MARGIN}:\n  {}",
+            ms(BUDGET),
+            self.failed.join("\n  ")
+        );
     }
 }
 
@@ -167,6 +224,19 @@ fn frames(
                 });
             }
             Pointer::Away => {}
+            Pointer::Drags(from, to) => {
+                let at = from.lerp(to, n as f32 / (count - 1).max(1) as f32);
+                input.events.push(egui::Event::PointerMoved(at));
+                let last = n + 1 == count;
+                if n == 0 || last {
+                    input.events.push(egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: !last,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+            }
         }
         wait(&device);
         let app = h.state_mut();
@@ -234,6 +304,9 @@ fn view_with(
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
     let rect = tab.and_then(|t| rect_of(h.state(), t)).unwrap_or(screen);
     if r.shots {
+        // (The view as its frames have it: its first frame's change made.)
+        each(h.state_mut(), 0);
+        h.run_steps(2);
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/test-output/frame-shots");
         std::fs::create_dir_all(&dir).unwrap();
@@ -251,35 +324,111 @@ fn view_with(
         // opening, not its frame.)
         frames(h, rect, pointer, 4, &mut each);
         let f = frames(h, rect, pointer, r.count, &mut each);
-        let cpu: Vec<Duration> = f.ui.iter().zip(&f.tessellate).map(|(a, b)| *a + *b).collect();
-        let (median, worst) = (pick(cpu.clone(), 0.5), pick(cpu, 0.99));
-        let mark = if median > BUDGET {
-            "OVER"
-        } else if worst > BUDGET {
-            "spikes"
-        } else {
-            "ok"
-        };
-        println!(
-            "  {what:44} {how:8} cpu {:6.2} ms (worst {:6.2}; ui {:6.2}, tessellate {:5.2}; \
-             {:6} vertices, {} pass) gpu {:5.2} ms, again {:8} {mark}",
-            ms(median),
-            ms(worst),
-            ms(pick(f.ui.clone(), 0.5)),
-            ms(pick(f.tessellate.clone(), 0.5)),
-            f.vertices,
-            f.passes,
-            ms(pick(f.gpu.clone(), 0.5)),
-            again(f.again),
-        );
-        if median > BUDGET {
-            r.over.push(format!("{what} ({how}): {:.2} ms", ms(median)));
+        said(r, what, how, &f);
+    }
+}
+
+/// A line for a view's frames, timed one way (`how`).
+fn said(r: &mut Report, what: &str, how: &str, f: &Frames) {
+    let cpu: Vec<Duration> = f.ui.iter().zip(&f.tessellate).map(|(a, b)| *a + *b).collect();
+    let (median, worst) = (pick(cpu.clone(), 0.5), pick(cpu, 0.99));
+    let mark = if median > BUDGET {
+        "OVER"
+    } else if worst > BUDGET {
+        "spikes"
+    } else {
+        "ok"
+    };
+    println!(
+        "  {what:44} {how:8} cpu {:6.2} ms (worst {:6.2}; ui {:6.2}, tessellate {:5.2}; \
+         {:6} vertices, {} pass) gpu {:5.2} ms, again {:8} {mark}",
+        ms(median),
+        ms(worst),
+        ms(pick(f.ui.clone(), 0.5)),
+        ms(pick(f.tessellate.clone(), 0.5)),
+        f.vertices,
+        f.passes,
+        ms(pick(f.gpu.clone(), 0.5)),
+        again(f.again),
+    );
+    r.took(format!("{what} ({how})"), median);
+    if r.detail {
+        let each: Vec<String> = f.ui.iter().map(|d| format!("{:.1}", ms(*d))).collect();
+        println!("      frames: {}", each.join(" "));
+        println!("      asked for the next by: {}", f.causes.join("; "));
+    }
+}
+
+/// An object of an area in sight close up selected and dragged a few
+/// meters, and the move taken back: the frames of the
+/// drag (each moves the selection's copies in the area's model).
+fn drag_selection(h: &mut App<'_>, r: &mut Report, what: &str, area: ResRef) {
+    let tab = Tab::Area(area);
+    if r.only.as_ref().is_some_and(|only| !what.contains(only.as_str())) || r.shots {
+        return;
+    }
+    let Some(rect) = rect_of(h.state(), &tab) else { return };
+    // (Once the camera rests: the wheel's zoom of the views before goes on
+    // a while, and the object would slip from under the press.)
+    let orbit = |h: &App<'_>| h.state().area_views.get(&area).and_then(|v| v.orbit);
+    for _ in 0..1000 {
+        let was = orbit(h);
+        h.run_steps(1);
+        if orbit(h) == was {
+            break;
         }
-        if r.detail {
-            let each: Vec<String> = f.ui.iter().map(|d| format!("{:.1}", ms(*d))).collect();
-            println!("      frames: {}", each.join(" "));
-            println!("      asked for the next by: {}", f.causes.join("; "));
+    }
+    if let Some(o) = h.state_mut().area_views.get_mut(&area).and_then(|v| v.orbit.as_mut()) {
+        o.pitch = 0.7;
+        o.distance = 25.0;
+    }
+    h.run_steps(2);
+    assert_eq!(orbit(h).map(|o| o.distance), Some(25.0), "{what}: the camera rests");
+    let inner = rect.shrink2(rect.size() * 0.2);
+    let Some(v) = h.state_mut().area_views.get_mut(&area) else { return };
+    let Some(m) = v.model.as_ref() else { return };
+    // (Those picked where they stand: not a sound's or a trigger's.)
+    use mg_area::ObjectKind as K;
+    let seen: Vec<_> = (m.objects.iter().enumerate())
+        .filter(|(_, o)| matches!(o.kind, K::Placeable | K::Creature | K::Waypoint | K::Item))
+        .filter(|(_, o)| v.screen_pos(o.position).is_some_and(|p| inner.contains(p)))
+        .map(|(i, o)| (i, (o.kind, o.index), o.position))
+        .collect();
+    if seen.is_empty() {
+        println!("  {what}: no object in sight close up");
+        return;
+    }
+    let what = format!("{what} (one of {} in sight)", seen.len());
+    // The first that can be held away from its handles (its feet are its
+    // turning ring's: pressed there, the drag turned it), selected alone
+    // (the turning rings of others about it would turn them instead), and
+    // dragged 5 m.
+    let mut grip = None;
+    for &(i, key, at) in &seen {
+        let Some(v) = h.state_mut().area_views.get_mut(&area) else { return };
+        v.selection = vec![key];
+        h.run_steps(2);
+        let v = &h.state().area_views[&area];
+        let step = v.screen_pos(at + glam::Vec3::new(4.0, 3.0, 0.0)).zip(v.screen_pos(at));
+        if let (Some(from), Some((ahead, foot))) = (v.move_grip(i), step) {
+            grip = Some((from, from + (ahead - foot)));
+            break;
         }
+    }
+    let Some((from, to)) = grip else {
+        println!("  {what}: none to hold away from its handles");
+        return;
+    };
+    let f = frames(h, rect, Pointer::Drags(from, to), r.count, |_, _| {});
+    said(r, &what, "drag", &f);
+    // (The move taken back, the selection let go.)
+    h.run_steps(2);
+    let now = h.state().ws.as_ref().and_then(|w| w.can_undo().map(str::to_owned));
+    assert_eq!(now.as_deref(), Some("Move"), "{what}: the drag moved the selection");
+    h.state_mut().actions.push(Action::Undo);
+    h.run_steps(2);
+    if let Some(v) = h.state_mut().area_views.get_mut(&area) {
+        v.selection.clear();
     }
 }
 
@@ -340,9 +489,18 @@ fn areas(app: &mut Moonglow) -> Vec<(ResRef, i64)> {
     vec![middle, largest]
 }
 
-fn harness<'a>(app: Moonglow, rs: egui_wgpu::RenderState) -> App<'a> {
+fn harness<'a>(mut app: Moonglow, rs: egui_wgpu::RenderState) -> App<'a> {
+    // (`FRAME_SHADOW_QUALITY=high`: the area views' shadows as stencil
+    // volumes, Options › Area's High.)
+    if std::env::var("FRAME_SHADOW_QUALITY").is_ok_and(|q| q.eq_ignore_ascii_case("high")) {
+        app.settings.shadow_quality = mg_ui::settings::ShadowQuality::High;
+    }
+    // (A step a 144th of a second, as the window's frames go: with the
+    // harness's quarter of a second, every frame of an area's opening
+    // was an animation step's, the picture drawn again in each.)
     Harness::builder()
         .with_size(SCREEN)
+        .with_step_dt((1.0 / FPS) as f32)
         .renderer(egui_kittest::wgpu::WgpuTestRenderer::from_render_state(rs))
         .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app)
 }
@@ -422,6 +580,32 @@ fn area_views(h: &mut App<'_>, r: &mut Report, area: ResRef, tiles: i64, label: 
             println!("      frames: {}", each.join(" "));
         }
     }
+    // An edit of it (its Comments: nothing drawn changes), and its Undo:
+    // the frame each is seen in (the one after it is made), the area read
+    // again and drawn there (against what it costs drawn alone: the
+    // overview's frames below).
+    if !r.shots {
+        let are = ResKey::new(area, ResType::ARE);
+        let comment = mg_gff::Value::String(b"timed".to_vec());
+        let edit = mg_edit::Edit::SetField {
+            key: are,
+            path: mg_edit::GffPath::root(),
+            label: "Comments".into(),
+            value: Some(comment),
+        };
+        let mut took = Vec::new();
+        for action in [Action::Apply(mg_edit::Command::new("Timed", vec![edit])), Action::Undo] {
+            h.state_mut().actions.push(action);
+            h.run_steps(1);
+            let t = Instant::now();
+            h.run_steps(1);
+            took.push(ms(t.elapsed()));
+        }
+        println!(
+            "  area {area}{label}: an edit's frame {:.1} ms, its Undo's {:.1} ms",
+            took[0], took[1]
+        );
+    }
     let objects = h
         .state()
         .area_views
@@ -443,6 +627,21 @@ fn area_views(h: &mut App<'_>, r: &mut Report, area: ResRef, tiles: i64, label: 
             o.yaw += 0.01;
         }
     });
+    // The tiles palette beside it with a search being typed: a letter
+    // more each frame (the tileset searched again as each is).
+    h.state_mut().actions.push(Action::OpenTab(Tab::Palette));
+    h.run_steps(2);
+    view_with(h, r, &format!("{name}, tiles palette searched as typed"), None, |app, n| {
+        const TYPED: &str = "corner wall";
+        let p = &mut app.palette;
+        (p.tiles, p.prefabs) = (true, false);
+        p.filter = TYPED[..1 + n % TYPED.len()].to_string();
+    });
+    {
+        let p = &mut h.state_mut().palette;
+        (p.tiles, p.filter) = (false, String::new());
+    }
+    close(h, &Tab::Palette);
     // Every object selected (Ctrl+A) and the ground's walkmesh shown,
     // turning: the overlays drawn for each, each frame.
     if let Some(v) = h.state_mut().area_views.get_mut(&area)
@@ -462,6 +661,7 @@ fn area_views(h: &mut App<'_>, r: &mut Report, area: ResRef, tiles: i64, label: 
         v.selection.clear();
         v.walkmesh = false;
     }
+    drag_selection(h, r, &format!("{name}, a selection dragged"), area);
     close(h, &tab);
 }
 
@@ -590,6 +790,8 @@ fn area_parts(h: &mut App<'_>, area: ResRef, count: usize, shaders: &[bool], gra
         renderer.game_shaders = on;
         renderer.game_water = water;
         renderer.soft_particles = soft;
+        renderer.shadow_volumes =
+            std::env::var("FRAME_SHADOW_QUALITY").is_ok_and(|q| q.eq_ignore_ascii_case("high"));
         let mut first = Duration::ZERO;
         let targets = Targets::new(&gpu, format, samples, w, h_px);
         let mut sims = std::collections::HashMap::new();
@@ -806,7 +1008,10 @@ fn frames_at_144() {
     tab(&mut h, &mut r, "standard placeable palette, searched for \"a\"", Tab::Palette);
     palette(&mut h, BlueprintKind::Item, false, "e");
     tab(&mut h, &mut r, "standard item palette, searched for \"e\"", Tab::Palette);
-    // The Gallery: its pictures are made a few a frame, then kept.
+    // The Gallery: its pictures are made a few a frame, then kept; their
+    // models and textures read apart, as the desktop app reads them.
+    let background = h.state().background_jobs;
+    h.state_mut().background_jobs = true;
     h.state_mut().settings.palette_gallery = true;
     for (side, what) in [(128, "Gallery"), (64, "Gallery, smallest pictures")] {
         h.state_mut().settings.gallery_tile = Some(side);
@@ -818,6 +1023,7 @@ fn frames_at_144() {
     }
     h.state_mut().settings.palette_gallery = false;
     h.state_mut().settings.gallery_tile = None;
+    h.state_mut().background_jobs = background;
     h.state_mut().palette.filter.clear();
 
     tab(&mut h, &mut r, "resource browser", Tab::Resources);
@@ -853,7 +1059,7 @@ fn frames_at_144() {
             area_parts(&mut h, *area, r.count, &[false], false);
         }
     }
-    println!("over the budget:\n  {}", r.over.join("\n  "));
+    r.end();
 }
 
 /// The persistent world's views (`world/mod.rs`): the lists at the sizes
@@ -903,6 +1109,18 @@ fn frames_at_144_in_a_persistent_world() {
     h.get_by_label("Inventory").click();
     h.run_steps(3);
     view(&mut h, &mut r, "store inventory with 1,000 items", Some(&store));
+    // Its picker on the custom palette, searched for what all 8,000 have:
+    // every blueprint folded into the tree, every match drawn.
+    if click(&mut h, "Custom Palette") {
+        let found = egui_kittest::kittest::by().predicate(|n| n.placeholder() == Some("Find"));
+        if let Some(find) = h.query_all(found).last() {
+            find.click();
+            h.run_steps(2);
+            h.event(egui::Event::Text("pw_i".into()));
+            h.run_steps(3);
+        }
+        view(&mut h, &mut r, "store inventory, picker searched (8,000 found)", Some(&store));
+    }
     close(&mut h, &store);
     // An item's Properties page: every property it may take, by kind.
     let item = Tab::Blueprint(ResKey::parse("pw_i00001", ResType::UTI).unwrap());
@@ -963,7 +1181,7 @@ fn frames_at_144_in_a_persistent_world() {
     h.run_steps(2);
     view(&mut h, &mut r, "log of 10,000 lines, 2,000 fixes", None);
     h.state_mut().log.clear();
-    println!("over the budget:\n  {}", r.over.join("\n  "));
+    r.end();
 }
 
 /// The persistent world (`world/mod.rs`) kept as a nasher project, built
@@ -1202,10 +1420,8 @@ fn reload_frames_at_144() {
     let ws = h.state_mut().ws.as_mut().unwrap();
     assert_eq!(ws.doc(&mine).unwrap().root.string("Tag"), Some(&b"MINE"[..]), "kept");
     assert_eq!(h.state().outside_conflicts(), [mine_path]);
-    if longest > BUDGET {
-        r.over.push(format!("reload after a pull: longest frame {:.1} ms", ms(longest)));
-    }
-    println!("over the budget:\n  {}", r.over.join("\n  "));
+    r.took("reload after a pull, its longest frame".into(), longest);
+    r.end();
 }
 
 /// Grass's cost: a 32 by 32 rural field (ttr01, grass on nearly every
@@ -1239,6 +1455,13 @@ fn grass_frames_at_144() {
     };
     let area = add_area(&mut m, &game, &spec, &mut rng).unwrap();
     let set = mg_area::tileset(&game, ResRef::from_str("ttr01").unwrap()).ok();
+    // (In a strong wind: the grass sways, each tile's posed.)
+    {
+        let key = ResKey::new(area, ResType::ARE);
+        let mut are = m.gff(&key).unwrap().unwrap();
+        are.root.set("WindPower", mg_gff::Value::Int(2));
+        m.set_gff(key, &are).unwrap();
+    }
     if let Some(density) = std::env::var("FRAME_GRASS_DENSITY").ok().and_then(|d| d.parse().ok()) {
         let key = ResKey::new(area, ResType::GIT);
         let mut git = m.gff(&key).unwrap().unwrap();
@@ -1338,9 +1561,61 @@ fn grass_frames_at_144() {
         times.push(t.elapsed());
     }
     println!("  grown again (a drag's frame): {:.2} ms", ms(pick(times, 0.5)));
-    for over in &r.over {
-        println!("OVER: {over}");
+    r.end();
+}
+
+/// Sound Ranges' cost: the campaign's area with the most placed sounds,
+/// in the viewer with the switch off and then on (each distance of each
+/// positional sound a dotted sphere). Needs the game and a GPU; run in
+/// release: `cargo test --release -p mg-ui --test frame_perf sound_ranges
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn sound_ranges_frames_at_144() {
+    mg_testkit::gpu::hold();
+    let root = mg_testkit::corpus!();
+    let path = root.join("data/nwm").join(CAMPAIGN);
+    if !path.is_file() {
+        println!("skipped: {CAMPAIGN} isn't installed");
+        return;
     }
+    let mut r = Report::new();
+    let rs = render_state();
+    let mut app =
+        Moonglow::new(Some(GameInstall::new(&root, None, "en")), Box::new(NoDialogs::default()));
+    app.set_render_state(rs.clone());
+    app.open_module(&path);
+    // The area with the most positional sounds, and its size in tiles.
+    let (area, tiles, sounds) = {
+        let ws = app.ws.as_mut().unwrap();
+        let keys: Vec<_> = ws.module.keys_of(ResType::GIT).copied().collect();
+        let mut best = None;
+        for k in keys {
+            let count = ws.doc(&k).ok().map_or(0, |g| {
+                let list = g.root.list("SoundList").unwrap_or(&[]);
+                list.iter().filter(|s| s.integer("Positional").unwrap_or(0) != 0).count()
+            });
+            let are = ws.doc(&ResKey::new(k.resref, ResType::ARE)).ok();
+            let size = are.and_then(|a| Some(a.root.integer("Width")? * a.root.integer("Height")?));
+            if best.as_ref().is_none_or(|(_, _, n)| count > *n) {
+                best = Some((k.resref, size.unwrap_or(0), count));
+            }
+        }
+        best.unwrap()
+    };
+    println!(
+        "Sound Ranges: {CAMPAIGN}'s {area}, {sounds} positional sounds, frames at {SCREEN:?}, \
+         budget {:.2} ms",
+        ms(BUDGET)
+    );
+    let mut h = harness(app, rs);
+    h.run_steps(3);
+    for on in [false, true] {
+        h.state_mut().settings.sound_ranges = on;
+        let label = if on { " (Sound Ranges on)" } else { " (Sound Ranges off)" };
+        area_views(&mut h, &mut r, area, tiles, label);
+    }
+    r.end();
 }
 
 /// The Shaders switch's cost (`docs/shaders-proposal.md`, M3): a large
@@ -1405,7 +1680,7 @@ fn game_shaders_frames_at_144() {
             None => println!("skipped The Domains of Dread: no tdod_t_tap.hak in MOONGLOW_HAKS"),
         }
     }
-    println!("over the budget:\n  {}", r.over.join("\n  "));
+    r.end();
 }
 
 /// A stock area of water, grass and fires (M5's special surfaces): 16 by

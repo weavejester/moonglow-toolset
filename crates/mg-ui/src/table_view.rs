@@ -62,6 +62,9 @@ pub struct TableDoc {
     anchor: Option<(usize, usize)>,
     /// A drag over the cells is selecting them.
     dragging: bool,
+    /// Such a drag past the grid's edge: how far to scroll it at the
+    /// next frame.
+    edge_scroll: egui::Vec2,
     /// A column's name is being dragged to another place: the column.
     moving: Option<usize>,
     /// What is being typed into the selected cell.
@@ -136,6 +139,7 @@ impl TableDoc {
             selected: None,
             anchor: None,
             dragging: false,
+            edge_scroll: egui::Vec2::ZERO,
             moving: None,
             typing: None,
             filter: String::new(),
@@ -176,6 +180,11 @@ impl TableDoc {
         self.anchor = None;
         self.selected = Some((row, column));
         self.reveal = true;
+    }
+
+    /// How far the grid is scrolled, across and down (points).
+    pub fn scrolled(&self) -> egui::Vec2 {
+        self.scroll
     }
 
     /// The cells selected: the first and last row, the first and last
@@ -308,7 +317,7 @@ pub fn open_path(app: &mut Moonglow, path: &std::path::Path) -> Option<u32> {
 
 /// A 2DA file anywhere, asked for.
 pub fn open_file(app: &mut Moonglow) {
-    if let Some(path) = app.dialogs.open_file(crate::dialogs::FileKind::Any, None) {
+    if let Some(path) = app.dialogs.open_file(crate::dialogs::FileKind::Table, None) {
         open_path(app, &path);
     }
 }
@@ -393,11 +402,12 @@ pub(crate) fn open_table_ui(app: &mut Moonglow, ctx: &egui::Context) {
         .default_size([460.0, 440.0])
         .collapsible(false)
         .show(ctx, |ui| {
-            let field = ui.add(
-                egui::TextEdit::singleline(&mut w.filter)
-                    .hint_text("Find by name")
-                    .desired_width(f32::INFINITY),
-            );
+            let field =
+                crate::widgets::SearchField::new(egui::Id::new("open-2da-find"), &mut w.filter)
+                    .hint("Find by name")
+                    .find_over()
+                    .show(ui)
+                    .response;
             crate::widgets::autofocus(ui, &field);
             let entered = ui.input(|i| i.key_pressed(egui::Key::Enter));
             let needle = mg_core::text::Needle::new(&w.filter);
@@ -471,12 +481,27 @@ pub fn edit_copy(app: &mut Moonglow, key: ResKey, home: Home) -> Option<u32> {
 }
 
 /// Edit a Copy In › a file: asks where.
-pub fn edit_copy_in_file(app: &mut Moonglow, key: ResKey) {
+pub fn edit_copy_in_file(app: &mut Moonglow, key: ResKey) -> Option<u32> {
     let suggested = PathBuf::from(key.to_string());
-    if let Some(path) = app.dialogs.save_file(crate::dialogs::FileKind::Any, Some(&suggested)) {
-        let path = if path.extension().is_some() { path } else { path.with_extension("2da") };
-        edit_copy(app, key, Home::File(path));
-    }
+    let path = app.dialogs.save_file(crate::dialogs::FileKind::Table, Some(&suggested))?;
+    let path = if path.extension().is_some() { path } else { path.with_extension("2da") };
+    edit_copy(app, key, Home::File(path))
+}
+
+/// Adds a row with `cells` (by column name) at the end of the table open
+/// as `id`, as one step to take back, and goes to it: its number.
+pub fn add_row_of(
+    app: &mut Moonglow,
+    id: u32,
+    label: &str,
+    cells: &[(String, String)],
+) -> Option<usize> {
+    let doc = app.tables.iter_mut().find(|d| d.id == id)?;
+    doc.commit();
+    let row = doc.edit.add_row_of(label, cells);
+    doc.changed();
+    doc.go_to(row, 0);
+    Some(row)
 }
 
 /// Saves a table where it lives. Whether it was saved.
@@ -542,7 +567,8 @@ pub fn save(app: &mut Moonglow, id: u32) -> bool {
 fn save_as_file(app: &mut Moonglow, id: u32) {
     let Some(doc) = app.tables.iter().find(|d| d.id == id) else { return };
     let suggested = PathBuf::from(doc.key.to_string());
-    let Some(path) = app.dialogs.save_file(crate::dialogs::FileKind::Any, Some(&suggested)) else {
+    let Some(path) = app.dialogs.save_file(crate::dialogs::FileKind::Table, Some(&suggested))
+    else {
         return;
     };
     let path = if path.extension().is_some() { path } else { path.with_extension("2da") };
@@ -926,31 +952,12 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui, id: u32) {
         return;
     };
     // OK and Cancel, as the other editors have: a table is saved when
-    // asked, so OK saves it and Cancel leaves it as last saved.
-    let tips = [
-        "Save the table and close the window",
-        "Close the window without saving (unsaved changes are asked about first)",
-    ];
-    let pressed = crate::blueprint::ok_cancel_saying(ui, egui::Id::new(("table", id)), false, tips);
-    match pressed {
-        Some(crate::blueprint::Pressed::Ok) => {
-            app.tables[at].commit();
-            if !app.tables[at].edit.is_dirty() || save(app, id) {
-                app.tables.retain(|d| d.id != id);
-                app.actions.push(Action::CloseTab(Tab::Table(id)));
-                return;
-            }
-        }
-        // (Closed as by its ×: unsaved changes are asked about first,
-        // no Undo bringing a table's back.)
-        Some(crate::blueprint::Pressed::Cancel) => {
-            app.tables[at].commit();
-            if app.may_close_side(&Tab::Table(id)) {
-                app.actions.push(Action::CloseTab(Tab::Table(id)));
-                return;
-            }
-        }
-        None => {}
+    // asked, so OK saves it and Cancel leaves it as last saved (asked
+    // about first, as its × asks: no Undo brings a table's changes back).
+    // (A cell being typed is set first.)
+    let commit = |app: &mut Moonglow| app.tables[at].commit();
+    if crate::side_doc::ok_cancel(app, ui, &Tab::Table(id), false, commit) {
+        return;
     }
     describe(app, ui.ctx(), at);
     let faults = faults(app, at);
@@ -1231,7 +1238,7 @@ fn shown_rows(doc: &TableDoc) -> Vec<usize> {
 
 /// Gives the keys to a table's grid: the arrows, and Undo and Redo, are
 /// that table's from then on.
-fn take_keys(ctx: &egui::Context, table: u32) {
+pub(crate) fn take_keys(ctx: &egui::Context, table: u32) {
     give_keys(ctx, Keys::Table);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("table-keys-of"), table));
 }
@@ -1331,6 +1338,15 @@ fn keys(app: &mut Moonglow, ui: &mut Ui, at: usize) {
     if pressed(ui, none, Key::Enter) || pressed(ui, none, Key::F2) {
         let now = doc.edit.table().cell(row, column).unwrap_or_default().to_string();
         doc.typing = Some(now);
+    } else if let Some(typed) = typed_text(ui) {
+        // A letter typed begins typing: the cell's text replaced by it,
+        // the cursor after it, as a spreadsheet does.
+        let id = egui::Id::new(("table-cell", doc.id));
+        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        let end = egui::text::CCursor::new(typed.chars().count());
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+        state.store(ui.ctx(), id);
+        doc.typing = Some(typed);
     }
     if pressed(ui, none, Key::Delete) && doc.edit.clear_cells(&chosen, left, right) > 0 {
         doc.changed();
@@ -1615,6 +1631,14 @@ fn grid(
     }
     let mut list =
         egui::ScrollArea::both().id_salt(("table-rows", doc.id)).auto_shrink([false, false]);
+    // (A drag selecting cells past an edge, the frame before: on that way.)
+    let edge = std::mem::take(&mut doc.edge_scroll);
+    if dragging && edge.y != 0.0 {
+        list = list.vertical_scroll_offset((scroll_y + edge.y).max(0.0));
+    }
+    if dragging && edge.x != 0.0 {
+        list = list.horizontal_scroll_offset((scroll_x + edge.x).max(0.0));
+    }
     if reveal && let Some((row, column)) = selected {
         if let Some(place) = rows.iter().position(|r| *r == row) {
             let above = (ui.available_height() / 2.0 - pitch).max(0.0);
@@ -1767,6 +1791,49 @@ fn grid(
         })
         .inner;
     doc.scroll = shown.state.offset;
+    // A drag selecting cells past the grid's edge scrolls it that way,
+    // the faster the further, and the selection reaches the row and
+    // column at that edge, as a spreadsheet's does.
+    if dragging
+        && let Some(p) = pointer
+        && let Some((_, column)) = doc.selected
+    {
+        let inner = shown.inner_rect;
+        let past = |at: f32, low: f32, high: f32, most: f32| {
+            if at > high {
+                (at - high).min(most)
+            } else if at < low {
+                -(low - at).min(most)
+            } else {
+                0.0
+            }
+        };
+        let by = egui::vec2(
+            past(p.x, inner.left(), inner.right(), 3.0 * CELL),
+            past(p.y, inner.top(), inner.bottom(), 3.0 * pitch),
+        );
+        if by != egui::Vec2::ZERO && !rows.is_empty() {
+            doc.edge_scroll = by;
+            ui.ctx().request_repaint();
+            let (offset, seen) = (doc.scroll, inner.size());
+            let place = match by.y {
+                y if y > 0.0 => ((offset.y + seen.y) / pitch) as usize,
+                y if y < 0.0 => (offset.y / pitch).ceil() as usize,
+                _ => doc.selected.and_then(|(r, _)| rows.iter().position(|x| *x == r)).unwrap_or(0),
+            };
+            let column = match by.x {
+                x if x > 0.0 => {
+                    lefts.iter().rposition(|l| *l < offset.x + seen.x).unwrap_or(column)
+                }
+                x if x < 0.0 => lefts.iter().position(|l| *l >= offset.x).unwrap_or(column),
+                _ => column,
+            };
+            let to = (rows[place.min(rows.len() - 1)], column);
+            if Some(to) != doc.selected {
+                doc.select_to(to);
+            }
+        }
+    }
     crate::palette_view::keys_outline(ui, shown.inner_rect, Keys::Table);
     if done {
         doc.commit();
@@ -1807,6 +1874,25 @@ fn grid(
             doc.typing = Some(now);
         }
     }
+}
+
+/// Text typed this frame (not with Ctrl, Alt or Command), taken from the
+/// input: what begins typing into a cell of the grid.
+fn typed_text(ui: &mut Ui) -> Option<String> {
+    ui.input_mut(|i| {
+        if i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt {
+            return None;
+        }
+        let mut typed = String::new();
+        i.events.retain(|e| match e {
+            egui::Event::Text(t) if !t.chars().any(char::is_control) => {
+                typed.push_str(t);
+                false
+            }
+            _ => true,
+        });
+        (!typed.is_empty()).then_some(typed)
+    })
 }
 
 /// A row's name for a list of rows to choose from: its number and its
@@ -1927,12 +2013,13 @@ fn inspector(
                     n => format!("{n} flags"),
                 };
                 ui.weak("flags:");
-                // (A set of ticks, not one choice: no arrow keys.)
+                // (A set of ticks, not one choice: the arrows move along
+                // them, Space or Enter ticks one.)
                 crate::widgets::dropdown(("table-flags-choice", id))
                     .selected_text(shown)
                     .width(300.0)
                     .stays_open()
-                    .show_ui(ui, |ui| {
+                    .show_menu(ui, |ui, keys| {
                         for e in entries {
                             let Some(v) =
                                 mg_module::table_desc::whole(&e.value).filter(|v| *v != 0)
@@ -1941,7 +2028,12 @@ fn inspector(
                             };
                             let mut ticked = bits & v == v;
                             let label = format!("{}  ({})", e.name, e.value);
-                            if ui.checkbox(&mut ticked, label).changed() {
+                            let r = ui.checkbox(&mut ticked, label);
+                            let keyed = keys.row(&r);
+                            if keyed {
+                                ticked = !ticked;
+                            }
+                            if r.changed() || keyed {
                                 let next = if ticked { bits | v } else { bits & !v };
                                 set = Some(kind.flags_cell(next, value.as_deref()));
                             }
