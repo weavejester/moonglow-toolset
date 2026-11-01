@@ -45,6 +45,12 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.0" date="2026-11-01">
+      <description>
+        <p>Moonscar 1.1.0, based on Moonglow 3.1.4. The releases listed
+        below this one are Moonglow's.</p>
+      </description>
+    </release>
     <release version="3.1.4" date="2026-10-31">
       <description>
         <p>Shift+click chooses a range of blueprints in the palette, and
