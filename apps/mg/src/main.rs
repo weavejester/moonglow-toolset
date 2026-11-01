@@ -1487,7 +1487,7 @@ fn undescribed_vars(
                 let place = mg_module::rename::describe(
                     f.key,
                     gff.as_ref(),
-                    &format!("{}/VarTable", f.path),
+                    &mg_module::var_desc::table_path(&f.path),
                 );
                 // (A blueprint's place begins with its name.)
                 match place.starts_with(&f.key.to_string()) {
@@ -1524,7 +1524,7 @@ fn undescribed_vars(
             "on": on,
             "places": places.iter().zip(&at).map(|(f, at)| json!({
                 "resource": f.key.to_string(),
-                "path": f.path,
+                "path": f.path.to_string(),
                 "index": f.index,
                 "at": at,
                 "value": f.value,
@@ -1871,8 +1871,8 @@ fn install(cli: &Cli) -> Result<GameInstall> {
             GameInstall::detect().context("no game install found; pass --root or set NWN_ROOT")?
         }
     };
-    if !GameInstall::is_install(&gi.root) {
-        bail!("{} is not a game install (no data/nwn_base.key)", gi.root.display());
+    if let Some(why) = GameInstall::why_not(&gi.root) {
+        bail!("{} is not a game install: {why}", gi.root.display());
     }
     if let Some(u) = &cli.user_dir {
         gi.user_dir = Some(u.clone());
@@ -2439,14 +2439,16 @@ fn run(cli: &Cli) -> Result<Output> {
             }));
             if *usage {
                 let started = std::time::Instant::now();
-                let (haks, reached) =
-                    usage::hak_usage(&gi, &m, &report).map_err(anyhow::Error::msg)?;
-                for u in &haks {
+                let walked = usage::hak_usage(&gi, &m, &report).map_err(anyhow::Error::msg)?;
+                let (haks, reached) = (&walked.haks, walked.reached);
+                for u in haks {
                     out.line(usage::line(u));
                 }
-                out.line(usage::total_line(&haks));
-                out.json["usage"] = usage::json(&haks);
+                out.line(usage::total_line(haks));
+                out.json["usage"] = usage::json(haks);
                 out.json["reached"] = json!(reached);
+                out.json["by_number"] = usage::by_number_json(&walked.by_number);
+                out.note(usage::by_number_line(&walked.by_number));
                 out.note(format!(
                     "the walk reached {reached} resources in {:.1} s; {}",
                     started.elapsed().as_secs_f64(),
@@ -3011,9 +3013,9 @@ fn run(cli: &Cli) -> Result<Output> {
                 )
             };
             out.json = json!({
-                "uses": usages.iter().map(|u| json!({ "place": u.place, "from": u.from.to_string(), "path": u.path })).collect::<Vec<_>>(),
+                "uses": usages.iter().map(|u| json!({ "place": u.place, "from": u.from.to_string(), "path": u.path.to_string() })).collect::<Vec<_>>(),
                 "script_strings": mentions.iter().map(|x| json!({ "script": x.script.to_string(), "line": x.line, "text": x.text })).collect::<Vec<_>>(),
-                "tables": run.iter().map(|r| json!({ "table": r.from.to_string(), "at": r.path })).collect::<Vec<_>>(),
+                "tables": run.iter().map(|r| json!({ "table": r.from.to_string(), "at": r.path.to_string() })).collect::<Vec<_>>(),
                 "marked": (!*tag).then(|| ResKey::from_filename(name))
                     .flatten()
                     .and_then(|k| m.project_file.used.marking(k.resref, k.restype)),
@@ -3262,7 +3264,7 @@ fn run(cli: &Cli) -> Result<Output> {
             let mut replaced = 0;
             // (A tag given another object's: said, as `mg set` says it; of
             // a dry run, as the replace would leave the module.)
-            let tags: Vec<(ResKey, Vec<mg_module::text::Step>)> = (hits.iter())
+            let tags: Vec<(ResKey, mg_edit::GffPath)> = (hits.iter())
                 .filter(|h| h.kind == TextKind::Tag)
                 .map(|h| (h.key, h.path.clone()))
                 .collect();
@@ -4607,7 +4609,7 @@ fn verify(
             "severity": if x.is_error() { "error" } else { "warning" },
             "category": format!("{:?}", x.category),
             "from": x.reference.from.to_string(),
-            "path": x.reference.path,
+            "path": x.reference.path.to_string(),
             "kind": x.reference.kind.name(),
             "target": x.reference.target.to_string(),
             "uncompiled": x.uncompiled,

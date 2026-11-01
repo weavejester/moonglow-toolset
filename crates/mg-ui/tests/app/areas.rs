@@ -994,17 +994,19 @@ fn an_area_s_variables_are_kept_in_its_git() {
     assert_eq!(vars(&mut h, are), None);
 }
 
-/// Saving a module folder without changing anything must leave every
-/// file untouched, even after opening an area, its properties, the
-/// blueprint and instance editors, and reading every area as Update
-/// Instances does. Previously, every document that had been read was
-/// re-serialized on save, so git reported each one as changed.
+/// A module folder saved with nothing changed is as it was, file for file,
+/// though its area, its Properties, every blueprint's editor and the first
+/// placed object of each kind were opened, and every area read as Update
+/// Instances reads them: what was only looked at keeps the bytes it was
+/// written with (Aurora's layout, not Moonglow's). James Reeves's test,
+/// from GitHub pull request 36: before 3.0.0, `chess.are` and `chess.git`
+/// were rewritten.
 #[test]
 fn a_module_folder_saved_with_nothing_changed_is_as_it_was() {
     let root = mg_testkit::corpus!();
     let folder = mg_testkit::scratch_dir("ui-folder-untouched").join("chess");
     let _ = std::fs::remove_dir_all(&folder);
-    // BioWare's own module, so the files have Aurora's byte layout.
+    // BioWare's own module, its files as Aurora laid them out.
     let chess = Module::open(&root.join("data/mod/Neverwinter Chess.mod")).unwrap();
     chess.clone().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
     let files = || -> std::collections::BTreeMap<String, Vec<u8>> {
@@ -1018,14 +1020,12 @@ fn a_module_folder_saved_with_nothing_changed_is_as_it_was() {
     let mut app = game_app(&root, None);
     app.open_module(&folder);
     let mut h = harness(app, 1200.0, 800.0);
-    h.run();
+    settle(&mut h);
     let area = ResRef::from_str("chess").unwrap();
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Area(area)));
-    h.run();
+    settle(&mut h);
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AreaProperties(area)));
-    h.run();
-    // Open every blueprint's editor, and the editor for the first placed
-    // object of each kind.
+    settle(&mut h);
     let blueprints: Vec<ResKey> = (chess.keys())
         .filter(|k| mg_rules::ObjectKind::from_restype(k.restype).is_some())
         .copied()
@@ -1040,7 +1040,7 @@ fn a_module_folder_saved_with_nothing_changed_is_as_it_was() {
     assert!(tabs.len() > 3, "{tabs:?}");
     for tab in tabs {
         h.state_mut().actions.push(mg_ui::Action::OpenTab(tab));
-        h.run();
+        settle(&mut h);
     }
     let ws = h.state_mut().ws.as_mut().unwrap();
     for area in chess.areas().unwrap() {
@@ -1049,10 +1049,10 @@ fn a_module_folder_saved_with_nothing_changed_is_as_it_was() {
         }
     }
     h.state_mut().actions.push(mg_ui::Action::Save);
-    h.run();
+    settle(&mut h);
     let after = files();
     let changed: std::collections::BTreeSet<&String> = (before.keys().chain(after.keys()))
         .filter(|name| before.get(*name) != after.get(*name))
         .collect();
-    assert!(changed.is_empty(), "files were rewritten although nothing changed: {changed:?}");
+    assert!(changed.is_empty(), "rewritten though nothing changed: {changed:?}");
 }

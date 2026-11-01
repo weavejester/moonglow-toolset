@@ -60,10 +60,13 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResRef
         };
         ui.colored_label(ui.visuals().warn_fg_color, text);
     }
+    if viewed {
+        crate::blueprint::typing_kept_out(ui, ui.available_rect_before_wrap());
+    }
     let shown = pages(app, ui, area, others, viewed);
-    if let Some(shown) = shown.filter(|_| viewed) {
+    if shown.is_some() && viewed {
         let keys: Vec<ResKey> = targets.iter().map(|(k, _)| *k).collect();
-        if crate::blueprint::look_only(app, ui, shown, pending, &|k| keys.contains(k)) {
+        if crate::blueprint::look_only(app, pending, &|k| keys.contains(k)) {
             let now = ui.input(|i| i.time);
             ui.data_mut(|d| d.insert_temp(refused_id, now));
             ui.ctx().request_repaint();
@@ -166,7 +169,8 @@ fn pages(
     }
     let also: Vec<(ResKey, GffPath)> =
         others.iter().map(|a| (ResKey::new(*a, ResType::ARE), GffPath::root())).collect();
-    let shown = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    // (Sideways too: the window fits its pane, `TabViewer::scroll_bars`.)
+    let shown = egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         if viewed {
             crate::blueprint::read_only_look(ui);
         }

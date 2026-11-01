@@ -537,11 +537,34 @@ impl TabViewer for Viewer<'_> {
         {
             ui.interact(ui.max_rect(), ui.id().with("no-window-drag"), egui::Sense::drag());
         }
-        egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
-            // (All the room, so a view that fills its tab still does.)
-            ui.set_min_size(ui.available_size());
-            self.body(ui, tab);
-        });
+        let framed = |viewer: &mut Self, ui: &mut Ui, tab: &mut Tab| {
+            egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
+                // (All the room, so a view that fills its tab still does.)
+                ui.set_min_size(ui.available_size());
+                viewer.body(ui, tab);
+            });
+        };
+        if fits(tab) {
+            framed(self, ui, tab);
+            return;
+        }
+        // The others scroll when wider or taller, in a scroll area of
+        // Moonglow's own, not egui_dock's: that one stretches what a tab
+        // shows to its room rounded to pixels, a sliver past itself at a
+        // display scale such as 125%, and at some sizes its scroll bars
+        // came and went every frame and the tab with them (GitHub issue 38,
+        // and Troubletcat's report after 3.1.0 in the area view beside a
+        // conversation). What the tab shows is held to the room in sight
+        // in whole pixels: only what is truly wider or taller scrolls.
+        let ppp = ui.ctx().pixels_per_point();
+        egui::ScrollArea::both().id_salt("tab-body").auto_shrink(false).show_viewport(
+            ui,
+            |ui, sight| {
+                let room = (sight.size() * ppp).floor() / ppp;
+                let layout = egui::Layout::top_down(egui::Align::Min);
+                ui.allocate_ui_with_layout(room, layout, |ui| framed(self, ui, tab));
+            },
+        );
     }
 
     /// The tab's menu (beside egui_dock's Eject and Close): Rename… for a
@@ -657,11 +680,43 @@ impl TabViewer for Viewer<'_> {
     /// The script editor scrolls its own text, lists and messages, and fits
     /// its pane (in a pane that scrolled, its side lists ran past the pane's
     /// edge and were cut off); so does the manual, whose text wraps at the
-    /// pane's width, and the Options, whose page scrolls between its panels.
-    /// The others scroll when wider or taller.
-    fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
-        let fits = matches!(tab, Tab::Script(_) | Tab::Nui(_) | Tab::Manual | Tab::Options);
-        [!fits, !fits]
+    /// pane's width, and the Options, whose page scrolls between its panels;
+    /// and the properties windows and the journal, conversation, talk
+    /// table and tileset editors, whose page scrolls over OK and Cancel at
+    /// their foot (in a pane that scrolled, at a display scale of 125% the
+    /// pane's scroll bars came and went each frame at some sizes, egui's
+    /// content rounded to pixels a sliver past it, and the foot went up
+    /// and down with them: GitHub issue 38). The others scroll when wider
+    /// or taller.
+    fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
+        // (None of egui_dock's: those that scroll have Moonglow's, `ui`.)
+        [false, false]
+    }
+}
+
+/// Whether a tab fits its pane, scrolling within itself, or scrolls in it
+/// when wider or taller ([`TabViewer::ui`]).
+fn fits(tab: &Tab) -> bool {
+    {
+        matches!(
+            tab,
+            Tab::Script(_)
+                | Tab::Nui(_)
+                | Tab::Manual
+                | Tab::Options
+                | Tab::ModuleProperties
+                | Tab::AreaProperties(_)
+                | Tab::AreasProperties(_)
+                | Tab::Blueprint(_)
+                | Tab::Blueprints(_)
+                | Tab::Instance { .. }
+                | Tab::Instances { .. }
+                | Tab::Gff(_)
+                | Tab::Journal
+                | Tab::Dialog(_)
+                | Tab::TalkTable
+                | Tab::Tileset(_)
+        )
     }
 }
 

@@ -45,6 +45,49 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.1.4" date="2026-10-31">
+      <description>
+        <p>Shift+click chooses a range of blueprints in the palette, and
+        Edit › Update All Instances… updates the objects placed from every
+        blueprint of the module.</p>
+      </description>
+    </release>
+    <release version="3.1.3" date="2026-10-31">
+      <description>
+        <p>Compile Models compiles a mesh of more than 21,845 faces and a
+        texture named longer than 16 characters, as the game draws them.</p>
+      </description>
+    </release>
+    <release version="3.1.2" date="2026-10-31">
+      <description>
+        <p>Metal 2 is drawn and chosen in the game's metal palette, as Metal
+        1 is. No window's scroll bars flicker at a 125% display scale any
+        more. A blueprint shown to look at has its fields copied again, and
+        the palette copies a blueprint's ResRef and Tag. A game folder that
+        isn't Enhanced Edition's says why.</p>
+      </description>
+    </release>
+    <release version="3.1.1" date="2026-10-31">
+      <description>
+        <p>The automatic update check asks at each start, so a new release
+        is told the next time Moonglow starts. With Shaders on, a tile
+        brush's preview and a blueprint about to be placed are drawn by the
+        game's shaders like the rest of the area. The tileset editor no
+        longer bounces at a 125% display scale, and the paths mg prints
+        and Moonglow keeps are written one way.</p>
+      </description>
+    </release>
+    <release version="3.1.0" date="2026-10-30">
+      <description>
+        <p>What the Module Uses (and mg haks --usage) follows what scripts
+        name by a number: visual effects, spells, item properties and
+        appearances, read from the compiled scripts, a hak's without source
+        too. Properties windows no longer bounce at a 125% display scale, a
+        body part whose material names no texture is drawn in the human's,
+        as the game draws it, and an edit undone leaves its file's bytes as
+        they were.</p>
+      </description>
+    </release>
     <release version="3.0.0" date="2026-10-30">
       <description>
         <p>The release after the deferred sprint: of the 440 things left

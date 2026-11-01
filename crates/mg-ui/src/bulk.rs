@@ -96,11 +96,30 @@ impl Moonglow {
         }
         let names: Vec<String> = blueprints.iter().map(ResKey::to_string).collect();
         if objects.is_empty() {
-            self.log.info(format!("Update Instances: nothing is placed from {}", names.join(", ")));
+            let names = crate::text::some_of(&names, 7);
+            self.log.info(format!("Update Instances: nothing is placed from {names}"));
             return;
         }
         let shown = self.palette.area;
         self.update_draft = Some(UpdateDraft { blueprints, only: None, shown, objects });
+    }
+
+    /// Opens Update Instances for every blueprint of the module (Edit ›
+    /// Update All Instances…), as `mg update-instances` with none named.
+    pub fn update_all_instances(&mut self) {
+        let Some(ws) = self.ws.as_ref() else { return };
+        let mut blueprints: Vec<ResKey> = ws
+            .module
+            .keys()
+            .copied()
+            .filter(|k| ObjectKind::from_restype(k.restype).is_some())
+            .collect();
+        blueprints.sort();
+        if blueprints.is_empty() {
+            self.log.info("Update Instances: the module has no blueprints");
+            return;
+        }
+        self.update_instances_of(blueprints);
     }
 
     /// Makes the ticked objects again from their blueprints, as one
@@ -301,15 +320,7 @@ impl Moonglow {
         let mut total = 0;
         let mut errors = Vec::new();
         for (hit, _) in draft.hits.iter().filter(|(_, on)| *on) {
-            let path = GffPath(
-                hit.path
-                    .iter()
-                    .map(|s| match s {
-                        mg_module::text::Step::Field(l) => mg_edit::Step::Field(l.clone()),
-                        mg_module::text::Step::Item(l, i) => mg_edit::Step::Item(l.clone(), *i),
-                    })
-                    .collect(),
-            );
+            let path = hit.path.clone();
             let Ok(doc) = ws.doc(&hit.key) else { continue };
             let Some(v) = path.get(&doc.root).and_then(|s| s.get(&hit.label)).cloned() else {
                 continue;
@@ -463,7 +474,7 @@ pub(crate) fn text_window(app: &mut Moonglow, ctx: &Context) {
         let hit = &draft.hits[i].0;
         let usage = mg_module::rename::Usage {
             from: hit.key,
-            path: hit.path_text(),
+            path: mg_module::refs::Location::Gff(hit.field()),
             place: hit.place.clone(),
         };
         app.go_to_usage(&usage);
