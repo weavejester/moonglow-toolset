@@ -615,11 +615,15 @@ impl Particles {
                         let r = Vec3::Z.cross(to_eye).normalize_or(Vec3::X);
                         (r, Vec3::Z)
                     }
-                    "billboard_to_local_z" => {
-                        let z = world.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
-                        let r = z.cross(eye - pos).normalize_or(Vec3::X);
-                        (r, z)
-                    }
+                    // `billboard_to_local_z` lies flat in the emitter's
+                    // own X and Y, facing along its Z: a rune circle on
+                    // the ground, as the game draws one (a builder's
+                    // report: the Scars of Risenholm's "[PW] Well:
+                    // Runes", drawn standing).
+                    "billboard_to_local_z" => (
+                        world.transform_vector3(Vec3::X).normalize_or(Vec3::X),
+                        world.transform_vector3(Vec3::Y).normalize_or(Vec3::Y),
+                    ),
                     "billboard_to_world_z" => (Vec3::X, Vec3::Y),
                     "aligned_to_particle_dir" => {
                         let world_vel =
@@ -1059,6 +1063,36 @@ mod tests {
         };
         assert!(heights("Aligned_to_World_Z") > 0.2, "upright");
         assert!(heights("Billboard_to_World_Z") < 1e-4, "flat");
+        assert!(heights("Billboard_to_Local_Z") < 1e-4, "flat, the emitter unturned");
+    }
+
+    /// A `Billboard_to_Local_Z` particle lies in its emitter's own X and Y,
+    /// facing along the emitter's Z however it is turned, and whichever
+    /// side it is seen from (the game draws a rune circle so on the ground,
+    /// where Moonglow stood it upright to the eye).
+    #[test]
+    fn a_local_z_particle_lies_in_its_emitter_s_plane() {
+        let mut m = fountain();
+        if let NodeKind::Emitter(e) = &mut m.nodes[1].kind {
+            e.render = "Billboard_to_Local_Z".into();
+        }
+        let pose = crate::rest_pose(&m);
+        let mut p = Particles::new(&m);
+        p.update(&m, None, 0.0, 0.1, &pose, Mat4::IDENTITY);
+        p.update(&m, None, 0.0, 0.1, &pose, Mat4::IDENTITY);
+        // Unturned, and tipped a quarter about X (its Z then along -Y).
+        let tipped = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        for (turn, normal) in [(Mat4::IDENTITY, Vec3::Z), (tipped, Vec3::NEG_Y)] {
+            for eye in [Vec3::new(0.0, -5.0, 1.0), Vec3::new(5.0, 0.0, 4.0)] {
+                let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Z);
+                let b = p.batches(&m, None, 0.0, &pose, turn, view);
+                let v = &b[0].vertices[..6];
+                let (bl, br, tr) =
+                    (Vec3::from(v[0].pos), Vec3::from(v[1].pos), Vec3::from(v[2].pos));
+                let facing = (br - bl).cross(tr - br).normalize();
+                assert!(facing.dot(normal).abs() > 0.999, "{normal} from {eye}: {facing}");
+            }
+        }
     }
 
     /// An upright (`Aligned_to_World_Z`) particle is turned about Z to the
