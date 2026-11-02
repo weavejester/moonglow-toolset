@@ -734,6 +734,15 @@ galleries' pictures made for 2 ms a frame and kept while in sight.
     area092's sea): they are drawn at the running clock, where
     `FRAME_PARTS_SHOTS` draws at a fixed one. A fixed clock for the
     shots would make them comparable. (S)
+- **`Billboard_to_Local_Z` in the client's picture:** Moonglow lays the
+  mode's particles flat in the emitter's X and Y (2026-11-02, from a
+  builder's report of a rune circle the game draws on the ground),
+  which the client's grouping of it with `Billboard_to_World_Z` and the
+  builder's sight of the game agree with; no client picture of it was
+  taken, as the client runs only through `tools/nwclient/run-client.sh`,
+  on Linux, and the fix was made on Windows. A `localz` run beside
+  `particles_look`'s `worldz`, with the emitter tipped, settles it. (S,
+  waits on a Linux machine) (from a Scars of Risenholm builder's report)
 - **Emitters a builder does not see** (GitHub issue 8: a demon's wings,
   braziers, shafts of light, all without particles in his area): not
   reproduced. The game's own balor, fire elemental, campfire and brazier
