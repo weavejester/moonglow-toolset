@@ -154,7 +154,10 @@ fn placeable_editor_fills_its_inventory() {
     h.run();
     // The row's menu ends with Properties, as Aurora's menus do (Jasperre's
     // ask).
-    assert_eq!(menu_items(&h, "Properties"), ["Copy", "Paste", "Remove", "Properties"]);
+    assert_eq!(
+        menu_items(&h, "Properties"),
+        ["Copy", "Paste", "Remove", "Find in Palette", "Properties"]
+    );
     h.get_by_label("Copy").click();
     h.run();
     assert_eq!(h.state().item_clip.len(), 1);
@@ -324,6 +327,143 @@ fn equipping_without_the_feat_asks_to_add_it() {
     h.run();
     assert!(feats(&mut h).is_empty());
     assert_eq!(primary(&mut h), before);
+}
+
+/// Find in Palette, from an equipped item's menu: its blueprint chosen in
+/// the palette on the left, its branch opened and its row in sight, the
+/// search that hid it cleared; from a backpack item's, the same. An item
+/// whose blueprint is in neither palette can't be found. The palette row's
+/// own menu opens the blueprint's Properties.
+#[test]
+fn find_in_palette_chooses_an_item_s_blueprint() {
+    let Some((mut h, key)) = blueprint_harness("nw_bandit001", "bandit_find", ResType::UTC) else {
+        return;
+    };
+    // A backpack of a torch and an item with no blueprint.
+    let entry = |id: u32, resref: &str| {
+        let mut s = mg_gff::Struct::new(id);
+        s.set("InventoryRes", mg_gff::Value::resref(ResRef::from_str(resref).unwrap()));
+        s.set("Repos_PosX", mg_gff::Value::Word(id as u16));
+        s.set("Repos_Posy", mg_gff::Value::Word(0));
+        s
+    };
+    let pack = vec![entry(0, "nw_it_torch001"), entry(1, "mg_gone")];
+    let edit = mg_edit::Edit::SetField {
+        key,
+        path: mg_edit::GffPath::root(),
+        label: "ItemList".into(),
+        value: Some(mg_gff::Value::List(pack)),
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("pack", vec![edit])));
+    // (Tall enough for the slots and the backpack under them.)
+    h.set_size(egui::vec2(1000.0, 1600.0));
+    h.run();
+    own_window(&mut h, &Tab::Blueprint(key), egui::pos2(20.0, 40.0), egui::vec2(960.0, 1500.0));
+    h.get_by_label("Inventory").click();
+    settle(&mut h);
+    // The equipped item, and its name as its slot shows it.
+    let worn =
+        field(&mut h, &key).list("Equip_ItemList").unwrap()[0].resref("EquippedRes").unwrap();
+    let name = |h: &Harness<'_, Moonglow>, resref: ResRef| {
+        let game = h.state().game.as_deref().unwrap();
+        let uti = game.resman.get(&ResKey::new(resref, ResType::UTI)).unwrap();
+        let uti = Gff::read(&uti).unwrap();
+        game.locstring(uti.root.locstring("LocalizedName").unwrap()).unwrap()
+    };
+    let worn_name = name(&h, worn);
+    // (Its blueprint is chosen: the item chosen shows under the palette.)
+    let chosen = |h: &Harness<'_, Moonglow>, resref: ResRef| {
+        h.query_by_label_contains(&format!("· {resref}")).is_some()
+    };
+    // The palette's row of an item: a button left of the slots and the
+    // backpack, in sight in the tree (between its Find and its Add to
+    // Backpack).
+    let palette_row = |h: &Harness<'_, Moonglow>, name: &str| -> Option<egui::Rect> {
+        // (The Find field: the text field under Standard Palette.)
+        let tabs = h.get_by_label("Standard Palette").rect();
+        let by = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+            n.role() == egui::accesskit::Role::TextInput
+        };
+        let top = h
+            .query_all(egui_kittest::kittest::by().predicate(by))
+            .map(|n| n.rect())
+            .filter(|r| r.left() < tabs.right() && r.top() >= tabs.bottom())
+            .min_by(|a, b| a.top().total_cmp(&b.top()))
+            .expect("the palette's Find")
+            .bottom();
+        let bottom = h.get_by_label("Add to Backpack").rect().top();
+        let buttons = || {
+            h.query_all_by_label(name)
+                .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+                .map(|n| n.rect())
+        };
+        let slot = buttons().max_by(|a, b| a.left().total_cmp(&b.left()))?;
+        buttons().find(|r| r.right() < slot.left() && r.top() >= top && r.bottom() <= bottom)
+    };
+    // A search that hides it, to be cleared.
+    type_into_hint(&mut h, "Find", "nw_it_mpotion001");
+    assert!(!chosen(&h, worn));
+    assert!(palette_row(&h, &worn_name).is_none(), "the branch shut: no row of it yet");
+    // (The slot's row: the rightmost button of that name.)
+    let slot = |h: &Harness<'_, Moonglow>, name: &str| {
+        h.query_all_by_label(name)
+            .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+            .map(|n| n.rect().center())
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let open_menu = |h: &mut Harness<'_, Moonglow>, at: egui::Pos2| {
+        h.hover_at(at);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        h.run_steps(3);
+    };
+    let at = slot(&h, &worn_name);
+    open_menu(&mut h, at);
+    assert_eq!(
+        menu_items(&h, "Properties"),
+        ["To Backpack", "Copy", "Remove", "Find in Palette", "Properties"]
+    );
+    h.get_by_label("Find in Palette").click();
+    settle(&mut h);
+    assert!(chosen(&h, worn), "the equipped item's blueprint chosen");
+    let typed =
+        |n: &egui_kittest::Node<'_>| n.accesskit_node().role() == egui::accesskit::Role::TextInput;
+    assert!(h.query_all_by_value("nw_it_mpotion001").find(typed).is_none(), "the search cleared");
+    assert!(palette_row(&h, &worn_name).is_some(), "its row in sight in the palette");
+
+    // The torch in the backpack: found the same way.
+    let torch = name(&h, ResRef::from_str("nw_it_torch001").unwrap());
+    let at = slot(&h, &torch);
+    open_menu(&mut h, at);
+    h.get_by_label("Find in Palette").click();
+    settle(&mut h);
+    assert!(chosen(&h, ResRef::from_str("nw_it_torch001").unwrap()), "the torch chosen");
+    assert!(palette_row(&h, &torch).is_some(), "its row in the palette");
+
+    // An item with no blueprint: Find in Palette is there, but off.
+    let at = slot(&h, "mg_gone");
+    open_menu(&mut h, at);
+    assert!(h.get_by_label("Find in Palette").accesskit_node().is_disabled());
+    h.key_press(egui::Key::Escape);
+    h.run();
+
+    // The palette's row: Properties opens the blueprint (the game's, to
+    // look at).
+    let row = palette_row(&h, &torch).unwrap();
+    open_menu(&mut h, row.center());
+    let items = menu_items(&h, "Properties");
+    assert_eq!(items.last().map(String::as_str), Some("Properties"), "{items:?}");
+    h.get_all_by_label("Properties").last().unwrap().click();
+    settle(&mut h);
+    let uti = ResKey::parse("nw_it_torch001", ResType::UTI).unwrap();
+    assert!(h.state().dock.find_tab(&Tab::Blueprint(uti)).is_some(), "the torch's Properties");
 }
 
 /// An item equipped that the creature may not wear (the game takes it off

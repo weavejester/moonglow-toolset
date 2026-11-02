@@ -639,10 +639,18 @@ A domain or school left **Not set** is the game's to choose.
   in the secondary; so one dragged there from the primary stays in the
   primary, though a missing feat is still asked about). A
   right click on an item anywhere offers the same (**Equip** or **To
-  Backpack**, **Copy**, **Remove**, and last, as in Aurora's menus,
-  **Properties**), and on the palette's
-  items **Add to Backpack** and **Equip**. A placeable's and a store's
-  items take an item dragged from the palette as well.
+  Backpack**, **Copy**, **Remove**, **Find in Palette**, and last, as in
+  Aurora's menus, **Properties**), and on the palette's
+  items **Add to Backpack**, **Equip** and **Properties** (the item's
+  blueprint: the module's to edit, the game's to look at). **Find in
+  Palette** chooses the item's blueprint in the palette on the left: the
+  standard palette or, if the blueprint is only there, the custom one,
+  its category opened and the tree scrolled to it, and a search that
+  hides it cleared. It is grayed out for an item whose blueprint is in
+  neither palette (one removed, or from a hak the module doesn't use).
+  A placeable's and a store's items have Find in Palette too, and their
+  palette rows Properties, and take an item dragged from the palette as
+  well.
 - **Between inventories, and within one:** drag an item from one object's
   inventory (a creature's backpack or equipment, a placeable's contents,
   a store's page) onto another's list or a creature's slot to move it
@@ -814,7 +822,8 @@ Triggers: Basic (generic, area transition or trap), Area Transition, Trap,
 Scripts, Advanced, Visuals, Comments. Encounters: Basic (difficulty, spawn option,
 the fewest and most creatures it spawns, 1 to 8: a minimum typed above the
 maximum raises the maximum to it, as Aurora's does; respawns), **Creature List** (from the creature palette, with unique
-creatures marked), Scripts, Advanced, Comments.
+creatures marked; right-click a palette row › **Properties** for the
+creature's blueprint), Scripts, Advanced, Comments.
 
 ### Stores
 

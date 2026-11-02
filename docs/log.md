@@ -1,5 +1,8 @@
 # Update log
 
+## 2026-11-02
+* **Update**: An inventory's items have **Find in Palette** in their right-click menu (a creature's equipment and backpack, a placeable's contents, a store's pages): the item's blueprint chosen in the palette on the left, in the standard palette or else the custom one, its category opened and the tree scrolled to it, a search that hides it cleared; grayed out where the blueprint is in neither palette. And a palette picker's rows (the inventories', an encounter's creature list) have **Properties**, last, as the palette's blueprint menu has: the blueprint's, the module's to edit, the game's to look at (asked for by the Scars of Risenholm builders). `find_in_palette_chooses_an_item_s_blueprint`, `placeable_editor_fills_its_inventory`; [Blueprints](manual/05-blueprints.md) says so.
+
 ## 2026-11-01
 * **Update**: Options › Area › **Keep animating behind other windows** (off by default): the area views and the model viewer go on animating while another program has the focus, where the audit had made them hold still there with no way to keep them going (the owner's ask). `an_area_s_animations_wait_while_the_window_has_not_the_focus`, `the_texture_limit_is_none_until_chosen_and_kept`; [Options](manual/10-options.md) says so.
 * **Update**: With the Tile Border on, past it is the area's fog color, as the client clears to it where an area has no skybox (whatever the fog's amount, read in the client's pictures: its sky the scratch area's fog color exactly), where Moonglow's background was black unless Fog was on; the skybox is drawn as before. `the_tile_border_is_drawn_past_the_edge_when_asked_for`; [Areas](manual/04-areas.md) and the [research note](research/notes_tile_border.md) say so.
