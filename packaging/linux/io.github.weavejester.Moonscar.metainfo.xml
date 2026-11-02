@@ -45,6 +45,14 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.2.0" date="2026-11-02">
+      <description>
+        <p>Moonscar 1.2.0, based on Moonglow 3.2.0. An inventory item's
+        menu has Find in Palette, and the palette's rows have Properties.
+        Particles laid along an emitter's Z (a rune circle on the ground)
+        lie flat, as the game draws them.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-11-01">
       <description>
         <p>Moonscar 1.1.0, based on Moonglow 3.1.4. The releases listed
