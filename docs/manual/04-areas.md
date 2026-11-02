@@ -3,7 +3,7 @@ type: Manual Page
 title: Areas
 description: Areas - the viewer's toolbar, minimaps and camera, selecting, arranging and placing objects, Setup Store, duplicate tags, claimed and protected areas, painting placeables, painting terrain, tiles, Area Properties, area sounds and making tilesets.
 tags: [manual, areas, terrain, tiles]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T13:45:00Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-01T23:53:35Z }
 ---
 
 # Areas
@@ -80,7 +80,14 @@ palette's Gallery is 🖼, the Grid ⊞.
   do once going from the moment the area is shown, a forge's fire as
   much as a campfire's. Switched off, they hold
   still (tiles' water and flames go on), in every area view; it stays as
-  you leave it.
+  you leave it. While Moonglow's window is behind another program's
+  (it has not the focus), the views hold still and draw nothing, and go
+  on as you come back to it: an area left open costs the GPU nothing in
+  the background (unless **Keep animating behind other windows** is
+  ticked in [Options › Area](10-options.md)). An area whose tab is closed, or behind another tab,
+  lets go of what its picture took of the GPU's memory after a couple of
+  seconds, and of its models too once closed (it is read again, where
+  its camera was, when it is opened again).
 - **🌿 Grass**: the grass the area grows, as the game grows it on the
   tiles' walkmesh faces: the tileset's, and the area's own (Area
   Properties › Grass). It is drawn wherever the view shows grass ground,
@@ -96,6 +103,23 @@ palette's Gallery is 🖼, the Grid ⊞.
   some 8 cm either way in a strong wind and half that in a weak one; in
   no wind it stands still. Switched off, in every area view; it stays as
   you leave it.
+- **🌄 Tile Border**: past the area's edge, what the game draws there
+  (its Enable Tile Border option, on by default in the game; a module
+  turns it off for an area with `SetAreaTileBorderDisabled`): the
+  tileset's edge tiles (`<tileset>_edge.2da`), five deep beyond each
+  edge tile and five by five beyond each corner, darkened. Each carries
+  on the edge tile's side, its two corners' terrains and the road,
+  stream or wall that crosses it, so that grass goes on as grass, water
+  as water, a road runs out to the horizon, and a city's houses or a
+  dungeon's floor go on past the edge; an interior's walls have a black
+  cap there, as in the game. They are lit as the area is, in half its
+  sun's (or moon's) light, as the game lights them. Beyond them is the
+  area's skybox, if it has one, and otherwise its fog color, as in the
+  game (whatever the fog's amount, and whether or not **Fog** is on).
+  Off, nothing is drawn past the edge and it is black, as in Aurora.
+  They can't be selected or painted.
+  Off by default, as Aurora shows the edge; in every area view, and it
+  stays as you leave it.
 - **🎨 Shaders**: draws with the game's own shaders, compiled on your
   machine from the game and the module's haks, as the game draws: a
   material's custom shaders (its MTR's `customshaderVS` and
@@ -227,10 +251,10 @@ palette's Gallery is 🖼, the Grid ⊞.
 
 ## Minimaps
 
-**Export Minimap…** (an area's right-click menu in the module tree) saves
-the area's map as a PNG, as the game's map draws it: each tile's picture
-(the tileset's `ImageMap2D`) turned as the tile is, north up, unsaved
-tiles included. A tile without a picture is black, as in the game. `mg
+**Export › Export Minimap…** (an area's right-click menu in the module
+tree) saves the area's map as a PNG, as the game's map draws it: each
+tile's picture (the tileset's `ImageMap2D`) turned as the tile is, north
+up, unsaved tiles included. A tile without a picture is black, as in the game. `mg
 minimap` does the same from the command line. Each picture keeps its own
 size unless `--size` sets one; the game's are mostly 16 pixels.
 
@@ -309,6 +333,11 @@ encounter turns by its outline: alone about the outline's middle (an
 encounter's spawn points go round with it), and with the others when
 they turn together. **Turn** on the
 toolbar snaps it. **Tools › Options › Area** switches the ring off.
+The ring, and the tilt rings, arrows and scale handle below, keep their
+size on screen however near or far the camera is (about a tenth of the
+view's height, or of its width where it is narrower): looking closely
+at something small, a piece of fruit on a table, they are as small as
+it and stay in the view.
 
 **The tilt rings**: hold **Shift** and two upright rings take the turning
 ring's place, red and green. Lead the red one round to tip the model
@@ -489,17 +518,20 @@ Aurora):
   in progress (a value on its way from one to another over some
   seconds), drawn at its end. Setting that value here ends the lerp; a
   value left as it is keeps it.
-- **Random Facing**: turns each selected object to face a way of its
-  own, at random (by the snap angle, if one is set): for trees and rocks
-  placed in numbers.
-- **Drop to Ground** (G): puts raised objects back on the ground under
-  them. A trigger or an encounter comes down (or up) as a whole, until
-  its lowest corner is on the ground.
-- **Drop onto Object** (Shift+G): sets each selected object on the
-  placeable or door below its center (a skull on an altar, a book on a
-  table), by that object's model, up to 2 m above it; with nothing there,
-  on the ground. Not creatures, which the game stands on the ground.
-  **Onto Objects** on the toolbar places them so in the first place.
+- **Position**, the quick ways of setting where the selection stands
+  and how it faces:
+  - **Position › Drop to Ground** (G): puts raised objects back on the
+    ground under them. A trigger or an encounter comes down (or up) as a
+    whole, until its lowest corner is on the ground.
+  - **Position › Drop onto Object** (Shift+G): sets each selected object
+    on the placeable or door below its center (a skull on an altar, a
+    book on a table), by that object's model, up to 2 m above it; with
+    nothing there, on the ground. Not creatures, which the game stands on
+    the ground. **Onto Objects** on the toolbar places them so in the
+    first place.
+  - **Position › Random Facing**: turns each selected object to face a
+    way of its own, at random (by the snap angle, if one is set): for
+    trees and rocks placed in numbers.
 - **Arrange** (several selected; the first selected leads):
   - **Line Up West–East** or **South–North**: on a line through the first.
   - **Space Evenly**: evenly spaced between the two farthest apart.
@@ -516,34 +548,38 @@ Aurora):
   keeps the project's locks in its own folder (see
   [nasher projects](03-modules.md#nasher-projects-version-control)), so
   locking never shows in a diff.
-- **Save as Prefab…**: the selected objects, kept under a name to place
-  again (see below): a group of placeables to copy around, in this area
-  or another.
 - Doors: **Reverse Door**, **Initial State** (open or closed, locked).
   Placeables: **Initial State** (open, active…). Sounds: **Mute** or
   **Turn On**. Triggers and encounters: **Redraw Polygon**; encounters:
   **Add Spawn Point** (at the point you right-clicked).
 - **Conversation**, **Inventory** (creatures, placeables with an
   inventory, stores).
-- **Add to Palette**: the instance as a new custom blueprint (its ResRef
-  after [your builder code](03-modules.md#your-builder-code), where you
-  have one), named as Aurora names it: a creature's or an item's its
-  blueprint's numbered past those in use (`w2guard` gives `w2guard002`,
-  `nw_wswls001` `wswls003`); a placeable's, door's, trigger's, sound's or
-  waypoint's its blueprint's without a reserved prefix (`nw_`, `plc_`,
-  `x0_`…) where that name is free (`nw_waypoint001` gives
-  `waypoint001`), else numbered (`mgp_utd001`).
-- **Export as Blueprint…**: the instance written into an archive (`.erf`)
-  as a blueprint of its own, made and named as Add to Palette makes one
-  (with the items it holds, each an item blueprint), but not added to the
-  module; with the module's resources it uses (its scripts, its
-  conversation), for another module's **File › Import…**. The module
-  tree's menu of a placed object has it too.
-- **Test From Here**: starts the game at the point you right-clicked,
-  facing the way the camera looks, with the module as it is now (see
-  [Build, verify and test](09-build-and-test.md)). **Test From Here,
-  Choose Character** does the same through the game's character
-  selection.
+- **Reuse**, what is selected kept to place again:
+  - **Reuse › Add to Palette**: the instance as a new custom blueprint
+    (its ResRef after [your builder
+    code](03-modules.md#your-builder-code), where you have one), named as
+    Aurora names it: a creature's or an item's its blueprint's numbered
+    past those in use (`w2guard` gives `w2guard002`, `nw_wswls001`
+    `wswls003`); a placeable's, door's, trigger's, sound's or waypoint's
+    its blueprint's without a reserved prefix (`nw_`, `plc_`, `x0_`…)
+    where that name is free (`nw_waypoint001` gives `waypoint001`), else
+    numbered (`mgp_utd001`).
+  - **Reuse › Export as Blueprint…**: the instance written into an
+    archive (`.erf`) as a blueprint of its own, made and named as Add to
+    Palette makes one (with the items it holds, each an item blueprint),
+    but not added to the module; with the module's resources it uses (its
+    scripts, its conversation), for another module's **File › Import…**.
+    The module tree's menu of a placed object has it too (at its top level).
+  - **Reuse › Save as Prefab…**: the selected objects, kept under a name
+    to place again (see below): a group of placeables to copy around, in
+    this area or another.
+
+  Add to Palette and Export as Blueprint… are for one object at a time.
+- **Test › Test From Here**: starts the game at the point you
+  right-clicked, facing the way the camera looks, with the module as it
+  is now (see [Build, verify and test](09-build-and-test.md)). **Test ›
+  Test From Here, Choose Character** does the same through the game's
+  character selection.
 - **Create Waypoint**: a waypoint where the object stands. **Create Set…**
   (waypoints): name the selected waypoints `<name>_01`, `<name>_02`…
 - **Levelup Wizard…** (creatures), **Setup Store…** (a creature or
@@ -629,9 +665,9 @@ camp, a market stall or a furnished room: the way to copy a group of
 placeables around.
 - **Saving one:** select the objects (a click, Ctrl+click for more, or a
   box dragged around them), then **Save N as Prefab…** on the area's
-  toolbar (it shows when several are selected), **Save as Prefab…** on
-  the selection's right-click menu, or **Save Selection as Prefab…** in
-  the palette's **Prefabs**.
+  toolbar (it shows when several are selected), **Reuse › Save as
+  Prefab…** on the selection's right-click menu, or **Save Selection as
+  Prefab…** in the palette's **Prefabs**.
 - **Placing one:** choose it in the palette's **🗐 Prefabs** (beside the
   blueprint types), or under **Edit › Prefabs**. It follows the pointer
   like a paste. A click places it, with the objects in their places
@@ -893,7 +929,8 @@ as Aurora's Terrain tab does:
 - The Tiles palette has the blueprint palettes' tools: a **search** (a
   brush's name, or a tile's model: a group or feature is found by the
   models of its tiles too, and shows as itself, one picture in the
-  Gallery), **Expand All** and **Collapse All**,
+  Gallery; what it finds shows opened out, and cleared, each heading is
+  open or closed again as it was before), **Expand All** and **Collapse All**,
   how many there are, and **List** (☰) or **Gallery** (🖼), the same switch
   as the blueprint palettes', with the pictures' size beside it.
 - In the **Gallery**, each terrain and crosser is a heading that opens and
@@ -1008,8 +1045,13 @@ same strokes give the same tiles, heights and crossers.
 
 ## Tiles
 
-With **Select Tiles** on, a click selects a tile, Ctrl + click adds one,
-and a drag selects a box of them. **Delete** takes the selected tiles'
+With **Select Tiles** on, a click selects a tile (a click past the
+area's edge selects none, as a click on bare ground does objects),
+**Shift + click** adds one to those selected, Ctrl + click adds one or
+takes it out, and a drag selects a box of them (one begun or ended past
+the edge, the tiles it covers); **Shift + drag** adds the box's tiles to
+those selected. (With Shift or Ctrl, a click on an object stays with
+the tiles: without, it selects the object, back to objects.) **Delete** takes the selected tiles'
 crossers away, and a group or a feature with a tile among them whole, as
 the Eraser does (Aurora's Delete takes the tile alone, leaving the rest
 of the group: Moonglow does so with **Allow editing tiles of groups and
@@ -1419,8 +1461,9 @@ chooser, Tick Shown, Edit Together, then Audio. From the command line,
 
 The game merges an area's **static** placeables into its tiles when the
 area loads, so they cost less to load and draw than dynamic ones. An
-area's right-click menu in the module tree has **Make Placeables
-Static**, and the **Areas** group's has **Make Placeables Static in Every
+area's right-click menu in the module tree has **Placeables › Make
+Placeables Static** (several areas chosen there: the same, on them all),
+and the **Areas** group's has **Make Placeables Static in Every
 Area**: each sets Static on the placeables that lose nothing by it, as
 one undoable step, and the log says how many it made static and how many
 it left, and why. Left dynamic are placeables that:
@@ -1449,7 +1492,7 @@ it left, and why. Left dynamic are placeables that:
 A tag a script makes up as it runs (`"LAMP_" + IntToString(n)`), or one
 named only in a compiled script with no source (a hak's), can't be seen:
 name such tags in the project file's `keep_tags`, or make the placeable
-dynamic again from its menu in the area view. **Make
+dynamic again from its menu in the area view. **Placeables › Make
 Placeables Dynamic**, on the same menus, clears Static on every
 placeable of the area or the module. From the command line, `mg areas
 --static-placeables` and `--dynamic-placeables` do the same.

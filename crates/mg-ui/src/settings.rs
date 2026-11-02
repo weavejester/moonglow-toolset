@@ -326,6 +326,18 @@ pub struct Settings {
     /// Options › Area › Shadows quality (also in the Shadows button's
     /// menu): every area view's.
     pub shadow_quality: ShadowQuality,
+    /// Options › Area › Largest textures: the most pixels a side the 3D
+    /// views upload a texture at (its larger levels left out:
+    /// [`mg_render::Gpu::set_texture_limit`]); `None`, as it is.
+    pub texture_limit: Option<u16>,
+    /// Options › Area › Area view resolution: the share of the screen's
+    /// pixels the area views draw their pictures at, percent (shown
+    /// stretched to the view); `None`, all of them.
+    pub area_resolution: Option<u8>,
+    /// Options › Area › Keep animating behind other windows: the 3D views'
+    /// animations go on while another program's window has the focus
+    /// (else they hold still there, sparing the GPU).
+    pub animate_unfocused: bool,
     /// The area view's Sound Ranges switch is on, in views opened from
     /// now on.
     pub sound_ranges: bool,
@@ -337,6 +349,11 @@ pub struct Settings {
     /// The area view's Grass switch is off: no grass is drawn (in every
     /// area view).
     pub no_grass: bool,
+    /// The area view's Tile Border switch is on: past the area's edge, the
+    /// tileset's edge tiles five deep, darkened, as the game client draws
+    /// them (in every area view). Off by default, as Aurora draws nothing
+    /// there and the area's edge shows plainest so.
+    pub tile_border: bool,
     /// The 3D views' Shaders switch (the area view's toolbar, the model
     /// view's): the game's own shaders draw what they can, a material's
     /// custom ones among them (`docs/shaders-proposal.md`). `None`: as
@@ -860,6 +877,37 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&chosen).unwrap()).unwrap();
         assert!(back.no_shadows && back.no_creature_shadows && back.no_light_shadows);
         assert_eq!(back.shadow_quality, ShadowQuality::High);
+    }
+
+    /// The area view's Tile Border: off by default and for settings saved
+    /// before it was; on, kept.
+    #[test]
+    fn the_tile_border_is_off_by_default_and_kept() {
+        assert!(!Settings::default().tile_border);
+        let old: Settings = serde_json::from_str(r#"{"no_grass":true}"#).unwrap();
+        assert!(!old.tile_border);
+        let on = Settings { tile_border: true, ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(back.tile_border);
+    }
+
+    /// The largest textures are as they are unless a limit is chosen, and
+    /// a limit chosen is kept.
+    #[test]
+    fn the_texture_limit_is_none_until_chosen_and_kept() {
+        let old: Settings = serde_json::from_str(r#"{"no_shadows":false}"#).unwrap();
+        assert_eq!(old.texture_limit, None);
+        assert_eq!(old.area_resolution, None, "every pixel unless chosen");
+        let chosen =
+            Settings { texture_limit: Some(512), area_resolution: Some(50), ..Settings::default() };
+        let back: Settings =
+            serde_json::from_str(&serde_json::to_string(&chosen).unwrap()).unwrap();
+        assert_eq!((back.texture_limit, back.area_resolution), (Some(512), Some(50)));
+        // Animations hold still behind other windows unless kept going.
+        assert!(!old.animate_unfocused);
+        let kept = Settings { animate_unfocused: true, ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
+        assert!(back.animate_unfocused);
     }
 
     #[test]

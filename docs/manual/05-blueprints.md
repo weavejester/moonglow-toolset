@@ -3,7 +3,7 @@ type: Manual Page
 title: Blueprints
 description: Blueprints - palettes, the blueprint editors and wizards, and instances.
 tags: [manual, blueprints, palettes]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-31T18:24:58Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-01T22:29:44Z }
 ---
 
 # Blueprints
@@ -27,7 +27,10 @@ the top:
   palettes open on the next time Moonglow starts, with what was typed
   in the search and the categories left open.
 - **Standard** and **Custom**, beside the type's name: whose blueprints.
-- **The search**, the pane's width; **×** clears it.
+- **The search**, the pane's width; **×** clears it. What is typed opens
+  every category with a match (close one again as you look); cleared,
+  each category is open or closed again as it was before the search,
+  in the List and the Gallery alike.
 - **The list's toolbar**, right over the list: the two arrows open and
   close every category, the count says how many blueprints the list has
   (or the search found), the two view buttons are **List** and
@@ -160,17 +163,17 @@ The palette's buttons:
   faces its bearer), and a thing made for a wall from the side that
   shows it; the light goes round with the view. Each fills its picture
   as it stands, a long or tall thing too (a dragon, a banner).
-- **Replace Selected with This** (a blueprint's right-click menu): the
-  objects of that type selected in the area become ones of this
-  blueprint, made as [Update Instances](#update-instances) makes them
+- **Replace Selected › Replace Selected with This** (a blueprint's
+  right-click menu): the objects of that type selected in the area become
+  ones of this blueprint, made as [Update Instances](#update-instances) makes them
   (Aurora has no command to replace; its Update Instances is the same
   remaking): where they stand, facing as they face, with their visual
   transform (a tilt, a scale), a trigger's or an encounter's outline and
   an encounter's spawn points. Their tag, name, scripts and variables
-  become the blueprint's; **Replace Selected, Keeping Tags and Scripts**
-  keeps each one's own instead (a placeholder replaced by the real thing
-  keeps the tag its scripts know it by), the rest coming from the
-  blueprint. A placeable the blueprint makes static loses
+  become the blueprint's; **Replace Selected › Replace Selected, Keeping
+  Tags and Scripts** keeps each one's own instead (a placeholder replaced
+  by the real thing keeps the tag its scripts know it by), the rest coming
+  from the blueprint. A placeable the blueprint makes static loses
   its transform, as ticking Static does. Locked objects are left. One
   Undo puts the old ones back. With the Gallery, this swaps a placed
   object for a neighboring one in a click or two.
@@ -207,8 +210,8 @@ The palette's buttons:
   **Find** is still typed in), its pages and lists can still be looked
   through, and a change tried is refused with a note that offers **Edit
   Copy…**.
-- **Copy ResRef** and **Copy Tag**: the blueprint's, to paste (in a
-  script), without opening it.
+- **Copy › Copy ResRef** and **Copy › Copy Tag**: the blueprint's, to
+  paste (in a script), without opening it.
 - **Export…** (a custom blueprint, or the several selected): the Export
   window with them chosen, as File › Export.
 - **Lists of choices** (an appearance, a race, a part, a palette
@@ -636,10 +639,18 @@ A domain or school left **Not set** is the game's to choose.
   in the secondary; so one dragged there from the primary stays in the
   primary, though a missing feat is still asked about). A
   right click on an item anywhere offers the same (**Equip** or **To
-  Backpack**, **Copy**, **Remove**, and last, as in Aurora's menus,
-  **Properties**), and on the palette's
-  items **Add to Backpack** and **Equip**. A placeable's and a store's
-  items take an item dragged from the palette as well.
+  Backpack**, **Copy**, **Remove**, **Find in Palette**, and last, as in
+  Aurora's menus, **Properties**), and on the palette's
+  items **Add to Backpack**, **Equip** and **Properties** (the item's
+  blueprint: the module's to edit, the game's to look at). **Find in
+  Palette** chooses the item's blueprint in the palette on the left: the
+  standard palette or, if the blueprint is only there, the custom one,
+  its category opened and the tree scrolled to it, and a search that
+  hides it cleared. It is grayed out for an item whose blueprint is in
+  neither palette (one removed, or from a hak the module doesn't use).
+  A placeable's and a store's items have Find in Palette too, and their
+  palette rows Properties, and take an item dragged from the palette as
+  well.
 - **Between inventories, and within one:** drag an item from one object's
   inventory (a creature's backpack or equipment, a placeable's contents,
   a store's page) onto another's list or a creature's slot to move it
@@ -811,7 +822,8 @@ Triggers: Basic (generic, area transition or trap), Area Transition, Trap,
 Scripts, Advanced, Visuals, Comments. Encounters: Basic (difficulty, spawn option,
 the fewest and most creatures it spawns, 1 to 8: a minimum typed above the
 maximum raises the maximum to it, as Aurora's does; respawns), **Creature List** (from the creature palette, with unique
-creatures marked), Scripts, Advanced, Comments.
+creatures marked; right-click a palette row › **Properties** for the
+creature's blueprint), Scripts, Advanced, Comments.
 
 ### Stores
 
@@ -850,6 +862,6 @@ the module places or names it.
 
 An object placed in an area has the same pages as its blueprint
 (double-click it, or right-click › **Properties**). Changing an instance
-changes neither its blueprint nor other instances. **Add to Palette**
-turns an instance into a new custom blueprint, and **Update Instances**
-on a blueprint remakes its instances from it.
+changes neither its blueprint nor other instances. **Reuse › Add to
+Palette** (its right-click menu) turns an instance into a new custom
+blueprint, and **Update Instances** on a blueprint remakes its instances from it.

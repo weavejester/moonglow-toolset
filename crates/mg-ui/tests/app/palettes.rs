@@ -396,8 +396,16 @@ fn palette_finds_by_tag_keeps_favorites_and_moves_between_categories() {
     h.get_by_label("No exact matches: close ones");
     h.get_by_label("Gate B");
     assert!(h.query_by_label("Gate A").is_none());
-    // A favorite, shown first.
+    // A favorite, shown first. (The search cleared, the categories are
+    // closed again, as they were: Expand All opens them.)
     h.state_mut().palette.filter.clear();
+    h.run();
+    assert!(h.query_by_label("Gate A").is_none(), "closed again");
+    // (The palette's, under its search: the module tree has one too.)
+    let search = search_rect(&h, "🔍 Search name, tag, resref");
+    let below = |n: &egui_kittest::Node<'_>| (n.rect().top() - search.bottom()).abs();
+    let expand = h.get_all_by_label("⏷").min_by(|a, b| below(a).total_cmp(&below(b)));
+    expand.expect("Expand All").click();
     h.run();
     h.get_by_label("Gate A").click_secondary();
     h.run();
@@ -406,7 +414,7 @@ fn palette_finds_by_tag_keeps_favorites_and_moves_between_categories() {
     assert_eq!(h.state().settings.palette_favorites, ["utw:mg_gate_a"]);
     h.get_by_label("Favorites (1)");
     // Dragged onto Custom 1, it moves there (one undoable step).
-    // (Finding opened the categories; they stay open.)
+    // (Expand All opened the categories; they stay open.)
     if h.query_by_label("Custom 1 (1)").is_none() {
         h.get_by_label("Special").click();
         h.run();
@@ -882,6 +890,7 @@ fn add_to_palette_create_waypoint_and_set() {
 
     // Add to Palette on the chest: a new blueprint, which the chest names.
     right_click(&mut h, Vec3::new(12.0, 30.0, 0.3));
+    open_submenu(&mut h, "Reuse");
     h.get_by_label("Add to Palette").click();
     h.run_steps(3);
     let chest = git(&mut h).list("Placeable List").unwrap()[0].clone();
@@ -1946,6 +1955,7 @@ fn the_palette_replaces_the_selected_object() {
     let (first, second) = (read(&mut h, 0), read(&mut h, 1));
     h.get_by_label(&tavern).click_secondary();
     h.run_steps(2);
+    open_submenu(&mut h, "Replace Selected");
     h.get_by_label("Replace Selected with This").click();
     h.run_steps(3);
     let now = read(&mut h, 0);
@@ -1965,6 +1975,7 @@ fn the_palette_replaces_the_selected_object() {
     let own = tag(&mut h);
     h.get_by_label(&tavern).click_secondary();
     h.run_steps(2);
+    open_submenu(&mut h, "Replace Selected");
     h.get_by_label("Replace Selected, Keeping Tags and Scripts").click();
     h.run_steps(3);
     assert_eq!(read(&mut h, 0).0.as_deref(), Some("nw_wp_tavern"), "of the blueprint");
@@ -2224,6 +2235,7 @@ fn a_blueprint_s_resref_and_tag_are_copied_from_the_palette() {
     let copied = |h: &mut Harness<'_, Moonglow>, label: &str| -> Vec<String> {
         h.get_all_by_label("Torch").next().expect("the torch listed").click_secondary();
         h.run_steps(3);
+        open_submenu(h, "Copy");
         h.get_by_label(label).click();
         h.step();
         let out: Vec<String> = (h.output().platform_output.commands.iter())
@@ -2237,4 +2249,157 @@ fn a_blueprint_s_resref_and_tag_are_copied_from_the_palette() {
     };
     assert_eq!(copied(&mut h, "Copy ResRef"), ["nw_it_torch001"]);
     assert_eq!(copied(&mut h, "Copy Tag"), [tag]);
+}
+
+/// A blueprint's menu in the palette keeps its related commands in
+/// submenus of one level (the owner's ask after 3.1.4, as the area
+/// toolbar's Shadows and Walkmesh… keep theirs behind one button): the two
+/// Replace Selected and the two Copy, every command still offered.
+#[test]
+fn the_palette_s_blueprint_menu_groups_its_commands_in_submenus() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-palette-submenus");
+    let path = sample_module(&dir);
+    let mut app = game_app(&root, None);
+    app.open_module(&path);
+    let game = app.game.as_deref().unwrap();
+    let mut g = Gff::read(&game.resman.get_named("nw_waypoint001", ResType::UTW).unwrap()).unwrap();
+    let key = ResKey::parse("mg_gate_a", ResType::UTW).unwrap();
+    g.root.set("TemplateResRef", mg_gff::Value::resref(key.resref));
+    let name = LocString::from_text(Language::ENGLISH, Gender::Male, "Gate A");
+    g.root.set("LocalizedName", mg_gff::Value::LocString(name));
+    g.root.set("Tag", mg_gff::Value::String(b"MG_GATE_A".to_vec()));
+    let made = mg_edit::Edit::SetResource { key, data: Some(g.to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(mg_edit::Command::new("setup", vec![made])).unwrap();
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    app.palette.kind = mg_module::palette::BlueprintKind::Waypoint;
+    (app.palette.tiles, app.palette.custom) = (false, true);
+    app.palette.filter = "Gate A".into();
+    let mut h = harness(app, 900.0, 700.0);
+    settle(&mut h);
+    h.get_by_label("Gate A").click_secondary();
+    h.run_steps(3);
+    let top = menu_items(&h, "Delete");
+    assert!(top[0].starts_with("New "), "the type's wizard first: {top:?}");
+    assert_eq!(
+        top[1..],
+        [
+            "Edit",
+            "Export…",
+            "Edit Copy…",
+            "Replace Selected ⏵",
+            "Add to Favorites",
+            "Find References",
+            "Copy ⏵",
+            "Update Instances",
+            "Delete"
+        ],
+        "{top:?}"
+    );
+    assert_eq!(
+        submenu_items(&mut h, "Replace Selected", "Replace Selected with This"),
+        ["Replace Selected with This", "Replace Selected, Keeping Tags and Scripts"]
+    );
+    assert_eq!(submenu_items(&mut h, "Copy", "Copy Tag"), ["Copy ResRef", "Copy Tag"]);
+    // An item of a submenu does what it did, and closes the menu.
+    h.get_by_label("Copy Tag").click();
+    h.step();
+    let copied: Vec<String> = (h.output().platform_output.commands.iter())
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(copied, ["MG_GATE_A"]);
+    h.run_steps(2);
+    assert!(h.query_by_label("Copy ResRef").is_none(), "the menu closed");
+    assert!(h.query_by_label("Edit Copy…").is_none(), "the menu closed");
+}
+
+/// Where the palette's search field is, with `hint` in it (nothing typed).
+fn search_rect(h: &Harness<'_, Moonglow>, hint: &str) -> egui::Rect {
+    let by_hint = |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some(hint);
+    h.get(egui_kittest::kittest::by().predicate(by_hint)).rect()
+}
+
+/// What the palette's list shows: the labels under its search field (at
+/// `search`), in its column (categories, rows and pictures; open ones'
+/// too).
+fn palette_labels(
+    h: &Harness<'_, Moonglow>,
+    search: egui::Rect,
+) -> std::collections::BTreeSet<String> {
+    h.query_all_by_label_contains("")
+        .filter(|n| {
+            let r = n.rect();
+            r.top() > search.bottom() && r.left() >= search.left() - 30.0
+        })
+        .filter_map(|n| n.accesskit_node().label())
+        .collect()
+}
+
+/// A search opens the categories with a match as it is typed; cleared,
+/// each category is open or closed again as it was before the search
+/// (the builder's report on 3.1.4: every category stayed open, which the
+/// Gallery's pictures made plain). One opened before it stays open.
+#[test]
+fn a_search_cleared_leaves_the_categories_as_they_were() {
+    let Some((mut h, _area)) = area_harness("palette-search-folds") else { return };
+    {
+        let p = &mut h.state_mut().palette;
+        p.kind = mg_module::palette::BlueprintKind::Placeable;
+        (p.tiles, p.custom) = (false, false);
+        p.filter.clear();
+    }
+    h.state_mut().settings.palette_gallery = true;
+    settle(&mut h);
+    let hint = search_rect(&h, "🔍 Search name, tag, resref");
+    let first = palette_labels(&h, hint);
+    // A category opened: its rows under it.
+    let header = first
+        .iter()
+        .find(|l| l.ends_with(')') && l.contains(" ("))
+        .expect("a category with blueprints")
+        .clone();
+    h.get_by_label(&header).click();
+    settle(&mut h);
+    let before = palette_labels(&h, hint);
+    assert!(before.len() > first.len(), "{header} opened: {before:?}");
+    h.state_mut().palette.filter = "chest".into();
+    settle(&mut h);
+    let found = palette_labels(&h, hint);
+    assert!(found.iter().any(|l| !before.contains(l)), "the search opens others: {found:?}");
+    h.state_mut().palette.filter.clear();
+    settle(&mut h);
+    assert_eq!(palette_labels(&h, hint), before, "every category as it was before the search");
+    // The List as well.
+    h.state_mut().settings.palette_gallery = false;
+    settle(&mut h);
+    let listed = palette_labels(&h, hint);
+    h.state_mut().palette.filter = "chest".into();
+    settle(&mut h);
+    h.state_mut().palette.filter.clear();
+    settle(&mut h);
+    assert_eq!(palette_labels(&h, hint), listed, "in the List too");
+}
+
+/// The tiles palette's search opens the headings with a match, in the
+/// Gallery a terrain's pictures too; cleared, each heading is again as it
+/// was before the search.
+#[test]
+fn the_tiles_palette_s_search_cleared_leaves_its_headings_as_they_were() {
+    let Some((mut h, _area)) = area_harness("tiles-search-folds") else { return };
+    h.state_mut().palette.tiles = true;
+    h.state_mut().palette.filter.clear();
+    h.state_mut().settings.palette_gallery = true;
+    settle(&mut h);
+    let hint = search_rect(&h, "🔍 Search name, model");
+    let before = palette_labels(&h, hint);
+    h.state_mut().palette.filter = "water".into();
+    settle(&mut h);
+    let found = palette_labels(&h, hint);
+    assert!(found.iter().any(|l| !before.contains(l)), "the search opens headings: {found:?}");
+    h.state_mut().palette.filter.clear();
+    settle(&mut h);
+    assert_eq!(palette_labels(&h, hint), before, "every heading as it was before the search");
 }

@@ -81,6 +81,14 @@ impl Form<'_> {
         ui.data(|d| d.get_temp::<(bool, String, Option<ResRef>)>(state_id)).and_then(|s| s.2)
     }
 
+    /// Find in Palette: the blueprint `resref` chosen in the type's palette
+    /// picker, the branches that hold it opened and the tree scrolled to
+    /// it (as the picker is next drawn, [`palette_picker`]).
+    pub(crate) fn find_in_palette(&self, ui: &Ui, kind: BlueprintKind, resref: ResRef) {
+        let state_id = self.id(&format!("picker-{}", kind.name()));
+        ui.data_mut(|d| d.insert_temp(reveal_id(state_id), Reveal { resref, at: None, frames: 0 }));
+    }
+
     /// A palette to choose blueprints from: Standard or Custom, a filter and
     /// the tree; a click chooses, a double-click or `add` takes it. The
     /// blueprint taken.
@@ -134,7 +142,29 @@ pub(crate) fn palette_picker(
     // (custom palette, filter, chosen blueprint)
     let (mut custom, mut filter, mut chosen): (bool, String, Option<ResRef>) =
         ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
-    let mut taken = None;
+    let (mut taken, mut viewed) = (None, None);
+    // A blueprint to show (Find in Palette): found first, in the standard
+    // palette or else the custom one, and chosen there; the search cleared
+    // if it hides it.
+    let mut reveal: Option<Reveal> = ui.data(|d| d.get_temp(reveal_id(state_id)));
+    if let Some(r) = reveal.as_mut().filter(|r| r.at.is_none()) {
+        let found = [false, true].into_iter().find_map(|c| {
+            let p = palette_view::palette(app, kind, c)?;
+            path_to(&p, r.resref).map(|path| (c, p, path))
+        });
+        match (found, app.game.as_deref()) {
+            (Some((c, p, path)), Some(game)) => {
+                custom = c;
+                chosen = Some(r.resref);
+                let searched = !mg_core::text::Needle::new(&filter).is_empty();
+                if searched && !Found::new(&p, game, &filter).blueprints.contains(&r.resref) {
+                    filter.clear();
+                }
+                r.at = Some(path);
+            }
+            _ => reveal = None,
+        }
+    }
     ui.horizontal(|ui| {
         ui.selectable_value(&mut custom, false, "Standard Palette");
         ui.selectable_value(&mut custom, true, "Custom Palette");
@@ -166,10 +196,18 @@ pub(crate) fn palette_picker(
     };
     let game = app.game.as_deref();
     let list = egui::ScrollArea::vertical().id_salt(state_id.with("tree")).max_height(height);
+    let mut shown = false;
     list.auto_shrink([false, true]).show(ui, |ui| {
         if let (Some(p), Some(game)) = (palette, game) {
-            let mut at =
-                Tree { game, found: found.as_deref(), chosen: &mut chosen, taken: &mut taken };
+            let mut at = Tree {
+                game,
+                found: found.as_deref(),
+                chosen: &mut chosen,
+                taken: &mut taken,
+                viewed: &mut viewed,
+                reveal: reveal.as_ref().and_then(|r| Some((r.at.as_deref()?, r.resref))),
+                shown: &mut shown,
+            };
             for (i, node) in p.nodes.iter().enumerate() {
                 at.branch(ui, node, state_id, &[i], (kind, add));
             }
@@ -178,8 +216,58 @@ pub(crate) fn palette_picker(
     if ui.add_enabled(chosen.is_some(), egui::Button::new(add)).clicked() {
         taken = chosen;
     }
+    if let Some(r) = viewed {
+        palette_view::view_blueprint(app, ResKey::new(r, kind.restype()));
+    }
+    // The blueprint shown is asked for again until its row is in sight:
+    // the branches above it open over a few frames, and the tree scrolls
+    // as they do. (Given up after a second, should the row never show.)
+    match reveal {
+        Some(mut r) if !shown && r.frames < 60 => {
+            r.frames += 1;
+            ui.data_mut(|d| d.insert_temp(reveal_id(state_id), r));
+            ui.ctx().request_repaint();
+        }
+        _ => ui.data_mut(|d| d.remove::<Reveal>(reveal_id(state_id))),
+    }
     ui.data_mut(|d| d.insert_temp(state_id, (custom, filter, chosen)));
     taken
+}
+
+/// Where a picker keeps the blueprint Find in Palette asked it to show.
+fn reveal_id(state_id: egui::Id) -> egui::Id {
+    state_id.with("reveal")
+}
+
+/// A blueprint a picker is to show (Find in Palette): `at`, the place in
+/// the tree of the branch that holds it, once found; `frames`, how many
+/// it has been asked for.
+#[derive(Debug, Clone)]
+struct Reveal {
+    resref: ResRef,
+    at: Option<Vec<usize>>,
+    frames: u32,
+}
+
+/// The place in the tree of the first branch of `p` that holds `resref`.
+fn path_to(p: &Palette, resref: ResRef) -> Option<Vec<usize>> {
+    fn walk(n: &PaletteNode, path: &mut Vec<usize>, resref: ResRef) -> bool {
+        if n.blueprints.iter().any(|b| b.resref == resref) {
+            return true;
+        }
+        for (i, c) in n.children.iter().enumerate() {
+            path.push(i);
+            if walk(c, path, resref) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    p.nodes.iter().enumerate().find_map(|(i, n)| {
+        let mut path = vec![i];
+        walk(n, &mut path, resref).then_some(path)
+    })
 }
 
 /// What the editors read of blueprints every frame, kept: blueprints'
@@ -275,12 +363,17 @@ impl Found {
 }
 
 /// A palette's tree as a picker draws it: what the search found (none:
-/// every blueprint), the blueprint chosen and the one taken.
+/// every blueprint), the blueprint chosen, the one taken and the one whose
+/// Properties were asked for; the blueprint to show (the branch that holds
+/// it, and its resref), and whether its row was in sight.
 struct Tree<'a> {
     game: &'a mg_rules::GameData,
     found: Option<&'a Found>,
     chosen: &'a mut Option<ResRef>,
     taken: &'a mut Option<ResRef>,
+    viewed: &'a mut Option<ResRef>,
+    reveal: Option<(&'a [usize], ResRef)>,
+    shown: &'a mut bool,
 }
 
 impl Tree<'_> {
@@ -296,36 +389,41 @@ impl Tree<'_> {
         if self.found.is_some_and(|f| !f.branches.contains(path)) {
             return;
         }
-        // While searching, every branch with a match is open.
+        // While searching, every branch with a match is open; so are those
+        // that hold the blueprint to show.
+        let revealing = self.reveal.is_some_and(|(at, _)| at.starts_with(path));
         egui::CollapsingHeader::new(node.name.text(self.game))
             .id_salt((salt, path))
-            .open(self.found.is_some().then_some(true))
+            .open((self.found.is_some() || revealing).then_some(true))
             .show(ui, |ui| {
                 for (i, child) in node.children.iter().enumerate() {
                     let mut p = path.to_vec();
                     p.push(i);
                     self.branch(ui, child, salt, &p, (kind, add));
                 }
+                let shows = self.reveal.filter(|(at, _)| *at == path).map(|(_, r)| r);
                 for b in &node.blueprints {
                     if self.found.is_some_and(|f| !f.blueprints.contains(&b.resref)) {
                         continue;
                     }
-                    self.row(ui, b, (kind, add));
+                    self.row(ui, b, (kind, add), shows == Some(b.resref));
                 }
             });
     }
 
     /// A blueprint's row: out of sight, its room only (a branch may hold
-    /// thousands).
+    /// thousands); the tree scrolled to it where it is the one to show
+    /// (`reveal`).
     fn row(
         &mut self,
         ui: &mut Ui,
         b: &mg_module::palette::PaletteBlueprint,
         (kind, add): (BlueprintKind, &str),
+        reveal: bool,
     ) {
         let height = ui.spacing().interact_size.y;
         let room = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(1.0, height));
-        if !ui.is_rect_visible(room) {
+        if !reveal && !ui.is_rect_visible(room) {
             ui.allocate_space(egui::vec2(1.0, height));
             return;
         }
@@ -337,6 +435,13 @@ impl Tree<'_> {
         let row = egui::Button::selectable(*self.chosen == Some(b.resref), label)
             .sense(egui::Sense::click_and_drag());
         let r = ui.add(row).on_hover_text(b.resref.to_string());
+        if reveal {
+            if ui.clip_rect().contains_rect(r.rect) {
+                *self.shown = true;
+            } else {
+                r.scroll_to_me(Some(egui::Align::Center));
+            }
+        }
         if r.clicked() {
             *self.chosen = Some(b.resref);
         }
@@ -358,6 +463,18 @@ impl Tree<'_> {
                 && ui.button("Equip").clicked()
             {
                 ui.data_mut(|d| d.insert_temp(equip_asked_id(), b.resref));
+                ui.close();
+            }
+            // Properties last, as in Aurora's menus.
+            ui.separator();
+            if ui
+                .button("Properties")
+                .on_hover_text(
+                    "The blueprint's properties: the module's to edit, the game's to look at",
+                )
+                .clicked()
+            {
+                *self.viewed = Some(b.resref);
                 ui.close();
             }
         });

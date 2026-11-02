@@ -85,7 +85,12 @@ impl std::fmt::Debug for Viewport3d {
 impl Viewport3d {
     pub fn new(render_state: egui_wgpu::RenderState) -> Viewport3d {
         let gpu = Gpu::new(render_state.device.clone(), render_state.queue.clone());
-        let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, SAMPLES);
+        let mut renderer = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, SAMPLES);
+        // (An integrated GPU's memory is the system's, and little of it:
+        // less is kept of the textures not drawn lately.)
+        if render_state.adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
+            renderer.set_stale_textures_kept(mg_render::STALE_TEXTURES_KEPT_INTEGRATED);
+        }
         Viewport3d { render_state, gpu, renderer, configured: false, textures_from: None }
     }
 
@@ -152,6 +157,45 @@ impl Viewport3d {
             ),
         };
         *held = Some((targets, id));
+    }
+
+    /// Lets go of a view's targets and the egui texture that shows them
+    /// (egui's binding of the texture held it on the GPU otherwise, after
+    /// the view had let go of it): made again when it is drawn.
+    pub(crate) fn let_go_of_targets(&self, held: &mut Option<(Targets, egui::TextureId)>) {
+        if let Some((_, id)) = held.take() {
+            self.render_state.renderer.write().free_texture(&id);
+        }
+    }
+}
+
+/// How long a 3D view goes undrawn (its tab behind another, closed, or
+/// its window shut) before the targets its picture is drawn into are let
+/// go of, seconds: an area view's at 3440 by 1400 pixels are 170 MB, with
+/// their samples, depth and framebuffer copies. A view shown again is
+/// drawn anew into new ones.
+pub(crate) const UNSEEN_AFTER: f64 = 2.0;
+
+/// After a frame: the model views not drawn for [`UNSEEN_AFTER`] let go
+/// of their targets.
+pub(crate) fn let_go_of_unseen(app: &mut Moonglow, now: f64) {
+    let Some(vp) = app.viewport.as_ref() else { return };
+    for view in app.model_views.values_mut() {
+        if view.targets.is_some() && view.last_frame.is_none_or(|t| now - t > UNSEEN_AFTER) {
+            view.let_go_of_targets(vp);
+        }
+    }
+}
+
+impl ModelView {
+    /// Lets go of its picture's targets (drawn anew into new ones).
+    pub(crate) fn let_go_of_targets(&mut self, vp: &Viewport3d) {
+        vp.let_go_of_targets(&mut self.targets);
+    }
+
+    /// Whether its picture's targets are held.
+    pub fn holds_targets(&self) -> bool {
+        self.targets.is_some()
     }
 }
 
@@ -1029,7 +1073,10 @@ fn show(app: &mut Moonglow, ui: &mut egui::Ui, source: Source, embedded: bool) -
     // Animation time.
     let now = ui.input(|i| i.time);
     let dt = match (view.last_frame, view.playing) {
-        (Some(last), true) => (now - last) as f32,
+        // (At most a quarter of a second, as the area view's: frames stop
+        // while the window has not the focus, and an hour away is no
+        // step of an hour for the particles.)
+        (Some(last), true) => ((now - last) as f32).min(0.25),
         _ => 0.0,
     };
     view.time += dt;
@@ -1089,7 +1136,11 @@ fn show(app: &mut Moonglow, ui: &mut egui::Ui, source: Source, embedded: bool) -
     }
     // Keep drawing while something moves: an animation, live particles or
     // dangly meshes.
-    if (pose.is_some() || live || dangly.moving()) && view.playing {
+    // (Behind another program's window, the picture kept as it is.)
+    if (pose.is_some() || live || dangly.moving())
+        && view.playing
+        && crate::area_view::animates_now(ui, app.settings.animate_unfocused, true, false)
+    {
         ui.ctx().request_repaint();
     }
 
@@ -1136,7 +1187,10 @@ fn show(app: &mut Moonglow, ui: &mut egui::Ui, source: Source, embedded: bool) -
     // A program of the game's that reads the clock moves what it draws:
     // drawn again as the area view's animations step, while the view plays;
     // and, while its pipelines are made, until they are.
-    if (vp.renderer.drawn.timed > 0 && view.playing) || vp.renderer.drawn.game_pending > 0 {
+    let focused = crate::area_view::animates_now(ui, app.settings.animate_unfocused, true, false);
+    if (vp.renderer.drawn.timed > 0 && view.playing && focused)
+        || vp.renderer.drawn.game_pending > 0
+    {
         ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(CLOCK_STEP));
     }
     let response = ui.add(
@@ -2171,7 +2225,11 @@ fn render_picture(app: &mut Moonglow, scene: &Scene, camera: &Camera, apart: boo
     // apart too, the picture waiting for them: made in the frame, one
     // took 13 to 27 ms.)
     vp.renderer.game_background = apart;
-    vp.renderer.render(
+    // (With the targets' framebuffer copies: shiny water drawn by the
+    // game's `fswater` where the Shaders switch is on, as the area view
+    // and the model view draw it; without them it was Moonglow's own pale
+    // water, a builder's report on 3.1.4.)
+    vp.renderer.render_with_copies(
         &vp.gpu,
         assets,
         scene,
@@ -2180,6 +2238,7 @@ fn render_picture(app: &mut Moonglow, scene: &Scene, camera: &Camera, apart: boo
         resolve,
         &targets.depth,
         (size, size),
+        &targets.copies,
     );
     vp.renderer.textures_apart = false;
     vp.renderer.game_background = false;
@@ -2287,5 +2346,45 @@ mod tests {
             pictured_look(&app, (Pictured::Look(mg_preview::CreatureLook::new(4)), false)).unwrap();
         assert!(bare.parts.iter().any(|p| p.model.ends_with("_chest001")), "a plain body's own");
         assert_ne!(dressed, bare);
+    }
+
+    /// With the Shaders switch on, a gallery's picture draws shiny water
+    /// as the area view does, by the game's `fswater` through the
+    /// pictures' framebuffer copies (a builder's report on 3.1.4: the
+    /// pictures drew it with Moonglow's own pale water, with no copies to
+    /// read). (A placeable's water, as the fountain's, is no shiny water:
+    /// `fslit`, in the area as in its picture.)
+    #[test]
+    fn a_picture_s_water_is_drawn_as_the_area_view_draws_it() {
+        let Some(root) = mg_testkit::nwn_root() else {
+            eprintln!("skipped: no game install");
+            return;
+        };
+        mg_testkit::gpu::hold();
+        if mg_render::Gpu::headless().is_none() {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        }
+        let rs = egui_kittest::wgpu::create_render_state(
+            crate::graphics_setup(egui_kittest::wgpu::default_wgpu_setup()),
+            egui_wgpu::RendererOptions::PREDICTABLE,
+        );
+        let install = mg_resman::GameInstall::new(&root, None, "en");
+        let mut app = Moonglow::new(Some(install), Box::new(crate::NoDialogs::default()));
+        app.set_render_state(rs);
+        app.set_game_shaders(true);
+        // A rural and a city water tile.
+        for model in ["ttr01_b20_01", "tcn01_b02_01"] {
+            let key = ResKey::parse(model, ResType::MDL).unwrap();
+            let source = Source::Resource(key);
+            let preview = preview_of(&app, &source).unwrap();
+            app.viewport.as_mut().unwrap().renderer.game_programs = Some(Vec::new());
+            let picture = draw_thumbnail(&mut app, Pictured::Tile(key, 0), &source, &preview);
+            assert!(picture.is_some(), "{model}: drawn");
+            let r = &app.viewport.as_ref().unwrap().renderer;
+            let programs = r.game_programs.as_deref().unwrap_or_default();
+            let fs: Vec<&str> = programs.iter().map(|p| p.fs.as_str()).collect();
+            assert!(fs.contains(&"fswater"), "{model}: its water by fswater, not {fs:?}");
+        }
     }
 }

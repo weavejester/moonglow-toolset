@@ -34,6 +34,7 @@ Documentation of Moonglow Toolset, the reimplementation of the Aurora Toolset fo
 # Report
 
 * [Audit: the documentation at 1.21.3](docs-audit.md) - An audit of all 46 documents in docs/ against the code at 1.21.3 - per document, whether it is correct, what was wrong and fixed, what is wrong and left, and whether it is still worth keeping (keep, update, trim, deprecate) - with the decisions it leaves to the owner.
+* [Audit: frames and GPU memory after 3.0.0, and on weaker hardware](performance-audit.md) - A dated record (2026-11-01, develop at 3.1.4) of an audit prompted by reports that performance fell and video memory rose since 3.0.0 - how frames and the GPU's memory were measured (v2.13.3, v3.0.0 and develop side by side; a discrete and an integrated GPU), what was found (no frame or memory regression since 2.13.3; views, textures and memory blocks held for good, an idle window drawing 25 pictures a second, a fill-bound picture on an integrated GPU), what was fixed with numbers before and after, and what is left with its cost.
 * [Review: test necessity, test speed and codebase cleanliness](test-review.md) - A dated record (2026-10-11, version 1.21.1) of where the time between a finished change and a release went, the decisions taken about it, the measurements before and after, and the state of the code by size and shape. How the tests run today is in the plan's §7 and CLAUDE.md.
 
 # Subdirectories
@@ -41,5 +42,5 @@ Documentation of Moonglow Toolset, the reimplementation of the Aurora Toolset fo
 * [manual](manual/index.md) - The user manual, a chapter per file, also built into the program (Help › User Manual, which shows each chapter without its frontmatter) and shipped beside it. (18 Manual Page, 1 Manual)
 * [parity](parity/index.md) - Parity with Aurora: the generated inventory of every Aurora form and control, and the control-by-control checklists of Moonglow against it. (1 Reference, 1 Checklist)
 * [plugins](plugins/index.md) - For plugin authors: the starting page, the API's changes, the example plugins (`examples/`) and the editor type file (`types/moonglow.luau`). (1 Changelog, 1 Guide)
-* [research](research/index.md) - Research behind the code: briefs on NWN:EE's formats, rendering, tilesets and models, what Aurora computes and how that was measured, prior art, and builders' pain points. (18 Research Note, 1 Reference)
+* [research](research/index.md) - Research behind the code: briefs on NWN:EE's formats, rendering, tilesets and models, what Aurora computes and how that was measured, prior art, and builders' pain points. (19 Research Note, 1 Reference)
 * [wiki-corrections](wiki-corrections/index.md) - The nwn.wiki edits, one file a page, ready to paste (the fifteen of the proposal, and two found 2026-10-31: the PLT page's metal palette, the Models page's triangle limit): the passage to find, the text to put in its place, the edit summary and how it was checked. (17 Wiki Edit)

@@ -325,6 +325,13 @@ const TOOLS_MAX: usize = 32;
 /// target otherwise.
 const RING_REACH: f32 = 11.5;
 
+/// The handles' radius by the eye's distance from what they are about:
+/// with the view's 40° field, about a tenth of its height.
+const HANDLE_SHARE: f32 = 0.0765;
+
+/// The least radius of the handles, meters: for an object at the eye.
+const HANDLE_LEAST: f32 = 0.005;
+
 /// Half the side of a scale handle's square, points.
 const SCALE_HANDLE: f32 = 5.0;
 
@@ -407,6 +414,8 @@ pub struct AreaView {
     pub tile_selection: Vec<(u32, u32)>,
     /// The box being dragged to select tiles (screen points).
     pub(crate) tile_box: Option<(Pos2, Pos2)>,
+    /// That box adds its tiles to those selected (Shift held as it began).
+    pub(crate) tile_box_adds: bool,
     /// Copied tiles follow the pointer, to be placed with a click.
     pub tile_pasting: bool,
     /// Where the tile menu was opened.
@@ -856,6 +865,60 @@ impl AreaView {
         self.drawn = None;
     }
 
+    /// Lets go of its picture's targets (drawn anew into new ones).
+    pub(crate) fn let_go_of_targets(&mut self, vp: &crate::model_view::Viewport3d) {
+        vp.let_go_of_targets(&mut self.targets);
+        self.drawn = None;
+    }
+
+    /// Its picture drawn anew at the next frame (what it was drawn with
+    /// changed: the textures read again).
+    pub(crate) fn redraw_picture(&mut self) {
+        self.drawn = None;
+    }
+
+    /// The size its picture is drawn at, pixels, while its targets are held.
+    pub fn picture_size(&self) -> Option<(u32, u32)> {
+        self.targets.as_ref().map(|(t, _)| t.size)
+    }
+
+    /// Whether its picture's targets are held (drawn into, and shown).
+    pub fn holds_targets(&self) -> bool {
+        self.targets.is_some()
+    }
+
+    /// Whether its scene is on the GPU (its tiles' and objects' models).
+    pub fn holds_scene(&self) -> bool {
+        self.scene.is_some()
+    }
+}
+
+/// After a frame: the area views not drawn for
+/// [`UNSEEN_AFTER`](crate::model_view::UNSEEN_AFTER) let go of their
+/// picture's targets (their tab is behind another, or closed); and those
+/// whose tab is closed, of their scene too (its models and their meshes on
+/// the GPU, the particles, the grass): the view keeps its camera,
+/// selection and tools, and is read again when its tab opens again, as
+/// Reload Resources reads it. (Kept, every area opened in a session held
+/// its targets and scene until the module closed.)
+pub(crate) fn let_go_of_unseen(app: &mut Moonglow, now: f64) {
+    let Some(vp) = app.viewport.as_ref() else { return };
+    let after = crate::model_view::UNSEEN_AFTER;
+    for (area, view) in app.area_views.iter_mut() {
+        if view.last_frame.is_some_and(|t| now - t <= after) {
+            continue;
+        }
+        if view.targets.is_some() {
+            view.let_go_of_targets(vp);
+        }
+        if view.scene.is_some() && app.dock.find_tab(&crate::Tab::Area(*area)).is_none() {
+            view.reload();
+            view.particles.clear();
+        }
+    }
+}
+
+impl AreaView {
     /// The area's tiles were laid out anew (another size, turned, another
     /// tileset, the file read again): the tile tools let go of the corners
     /// and tiles they held of the ground as it was, the pointer's (until
@@ -901,6 +964,7 @@ impl AreaView {
             tile_mode: false,
             tile_selection: Vec::new(),
             tile_box: None,
+            tile_box_adds: false,
             tile_pasting: false,
             tile_menu_at: None,
             group_turns: 0,
@@ -1359,6 +1423,51 @@ impl AreaView {
             .take(TOOLS_MAX)
     }
 
+    /// The radius of the handles about a selected object at `at` (its
+    /// rings; its arrows and scale handle reach out from it by so much),
+    /// meters, seen by `camera`: the same share of the view on screen at
+    /// any distance (about a tenth of its height, the arrows' heads ending
+    /// at a sixth), so that from close by (fruit placed on a table) they
+    /// are as small as the object and stay in the view; a view narrower
+    /// than it is tall takes that share of its width. (They were half a
+    /// meter at the least, which from a meter away ran out of the view.)
+    fn handle_radius(&self, camera: &Camera, at: Vec3) -> f32 {
+        let size = self.rect.size();
+        let narrow = if size.x > 0.0 && size.y > 0.0 { (size.x / size.y).min(1.0) } else { 1.0 };
+        ((camera.eye - at).length() * HANDLE_SHARE * narrow).max(HANDLE_LEAST)
+    }
+
+    /// The radius of the handles of a selected object at `at`, as the
+    /// view draws them now: for the tests.
+    pub fn handle_radius_at(&self, at: Vec3) -> Option<f32> {
+        Some(self.handle_radius(&self.camera()?, at))
+    }
+
+    /// Where the selection's handles are on screen, as the view would draw
+    /// them now (with Shift held, `shift`; `None` behind the eye): the
+    /// turning rings' pieces' ends, or the tilt rings', the arrows' heads
+    /// and the scale handles.
+    /// For the tests.
+    pub fn handle_points(&self, shift: bool) -> Vec<Option<Pos2>> {
+        let Some(model) = self.model.as_ref() else { return Vec::new() };
+        let mut points: Vec<Vec3> = Vec::new();
+        if shift {
+            for ring in self.tilt_rings(model) {
+                points.extend((0..RING_SEGMENTS).map(|k| ring.segment(k).0));
+            }
+            for arrow in self.axis_arrows(model) {
+                let (neck, tip) = arrow.head();
+                points.extend([neck, tip]);
+            }
+            points.extend(self.scale_handles(model).into_iter().map(|(_, handle)| handle));
+        } else {
+            for ring in self.turn_rings(model) {
+                points.extend((0..RING_SEGMENTS).map(|k| ring.segment(k).0));
+            }
+        }
+        points.into_iter().map(|p| self.screen_pos(p)).collect()
+    }
+
     /// The rings for turning the selection, one around each selected
     /// object that turns (as `model` has it): about the same size on
     /// screen however far the camera is.
@@ -1367,7 +1476,7 @@ impl AreaView {
         self.chosen(model)
             .filter(|o| turns(o.kind))
             .map(|o| {
-                let radius = ((camera.eye - pivot(o)).length() * 0.0765).max(0.5);
+                let radius = self.handle_radius(&camera, pivot(o));
                 TurnRing { pivot: pivot(o), radius, facing: ring_mark(o) }
             })
             .collect()
@@ -1438,7 +1547,7 @@ impl AreaView {
                 let about_x = stands * glam::Quat::from_rotation_z(r.x);
                 let about_y = about_x * glam::Quat::from_rotation_x(r.y);
                 let pivot = o.transform().transform_point3(visual.translate);
-                let radius = ((camera.eye - pivot).length() * 0.0765).max(0.5);
+                let radius = self.handle_radius(&camera, pivot);
                 let ring = |axis: usize, n: Vec3| {
                     let u = n.any_orthonormal_vector();
                     TiltRing { axis, pivot, radius, u, v: n.cross(u) }
@@ -1459,7 +1568,7 @@ impl AreaView {
         self.chosen(model)
             .filter(|o| o.takes_visual_transform())
             .map(|o| {
-                let radius = ((camera.eye - o.position).length() * 0.0765).max(0.5);
+                let radius = self.handle_radius(&camera, o.position);
                 (o.position, o.position + out * radius * 1.25)
             })
             .collect()
@@ -1540,7 +1649,7 @@ impl AreaView {
         let Some(camera) = self.camera().filter(|_| self.turn_ring) else { return Vec::new() };
         let mut arrows = Vec::new();
         for o in self.chosen(model) {
-            let radius = ((camera.eye - o.position).length() * 0.0765).max(0.5);
+            let radius = self.handle_radius(&camera, o.position);
             let axes = if lifts(o.kind) { 0..3 } else { 0..2 };
             arrows.extend(axes.map(|axis| AxisArrow { axis, pivot: o.position, radius }));
         }
@@ -2537,6 +2646,15 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
         {
             app.settings.no_grass = !grass;
         }
+        tools.toggle(
+            ui,
+            &mut app.settings.tile_border,
+            icons::TILE_BORDER,
+            "Tile Border",
+            "Past the area's edge, what the game draws there: the tileset's edge tiles, five \
+             deep and darkened, carrying on the area's terrain, roads and streams (the game's \
+             Enable Tile Border); off, nothing, as in Aurora (in every area view)",
+        );
         let mut shaders = app.game_shaders();
         if tools
             .toggle(
@@ -2828,7 +2946,8 @@ fn toolbar(app: &mut Moonglow, ui: &mut egui::Ui, view: &mut AreaView) {
     } else if view.tile_mode {
         // (And why a step was refused, as a brush's line says it: first,
         // where a narrow view doesn't cut it short.)
-        let how = "Select Tiles: click a tile (Ctrl + click: add one), drag a box; Shift + right \
+        let how = "Select Tiles: click a tile (Shift + click: add one, Ctrl + click: add or take \
+                   it out), drag a box (with Shift: add it); Shift + right \
                    click: its next tile; right click: the tile menu";
         match &view.notice {
             Some(n) => format!("{n} · {how}"),
@@ -2938,6 +3057,7 @@ fn viewport(
         shadows: view.shadows,
         creature_shadows: view.creature_shadows,
         light_shadows: view.light_shadows,
+        border: app.settings.tile_border,
         show: view.show,
         animate: !app.settings.still_objects,
         fade: view.fade.now(view.tile_mode || crate::terrain_mode::active(app, view).is_some()),
@@ -3045,7 +3165,10 @@ fn viewport(
         return;
     };
     let size = ui.available_size().max(egui::vec2(32.0, 32.0));
-    let ppp = ui.ctx().pixels_per_point();
+    // (Options › Area › Area view resolution: so many of a hundred pixels
+    // each way, the picture stretched to the view.)
+    let share = app.settings.area_resolution.map_or(1.0, |p| f32::from(p.clamp(25, 100)) / 100.0);
+    let ppp = ui.ctx().pixels_per_point() * share;
     let (w, h) = ((size.x * ppp).round() as u32, (size.y * ppp).round() as u32);
     let (w, h) = (w.clamp(16, 8192), h.clamp(16, 8192));
 
@@ -3176,6 +3299,8 @@ fn viewport(
         view.drawn = Some((from, view.time));
         view.pictures += 1;
     }
+    // (What the picture still waits for: drawn again when it comes.)
+    let pending = vp.renderer.drawn.textures_pending > 0 || vp.renderer.drawn.game_pending > 0;
     let watch_failed = view.watching.read(vp, &view.area.to_string());
     let response = ui.add(
         egui::Image::new(egui::load::SizedTexture::new(*id, size))
@@ -3247,12 +3372,26 @@ fn viewport(
     crate::tile_select::overlay(ui, view, app.tile_clip.as_ref());
     crate::tile_select::refused_overlay(ui, view);
     // Tiles animate: keep drawing while the view is on screen, when their
-    // next step is due.
-    let due = view.drawn.as_ref().map_or(0.0, |(_, at)| ANIMATION_STEP - (view.time - at));
-    ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(due.clamp(0.0, 1.0)));
+    // next step is due; while the window has the focus (behind another
+    // program's, the picture is kept as it is, until a frame comes or the
+    // window is gone back to: a toolset left open drew 25 pictures a
+    // second that no one looked at, an integrated GPU's every moment).
+    if animates_now(ui, app.settings.animate_unfocused, view.drawn.is_some(), pending) {
+        let due = view.drawn.as_ref().map_or(0.0, |(_, at)| ANIMATION_STEP - (view.time - at));
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(due.clamp(0.0, 1.0)));
+    }
     // (The map last: over the rest, and the pointer's there.)
     minimap_overlay(app, ui, view);
     input(app, ui, view, &response);
+}
+
+/// Whether a 3D view's animations step now: while the window has the
+/// focus or the builder keeps them going behind other windows (`always`:
+/// Options › Area › Keep animating behind other windows), or its picture
+/// is still to be drawn whole (`drawn` is false, or it waits for textures
+/// or the game's programs: `pending`).
+pub(crate) fn animates_now(ui: &egui::Ui, always: bool, drawn: bool, pending: bool) -> bool {
+    !drawn || pending || always || ui.input(|i| i.focused)
 }
 
 /// The area's map in the view's top right corner (the toolbar's
@@ -6168,10 +6307,12 @@ fn set_locked(
     }
 }
 
-/// The context menu of the selection: Preview, Adjust Location, what the
-/// object's type offers (Aurora's `pmViewerArea`), Delete, the start
-/// location and tests from here; last, as in Aurora, Variables and
-/// Properties.
+/// The context menu of the selection: Preview, Adjust Location, Position
+/// (the drops, Random Facing), what the object's type offers (Aurora's
+/// `pmViewerArea`), Reuse, Delete, the start location and Test (from
+/// here); last, as in Aurora, Variables and Properties. Runs of related
+/// commands are submenus of one level, as the toolbar's Shadows and
+/// Walkmesh… keep theirs behind one button.
 fn context_menu(app: &mut Moonglow, view: &mut AreaView, ui: &mut egui::Ui) {
     let single = match view.selection.as_slice() {
         [one] => Some(*one),
@@ -6249,6 +6390,8 @@ fn editing_items(
     preview_item(app, view, ui, single);
     let any = !view.selection.is_empty();
     let start = view.start_is_selected().then(|| start_location(app, view.area)).flatten();
+    // (Adjust Location…, the start location's too, at the top as in
+    // Aurora's menu.)
     if ui.add_enabled(any || start.is_some(), egui::Button::new("Adjust Location…")).clicked() {
         app.adjust = match start {
             Some(at) => Some(crate::area_tools::adjust_start(view.area, at)),
@@ -6256,32 +6399,41 @@ fn editing_items(
         };
         ui.close();
     }
-    if ui.add_enabled(any, egui::Button::new("Drop to Ground (G)")).clicked() {
-        drop_to_ground(app, view);
-        ui.close();
-    }
-    if ui
-        .add_enabled(any, egui::Button::new("Drop onto Object (Shift+G)"))
-        .on_hover_text(
-            "Set each selected object on the placeable or door below it (a skull on an altar, \
-             a book on a table), up to 2 m above it; else on the ground",
-        )
-        .clicked()
-    {
-        drop_onto_objects(app, view);
-        ui.close();
-    }
-    if ui
-        .add_enabled(any, egui::Button::new("Random Facing"))
-        .on_hover_text(
-            "Turn each selected object to face a way of its own, at random (trees and rocks \
-             placed in a row no longer all face alike); by the snap angle, if one is set",
-        )
-        .clicked()
-    {
-        random_facing(app, view);
-        ui.close();
-    }
+    // The quick ways of setting where the selection stands and which way
+    // it faces, together.
+    ui.add_enabled_ui(any, |ui| {
+        ui.menu_button("Position", |ui| {
+            if ui.add_enabled(any, egui::Button::new("Drop to Ground (G)")).clicked() {
+                drop_to_ground(app, view);
+                ui.close();
+            }
+            if ui
+                .add_enabled(any, egui::Button::new("Drop onto Object (Shift+G)"))
+                .on_hover_text(
+                    "Set each selected object on the placeable or door below it (a skull on an \
+                     altar, a book on a table), up to 2 m above it; else on the ground",
+                )
+                .clicked()
+            {
+                drop_onto_objects(app, view);
+                ui.close();
+            }
+            if ui
+                .add_enabled(any, egui::Button::new("Random Facing"))
+                .on_hover_text(
+                    "Turn each selected object to face a way of its own, at random (trees and \
+                     rocks placed in a row no longer all face alike); by the snap angle, if one \
+                     is set",
+                )
+                .clicked()
+            {
+                random_facing(app, view);
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Drop to Ground, Drop onto Object, Random Facing");
+    });
     // Placeables: static (part of the scenery; the game gives those no
     // visual transform, so they don't tilt) or dynamic.
     let placeables: Vec<(usize, bool, bool)> = view.model.as_ref().map_or_else(Vec::new, |m| {
@@ -6391,10 +6543,6 @@ fn editing_items(
         .unwrap_or_default();
     if !locked.is_empty() && ui.button(format!("Unlock All ({})", locked.len())).clicked() {
         set_locked(app, view, &locked, false);
-        ui.close();
-    }
-    if ui.add_enabled(any, egui::Button::new("Save as Prefab…")).clicked() {
-        app.prefab_save = copy_selection(app, view).map(|clip| (String::new(), clip));
         ui.close();
     }
     let kinds: Vec<ObjectKind> = view.selection.iter().map(|(k, _)| *k).collect();
@@ -6586,24 +6734,40 @@ fn editing_items(
         app.actions.push(Action::OpenTab(crate::Tab::Instance { area: view.area, path }));
         ui.close();
     }
-    if let Some((kind, index)) = single
-        && ui.button("Add to Palette").clicked()
-    {
-        add_to_palette(app, view, kind, index);
-        ui.close();
-    }
-    if let Some((kind, index)) = single
-        && ui
-            .button("Export as Blueprint…")
-            .on_hover_text(
-                "Write it into an archive (.erf) as a blueprint of its own, with the items it \
-                 holds, as Add to Palette makes one: for another module's Import",
-            )
-            .clicked()
-    {
-        app.actions.push(Action::ExportObject { area: view.area, kind, index });
-        ui.close();
-    }
+    // What is selected kept to place again: a blueprint of one (in the
+    // palette, or in an archive for another module), a prefab of them.
+    ui.add_enabled_ui(any, |ui| {
+        ui.menu_button("Reuse", |ui| {
+            if let Some((kind, index)) = single
+                && ui.button("Add to Palette").clicked()
+            {
+                add_to_palette(app, view, kind, index);
+                ui.close();
+            }
+            if let Some((kind, index)) = single
+                && ui
+                    .button("Export as Blueprint…")
+                    .on_hover_text(
+                        "Write it into an archive (.erf) as a blueprint of its own, with the \
+                         items it holds, as Add to Palette makes one: for another module's \
+                         Import",
+                    )
+                    .clicked()
+            {
+                app.actions.push(Action::ExportObject { area: view.area, kind, index });
+                ui.close();
+            }
+            if ui.button("Save as Prefab…").clicked() {
+                app.prefab_save = copy_selection(app, view).map(|clip| (String::new(), clip));
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text(
+            "Kept to place again: Add to Palette and Export as Blueprint… (one object), Save \
+             as Prefab… (what is selected)",
+        );
+    });
     if let Some((ObjectKind::Creature, index)) = single
         && let Some(at) = view.menu_at
         && ui.button("Create Waypoint").clicked()
@@ -6670,14 +6834,19 @@ fn editing_items(
                 true,
             ),
         ];
-        for (label, tip, choose) in tests {
-            if ui.button(label).on_hover_text(tip).clicked() {
-                let facing = view.orbit.as_ref().map_or(0.0, |o| o.yaw + std::f32::consts::PI);
-                let area = view.area;
-                app.actions.push(Action::TestFromHere { area, at: at.to_array(), facing, choose });
-                ui.close();
+        ui.menu_button("Test", |ui| {
+            for (label, tip, choose) in tests {
+                if ui.button(label).on_hover_text(tip).clicked() {
+                    let facing = view.orbit.as_ref().map_or(0.0, |o| o.yaw + std::f32::consts::PI);
+                    let area = view.area;
+                    let at = at.to_array();
+                    app.actions.push(Action::TestFromHere { area, at, facing, choose });
+                    ui.close();
+                }
             }
-        }
+        })
+        .response
+        .on_hover_text("Test From Here, and Test From Here, Choose Character");
     }
     // The plugins' commands for what is selected (with nothing selected,
     // for the area), run on it.
