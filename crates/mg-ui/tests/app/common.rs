@@ -34,6 +34,96 @@ pub(crate) fn app_with(open: Vec<std::path::PathBuf>) -> Moonglow {
     Moonglow::new(None, Box::new(NoDialogs { open, ..Default::default() }))
 }
 
+/// The way editors open in a test's window (Options › General › Open
+/// editors): an existing user's settings (`Settings::default`, As
+/// Floating Windows), or a new installation's (`Settings::new_installation`:
+/// As Tabs, the Bottom Dock closed), which every new user starts with.
+/// A test family runs its body once for each ([`MODES`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Floating,
+    Tabs,
+}
+
+/// Both ways, an existing user's first.
+pub(crate) const MODES: [Mode; 2] = [Mode::Floating, Mode::Tabs];
+
+impl Mode {
+    /// The settings a window of this mode starts with.
+    pub(crate) fn settings(self) -> mg_ui::Settings {
+        match self {
+            Mode::Floating => mg_ui::Settings::default(),
+            Mode::Tabs => mg_ui::Settings::new_installation(),
+        }
+    }
+
+    /// A scratch folder's name for this mode (`scratch_dir` empties its
+    /// folder: the two runs of a family must not share one).
+    pub(crate) fn dir(self, name: &str) -> String {
+        format!("{name}-{}", self.word())
+    }
+
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Mode::Floating => "floating",
+            Mode::Tabs => "tabs",
+        }
+    }
+
+    /// Whether editors open as tabs.
+    pub(crate) fn tabs(self) -> bool {
+        self == Mode::Tabs
+    }
+}
+
+/// Gives `app`, made with its own settings, the two a mode's differ in
+/// (Open editors and the Bottom Dock's fold).
+pub(crate) fn put_in(app: &mut Moonglow, mode: Mode) {
+    let s = mode.settings();
+    app.settings.open_editors = s.open_editors;
+    app.settings.hide_log = s.hide_log;
+}
+
+/// [`app_with`] in `mode`: its settings those of an existing user (As
+/// Floating Windows) or of a new installation (As Tabs).
+pub(crate) fn app_in(mode: Mode, open: Vec<std::path::PathBuf>) -> Moonglow {
+    let mut app = app_with(open);
+    app.settings = mode.settings();
+    app
+}
+
+/// Shared base `GameData` components (`ResMan` base keys/dirs + `Arc<Tlk>`),
+/// creating a fresh `GameData` (whose caches and module layers stay isolated)
+/// without re-reading KEY/BIF/dialog.tlk across hundreds of UI tests.
+fn shared_game_data_for(install: &mg_resman::GameInstall) -> Option<mg_rules::GameData> {
+    static TLK: mg_testkit::Shared<
+        (std::path::PathBuf, String),
+        Option<std::sync::Arc<mg_tlk::Tlk>>,
+    > = mg_testkit::Shared::new();
+    let resman = mg_testkit::shared_resman(install).ok()?;
+    let key = (install.root.clone(), install.language.clone());
+    let tlk =
+        TLK.get(&key, || mg_rules::GameData::open_tlk(install).ok().map(std::sync::Arc::new))?;
+    Some(mg_rules::GameData::with_shared_tlk(resman, tlk))
+}
+
+/// Shared base `GameData` components (`ResMan` base keys/dirs + `Arc<Tlk>`),
+/// creating a fresh `GameData` (whose caches and module layers stay isolated)
+/// without re-reading KEY/BIF/dialog.tlk across hundreds of UI tests.
+pub(crate) fn shared_game_data(
+    root: &std::path::Path,
+    user: Option<std::path::PathBuf>,
+) -> mg_rules::GameData {
+    shared_game_data_for(&mg_resman::GameInstall::new(root, user, "en"))
+        .expect("open base game data")
+}
+
+/// Opens `Moonglow` with shared immutable base game resources.
+pub(crate) fn open_game_app(install: mg_resman::GameInstall, dialogs: NoDialogs) -> Moonglow {
+    let game = shared_game_data_for(&install);
+    Moonglow::new_with_game(Some(install), game, Box::new(dialogs))
+}
+
 /// The application on the game installed at `root`, in English, with
 /// `user` as the game's user folder (`None`: none), its dialogs answered
 /// by `dialogs`.
@@ -42,7 +132,7 @@ pub(crate) fn game_app_with(
     user: Option<std::path::PathBuf>,
     dialogs: NoDialogs,
 ) -> Moonglow {
-    Moonglow::new(Some(mg_resman::GameInstall::new(root, user, "en")), Box::new(dialogs))
+    open_game_app(mg_resman::GameInstall::new(root, user, "en"), dialogs)
 }
 
 /// [`game_app_with`] answering no dialogs.
@@ -53,13 +143,122 @@ pub(crate) fn game_app(
     game_app_with(root, user, NoDialogs::default())
 }
 
+std::thread_local! {
+    static USE_SHARED_GPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn using_shared_renderer() -> bool {
+    USE_SHARED_GPU.with(std::cell::Cell::get)
+}
+
+pub(crate) struct SharedRendererGuard(bool);
+
+impl Drop for SharedRendererGuard {
+    fn drop(&mut self) {
+        USE_SHARED_GPU.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Attaches a fresh renderer sharing the cached GPU device to subsequent
+/// [`harness`] and UI area harnesses on this thread until dropped.
+pub(crate) fn with_shared_renderer() -> SharedRendererGuard {
+    let prev = USE_SHARED_GPU.with(|cell| cell.replace(true));
+    SharedRendererGuard(prev)
+}
+
+fn build_harness(
+    app: Moonglow,
+    width: f32,
+    height: f32,
+    step_dt: Option<f32>,
+    rs: Option<egui_wgpu::RenderState>,
+) -> Harness<'static, Moonglow> {
+    let mut b = Harness::builder().with_size(egui::vec2(width, height));
+    if let Some(dt) = step_dt {
+        b = b.with_step_dt(dt);
+    }
+    if let Some(rs) = rs.or_else(|| using_shared_renderer().then(gpu).flatten()) {
+        b = b.renderer(egui_kittest::wgpu::WgpuTestRenderer::from_render_state(rs));
+    }
+    let mut recorded = false;
+    let h = b.build_ui_state(
+        move |ui, app: &mut Moonglow| {
+            if !recorded {
+                recorded = true;
+                mg_uikit::header::record_headers(ui.ctx());
+                mg_ui::widgets::record_footers(ui.ctx());
+            }
+            app.ui(ui)
+        },
+        app,
+    );
+    // (Which icons are drawn where, for a test to ask: [`icon_drawn`].)
+    mg_uikit::record_icons(&h.ctx);
+    h
+}
+
 /// `app`'s window in a harness `width` by `height` points, drawn (by
-/// `render`, `snapshot`) on a GPU device of kittest's own: a test that
-/// draws takes the GPU first (`mg_testkit::gpu::hold`).
+/// `render`, `snapshot`) on a GPU device of kittest's own unless
+/// [`with_shared_renderer`] is active: a test that draws takes the GPU
+/// first (`mg_testkit::gpu::hold`).
 pub(crate) fn harness(app: Moonglow, width: f32, height: f32) -> Harness<'static, Moonglow> {
-    Harness::builder()
-        .with_size(egui::vec2(width, height))
-        .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app)
+    build_harness(app, width, height, None, None)
+}
+
+/// [`harness`] with frames a 60th of a second apart, as on a screen (for
+/// what moves over time: a smooth scroll, a double click).
+pub(crate) fn timed_harness(app: Moonglow, width: f32, height: f32) -> Harness<'static, Moonglow> {
+    build_harness(app, width, height, Some(1.0 / 60.0), None)
+}
+
+/// The Left Dock unfolded by hand where the window's width folds it (a
+/// window under 1500 points, the shell's yields, M3 T14), as a builder who
+/// works in the module tree, the Resources panel or the Outliner at that
+/// width has it: its strip's chevron clicked, after a frame for the width
+/// to fold it; nothing where the dock is open already. Fails where it is
+/// neither open nor folded to a strip with its chevron (a dock that holds
+/// no panel), and unless it is open after. Under 962 points, where both
+/// side docks do not fit beside the editor area, unfolding it folds the
+/// Right Dock to its strip (`shell::BOTH_DOCKS_UNDER`).
+pub(crate) fn unfold_left_dock(h: &mut Harness<'_, Moonglow>) {
+    unfold_dock(h, "Left Dock", |app| app.left_dock_shows().is_some());
+}
+
+/// The window 1600 points wide, its height kept, and settled: wide enough
+/// that no width folds a side dock (the shell's yields, M3 T14), for a
+/// test of the builder's own fold of the docks (`hide_tree`,
+/// `hide_palettes`) or of both docks open as they are at first.
+pub(crate) fn wide_window(h: &mut Harness<'_, Moonglow>) {
+    let height = h.ctx.content_rect().height();
+    h.set_size(egui::vec2(1600.0, height));
+    settle(h);
+}
+
+/// The Right Dock unfolded by hand where the window's width folds it
+/// (under 796 points), as [`unfold_left_dock`] does the Left Dock's: under
+/// 962 points it folds the Left Dock to its strip.
+pub(crate) fn unfold_right_dock(h: &mut Harness<'_, Moonglow>) {
+    unfold_dock(h, mg_ui::RIGHT_DOCK, |app| app.right_dock_shows().is_some());
+}
+
+/// [`unfold_left_dock`] or [`unfold_right_dock`]: the dock named `dock`,
+/// `open` saying whether it shows a panel.
+fn unfold_dock(h: &mut Harness<'_, Moonglow>, dock: &str, open: fn(&Moonglow) -> bool) {
+    h.step();
+    if h.query_by_label(&format!("Fold the {dock}")).is_some() {
+        assert!(open(h.state()), "the {dock}'s fold button with no panel shown");
+        return;
+    }
+    let show = format!("Show the {dock}");
+    let chevron = h.query_by_label(&show);
+    let chevron = chevron.unwrap_or_else(|| panic!("the {dock} neither open nor with its chevron"));
+    chevron.click();
+    let started = std::time::Instant::now();
+    while h.query_by_label(&format!("Fold the {dock}")).is_none() {
+        assert!(started.elapsed().as_secs() < 10, "never: the {dock} unfolded");
+        h.step();
+    }
+    assert!(open(h.state()), "the {dock} unfolded, a panel shown");
 }
 
 /// The game's data at `root`, in English, with no user folder: read
@@ -74,6 +273,9 @@ pub(crate) fn game_data_in(
     root: &std::path::Path,
     user: Option<std::path::PathBuf>,
 ) -> mg_rules::GameData {
+    if user.is_none() {
+        return shared_game_data(root, None);
+    }
     mg_rules::GameData::open(&mg_resman::GameInstall::new(root, user, "en")).unwrap()
 }
 
@@ -81,6 +283,102 @@ pub(crate) fn game_data_in(
 /// most of its tests draw it.
 pub(crate) fn window_harness(app: Moonglow) -> Harness<'static, Moonglow> {
     harness(app, 800.0, 600.0)
+}
+
+/// A double click on a widget: both clicks in one frame (the harness gives
+/// each event it queues a frame of its own, a quarter of a second by
+/// default, longer than egui's double-click time), a second past any
+/// click before at 60 frames a second (else the three are a triple click).
+/// Advances egui's simulated input clock by `seconds` in one frame step,
+/// avoiding multi-second 60-step frame burns for timers and double-click delays.
+pub(crate) fn advance_clock(h: &mut Harness<'_, Moonglow>, seconds: f64) {
+    let now = h.ctx.input(|i| i.time);
+    h.input_mut().time = Some(now + seconds);
+    h.run_steps(1);
+    h.input_mut().time = None;
+}
+
+pub(crate) fn double_click_now(h: &mut Harness<'_, Moonglow>, at: egui::Pos2) {
+    h.hover_at(at);
+    advance_clock(h, 1.0);
+    let button = egui::PointerButton::Primary;
+    for pressed in [true, false, true, false] {
+        let modifiers = egui::Modifiers::NONE;
+        h.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button,
+            pressed,
+            modifiers,
+        });
+    }
+    h.run_steps(2);
+}
+
+/// The resource browser shown: the Left Dock unfolded on its Resources
+/// panel, as Tools › Resource Browser shows it (at the next frame).
+pub(crate) fn show_resources(app: &mut Moonglow) {
+    app.actions.push(mg_ui::Action::ShowPanel(mg_ui::Panel::Resources));
+}
+
+/// The palettes shown: the Right Dock unfolded on its Palette panel, as
+/// Tools › Palettes shows it (at the next frame).
+pub(crate) fn show_palette(app: &mut Moonglow) {
+    app.actions.push(mg_ui::Action::ShowPanel(mg_ui::Panel::Palette));
+}
+
+/// The palette's row (or other widget) named `label`: the one in the
+/// Right Dock's Palette panel, which must be in front (the Preview's tab,
+/// which names the blueprint chosen too, behind it).
+#[track_caller]
+pub(crate) fn palette_row<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    label: &'t str,
+) -> egui_kittest::Node<'t> {
+    assert!(palette_shown(h.state()), "the Palette's tab in front");
+    let palette = right_dock_rect(h);
+    let mut found = h.query_all_by_label(label).filter(|n| palette.contains(n.rect().center()));
+    let Some(first) = found.next() else { panic!("no {label} in the palette") };
+    assert!(found.next().is_none(), "two or more {label} in the palette");
+    first
+}
+
+/// Whether the palettes are shown: the Right Dock unfolded on its Palette
+/// panel.
+pub(crate) fn palette_shown(app: &Moonglow) -> bool {
+    app.right_dock_shows() == Some(mg_ui::Panel::Palette)
+}
+
+/// The palettes folded away: the Right Dock folded, as View › Right Dock
+/// folds it.
+pub(crate) fn fold_palette(app: &mut Moonglow) {
+    app.actions.push(mg_ui::Action::FoldPalettes);
+}
+
+/// The Right Dock `width` wide (its outer width, as its edge is dragged
+/// to: the width chosen, `Settings::right_dock_width`), from the next
+/// frame, where the window has the room.
+pub(crate) fn right_dock_width(h: &mut Harness<'_, Moonglow>, width: f32) {
+    h.state_mut().settings.right_dock_width = Some(width.round() as u32);
+}
+
+/// Where the Right Dock is drawn: from its inner edge to its outer edge,
+/// the Top Bar to the Status Bar. It must be shown.
+pub(crate) fn right_dock_rect(h: &Harness<'_, Moonglow>) -> egui::Rect {
+    h.state().right_dock_rect().expect("the Right Dock is shown")
+}
+
+/// Where the Left Dock is drawn: from its outer edge to its inner one
+/// (the line along it included), the Top Bar to the Status Bar. It must
+/// be shown.
+pub(crate) fn left_dock_rect(h: &Harness<'_, Moonglow>) -> egui::Rect {
+    h.state().left_dock_rect().expect("the Left Dock is shown")
+}
+
+/// The Left Dock `width` wide (its outer width, as its edge is dragged to:
+/// the width chosen, `Settings::left_dock_width`), from the next frame,
+/// where the window has the room.
+pub(crate) fn left_dock_width(h: &mut Harness<'_, Moonglow>, width: f32) {
+    h.state_mut().settings.left_dock_width = Some(width.round() as u32);
 }
 
 /// A scratch user folder for the game: `dir`'s `user`, with `subfolders`
@@ -105,10 +403,20 @@ pub(crate) fn gpu() -> Option<egui_wgpu::RenderState> {
         eprintln!("skipped: no GPU adapter");
         return None;
     }
-    Some(egui_kittest::wgpu::create_render_state(
-        mg_ui::graphics_setup(egui_kittest::wgpu::default_wgpu_setup()),
+    static BASE: std::sync::OnceLock<egui_wgpu::RenderState> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        egui_kittest::wgpu::create_render_state(
+            mg_ui::graphics_setup(egui_kittest::wgpu::default_wgpu_setup()),
+            egui_wgpu::RendererOptions::PREDICTABLE,
+        )
+    });
+    let mut rs = base.clone();
+    rs.renderer = std::sync::Arc::new(egui::epaint::mutex::RwLock::new(egui_wgpu::Renderer::new(
+        &rs.device,
+        rs.target_format,
         egui_wgpu::RendererOptions::PREDICTABLE,
-    ))
+    )));
+    Some(rs)
 }
 
 /// Whether this machine has a GPU adapter (CI's Linux runner has none):
@@ -123,6 +431,17 @@ pub(crate) fn adapter() -> bool {
     })
 }
 
+/// For a test whose assertions read the pixels `render` gives (kittest's
+/// own wgpu device): `true`, said, without a GPU adapter, and the test
+/// returns (`if no_adapter() { return; }`); CI's Linux runner has none.
+pub(crate) fn no_adapter() -> bool {
+    let none = !adapter();
+    if none {
+        eprintln!("skipped: no GPU adapter");
+    }
+    none
+}
+
 /// [`harness`] drawn on the GPU's render state `rs` (from [`gpu`], given
 /// to `app` too). Takes the GPU as well, so that no harness draws without
 /// it.
@@ -133,10 +452,7 @@ pub(crate) fn gpu_harness(
     height: f32,
 ) -> Harness<'static, Moonglow> {
     mg_testkit::gpu::hold();
-    Harness::builder()
-        .with_size(egui::vec2(width, height))
-        .renderer(egui_kittest::wgpu::WgpuTestRenderer::from_render_state(rs))
-        .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app)
+    build_harness(app, width, height, None, Some(rs))
 }
 
 /// [`gpu_harness`] for an area view: frames a 60th of a second apart, so
@@ -148,11 +464,7 @@ pub(crate) fn area_gpu_harness(
     height: f32,
 ) -> Harness<'static, Moonglow> {
     mg_testkit::gpu::hold();
-    Harness::builder()
-        .with_size(egui::vec2(width, height))
-        .with_step_dt(1.0 / 60.0)
-        .renderer(egui_kittest::wgpu::WgpuTestRenderer::from_render_state(rs))
-        .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app)
+    build_harness(app, width, height, Some(1.0 / 60.0), Some(rs))
 }
 
 /// What a key pressed with `modifiers` came to in its frame (pressed in
@@ -224,13 +536,36 @@ pub(crate) fn blueprint_harness(
     copy: &str,
     t: ResType,
 ) -> Option<(Harness<'static, Moonglow>, ResKey)> {
+    blueprint_harness_with(name, copy, t, None)
+}
+
+/// [`blueprint_harness`] with the game's user folder `user` (content in
+/// its override).
+pub(crate) fn blueprint_harness_with(
+    name: &str,
+    copy: &str,
+    t: ResType,
+    user: Option<std::path::PathBuf>,
+) -> Option<(Harness<'static, Moonglow>, ResKey)> {
+    blueprint_harness_in(Mode::Floating, name, copy, t, user)
+}
+
+/// [`blueprint_harness_with`] in `mode` (the editor a tab in As Tabs).
+pub(crate) fn blueprint_harness_in(
+    mode: Mode,
+    name: &str,
+    copy: &str,
+    t: ResType,
+    user: Option<std::path::PathBuf>,
+) -> Option<(Harness<'static, Moonglow>, ResKey)> {
     let Some(root) = mg_testkit::nwn_root() else {
         eprintln!("skipped: no game install");
         return None;
     };
-    let dir = mg_testkit::scratch_dir(&format!("ui-bp-{copy}"));
+    let dir = mg_testkit::scratch_dir(&crate::dialog_pattern::scratch(&format!("ui-bp-{copy}")));
     let path = sample_module(&dir);
-    let mut app = game_app(&root, None);
+    let mut app = game_app(&root, user);
+    put_in(&mut app, mode);
     app.open_module(&path);
     let game = app.game.as_deref().unwrap();
     let data = game.resman.get_named(name, t).unwrap().into_owned();
@@ -243,7 +578,7 @@ pub(crate) fn blueprint_harness(
     // The editor alone on screen (Module Properties, docked when the module
     // opened, and the palette would show beside its window).
     close_tab(&mut app, &Tab::ModuleProperties);
-    app.open_palette = false;
+    app.palette_dock = false;
     let h = harness(app, 1000.0, 800.0);
     Some((h, key))
 }
@@ -257,46 +592,1130 @@ pub(crate) fn filter_type(h: &mut Harness<'_, Moonglow>, text: &str) {
     h.run_steps(2);
 }
 
-/// The palette's types' icons, as its dropdown shows the one chosen.
-pub(crate) const PALETTE_TYPES: [&str; 11] =
-    ["🗻", "👤", "🚪", "⚔", "🗡", "⛲", "🔉", "💰", "⚡", "📍", "🗐"];
+/// The palette's types, by the names its row of icons and its dropdown
+/// give them.
+pub(crate) const PALETTE_TYPES: [&str; 13] = [
+    "Tiles",
+    "Creatures",
+    "Doors",
+    "Encounters",
+    "Items",
+    "Placeables",
+    "Sounds",
+    "Stores",
+    "Triggers",
+    "Waypoints",
+    "Prefabs",
+    "Lights",
+    "Start Location",
+];
 
-/// Chooses a type in the palette's header: its icon in the row of them,
-/// or, in a pane too narrow for the row, its name in the dropdown.
-pub(crate) fn palette_type(h: &mut Harness<'_, Moonglow>, glyph: &str, name: &str) {
-    if h.query_by_label(glyph).is_some() {
-        h.get_by_label(glyph).click();
+/// The palette's types as drawn: the row of their icons ("Palette
+/// types"), or under 300 points of panel (the Right Dock at its narrow
+/// 280, M3 T14) the dropdown showing the type's name; `None` where the
+/// palette is not drawn.
+pub(crate) fn palette_types<'t>(h: &'t Harness<'_, Moonglow>) -> Option<egui_kittest::Node<'t>> {
+    if let Some(row) = h.query_by_label("Palette types") {
+        return Some(row);
+    }
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    h.query_all(combo).find(|n| {
+        let value = n.accesskit_node().value().unwrap_or_default();
+        PALETTE_TYPES.contains(&value.as_str())
+    })
+}
+
+/// Chooses a type in the palette's header by its name: its icon in the
+/// row of them (a group of its own, "Palette types": the area toolbar
+/// names the kinds too), or, in a pane too narrow for the row, its name in
+/// the dropdown.
+pub(crate) fn palette_type(h: &mut Harness<'_, Moonglow>, name: &str) {
+    if let Some(row) = h.query_by_label("Palette types") {
+        row.get_by_label(name).click();
         return;
     }
     let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
     let is_type = |n: &egui_kittest::Node<'_>| {
         let value = n.accesskit_node().value().unwrap_or_default();
-        PALETTE_TYPES.iter().any(|glyph| value.starts_with(glyph))
+        PALETTE_TYPES.contains(&value.as_str())
     };
     h.query_all(combo).find(is_type).expect("the palette's type dropdown").click();
     settle(h);
-    // (The last of them are below the dropdown's edge until scrolled to.)
-    h.get_by_label(&format!("{glyph} {name}")).scroll_to_me();
+    // (The open list, named as the row is. The last of them are below
+    // the dropdown's edge until scrolled to.)
+    h.get_by_label("Palette types").get_by_label(name).scroll_to_me();
     settle(h);
-    h.get_by_label(&format!("{glyph} {name}")).click();
+    h.get_by_label("Palette types").get_by_label(name).click();
     settle(h);
+}
+
+/// The Top Bar's button `name` (found within it: the editors have a
+/// Save, an Undo, a Compile of their own).
+#[track_caller]
+pub(crate) fn tool<'t>(h: &'t Harness<'_, Moonglow>, name: &'t str) -> egui_kittest::Node<'t> {
+    h.get_by_label("Top Bar").get_by_label(name)
+}
+
+/// Chooses `row` in the Top Bar's menu `menu` ("View", "Go to Start
+/// Location"): the menu opened by its title, the row clicked (a button or
+/// a ticked row, named by its words, or by its words and its keys: of
+/// those that begin so, the shortest; not a bar's control of that name,
+/// the Log's switch say).
+#[track_caller]
+pub(crate) fn menu_command(h: &mut Harness<'_, Moonglow>, menu: &str, row: &str) {
+    h.get_by_label("Top Bar").get_by_label(menu).click();
+    settle(h);
+    let rect = menu_row(h, row).expect("the menu's row").1;
+    click_pos(h, rect.center());
+    settle(h);
+}
+
+/// The row `row` of the menu that is open ([`menu_command`]'s): its
+/// label and where it is.
+pub(crate) fn menu_row(h: &Harness<'_, Moonglow>, row: &str) -> Option<(String, egui::Rect)> {
+    use egui::accesskit::Role;
+    let keyed = format!("{row} ");
+    let is_row = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        matches!(n.role(), Role::Button | Role::CheckBox)
+            && n.label().is_some_and(|l| l == row || l.starts_with(&keyed))
+    };
+    let bars = ["Top Bar", "Status Bar", "Left Dock", mg_ui::RIGHT_DOCK, "Bottom Dock"];
+    h.query_all_by(is_row)
+        .filter(|n| !bars.iter().any(|b| in_group(n, b)))
+        .map(|n| (n.accesskit_node().label().unwrap_or_default(), n.rect()))
+        .min_by_key(|(l, _)| l.len())
+}
+
+/// The Module panel's header button `name` (today's toolbar's Properties
+/// and New Area), found within the Left Dock's tab bar.
+#[track_caller]
+pub(crate) fn module_tool<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    h.get_by_label("Left Dock").get_by_label(name)
+}
+
+/// The buttons `name` that are not the Top Bar's, the Module panel
+/// header's or the area view's (an editor's own Save, Undo or Compile, a
+/// dialog's Open, a page's Properties, the palette's Grass): the nodes of
+/// that name that have no "Top Bar", "Left Dock" or "Area header" group,
+/// nor one of the area header's popovers, above them.
+pub(crate) fn apart_all<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    name: &'t str,
+) -> impl Iterator<Item = egui_kittest::Node<'t>> {
+    h.query_all_by_label(name).filter(|n| !in_toolbar(n))
+}
+
+/// Whether `n` is in the group named `group` (`mg_uikit::name_group`).
+pub(crate) fn in_group(n: &egui_kittest::Node<'_>, group: &str) -> bool {
+    let mut up = n.accesskit_node().parent();
+    while let Some(p) = up {
+        if p.label().as_deref() == Some(group) {
+            return true;
+        }
+        up = p.parent();
+    }
+    false
+}
+
+/// Whether `n` is on the Top Bar, a dock's tab bar (the Left Dock's, with
+/// the Module panel's header buttons; the Right Dock's Palette and Preview
+/// tabs) or the area view's header, or in one of its popovers, or on the
+/// area view's tool shelf or by its compass.
+pub(crate) fn in_toolbar(n: &egui_kittest::Node<'_>) -> bool {
+    let mut up = n.accesskit_node().parent();
+    while let Some(p) = up {
+        let bars = [
+            "Top Bar",
+            "Left Dock",
+            AREA_HEADER,
+            "More in Area header",
+            "Lighting",
+            "Overlays",
+            "Audio",
+            "Brush",
+            AREA_TOOLS,
+            "More Tools",
+            "Compass",
+            mg_ui::RIGHT_DOCK,
+        ];
+        if p.label().is_some_and(|l| bars.contains(&l.as_str())) {
+            return true;
+        }
+        up = p.parent();
+    }
+    false
+}
+
+/// The one of them ([`apart_all`]): exactly one, as `get_by_label` asks,
+/// or it panics naming how many there are.
+#[track_caller]
+pub(crate) fn apart<'t>(h: &'t Harness<'_, Moonglow>, name: &'t str) -> egui_kittest::Node<'t> {
+    let mut found = apart_all(h, name);
+    let Some(first) = found.next() else { panic!("no {name} apart from the bars") };
+    let more = found.count();
+    assert!(more == 0, "{} named {name:?} apart from the toolbars, not one", more + 1);
+    first
+}
+
+/// That the editor header named `group` (`mg_uikit::header`) holds each
+/// of `names`, wherever it put them at this width: on the row (with its
+/// words, as an icon, a joined group's button, or a popover's rows
+/// unfolded into it), found there by its name within the header's group
+/// and drawn inside the row, clear of the end slot and More; or in More,
+/// found in its popover once More is opened and drawn inside it (More
+/// closed again with Escape). What the header cut (a row too narrow even
+/// with everything yielded) or never had fails, naming it. Each editor's
+/// narrowing test runs it at its least width (proposal section 6.1, M4's
+/// U1). Where two headers of the name are drawn, the first
+/// ([`header_holds_nth`]).
+#[track_caller]
+pub(crate) fn header_holds<S>(h: &mut Harness<'_, S>, group: &str, names: &[&str]) {
+    header_holds_nth(h, group, 0, names);
+}
+
+/// Runs frames until the window rests, as [`settle`] does for any state:
+/// a view with work of its own under way (a table's look read on a
+/// thread, which asks for frames until it is done) is waited for, not
+/// taken as never resting after kittest's four steps (the M4 U22 review's
+/// `the_table_header_holds_every_control_from_420_to_1600` under load).
+pub(crate) fn rest<S>(h: &mut Harness<'_, S>) {
+    let started = std::time::Instant::now();
+    loop {
+        match h.try_run() {
+            Ok(_) => return,
+            Err(e) if started.elapsed() > SETTLE_TIME => panic!("the UI keeps repainting: {e}"),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+}
+
+/// [`header_holds`] for the `nth` header named `group` (by where it is:
+/// top to bottom, then left to right; `mg_uikit::header::records`).
+#[track_caller]
+pub(crate) fn header_holds_nth<S>(h: &mut Harness<'_, S>, group: &str, nth: usize, names: &[&str]) {
+    use mg_uikit::header::{self, Place};
+    let record = |h: &Harness<'_, S>| {
+        let records = header::records(&h.ctx, group);
+        let count = records.len();
+        records.into_iter().nth(nth).unwrap_or_else(|| panic!("{count} headers named {group}"))
+    };
+    let rec = record(h);
+    // (AccessKit's boxes are in pixels, the header's record in points: at a
+    // larger text the one is compared with the other in points.)
+    let ppp = h.ctx.pixels_per_point();
+    let rect_of = |n: &egui_kittest::Node<'_>| -> egui::Rect {
+        let b = n.accesskit_node().bounding_box().expect("drawn");
+        egui::Rect::from_min_max(
+            egui::pos2(b.x0 as f32 / ppp, b.y0 as f32 / ppp),
+            egui::pos2(b.x1 as f32 / ppp, b.y1 as f32 / ppp),
+        )
+    };
+    let mut in_more = Vec::new();
+    let mut drawn: Vec<(String, egui::Rect)> = Vec::new();
+    for name in names {
+        let place = rec.places.iter().find(|(n, _)| n == name).map(|(_, p)| *p);
+        match place {
+            None => panic!("{name} is not in {group} ({:?})", rec.places),
+            Some(Place::Cut) => panic!("{name} is cut from {group}: the row is too narrow"),
+            Some(Place::More) => in_more.push(*name),
+            Some(Place::Row | Place::Icon | Place::Unfolded) => {
+                // (A popover unfolded into the row shows its rows and parts,
+                // not its button: each is checked by its own name.)
+                let rows = h.query_all_by_label(group).nth(nth);
+                let Some(row) = rows else { panic!("no group {group}") };
+                let mut shown: Vec<String> = Vec::new();
+                if row.query_by_label(name).is_some() {
+                    shown.push(name.to_string());
+                } else if place == Some(Place::Unfolded) {
+                    let after = rec.places.iter().skip_while(|(n, _)| n != name).skip(1);
+                    // (Up to the next item that is not a row: another
+                    // popover unfolded beside it has no node of its own.)
+                    let parts = after
+                        .take_while(|(_, p)| *p == Place::Unfolded)
+                        .filter(|(n, _)| row.query_by_label(n).is_some())
+                        .map(|(n, _)| n.clone());
+                    shown.extend(parts);
+                    assert!(!shown.is_empty(), "none of {name}'s rows is shown on {group}'s row");
+                } else {
+                    panic!("{name} is not shown on {group}'s row ({place:?})")
+                }
+                for part in shown {
+                    let r = rect_of(&row.get_by_label(&part));
+                    assert!(
+                        rec.row.expand(0.5).contains_rect(r),
+                        "{part} is drawn outside {group}'s row: {r:?} in {:?}",
+                        rec.row
+                    );
+                    for (what, other) in [("the end slot", rec.end), ("More", rec.more)] {
+                        if let Some(other) = other {
+                            assert!(
+                                !other.shrink(0.5).intersects(r),
+                                "{part} is drawn over {what} of {group}: {r:?} {other:?}"
+                            );
+                        }
+                    }
+                    if !drawn.iter().any(|(n, _)| *n == part) {
+                        drawn.push((part, r));
+                    }
+                }
+            }
+        }
+    }
+    // (Each drawn clear of the others: a part measured short overlaps the
+    // part after it, inside the row.)
+    for (i, (a, ra)) in drawn.iter().enumerate() {
+        for (b, rb) in &drawn[i + 1..] {
+            assert!(
+                !ra.shrink(0.5).intersects(rb.shrink(0.5)),
+                "{a} and {b} are drawn over each other on {group}'s row: {ra:?} {rb:?}"
+            );
+        }
+    }
+    if in_more.is_empty() {
+        return;
+    }
+    let more = header::more_name(group);
+    if record(h).open.as_deref() != Some(header::MORE) {
+        let rows = h.query_all_by_label(group).nth(nth).expect("its group");
+        rows.get_by_label(header::MORE).click();
+        rest(h);
+    }
+    let popover = record(h).popover.expect("More's popover drawn");
+    for name in &in_more {
+        let Some(node) = h.get_by_label(&more).query_by_label(name) else {
+            panic!("{name} is not in {group}'s More")
+        };
+        // (A long More scrolls: what is in it is reached by scrolling it
+        // into sight.)
+        if !popover.expand(0.5).contains_rect(rect_of(&node)) {
+            node.scroll_to_me();
+            rest(h);
+        }
+        // (A group, a segmented control's, is scrolled to by its first
+        // part: egui scrolls to widgets, not to a scope.)
+        let scrolled = {
+            let node = h.get_by_label(&more).get_by_label(name);
+            let outside = !popover.expand(0.5).contains_rect(rect_of(&node));
+            let first = node.query_all_by(|n| n.bounding_box().is_some()).next();
+            match (outside, first) {
+                (true, Some(first)) => {
+                    first.scroll_to_me();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if scrolled {
+            rest(h);
+        }
+        let node = h.get_by_label(&more).get_by_label(name);
+        let r = rect_of(&node);
+        assert!(
+            popover.expand(0.5).contains_rect(r),
+            "{name} is drawn outside {group}'s More: {r:?} in {popover:?}"
+        );
+    }
+    h.key_press(egui::Key::Escape);
+    rest(h);
+    assert!(h.query_by_label(&more).is_none(), "{group}'s More stayed open");
+}
+
+/// The area editor's header (`mg_uikit::header`, M4's U3): its group.
+pub(crate) const AREA_HEADER: &str = "Area header";
+/// The area view's tool shelf (M4's U4): its group (the board's "Tools",
+/// named apart from the Top Bar's Tools menu).
+pub(crate) const AREA_TOOLS: &str = "Area tools";
+
+/// The area header's popovers and menus by their names, each with the
+/// controls it holds (by their accessible names): the compact header's
+/// Show popover, the full header's All or None menu, Lighting, Overlays,
+/// Audio; and the unfolded row's Shadows and Walkmesh toggles, whose
+/// held menus hold the rows their popovers had.
+const AREA_HOLDERS: [(&str, &[&str]); 8] = [
+    (
+        "Show",
+        &[
+            "Show Creatures",
+            "Show Doors",
+            "Show Encounters",
+            "Show Items",
+            "Show Placeables",
+            "Show Sounds",
+            "Show Stores",
+            "Show Triggers",
+            "Show Waypoints",
+            "Show Start",
+            "All",
+            "None",
+        ],
+    ),
+    ("Show All or None", &["All", "None"]),
+    (
+        "Lighting",
+        &[
+            "Use the area's lighting",
+            "Sun and moon shadows",
+            "Creature shadows",
+            "Light shadows",
+            "Fast",
+            "High",
+            "Fog",
+            "Fade Geometry",
+            "Animations",
+            "Grass",
+            "Tile border",
+            "Shaders",
+        ],
+    ),
+    (
+        "Overlays",
+        &[
+            "Show overlays",
+            "Grid",
+            "Minimap",
+            "Ground walkmesh",
+            "Object walkmeshes",
+            "Sound ranges",
+        ],
+    ),
+    ("Audio", &["Play Sounds", "Ambient", "Music"]),
+    ("Shadows", &["Sun and moon shadows", "Creature shadows", "Light shadows", "Fast", "High"]),
+    ("Walkmesh", &["Ground walkmesh", "Object walkmeshes"]),
+    // (Paint's, while it is the tool in hand: the header's Snap and Turn
+    // stand in it then.)
+    (
+        "Brush",
+        &[
+            "Count all",
+            "Spacing",
+            "By size",
+            "Flow",
+            "Turn spread",
+            "Scale",
+            "Scale to",
+            "Gap",
+            "Height",
+            "Lock",
+            "Snap",
+            "Turn",
+        ],
+    ),
+];
+
+/// The node named `name` among the area header's controls: on its row,
+/// or in the popover or menu open from it (none opened for it); or on the
+/// view's tool shelf (or in its More Tools), or by its compass.
+pub(crate) fn area_tool_shown<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    name: &'t str,
+) -> Option<egui_kittest::Node<'t>> {
+    if let Some(n) = h.query_by_label(AREA_HEADER).and_then(|g| g.query_by_label(name)) {
+        return Some(n);
+    }
+    let holders = [
+        "More in Area header",
+        "Lighting",
+        "Overlays",
+        "Audio",
+        "Show",
+        "Brush",
+        AREA_TOOLS,
+        "More Tools",
+        "Compass",
+    ];
+    for holder in holders {
+        for group in h.query_all_by_label(holder) {
+            if let Some(n) = group.query_by_label(name) {
+                return Some(n);
+            }
+        }
+    }
+    // (A held menu's or the arrow's, an egui popup over everything:
+    // Shadows', Walkmesh's, All or None's rows, drawn last.)
+    let held = AREA_HOLDERS
+        .iter()
+        .filter(|(holder, _)| matches!(*holder, "Shadows" | "Walkmesh" | "Show All or None"));
+    if egui::Popup::is_any_open(&h.ctx) && held.into_iter().any(|(_, rows)| rows.contains(&name)) {
+        return h.query_all_by_label(name).last();
+    }
+    None
+}
+
+/// Opens what holds the area header's control `name` where it is not on
+/// the row (the popover that holds it, More, a held menu): by the
+/// header's record of where each of its items went.
+fn open_area_tool(h: &mut Harness<'_, Moonglow>, name: &str) {
+    use mg_uikit::header::{self, Place};
+    if area_tool_shown(h, name).is_some() {
+        return;
+    }
+    // (The shelf's tools that its More Tools holds, in a short view.)
+    let shelf = ["Select Objects", "Select Tiles", "Paint", "Terrain"];
+    if shelf.contains(&name) {
+        if let Some(more) =
+            h.query_by_label(AREA_TOOLS).and_then(|g| g.query_by_label("More Tools"))
+        {
+            more.click();
+            h.run_steps(3);
+        }
+        return;
+    }
+    let rec = header::records(&h.ctx, AREA_HEADER).into_iter().next().expect("the area header");
+    let place = |n: &str| rec.places.iter().find(|(p, _)| p == n).map(|(_, p)| *p);
+    let open_more = |h: &mut Harness<'_, Moonglow>| {
+        h.get_by_label(AREA_HEADER).get_by_label(header::MORE).click();
+        h.run_steps(3);
+    };
+    if place(name) == Some(Place::More) {
+        open_more(h);
+        return;
+    }
+    for (holder, rows) in AREA_HOLDERS {
+        // (The full header's Show is a joined group, not a popover: its
+        // All and None are the arrow's.)
+        let joined = holder == "Show" && place("Show All or None").is_some();
+        if !rows.contains(&name) || joined {
+            continue;
+        }
+        match place(holder) {
+            Some(Place::Row | Place::Icon) => {
+                h.get_by_label(AREA_HEADER).get_by_label(holder).click();
+            }
+            Some(Place::Unfolded) if holder == "Shadows" || holder == "Walkmesh" => {
+                h.get_by_label(AREA_HEADER).get_by_label(holder).click_secondary();
+            }
+            Some(Place::More) => {
+                open_more(h);
+                return;
+            }
+            _ => continue,
+        }
+        h.run_steps(3);
+        return;
+    }
+}
+
+/// The area header's control `name`: on its row (the header's group,
+/// "Area header"), or in the popover, More or held menu that holds it,
+/// which is opened for it. The objects' filters are "Show Creatures"…,
+/// "Show Start"; the switch that plays the placed sounds is "Play
+/// Sounds". What it opened stays open: [`area_click`] clicks and closes.
+#[track_caller]
+pub(crate) fn area_tool<'t>(
+    h: &'t mut Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    open_area_tool(h, name);
+    let h: &'t Harness<'_, Moonglow> = h;
+    match area_tool_shown(h, name) {
+        Some(n) => n,
+        None => {
+            let rec = mg_uikit::header::records(&h.ctx, AREA_HEADER);
+            let (places, open) = rec.first().map(|r| (r.places.clone(), r.open.clone())).unzip();
+            panic!("no {name} in the area header or what it opens: {places:?}, {open:?} open")
+        }
+    }
+}
+
+/// The script editor's header's control `name` (`mg_ui::SCRIPT_HEADER`,
+/// M4's U12): on its row, or in its More, which is opened for it where
+/// the header's record says it went there (left open: [`script_click`]
+/// clicks it, which closes More).
+#[track_caller]
+pub(crate) fn script_tool<'t>(
+    h: &'t mut Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    use mg_uikit::header::{self, Place};
+    let records = header::records(&h.ctx, mg_ui::SCRIPT_HEADER);
+    let rec = records.into_iter().next().expect("the script header");
+    let place = rec.places.iter().find(|(n, _)| n == name).map(|(_, p)| *p);
+    assert_eq!(header::more_name(mg_ui::SCRIPT_HEADER), SCRIPT_MORE);
+    if place == Some(Place::More) && h.query_by_label(SCRIPT_MORE).is_none() {
+        h.get_by_label(mg_ui::SCRIPT_HEADER).get_by_label(header::MORE).click();
+        h.run_steps(3);
+    }
+    let h: &'t Harness<'_, Moonglow> = h;
+    match place {
+        Some(Place::More) => h.get_by_label(SCRIPT_MORE).get_by_label(name),
+        Some(Place::Row | Place::Icon) => h.get_by_label(mg_ui::SCRIPT_HEADER).get_by_label(name),
+        other => panic!("{name} in the script header: {other:?} ({:?})", rec.places),
+    }
+}
+
+/// A conversation's lines as its outline: kind, text and whether a link.
+pub(crate) fn dialog_lines(h: &mut Harness<'_, Moonglow>, key: ResKey) -> Vec<String> {
+    let g = h.state_mut().ws.as_mut().unwrap().doc(&key).unwrap().clone();
+    mg_module::dialog::outline(&g)
+        .iter()
+        .map(|l| l.split('|').take(3).collect::<Vec<_>>().join("|"))
+        .collect()
+}
+
+/// The conversation editor's header's control `name`
+/// (`mg_ui::dialog_view::CONVERSATION_HEADER`, M4's U14): on its row, or
+/// in its More, which is opened for it where the header's record says it
+/// went there (left open: [`dialog_click`] clicks it, which closes More).
+/// Of the first conversation drawn where several are.
+#[track_caller]
+pub(crate) fn dialog_tool<'t>(
+    h: &'t mut Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    use mg_uikit::header::{self, Place};
+    let header_name = mg_ui::dialog_view::CONVERSATION_HEADER;
+    let records = header::records(&h.ctx, header_name);
+    let rec = records.into_iter().next().expect("the conversation header");
+    let place = rec.places.iter().find(|(n, _)| n == name).map(|(_, p)| *p);
+    // (A highlight's place is its group's.)
+    let place = place.or_else(|| {
+        let highlights = ["Comments", "Actions", "Quests", "Animations", "Sounds"];
+        let group = rec.places.iter().find(|(n, _)| n == "Highlight").map(|(_, p)| *p);
+        group.filter(|_| highlights.contains(&name))
+    });
+    assert_eq!(header::more_name(header_name), DIALOG_MORE);
+    if place == Some(Place::More) && h.query_by_label(DIALOG_MORE).is_none() {
+        h.get_by_label(header_name).get_by_label(header::MORE).click();
+        settle(h);
+    }
+    let h: &'t Harness<'_, Moonglow> = h;
+    match place {
+        Some(Place::More) => h.get_by_label(DIALOG_MORE).get_by_label(name),
+        Some(Place::Row | Place::Icon) => h.get_by_label(header_name).get_by_label(name),
+        other => panic!("{name} in the conversation header: {other:?} ({:?})", rec.places),
+    }
+}
+
+/// The tileset editor's header's control `name` (M4's U20, the kit's
+/// header `tileset_view::TILESET_HEADER`): a command (Save, Make Palette,
+/// Check, Render Minimap Pictures) or a page of its switch (General,
+/// Terrains and Crossers, Painting Rules, Tiles, Groups), wherever it is at
+/// this width: on the row, or in More, which is opened for it. The first
+/// tileset header's.
+#[track_caller]
+pub(crate) fn tileset_tool<'t>(
+    h: &'t mut Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    use mg_uikit::header::{self, Place};
+    let header_name = mg_ui::tileset_view::TILESET_HEADER;
+    let rec = header::records(&h.ctx, header_name).into_iter().next().expect("a tileset header");
+    let pages = ["General", "Terrains and Crossers", "Painting Rules", "Tiles", "Groups"];
+    let item = if pages.contains(&name) { mg_ui::tileset_view::PAGE } else { name };
+    let place = rec.places.iter().find(|(n, _)| n == item).map(|(_, p)| *p);
+    let more = header::more_name(header_name);
+    if place == Some(Place::More) && h.query_by_label(&more).is_none() {
+        h.get_by_label(header_name).get_by_label(header::MORE).click();
+        settle(h);
+    }
+    let h: &'t Harness<'_, Moonglow> = h;
+    match place {
+        Some(Place::More) => h.get_by_label(TILESET_MORE).get_by_label(name),
+        Some(Place::Row | Place::Icon) => h.get_by_label(header_name).get_by_label(name),
+        other => panic!("{name} in the tileset header: {other:?} ({:?})", rec.places),
+    }
+}
+
+/// What Problems holds of the tileset file at `path` (M4's U20): its last
+/// Check's findings, errors first.
+#[track_caller]
+pub(crate) fn tileset_problems(
+    h: &Harness<'_, Moonglow>,
+    path: &std::path::Path,
+) -> Vec<mg_ui::problems::Problem> {
+    let source = mg_ui::problems::Source::Tileset(path.to_path_buf());
+    h.state().problems.of(&source).expect("the tileset was checked").problems.clone()
+}
+
+/// What Problems holds of Build Module's last build (M4's U28, the owner's
+/// Q4), each as its row says it: "Error: mg_bad.nss, …", "Warning:
+/// hello.nss, Unused (source and compiled)" (none: not built).
+#[track_caller]
+pub(crate) fn build_results(h: &Harness<'_, Moonglow>) -> Vec<String> {
+    problem_rows(h, &mg_ui::problems::Source::Build)
+}
+
+/// The Log in front of the Bottom Dock, by its switch where another panel
+/// is (Verify brings Problems to the front: M4's U28).
+pub(crate) fn log_in_front(h: &mut Harness<'_, Moonglow>) {
+    if h.state().bottom_dock_shows() != Some(mg_ui::Panel::Log) {
+        h.get_by_label("Status Bar").get_by_label("Log").click();
+        h.run();
+    }
+}
+
+/// The Bottom Dock made `high` points high, as its edge dragged would
+/// (a form over a list needs more than the default's room for its rows).
+pub(crate) fn dock_high(h: &mut Harness<'_, Moonglow>, high: u32) {
+    h.state_mut().settings.bottom_dock_height = Some(high);
+    h.run();
+}
+
+/// The first node named `label` drawn in the Bottom Dock (M4's U28: its
+/// tabs' bodies are not inside the dock's own node, so it is found by
+/// where it is drawn), failing where none is.
+#[track_caller]
+pub(crate) fn in_dock<'t>(h: &'t Harness<'_, Moonglow>, label: &'t str) -> egui_kittest::Node<'t> {
+    let dock = h.state().bottom_dock_rect().expect("the Bottom Dock open");
+    h.get_all_by_label(label)
+        .find(|n| n.accesskit_node().bounding_box().is_some() && dock.contains_rect(n.rect()))
+        .unwrap_or_else(|| panic!("{label} in the Bottom Dock {dock:?}"))
+}
+
+/// What Problems holds of `source`, each as its row's accessible name.
+#[track_caller]
+pub(crate) fn problem_rows(
+    h: &Harness<'_, Moonglow>,
+    source: &mg_ui::problems::Source,
+) -> Vec<String> {
+    let Some(set) = h.state().problems.of(source) else { return Vec::new() };
+    (set.problems.iter()).map(mg_ui::problems::row_name).collect()
+}
+
+/// The 2DA editor's header's control `name` (M4's U16, the kit's header
+/// `table_view::TABLE_HEADER`), wherever it is at this width: on the row
+/// (a joined group's toggle, "How cells show"'s, by its own name), or in
+/// More, which is opened for it. The first table header's (or `nth`'s:
+/// [`table_tool_nth`]).
+#[track_caller]
+pub(crate) fn table_tool<'t>(
+    h: &'t mut Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    table_tool_nth(h, 0, name)
+}
+
+/// [`table_tool`] for the `nth` table header (two tables side by side).
+#[track_caller]
+pub(crate) fn table_tool_nth<'t>(
+    h: &'t mut Harness<'_, Moonglow>,
+    nth: usize,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    use mg_uikit::header::{self, Place};
+    let header_name = mg_ui::table_view::TABLE_HEADER;
+    let records = header::records(&h.ctx, header_name);
+    let count = records.len();
+    let rec = records.into_iter().nth(nth).unwrap_or_else(|| panic!("{count} table headers"));
+    let place = rec.places.iter().find(|(n, _)| n == name).map(|(_, p)| *p);
+    // (A toggle of "How cells show" is in its group's place.)
+    let how = [mg_ui::table_view::VALUES_AS_NAMES, mg_ui::table_view::STRINGS_AS_TEXT];
+    let place = place.or_else(|| {
+        let group = rec.places.iter().find(|(n, _)| n == mg_ui::table_view::HOW_CELLS_SHOW);
+        group.map(|(_, p)| *p).filter(|_| how.contains(&name))
+    });
+    let more = header::more_name(header_name);
+    if place == Some(Place::More) && h.query_by_label(&more).is_none() {
+        let headers = h.query_all_by_label(header_name).nth(nth).expect("the table header");
+        headers.get_by_label(header::MORE).click();
+        settle(h);
+    }
+    let h: &'t Harness<'_, Moonglow> = h;
+    match place {
+        Some(Place::More) => h.get_by_label(TABLE_MORE).get_by_label(name),
+        Some(Place::Row | Place::Icon) => {
+            h.query_all_by_label(header_name).nth(nth).expect("the table header").get_by_label(name)
+        }
+        other => panic!("{name} in the table header: {other:?} ({:?})", rec.places),
+    }
+}
+
+/// How many table headers hold `name` (on the row or in More: where it
+/// is at their width), as their records say; only the headers drawn now
+/// count (the kit keeps the records of the last pass that drew one): with
+/// none drawn, it fails.
+#[track_caller]
+pub(crate) fn table_headers_with(h: &Harness<'_, Moonglow>, name: &str) -> usize {
+    use mg_uikit::header::{self, Place};
+    let drawn = h.query_all_by_label(mg_ui::table_view::TABLE_HEADER).count();
+    assert!(drawn > 0, "no table header drawn now");
+    let records = header::records(&h.ctx, mg_ui::table_view::TABLE_HEADER);
+    let held =
+        |r: &header::HeaderRecord| r.places.iter().any(|(n, p)| n == name && *p != Place::Cut);
+    records.iter().take(drawn).filter(|r| held(r)).count()
+}
+
+/// The Cell panel's Value field (M4's U16): the text input named so, not
+/// its label.
+#[track_caller]
+pub(crate) fn cell_value<'t>(h: &'t Harness<'_, Moonglow>) -> egui_kittest::Node<'t> {
+    let mut found = h
+        .query_all_by_label("Value")
+        .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::TextInput);
+    let first = found.next().expect("the Cell panel's Value");
+    assert!(found.next().is_none(), "one Value field");
+    first
+}
+
+/// A table's column's name `label` over its grid (or a read-only view's),
+/// not its row in the Outliner (M4's U16: the Outliner lists the columns).
+#[track_caller]
+pub(crate) fn column_name<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    label: &'t str,
+) -> egui_kittest::Node<'t> {
+    let mut found = h.query_all_by_label(label).filter(|n| !in_group(n, mg_ui::OUTLINER));
+    let first = found.next().unwrap_or_else(|| panic!("no column {label} over the grid"));
+    assert!(found.next().is_none(), "one column {label} over the grid");
+    first
+}
+
+/// A cell of the grid showing `text` (a Label of the grid's, not a field
+/// or a choice of the Cell panel's).
+#[track_caller]
+pub(crate) fn grid_cell<'t>(h: &'t Harness<'_, Moonglow>, text: &'t str) -> egui_kittest::Node<'t> {
+    let mut found = h
+        .query_all_by_label(text)
+        .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Label)
+        .filter(|n| !in_group(n, mg_ui::OUTLINER));
+    found.next().unwrap_or_else(|| panic!("no cell {text}"))
+}
+
+/// The Cell panel's row of a list's or flags' choice `name` (its check box
+/// or radio button, not a cell of the grid showing the same name).
+#[track_caller]
+pub(crate) fn choice<'t>(h: &'t Harness<'_, Moonglow>, name: &'t str) -> egui_kittest::Node<'t> {
+    use egui::accesskit::Role;
+    let mut found = h
+        .query_all_by_label(name)
+        .filter(|n| matches!(n.accesskit_node().role(), Role::CheckBox | Role::RadioButton));
+    found.next().unwrap_or_else(|| panic!("no choice {name}"))
+}
+
+/// The table header's More's popover.
+pub(crate) const TABLE_MORE: &str = "More in 2DA table header";
+/// The tileset editor's header's More's popover (M4's U20).
+pub(crate) const TILESET_MORE: &str = "More in Tileset header";
+
+/// Clicks the table header's control `name` ([`table_tool`]: through More
+/// where it is there) and runs the frames that follow.
+#[track_caller]
+pub(crate) fn table_click(h: &mut Harness<'_, Moonglow>, name: &str) {
+    table_tool(h, name).click();
+    settle(h);
+}
+
+/// The conversation header's More's popover.
+pub(crate) const DIALOG_MORE: &str = "More in Conversation header";
+
+/// Clicks the conversation header's control `name` ([`dialog_tool`]:
+/// through More where it is there) and runs the frames that follow.
+#[track_caller]
+pub(crate) fn dialog_click(h: &mut Harness<'_, Moonglow>, name: &str) {
+    dialog_tool(h, name).click();
+    settle(h);
+}
+
+/// The talk table header's More's popover (M4's U17).
+pub(crate) const TALK_MORE: &str = "More in Talk table header";
+
+/// The talk table header's control `name` (M4's U17, the kit's header
+/// `talk_view::TALK_HEADER`), wherever it is at this width: on the row, or
+/// in More, which is opened for it. The first talk table header's (or
+/// `nth`'s: two side by side).
+#[track_caller]
+pub(crate) fn talk_tool<'t>(
+    h: &'t mut Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    talk_tool_nth(h, 0, name)
+}
+
+/// [`talk_tool`] for the `nth` talk table header.
+#[track_caller]
+pub(crate) fn talk_tool_nth<'t>(
+    h: &'t mut Harness<'_, Moonglow>,
+    nth: usize,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    use mg_uikit::header::{self, Place};
+    let header_name = mg_ui::talk_view::TALK_HEADER;
+    let records = header::records(&h.ctx, header_name);
+    let count = records.len();
+    let rec = records.into_iter().nth(nth).unwrap_or_else(|| panic!("{count} talk headers"));
+    let place = rec.places.iter().find(|(n, _)| n == name).map(|(_, p)| *p);
+    assert_eq!(header::more_name(header_name), TALK_MORE);
+    if place == Some(Place::More) && h.query_by_label(TALK_MORE).is_none() {
+        let headers = h.query_all_by_label(header_name).nth(nth).expect("the talk header");
+        headers.get_by_label(header::MORE).click();
+        settle(h);
+    }
+    let h: &'t Harness<'_, Moonglow> = h;
+    match place {
+        Some(Place::More) => h.get_by_label(TALK_MORE).get_by_label(name),
+        Some(Place::Row | Place::Icon) => {
+            h.query_all_by_label(header_name).nth(nth).expect("the talk header").get_by_label(name)
+        }
+        other => panic!("{name} in the talk header: {other:?} ({:?})", rec.places),
+    }
+}
+
+/// Clicks the talk table header's control `name` ([`talk_tool`]: through
+/// More where it is there) and runs the frames that follow.
+#[track_caller]
+pub(crate) fn talk_click(h: &mut Harness<'_, Moonglow>, name: &str) {
+    talk_tool(h, name).click();
+    settle(h);
+    // (A toggle's check row leaves More open: closed, as a click elsewhere
+    // would close it, taking that click.)
+    if h.query_by_label(TALK_MORE).is_some() {
+        h.key_press(egui::Key::Escape);
+        settle(h);
+    }
+}
+
+/// How many talk table headers hold `name` (on the row or in More), as
+/// their records say; only the headers drawn now count: with none drawn,
+/// it fails.
+#[track_caller]
+pub(crate) fn talk_headers_with(h: &Harness<'_, Moonglow>, name: &str) -> usize {
+    use mg_uikit::header::{self, Place};
+    let drawn = h.query_all_by_label(mg_ui::talk_view::TALK_HEADER).count();
+    assert!(drawn > 0, "no talk header drawn now");
+    let records = header::records(&h.ctx, mg_ui::talk_view::TALK_HEADER);
+    let held =
+        |r: &header::HeaderRecord| r.places.iter().any(|(n, p)| n == name && *p != Place::Cut);
+    records.iter().take(drawn).filter(|r| held(r)).count()
+}
+
+/// The talk table header's Export's row `row` ("Export CSV…", "Export
+/// JSON…") clicked: Export's menu opened on the row, or its rows in More.
+#[track_caller]
+pub(crate) fn talk_export(h: &mut Harness<'_, Moonglow>, row: &str) {
+    use mg_uikit::header::{self, Place};
+    let records = header::records(&h.ctx, mg_ui::talk_view::TALK_HEADER);
+    let rec = records.into_iter().next().expect("the talk header");
+    let place = rec.places.iter().find(|(n, _)| n == "Export").map(|(_, p)| *p);
+    match place {
+        Some(Place::More) => {
+            talk_tool(h, "Export");
+            h.get_by_label(TALK_MORE).get_by_label(row).click();
+        }
+        _ => {
+            talk_tool(h, "Export").click();
+            settle(h);
+            h.get_by_label(row).click();
+        }
+    }
+    settle(h);
+}
+
+/// The String panel's field named `name` ("Text", "Feminine", "Sound"): the
+/// text input, not its label (M4's U17).
+#[track_caller]
+pub(crate) fn string_field<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    use egui::accesskit::Role;
+    let mut found = h.query_all_by_label(name).filter(|n| {
+        matches!(n.accesskit_node().role(), Role::TextInput | Role::MultilineTextInput)
+    });
+    found.next().unwrap_or_else(|| panic!("no field {name} in String"))
+}
+
+/// The control `name` of a conversation's Data under its section's
+/// heading `heading` (M4's U14: Text Appears When… and Actions Taken each
+/// have a Script, Add Set and the rest): the first of the name below the
+/// heading and above the next heading of those two.
+#[track_caller]
+pub(crate) fn in_section<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    heading: &str,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    let headings = ["Text Appears When…", "Actions Taken", "Other Actions"];
+    let top = |label: &str| {
+        let mut all = h.query_all_by_label(label);
+        all.find(|n| n.accesskit_node().role() == egui::accesskit::Role::Label)
+            .map(|n| n.rect().top())
+    };
+    let from = top(heading).expect("the section's heading");
+    let to = (headings.iter().filter_map(|l| top(l)))
+        .filter(|y| *y > from + 1.0)
+        .fold(f32::INFINITY, f32::min);
+    let mut all = h.get_all_by_label(name);
+    all.find(|n| n.rect().center().y > from && n.rect().center().y < to)
+        .unwrap_or_else(|| panic!("{name} under {heading}"))
+}
+
+/// The row `name` of a script's Reference panel's list (M4's U12), in
+/// the Right Dock or in the script's window's right pane: by its group,
+/// apart from a header's button or a tab of the same name.
+#[track_caller]
+pub(crate) fn reference_row<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    h.get_by_label(mg_ui::SCRIPT_REFERENCE).get_by_label(name)
+}
+
+/// The script header's More's popover (`mg_uikit::header::more_name`).
+pub(crate) const SCRIPT_MORE: &str = "More in Script header";
+
+/// Clicks the script header's control `name` ([`script_tool`]: through
+/// More where it is there) and runs the frames that follow.
+#[track_caller]
+pub(crate) fn script_click(h: &mut Harness<'_, Moonglow>, name: &str) {
+    script_tool(h, name).click();
+    h.run_steps(3);
+}
+
+/// The palette's More (its rarer commands), not the area header's.
+#[track_caller]
+pub(crate) fn palette_more<'t>(h: &'t Harness<'_, Moonglow>) -> egui_kittest::Node<'t> {
+    let mut found = h.query_all_by_label("More").filter(|n| !in_group(n, AREA_HEADER));
+    found.next().expect("the palette's More")
+}
+
+/// Clicks the area header's control `name` ([`area_tool`]), runs the
+/// frames that follow, and closes what was opened for it.
+#[track_caller]
+pub(crate) fn area_click(h: &mut Harness<'_, Moonglow>, name: &str) {
+    area_tool(h, name).click();
+    h.run_steps(3);
+    close_area_popover(h);
+}
+
+/// Closes the area header's open popover or More (by its button), or a
+/// held menu (Escape), where one is open.
+pub(crate) fn close_area_popover(h: &mut Harness<'_, Moonglow>) {
+    use mg_uikit::header;
+    let rec = header::records(&h.ctx, AREA_HEADER).into_iter().next();
+    if let Some(open) = rec.and_then(|r| r.open) {
+        h.get_by_label(AREA_HEADER).get_by_label(&open).click();
+        h.run_steps(3);
+    }
+    if egui::Popup::is_any_open(&h.ctx) {
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+    }
+}
+
+/// The tooltip shown with the pointer at `rect`'s middle: the words of
+/// what appears there (the nodes that were not there before), or `None`
+/// if nothing appears in a second and a half of frames (a tip waits a
+/// moment; on a busy machine the same moment is more frames, so the wait
+/// is long for an absent tip and short for a present one). What appears
+/// inside the Status Bar is not a tip: its hints follow the pointer.
+pub(crate) fn tip_at(h: &mut Harness<'_, Moonglow>, rect: egui::Rect) -> Option<String> {
+    use std::collections::HashMap;
+    fn words(h: &Harness<'_, Moonglow>) -> HashMap<String, usize> {
+        let mut out = HashMap::new();
+        let bar: std::collections::HashSet<_> = (h.query_by_label("Status Bar"))
+            .map(|b| b.query_all_by(|_| true).map(|n| n.accesskit_node().id()).collect())
+            .unwrap_or_default();
+        for n in h.query_all_by(|n| n.bounding_box().is_some()) {
+            if bar.contains(&n.accesskit_node().id()) {
+                continue;
+            }
+            let a = n.accesskit_node();
+            let text = a.label().or(a.value()).unwrap_or_default();
+            if !text.trim().is_empty() {
+                *out.entry(text).or_default() += 1;
+            }
+        }
+        out
+    }
+    // (Away first, so that a tip shown before is gone.)
+    h.hover_at(egui::pos2(1.0, 1.0));
+    h.run_steps(2);
+    let before = words(h);
+    h.hover_at(rect.center());
+    for _ in 0..90 {
+        h.run_steps(1);
+        let now = words(h);
+        let mut new: Vec<String> = (now.into_iter())
+            .filter(|(t, n)| *n > before.get(t).copied().unwrap_or(0))
+            .map(|(t, _)| t)
+            .collect();
+        if !new.is_empty() {
+            new.sort();
+            return Some(new.join("\n"));
+        }
+    }
+    None
+}
+
+/// Whether the icon `icon` is drawn inside `rect` in the last frame (the
+/// harness records them: `mg_uikit::record_icons`, set up by [`harness`]).
+pub(crate) fn icon_drawn(
+    h: &Harness<'_, Moonglow>,
+    icon: mg_uikit::Icon,
+    rect: egui::Rect,
+) -> bool {
+    mg_uikit::icons_drawn(&h.ctx)
+        .iter()
+        .any(|(i, r)| *i == icon && rect.expand(1.0).contains_rect(*r))
+}
+
+/// The module tree's Filter's accessible name (it says "Filter" while
+/// empty, as a dropdown's does).
+pub(crate) const TREE_FILTER: &str = "Filter Module Tree";
+
+/// Whether `n` is a dropdown's or a list's Filter field (its placeholder
+/// "Filter"), not the module tree's (which says the same, named
+/// [`TREE_FILTER`]).
+pub(crate) fn list_filter(n: &egui_kittest::kittest::AccessKitNode<'_>) -> bool {
+    n.placeholder() == Some("Filter") && n.label().as_deref() != Some(TREE_FILTER)
+}
+
+/// Whether `n` is the module tree's Filter field.
+pub(crate) fn tree_filter(n: &egui_kittest::kittest::AccessKitNode<'_>) -> bool {
+    n.label().as_deref() == Some(TREE_FILTER)
+}
+
+/// Types `text` into the module tree's Filter, and waits for what it shows.
+pub(crate) fn type_into_tree_filter(h: &mut Harness<'_, Moonglow>, text: &str) {
+    h.get(egui_kittest::kittest::by().predicate(tree_filter)).click();
+    settle(h);
+    h.get(egui_kittest::kittest::by().predicate(tree_filter)).type_text(text);
+    settle(h);
+}
+
+/// The module tree's row `label` (a resource's, a group's "Areas (1)",
+/// Module Properties: not the Module panel header's button of that name).
+#[track_caller]
+pub(crate) fn tree_row<'t>(h: &'t Harness<'_, Moonglow>, label: &'t str) -> egui_kittest::Node<'t> {
+    h.get_by_label("Module Tree Rows").get_by_label(label)
+}
+
+/// A document tab of the editor area by its name (its title, with no mark
+/// of unsaved changes): a node of role Tab, where a tree row or a field
+/// may have the same name.
+pub(crate) fn doc_tab<'t>(h: &'t Harness<'_, Moonglow>, name: &'t str) -> egui_kittest::Node<'t> {
+    h.get_by_role_and_label(egui::accesskit::Role::Tab, name)
 }
 
 /// Types into the text field with placeholder `hint` (a live filter), and
 /// waits for what it shows ([`settle`]: a gallery's pictures, made a few
-/// milliseconds' worth a frame).
+/// milliseconds' worth a frame). A "Filter" is a dropdown's or a list's,
+/// not the module tree's ([`type_into_tree_filter`]).
 pub(crate) fn type_into_hint(h: &mut Harness<'_, Moonglow>, hint: &str, text: &str) {
-    // ("Find" is a list's search: the palette's says what it looks in.)
-    let palette = "🔍 Search name, tag, resref";
+    // ("Find" is a list's search: the palette's says what it looks in.
+    // A search field's glass is drawn, not in its hint.)
+    let palette = "Search name, tag, resref";
     let has = |h: &Harness<'_, Moonglow>, hint: &str| {
         let by = |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some(hint);
         h.query_all(egui_kittest::kittest::by().predicate(by)).next().is_some()
     };
-    let hint = if hint == "Find" && !has(h, hint) { palette } else { hint };
-    let by_hint = |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some(hint);
-    h.get(egui_kittest::kittest::by().predicate(by_hint)).click();
+    let hint = if !has(h, hint) && hint == "Find" { palette } else { hint };
+    let by_hint = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.placeholder() == Some(hint) && (hint != "Filter" || list_filter(n))
+    };
+    // (The first: a form's pages on one scroll show several, the page at
+    // the top first.)
+    let first = |h: &'_ Harness<'_, Moonglow>| {
+        let found = h.query_all(egui_kittest::kittest::by().predicate(by_hint)).next();
+        found.unwrap_or_else(|| panic!("no field with the hint {hint}")).accesskit_node().id()
+    };
+    let id = first(h);
+    h.get(egui_kittest::kittest::by().predicate(|n| n.id() == id)).click();
     settle(h);
-    h.get(egui_kittest::kittest::by().predicate(by_hint)).type_text(text);
+    h.get(egui_kittest::kittest::by().predicate(|n| n.id() == id)).type_text(text);
     settle(h);
 }
 
@@ -306,6 +1725,26 @@ pub(crate) const ANIMATIONS: (&str, &str, &str, &str) =
 /// How long [`settle`] waits for the window to settle: far longer than
 /// any of its work takes on a busy machine, short of a test that hangs.
 pub(crate) const SETTLE_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The Area Wizard taken `pages` pages on, each by its Next button.
+pub(crate) fn area_wizard_next(h: &mut Harness<'_, Moonglow>, pages: usize) {
+    for _ in 0..pages {
+        h.get_by_label("Next >").scroll_to_me();
+        settle(h);
+        h.get_by_label("Next >").click();
+        settle(h);
+    }
+}
+
+/// The Area Wizard on its Size page taken to its last and finished.
+pub(crate) fn area_wizard_finish(h: &mut Harness<'_, Moonglow>) {
+    area_wizard_next(h, 1);
+    // (The step list has a Finish too: the button by its role.)
+    let role = egui::accesskit::Role::Button;
+    h.get_by_role_and_label(role, "Finish").scroll_to_me();
+    settle(h);
+    h.get_by_role_and_label(role, "Finish").click();
+}
 
 /// Frames until the UI stops asking for more and the window's own work is
 /// done ([`Moonglow::under_way`]: a gallery makes its pictures a few
@@ -350,6 +1789,62 @@ pub(crate) fn module_gff(h: &mut Harness<'_, Moonglow>, name: &str, t: ResType) 
     ws.module.gff(&key).map(|g| g.unwrap())
 }
 
+/// The Left Dock's upper panel (the module tree) as tall as the Outliner
+/// under it lets it be (its least), in a window 300 points taller: for the
+/// module tree's tests with an area in front, written while the tree had
+/// the whole dock (M3's T13 split it, the Module panel 496 points tall at
+/// first): the tree as tall as it was, its Areas group's well too.
+pub(crate) fn tall_tree(h: &mut Harness<'_, Moonglow>) {
+    let size = h.ctx.content_rect().size();
+    h.set_size(size + egui::vec2(0.0, 300.0));
+    h.state_mut().settings.module_panel_height = Some(10_000);
+    // (Until the seam has come down and rests there: the Outliner's
+    // header in the same place three frames running, lower than it was;
+    // or there is no Outliner.)
+    let header = |h: &Harness<'_, Moonglow>| {
+        (h.query_by_label(mg_ui::OUTLINER))
+            .and_then(|o| o.query_by_label("Collapse All").map(|b| b.rect().center().y))
+    };
+    let was = header(h);
+    let (mut last, mut same) = (was, 0);
+    let started = std::time::Instant::now();
+    loop {
+        h.step();
+        let now = header(h);
+        same = if now == last { same + 1 } else { 0 };
+        last = now;
+        let lower = match (was, now) {
+            (Some(was), Some(now)) => now > was,
+            _ => true,
+        };
+        if lower && same >= 3 {
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 10, "never: the tree as tall as it can be");
+    }
+}
+
+/// Module Properties docked in front of the area (opened again As Tabs):
+/// the Outliner not shown, the module tree following the area's
+/// selection as it does without it (the owner's ruling of 2026-11-14:
+/// while the Outliner shows, the tree stops following the selection). The
+/// area's view keeps its selection, which tests then set.
+pub(crate) fn outliner_away(h: &mut Harness<'_, Moonglow>) {
+    h.state_mut().settings.open_editors = mg_ui::OpenEditors::Tabs;
+    h.state_mut().actions.push(mg_ui::Action::CloseTabs(vec![Tab::ModuleProperties]));
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::ModuleProperties));
+    let started = std::time::Instant::now();
+    while h.state().active_editor() != Some(&Tab::ModuleProperties)
+        || h.query_by_label(mg_ui::OUTLINER).is_some()
+    {
+        assert!(started.elapsed().as_secs() < 10, "never: Module Properties in front");
+        h.step();
+    }
+}
+
+/// The width of [`area_harness`]'s window.
+pub(crate) const AREA_HARNESS_WIDTH: f32 = 1160.0;
+
 /// A module with a 4 by 4 rural area holding two waypoints, at (20, 20)
 /// and (30, 20), with the game's data and a GPU (`None` without either).
 pub(crate) fn area_harness(name: &str) -> Option<(Harness<'static, Moonglow>, ResRef)> {
@@ -365,8 +1860,12 @@ pub(crate) fn area_harness_on(
 ) -> Option<(Harness<'static, Moonglow>, ResRef)> {
     // (A look test on a builder's content: an area with room for its
     // groups.)
-    let side = std::env::var("MG_TEST_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-    area_harness_sized(name, tileset, tile, side)
+    area_harness_sized(name, tileset, tile, test_area_side())
+}
+
+/// The area's side in tiles: 4, or `MG_TEST_SIZE`.
+fn test_area_side() -> u32 {
+    std::env::var("MG_TEST_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(4)
 }
 
 /// [`area_harness_on`] with an area `side` tiles each way.
@@ -394,7 +1893,48 @@ pub(crate) fn area_harness_with(
     prepare: &dyn Fn(&mut mg_module::Module, &mg_rules::GameData, ResRef),
 ) -> Option<(Harness<'static, Moonglow>, ResRef)> {
     let (app, rs, area) = area_app(name, tileset, tile, side, user, prepare)?;
-    let mut h = area_gpu_harness(app, rs, 1100.0, 800.0);
+    // (1160 wide: the area's view as wide as it was at 1100 with the
+    // palettes' pane in the editor area, now that they are the Right
+    // Dock's 320 points beside it, M3 T5.)
+    let mut h = area_gpu_harness(app, rs, AREA_HARNESS_WIDTH, 800.0);
+    h.run_steps(3);
+    Some((h, area))
+}
+
+/// Non-GPU counterpart of [`area_app`] returning `(app, area)` without taking the GPU lock.
+pub(crate) fn area_ui_app(
+    name: &str,
+    tileset: &str,
+    tile: Option<i32>,
+    side: u32,
+    user: Option<std::path::PathBuf>,
+    prepare: &dyn Fn(&mut mg_module::Module, &mg_rules::GameData, ResRef),
+) -> Option<(Moonglow, ResRef)> {
+    let (app, _, area) = area_app_with(name, tileset, tile, side, user, false, prepare)?;
+    Some((app, area))
+}
+
+/// Pure-UI area harness (no GPU device or `gpu::hold()`), rendering UI panels,
+/// docks, toolbars, and forms without a 3D viewport.
+pub(crate) fn area_ui_harness(name: &str) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    // (As `area_harness_on`: `MG_TEST_SIZE` and `MG_TEST_USER`, for a look test on a builder's
+    // content.)
+    let side = test_area_side();
+    let user = std::env::var_os("MG_TEST_USER").map(std::path::PathBuf::from);
+    area_ui_harness_with(name, "ttr01", None, side, user, &|_, _, _| {})
+}
+
+/// [`area_ui_harness`] with custom tileset, tile, size, user dir, and module setup.
+pub(crate) fn area_ui_harness_with(
+    name: &str,
+    tileset: &str,
+    tile: Option<i32>,
+    side: u32,
+    user: Option<std::path::PathBuf>,
+    prepare: &dyn Fn(&mut mg_module::Module, &mg_rules::GameData, ResRef),
+) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    let (app, area) = area_ui_app(name, tileset, tile, side, user, prepare)?;
+    let mut h = build_harness(app, AREA_HARNESS_WIDTH, 800.0, Some(1.0 / 60.0), None);
     h.run_steps(3);
     Some((h, area))
 }
@@ -410,49 +1950,80 @@ pub(crate) fn area_app(
     user: Option<std::path::PathBuf>,
     prepare: &dyn Fn(&mut mg_module::Module, &mg_rules::GameData, ResRef),
 ) -> Option<(Moonglow, egui_wgpu::RenderState, ResRef)> {
+    let (app, rs, area) = area_app_with(name, tileset, tile, side, user, true, prepare)?;
+    Some((app, rs?, area))
+}
+
+fn area_app_with(
+    name: &str,
+    tileset: &str,
+    tile: Option<i32>,
+    side: u32,
+    user: Option<std::path::PathBuf>,
+    with_gpu: bool,
+    prepare: &dyn Fn(&mut mg_module::Module, &mg_rules::GameData, ResRef),
+) -> Option<(Moonglow, Option<egui_wgpu::RenderState>, ResRef)> {
     use mg_module::instances::{Placement, Placing, instance};
     use mg_module::new::{AreaSpec, add_area, new_module};
     let root = mg_testkit::nwn_root()?;
-    let rs = gpu()?;
-    let install = mg_resman::GameInstall::new(&root, user, "en");
-    let game = mg_rules::GameData::open(&install).unwrap();
-    let mut rng = fastrand::Rng::with_seed(7);
-    let mut m = new_module(&game, "Area View", &mut rng).unwrap();
-    let spec = AreaSpec {
-        name: "Field".into(),
-        tileset: ResRef::from_str(tileset).unwrap(),
-        width: side,
-        height: side,
+    let rs = if with_gpu { Some(gpu()?) } else { None };
+    let install = mg_resman::GameInstall::new(&root, user.clone(), "en");
+    let game = shared_game_data(&root, user.clone());
+    type StarterKey = (std::path::PathBuf, String, Option<i32>, u32);
+    static STARTER: mg_testkit::Shared<StarterKey, (ResRef, Module)> = mg_testkit::Shared::new();
+    let build = || {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let mut m = new_module(&game, "Area View", &mut rng).unwrap();
+        let spec = AreaSpec {
+            name: "Field".into(),
+            tileset: ResRef::from_str(tileset).unwrap(),
+            width: side,
+            height: side,
+        };
+        let area = add_area(&mut m, &game, &spec, &mut rng).unwrap();
+        if let Some(id) = tile {
+            let key = ResKey::new(area, ResType::ARE);
+            let mut are = m.gff(&key).unwrap().unwrap();
+            let t = &mut are.root.list_mut("Tile_List").unwrap()[5];
+            t.set("Tile_ID", mg_gff::Value::Int(id));
+            t.set("Tile_Orientation", mg_gff::Value::Int(0));
+            t.set("Tile_Height", mg_gff::Value::Int(0));
+            m.set_gff(key, &are).unwrap();
+        }
+        let bp = game.resman.get(&ResKey::parse("nw_waypoint001", ResType::UTW).unwrap()).unwrap();
+        let bp = Gff::read(&bp).unwrap();
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        let none = |_: ResRef| None;
+        let placing = Placing { game: &game, item: &none };
+        let waypoints = [20.0, 30.0]
+            .map(|x| {
+                let at = Placement { position: [x, 20.0, 0.0], rotation: 0.3 };
+                instance(&placing, ResType::UTW, &bp.root, at, &[]).unwrap()
+            })
+            .to_vec();
+        git.root.set("WaypointList", mg_gff::Value::List(waypoints));
+        m.set_gff(git_key, &git).unwrap();
+        (m, area)
     };
-    let area = add_area(&mut m, &game, &spec, &mut rng).unwrap();
-    if let Some(id) = tile {
-        let key = ResKey::new(area, ResType::ARE);
-        let mut are = m.gff(&key).unwrap().unwrap();
-        let t = &mut are.root.list_mut("Tile_List").unwrap()[5];
-        t.set("Tile_ID", mg_gff::Value::Int(id));
-        t.set("Tile_Orientation", mg_gff::Value::Int(0));
-        t.set("Tile_Height", mg_gff::Value::Int(0));
-        m.set_gff(key, &are).unwrap();
-    }
-    let bp = game.resman.get(&ResKey::parse("nw_waypoint001", ResType::UTW).unwrap()).unwrap();
-    let bp = Gff::read(&bp).unwrap();
-    let git_key = ResKey::new(area, ResType::GIT);
-    let mut git = m.gff(&git_key).unwrap().unwrap();
-    let none = |_: ResRef| None;
-    let placing = Placing { game: &game, item: &none };
-    let waypoints = [20.0, 30.0]
-        .map(|x| {
-            let at = Placement { position: [x, 20.0, 0.0], rotation: 0.3 };
-            instance(&placing, ResType::UTW, &bp.root, at, &[]).unwrap()
-        })
-        .to_vec();
-    git.root.set("WaypointList", mg_gff::Value::List(waypoints));
-    m.set_gff(git_key, &git).unwrap();
+    let (mut m, area) = if user.is_none() {
+        let key = (root.clone(), tileset.to_string(), tile, side);
+        let (area, tmpl) = STARTER.get(&key, || {
+            let (m, area) = build();
+            (area, m)
+        });
+        (tmpl, area)
+    } else {
+        build()
+    };
     prepare(&mut m, &game, area);
     let path = mg_testkit::scratch_dir(&format!("ui-area-{name}")).join("area.mod");
     m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
-    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
-    app.set_render_state(rs.clone());
+    let mut app =
+        Moonglow::new_with_game(Some(install), Some(game), Box::new(NoDialogs::default()));
+    if let Some(rs) = &rs {
+        app.set_render_state(rs.clone());
+    }
     // (Moonglow's own shader, chosen: the area view tests' pictures don't
     // change as the game's programs are made.)
     app.settings.game_shaders = Some(false);
@@ -461,11 +2032,60 @@ pub(crate) fn area_app(
     Some((app, rs, area))
 }
 
+/// Non-GPU [`read_only_area_harness`] for layout, permissions, and panel tests.
+pub(crate) fn read_only_area_ui_harness(
+    name: &str,
+) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    read_only_area_ui_harness_with(name, "")
+}
+
+/// Non-GPU [`read_only_area_harness_with`].
+pub(crate) fn read_only_area_ui_harness_with(
+    name: &str,
+    rows: &str,
+) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    let (app, _, area) = read_only_area_app_with(name, rows, false, &|_, _, _| {})?;
+    let mut h = build_harness(app, 1100.0, 800.0, Some(1.0 / 60.0), None);
+    h.run_steps(3);
+    Some((h, area))
+}
+
 /// [`area_harness`]'s area with a chest at 12, 20, in a project folder
 /// whose claims table says `cd` holds the area and whose moonglow.toml
 /// keeps others' areas read-only, the builder `ab`: an area read-only
 /// here.
 pub(crate) fn read_only_area_harness(name: &str) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    read_only_area_harness_with(name, "")
+}
+
+/// [`read_only_area_harness`] with `rows` more in its claims table (each
+/// a 2DA row, numbered from 1).
+pub(crate) fn read_only_area_harness_with(
+    name: &str,
+    rows: &str,
+) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    read_only_area_harness_prepared(name, rows, &|_, _, _| {})
+}
+
+/// [`read_only_area_harness_with`] with the module changed by `prepare`
+/// (given the game and the area) after its chest is placed.
+pub(crate) fn read_only_area_harness_prepared(
+    name: &str,
+    rows: &str,
+    prepare: &dyn Fn(&mut mg_module::Module, &mg_rules::GameData, ResRef),
+) -> Option<(Harness<'static, Moonglow>, ResRef)> {
+    let (app, rs, area) = read_only_area_app_with(name, rows, true, prepare)?;
+    let mut h = area_gpu_harness(app, rs?, 1100.0, 800.0);
+    h.run_steps(3);
+    Some((h, area))
+}
+
+fn read_only_area_app_with(
+    name: &str,
+    rows: &str,
+    with_gpu: bool,
+    prepare: &dyn Fn(&mut mg_module::Module, &mg_rules::GameData, ResRef),
+) -> Option<(Moonglow, Option<egui_wgpu::RenderState>, ResRef)> {
     let chest = |m: &mut Module, game: &mg_rules::GameData, area: ResRef| {
         use mg_module::instances::{Placement, Placing, instance};
         let key = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
@@ -478,8 +2098,9 @@ pub(crate) fn read_only_area_harness(name: &str) -> Option<(Harness<'static, Moo
         let mut git = m.gff(&git_key).unwrap().unwrap();
         git.root.set("Placeable List", mg_gff::Value::List(vec![item]));
         m.set_gff(git_key, &git).unwrap();
+        prepare(m, game, area);
     };
-    let (mut app, rs, area) = area_app(name, "ttr01", None, 4, None, &chest)?;
+    let (mut app, rs, area) = area_app_with(name, "ttr01", None, 4, None, with_gpu, &chest)?;
     // The same module as a project folder that names a claims table.
     let mut m = app.ws.as_ref()?.module.clone();
     let dir = mg_testkit::scratch_dir(&format!("ui-area-{name}-project"));
@@ -488,16 +2109,14 @@ pub(crate) fn read_only_area_harness(name: &str) -> Option<(Harness<'static, Moo
     std::fs::write(dir.join("moonglow.toml"), rules).unwrap();
     let table = format!(
         "2DA V2.0\n\n    Area             Builder  Status   Date        Tag\n\
-         0   {:<16} cd       claimed  2026-10-20  ****\n",
+         0   {:<16} cd       claimed  2026-10-20  ****\n{rows}",
         area.to_string()
     );
     std::fs::write(dir.join("claims.2da"), table).unwrap();
     mg_module::project_file::ProjectFile::set_builder_code(&dir, Some("ab")).unwrap();
     app.open_module(&dir);
     app.actions.push(mg_ui::Action::OpenTab(Tab::Area(area)));
-    let mut h = area_gpu_harness(app, rs, 1100.0, 800.0);
-    h.run_steps(3);
-    Some((h, area))
+    Some((app, rs, area))
 }
 
 /// A waypoint's position in the workspace's GIT.
@@ -510,6 +2129,42 @@ pub(crate) fn waypoint(
     let git = ws.doc(&ResKey::new(area, ResType::GIT)).unwrap();
     let w = git.root.list("WaypointList")?.get(index)?;
     Some((w.float("XPosition")?, w.float("YPosition")?, w.float("XOrientation")?.to_bits()))
+}
+
+/// Steps until Q and E's turning in `area` is made a command (when the
+/// keys rest): shown at once, it is not one yet.
+pub(crate) fn rest_turn_keys(h: &mut Harness<'_, Moonglow>, area: ResRef) {
+    for _ in 0..2000 {
+        if !h.state().area_views[&area].key_turning() {
+            h.run_steps(2);
+            return;
+        }
+        h.run_steps(1);
+    }
+    panic!("Q and E's turning was never made a command");
+}
+
+/// Whether the camera of `area`'s view looks at object `(kind, index)` as
+/// Focus Selection frames it: over where it stands (within half a meter,
+/// as its turned model's box may lie a little aside), at the height of
+/// the middle of the box its model is drawn and selected by (a
+/// waypoint's flag, about a meter up; `focus_frames.rs`).
+pub(crate) fn camera_on(
+    h: &Harness<'_, Moonglow>,
+    area: ResRef,
+    kind: mg_area::ObjectKind,
+    index: usize,
+) -> bool {
+    let view = &h.state().area_views[&area];
+    let Some(model) = view.model.as_ref() else { return false };
+    let Some(i) = model.objects.iter().position(|o| o.kind == kind && o.index == index) else {
+        return false;
+    };
+    let at = model.objects[i].position;
+    let Some((min, max)) = view.box_of(i) else { return false };
+    let target = view.orbit.unwrap().target;
+    let middle = at.z + (min.z + max.z) * 0.5;
+    (target - at).truncate().length() < 0.5 && (target.z - middle).abs() < 0.05
 }
 
 pub(crate) fn screen(h: &Harness<'_, Moonglow>, area: ResRef, p: glam::Vec3) -> egui::Pos2 {
@@ -559,9 +2214,13 @@ pub(crate) fn overlapping(h: &Harness<'_, Moonglow>) -> Vec<String> {
     fn names(n: AccessKitNode<'_>, out: &mut HashMap<u64, String>) {
         let role = n.role();
         let name = n.label().or_else(|| n.value()).unwrap_or_default();
+        // (A gallery's grid is a list of the cells drawn in it, which
+        // egui gives it not as children but beside it.)
         let part = matches!(
             role,
-            egui::accesskit::Role::Unknown | egui::accesskit::Role::GenericContainer
+            egui::accesskit::Role::Unknown
+                | egui::accesskit::Role::GenericContainer
+                | egui::accesskit::Role::List
         );
         // Widgets, not the windows and groups that hold them.
         let leaf = n.children().next().is_none();
@@ -582,8 +2241,17 @@ pub(crate) fn overlapping(h: &Harness<'_, Moonglow>) -> Vec<String> {
                 .filter(|w| w.interact_rect.area() > 1.0)
                 .filter_map(|w| Some((w.interact_rect, named.get(&w.id.value())?)))
                 .collect();
+            // (A document tab's close button lies in its tab, by design.)
+            let close_of = |close: &str, tab: &str| {
+                tab.strip_prefix("Tab ").is_some_and(|t| {
+                    close == format!("Button \"Close {}", t.trim_start_matches('"'))
+                })
+            };
             for (i, (a, name_a)) in shown.iter().enumerate() {
                 for (b, name_b) in &shown[i + 1..] {
+                    if close_of(name_a, name_b) || close_of(name_b, name_a) {
+                        continue;
+                    }
                     let both = a.intersect(*b);
                     let smaller = a.area().min(b.area());
                     if both.is_positive() && both.area() > 0.25 * smaller {
@@ -601,6 +2269,154 @@ pub(crate) fn close_tab(app: &mut Moonglow, tab: &Tab) {
     if let Some(path) = app.dock.find_tab(tab) {
         app.dock.remove_tab(path);
     }
+}
+
+/// Clicks a tab's close button as the pointer does (pressed, then let go a frame
+/// on): the tab hovered first, for one not in front shows its close
+/// button only under the pointer. (The close button is the square inside
+/// its tab, named "Close" and the tab's name; the tabs are what can be
+/// clicked and dragged in their pane's tab bar, in their order.)
+pub(crate) fn click_tab_close(h: &mut Harness<'_, Moonglow>, tab: &Tab) {
+    let (own, _) = tab_rects(h, tab);
+    h.hover_at(egui::pos2(own.left() + 12.0, own.center().y));
+    h.run_steps(1);
+    let (own, squares) = tab_rects(h, tab);
+    // (16 points square: the Top Bar's buttons under a window's bar are
+    // 22.)
+    let side = mg_uikit::shell::DOC_TAB_CLOSE;
+    // (Its own at its right end: another tab's under a floating window
+    // may lie within its rectangle too, the editor area's tab bar flush
+    // under the Top Bar since M3 T14.)
+    let close = (squares.iter())
+        .filter(|r| own.contains_rect(**r) && (r.width() - side).abs() < 0.5)
+        .max_by(|a, b| a.right().total_cmp(&b.right()));
+    let at = close.expect("its close button").center();
+    h.hover_at(at);
+    h.run_steps(1);
+    press(h, at, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    press(h, at, false, egui::Modifiers::NONE);
+    h.run_steps(1);
+}
+
+/// Clicks a tab as the pointer does, left of its close button (pressed,
+/// then let go a frame on): brought to the front of its pane, the pane
+/// given the focus.
+pub(crate) fn click_tab(h: &mut Harness<'_, Moonglow>, tab: &Tab) {
+    let (own, _) = tab_rects(h, tab);
+    let at = egui::pos2(own.left() + 12.0, own.center().y);
+    h.hover_at(at);
+    h.run_steps(1);
+    press(h, at, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    press(h, at, false, egui::Modifiers::NONE);
+    h.run_steps(1);
+}
+
+/// Where `tab`'s tab is drawn in its pane's tab bar, and the squares that
+/// can be clicked in that bar (the tabs' close buttons among them): of
+/// that bar's layer alone, the main window's for a docked tab and its own
+/// window's for a floating one, so that a floating window's tabs over the
+/// bar are neither counted among its tabs nor taken for its squares.
+pub(crate) fn tab_rects(h: &Harness<'_, Moonglow>, tab: &Tab) -> (egui::Rect, Vec<egui::Rect>) {
+    let (band, index, main, count) = h
+        .state()
+        .dock
+        .iter_leaves()
+        .find_map(|(path, l)| {
+            let index = l.tabs.iter().position(|t| t == tab)?;
+            let band =
+                egui::Rect::from_x_y_ranges(l.rect.x_range(), l.rect.top()..=l.viewport.top());
+            Some((band, index, path.surface.is_main(), l.tabs.len()))
+        })
+        .expect("the tab is open");
+    // Each layer's tabs and squares in the band.
+    let mut layers: Vec<(egui::LayerId, Vec<egui::Rect>, Vec<egui::Rect>)> = Vec::new();
+    h.ctx.viewport(|v| {
+        for (layer, widgets) in v.prev_pass.widgets.layers() {
+            let (mut tabs, mut squares) = (Vec::new(), Vec::new());
+            for w in widgets.iter().filter(|w| band.contains_rect(w.interact_rect)) {
+                let r = w.interact_rect;
+                if w.sense.senses_click() && w.sense.senses_drag() {
+                    tabs.push(r);
+                } else if w.sense.senses_click() && (r.width() - r.height()).abs() < 0.5 {
+                    squares.push(r);
+                }
+            }
+            if !tabs.is_empty() {
+                layers.push((*layer, tabs, squares));
+            }
+        }
+    });
+    // (A docked tab's bar is in the main window's panels, under every
+    // window; a floating one's in its window's layer: a window whose area
+    // holds the bar, and of windows overlapping there the one with as
+    // many tabs there as its pane, else the first by its id, so that the
+    // choice does not hang on the order egui keeps its layers in.)
+    let holds = |layer: &egui::LayerId| {
+        h.ctx.memory(|m| m.area_rect(layer.id)).is_some_and(|r| r.contains(band.center()))
+    };
+    layers.retain(|(layer, ..)| match main {
+        true => layer.order != egui::Order::Middle,
+        false => layer.order == egui::Order::Middle && holds(layer),
+    });
+    layers.sort_by_key(|(layer, ..)| (layer.order, layer.id.value()));
+    let mine = (layers.iter().position(|(_, tabs, _)| tabs.len() == count)).unwrap_or(0);
+    assert!(!layers.is_empty(), "its tab bar's layer");
+    let (_, mut tabs, squares) = layers.swap_remove(mine);
+    tabs.sort_by(|a, b| a.left().total_cmp(&b.left()));
+    (*tabs.get(index).expect("its tab"), squares)
+}
+
+/// Clicks the Close of the window `tab` is in: the button named "Close
+/// Window" ("Close Pane" in a window split in panes) at the right end of
+/// its pane's tab bar (egui_dock's close all, which
+/// Moonglow paints and names: `tabs::paint_window_bar_button`), after
+/// Maximize. Fails, naming what it found, where there is none, or more
+/// than one, in that bar.
+pub(crate) fn click_window_close(h: &mut Harness<'_, Moonglow>, tab: &Tab) {
+    let band = h
+        .state()
+        .dock
+        .iter_leaves()
+        .find(|(_, l)| l.tabs.contains(tab))
+        .map(|(_, l)| {
+            egui::Rect::from_x_y_ranges(l.rect.x_range(), l.rect.top()..=l.viewport.top())
+        })
+        .expect("the tab is open");
+    let closes: Vec<egui::Rect> = (h.query_all_by_label("Close Window"))
+        .chain(h.query_all_by_label("Close Pane"))
+        .map(|n| n.rect())
+        .filter(|r| band.expand(1.0).contains_rect(*r))
+        .collect();
+    let [close] = closes[..] else {
+        panic!("one Close in the bar of {tab:?}'s window ({band:?}), found {closes:?}");
+    };
+    assert!(close.right() >= band.right() - 4.0, "the Close at the bar's right end: {close:?}");
+    let at = close.center();
+    h.hover_at(at);
+    h.run_steps(1);
+    press(h, at, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    press(h, at, false, egui::Modifiers::NONE);
+    h.run_steps(1);
+}
+
+/// Clicks the dialog `title`'s own Close button, at its foot (the Check
+/// for Updates window's, the Claims Table's): the lowest named "Close"
+/// in it, not its title row's at its top, which closes it too.
+pub(crate) fn click_dialog_s_own_close(h: &mut Harness<'_, Moonglow>, title: &str) {
+    let window = h.get_by_label(title).rect();
+    // (Not the title row's, in its top 28 points: that one is not the
+    // dialog's own.)
+    let below_row = window.top() + 28.0;
+    let own: Vec<egui::Rect> = (h.get_by_label(title).query_all_by_label("Close"))
+        .map(|n| n.rect())
+        .filter(|r| r.top() >= below_row)
+        .collect();
+    let [at] = own[..] else { panic!("one Close of {title}'s own under its row, found {own:?}") };
+    let node = (h.get_by_label(title).query_all_by_label("Close")).find(|n| n.rect() == at);
+    node.expect("the Close found").click();
 }
 
 /// Closes the editors' windows (the tabs not in the main dock), back to the
@@ -638,7 +2454,7 @@ pub(crate) fn plugin_harness(
         app_with(Vec::new())
     };
     app.open_module(&path);
-    app.open_palette = false;
+    app.palette_dock = false;
     let key = ResKey::parse("guard", ResType::UTC).unwrap();
     let mut guard = Gff::new(*b"UTC ");
     guard.root.set("Tag", mg_gff::Value::String(b"gate_guard".to_vec()));
@@ -672,6 +2488,64 @@ pub(crate) fn own_window(
     h.run_steps(4);
 }
 
+/// Scrolls the widget labeled `label` into its scroll area's view and
+/// waits until it stays still there (egui's scrolling is animated). A
+/// node's rect is where it is laid out, in sight or not, and kittest
+/// clicks at its center: out of sight, that is whatever is drawn there.
+pub(crate) fn bring_in_sight(h: &mut Harness<'_, Moonglow>, label: &str) {
+    apart(h, label).scroll_to_me();
+    at_rest(h, label, &|h| apart(h, label).rect());
+}
+
+/// Frames until the widget whose place `rect` gives (`what` names it)
+/// stays still: a scroll asked for begins a frame or two later and is
+/// animated, so still for a few frames in a row is at rest.
+pub(crate) fn at_rest(
+    h: &mut Harness<'_, Moonglow>,
+    what: &str,
+    rect: &dyn Fn(&Harness<'_, Moonglow>) -> egui::Rect,
+) {
+    let started = std::time::Instant::now();
+    let (mut last, mut still) = (None, 0);
+    while still < 4 {
+        h.run_steps(1);
+        let now = rect(h);
+        still = if last == Some(now) { still + 1 } else { 0 };
+        assert!(started.elapsed() < SETTLE_TIME, "{what} never came to rest");
+        last = Some(now);
+    }
+}
+
+/// Turns the mouse wheel down over `at`, in a scroll area that lays out
+/// only the rows in sight (the module tree), a little at a time, until
+/// the row labeled `label` is laid out, then brings it into sight.
+pub(crate) fn wheel_to(h: &mut Harness<'_, Moonglow>, at: egui::Pos2, label: &str) {
+    wheel_until(h, at, -20.0, label);
+}
+
+fn wheel_until(h: &mut Harness<'_, Moonglow>, at: egui::Pos2, dy: f32, label: &str) {
+    let started = std::time::Instant::now();
+    h.hover_at(at);
+    while h.query_by_label(label).is_none() {
+        assert!(started.elapsed() < SETTLE_TIME, "{label} never came into sight");
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, dy),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(2);
+    }
+    bring_in_sight(h, label);
+}
+
+/// A click on the widget labeled `label`, brought into sight first
+/// ([`bring_in_sight`]).
+pub(crate) fn click_in_sight(h: &mut Harness<'_, Moonglow>, label: &str) {
+    bring_in_sight(h, label);
+    apart(h, label).click();
+}
+
 /// A click of the pointer's first button at `pos`.
 pub(crate) fn click_pos(h: &Harness<'_, Moonglow>, pos: egui::Pos2) {
     h.hover_at(pos);
@@ -700,15 +2574,30 @@ pub(crate) fn drag(h: &mut Harness<'_, Moonglow>, from: egui::Pos2, to: egui::Po
     h.run_steps(3);
 }
 
+/// The item `name` of the open right-click menu: a popup is a layer of its
+/// own, with the fewest containers above it (the toolbars, an editor and
+/// the palette name some of the same words); of those as shallow, the last.
+#[track_caller]
+pub(crate) fn popup_item<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    let depth = |n: &egui_kittest::Node<'_>| {
+        std::iter::successors(n.accesskit_node().parent(), |p| p.parent()).count()
+    };
+    let all: Vec<_> = h.get_all_by_label(name).collect();
+    all.into_iter().rev().min_by_key(depth).unwrap_or_else(|| panic!("no menu item {name}"))
+}
+
 /// Opens the submenu `name` of the right-click menu that is open (the
 /// palette's Copy, the area view's Position…): the pointer brought to it
-/// and a frame run, as a builder's would be, then a click. (egui names a
-/// submenu's button with its arrow: "Copy ⏵".)
+/// and a frame run, as a builder's would be, then a click. (A submenu's
+/// button is named by its words; its arrow is drawn.)
 pub(crate) fn open_submenu(h: &mut Harness<'_, Moonglow>, name: &str) {
-    let label = format!("{name} ⏵");
-    h.get_by_label(&label).hover();
+    let item = |h: &Harness<'_, Moonglow>| popup_item(h, name).rect();
+    h.hover_at(item(h).center());
     h.run_steps(1);
-    h.get_by_label(&label).click();
+    click_pos(h, item(h).center());
     h.run_steps(2);
 }
 
@@ -806,4 +2695,555 @@ pub(crate) fn area_tag(h: &mut Harness<'_, Moonglow>, area: &str) -> String {
     let ws = h.state_mut().ws.as_mut().unwrap();
     let doc = ws.doc(&ResKey::parse(area, ResType::ARE).unwrap()).unwrap();
     String::from_utf8_lossy(doc.root.string("Tag").unwrap_or_default()).into_owned()
+}
+
+/// Sets a number field (a `DragValue`) to `v`, as a screen reader does
+/// (accesskit's SetValue): the field takes it as a number typed.
+pub(crate) fn set_number(h: &Harness<'_, Moonglow>, node: &egui_kittest::Node<'_>, v: f64) {
+    let (target_node, target_tree) = node.accesskit_node().locate();
+    h.event(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+        action: egui::accesskit::Action::SetValue,
+        target_node,
+        target_tree,
+        data: Some(egui::accesskit::ActionData::NumericValue(v)),
+    }));
+}
+
+/// The number field (a SpinButton) on the row of the widget `label`
+/// names, the `n`th from the left: a list page's rank, level or uses.
+pub(crate) fn number_beside<'h>(
+    h: &'h Harness<'_, Moonglow>,
+    label: &str,
+    n: usize,
+) -> egui_kittest::Node<'h> {
+    let row = h.get_by_label(label).rect();
+    let mut on: Vec<_> = h
+        .get_all_by_role(egui::accesskit::Role::SpinButton)
+        .filter(|s| (s.rect().center().y - row.center().y).abs() < row.height().max(8.0))
+        .collect();
+    on.sort_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x));
+    on.into_iter().nth(n).unwrap_or_else(|| panic!("no number beside {label}"))
+}
+
+/// Puts a dynamic chest at 12, 20 in the area of `git`, first of its
+/// placeables, tinted white (The Domains of Dread's `tdod_tint`), as one
+/// command: for the tests of a tint being picked.
+pub(crate) fn place_tinted_chest(app: &mut Moonglow, git: ResKey) {
+    use mg_module::instances::{Placement, Placing, instance};
+    let game = app.game.as_deref().unwrap();
+    let data = game.resman.get(&ResKey::parse("plc_chest1", ResType::UTP).unwrap()).unwrap();
+    let chest = Gff::read(&data).unwrap().root;
+    let none = |_: ResRef| None;
+    let placing = Placing { game, item: &none };
+    let at = Placement { position: [12.0, 20.0, 0.0], rotation: 0.0 };
+    let mut item = instance(&placing, ResType::UTP, &chest, at, &[]).unwrap();
+    item.set("Static", mg_gff::Value::Byte(0));
+    let mut v = mg_gff::Struct::new(0);
+    v.set("Name", mg_gff::Value::String(b"tdod_tint".to_vec()));
+    v.set("Type", mg_gff::Value::Dword(3));
+    v.set("Value", mg_gff::Value::String(b"#ffffff".to_vec()));
+    item.set("VarTable", mg_gff::Value::List(vec![v]));
+    let edit = mg_edit::Edit::InsertItem {
+        key: git,
+        path: mg_edit::GffPath::root(),
+        list: "Placeable List".into(),
+        index: 0,
+        item,
+    };
+    app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", vec![edit])));
+}
+
+/// The tint the area view draws the first placeable of `area` with (its
+/// whole object's, `tdod_tint`), as the renderer is given it.
+pub(crate) fn drawn_tint(h: &Harness<'_, Moonglow>, area: ResRef) -> Option<Vec<f32>> {
+    let view = h.state().area_views.get(&area)?;
+    let chest = view.model.as_ref()?.object(mg_area::ObjectKind::Placeable, 0)?;
+    let values = &chest.preview.as_ref()?.base.material_values;
+    values.iter().find(|v| v.material.is_none()).and_then(|v| match &v.value {
+        mg_image::mtr::Param::Float(f) => Some(f.clone()),
+        mg_image::mtr::Param::Int(_) => None,
+    })
+}
+
+/// Drags across the color picker's square opened from the swatch at
+/// `well`, from `from` to `to` points along it, a frame a step, and lets
+/// go: the picker stays open. (The square found by the picker's own
+/// parts, its #rrggbb field at its left under it and Paste Color beside
+/// that: the popover opens under the swatch, or beside it where there is
+/// no room under it.)
+pub(crate) fn drag_picker(h: &mut Harness<'_, Moonglow>, well: egui::Rect, from: f32, to: f32) {
+    let pastes: Vec<egui::Rect> = h.query_all_by_label("Paste Color").map(|n| n.rect()).collect();
+    let hex = h
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .filter(|n| n.accesskit_node().label().as_deref() != Some("Quick Open"))
+        .filter(|n| n.accesskit_node().value().is_some_and(|v| v.starts_with('#')))
+        .map(|n| n.rect())
+        // (The picker's own, with Paste Color beside it: a variable's
+        // value can be a #rrggbb too.)
+        .filter(|r| {
+            pastes.iter().any(|p| (p.center().y - r.center().y).abs() < 4.0 && p.left() > r.left())
+        })
+        .min_by(|a, b| {
+            let d = |r: &egui::Rect| r.center().distance(well.center());
+            d(a).total_cmp(&d(b))
+        })
+        .expect("the picker's #rrggbb field");
+    // (Above the field: the hue strip, then the square's lower part.)
+    let point = |x: f32| egui::pos2(hex.left() + 20.0 + x, hex.top() - 100.0);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(egui::Event::PointerMoved(point(from)));
+    h.event(button(point(from), true));
+    h.run();
+    for i in 1..=10 {
+        h.event(egui::Event::PointerMoved(point(from + (to - from) * i as f32 / 10.0)));
+        h.run();
+    }
+    h.event(button(point(to), false));
+    h.run_steps(3);
+}
+
+/// A click away from everything at `at`, as one closes a popup with.
+pub(crate) fn click_away(h: &mut Harness<'_, Moonglow>, at: egui::Pos2) {
+    h.event(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(4);
+}
+
+/// Every shape of the frame just drawn, groups opened.
+pub(crate) fn drawn(h: &Harness<'_, Moonglow>) -> Vec<egui::Shape> {
+    fn add(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| add(s, out)),
+            s => out.push(s.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    h.output().shapes.iter().for_each(|c| add(&c.shape, &mut out));
+    out
+}
+
+/// [`drawn`], each shape with the rectangle it is clipped to.
+pub(crate) fn drawn_clipped(h: &Harness<'_, Moonglow>) -> Vec<(egui::Shape, egui::Rect)> {
+    fn add(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<(egui::Shape, egui::Rect)>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| add(s, clip, out)),
+            s => out.push((s.clone(), clip)),
+        }
+    }
+    let mut out = Vec::new();
+    h.output().shapes.iter().for_each(|c| add(&c.shape, c.clip_rect, &mut out));
+    out
+}
+
+/// Opens Quick Open by its key (Ctrl+P) and types `text` into its field
+/// (nothing typed for an empty `text`).
+pub(crate) fn quick_open(h: &mut Harness<'_, Moonglow>, text: &str) {
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
+    settle(h);
+    assert!(h.state().quick_open.is_open(), "Ctrl+P opens Quick Open");
+    if !text.is_empty() {
+        quick_open_field(h).type_text(text);
+        settle(h);
+    }
+}
+
+/// Quick Open's field (in the Top Bar, or over it where the bar shows
+/// its icon: not the icon, of the same name).
+#[track_caller]
+pub(crate) fn quick_open_field<'t>(h: &'t Harness<'_, Moonglow>) -> egui_kittest::Node<'t> {
+    use egui::accesskit::Role;
+    let mut fields = h
+        .query_all_by_label(mg_ui::quick_open::NAME)
+        .filter(|n| n.accesskit_node().role() != Role::Button);
+    fields.next().expect("Quick Open's field")
+}
+
+/// Opens Quick Open among the commands (Ctrl+Shift+P, the Command
+/// Palette's key) and types `text` after its `>`.
+pub(crate) fn command_palette(h: &mut Harness<'_, Moonglow>, text: &str) {
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P);
+    settle(h);
+    assert!(h.state().quick_open.is_open(), "Ctrl+Shift+P opens Quick Open");
+    assert_eq!(h.state().quick_open.text, ">", "among the commands");
+    if !text.is_empty() {
+        quick_open_field(h).type_text(text);
+        settle(h);
+    }
+}
+
+/// Quick Open's row `name` (found in its popover).
+#[track_caller]
+pub(crate) fn quick_open_row<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    name: &'t str,
+) -> egui_kittest::Node<'t> {
+    h.get_by_label(mg_ui::quick_open::RESULTS).get_by_label(name)
+}
+
+/// Quick Open's rows as shown, top to bottom: each one's name.
+pub(crate) fn quick_open_rows(h: &Harness<'_, Moonglow>) -> Vec<String> {
+    use egui::accesskit::Role;
+    let Some(group) = h.query_by_label(mg_ui::quick_open::RESULTS) else { return Vec::new() };
+    let mut rows: Vec<(f32, String)> = group
+        .query_all(egui_kittest::kittest::by().role(Role::Button))
+        .map(|n| (n.rect().top(), n.accesskit_node().label().unwrap_or_default()))
+        .collect();
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    rows.into_iter().map(|(_, l)| l).collect()
+}
+
+/// The row Enter would run in Quick Open: its name.
+pub(crate) fn quick_open_chosen(h: &Harness<'_, Moonglow>) -> Option<String> {
+    let group = h.query_by_label(mg_ui::quick_open::RESULTS)?;
+    let chosen = group
+        .query_all(
+            egui_kittest::kittest::by()
+                .predicate(|n| n.toggled() == Some(egui::accesskit::Toggled::True)),
+        )
+        .next()?;
+    chosen.accesskit_node().label()
+}
+
+/// The row of the page `name` in the page list of the form in front:
+/// the window's ("Pages", the blueprints' and Module Properties'; "Area
+/// Properties pages"; the Properties panel's rail is "Pages" too), the
+/// last drawn where there are several.
+pub(crate) fn page_row<'t>(
+    h: &'t Harness<'_, Moonglow>,
+    name: &'t str,
+) -> Option<egui_kittest::Node<'t>> {
+    let mut found = None;
+    for list in [mg_uikit::pages::PAGES, "Area Properties pages"] {
+        for group in h.query_all_by_label(list) {
+            if let Some(row) = group.query_by_label(name) {
+                found = Some(row);
+            }
+        }
+    }
+    found
+}
+
+/// Brings the page `name` of the form in front to the top of its one
+/// scroll (M4's U9): its row in the page list clicked, then waits until
+/// it is the page at the top (its row selected), the page drawn.
+pub(crate) fn page(h: &mut Harness<'_, Moonglow>, name: &str) {
+    page_row(h, name).unwrap_or_else(|| panic!("no page {name} in a page list")).click();
+    let started = std::time::Instant::now();
+    loop {
+        // (Settled, not run: a page's pictures are made a few a frame,
+        // the armor's two rows of part pictures among them.)
+        settle(h);
+        let on = page_row(h, name)
+            .is_some_and(|r| r.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True));
+        if on {
+            return;
+        }
+        assert!(started.elapsed() < SETTLE_TIME, "the page {name} never came to the top");
+    }
+}
+
+/// The page `name` of the form in front, as drawn on its one scroll (a
+/// group named "Basic page"): what a test looks for on that page alone,
+/// the pages beside it in view too.
+#[track_caller]
+pub(crate) fn in_page<'t>(h: &'t Harness<'_, Moonglow>, name: &str) -> egui_kittest::Node<'t> {
+    let group = format!("{name}{}", mg_uikit::pages::PAGE_GROUP);
+    h.query_all_by(move |n| n.label().as_deref() == Some(group.as_str()))
+        .last()
+        .unwrap_or_else(|| panic!("no {name}{} drawn", mg_uikit::pages::PAGE_GROUP))
+}
+
+pub(crate) fn shot_dir(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("MG_SHOT").map(|_| mg_testkit::scratch_dir(name))
+}
+
+pub(crate) fn pos_to_pixel(pos: egui::Pos2, ppp: f32) -> (u32, u32) {
+    ((pos.x * ppp).round().max(0.0) as u32, (pos.y * ppp).round().max(0.0) as u32)
+}
+
+pub(crate) fn crop_rect(
+    img: &image::RgbaImage,
+    rect: egui::Rect,
+    ppp: f32,
+    inset: f32,
+) -> image::RgbaImage {
+    let r = rect.shrink(inset);
+    let x = ((r.min.x * ppp).round().max(0.0) as u32).min(img.width());
+    let y = ((r.min.y * ppp).round().max(0.0) as u32).min(img.height());
+    let w = ((r.width() * ppp).round().max(0.0) as u32).min(img.width().saturating_sub(x));
+    let h = ((r.height() * ppp).round().max(0.0) as u32).min(img.height().saturating_sub(y));
+    image::imageops::crop_imm(img, x, y, w, h).to_image()
+}
+
+/// Frames until `done` holds, for twenty seconds at most, failing with `what`.
+#[track_caller]
+pub(crate) fn until(
+    h: &mut Harness<'_, Moonglow>,
+    what: &str,
+    done: impl Fn(&Harness<'_, Moonglow>) -> bool,
+) {
+    let started = std::time::Instant::now();
+    while !done(h) {
+        assert!(started.elapsed().as_secs() < 20, "never: {what}");
+        h.step();
+    }
+}
+
+/// Frames until the Status Bar says each of `what` (drawn) and none of `not`.
+#[track_caller]
+pub(crate) fn says(h: &mut Harness<'_, Moonglow>, what: &[&str], not: &[&str]) {
+    let started = std::time::Instant::now();
+    loop {
+        let now = h.state().status_said();
+        let has = |w: &&str| now.iter().any(|s| s == w);
+        let drawn = |w: &&str| h.get_by_label("Status Bar").query_by_label(w).is_some();
+        if what.iter().all(has) && !not.iter().any(has) && what.iter().all(drawn) {
+            return;
+        }
+        let missing: Vec<&&str> = what.iter().filter(|w| !drawn(w)).collect();
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "never said {what:?} without {not:?}: it says {now:?}; not drawn: {missing:?}"
+        );
+        h.step();
+    }
+}
+
+/// Asserts that no widget in `dock` exceeds its right edge and no one-line field truncates its value.
+#[track_caller]
+pub(crate) fn fits_dock(
+    h: &Harness<'_, Moonglow>,
+    dock: egui::Rect,
+    what: &str,
+    font: egui::FontId,
+    skip_scrollbar: bool,
+) {
+    let in_sight = |n: &egui_kittest::Node<'_>| {
+        let r = n.rect();
+        r.left() >= dock.left() - 0.5
+            && r.top() >= dock.top() - 0.5
+            && r.bottom() <= dock.bottom()
+            && r.width() > 0.0
+    };
+    let past: Vec<String> = h
+        .get_all_by(|n| n.bounding_box().is_some())
+        .filter(in_sight)
+        .filter(|n| n.rect().right() > dock.right() + 0.5)
+        .filter(|n| {
+            !skip_scrollbar || n.accesskit_node().role() != egui::accesskit::Role::ScrollBar
+        })
+        .map(|n| {
+            let a = n.accesskit_node();
+            format!("{:?} {:?} {:?} {:?}", a.role(), a.label(), a.value(), n.rect())
+        })
+        .collect();
+    assert!(past.is_empty(), "{what}: past the edge {past:?}");
+    let margins = {
+        let m = mg_uikit::controls::FIELD_MARGIN;
+        f32::from(m.left) + f32::from(m.right)
+    };
+    let cut: Vec<String> = h
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .filter(in_sight)
+        .filter_map(|n| {
+            let value = n.accesskit_node().value()?;
+            let words = h.ctx.fonts_mut(|f| {
+                f.layout_no_wrap(value.clone(), font.clone(), egui::Color32::WHITE).size().x
+            });
+            (n.rect().width() + 0.5 < words + margins)
+                .then(|| format!("{value:?}: {} for {}", n.rect().width(), words + margins))
+        })
+        .collect();
+    assert!(cut.is_empty(), "{what}: cut short in their fields {cut:?}");
+}
+
+/// Types `to` over the text field showing `from`, and leaves it with Tab.
+#[track_caller]
+pub(crate) fn retype(h: &mut Harness<'_, Moonglow>, from: &str, to: &str) {
+    let is_input =
+        |n: &egui_kittest::Node<'_>| n.accesskit_node().role() == egui::accesskit::Role::TextInput;
+    h.get_all_by_value(from).find(is_input).expect("the field").click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_all_by_value(from).find(is_input).unwrap().type_text(to);
+    h.run_steps(2);
+    h.key_press(egui::Key::Tab);
+    h.run_steps(3);
+}
+
+/// Sweeps `settings.right_dock_width` across `270..=480` with coarse stride 12
+/// and 1px refinement across height transitions to verify monotonic panel height
+/// (every width, with `MOONGLOW_FULL_CORPUS=1`).
+#[track_caller]
+pub(crate) fn sweep_dock_heights(
+    h: &mut Harness<'_, Moonglow>,
+    label: &str,
+    height_of: impl Fn(&Harness<'_, Moonglow>) -> f32,
+    check_jitter: bool,
+) {
+    let measure = |h: &mut Harness<'_, Moonglow>, w: u32| -> f32 {
+        h.state_mut().settings.right_dock_width = Some(w);
+        settle(h);
+        height_of(h)
+    };
+    let mut prev: Option<(u32, f32)> = None;
+    let mut least: Option<(u32, f32)> = None;
+    let mut changes = Vec::new();
+    // (Every width, as before the fast path, in a full run.)
+    let stride = if mg_testkit::full_corpus() { 1 } else { 12 };
+    let coarse: Vec<u32> = (270..480).step_by(stride).chain(std::iter::once(480)).collect();
+    for w in coarse {
+        let high = measure(h, w);
+        if let Some((pw, ph)) = prev
+            && (high - ph).abs() > 0.5
+        {
+            let mut inner_prev = ph;
+            for rw in (pw + 1)..w {
+                let rh = measure(h, rw);
+                if let Some((at, low)) = least {
+                    assert!(rh <= low + 0.5, "{label}: {low} at {at}, {rh} at {rw}");
+                }
+                if (rh - inner_prev).abs() > 0.5 {
+                    changes.push(rw);
+                }
+                if least.is_none_or(|(_, low)| rh < low) {
+                    least = Some((rw, rh));
+                }
+                inner_prev = rh;
+            }
+            if (high - inner_prev).abs() > 0.5 {
+                changes.push(w);
+            }
+        }
+        if let Some((at, low)) = least {
+            assert!(high <= low + 0.5, "{label}: {low} at {at}, {high} at {w}");
+        }
+        if least.is_none_or(|(_, low)| high < low) {
+            least = Some((w, high));
+        }
+        prev = Some((w, high));
+    }
+    if check_jitter {
+        for w in changes {
+            for at in w.saturating_sub(2)..=w + 2 {
+                h.state_mut().settings.right_dock_width = Some(at);
+                let heights_step = if mg_testkit::full_corpus() { 10 } else { 20 };
+                for high in (700..=900).step_by(heights_step) {
+                    h.set_size(egui::vec2(1600.0, high as f32));
+                    settle(h);
+                }
+            }
+            h.set_size(egui::vec2(1600.0, 900.0));
+        }
+    }
+}
+
+/// The Top Bar's menu `name` ("Edit"), not a control of the same name a
+/// form in view shows (a script field's Edit).
+pub(crate) fn menu<'t>(h: &'t Harness<'_, Moonglow>, name: &'t str) -> egui_kittest::Node<'t> {
+    h.get_all_by_label(name)
+        .find(|n| n.rect().top() < mg_uikit::metrics::TOP_BAR)
+        .unwrap_or_else(|| panic!("no menu {name} in the Top Bar"))
+}
+
+/// The paths of the wavy lines painted in the last frame in `color`, as
+/// their points.
+pub(crate) fn waves(h: &Harness<'_, Moonglow>, color: egui::Color32) -> Vec<Vec<egui::Pos2>> {
+    fn walk(shape: &egui::Shape, color: egui::Color32, out: &mut Vec<Vec<egui::Pos2>>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, color, out)),
+            egui::Shape::Path(p)
+                if !p.closed
+                    && p.points.len() >= 3
+                    && p.stroke.color == egui::epaint::ColorMode::Solid(color) =>
+            {
+                out.push(p.points.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in &h.output().shapes {
+        walk(&clipped.shape, color, &mut out);
+    }
+    out
+}
+
+/// The texts the last frame painted, each with its rectangle (a gutter's
+/// line numbers, which are painted, not widgets).
+pub(crate) fn painted_texts(h: &Harness<'_, Moonglow>) -> Vec<(String, egui::Rect)> {
+    let mut found = Vec::new();
+    for clipped in &h.output().shapes {
+        painted(&clipped.shape, &mut |shape| {
+            if let egui::Shape::Text(t) = shape {
+                found.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2())));
+            }
+        });
+    }
+    found
+}
+
+/// Whether the last frame painted something other than text inside
+/// `within` (an icon, a mark).
+pub(crate) fn painted_inside(h: &Harness<'_, Moonglow>, within: egui::Rect) -> bool {
+    let mut seen = false;
+    for clipped in &h.output().shapes {
+        painted(&clipped.shape, &mut |shape| {
+            let r = shape.visual_bounding_rect();
+            let text = matches!(shape, egui::Shape::Text(_));
+            seen |= !text && r.is_positive() && within.contains_rect(r);
+        });
+    }
+    seen
+}
+
+/// The rectangle around what the last frame painted, other than text,
+/// inside `within` (an icon's ink).
+pub(crate) fn painted_extent(h: &Harness<'_, Moonglow>, within: egui::Rect) -> Option<egui::Rect> {
+    let mut seen: Option<egui::Rect> = None;
+    for clipped in &h.output().shapes {
+        painted(&clipped.shape, &mut |shape| {
+            let r = shape.visual_bounding_rect();
+            let text = matches!(shape, egui::Shape::Text(_));
+            if !text && r.is_positive() && within.contains_rect(r) {
+                seen = Some(seen.map_or(r, |s| s.union(r)));
+            }
+        });
+    }
+    seen
+}
+
+fn painted(shape: &egui::Shape, f: &mut impl FnMut(&egui::Shape)) {
+    match shape {
+        egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| painted(s, f)),
+        shape => f(shape),
+    }
+}
+
+/// How many outlines in the accent (one point wide) are drawn round a
+/// rectangle `high` or taller as the last frame had them: the ring round a
+/// list that has the keys ([`mg_ui::palette_view::keys_are_the_logs`]'s
+/// sibling in the lists' own panes).
+pub(crate) fn accent_outlines(h: &Harness<'_, Moonglow>, high: f32) -> usize {
+    let accent = mg_uikit::tokens(&h.ctx).accent;
+    (h.output().shapes.iter())
+        .filter(|c| match &c.shape {
+            egui::Shape::Rect(r) => {
+                r.stroke.color == accent && r.stroke.width == 1.0 && r.rect.height() >= high
+            }
+            _ => false,
+        })
+        .count()
 }

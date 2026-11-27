@@ -1,6 +1,6 @@
 //! Trigger Properties (`TdlgTriggerEdit`): Basic, Area Transition, Trap,
-//! Scripts, Advanced, Comments. The Area Transition and Trap pages apply to
-//! those trigger types.
+//! Scripts, Advanced, Variables, Visuals, Comments. The Area Transition and
+//! Trap pages apply to those trigger types.
 
 use egui::Ui;
 use mg_gff::FieldType;
@@ -9,8 +9,8 @@ use mg_rules::Choice;
 
 use super::{Form, situated};
 
-pub(super) const PAGES: [&str; 7] =
-    ["Basic", "Area Transition", "Trap", "Scripts", "Advanced", "Visuals", "Comments"];
+pub(super) const PAGES: [&str; 8] =
+    ["Basic", "Area Transition", "Trap", "Scripts", "Advanced", "Variables", "Visuals", "Comments"];
 
 /// Trigger types (`Type`).
 const TYPES: [(i64, &str); 3] = [(0, "Generic"), (1, "Area Transition"), (2, "Trap")];
@@ -48,20 +48,56 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
         .iter()
         .map(|(row, text)| Choice { row: *row as usize, text: (*text).into() })
         .collect();
-    egui::Grid::new(("utt-basic", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        crate::widgets::field_label(ui, "Name");
-        f.locstring(ui, "Name", "LocalizedName");
-        ui.end_row();
-        crate::widgets::field_label(ui, "Tag");
-        f.tag(ui, "Tag", "Tag");
-        ui.end_row();
-        crate::widgets::field_label(ui, "Trigger Type");
-        f.choice(ui, "Trigger type", "Type", &types, FieldType::Int);
+    super::form_grid(ui, ("utt-basic", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+        f.name_and_tag(ui, "LocalizedName");
+        crate::widgets::field_label(ui, "Trigger type");
+        trigger_type(f, ui, &types);
         ui.end_row();
         crate::widgets::field_label(ui, "Category");
         f.category(ui, BlueprintKind::Trigger);
         ui.end_row();
     });
+}
+
+/// Trigger Type, as Aurora's: a trigger made an area transition takes the
+/// transition cursor too (`Cursor` 1) where it had none (0), in the same
+/// step; made generic or a trap, only its type changes (captured:
+/// `transition-triggers/06-typechange.mod`). Each trigger edited together
+/// by its own cursor.
+fn trigger_type(f: &mut Form<'_>, ui: &mut Ui, types: &[Choice]) {
+    f.mark_mixed(ui, "Type");
+    let current = f.int("Type");
+    let Some(v) = crate::widgets::row_choice(f.id("Type"), types, current).width(220.0).show(ui)
+    else {
+        return;
+    };
+    let typed =
+        super::integer(f.root.get("Type"), v, f.schema_type("Type").unwrap_or(FieldType::Int));
+    let cursor_type = f.schema_type("Cursor").unwrap_or(FieldType::Byte);
+    let targets: Vec<(mg_resman::ResKey, mg_gff::GffPath)> =
+        f.targets().map(|(k, p)| (k, p.clone())).collect();
+    let mut edits = Vec::new();
+    for (key, path) in targets {
+        let cursor = match key == f.key && path == f.path {
+            true => f.root.get("Cursor").cloned(),
+            false => (f.app.ws.as_mut())
+                .and_then(|ws| ws.doc(&key).ok())
+                .and_then(|d| path.get(&d.root))
+                .and_then(|s| s.get("Cursor").cloned()),
+        };
+        let set = |label: &str, value| mg_edit::Edit::SetField {
+            key,
+            path: path.clone(),
+            label: label.into(),
+            value: Some(value),
+        };
+        edits.push(set("Type", typed.clone()));
+        let none = cursor.as_ref().is_none_or(|c| c.as_integer() == Some(0));
+        if v == 1 && none {
+            edits.push(set("Cursor", super::integer(cursor.as_ref(), 1, cursor_type)));
+        }
+    }
+    f.app.actions.push(crate::Action::Apply(mg_edit::Command::new("Trigger type", edits)));
 }
 
 fn transition(f: &mut Form<'_>, ui: &mut Ui) {
@@ -74,18 +110,18 @@ fn transition(f: &mut Form<'_>, ui: &mut Ui) {
 
 fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
     let cursors = f.choices("cursors", None, Some("Label"));
-    egui::Grid::new(("utt-advanced", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+    super::form_grid(ui, ("utt-advanced", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
         crate::widgets::field_label(ui, "Blueprint ResRef");
         f.blueprint_resref(ui);
         ui.end_row();
         crate::widgets::field_label(ui, "Faction");
         situated::faction(f, ui, "Faction", "Faction");
         ui.end_row();
-        crate::widgets::field_label(ui, "Key Tag");
+        crate::widgets::field_label(ui, "Key tag");
         f.text(ui, "Key tag", "KeyName", 32);
         ui.end_row();
         crate::widgets::field_label(ui, "");
-        f.check(ui, "Auto Remove Key", "AutoRemoveKey");
+        f.check(ui, "Auto remove key", "AutoRemoveKey");
         ui.end_row();
         crate::widgets::field_label(ui, "Cursor");
         f.choice(ui, "Cursor", "Cursor", &cursors, FieldType::Byte);
@@ -93,7 +129,7 @@ fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
         crate::widgets::field_label(ui, "Portrait");
         situated::portrait(f, ui);
         ui.end_row();
-        crate::widgets::field_label(ui, "Highlight Height");
+        crate::widgets::field_label(ui, "Highlight height");
         f.spin_float(ui, "Highlight height", "HighlightHeight", 0.0..=10.0, 0.1, 1.0);
         ui.end_row();
         crate::widgets::field_label(ui, "Variables");

@@ -74,84 +74,138 @@ pub struct Compiled {
     pub notes: Vec<(usize, String)>,
 }
 
-/// A mesh's tangents as the game's compiler makes them (nwn-mdl-spec
-/// MDL-MESH-043), from its first UV set, triangle by triangle in the index
-/// list: each adds its tangent to its corners' vertices, the first to
-/// reach a vertex giving its handedness; one of the other handedness
-/// takes a copy of the vertex instead (once per vertex and handedness;
-/// an animated mesh's vertex is overwritten), its corner in the index list
-/// rewritten, the faces left. Then each is made square to the normal and
-/// unit. A triangle flat in UV adds its normals' mean, turned (y, z, x).
-fn engine_tangents(mesh: &mut Mesh) {
+/// How the game's compiler splits a mesh's vertices for its tangents
+/// (nwn-mdl-spec MDL-MESH-043; [`handedness_split`]): its triangles with
+/// their corners rewritten, the vertex each copy is of (the copies follow
+/// the mesh's vertices, in this order), and each vertex's handedness and
+/// copies' (1, or −1 where the texture is mirrored; 0 for one no triangle
+/// reaches).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HandednessSplit {
+    pub triangles: Vec<[u32; 3]>,
+    pub copies: Vec<u32>,
+    pub handedness: Vec<f32>,
+}
+
+impl HandednessSplit {
+    /// The vertex of the mesh that vertex `v` (of the mesh's and the
+    /// copies) is, or is a copy of.
+    pub fn original(&self, v: usize, count: usize) -> usize {
+        match v.checked_sub(count) {
+            Some(k) => self.copies.get(k).map_or(v, |&o| o as usize),
+            None => v,
+        }
+    }
+}
+
+/// A triangle's tangent and handedness from its first UV set, as the
+/// game's compiler takes them: flat in UV, its normals' mean turned
+/// (y, z, x), handedness 1. The game's client makes an ASCII model's
+/// tangents at load by the same rule (`reading_tangents_flat_in_uv` in
+/// `client_render.rs`), which Moonglow's renderer takes for the
+/// tangents it makes. (A coordinate or normal the mesh lacks is zero;
+/// the corners are the mesh's vertices.)
+pub fn triangle_tangent(mesh: &Mesh, [a, b, c]: [usize; 3]) -> (Vec3, f32) {
+    let p = &mesh.vertices;
+    let uv = |v: usize| mesh.uvs[0].get(v).copied().unwrap_or([0.0, 0.0]);
+    let (e1, e2) = (sub(p[b], p[a]), sub(p[c], p[a]));
+    let (du1, dv1) = (uv(b)[0] - uv(a)[0], uv(b)[1] - uv(a)[1]);
+    let (du2, dv2) = (uv(c)[0] - uv(a)[0], uv(c)[1] - uv(a)[1]);
+    let det = du1 * dv2 - du2 * dv1;
+    if det != 0.0 {
+        (
+            std::array::from_fn(|k| (dv2 * e1[k] - dv1 * e2[k]) / det),
+            if det >= 0.0 { 1.0 } else { -1.0 },
+        )
+    } else {
+        let n = |v: usize| mesh.normals.get(v).copied().unwrap_or([0.0; 3]);
+        let mean: Vec3 = std::array::from_fn(|k| (n(a)[k] + n(b)[k] + n(c)[k]) / 3.0);
+        ([mean[1], mean[2], mean[0]], 1.0)
+    }
+}
+
+/// The game's compiler's split of a mesh's vertices by the handedness of
+/// the triangles that reach them (MDL-MESH-043), triangle by triangle in
+/// the index list: the first to reach a vertex gives its handedness; one
+/// of the other handedness takes a copy of the vertex instead (once per
+/// vertex and handedness), its corner rewritten. An animated mesh's vertex
+/// is not copied: its handedness is the last triangle's. `None` for a mesh
+/// whose texture coordinates or normals aren't one a vertex. The game's
+/// client splits a model it reads as text so at load (`reading_tangents`
+/// in `client_render.rs`); Moonglow's renderer takes it for the tangents it
+/// makes.
+pub fn handedness_split(mesh: &Mesh) -> Option<HandednessSplit> {
     let count = mesh.vertices.len();
     if mesh.uvs[0].len() != count || mesh.normals.len() != count {
-        return;
+        return None;
     }
     let animated = matches!(mesh.extra, MeshExtra::Anim(_));
-    let mut tris: Vec<[u32; 3]> = mesh.triangles().collect();
-    let mut tan: Vec<Vec3> = vec![[0.0; 3]; count];
+    let mut triangles: Vec<[u32; 3]> = mesh.triangles().collect();
     let mut hand: Vec<f32> = vec![0.0; count];
-    let mut copies: HashMap<(u32, i8), u32> = HashMap::new();
-    let mut cloned = false;
-    for tri in &mut tris {
+    let mut copies: Vec<u32> = Vec::new();
+    let mut made: HashMap<(u32, i8), u32> = HashMap::new();
+    for tri in &mut triangles {
         let [a, b, c] = tri.map(|v| v as usize);
-        if a >= mesh.vertices.len() || b >= mesh.vertices.len() || c >= mesh.vertices.len() {
+        if a >= count || b >= count || c >= count {
             continue;
         }
-        let (p, uv) = (&mesh.vertices, &mesh.uvs[0]);
-        let (e1, e2) = (sub(p[b], p[a]), sub(p[c], p[a]));
-        let (du1, dv1) = (uv[b][0] - uv[a][0], uv[b][1] - uv[a][1]);
-        let (du2, dv2) = (uv[c][0] - uv[a][0], uv[c][1] - uv[a][1]);
-        let det = du1 * dv2 - du2 * dv1;
-        let (t, w): (Vec3, f32) = if det != 0.0 {
-            (
-                std::array::from_fn(|k| (dv2 * e1[k] - dv1 * e2[k]) / det),
-                if det >= 0.0 { 1.0 } else { -1.0 },
-            )
-        } else {
-            let n = &mesh.normals;
-            let mean: Vec3 = std::array::from_fn(|k| (n[a][k] + n[b][k] + n[c][k]) / 3.0);
-            ([mean[1], mean[2], mean[0]], 1.0)
-        };
+        let (_, w) = triangle_tangent(mesh, [a, b, c]);
         for corner in tri.iter_mut() {
-            let mut v = *corner as usize;
+            let v = *corner as usize;
             if hand[v] == 0.0 {
                 hand[v] = w;
             } else if hand[v] != w {
                 if animated {
                     hand[v] = w;
                 } else {
-                    let key = (*corner, w as i8);
-                    let copy = match copies.get(&key) {
-                        Some(&i) => i as usize,
-                        None => {
-                            let i = clone_vertex(mesh, v);
-                            tan.push([0.0; 3]);
-                            hand.push(w);
-                            copies.insert(key, i as u32);
-                            i
-                        }
-                    };
-                    *corner = copy as u32;
-                    v = copy;
-                    cloned = true;
+                    let copy = *made.entry((*corner, w as i8)).or_insert_with(|| {
+                        copies.push(*corner);
+                        hand.push(w);
+                        (count + copies.len() - 1) as u32
+                    });
+                    *corner = copy;
                 }
             }
+        }
+    }
+    Some(HandednessSplit { triangles, copies, handedness: hand })
+}
+
+/// A mesh's tangents as the game's compiler makes them (nwn-mdl-spec
+/// MDL-MESH-043), from its first UV set, its vertices split by the
+/// handedness of the triangles that reach them ([`handedness_split`]):
+/// each triangle adds its tangent to its corners' vertices (a copy's
+/// appended to the mesh, its corner in the index list rewritten, the faces
+/// left). Then each is made square to the normal and unit.
+fn engine_tangents(mesh: &mut Mesh) {
+    let count = mesh.vertices.len();
+    let Some(split) = handedness_split(mesh) else { return };
+    let mut tan: Vec<Vec3> = vec![[0.0; 3]; split.handedness.len()];
+    for (tri, original) in split.triangles.iter().zip(mesh.triangles()) {
+        let [a, b, c] = original.map(|v| v as usize);
+        if a >= count || b >= count || c >= count {
+            continue;
+        }
+        let (t, _) = triangle_tangent(mesh, [a, b, c]);
+        for &v in tri {
             for k in 0..3 {
-                tan[v][k] += t[k];
+                tan[v as usize][k] += t[k];
             }
         }
+    }
+    for &v in &split.copies {
+        clone_vertex(mesh, v as usize);
     }
     mesh.tangents = (0..mesh.vertices.len())
         .map(|v| {
             let n = mesh.normals[v];
             let d = dot(n, tan[v]);
             let t = crate::engine_normalize(std::array::from_fn(|k| tan[v][k] - n[k] * d));
-            [t[0], t[1], t[2], hand[v]]
+            [t[0], t[1], t[2], split.handedness[v]]
         })
         .collect();
-    if cloned {
-        mesh.drawn = tris;
+    if !split.copies.is_empty() {
+        mesh.drawn = split.triangles;
     }
 }
 
@@ -229,7 +283,7 @@ pub fn aabb_tree(mesh: &Mesh) -> Vec<AabbEntry> {
 
 type Quat = [f32; 4];
 
-fn quat_mul(a: Quat, b: Quat) -> Quat {
+pub(crate) fn quat_mul(a: Quat, b: Quat) -> Quat {
     let ([ax, ay, az, aw], [bx, by, bz, bw]) = (a.map(f64::from), b.map(f64::from));
     [
         aw * bx + ax * bw + ay * bz - az * by,
@@ -240,7 +294,7 @@ fn quat_mul(a: Quat, b: Quat) -> Quat {
     .map(|x| x as f32)
 }
 
-fn quat_unit(q: Quat) -> Quat {
+pub(crate) fn quat_unit(q: Quat) -> Quat {
     let len = q.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
     if len < 1e-12 { crate::IDENTITY } else { q.map(|x| (f64::from(x) / len) as f32) }
 }
@@ -249,7 +303,7 @@ fn quat_conjugate(q: Quat) -> Quat {
     [-q[0], -q[1], -q[2], q[3]]
 }
 
-fn rotate(q: Quat, v: Vec3) -> Vec3 {
+pub(crate) fn rotate(q: Quat, v: Vec3) -> Vec3 {
     let p = quat_mul(quat_mul(q, [v[0], v[1], v[2], 0.0]), quat_conjugate(q));
     [p[0], p[1], p[2]]
 }
@@ -296,7 +350,11 @@ pub fn compile(text: &[u8], sources: &Sources<'_>) -> Result<Compiled, CompileEr
     let line = |node: usize| map.nodes.get(node).map_or(0, |s| s.start);
 
     // Whether a node's block has a keyword (lines are numbered from 1).
-    let text_lines: Vec<&str> = std::str::from_utf8(text).unwrap_or("").lines().collect();
+    // (Read as the reader reads it, so that the lines are its lines: a
+    // byte that is no UTF-8, an exporter's Latin-1 file name, is one
+    // character of its line.)
+    let lossy = String::from_utf8_lossy(text);
+    let text_lines: Vec<&str> = lossy.lines().collect();
     let says =
         |node: usize, keyword: &str| {
             let Some(span) = map.nodes.get(node).filter(|s| s.start > 0) else { return true };
@@ -676,6 +734,28 @@ endmodelgeom m\ndonemodel m\n";
         assert_eq!((of("m"), of("b"), of("a"), of("floor")), (0, 1, 2, 3));
     }
 
+    /// A mesh keeps the shininess its text gives, and has 1 where it gives
+    /// none, whatever bytes the text holds: with one byte that is no UTF-8
+    /// (an exporter's file name in Windows-1252, in a comment or a
+    /// `filedependancy`) no keyword was found in any node, and every mesh
+    /// was compiled with a shininess of 1 (the review's M8).
+    #[test]
+    fn a_text_that_is_not_utf_8_keeps_its_shininess() {
+        let shiny = MODEL.replace("  bitmap wood\n", "  bitmap wood\n  shininess 26\n");
+        let shininess = |text: &[u8], node: &str| {
+            let compiled = compile(text, &Sources::default()).unwrap();
+            let back = Model::read(&compiled.binary).unwrap();
+            back.nodes[back.node(node).unwrap()].mesh().unwrap().shininess
+        };
+        assert_eq!(shininess(shiny.as_bytes(), "b"), 26.0);
+        assert_eq!(shininess(shiny.as_bytes(), "floor"), 1.0);
+        let mut latin = b"# mod\xE8le.max\nfiledependancy caf\xE9.max\n".to_vec();
+        latin.extend_from_slice(shiny.as_bytes());
+        assert!(std::str::from_utf8(&latin).is_err());
+        assert_eq!(shininess(&latin, "b"), 26.0);
+        assert_eq!(shininess(&latin, "floor"), 1.0);
+    }
+
     #[test]
     fn a_model_compiled_before_keeps_its_numbers() {
         let first = compile(MODEL.as_bytes(), &Sources::default()).unwrap();
@@ -791,5 +871,52 @@ endmodelgeom m\ndonemodel m\n";
         let names: Vec<&str> = skin.bones.iter().map(|&b| back.nodes[b].name.as_str()).collect();
         assert_eq!(names, ["a", "m"]);
         assert_eq!(skin.weights.len(), 3);
+    }
+
+    #[test]
+    fn normal_mapped_mirrored_uv_seam_keeps_split_drawn_indices_on_binary_load() {
+        // Two triangles sharing vertices 0 and 1 along the diagonal, with
+        // opposite UV handedness across the diagonal so engine_tangents splits them.
+        let text = "newmodel seam
+setsupermodel seam NULL
+classification tile
+beginmodelgeom seam
+node dummy seam
+  parent NULL
+endnode
+node trimesh quad
+  parent seam
+  renderhint normaltangents
+  verts 4
+    0.0 0.0 0.0
+    1.0 0.0 0.0
+    1.0 1.0 0.0
+    0.0 1.0 0.0
+  tverts 4
+    0.0 0.0 0.0
+    1.0 0.0 0.0
+    1.0 1.0 0.0
+    1.0 0.0 0.0
+  faces 2
+    0 1 2 1 0 1 2 0
+    0 2 3 1 0 2 3 0
+endnode
+endmodelgeom seam
+donemodel seam
+";
+        let mut expected = Model::read(text.as_bytes()).unwrap();
+        let NodeKind::Mesh(expected_mesh) = &mut expected.nodes[1].kind else { panic!() };
+        engine_tangents(expected_mesh);
+        assert!(!expected_mesh.drawn.is_empty(), "expected mirrored seam split");
+        assert!(expected_mesh.tangents.len() > 4);
+
+        let out = compile(text.as_bytes(), &Sources::default()).unwrap();
+        let back = Model::read(&out.binary).unwrap();
+        let read_mesh = back.nodes[1].mesh().unwrap();
+        assert_eq!(read_mesh.drawn, expected_mesh.drawn);
+        let compiled_mesh = expected_mesh;
+        assert_eq!(read_mesh.tangents, compiled_mesh.tangents);
+        assert!(read_mesh.tangents.iter().any(|t| t[3] > 0.0));
+        assert!(read_mesh.tangents.iter().any(|t| t[3] < 0.0));
     }
 }

@@ -152,13 +152,21 @@ pub fn links(g: &Gff, parent: Parent) -> &[Struct] {
     }
 }
 
-/// Adds a starting link to an NPC line already made (a conversation may
-/// start at the same line under two conditions).
-pub fn add_start(g: &mut Gff, target: u32) -> bool {
+/// Adds a starting link without renumbering the entire dialog tree.
+pub(crate) fn add_start_raw(g: &mut Gff, target: u32) -> bool {
     if node(g, Kind::Entry, target).is_none() {
         return false;
     }
     list_mut(g, "StartingList").push(new_link(target, Parent::Root, false));
+    true
+}
+
+/// Adds a starting link to an NPC line already made (a conversation may
+/// start at the same line under two conditions).
+pub fn add_start(g: &mut Gff, target: u32) -> bool {
+    if !add_start_raw(g, target) {
+        return false;
+    }
     renumber(g);
     true
 }
@@ -204,8 +212,8 @@ pub fn is_link(link: &Struct) -> bool {
     link.byte("IsChild") == Some(1)
 }
 
-/// Adds a new line under a parent (last), and returns its index.
-pub fn add_node(g: &mut Gff, parent: Parent, text: &str) -> u32 {
+/// Adds a new line under a parent (last) without renumbering, returning its index.
+pub(crate) fn add_node_raw(g: &mut Gff, parent: Parent, text: &str) -> u32 {
     let kind = parent.child_kind();
     let nodes = list_mut(g, kind.list());
     nodes.push(new_node(kind, text));
@@ -213,17 +221,31 @@ pub fn add_node(g: &mut Gff, parent: Parent, text: &str) -> u32 {
     if let Some(l) = links_mut(g, parent) {
         l.push(new_link(index, parent, false));
     }
+    index
+}
+
+/// Adds a new line under a parent (last), and returns its index.
+pub fn add_node(g: &mut Gff, parent: Parent, text: &str) -> u32 {
+    let index = add_node_raw(g, parent, text);
     renumber(g);
     index
 }
 
-/// Adds a link under a parent to an existing line (Paste As Link).
-pub fn add_link(g: &mut Gff, parent: Parent, target: u32) -> bool {
+/// Adds a link under a parent to an existing line without renumbering.
+pub(crate) fn add_link_raw(g: &mut Gff, parent: Parent, target: u32) -> bool {
     if parent == Parent::Root || node(g, parent.child_kind(), target).is_none() {
         return false;
     }
     let Some(l) = links_mut(g, parent) else { return false };
     l.push(new_link(target, parent, true));
+    true
+}
+
+/// Adds a link under a parent to an existing line (Paste As Link).
+pub fn add_link(g: &mut Gff, parent: Parent, target: u32) -> bool {
+    if !add_link_raw(g, parent, target) {
+        return false;
+    }
     renumber(g);
     true
 }
@@ -491,16 +513,46 @@ impl Renumbering {
     }
 }
 
+fn hash_value(v: Option<&Value>, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match v {
+        None => 0u8.hash(h),
+        Some(Value::LocString(ls)) => {
+            1u8.hash(h);
+            ls.hash(h);
+        }
+        Some(Value::String(b)) => {
+            2u8.hash(h);
+            b.hash(h);
+        }
+        Some(Value::ResRef(b)) => {
+            3u8.hash(h);
+            b.hash(h);
+        }
+        Some(other) => {
+            4u8.hash(h);
+            format!("{other:?}").hash(h);
+        }
+    }
+}
+
 /// Each line's signature for [`Renumbering::by_lines`], entries' then
 /// replies': a hash of its text and speaker, then each owning line's up
 /// to Root (an extra 0 for a line no owning link reaches).
 fn signatures(g: &Gff) -> [Vec<Vec<u64>>; 2] {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     let own = |n: &Struct| {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}{:?}", n.get("Text"), n.get("Speaker")).hash(&mut h);
+        hash_value(n.get("Text"), &mut h);
+        hash_value(n.get("Speaker"), &mut h);
         h.finish() | 1
     };
+    // (Each line's own, once: it was made again for every line under it,
+    // a greeting of 30,000 characters written out for each of a thousand
+    // descendants, at every edit of the conversation.)
+    let owns = [Kind::Entry, Kind::Reply].map(|k| nodes(g, k).iter().map(own).collect::<Vec<_>>());
+    let own_of =
+        |(kind, index): (Kind, u32)| owns[kind as usize].get(index as usize).copied().unwrap_or(0);
     // (Each line's owner, the first as `owner` finds it.)
     let mut up: HashMap<(Kind, u32), (Kind, u32)> = HashMap::new();
     let mut roots = HashSet::new();
@@ -523,7 +575,7 @@ fn signatures(g: &Gff) -> [Vec<Vec<u64>>; 2] {
         let mut at = (kind, index);
         let mut path = HashSet::new();
         loop {
-            out.push(node(g, at.0, at.1).map_or(0, own));
+            out.push(own_of(at));
             if at.0 == Kind::Entry && roots.contains(&at.1) {
                 break;
             }
@@ -605,7 +657,7 @@ fn prune(g: &mut Gff) -> Renumbering {
 }
 
 /// Struct ids as Aurora writes them: each list's index, and the word count.
-fn renumber(g: &mut Gff) {
+pub(crate) fn renumber(g: &mut Gff) {
     fn ids(list: &mut [Struct]) {
         for (i, s) in list.iter_mut().enumerate() {
             s.id = i as u32;
@@ -650,12 +702,16 @@ pub fn word_count(g: &Gff) -> u32 {
         .iter()
         .flat_map(|k| nodes(g, *k))
         .filter_map(|n| n.locstring("Text"))
-        .map(|t| {
-            t.strings.first().map_or(0, |(_, b)| {
-                b.split(|c| c.is_ascii_whitespace()).filter(|w| !w.is_empty()).count()
-            })
-        })
-        .sum::<usize>() as u32
+        .map(words_of)
+        .sum()
+}
+
+/// The words of one line's text, as [`word_count`] counts them (its first
+/// language's): what a change of the line's text changes the count by.
+pub fn words_of(text: &LocString) -> u32 {
+    text.strings.first().map_or(0, |(_, b)| {
+        b.split(|c| c.is_ascii_whitespace()).filter(|w| !w.is_empty()).count() as u32
+    })
 }
 
 /// A copied branch: its lines (the first is the top), with links between
@@ -672,18 +728,55 @@ pub struct Branch {
     condition: Vec<(&'static str, Value)>,
 }
 
+impl Branch {
+    /// Has the branch follow the lines of the conversation it was copied
+    /// from across a change that numbered them anew (`map`): the links
+    /// out of it go on naming their lines, and one whose line was deleted
+    /// is dropped. Without it, a branch copied before a line was deleted
+    /// pasted its links at whatever lines had those numbers by then. (The
+    /// lines it copied are told from the conversation's by their numbers
+    /// too: they are numbered along, and one whose original is gone gets
+    /// a number no line has.)
+    pub fn renumber(&mut self, map: &Renumbering) {
+        let now: Vec<(Kind, u32)> = (self.origin.iter().enumerate())
+            .map(|(at, &(k, i))| (k, map.line(k, i).unwrap_or(u32::MAX - at as u32)))
+            .collect();
+        let inside: HashMap<(Kind, u32), u32> =
+            self.origin.iter().copied().zip(now.iter().map(|n| n.1)).collect();
+        for (k, line) in &mut self.lines {
+            let Some(l) = line.list_mut(k.links()) else { continue };
+            l.retain_mut(|link| {
+                let target = (k.child(), link_index(link));
+                let to = match inside.get(&target) {
+                    Some(n) => Some(*n),
+                    None => map.line(target.0, target.1),
+                };
+                if let Some(n) = to {
+                    link.set("Index", Value::Dword(n));
+                }
+                to.is_some()
+            });
+        }
+        self.origin = now;
+    }
+}
+
 /// Copies the branch a link under a parent points to (following owning
-/// links).
+/// links). A link to a line that isn't there (another tool's file) is no
+/// part of it: the lines and where each came from are made together, one
+/// for one. `None` where the link itself leads to no line.
 pub fn copy_branch(g: &Gff, parent: Parent, pos: usize) -> Option<Branch> {
     let link = links(g, parent).get(pos)?;
     let top = (parent.child_kind(), link_index(link));
-    let mut order = Vec::new();
+    let (mut lines, mut order) = (Vec::new(), Vec::new());
     let mut seen = HashSet::new();
     let mut stack = vec![top];
     while let Some((k, i)) = stack.pop() {
         if !seen.insert((k, i)) {
             continue;
         }
+        let Some(line) = node(g, k, i) else { continue };
+        lines.push((k, line.clone()));
         order.push((k, i));
         for l in links(g, Parent::Node(k, i)).iter().rev() {
             if !is_link(l) {
@@ -691,7 +784,9 @@ pub fn copy_branch(g: &Gff, parent: Parent, pos: usize) -> Option<Branch> {
             }
         }
     }
-    let lines = order.iter().filter_map(|(k, i)| Some((*k, node(g, *k, *i)?.clone()))).collect();
+    if lines.is_empty() {
+        return None;
+    }
     let condition = ["Active", "ConditionParams"]
         .into_iter()
         .filter_map(|label| Some((label, link.get(label)?.clone())))
@@ -758,7 +853,8 @@ pub fn text(n: &Struct) -> String {
 /// The conversation as an indented outline, starting links first:
 /// `kind|text|link?|condition|params` per line, links not followed. Two
 /// conversations with the same outline behave the same, whatever the order
-/// of their node lists.
+/// of their node lists. A line more than one line owns is followed under
+/// the first alone (such lines may own each other in a loop).
 pub fn outline(g: &Gff) -> Vec<String> {
     fn params(s: &Struct, label: &str) -> String {
         s.list(label)
@@ -772,7 +868,8 @@ pub fn outline(g: &Gff) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(",")
     }
-    fn walk(g: &Gff, parent: Parent, depth: usize, out: &mut Vec<String>) {
+    type Seen = HashSet<(Kind, u32)>;
+    fn walk(g: &Gff, parent: Parent, depth: usize, seen: &mut Seen, out: &mut Vec<String>) {
         let kind = parent.child_kind();
         for l in links(g, parent) {
             let i = link_index(l);
@@ -791,13 +888,13 @@ pub fn outline(g: &Gff) -> Vec<String> {
                 n.dword("Animation").unwrap_or(0),
                 String::from_utf8_lossy(n.string("Comment").unwrap_or_default()),
             ));
-            if !is_link(l) {
-                walk(g, Parent::Node(kind, i), depth + 1, out);
+            if !is_link(l) && seen.insert((kind, i)) {
+                walk(g, Parent::Node(kind, i), depth + 1, seen, out);
             }
         }
     }
     let mut out = Vec::new();
-    walk(g, Parent::Root, 0, &mut out);
+    walk(g, Parent::Root, 0, &mut Seen::new(), &mut out);
     out
 }
 
@@ -1032,6 +1129,32 @@ mod tests {
         assert_eq!([map.line(e, 0), map.line(e, 1)], [Some(0), None]);
     }
 
+    /// A long conversation's lines are found again in time: each line's
+    /// text is written out and hashed once, not once for every line under
+    /// it (a greeting of 30,000 characters over a chain of 2,000 lines
+    /// was, at every edit: the review of November 2026, D26). What is
+    /// found is the same.
+    #[test]
+    fn a_long_chain_s_lines_are_found_again_in_time() {
+        let mut before = new_dialog();
+        let greeting = "word ".repeat(6_000);
+        let mut at = Parent::Root;
+        for i in 0..2_000 {
+            let text = if i == 0 { greeting.clone() } else { format!("Line {i}.") };
+            let line = add_node(&mut before, at, &text);
+            at = Parent::Node(at.child_kind(), line);
+        }
+        // The last line taken off: every other is found where it was.
+        let mut after = before.clone();
+        let known = remove(&mut after, Parent::Node(Kind::Reply, 998), 0);
+        let began = std::time::Instant::now();
+        let found = Renumbering::by_lines(&before, &after);
+        let took = began.elapsed();
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+        assert_eq!(found, known);
+        assert_eq!((found.line(Kind::Entry, 999), found.line(Kind::Entry, 500)), (None, Some(500)));
+    }
+
     #[test]
     fn owners() {
         let g = sample();
@@ -1067,5 +1190,76 @@ mod tests {
         assert_eq!(pasted.resref("Active").map(|r| r.to_string()).as_deref(), Some("cond_weapmod"));
         assert_eq!(pasted.get("ConditionParams"), Some(&params));
         assert!(!is_link(pasted) && link_index(pasted) != link_index(&links(&g, Parent::Root)[0]));
+    }
+
+    /// A branch with an owning link to a line that isn't there (another
+    /// tool's file) is copied without it, and the copy's own links lead to
+    /// the copies (the review's V18: the lines after the missing one were
+    /// each taken for the one before, and a missing top line panicked).
+    #[test]
+    fn a_branch_with_a_link_to_no_line_is_pasted_without_it() {
+        let mut g = new_dialog();
+        let top = add_node(&mut g, Parent::Root, "Top");
+        let at = Parent::Node(Kind::Entry, top);
+        let one = add_node(&mut g, at, "one");
+        // (Between its two replies: a reply that is not in the list.)
+        links_mut(&mut g, at).unwrap().push(new_link(999, at, false));
+        let two = add_node(&mut g, at, "two");
+        add_node(&mut g, Parent::Node(Kind::Reply, one), "after one");
+        let last = add_node(&mut g, Parent::Node(Kind::Reply, two), "after two");
+        add_node(&mut g, Parent::Node(Kind::Entry, last), "the end");
+        let before = outline(&g);
+        assert_eq!(before.len(), 6, "the link to no line is no line: {before:?}");
+        let branch = copy_branch(&g, Parent::Root, 0).unwrap();
+        assert_eq!(branch.lines.len(), 6);
+        assert!(paste_branch(&mut g, Parent::Root, &branch, true));
+        let after = outline(&g);
+        assert_eq!(after[..6], before[..], "the original as it was");
+        assert_eq!(after[6..], before[..], "the copy has the same lines, each under its own");
+        // A link that leads to no line copies nothing, and nothing is pasted.
+        let none = Parent::Node(Kind::Entry, top);
+        assert_eq!(copy_branch(&g, none, 1), None);
+    }
+
+    /// A branch copied with a link out of it keeps naming that line
+    /// across a delete that numbers the lines anew (the review of November
+    /// 2026, D11): pasted, its link leads to the line it led to, not to
+    /// the one that has its old number; a link whose line is gone is left
+    /// out, and the lines it copied stay its own.
+    #[test]
+    fn a_copied_branch_follows_the_lines_it_links_to() {
+        let mut g = new_dialog();
+        let first = add_node(&mut g, Parent::Root, "First.");
+        add_node(&mut g, Parent::Node(Kind::Entry, first), "Gone.");
+        let kept = add_node(&mut g, Parent::Node(Kind::Entry, first), "Kept.");
+        let second = add_node(&mut g, Parent::Root, "Second.");
+        let own = add_node(&mut g, Parent::Node(Kind::Entry, second), "Mine.");
+        assert!(add_link(&mut g, Parent::Node(Kind::Entry, second), kept));
+        let mut branch = copy_branch(&g, Parent::Root, 1).unwrap();
+        assert_eq!(branch.lines.len(), 2, "Second. and its own reply");
+        // "Gone." (reply 0) is deleted: "Kept." is reply 0 now, "Mine." 1.
+        let map = remove(&mut g, Parent::Node(Kind::Entry, first), 0);
+        assert_eq!((map.line(Kind::Reply, kept), map.line(Kind::Reply, own)), (Some(0), Some(1)));
+        branch.renumber(&map);
+        assert!(paste_branch(&mut g, Parent::Root, &branch, true));
+        let pasted = link_index(links(&g, Parent::Root).last().unwrap());
+        let under: Vec<(String, bool)> = links(&g, Parent::Node(Kind::Entry, pasted))
+            .iter()
+            .map(|l| (text(node(&g, Kind::Reply, link_index(l)).unwrap()), is_link(l)))
+            .collect();
+        assert_eq!(under, [("Mine.".to_string(), false), ("Kept.".to_string(), true)]);
+        // (Its own reply is a copy, not the original's line.)
+        let mine = link_index(&links(&g, Parent::Node(Kind::Entry, pasted))[0]);
+        assert_ne!(mine, 1);
+        // The line it links to deleted too: the link goes, its own stays.
+        let map = remove(&mut g, Parent::Node(Kind::Entry, first), 0);
+        branch.renumber(&map);
+        assert!(paste_branch(&mut g, Parent::Root, &branch, true));
+        let pasted = link_index(links(&g, Parent::Root).last().unwrap());
+        let under: Vec<String> = links(&g, Parent::Node(Kind::Entry, pasted))
+            .iter()
+            .map(|l| text(node(&g, Kind::Reply, link_index(l)).unwrap()))
+            .collect();
+        assert_eq!(under, ["Mine."]);
     }
 }

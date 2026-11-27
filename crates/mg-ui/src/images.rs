@@ -34,13 +34,49 @@ impl std::fmt::Debug for Picture {
 /// Decoded images, by lowercase name (and colouring, for PLTs).
 pub(crate) type Pictures = HashMap<String, Option<Picture>>;
 
-/// Decoded palettes (`pal_*`), by name.
-pub(crate) type Palettes = HashMap<String, Option<Arc<mg_image::Rgba>>>;
+/// Decoded palettes (`pal_*`), by name: the renderer's own keeping.
+pub(crate) use mg_render::Palettes;
+
+/// Lets go of the pictures and palettes kept of what the module's changes
+/// since the last call touched, so that a picture the module adds, changes
+/// or removes is read again (a portrait imported shows at once). `seen` is
+/// the workspace (its identity and revision) last looked at. Where what was
+/// touched isn't known (a change made outside the edit history), all are let
+/// go; another module, or none, is [`Moonglow`]'s own reset.
+pub(crate) fn forget_changed(
+    pictures: &mut Pictures,
+    palettes: &Palettes,
+    ws: Option<&Workspace>,
+    seen: &mut Option<(u64, u64)>,
+) {
+    let Some(ws) = ws else { return };
+    let now = (ws.identity(), ws.revision());
+    let was = seen.replace(now);
+    let Some((identity, revision)) = was.filter(|w| *w != now) else { return };
+    let touched = (identity == now.0).then(|| ws.touched_since(revision)).flatten();
+    let Some(touched) = touched else {
+        pictures.clear();
+        palettes.clear();
+        return;
+    };
+    let names: std::collections::HashSet<String> =
+        touched.iter().map(|t| t.key.resref.to_string().to_ascii_lowercase()).collect();
+    if names.is_empty() {
+        return;
+    }
+    // (A key is the name, or the name and `#` and how it was made; a
+    // loading screen is also read from the name with an `s` after it.)
+    pictures.retain(|key, _| {
+        let (base, how) = key.split_once('#').unwrap_or((key, ""));
+        !names.contains(base) && !(how == "loadscreen" && names.contains(&format!("{base}s")))
+    });
+    palettes.retain(|name| !names.contains(name));
+}
 
 /// Loads images from the module and the game into the cache.
 pub(crate) struct Loader<'a> {
     pub pictures: &'a mut Pictures,
-    pub palettes: &'a mut Palettes,
+    pub palettes: &'a Palettes,
     pub ws: Option<&'a Workspace>,
     pub game: &'a GameData,
 }
@@ -88,9 +124,7 @@ fn part(item: &Struct, label: &str) -> i64 {
 /// Whether an item's icon is an armor's, of parts (baseitems.2da
 /// `ModelType` 3).
 fn is_armor(game: &GameData, item: &Struct) -> bool {
-    let Ok(t) = game.table("baseitems") else { return false };
-    usize::try_from(item.integer("BaseItem").unwrap_or(-1))
-        .is_ok_and(|row| t.get_int(row, "ModelType") == Some(3))
+    u32::try_from(item.integer("BaseItem").unwrap_or(-1)).is_ok_and(|row| game.is_armor(row))
 }
 
 /// Where a resource comes from in the load order, as a builder names it,
@@ -141,19 +175,28 @@ fn screen_parts(model: &[u8]) -> Option<ScreenParts> {
         if !replaced || mesh.uvs[0].is_empty() {
             continue;
         }
-        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-        for uv in &mesh.uvs[0] {
-            for i in 0..2 {
-                lo[i] = lo[i].min(uv[i].clamp(0.0, 1.0));
-                hi[i] = hi[i].max(uv[i].clamp(0.0, 1.0));
-            }
-        }
+        let Some(part) = uv_rect(&mesh.uvs[0]) else { continue };
         let left = mesh.vertices.iter().map(|v| v[0]).fold(f32::MAX, f32::min);
-        parts.push((node.position[0] + left, [lo[0], lo[1], hi[0], hi[1]]));
+        parts.push((node.position[0] + left, part));
     }
     parts.sort_by(|a, b| a.0.total_cmp(&b.0));
     let parts: ScreenParts = parts.into_iter().map(|(_, r)| r).collect();
     (!parts.is_empty()).then_some(parts)
+}
+
+/// The rectangle `[u0, v0, u1, v1]` of a mesh's texture coordinates,
+/// within the texture. `None` where one of its sides has no number to go
+/// by (every U, or every V, a NaN): such a mesh shows no part of a
+/// picture.
+fn uv_rect(uvs: &[[f32; 2]]) -> Option<[f32; 4]> {
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for uv in uvs {
+        for i in 0..2 {
+            lo[i] = lo[i].min(uv[i].clamp(0.0, 1.0));
+            hi[i] = hi[i].max(uv[i].clamp(0.0, 1.0));
+        }
+    }
+    (lo[0] <= hi[0] && lo[1] <= hi[1]).then_some([lo[0], lo[1], hi[0], hi[1]])
 }
 
 /// A loading screen's picture from its texture (rows from the bottom, as
@@ -167,8 +210,13 @@ fn stitched(whole: &mg_image::Rgba, parts: &[[f32; 4]]) -> Option<mg_image::Rgba
     let px = |f: f32, n: usize| ((f * n as f32).round() as usize).min(n);
     let rects: Vec<[usize; 4]> =
         parts.iter().map(|p| [px(p[0], w), px(p[1], h), px(p[2], w), px(p[3], h)]).collect();
-    let height = rects.iter().map(|r| r[3].saturating_sub(r[1])).min()?;
-    let width: usize = rects.iter().map(|r| r[2].saturating_sub(r[0])).sum();
+    // (A part that runs backwards covers nothing, and is no range of a
+    // row.)
+    if rects.iter().any(|r| r[2] < r[0] || r[3] < r[1]) {
+        return None;
+    }
+    let height = rects.iter().map(|r| r[3] - r[1]).min()?;
+    let width: usize = rects.iter().map(|r| r[2] - r[0]).sum();
     if height == 0 || width == 0 {
         return None;
     }
@@ -246,6 +294,28 @@ impl Loader<'_> {
         found.map(|(t, d)| (t, Arc::from(&*d)))
     }
 
+    /// Whether the module being edited (its unsaved changes too) or the
+    /// game has the resource `key`, in any layer.
+    fn exists(&self, key: &ResKey) -> bool {
+        self.ws.is_some_and(|ws| ws.module.get(key).is_some()) || self.game.resman.contains(key)
+    }
+
+    /// An item icon's picture (a layer that is not a PLT) as the game's
+    /// inventory and examine window draw it: only where there is a TGA of
+    /// its name, in any layer; then the texture the game finds for the
+    /// name, a DDS over the TGA where there is one ([`Loader::texture`]).
+    /// An icon that is only a DDS the game draws as missing, with its base
+    /// item's `DefaultIcon` (the red cross), as when there is no picture
+    /// at all (seen in the client, 89.8193.37: `client_render`'s
+    /// `reading_icon_rows`).
+    pub(crate) fn icon_picture(&mut self, ctx: &egui::Context, name: &str) -> Option<Picture> {
+        let tga = ResKey::parse(name, ResType::TGA)?;
+        if !self.exists(&tga) {
+            return None;
+        }
+        self.picture(ctx, name)
+    }
+
     fn keep(
         &mut self,
         ctx: &egui::Context,
@@ -265,19 +335,11 @@ impl Loader<'_> {
     }
 
     /// A palette image (`pal_cloth01`, ...) as pixels, loaded once.
-    pub(crate) fn palette(&mut self, name: &str) -> Option<Arc<mg_image::Rgba>> {
-        // (By its name in lower case, as `picture`'s: one image, however
-        // it is asked for.)
-        let name = name.to_ascii_lowercase();
-        if let Some(p) = self.palettes.get(&name) {
-            return p.clone();
-        }
-        let rgba = ResRef::from_str(&name).ok().and_then(|r| {
-            let (t, data) = self.texture(r)?;
-            Some(Arc::new(mg_image::read(t, &data).ok()?.to_rgba()))
-        });
-        self.palettes.insert(name, rgba.clone());
-        rgba
+    pub(crate) fn palette(&self, name: &'static str) -> Option<Arc<mg_image::Rgba>> {
+        self.palettes.get(name, |name| {
+            let (t, data) = self.texture(ResRef::from_str(name).ok()?)?;
+            Some(mg_image::read(t, &data).ok()?.to_rgba())
+        })
     }
 
     /// The image named `name` (a texture resref), loaded once.
@@ -409,7 +471,7 @@ impl Loader<'_> {
         let parts = if is_armor(self.game, item) { armor_icon_parts(item) } else { Vec::new() };
         let colors_of = |i: usize| parts.get(i).map_or(colors, |&p| part_colors(item, p));
         let one = |l: &mut Self, n: &str, colors| {
-            l.plt_picture(ctx, n, colors).or_else(|| l.picture(ctx, n))
+            l.plt_picture(ctx, n, colors).or_else(|| l.icon_picture(ctx, n))
         };
         let mut layers: Vec<Picture> = names
             .iter()
@@ -444,17 +506,25 @@ impl Loader<'_> {
         let row = usize::try_from(item.integer("BaseItem").unwrap_or(-1)).ok()?;
         let class = t.get(row, "ItemClass").unwrap_or_default().to_ascii_lowercase();
         let name = format!("i{class}_{letter}_{:03}", part(item, label));
-        self.plt_picture(ctx, &name, item_colors(item)).or_else(|| self.picture(ctx, &name))
+        self.plt_picture(ctx, &name, item_colors(item)).or_else(|| self.icon_picture(ctx, &name))
     }
 }
 
 impl Moonglow {
     /// The image loader, while there is game data.
+    /// How many portraits' cells were asked for in `ctx`'s last frame
+    /// that asked for any ([`Loader::portrait_cell`]): for the tests of
+    /// what asks for them (only those in sight and a row ahead).
+    #[doc(hidden)]
+    pub fn portraits_now(ctx: &egui::Context) -> usize {
+        ctx.data(|d| d.get_temp::<(u64, usize)>(portraits_asked_id())).map_or(0, |n| n.1)
+    }
+
     pub(crate) fn loader(&mut self) -> Option<Loader<'_>> {
         let game = self.game.as_deref()?;
         Some(Loader {
             pictures: &mut self.pictures,
-            palettes: &mut self.palettes,
+            palettes: &self.palettes,
             ws: self.ws.as_ref(),
             game,
         })
@@ -467,7 +537,7 @@ impl Moonglow {
         let game = self.game.as_deref()?;
         let loader = Loader {
             pictures: &mut self.pictures,
-            palettes: &mut self.palettes,
+            palettes: &self.palettes,
             ws: self.ws.as_ref(),
             game,
         };
@@ -500,34 +570,81 @@ impl Moonglow {
     }
 }
 
-/// Whether a portrait has a picture to show, in the module or the game
-/// (portraits.2da lists some the game has no pictures for: `matron`,
-/// `tm_tnobrl3_`).
-pub(crate) fn has_portrait(game: &GameData, ws: Option<&mg_edit::Workspace>, base: &str) -> bool {
-    ['m', 's', 'l', 'h', 't'].into_iter().any(|size| {
-        let Ok(name) = ResRef::from_str(&format!("po_{}{size}", base.to_ascii_lowercase())) else {
-            return false;
+/// The portraits' pictures there are, in the module or the game, by name
+/// (lowercase): found in one pass over the layers' names. (A row's five
+/// sizes looked for in every layer, 32,000 rows took Select Portrait's
+/// opening 19 ms.)
+pub(crate) struct Portraits(std::collections::HashSet<ResRef>);
+
+impl Portraits {
+    pub(crate) fn of(game: &GameData, ws: Option<&mg_edit::Workspace>) -> Portraits {
+        let texture = |k: &ResKey| k.restype == ResType::DDS || k.restype == ResType::TGA;
+        let portrait = |k: &ResKey| {
+            let name = k.resref.as_bytes();
+            name.len() > 3 && name[..3].eq_ignore_ascii_case(b"po_")
         };
-        let module = ws.is_some_and(|ws| {
-            [ResType::DDS, ResType::TGA]
-                .into_iter()
-                .any(|t| ws.module.get(&ResKey::new(name, t)).is_some())
+        let game_keys = game.resman.layers().iter().flat_map(|l| l.container.keys());
+        let module_keys = ws.into_iter().flat_map(|ws| {
+            [ResType::DDS, ResType::TGA].into_iter().flat_map(|t| ws.module.keys_of(t).copied())
         });
-        module || game.resman.texture(name).is_some()
-    })
+        let names = game_keys
+            .chain(module_keys)
+            .filter(|k| texture(k) && portrait(k))
+            .map(|k| k.resref.to_lowercase())
+            .collect();
+        Portraits(names)
+    }
+
+    /// Whether a portrait has a picture to show (portraits.2da lists some
+    /// the game has no pictures for: `matron`, `tm_tnobrl3_`).
+    pub(crate) fn has(&self, base: &str) -> bool {
+        let base = base.to_ascii_lowercase();
+        ['m', 's', 'l', 'h', 't'].into_iter().any(|size| {
+            ResRef::from_str(&format!("po_{base}{size}")).is_ok_and(|name| self.0.contains(&name))
+        })
+    }
 }
 
 /// A portrait thumbnail's width in a grid of them (Select Portrait, the
 /// Creature Wizard), points; it is 100/64 of that tall.
 pub(crate) const PORTRAIT_THUMB: f32 = 54.0;
 
-/// A grid of portrait thumbnails `width` points wide (a scroll bar
-/// included): how many to a row, and each row's height.
-pub(crate) fn portrait_grid(ui: &Ui, width: f32) -> (usize, f32) {
-    let gap = ui.spacing().item_spacing;
-    let usable = width - ui.spacing().scroll.bar_width - gap.x;
-    let per_row = ((usable + gap.x) / (PORTRAIT_THUMB + gap.x)).floor().max(1.0) as usize;
-    (per_row, PORTRAIT_THUMB * 100.0 / 64.0 + gap.y)
+/// A portrait's cell in a grid of them (the Pickers board's 54 by 84, M4's
+/// U26: its 84.375 rounded so rows stand on whole points).
+pub(crate) const PORTRAIT_TILE: egui::Vec2 = egui::vec2(54.0, 84.0);
+
+/// The least gap between portraits across a row, and between rows (the
+/// Pickers board's 8 and 3).
+pub(crate) const PORTRAIT_GAPS: (f32, f32) = (8.0, 3.0);
+
+impl Loader<'_> {
+    /// A portrait's picture for a gallery cell: the part a portrait uses
+    /// (the upper 100/128 of its canvas) filling the tile; none: Missing.
+    pub(crate) fn portrait_cell(
+        &mut self,
+        ctx: &egui::Context,
+        base: &str,
+    ) -> mg_uikit::gallery::Picture {
+        use mg_uikit::gallery::Picture;
+        // (Counted for the frame, as the thumbnails' `shown_now`: the tests
+        // of a long portraits table ask that only those in sight and a row
+        // ahead are asked for.)
+        let pass = ctx.cumulative_pass_nr();
+        ctx.data_mut(|d| {
+            let n = d.get_temp_mut_or_default::<(u64, usize)>(portraits_asked_id());
+            *n = if n.0 == pass { (pass, n.1 + 1) } else { (pass, 1) };
+        });
+        let used = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 100.0 / 128.0));
+        match self.picture(ctx, &format!("po_{base}m")) {
+            Some(p) => Picture::Fill(p.texture.id(), used),
+            None => Picture::Missing,
+        }
+    }
+}
+
+/// Where [`Moonglow::portraits_now`]'s count is kept.
+fn portraits_asked_id() -> egui::Id {
+    egui::Id::new("portrait-cells-asked")
 }
 
 /// Draws an icon's layers over each other, `scale` times their size (the
@@ -715,6 +832,21 @@ mod tests {
         assert_eq!((out.width, out.height), (96, 16));
         let at = |x: usize| (out.data[x * 4], out.data[x * 4 + 1]);
         assert_eq!([at(0), at(32), at(64)], [(0, 0), (32, 0), (32, 16)]);
+        // A mesh whose U coordinates are no numbers is left out (the
+        // review's B5: its part ran from the texture's right edge to its
+        // left, and the stitching sliced a row backwards), and parts that
+        // run backwards make no picture.
+        assert_eq!(uv_rect(&[[f32::NAN, 0.0], [f32::NAN, 0.5]]), None);
+        assert_eq!(uv_rect(&[[0.25, f32::NAN], [0.5, f32::NAN]]), None);
+        assert_eq!(uv_rect(&[]), None);
+        assert_eq!(
+            uv_rect(&[[f32::NAN, 0.0], [0.25, 0.5], [2.0, -1.0]]),
+            Some([0.25, 0.0, 1.0, 0.5])
+        );
+        let backwards = [[0.0, 0.0, 0.5, 0.5], [1.0, 0.0, 0.0, 0.5]];
+        assert!(stitched(&where_texture(64, 32), &backwards).is_none());
+        let nowhere = [[0.0, 0.0, 0.5, 0.5], [f32::MAX, 0.0, f32::MIN, 0.5]];
+        assert!(stitched(&where_texture(64, 32), &nowhere).is_none());
         // A model with no such mesh, or not a model: the stock layout.
         let bare = "newmodel x\nbeginmodelgeom x\nnode dummy x\n  parent NULL\nendnode\n\
                     endmodelgeom x\ndonemodel x\n";
@@ -750,15 +882,196 @@ mod tests {
         m.set(key("po_bothm"), tga(30));
         m.set(key("po_modm"), tga(40));
         let ws = Workspace::new(m);
-        let (mut pictures, mut palettes) = (Pictures::new(), Palettes::new());
+        let (mut pictures, palettes) = (Pictures::new(), Palettes::default());
         let loader =
-            Loader { pictures: &mut pictures, palettes: &mut palettes, ws: Some(&ws), game: &game };
+            Loader { pictures: &mut pictures, palettes: &palettes, ws: Some(&ws), game: &game };
         let level = |name: &str| {
             let (t, d) = loader.texture(ResRef::from_str(name).unwrap()).unwrap();
             mg_image::read(t, &d).unwrap().to_rgba().data[0]
         };
         assert_eq!(level("po_bothm"), 10);
         assert_eq!(level("po_modm"), 40);
+    }
+
+    /// A picture the module adds, changes or removes is read again at once;
+    /// pictures of other names stay kept; an undo counts as a change; a
+    /// change made outside the edit history lets every picture go.
+    #[test]
+    fn a_picture_the_module_changes_is_read_again() {
+        let tga = |level: u8| {
+            let mut t = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 32, 8];
+            t.extend([level, level, level, 255]);
+            t
+        };
+        let key = |n: &str| ResKey::parse(n, ResType::TGA).unwrap();
+        let mut game_layer = mg_resman::MemContainer::new();
+        game_layer.insert(key("po_gamem"), tga(10));
+        game_layer.insert(key("po_otherm"), tga(11));
+        let mut rm = mg_resman::ResMan::new();
+        rm.add(mg_resman::priority::HAK, "hak:pics", mg_resman::LayerClass::Erf, game_layer);
+        let game = GameData::new(rm, mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let mut ws = Workspace::new(mg_module::Module::new());
+        let ctx = egui::Context::default();
+        let (mut pictures, palettes) = (Pictures::new(), Palettes::default());
+        let mut seen = None;
+        let mut frame = |ws: &Workspace, pictures: &mut Pictures, names: &[&str]| {
+            forget_changed(pictures, &palettes, Some(ws), &mut seen);
+            let mut loader =
+                Loader { pictures, palettes: &Palettes::default(), ws: Some(ws), game: &game };
+            names
+                .iter()
+                .map(|n| loader.picture(&ctx, n).map(|p| p.texture.id()))
+                .collect::<Vec<_>>()
+        };
+        let set = |ws: &mut Workspace, name: &str, data: Option<Vec<u8>>| {
+            let edit = mg_edit::Edit::SetResource { key: key(name), data };
+            ws.apply(mg_edit::Command::new("Set", vec![edit])).unwrap();
+        };
+        let first = frame(&ws, &mut pictures, &["po_gamem", "po_otherm", "po_newm"]);
+        assert!(first[0].is_some() && first[1].is_some() && first[2].is_none());
+
+        // (The module's own picture over the hak's, and one only it has.)
+        set(&mut ws, "po_gamem", Some(tga(30)));
+        set(&mut ws, "po_newm", Some(tga(40)));
+        let next = frame(&ws, &mut pictures, &["po_gamem", "po_otherm", "po_newm"]);
+        assert_ne!(next[0], first[0], "the module's copy is read");
+        assert_eq!(next[1], first[1], "a picture nothing changed is kept");
+        assert!(next[2].is_some(), "a picture the module adds is found");
+
+        ws.undo().unwrap();
+        let undone = frame(&ws, &mut pictures, &["po_newm"]);
+        assert!(undone[0].is_none(), "an undone picture is gone again");
+
+        ws.derive(|_| ()).unwrap();
+        let outside = frame(&ws, &mut pictures, &["po_otherm"]);
+        assert_ne!(outside[0], first[1], "a change outside the history reads all again");
+    }
+
+    /// A palette is read once, kept in the renderer's keeping
+    /// (`mg_render::Palettes`), and read again when the module changes it;
+    /// the others stay kept.
+    #[test]
+    fn a_palette_the_module_changes_is_read_again() {
+        let tga = |level: u8| {
+            let mut t = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 32, 8];
+            t.extend([level, level, level, 255]);
+            t
+        };
+        let key = |n: &str| ResKey::parse(n, ResType::TGA).unwrap();
+        let mut game_layer = mg_resman::MemContainer::new();
+        game_layer.insert(key("pal_skin01"), tga(10));
+        game_layer.insert(key("pal_hair01"), tga(20));
+        let mut rm = mg_resman::ResMan::new();
+        rm.add(mg_resman::priority::KEY, "key:pals", mg_resman::LayerClass::Key, game_layer);
+        let game = GameData::new(rm, mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let mut ws = Workspace::new(mg_module::Module::new());
+        let (mut pictures, palettes) = (Pictures::new(), Palettes::default());
+        let mut seen = None;
+        let mut frame = |ws: &Workspace| {
+            forget_changed(&mut pictures, &palettes, Some(ws), &mut seen);
+            let loader =
+                Loader { pictures: &mut pictures, palettes: &palettes, ws: Some(ws), game: &game };
+            ["pal_skin01", "pal_hair01"].map(|n| loader.palette(n).unwrap())
+        };
+        let first = frame(&ws);
+        assert_eq!((first[0].data[0], first[1].data[0]), (10, 20));
+        assert!(Arc::ptr_eq(&frame(&ws)[0], &first[0]), "kept, not read again");
+
+        let edit = mg_edit::Edit::SetResource { key: key("pal_skin01"), data: Some(tga(30)) };
+        ws.apply(mg_edit::Command::new("Set", vec![edit])).unwrap();
+        let next = frame(&ws);
+        assert_eq!(next[0].data[0], 30, "the module's palette is read");
+        assert!(Arc::ptr_eq(&next[1], &first[1]), "a palette nothing changed is kept");
+    }
+
+    /// A portrait has a picture where any of its sizes is a DDS or TGA in
+    /// the game or the module, whatever the case of its name; not where
+    /// only another type or another name is.
+    #[test]
+    fn a_portrait_has_a_picture_where_one_of_its_sizes_is_there() {
+        let key = |n: &str, t: ResType| ResKey::parse(n, t).unwrap();
+        let mut layer = mg_resman::MemContainer::new();
+        layer.insert(key("po_gamem", ResType::TGA), vec![0]);
+        layer.insert(key("PO_Upperh", ResType::DDS), vec![0]);
+        layer.insert(key("po_mdlm", ResType::MDL), vec![0]);
+        let mut rm = mg_resman::ResMan::new();
+        rm.add(mg_resman::priority::KEY, "key:po", mg_resman::LayerClass::Key, layer);
+        let game = GameData::new(rm, mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let mut ws = Workspace::new(mg_module::Module::new());
+        let edit =
+            mg_edit::Edit::SetResource { key: key("po_ownl", ResType::TGA), data: Some(vec![0]) };
+        ws.apply(mg_edit::Command::new("Set", vec![edit])).unwrap();
+        let p = Portraits::of(&game, Some(&ws));
+        assert!(p.has("game") && p.has("Upper") && p.has("own"));
+        assert!(!p.has("mdl") && !p.has("matron"));
+        assert!(!Portraits::of(&game, None).has("own"), "the module's own only with it");
+    }
+
+    /// An item icon is drawn only where a TGA of its name is there, in any
+    /// layer or the module being edited; then from the DDS where there is
+    /// one. An icon that is only a DDS is drawn as missing, with the base
+    /// item's `DefaultIcon` (seen in the client: `reading_icon_rows`).
+    /// The pictures are told apart by size: a DDS 8 across, a TGA 4, the
+    /// default icon 2.
+    #[test]
+    fn an_item_icon_that_is_only_a_dds_is_drawn_as_missing() {
+        let tga = |side: u8| {
+            let mut t = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, side, 0, side, 0, 32, 8];
+            t.extend(
+                std::iter::repeat_n([9, 9, 9, 255], usize::from(side) * usize::from(side))
+                    .flatten(),
+            );
+            t
+        };
+        // A BioWare DDS, DXT1, 8 across: its largest level alone.
+        let dds = || {
+            let mut d = Vec::new();
+            for v in [8u32, 8, 3, 32] {
+                d.extend(v.to_le_bytes());
+            }
+            d.extend(1.0f32.to_le_bytes());
+            d.extend([0u8; 32]);
+            d
+        };
+        let key = |n: &str, t| ResKey::parse(n, t).unwrap();
+        let mut base = mg_resman::MemContainer::new();
+        base.insert(
+            key("baseitems", ResType::TWODA),
+            b"2DA V2.0\n\n  label ItemClass ModelType GenderSpecific DefaultIcon\n\
+              0 miscsmall it_smlmisc 0 0 iinvalid_1x1\n"
+                .to_vec(),
+        );
+        base.insert(key("iinvalid_1x1", ResType::TGA), tga(2));
+        base.insert(key("iit_smlmisc_002", ResType::TGA), tga(4));
+        let mut over = mg_resman::MemContainer::new();
+        over.insert(key("iit_smlmisc_001", ResType::DDS), dds());
+        over.insert(key("iit_smlmisc_002", ResType::DDS), dds());
+        over.insert(key("iit_smlmisc_003", ResType::DDS), dds());
+        over.insert(key("iit_smlmisc_004", ResType::DDS), dds());
+        let mut rm = mg_resman::ResMan::new();
+        rm.add(mg_resman::priority::OVERRIDE, "override", mg_resman::LayerClass::Directory, over);
+        rm.add(mg_resman::priority::KEY, "key:base", mg_resman::LayerClass::Key, base);
+        let game = GameData::new(rm, mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        // The module being edited has 004's TGA (unsaved).
+        let mut m = mg_module::Module::new();
+        m.set(key("iit_smlmisc_004", ResType::TGA), tga(4));
+        let ws = Workspace::new(m);
+        let (mut pictures, palettes) = (Pictures::new(), Palettes::default());
+        let mut loader =
+            Loader { pictures: &mut pictures, palettes: &palettes, ws: Some(&ws), game: &game };
+        let ctx = egui::Context::default();
+        let mut drawn = |n: u8| {
+            let mut item = Struct::new(0);
+            item.set("BaseItem", Value::Int(0));
+            item.set("ModelPart1", Value::Byte(n));
+            let layers = loader.item_icon_on(&ctx, &item, false);
+            layers.iter().map(|p| p.size.x as u32).collect::<Vec<_>>()
+        };
+        assert_eq!(drawn(1), [2], "a DDS alone: the default icon");
+        assert_eq!(drawn(2), [8], "a DDS and a TGA: the DDS");
+        assert_eq!(drawn(3), [2]);
+        assert_eq!(drawn(4), [8], "the TGA the module's, the DDS the game's");
+        assert_eq!(drawn(5), [2], "no picture at all: the default icon");
     }
 
     #[test]

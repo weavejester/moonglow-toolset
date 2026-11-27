@@ -244,7 +244,7 @@ fn heed_armourer_look() {
     use mg_rules::ObjectKind::{Encounter, Sound, Store, Trigger, Waypoint};
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -279,7 +279,12 @@ fn heed_armourer_look() {
         let camera = scripted_camera(pc, facing);
         let size = client.as_ref().map_or((1280, 800), |c| (c.width, c.height));
         // (Without the editor's markers: the client shows none.)
-        let mut view = mg_area::View { lit: true, fog: true, ..mg_area::View::of(&model) };
+        let mut view = mg_area::View {
+            lit: true,
+            fog: true,
+            camera: scripted_camera_distance(facing),
+            ..mg_area::View::of(&model)
+        };
         for kind in [Encounter, Sound, Store, Trigger, Waypoint] {
             view.show[kind.index()] = false;
         }

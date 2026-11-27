@@ -32,10 +32,16 @@
 //!   Twine passage's tags, which can't hold a space, an action's are a
 //!   query: `do:a_give?item=gold%20coins&count=5`. Names and values are
 //!   text in the game's codepage, as the lines' are.
+//! - **The conversation's own settings** (the scripts run when it ends
+//!   and is aborted, its delays, the camera's zoom: [`Settings`]) are tags
+//!   before the first knot in Ink (`# end:gate_done`) and a `moonglow`
+//!   object in a Twine story's `StoryData`. A story that says none
+//!   (written in Twine or Inky; Twine may drop the object) leaves them as
+//!   the conversation it replaces has them ([`Format::read_over`]).
 //!
 //! A CSV carries every language's text, a column each; Twine and Ink,
 //! which hold one text a line, carry English's. A conversation read back
-//! plays as the original did ([`play_outline`]).
+//! plays as the original did ([`play_outline`]) and ends as it did.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -44,9 +50,11 @@ use mg_core::{Codepage, Gender, Language, LocString, LocStringKey, ResRef};
 use mg_gff::{Gff, Struct, Value};
 
 use crate::dialog::{
-    Kind, Parent, add_link, add_node, is_link, link_index, links, new_dialog, node, node_mut,
-    set_condition, text,
+    Kind, Parent, add_link_raw, add_node_raw, add_start_raw, is_link, link_index, links,
+    new_dialog, node, node_mut, renumber, set_condition, text,
 };
+#[cfg(test)]
+use crate::dialog::{add_link, add_node};
 
 /// The formats a conversation is written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,9 +128,18 @@ impl Format {
     /// A conversation read from a story in this format; `None` for a
     /// format that does not hold a whole one ([`Format::reads`]).
     pub fn read(self, text: &str) -> Option<Result<Gff, String>> {
+        self.read_over(text, None)
+    }
+
+    /// [`read`](Self::read) for a story that takes the place of the
+    /// conversation `replaced`: what the story does not say of the
+    /// conversation as a whole (the scripts run at its end, its delays:
+    /// a story written in Twine or Inky says none) stays as that
+    /// conversation has it.
+    pub fn read_over(self, text: &str, replaced: Option<&Gff>) -> Option<Result<Gff, String>> {
         match self {
-            Format::Twine => Some(from_twee(text)),
-            Format::Ink => Some(from_ink(text)),
+            Format::Twine => Some(from_twee_over(text, replaced)),
+            Format::Ink => Some(from_ink_over(text, replaced)),
             Format::Text | Format::Csv => None,
         }
     }
@@ -317,7 +334,10 @@ fn condition(l: &Struct) -> Option<String> {
 /// [`condition`] writes it: the script and its parameters.
 fn set_condition_call(g: &mut Gff, parent: Parent, pos: usize, call: &str) -> Result<(), String> {
     let (script, params) = read_call(call)?;
-    set_condition(g, parent, pos, &script);
+    let _ = ResRef::from_str(&script).map_err(|e| format!("{script}: {e}"))?;
+    if !set_condition(g, parent, pos, &script) {
+        return Err(format!("{script}: condition link not found"));
+    }
     if !params.is_empty()
         && let Some(l) = crate::dialog::links_mut(g, parent).and_then(|l| l.get_mut(pos))
     {
@@ -377,13 +397,13 @@ fn comment_text(comment: &str, passage_tags: bool) -> String {
 /// A line's tags: speaker, action (with its parameters: `do:a_give
 /// item="gold coins"`, or in a Twine passage's tags, which can't hold a
 /// space, `do:a_give?item=gold%20coins`), journal update, sound,
-/// animation (`anim:bow`), delay (`delay:500`, where it has one) and
-/// comment (`comment:Asked about the sword`).
+/// animation (`anim:bow`; `loop:0` where it plays once), delay
+/// (`delay:500`, where it has one) and comment (`comment:Asked about the sword`).
 fn tags(kind: Kind, n: &Struct, passage_tags: bool) -> Vec<String> {
     let mut out = Vec::new();
     let speaker = string(n, "Speaker");
     if kind == Kind::Entry && !speaker.is_empty() {
-        out.push(format!("speaker:{}", escape(&speaker)));
+        out.push(format!("speaker:{}", percent(&speaker, " ")));
     }
     if let Some(a) = resref(n, "Script") {
         let p = params(n, "ActionParams");
@@ -395,13 +415,21 @@ fn tags(kind: Kind, n: &Struct, passage_tags: bool) -> Vec<String> {
     }
     let quest = string(n, "Quest");
     if !quest.is_empty() {
-        out.push(format!("journal:{}:{}", escape(&quest), n.integer("QuestEntry").unwrap_or(0)));
+        out.push(format!(
+            "journal:{}:{}",
+            percent(&quest, " :"),
+            n.integer("QuestEntry").unwrap_or(0)
+        ));
     }
     if let Some(s) = resref(n, "Sound") {
         out.push(format!("sound:{}", escape(&s)));
     }
     if let Some(a) = n.integer("Animation").filter(|a| *a != 0) {
         out.push(format!("anim:{}", animation_name(a as u32)));
+    }
+    // (New lines' animations loop.)
+    if n.integer("AnimLoop") == Some(0) {
+        out.push("loop:0".into());
     }
     // (None: the game's own, `0xFFFFFFFF`, which new lines have.)
     if let Some(d) = n.integer("Delay").filter(|d| *d != i64::from(u32::MAX)) {
@@ -415,19 +443,20 @@ fn tags(kind: Kind, n: &Struct, passage_tags: bool) -> Vec<String> {
 }
 
 /// Applies tags (`speaker:`, `do:`, `journal:`, `sound:`, `anim:`,
-/// `delay:`, `comment:`) to a line; others are ignored.
+/// `loop:`, `delay:`, `comment:`) to a line; others are ignored.
 fn apply_tags(n: &mut Struct, tags: &[String]) -> Result<(), String> {
     let r = |v: &str| ResRef::from_str(v).map(Value::resref).map_err(|e| format!("{v}: {e}"));
     for t in tags {
         let (k, raw) = t.split_once(':').unwrap_or((t, ""));
-        let v = unescape(raw.trim());
+        let raw_trimmed = raw.trim();
+        let v = unescape(raw_trimmed);
         match k.trim() {
-            "speaker" => n.set("Speaker", string_value(&v)),
+            "speaker" => n.set("Speaker", string_value(&unpercent(raw_trimmed))),
             "do" => {
                 // `a_give?item=gold%20coins` (a Twine passage's tag) or
                 // `a_give item="gold coins"`.
                 let query =
-                    raw.trim().split_once('?').filter(|(s, _)| !s.contains(char::is_whitespace));
+                    raw_trimmed.split_once('?').filter(|(s, _)| !s.contains(char::is_whitespace));
                 let (script, params) = match query {
                     Some((s, q)) => (unescape(s), read_query(q)?),
                     None => read_call(raw).map(|(s, p)| (unescape(&s), p))?,
@@ -439,11 +468,12 @@ fn apply_tags(n: &mut Struct, tags: &[String]) -> Result<(), String> {
             }
             "sound" => n.set("Sound", r(&v)?),
             "journal" => {
-                let (q, e) = v.rsplit_once(':').unwrap_or((&v, "0"));
-                n.set("Quest", string_value(q));
+                let (q, e) = raw_trimmed.rsplit_once(':').unwrap_or((raw_trimmed, "0"));
+                n.set("Quest", string_value(&unpercent(q)));
                 n.set("QuestEntry", Value::Dword(e.trim().parse().unwrap_or(0)));
             }
             "anim" => n.set("Animation", Value::Dword(read_animation(&v)?)),
+            "loop" => n.set("AnimLoop", Value::Byte(u8::from(v.trim() != "0"))),
             "delay" => {
                 let d = v.trim().parse().map_err(|_| format!("delay:{v} isn't a number"))?;
                 n.set("Delay", Value::Dword(d));
@@ -464,29 +494,66 @@ fn passage(kind: Kind, i: u32) -> String {
 
 // ---------------------------------------------------------------- escapes
 
+/// The words Ink reads as a declaration where they start a line, each
+/// with what follows it there.
+const INK_KEYWORDS: [&str; 6] = ["VAR ", "CONST ", "LIST ", "INCLUDE ", "EXTERNAL ", "TODO:"];
+
 /// Text for Ink: a backslash before each character Ink reads as syntax
-/// (and before `-`, `*`, `+` or `=` starting a line), a blank line as an
-/// empty comment (`//`), which Ink skips and Moonglow reads back.
+/// (and before `-`, `*`, `+` or `=` starting a line, or the first letter
+/// of a word Ink reads as a declaration there: `\VAR is a joke`), a blank
+/// line as an empty comment (`//`), which Ink skips and Moonglow reads
+/// back.
 fn ink_text(s: &str) -> String {
     s.lines()
-        .map(|line| {
-            if line.trim().is_empty() {
-                return "//".to_string();
-            }
-            let mut out = String::new();
-            for (i, c) in line.trim_start().chars().enumerate() {
-                let syntax =
-                    matches!(c, '\\' | '{' | '}' | '[' | ']' | '|' | '#' | '/' | '<' | '>' | '~')
-                        || (i == 0 && matches!(c, '-' | '*' | '+' | '='));
-                if syntax {
-                    out.push('\\');
-                }
-                out.push(c);
-            }
-            out
-        })
+        .map(|line| if line.trim().is_empty() { "//".to_string() } else { ink_line(line) })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// One line of [`ink_text`], which is not blank.
+fn ink_line(line: &str) -> String {
+    let line = line.trim_start();
+    let mut out = String::new();
+    if INK_KEYWORDS.iter().any(|k| line.starts_with(k)) {
+        out.push('\\');
+    }
+    for (i, c) in line.chars().enumerate() {
+        let syntax = matches!(c, '\\' | '{' | '}' | '[' | ']' | '|' | '#' | '/' | '<' | '>' | '~')
+            || (i == 0 && matches!(c, '-' | '*' | '+' | '='));
+        if syntax {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A reply's text as an Ink choice holds it, on one line: its line breaks
+/// written `\n` (a blank line is nothing between two of them: a comment
+/// would end the choice).
+fn ink_choice_text(s: &str) -> String {
+    s.lines()
+        .map(|line| if line.trim().is_empty() { String::new() } else { ink_line(line) })
+        .collect::<Vec<_>>()
+        .join("\\n")
+}
+
+/// [`ink_choice_text`] read back: Ink's escapes undone, an escaped `n` a
+/// line break (a backslash of the text itself is written `\\`, so
+/// `C:\\new` is `C:\new`).
+fn ink_choice_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                other => out.extend(other),
+            },
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// A line of Ink without its comment (`//` not escaped), escapes kept.
@@ -651,9 +718,13 @@ pub fn play_outline(g: &Gff, limit: usize) -> Option<Vec<String>> {
 // ---------------------------------------------------------------- text
 
 /// The conversation as readable text: NPC lines and the numbered replies
-/// under them, conditions and actions in brackets, links named.
+/// under them, conditions and actions in brackets, links named. A line
+/// that more than one line owns (another tool's file; such lines may own
+/// each other in a loop) is written out under the first and named under
+/// the others, as a link is.
 pub fn to_text(g: &Gff) -> String {
-    fn walk(g: &Gff, parent: Parent, depth: usize, out: &mut String) {
+    type Seen = std::collections::HashSet<(Kind, u32)>;
+    fn walk(g: &Gff, parent: Parent, depth: usize, seen: &mut Seen, out: &mut String) {
         let kind = parent.child_kind();
         for (pos, l) in links(g, parent).iter().enumerate() {
             let i = link_index(l);
@@ -677,18 +748,21 @@ pub fn to_text(g: &Gff) -> String {
             if !notes.is_empty() {
                 let _ = write!(line, "   [{}]", notes.join("; "));
             }
+            let first = !is_link(l) && seen.insert((kind, i));
             if is_link(l) {
                 let _ = write!(line, "   (goes to {} above)", passage(kind, i));
+            } else if !first {
+                let _ = write!(line, "   ({}, shown above)", passage(kind, i));
             }
             out.push_str(&line);
             out.push('\n');
-            if !is_link(l) {
-                walk(g, Parent::Node(kind, i), depth + 1, out);
+            if first {
+                walk(g, Parent::Node(kind, i), depth + 1, seen, out);
             }
         }
     }
     let mut out = String::new();
-    walk(g, Parent::Root, 0, &mut out);
+    walk(g, Parent::Root, 0, &mut Seen::new(), &mut out);
     out
 }
 
@@ -703,8 +777,10 @@ pub(crate) fn csv_field(s: &str) -> String {
 }
 
 /// Reads CSV (RFC 4180: quoted fields may hold commas, quotes and line
-/// breaks).
+/// breaks). A byte order mark at its start, which a spreadsheet's "CSV
+/// UTF-8" writes, is no part of the first cell.
 pub fn read_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut rows = Vec::new();
     let mut row = Vec::new();
     let mut field = String::new();
@@ -949,6 +1025,140 @@ pub fn update_from_csv_in(g: &mut Gff, csv: &str, game: Codepage) -> Result<usiz
     Ok(changed)
 }
 
+// ---------------------------------------------------------------- settings
+
+/// What a story says of the conversation as a whole (its root's fields):
+/// the scripts run when it ends and when it is aborted, the delays before
+/// NPC lines and replies, and whether the camera zooms in. `None`: the
+/// story does not say (one written in Twine or Inky, or by a Moonglow
+/// before 4.0.0), and the conversation it replaces keeps its own, a new
+/// one Aurora's ([`new_dialog`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Settings {
+    /// `EndConversation` (empty: none is run).
+    end: Option<String>,
+    /// `EndConverAbort`.
+    abort: Option<String>,
+    delay_entry: Option<u32>,
+    delay_reply: Option<u32>,
+    /// `PreventZoomIn`, the other way around.
+    zoom: Option<bool>,
+}
+
+impl Settings {
+    /// What a conversation's root says: the end scripts always (the story
+    /// then plays as this conversation wherever it is read), the rest where
+    /// it is not Aurora's own.
+    fn of(g: &Gff) -> Settings {
+        let script = |label: &str| Some(resref(&g.root, label).unwrap_or_default());
+        let delay = |label: &str| {
+            g.root.integer(label).and_then(|d| u32::try_from(d).ok()).filter(|d| *d != 0)
+        };
+        Settings {
+            end: script("EndConversation"),
+            abort: script("EndConverAbort"),
+            delay_entry: delay("DelayEntry"),
+            delay_reply: delay("DelayReply"),
+            zoom: (g.root.integer("PreventZoomIn").unwrap_or(0) != 0).then_some(false),
+        }
+    }
+
+    /// As Ink's tags before the first knot: `end:SCRIPT`, `abort:SCRIPT`
+    /// (nothing after the colon: none is run), `delay-entry:500`,
+    /// `delay-reply:500`, `zoom:no`.
+    fn tags(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let script = |s: &String| percent(s, " ");
+        out.extend(self.end.as_ref().map(|s| format!("end:{}", script(s))));
+        out.extend(self.abort.as_ref().map(|s| format!("abort:{}", script(s))));
+        out.extend(self.delay_entry.map(|d| format!("delay-entry:{d}")));
+        out.extend(self.delay_reply.map(|d| format!("delay-reply:{d}")));
+        out.extend(self.zoom.map(|z| format!("zoom:{}", if z { "yes" } else { "no" })));
+        out
+    }
+
+    /// Reads one of [`tags`](Self::tags); another tag (an Ink story's
+    /// `author:`) is passed over.
+    fn read_tag(&mut self, tag: &str) -> Result<(), String> {
+        let (k, v) = tag.split_once(':').unwrap_or((tag, ""));
+        let (k, v) = (k.trim(), v.trim());
+        let delay = || v.parse::<u32>().map_err(|_| format!("{k}:{v} isn't a number"));
+        match k {
+            "end" => self.end = Some(unpercent(v)),
+            "abort" => self.abort = Some(unpercent(v)),
+            "delay-entry" => self.delay_entry = Some(delay()?),
+            "delay-reply" => self.delay_reply = Some(delay()?),
+            "zoom" => self.zoom = Some(!v.eq_ignore_ascii_case("no")),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// As the `moonglow` object of a Twine story's `StoryData`.
+    fn json(&self) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        let mut put = |k: &str, v: Option<serde_json::Value>| {
+            m.extend(v.map(|v| (k.to_string(), v)));
+        };
+        put("end", self.end.clone().map(Into::into));
+        put("abort", self.abort.clone().map(Into::into));
+        put("delay-entry", self.delay_entry.map(Into::into));
+        put("delay-reply", self.delay_reply.map(Into::into));
+        put("zoom", self.zoom.map(Into::into));
+        serde_json::Value::Object(m)
+    }
+
+    /// [`json`](Self::json) read back; what is not of the kind written is
+    /// not said.
+    fn of_json(v: &serde_json::Value) -> Settings {
+        let text = |k: &str| v.get(k).and_then(|s| s.as_str()).map(str::to_string);
+        let number = |k: &str| v.get(k).and_then(|n| n.as_u64()).and_then(|n| n.try_into().ok());
+        Settings {
+            end: text("end"),
+            abort: text("abort"),
+            delay_entry: number("delay-entry"),
+            delay_reply: number("delay-reply"),
+            zoom: v.get("zoom").and_then(|z| z.as_bool()),
+        }
+    }
+
+    /// Puts them on a conversation just read from a story, which stands in
+    /// for `replaced` if there is one: what the story does not say is as
+    /// that conversation had it (its root's other fields too).
+    fn apply(&self, g: &mut Gff, replaced: Option<&Gff>) -> Result<(), String> {
+        if let Some(old) = replaced {
+            let made = std::mem::replace(&mut g.root, old.root.clone());
+            for f in made.fields {
+                let label = f.label.to_string_lossy();
+                let lines = ["EntryList", "ReplyList", "StartingList", "NumWords"];
+                if lines.contains(&label.as_str()) || !g.root.contains(&label) {
+                    g.root.set(&label, f.value);
+                }
+            }
+        }
+        let script = |s: &String| match s.is_empty() {
+            true => Ok(Value::resref(ResRef::default())),
+            false => ResRef::from_str(s).map(Value::resref).map_err(|e| format!("{s}: {e}")),
+        };
+        if let Some(s) = &self.end {
+            g.root.set("EndConversation", script(s)?);
+        }
+        if let Some(s) = &self.abort {
+            g.root.set("EndConverAbort", script(s)?);
+        }
+        if let Some(d) = self.delay_entry {
+            g.root.set("DelayEntry", Value::Dword(d));
+        }
+        if let Some(d) = self.delay_reply {
+            g.root.set("DelayReply", Value::Dword(d));
+        }
+        if let Some(z) = self.zoom {
+            g.root.set("PreventZoomIn", Value::Byte(u8::from(!z)));
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- Twine
 
 /// Where a reply leads: nowhere (the end), one NPC line, or several to
@@ -992,9 +1202,12 @@ pub fn to_twee(g: &Gff, title: &str) -> String {
         Next::One(i) => passage(Kind::Entry, i),
         _ => "Start".to_string(),
     };
+    // (The conversation's own settings, which no passage holds: an object
+    // of Moonglow's in the story's data.)
     let mut out = format!(
-        ":: StoryTitle\n{title}\n\n:: StoryData\n{{\n  \"ifid\": \"{}\",\n  \"format\": \"Harlowe\",\n  \"format-version\": \"3.3.9\",\n  \"start\": \"{start}\"\n}}\n\n",
-        ifid(title)
+        ":: StoryTitle\n{title}\n\n:: StoryData\n{{\n  \"ifid\": \"{}\",\n  \"format\": \"Harlowe\",\n  \"format-version\": \"3.3.9\",\n  \"start\": \"{start}\",\n  \"moonglow\": {}\n}}\n\n",
+        ifid(title),
+        Settings::of(g).json()
     );
     let choice = |out: &mut String, name: &str, parent: Parent| {
         let _ = writeln!(out, ":: {name} [npc-choice]");
@@ -1056,9 +1269,10 @@ fn tags_of_reply(n: &Struct) -> Vec<String> {
     tags(Kind::Reply, n, false).into_iter().map(|t| t.replacen(':', " ", 1)).collect()
 }
 
-/// A Twine story as read: its passages, its start (`StoryData`'s), and
-/// the passages' names in order.
-type Story = (HashMap<String, Passage>, Option<String>, Vec<String>);
+/// A Twine story as read: its passages, its start (`StoryData`'s), the
+/// passages' names in order, and what `StoryData` says of the
+/// conversation as a whole.
+type Story = (HashMap<String, Passage>, Option<String>, Vec<String>, Settings);
 
 /// A reply as read: text, condition, tags, where it leads (`None`: the
 /// end).
@@ -1078,15 +1292,17 @@ fn parse_twee(source: &str) -> Story {
     let mut order = Vec::new();
     let mut current: Option<(String, Vec<String>, String)> = None;
     let mut start = None;
-    let finish = |c: Option<(String, Vec<String>, String)>,
-                  passages: &mut HashMap<String, Passage>,
-                  start: &mut Option<String>| {
+    let mut settings = Settings::default();
+    let mut finish = |c: Option<(String, Vec<String>, String)>,
+                      passages: &mut HashMap<String, Passage>,
+                      start: &mut Option<String>| {
         let Some((name, tags, body)) = c else { return };
         match name.as_str() {
             "StoryTitle" => {}
             "StoryData" => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                     *start = v.get("start").and_then(|s| s.as_str()).map(str::to_string);
+                    settings = v.get("moonglow").map(Settings::of_json).unwrap_or_default();
                 }
             }
             _ => {
@@ -1121,15 +1337,22 @@ fn parse_twee(source: &str) -> Story {
             finish(current.take(), &mut passages, &mut start);
             // Name, then [tags], then {metadata}.
             let header = header.trim();
-            let (head, _) = header.split_once('{').map_or((header, ""), |(a, b)| (a.trim(), b));
-            let (name, tags) = match head.split_once('[') {
-                Some((n, t)) => (
-                    n.trim(),
-                    t.trim_end_matches(']').split_whitespace().map(str::to_string).collect(),
+            let (head, _) = match ink_find(header, '{') {
+                Some(at) => (header[..at].trim(), &header[at + 1..]),
+                None => (header, ""),
+            };
+            let (name, tags) = match ink_find(head, '[') {
+                Some(at) => (
+                    head[..at].trim(),
+                    head[at + 1..]
+                        .trim_end_matches(']')
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect(),
                 ),
                 None => (head, Vec::new()),
             };
-            let name = name.replace("\\[", "[").replace("\\]", "]");
+            let name = ink_unescape(name);
             if !matches!(name.as_str(), "StoryTitle" | "StoryData") {
                 order.push(name.clone());
             }
@@ -1140,12 +1363,12 @@ fn parse_twee(source: &str) -> Story {
         }
     }
     finish(current.take(), &mut passages, &mut start);
-    (passages, start, order)
+    (passages, start, order, settings)
 }
 
 /// A reply's label as read: its text and the braces after it (`{if c}`,
-/// `{do a}`, `{journal q:10}`, `{sound s}`, `{anim bow}`, `{delay 500}`,
-/// `{comment text}`).
+/// `{do a}`, `{journal q:10}`, `{sound s}`, `{anim bow}`, `{loop 0}`,
+/// `{delay 500}`, `{comment text}`).
 fn reply_label(label: &str) -> (String, Option<String>, Vec<String>) {
     let mut text = label.to_string();
     let mut cond = None;
@@ -1155,7 +1378,7 @@ fn reply_label(label: &str) -> (String, Option<String>, Vec<String>) {
         let inner = text[open + 1..open + close].trim().to_string();
         match inner.split_once(' ') {
             Some(("if", c)) => cond = Some(c.trim().to_string()),
-            Some((k @ ("do" | "journal" | "sound" | "anim" | "delay" | "comment"), v)) => {
+            Some((k @ ("do" | "journal" | "sound" | "anim" | "loop" | "delay" | "comment"), v)) => {
                 tags.push(format!("{k}:{}", v.trim()))
             }
             _ => break,
@@ -1206,19 +1429,19 @@ impl Builder<'_> {
         let pos = links(&self.g, parent).len();
         if let Some(&i) = self.made.get(name) {
             let linked = match parent {
-                Parent::Root => crate::dialog::add_start(&mut self.g, i),
-                _ => add_link(&mut self.g, parent, i),
+                Parent::Root => add_start_raw(&mut self.g, i),
+                _ => add_link_raw(&mut self.g, parent, i),
             };
             if !linked {
                 return Ok(());
             }
         } else {
-            let i = add_node(&mut self.g, parent, &line.text);
+            let i = add_node_raw(&mut self.g, parent, &line.text);
             apply_tags(node_mut(&mut self.g, Kind::Entry, i).expect("made"), &line.tags)?;
             self.made.insert(name.to_string(), i);
             for (text, rc, tags, to) in &line.replies {
                 let at = Parent::Node(Kind::Entry, i);
-                let r = add_node(&mut self.g, at, text);
+                let r = add_node_raw(&mut self.g, at, text);
                 apply_tags(node_mut(&mut self.g, Kind::Reply, r).expect("made"), tags)?;
                 if let Some(c) = rc {
                     let last = links(&self.g, at).len() - 1;
@@ -1235,9 +1458,21 @@ impl Builder<'_> {
         Ok(())
     }
 
-    fn build(lines: &HashMap<String, Line>, start: &str) -> Result<Gff, String> {
+    /// The conversation the lines make from `start` (none: an empty one),
+    /// with what the story says of it as a whole, in the place of
+    /// `replaced` ([`Settings::apply`]).
+    fn build(
+        lines: &HashMap<String, Line>,
+        start: Option<&str>,
+        settings: &Settings,
+        replaced: Option<&Gff>,
+    ) -> Result<Gff, String> {
         let mut b = Builder { g: new_dialog(), made: HashMap::new(), lines };
-        b.place(Parent::Root, start, None, 0)?;
+        if let Some(start) = start {
+            b.place(Parent::Root, start, None, 0)?;
+        }
+        renumber(&mut b.g);
+        settings.apply(&mut b.g, replaced)?;
         crate::dialog::recount(&mut b.g);
         Ok(b.g)
     }
@@ -1247,7 +1482,13 @@ impl Builder<'_> {
 /// Twine) as a new conversation. Harlowe's or SugarCube's macros are kept
 /// as text.
 pub fn from_twee(source: &str) -> Result<Gff, String> {
-    let (passages, start, order) = parse_twee(source);
+    from_twee_over(source, None)
+}
+
+/// [`from_twee`] for a story that takes the place of `replaced`
+/// ([`Format::read_over`]).
+pub fn from_twee_over(source: &str, replaced: Option<&Gff>) -> Result<Gff, String> {
+    let (passages, start, order, settings) = parse_twee(source);
     let start = start.or_else(|| order.first().cloned()).ok_or("no passages")?;
     let mut lines = HashMap::new();
     for (name, p) in &passages {
@@ -1275,7 +1516,7 @@ pub fn from_twee(source: &str) -> Result<Gff, String> {
         };
         lines.insert(name.clone(), line);
     }
-    Builder::build(&lines, &start)
+    Builder::build(&lines, Some(&start), &settings, replaced)
 }
 
 // ---------------------------------------------------------------- Ink
@@ -1306,7 +1547,12 @@ pub fn to_ink(g: &Gff) -> String {
             add(resref(l, "Active"));
         }
     }
+    // The conversation's own settings: tags before anything else (Ink's
+    // global tags).
     let mut out = String::new();
+    for t in Settings::of(g).tags() {
+        let _ = writeln!(out, "# {t}");
+    }
     for c in &conditions {
         let _ = writeln!(out, "VAR {c} = true");
     }
@@ -1359,11 +1605,7 @@ pub fn to_ink(g: &Gff) -> String {
             let Some(reply) = node(g, Kind::Reply, r) else { continue };
             let t = text(reply);
             // A choice is one line: its line breaks are written `\n`.
-            let t = if t.is_empty() {
-                "(Continue)".to_string()
-            } else {
-                t.lines().map(ink_text).collect::<Vec<_>>().join("\\n")
-            };
+            let t = if t.is_empty() { "(Continue)".to_string() } else { ink_choice_text(&t) };
             let cond = resref(l, "Active").map(|c| format!("{{{c}}} ")).unwrap_or_default();
             let target = match next_of(g, Parent::Node(Kind::Reply, r)) {
                 Next::End => "END".to_string(),
@@ -1408,11 +1650,84 @@ fn with_params(at: usize, cond: Option<&str>, call: String) -> Result<String, St
     }
 }
 
+fn parse_ink_choice(at: usize, line: &str) -> Result<Reply, String> {
+    let named = |tags: &str| tags.split('#').map(|t| t.trim().to_string()).collect();
+    let joined;
+    let (choice, mut tags): (&str, Vec<String>) = match ink_find(line, '#') {
+        Some(hash) => match line[hash..].rfind("->") {
+            Some(arrow) => {
+                joined = format!("{} {}", &line[..hash], &line[hash + arrow..]);
+                (joined.as_str(), named(&line[hash + 1..hash + arrow]))
+            }
+            None => (&line[..hash], named(&line[hash + 1..])),
+        },
+        None => (line, Vec::new()),
+    };
+    let mut rest = choice.trim();
+    let mut cond = None;
+    if let Some(r) = rest.strip_prefix('{') {
+        let end = r.find('}').ok_or(format!("line {at}: a condition doesn't end"))?;
+        cond = Some(r[..end].trim().to_string());
+        rest = r[end + 1..].trim();
+    }
+    if let Some(i) = tags.iter().position(|t| t.starts_with("if:")) {
+        let call = tags.remove(i)["if:".len()..].trim().to_string();
+        if tags.iter().any(|t| t.starts_with("if:")) {
+            return Err(format!("line {at}: a choice has one condition, one # if:"));
+        }
+        cond = Some(with_params(at, cond.as_deref(), call)?);
+    }
+    let (text, after) = match rest.strip_prefix('[') {
+        Some(r) => {
+            let end =
+                ink_find(r, ']').ok_or(format!("line {at}: a choice's [text] doesn't end"))?;
+            (r[..end].to_string(), r[end + 1..].trim())
+        }
+        None => match rest.split_once("->") {
+            Some((t, _)) => (t.trim().to_string(), &rest[t.len()..]),
+            None => (rest.to_string(), ""),
+        },
+    };
+    let target = after
+        .trim()
+        .strip_prefix("->")
+        .map(|t| t.trim().to_string())
+        .ok_or(format!("line {at}: a choice must divert (-> KNOT or -> END)"))?;
+    let text = text.trim();
+    let text = if text == "(Continue)" { String::new() } else { ink_choice_unescape(text) };
+    let to = (target != "END" && target != "DONE").then_some(target);
+    Ok((text, cond, tags, to))
+}
+
+fn parse_ink_divert(
+    at: usize,
+    inner: &str,
+    pending_if: Option<(usize, String)>,
+) -> Result<(Option<String>, String), String> {
+    let body = inner.strip_suffix('}').ok_or(format!("line {at}: logic isn't read"))?;
+    let (cond, target) = body
+        .split_once(':')
+        .and_then(|(c, t)| Some((c.trim(), t.trim().strip_prefix("->")?.trim())))
+        .ok_or(format!("line {at}: only {{condition: -> KNOT}} is read"))?;
+    let cond = match pending_if {
+        Some((from, call)) => with_params(from, Some(cond), call)?,
+        None => cond.to_string(),
+    };
+    Ok((Some(cond), target.to_string()))
+}
+
 /// Reads an Ink story as a new conversation: the subset [`to_ink`]
 /// writes (knots, `# tags`, text, choices with a condition and a divert,
 /// conditional diverts). Anything else (stitches, gathers, logic, glue) is
 /// refused with its line.
 pub fn from_ink(source: &str) -> Result<Gff, String> {
+    from_ink_over(source, None)
+}
+
+/// [`from_ink`] for a story that takes the place of `replaced`
+/// ([`Format::read_over`]).
+pub fn from_ink_over(source: &str, replaced: Option<&Gff>) -> Result<Gff, String> {
+    let mut settings = Settings::default();
     let mut lines: HashMap<String, Line> = HashMap::new();
     let mut start: Option<String> = None;
     let mut current: Option<String> = None;
@@ -1431,6 +1746,8 @@ pub fn from_ink(source: &str) -> Result<Gff, String> {
             continue;
         }
         let line = ink_uncomment(raw).trim();
+        // (A declaration: one of an NPC line's own that starts so is
+        // written with a backslash before it.)
         if line.is_empty() || line.starts_with("VAR ") || line.starts_with("CONST ") {
             continue;
         }
@@ -1451,7 +1768,14 @@ pub fn from_ink(source: &str) -> Result<Gff, String> {
             continue;
         }
         let Some(knot) = current.clone() else {
-            // Before the first knot: the start's divert.
+            // Before the first knot: the story's tags (the conversation's
+            // settings among them) and the start's divert.
+            if let Some(tag) = line.strip_prefix('#') {
+                for tag in tag.split('#') {
+                    settings.read_tag(tag.trim()).map_err(|e| format!("line {at}: {e}"))?;
+                }
+                continue;
+            }
             match line.strip_prefix("->") {
                 Some(t) => start = Some(t.trim().to_string()),
                 None => return Err(format!("line {at}: text before the first knot isn't read")),
@@ -1465,72 +1789,9 @@ pub fn from_ink(source: &str) -> Result<Gff, String> {
                 None => k.tags.push(tag.trim().to_string()),
             }
         } else if let Some(choice) = line.strip_prefix('+').or_else(|| line.strip_prefix('*')) {
-            // + {cond} [text] # tag -> target (and, as Moonglow wrote it
-            // before 1.22.1, + {cond} [text] -> target # tag)
-            let named = |tags: &str| tags.split('#').map(|t| t.trim().to_string()).collect();
-            let joined;
-            let (choice, tags): (&str, Vec<String>) = match ink_find(choice, '#') {
-                Some(at) => match choice[at..].rfind("->") {
-                    Some(arrow) => {
-                        joined = format!("{} {}", &choice[..at], &choice[at + arrow..]);
-                        (joined.as_str(), named(&choice[at + 1..at + arrow]))
-                    }
-                    None => (&choice[..at], named(&choice[at + 1..])),
-                },
-                None => (choice, Vec::new()),
-            };
-            let mut rest = choice.trim();
-            let mut cond = None;
-            if let Some(r) = rest.strip_prefix('{') {
-                let end = r.find('}').ok_or(format!("line {at}: a condition doesn't end"))?;
-                cond = Some(r[..end].trim().to_string());
-                rest = r[end + 1..].trim();
-            }
-            // `# if:c_x key=value`: the condition's parameters.
-            let mut tags = tags;
-            if let Some(i) = tags.iter().position(|t| t.starts_with("if:")) {
-                let call = tags.remove(i)["if:".len()..].trim().to_string();
-                if tags.iter().any(|t| t.starts_with("if:")) {
-                    return Err(format!("line {at}: a choice has one condition, one # if:"));
-                }
-                cond = Some(with_params(at, cond.as_deref(), call)?);
-            }
-            let (text, after) = match rest.strip_prefix('[') {
-                Some(r) => {
-                    let end = ink_find(r, ']')
-                        .ok_or(format!("line {at}: a choice's [text] doesn't end"))?;
-                    (r[..end].replace("\\n", "\n"), r[end + 1..].trim())
-                }
-                None => match rest.split_once("->") {
-                    Some((t, _)) => (t.trim().to_string(), &rest[t.len()..]),
-                    None => (rest.to_string(), ""),
-                },
-            };
-            let target = after
-                .trim()
-                .strip_prefix("->")
-                .map(|t| t.trim().to_string())
-                .ok_or(format!("line {at}: a choice must divert (-> KNOT or -> END)"))?;
-            let text = text.trim();
-            let text = if text == "(Continue)" {
-                String::new()
-            } else {
-                text.split('\n').map(ink_unescape).collect::<Vec<_>>().join("\n")
-            };
-            let to = (target != "END" && target != "DONE").then_some(target);
-            k.replies.push((text, cond, tags, to));
+            k.replies.push(parse_ink_choice(at, choice)?);
         } else if let Some(r) = line.strip_prefix('{') {
-            // {cond: -> target}
-            let inner = r.strip_suffix('}').ok_or(format!("line {at}: logic isn't read"))?;
-            let (cond, target) = inner
-                .split_once(':')
-                .and_then(|(c, t)| Some((c.trim(), t.trim().strip_prefix("->")?.trim())))
-                .ok_or(format!("line {at}: only {{condition: -> KNOT}} is read"))?;
-            let cond = match pending_if {
-                Some((from, call)) => with_params(from, Some(cond), call)?,
-                None => cond.to_string(),
-            };
-            k.choice.get_or_insert_with(Vec::new).push((Some(cond), target.to_string()));
+            k.choice.get_or_insert_with(Vec::new).push(parse_ink_divert(at, r, pending_if)?);
         } else if let Some(t) = line.strip_prefix("->") {
             k.choice.get_or_insert_with(Vec::new).push((None, t.trim().to_string()));
         } else if line.starts_with('-')
@@ -1550,10 +1811,8 @@ pub fn from_ink(source: &str) -> Result<Gff, String> {
         return Err(format!("line {from}: {IF_TAG_PLACE}"));
     }
     let start = start.or(first_knot).ok_or("no knots")?;
-    if start == "END" {
-        return Ok(new_dialog());
-    }
-    Builder::build(&lines, &start)
+    let start = (start != "END").then_some(start.as_str());
+    Builder::build(&lines, start, &settings, replaced)
 }
 
 #[cfg(test)]
@@ -1583,6 +1842,52 @@ mod tests {
         add_node(&mut g, Parent::Node(Kind::Entry, again), "Yes.");
         crate::dialog::recount(&mut g);
         g
+    }
+
+    /// An owning link (`IsChild` 0) from `parent` to a line that is there.
+    fn own(g: &mut Gff, parent: Parent, index: u32) {
+        let link = crate::dialog::new_link(index, parent, false);
+        crate::dialog::links_mut(g, parent).unwrap().push(link);
+    }
+
+    /// Another tool's conversation whose lines own each other is written
+    /// out and ends, and a line two lines own is written out once (the
+    /// review's V2: the walk had no guard, and overflowed the stack or grew
+    /// as two to the depth).
+    #[test]
+    fn plain_text_ends_where_lines_own_each_other() {
+        let mut g = new_dialog();
+        let e = add_node(&mut g, Parent::Root, "Round");
+        let r = add_node(&mut g, Parent::Node(Kind::Entry, e), "and round");
+        own(&mut g, Parent::Node(Kind::Reply, r), e);
+        let text = to_text(&g);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[2].trim(), "NPC Round   (E0, shown above)");
+        assert_eq!(crate::dialog::outline(&g).len(), 3);
+
+        // Thirty levels, each line owned by both lines of the level above.
+        let mut g = new_dialog();
+        let mut above = vec![add_node(&mut g, Parent::Root, "Top")];
+        let mut kind = Kind::Entry;
+        for level in 0..30 {
+            let first = Parent::Node(kind, above[0]);
+            let below = [
+                add_node(&mut g, first, &format!("a{level}")),
+                add_node(&mut g, first, &format!("b{level}")),
+            ];
+            if let Some(second) = above.get(1) {
+                own(&mut g, Parent::Node(kind, *second), below[0]);
+                own(&mut g, Parent::Node(kind, *second), below[1]);
+            }
+            above = below.to_vec();
+            kind = kind.child();
+        }
+        let text = to_text(&g);
+        let whole = |l: &&str| l.contains("a29") && !l.contains("shown above");
+        assert_eq!(text.lines().filter(whole).count(), 1, "written out once");
+        assert_eq!(text.lines().count(), 1 + 30 * 2 + 29 * 2);
+        assert_eq!(crate::dialog::outline(&g).len(), 1 + 30 * 2 + 29 * 2);
     }
 
     /// What a format says it reads is what it reads.
@@ -1772,6 +2077,90 @@ mod tests {
         assert!(apply_tags(&mut n, &["delay:soon".to_string()]).is_err());
     }
 
+    /// A conversation's own settings go out to Ink and Twine and come back:
+    /// the scripts run when it ends and is aborted (one of its own, or
+    /// none, as Setup Store makes them), its delays, the camera's zoom, and
+    /// a line whose animation plays once (the review's V7: read back, the
+    /// conversation ran Aurora's default `nw_walk_wp` at its end).
+    #[test]
+    fn a_conversation_s_end_scripts_survive_ink_and_twine() {
+        let mut g = sample();
+        g.root.set("EndConversation", Value::resref(ResRef::from_str("x").unwrap()));
+        g.root.set("EndConverAbort", Value::resref(ResRef::default()));
+        g.root.set("DelayEntry", Value::Dword(250));
+        g.root.set("PreventZoomIn", Value::Byte(1));
+        node_mut(&mut g, Kind::Entry, 1).unwrap().set("AnimLoop", Value::Byte(0));
+        node_mut(&mut g, Kind::Reply, 1).unwrap().set("AnimLoop", Value::Byte(0));
+        let ink = to_ink(&g);
+        assert!(ink.starts_with("# end:x\n# abort:\n# delay-entry:250\n# zoom:no\nVAR "), "{ink}");
+        let twee = to_twee(&g, "keeper");
+        let data = r#""moonglow": {"end":"x","abort":"","delay-entry":250,"zoom":false}"#;
+        assert!(twee.contains(data), "{twee}");
+        for (format, back) in [("Ink", from_ink(&ink)), ("Twine", from_twee(&twee))] {
+            let back = back.unwrap_or_else(|e| panic!("{format}: {e}"));
+            for label in
+                ["EndConversation", "EndConverAbort", "DelayEntry", "DelayReply", "PreventZoomIn"]
+            {
+                assert_eq!(back.root.get(label), g.root.get(label), "{format}: {label}");
+            }
+            assert_eq!(play_outline(&back, 10_000), play_outline(&g, 10_000), "{format}");
+            let once = |kind| {
+                let n = crate::dialog::nodes(&back, kind);
+                n.iter().filter(|n| n.integer("AnimLoop") == Some(0)).count()
+            };
+            assert_eq!((once(Kind::Entry), once(Kind::Reply)), (1, 1), "{format}");
+        }
+        // Aurora's own come back as they are, and an empty conversation's too.
+        let plain = sample();
+        assert!(to_ink(&plain).starts_with("# end:nw_walk_wp\n# abort:nw_walk_wp\nVAR "));
+        let back = from_twee(&to_twee(&plain, "keeper")).unwrap();
+        assert_eq!(back.root.get("EndConverAbort"), plain.root.get("EndConverAbort"));
+        let mut empty = new_dialog();
+        empty.root.set("EndConversation", Value::resref(ResRef::from_str("x").unwrap()));
+        assert_eq!(from_ink(&to_ink(&empty)).unwrap(), empty);
+        // A script's name that is none is said, with the line.
+        let e = from_ink("# end:a_name_seventeen_x\n-> END\n").unwrap_err();
+        assert!(e.contains("a_name_seventeen_x"), "{e}");
+        assert!(from_ink("# delay-entry:soon\n-> END\n").unwrap_err().starts_with("line 1:"));
+    }
+
+    /// A story that says nothing of the conversation as a whole (written in
+    /// Twine or Inky) and takes a conversation's place leaves that
+    /// conversation's settings as they are, a field Moonglow doesn't know
+    /// among them; one that is a new conversation has Aurora's.
+    #[test]
+    fn a_story_keeps_the_settings_of_the_conversation_it_replaces() {
+        let mut old = sample();
+        old.root.set("EndConversation", Value::resref(ResRef::from_str("gate_done").unwrap()));
+        old.root.set("DelayReply", Value::Dword(7));
+        old.root.set("Custom", Value::Int(3));
+        let ink = "-> a\n=== a ===\nHi\n+ [Bye] -> END\n";
+        let twee = ":: a\nHi\n[[Bye->END]]\n";
+        let read = [
+            ("Ink", from_ink(ink), from_ink_over(ink, Some(&old))),
+            ("Twine", from_twee(twee), from_twee_over(twee, Some(&old))),
+        ];
+        for (format, new, over) in read {
+            let (new, over) = (new.unwrap(), over.unwrap());
+            assert_eq!(new.root.resref("EndConversation"), ResRef::from_str("nw_walk_wp").ok());
+            for label in ["EndConversation", "EndConverAbort", "DelayReply", "Custom"] {
+                assert_eq!(over.root.get(label), old.root.get(label), "{format}: {label}");
+            }
+            // The lines are the story's, and counted.
+            assert_eq!(play_outline(&over, 100), play_outline(&new, 100), "{format}");
+            assert_eq!(over.root.get("NumWords"), new.root.get("NumWords"), "{format}");
+            assert_eq!(crate::dialog::nodes(&over, Kind::Entry).len(), 1, "{format}");
+        }
+        // What the story says wins over the replaced one's.
+        let said = from_ink_over(&format!("# end:mine\n{ink}"), Some(&old)).unwrap();
+        assert_eq!(said.root.resref("EndConversation"), ResRef::from_str("mine").ok());
+        assert_eq!(said.root.get("DelayReply"), Some(&Value::Dword(7)));
+        assert_eq!(
+            Format::Ink.read_over(ink, Some(&old)).unwrap().unwrap(),
+            from_ink_over(ink, Some(&old)).unwrap()
+        );
+    }
+
     /// The CSV's condition and action name their scripts' parameters too.
     #[test]
     fn csv_scripts_carry_their_parameters() {
@@ -1826,6 +2215,20 @@ mod tests {
             update_from_csv(&mut g, "id,text\r\nE99,x\r\n").unwrap_err().contains("no line E99")
         );
         assert_eq!(read_csv("a,\"b\nc\",d\r\n").unwrap(), [vec!["a", "b\nc", "d"]]);
+    }
+
+    /// A CSV a spreadsheet saved as "CSV UTF-8" begins with a byte order
+    /// mark, which is no part of the `id` header (the review's V5: Import
+    /// Lines said "no id column").
+    #[test]
+    fn a_csv_with_a_byte_order_mark_reads_back() {
+        let mut g = new_dialog();
+        add_node(&mut g, Parent::Root, "Hi");
+        assert_eq!(update_from_csv(&mut g, "\u{feff}id,text\r\nE0,Hello\r\n"), Ok(1));
+        assert_eq!(text(node(&g, Kind::Entry, 0).unwrap()), "Hello");
+        // A quoted first header too, and the mark nowhere else.
+        assert_eq!(update_from_csv(&mut g, "\u{feff}\"id\",text\r\nE0,Hello\r\n"), Ok(0));
+        assert_eq!(read_csv("\u{feff}a,\u{feff}b").unwrap(), [vec!["a", "\u{feff}b"]]);
     }
 
     /// A CSV carries a column for each language a line has text in, and
@@ -1891,9 +2294,78 @@ mod tests {
         assert!(t.contains("(goes to E1 above)"), "{t}");
     }
 
+    /// Three texts that did not come back from Ink as written (the
+    /// review's V13): a reply with a backslash before an `n` (its `\n` was
+    /// read as a line break), an NPC line that starts with a word Ink
+    /// declares by (it was skipped as a declaration), and a reply with a
+    /// line of spaces between two paragraphs (written as a comment, which
+    /// cut the choice short: the story was refused).
+    #[test]
+    fn ink_texts_come_back_as_written() {
+        let mut g = new_dialog();
+        let var = add_node(&mut g, Parent::Root, "VAR is a joke, right?\nCONST too.\nVARY not.");
+        let at = Parent::Node(Kind::Entry, var);
+        let path = add_node(&mut g, at, "Path: C:\\new\\\\n and \\ alone");
+        let paragraphs = add_node(&mut g, at, "One.\n \nTwo.\n-three\\n");
+        let list = add_node(&mut g, at, "LIST of things [x] // not a comment");
+        let ink = to_ink(&g);
+        assert!(ink.contains("\n\\VAR is a joke, right?\n\\CONST too.\nVARY not.\n"), "{ink}");
+        assert!(ink.contains("+ [Path: C:\\\\new\\\\\\\\n and \\\\ alone] -> END"), "{ink}");
+        assert!(ink.contains("+ [One.\\n\\nTwo.\\n\\-three\\\\n] -> END"), "{ink}");
+        let back = from_ink(&ink).unwrap();
+        let said = |kind, i| text(node(&back, kind, i).unwrap());
+        assert_eq!(said(Kind::Entry, var), "VAR is a joke, right?\nCONST too.\nVARY not.");
+        assert_eq!(said(Kind::Reply, path), "Path: C:\\new\\\\n and \\ alone");
+        assert_eq!(said(Kind::Reply, paragraphs), "One.\n\nTwo.\n-three\\n");
+        assert_eq!(said(Kind::Reply, list), "LIST of things [x] // not a comment");
+        assert_eq!(play_outline(&back, 100), play_outline(&g, 100));
+        // A story's own declarations are still passed over.
+        let declared = from_ink("VAR c = true\nCONST d = 1\n-> a\n=== a ===\nHi\n").unwrap();
+        assert_eq!(text(node(&declared, Kind::Entry, 0).unwrap()), "Hi");
+    }
+
     #[test]
     fn unsupported_ink_is_refused_with_its_line() {
         let e = from_ink("-> a\n=== a ===\nHi\n- gather\n").unwrap_err();
         assert!(e.starts_with("line 4:"), "{e}");
+    }
+
+    #[test]
+    fn overlong_condition_errors_and_special_tags_and_escaped_headers_round_trip() {
+        // Overlong condition script (>16 chars) returns an error instead of writing ConditionParams alone.
+        let bad_twee = ":: StoryTitle\nTest\n\n:: StoryData\n{\"start\":\"Start\"}\n\n:: Start [npc-choice]\n[[if cond_script_too_long_17 item=1->E0]]\n\n:: E0\nHi\n";
+        assert!(from_twee(bad_twee).is_err());
+        let bad_ink = "VAR cond_script_too_long_17 = true\n-> Start\n=== Start ===\n{cond_script_too_long_17 item=1: -> E0}\n=== E0 ===\nHi\n";
+        assert!(from_ink(bad_ink).is_err());
+
+        // Speaker and journal tags containing brackets, braces, comments, colons, spaces, newlines round-trip.
+        let mut g = new_dialog();
+        let e = add_node(&mut g, Parent::Root, "Line");
+        let speaker = "Sir [A] {B} // C:1\nD";
+        let quest = "q_[sub]:{part}//x";
+        let n = node_mut(&mut g, Kind::Entry, e).unwrap();
+        n.set("Speaker", Value::String(speaker.as_bytes().to_vec()));
+        n.set("Quest", Value::String(quest.as_bytes().to_vec()));
+        n.set("QuestEntry", Value::Dword(7));
+
+        let twee = to_twee(&g, "T");
+        let back_twee = from_twee(&twee).unwrap();
+        let ne = node(&back_twee, Kind::Entry, 0).unwrap();
+        assert_eq!(string(ne, "Speaker"), speaker);
+        assert_eq!(string(ne, "Quest"), quest);
+        assert_eq!(ne.integer("QuestEntry"), Some(7));
+
+        let ink = to_ink(&g);
+        let back_ink = from_ink(&ink).unwrap();
+        let ie = node(&back_ink, Kind::Entry, 0).unwrap();
+        assert_eq!(string(ie, "Speaker"), speaker);
+        assert_eq!(string(ie, "Quest"), quest);
+        assert_eq!(ie.integer("QuestEntry"), Some(7));
+
+        // parse_twee keeps escaped brackets in passage names before real [tags].
+        let (passages, start, _, _) =
+            parse_twee(":: Escaped\\[Name\\] [speaker:NPC] {\"position\":\"1,2\"}\nHello\n");
+        assert!(start.is_none());
+        assert_eq!(passages["Escaped[Name]"].tags, ["speaker:NPC"]);
     }
 }

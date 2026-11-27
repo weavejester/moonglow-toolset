@@ -1,6 +1,24 @@
 use super::super::*;
 use egui_kittest::{Harness, kittest::Queryable};
 
+/// The header's Interact and Reset over the canvas (M4's U18: the
+/// canvas's row had them), for the cases that draw the canvas alone.
+fn header(ui: &mut Ui, state: &mut State) {
+    // (A panel of its own over the canvas: the canvas under it at whole
+    // pixels, as under the header.)
+    egui::Panel::top("test-header").exact_size(24.0).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let mut on = state.preview_interactive;
+            if ui.toggle_value(&mut on, "Interact").changed() {
+                state.interact(on);
+            }
+            if ui.add_enabled(on, egui::Button::new("Reset")).clicked() {
+                state.reset();
+            }
+        });
+    });
+}
+
 struct Case {
     doc: Value,
     settings: Settings,
@@ -14,6 +32,7 @@ fn harness(children: Value, settings: Settings) -> Harness<'static, Case> {
     doc["root"]["children"] = children;
     Harness::builder().with_size(egui::vec2(900.0, 850.0)).build_ui_state(
         |ui, t: &mut Case| {
+            header(ui, &mut t.state);
             preview::canvas(ui, &mut t.doc, &t.settings, &mut t.state, &mut t.assets)
         },
         Case { doc, settings, state: State::default(), assets: skin::Assets::default() },
@@ -21,6 +40,13 @@ fn harness(children: Value, settings: Settings) -> Harness<'static, Case> {
 }
 
 fn click_at(h: &mut Harness<'_, Case>, pos: egui::Pos2) {
+    hold_at(h, pos, 1);
+}
+
+/// The pointer pressed at `pos` for `frames` frames, then let go. (A
+/// frame at a time while it is held: an end button held draws the window
+/// again each frame.)
+fn hold_at(h: &mut Harness<'_, Case>, pos: egui::Pos2, frames: usize) {
     h.hover_at(pos);
     h.run();
     for pressed in [true, false] {
@@ -30,7 +56,13 @@ fn click_at(h: &mut Harness<'_, Case>, pos: egui::Pos2) {
             pressed,
             modifiers: egui::Modifiers::NONE,
         });
-        h.run();
+        if pressed {
+            for _ in 0..frames {
+                h.step();
+            }
+        } else {
+            h.run();
+        }
     }
 }
 
@@ -143,7 +175,7 @@ fn whole_window_view_changes_only_root_and_reset_restores_it() {
         extra: Default::default(),
     });
     let doc = mg_nui::window();
-    let mut session = interaction::Session::new(&doc, &settings);
+    let mut session = interaction::Session::new(&doc, &settings, None);
     session.row_values.insert(("old_list".into(), 0), true.into());
     session.dispatch("click", "details_button", None, 0);
     let mut expected = doc.clone();
@@ -151,7 +183,7 @@ fn whole_window_view_changes_only_root_and_reset_restores_it() {
     assert_eq!(session.doc, expected);
     assert!(session.row_values.is_empty());
     assert_eq!(settings.variants["details"]["value"], "Details");
-    assert_eq!(interaction::Session::new(&doc, &settings).doc, doc);
+    assert_eq!(interaction::Session::new(&doc, &settings, None).doc, doc);
 }
 
 #[test]
@@ -258,6 +290,7 @@ fn wrapped_preview_toolbar_stays_compact() {
             assets.loaded = true;
             let mut h = Harness::builder().with_size(egui::vec2(width, 760.0)).build_ui_state(
                 |ui, t: &mut Case| {
+                    header(ui, &mut t.state);
                     preview::canvas(ui, &mut t.doc, &t.settings, &mut t.state, &mut t.assets)
                 },
                 Case {
@@ -418,11 +451,126 @@ fn list_scroll_reaches_later_rows_without_changing_source() {
     h.run();
     let before = h.state().doc.clone();
     let scroll = h.get_by_label("Scroll list /root/children/0").rect();
-    click_at(&mut h, scroll.center_bottom() - egui::vec2(0.0, 3.0));
+    // (The down button held until the end.)
+    hold_at(&mut h, scroll.center_bottom() - egui::vec2(0.0, 3.0), 400);
     assert!(h.state().state.list_scroll.values().any(|v| *v > 500.0));
     assert!(h.query_by_label("Canvas Label · Entry · row 0").is_none());
     assert!(h.query_by_label("Canvas Label · Entry · row 39").is_some());
     assert_eq!(h.state().doc, before);
+}
+
+/// An end button held scrolls a list, a group and a text alike, 1% of the
+/// bar's length a frame of the client's, as long as it is held, and back
+/// with the other end's (`reading_scrollbar_end_buttons`: the client's
+/// buttons repeat each frame they are held). A click on one scrolled a
+/// group 20 points, a text a line, and a list to the track's end.
+#[test]
+fn an_end_button_held_scrolls_a_hundredth_of_its_bar_a_client_frame() {
+    let lines: Vec<String> = (0..40).map(|i| format!("Line {i}")).collect();
+    let labels: Vec<Value> =
+        (0..40).map(|i| json!({"type":"label","value":format!("G {i}"),"height":30})).collect();
+    type Offset = fn(&State) -> f32;
+    let cases: [(Value, &str, Offset); 3] = [
+        (
+            json!({"type":"list","row_template":[[{"type":"label","value":"Entry"},150,true]],
+                "row_count":40,"row_height":30,"width":200,"height":300,"scrollbars":2}),
+            "Scroll list /root/children/0",
+            |s| s.list_scroll.values().copied().next().unwrap_or(0.0),
+        ),
+        (
+            json!({"type":"group","width":200,"height":300,"scrollbars":2,
+                "children":[{"type":"col","children":labels}]}),
+            "Scroll group vertically /root/children/0",
+            |s| s.group_scroll_y.values().copied().next().unwrap_or(0.0),
+        ),
+        (
+            json!({"type":"text","value":lines.join("\n"),"width":200,"height":300,
+                "scrollbars":2}),
+            "Scroll text vertically /root/children/0",
+            |s| s.text_scroll_y.values().copied().next().unwrap_or(0.0),
+        ),
+    ];
+    for (control, label, offset) in cases {
+        let mut h = harness(json!([control]), Settings::default());
+        h.state_mut().state.zoom = 1.0;
+        h.state_mut().state.preview_interactive = true;
+        h.run();
+        let bar = h.get_by_label(label).rect();
+        let press = |h: &mut Harness<'_, Case>, pos: egui::Pos2, pressed: bool| {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        };
+        // Held for ten frames: ten frames' worth, the window drawn again
+        // while it is held.
+        let down = egui::pos2(bar.center().x, bar.bottom() - 3.0);
+        h.hover_at(down);
+        h.run();
+        press(&mut h, down, true);
+        for _ in 0..10 {
+            h.step();
+        }
+        let frame = super::super::node::end_button_scroll(
+            bar.height(),
+            h.ctx.input(|i| i.stable_dt).min(0.1),
+        );
+        let held = offset(&h.state().state);
+        assert!(h.ctx.has_requested_repaint(), "{label}: drawn again while held");
+        press(&mut h, down, false);
+        h.run();
+        assert!((held - 10.0 * frame).abs() < frame * 1.01, "{label}: {held}, a frame {frame}");
+        assert_eq!(offset(&h.state().state), held, "{label}: let go, it stops");
+        // A click (a press and its release a frame apart): a frame's worth.
+        click_at(&mut h, down);
+        let clicked = offset(&h.state().state) - held;
+        assert!(clicked <= 2.0 * frame && clicked >= 0.0, "{label}: a click {clicked}");
+        // The other end's, held as long: back.
+        let up = egui::pos2(bar.center().x, bar.top() + 3.0);
+        h.hover_at(up);
+        h.run();
+        press(&mut h, up, true);
+        for _ in 0..20 {
+            h.step();
+        }
+        press(&mut h, up, false);
+        h.run();
+        assert_eq!(offset(&h.state().state), 0.0, "{label}: back at the start");
+    }
+}
+
+/// A list scrolled to a row shows that row at another UI scale and at
+/// another zoom, as a group and a text do: how far it is scrolled is kept
+/// in points. (It was kept in the canvas's pixels: scrolled to row 30 at
+/// 100%, a list showed row 15 at 200%.)
+#[test]
+fn a_scrolled_list_shows_the_same_rows_at_another_scale() {
+    let mut h = harness(
+        json!([{"type":"list","row_template":[[{"type":"label","value":"Entry"},150,true]],
+            "row_count":40,"row_height":25,"width":200,"height":120,"scrollbars":2}]),
+        Settings::default(),
+    );
+    h.state_mut().state.zoom = 1.0;
+    h.run();
+    let track = h.get_by_label("Scroll list /root/children/0").rect();
+    click_at(&mut h, track.center());
+    let first = |h: &Harness<'_, Case>| {
+        let shown =
+            |r: &usize| h.query_by_label(&format!("Canvas Label · Entry · row {r}")).is_some();
+        (0..40).find(shown).expect("a row in view")
+    };
+    let row = first(&h);
+    assert!((10..30).contains(&row), "scrolled to the middle: row {row}");
+    let kept = h.state().state.list_scroll.clone();
+    for (scale, zoom) in [(2.0, 1.0), (1.5, 1.0), (1.0, 0.5), (1.0, 1.0)] {
+        h.state_mut().state.preview_scale = scale;
+        h.state_mut().state.zoom = zoom;
+        h.run();
+        assert_eq!(first(&h), row, "at UI scale {scale}, zoom {zoom}");
+    }
+    assert_eq!(h.state().state.list_scroll, kept, "and back as it was");
 }
 
 #[test]
@@ -546,8 +694,9 @@ fn list_scrolls_to_the_rows_the_client_ends_on() {
         h.state_mut().state.zoom = 1.0;
         h.state_mut().state.preview_interactive = true;
         h.run();
+        // (The track dragged past its end.)
         let track = h.get_by_label("Scroll list /root/children/0").rect();
-        click_at(&mut h, egui::pos2(track.center().x, track.bottom() - 2.0));
+        drag(&mut h, track.center(), egui::vec2(0.0, height));
         let offset = *h.state().state.list_scroll.values().next().unwrap();
         assert_eq!(offset, last_top_row * 29.0, "{count} rows in {height}");
     }
@@ -667,10 +816,8 @@ fn text_scrolls_its_measured_extents() {
         h.state_mut().state.preview_interactive = true;
         h.run();
         let track = h.get_by_label("Scroll text horizontally /root/children/0").rect();
-        // The increment arrow, until the end.
-        for _ in 0..4 {
-            click_at(&mut h, egui::pos2(track.right() - 4.0, track.center().y));
-        }
+        // The increment arrow held, until the end.
+        hold_at(&mut h, egui::pos2(track.right() - 4.0, track.center().y), 30);
         let offset = *h.state().state.text_scroll_x.values().next().unwrap();
         assert_eq!(offset, 36.0, "{width}");
     }
@@ -1421,6 +1568,43 @@ fn progress_over_one_draws_past_its_frame_and_long_combo_lists_scroll() {
     assert!(h.query_by_label("Entry 29").is_some());
 }
 
+/// A combo's popup scrolls as a group, a list and a text do: its bar is
+/// dragged and clicked (it could not be), and the wheel over it is its
+/// own (the last pass's item 15, seen by the NUI drawing fixer).
+#[test]
+fn a_combo_popup_s_bar_is_dragged_and_clicked() {
+    let entries: Vec<_> = (0..30).map(|i| json!([format!("Entry {i}"), i])).collect();
+    let mut h = harness(
+        json!([{"type":"combo","value":0,"height":30,"width":200,"elements":entries}]),
+        Settings::default(),
+    );
+    h.state_mut().state.zoom = 1.0;
+    h.state_mut().state.preview_interactive = true;
+    h.run();
+    h.get_by_label("Canvas Dropdown").click();
+    h.run();
+    let bar = h.get_by_label("Scroll the list").rect();
+    assert!(h.query_by_label("Entry 29").is_none());
+    // A click on the lower end button: one entry on.
+    click_at(&mut h, bar.center_bottom() - egui::vec2(0.0, 4.0));
+    assert!(h.query_by_label("Entry 13").is_some(), "one entry on");
+    // The thumb dragged to the track's end: the last entries.
+    drag(&mut h, bar.center(), egui::vec2(0.0, bar.height() / 2.0 - 19.0));
+    assert!(h.query_by_label("Entry 29").is_some(), "dragged to the end");
+    // The wheel over it, back to the start, taken by it.
+    let first = h.get_by_label("Entry 29").rect();
+    h.hover_at(first.center());
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 1000.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run();
+    assert!(h.query_by_label("Entry 0").is_some());
+    assert_eq!(h.ctx.input(|i| i.smooth_scroll_delta.y), 0.0, "the wheel taken");
+}
+
 #[test]
 fn content_starts_under_the_clients_33_point_title_bar() {
     // NWN EE 8193.37, np_group: a window's first control (margin 2) is 43
@@ -1476,6 +1660,48 @@ fn bound_slider_values_are_clamped_into_their_bound_range() {
     h.run();
     assert_eq!(value(&h), json!(5));
     assert_eq!(h.state().settings.bindings["v"].value, json!(100));
+}
+
+/// A correction the simulation has nowhere to write (a combo or a slider
+/// bound to a bind the settings don't have, as a window imported without
+/// its settings; a list's row past what its bind holds) is not asked for:
+/// it was tried again every frame, the canvas repainting without end and
+/// the event line saying "Missing preview bind" over everything else.
+#[test]
+fn a_correction_with_nowhere_to_go_is_not_asked_for_every_frame() {
+    let mut settings = Settings::default();
+    settings.bindings.insert("short".into(), Binding { value: json!([5]), ..Default::default() });
+    let entries = json!([["First", 0], ["Second", 1]]);
+    for control in [
+        json!({"type":"combo","height":30,"elements":entries,"value":{"bind":"choice"}}),
+        json!({"type":"slider","height":30,"min":5,"max":9,"value":{"bind":"choice"}}),
+        json!({"type":"list","row_count":3,"row_height":30,"height":120,"row_template":[[
+            {"type":"combo","elements":entries,"value":{"bind":"short"}},0,true]]}),
+        json!({"type":"list","row_count":3,"row_height":30,"height":120,"row_template":[[
+            {"type":"slider","min":7,"max":9,"value":{"bind":"short"}},0,true]]}),
+    ] {
+        let mut h = harness(json!([control]), settings.clone());
+        h.state_mut().state.preview_interactive = true;
+        // (The first frames: the session made, the skin looked for.)
+        for _ in 0..3 {
+            h.step();
+        }
+        let runtime = h.state().state.runtime.as_ref().unwrap();
+        // (The row the bind does hold was corrected: 5 is no entry's, and
+        // under the slider's 7.)
+        let held = &runtime.settings.bindings["short"].value;
+        assert!(control["type"] != "list" || *held != json!([5]), "{control}: {held}");
+        let before = (runtime.settings.clone(), runtime.doc.clone());
+        for frame in 0..3 {
+            h.step();
+            let runtime = h.state().state.runtime.as_ref().unwrap();
+            assert_eq!(runtime.last_event.find("Missing preview"), None, "{control}");
+            assert!(before == (runtime.settings.clone(), runtime.doc.clone()));
+            let root = h.output().viewport_output.get(&egui::ViewportId::ROOT);
+            let again = root.is_some_and(|v| v.repaint_delay.is_zero());
+            assert!(!again, "{control}: frame {frame} asks for the next");
+        }
+    }
 }
 
 #[test]

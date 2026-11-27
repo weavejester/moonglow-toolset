@@ -31,7 +31,7 @@ pub use json::{
     JsonError, TextStyle, from_json, struct_from_json, struct_to_json, to_json, to_json_text,
     value_from_json, value_to_json,
 };
-pub use nwnt::{NwntError, from_nwnt, nwnt_unkept_label, to_nwnt};
+pub use nwnt::{NwntError, from_nwnt, nwnt_unkept, nwnt_unkept_label, to_nwnt};
 pub use path::{GffPath, Step};
 pub use read::ReadError;
 pub use value::{Field, FieldAt, FieldType, Label, LabelError, Struct, Value};
@@ -61,6 +61,13 @@ impl Gff {
     /// Parses a GFF file.
     pub fn read(data: &[u8]) -> Result<Gff, ReadError> {
         read::read(data)
+    }
+
+    /// Parses a GFF file's root with only the root's lists named in
+    /// `lists` read: the others are there, empty, and nothing under them
+    /// is read (a GIT's doors without its creatures and their items).
+    pub fn read_lists(data: &[u8], lists: &[&str]) -> Result<Gff, ReadError> {
+        read::read_with(data, Some(lists))
     }
 
     /// Serializes to GFF bytes.

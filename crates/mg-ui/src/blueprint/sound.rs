@@ -1,17 +1,19 @@
 //! Sound Properties (`TdlgSoundEdit`): Basic (sounds, volume), Positioning,
-//! Advanced (timing, play style and order, interval, variations), Comments.
+//! Advanced (timing, play style and order, interval, variations),
+//! Variables, Comments.
 
 use egui::Ui;
 use mg_core::{ResRef, ResType};
 use mg_edit::{Command, Edit};
 use mg_gff::{FieldType, Struct, Value};
 use mg_module::palette::BlueprintKind;
+use mg_uikit::Controls as _;
 
 use super::Form;
 use crate::Action;
 use crate::audio::Channel;
 
-pub(super) const PAGES: [&str; 4] = ["Basic", "Positioning", "Advanced", "Comments"];
+pub(super) const PAGES: [&str; 5] = ["Basic", "Positioning", "Advanced", "Variables", "Comments"];
 
 pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
     match page {
@@ -23,13 +25,8 @@ pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
 }
 
 fn basic(f: &mut Form<'_>, ui: &mut Ui) {
-    egui::Grid::new(("uts-basic", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        crate::widgets::field_label(ui, "Name");
-        f.locstring(ui, "Name", "LocName");
-        ui.end_row();
-        crate::widgets::field_label(ui, "Tag");
-        f.tag(ui, "Tag", "Tag");
-        ui.end_row();
+    super::form_grid(ui, ("uts-basic", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+        f.name_and_tag(ui, "LocName");
         crate::widgets::field_label(ui, "Category");
         f.category(ui, BlueprintKind::Sound);
         ui.end_row();
@@ -38,7 +35,7 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
         ui.end_row();
     });
     ui.separator();
-    crate::widgets::field_label(ui, "List of Sounds to Play");
+    crate::widgets::field_label(ui, "List of sounds to play");
     sound_list(f, ui);
 }
 
@@ -52,12 +49,13 @@ fn sound_list(f: &mut Form<'_>, ui: &mut Ui) {
         .iter()
         .map(|s| s.resref("Sound").unwrap_or(ResRef::EMPTY))
         .collect();
-    let sel_id = egui::Id::new(("uts-selected", f.key));
+    let sel_id = f.id("uts-selected");
     let mut selected: Option<usize> =
         ui.data(|d| d.get_temp(sel_id)).filter(|&i: &usize| i < sounds.len());
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_min_height(120.0);
         ui.set_min_width(260.0);
+        mg_uikit::list_rows(ui);
         for (i, s) in sounds.iter().enumerate() {
             if ui.selectable_label(selected == Some(i), s.to_string()).clicked() {
                 selected = Some(i);
@@ -65,14 +63,15 @@ fn sound_list(f: &mut Form<'_>, ui: &mut Ui) {
         }
     });
     let key = f.key;
+    let add_id = f.id("uts-add");
     let edit = |what: &str, edits: Vec<Edit>| Action::Apply(Command::new(what, edits));
     let item = |r: ResRef| {
         let mut s = Struct::new(0);
         s.set("Sound", Value::resref(r));
         s
     };
-    ui.horizontal(|ui| {
-        let pick_id = egui::Id::new(("uts-add", key));
+    super::row(ui, |ui| {
+        let pick_id = add_id;
         if let Some(r) = f.app.take_pick(pick_id).filter(|r| !r.is_empty()) {
             f.app.actions.push(edit(
                 "Add sound",
@@ -142,7 +141,7 @@ fn positioning(f: &mut Form<'_>, ui: &mut Ui) {
     f.mark_mixed_inline(ui, &["Positional", "RandomPosition"]);
     for (text, p, r) in choices {
         let on = positional == p && (!p || random == r);
-        if ui.radio(on, text).clicked() && !on {
+        if ui.radio_button(on, text).clicked() && !on {
             // Aurora sets the priority group with it.
             let priority = i64::from(mg_module::blueprints::sound_priority(looping, p));
             f.set_many(
@@ -156,27 +155,27 @@ fn positioning(f: &mut Form<'_>, ui: &mut Ui) {
         }
     }
     ui.separator();
-    egui::Grid::new(("uts-pos", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+    super::form_grid(ui, ("uts-pos", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
         ui.add_enabled_ui(positional, |ui| crate::widgets::field_label(ui, "Cutoff distance (m)"));
         ui.add_enabled_ui(positional, |ui| {
             f.spin_float(ui, "Cutoff distance", "MaxDistance", 0.0..=32000.0, 0.5, 10.0)
         });
         ui.end_row();
         ui.add_enabled_ui(positional, |ui| {
-            crate::widgets::field_label(ui, "Max Volume Distance (m)")
+            crate::widgets::field_label(ui, "Max volume distance (m)")
         });
         ui.add_enabled_ui(positional, |ui| {
             f.float(ui, "Max volume distance", "MinDistance", 0.0..=32000.0, 0.5)
         });
         ui.end_row();
         let rand = positional && random;
-        ui.add_enabled_ui(rand, |ui| crate::widgets::field_label(ui, "West-East Random Range (m)"));
+        ui.add_enabled_ui(rand, |ui| crate::widgets::field_label(ui, "West-East random range (m)"));
         ui.add_enabled_ui(rand, |ui| {
             f.spin_float(ui, "West-east random range", "RandomRangeX", 0.0..=32000.0, 0.5, 1.0)
         });
         ui.end_row();
         ui.add_enabled_ui(rand, |ui| {
-            crate::widgets::field_label(ui, "North-South Random Range (m)")
+            crate::widgets::field_label(ui, "North-South random range (m)")
         });
         ui.add_enabled_ui(rand, |ui| {
             f.spin_float(ui, "North-south random range", "RandomRangeY", 0.0..=32000.0, 0.5, 1.0)
@@ -195,17 +194,17 @@ const HOURS: [&str; 24] = [
 ];
 
 fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
-    egui::Grid::new(("uts-adv", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+    super::form_grid(ui, ("uts-adv", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
         crate::widgets::field_label(ui, "Blueprint ResRef");
         f.blueprint_resref(ui);
         ui.end_row();
         crate::widgets::field_label(ui, "Active");
         f.check(ui, "", "Active");
         ui.end_row();
-        crate::widgets::field_label(ui, "Pitch Variation (octaves)");
+        crate::widgets::field_label(ui, "Pitch variation (octaves)");
         f.float(ui, "Pitch variation", "PitchVariation", 0.0..=1.0, 0.01);
         ui.end_row();
-        crate::widgets::field_label(ui, "Volume Variation");
+        crate::widgets::field_label(ui, "Volume variation");
         f.slider(ui, "Volume variation", "VolumeVrtn", 0..=127);
         ui.end_row();
         crate::widgets::field_label(ui, "Variables");
@@ -217,10 +216,10 @@ fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
 
     crate::widgets::field_label(ui, "When to play");
     let times = f.int("Times");
-    ui.horizontal(|ui| {
+    super::row(ui, |ui| {
         f.mark_mixed_inline(ui, &["Times"]);
-        for (text, v) in [("Always", 3), ("Day", 1), ("Night", 2), ("Specific Hours", 0)] {
-            if ui.radio(times == v, text).clicked() && times != v {
+        for (text, v) in [("Always", 3), ("Day", 1), ("Night", 2), ("Specific hours", 0)] {
+            if ui.radio_button(times == v, text).clicked() && times != v {
                 f.set_int("When to play", "Times", v, FieldType::Byte);
             }
         }
@@ -228,14 +227,16 @@ fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
     let hours = f.int("Hours");
     ui.add_enabled_ui(times == 0, |ui| {
         f.mark_mixed_inline(ui, &["Hours"]);
-        egui::Grid::new(("uts-hours", f.key)).num_columns(6).show(ui, |ui| {
+        // (Four to a row in a narrow room, the Properties panel's.)
+        let per = if super::narrow(ui) { 4 } else { 6 };
+        egui::Grid::new(("uts-hours", f.key, per)).num_columns(per).show(ui, |ui| {
             for (bit, text) in HOURS.iter().enumerate() {
                 let mut on = hours & (1 << bit) != 0;
-                if ui.checkbox(&mut on, *text).changed() {
+                if ui.check_box(&mut on, *text).changed() {
                     let v = if on { hours | (1 << bit) } else { hours & !(1 << bit) };
                     f.set_int("Hours", "Hours", v, FieldType::Dword);
                 }
-                if bit % 6 == 5 {
+                if bit % per == per - 1 {
                     ui.end_row();
                 }
             }
@@ -247,8 +248,8 @@ fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
     let continuous = f.int("Continuous") != 0;
     let positional = f.int("Positional") != 0;
     let single = f.root.list("Sounds").is_some_and(|l| l.len() == 1);
-    crate::widgets::field_label(ui, "Play Style");
-    ui.horizontal(|ui| {
+    crate::widgets::field_label(ui, "Play style");
+    super::row(ui, |ui| {
         f.mark_mixed_inline(ui, &["Looping", "Continuous"]);
         // (label, Looping, Continuous), as Aurora writes them; seamless
         // looping takes a single sound, played in order.
@@ -256,7 +257,7 @@ fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
             let on = if l { looping } else { !looping && continuous == c };
             let enabled = !l || single || looping;
             if ui
-                .add_enabled(enabled, egui::RadioButton::new(on, text))
+                .add_enabled(enabled, mg_uikit::RadioButton::new(on, text))
                 .on_disabled_hover_text("Seamless looping plays a single sound")
                 .clicked()
                 && !on
@@ -274,29 +275,26 @@ fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
             }
         }
     });
-    crate::widgets::field_label(ui, "Play Order");
+    crate::widgets::field_label(ui, "Play order");
     let random = f.int("Random") != 0;
     ui.add_enabled_ui(!looping, |ui| {
-        ui.horizontal(|ui| {
+        super::row(ui, |ui| {
             f.mark_mixed_inline(ui, &["Random"]);
             for (text, v) in [("Sequential", false), ("Random", true)] {
-                if ui.radio(random == v, text).clicked() && random != v {
+                if ui.radio_button(random == v, text).clicked() && random != v {
                     f.set_int("Play order", "Random", i64::from(v), FieldType::Byte);
                 }
             }
         });
     });
     ui.add_enabled_ui(!looping, |ui| {
-        egui::Grid::new(("uts-interval", f.key)).num_columns(2).spacing([12.0, 6.0]).show(
-            ui,
-            |ui| {
-                crate::widgets::field_label(ui, "Interval between playing sounds (seconds)");
-                f.millis(ui, "Interval", "Interval", 0.0..=60.0, 10.0);
-                ui.end_row();
-                crate::widgets::field_label(ui, "Interval Variation (seconds)");
-                f.millis(ui, "Interval variation", "IntervalVrtn", 0.0..=60.0, 10.0);
-                ui.end_row();
-            },
-        );
+        super::form_grid(ui, ("uts-interval", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+            crate::widgets::field_label(ui, "Interval between playing sounds (seconds)");
+            f.millis(ui, "Interval", "Interval", 0.0..=60.0, 10.0);
+            ui.end_row();
+            crate::widgets::field_label(ui, "Interval variation (seconds)");
+            f.millis(ui, "Interval variation", "IntervalVrtn", 0.0..=60.0, 10.0);
+            ui.end_row();
+        });
     });
 }

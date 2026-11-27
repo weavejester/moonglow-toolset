@@ -13,7 +13,7 @@
 //! moves the client's camera.
 //!
 //! Needs the game, a GPU and the off-screen display; run by hand:
-//! `DISPLAY=:2 cargo test -p mg-corpus-tests --release --test client_render heads -- --ignored --nocapture`.
+//! `DISPLAY=$D cargo test -p mg-corpus-tests --release --test client_render heads -- --ignored --nocapture`.
 
 use super::*;
 use mg_module::instances::{Placement, Placing, instance};
@@ -126,7 +126,7 @@ fn moonglow(gpu: &Gpu, game: &GameData, are: &Gff, git: &Gff, size: (u32, u32)) 
 fn heads_look() {
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;

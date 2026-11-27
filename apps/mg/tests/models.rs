@@ -63,11 +63,8 @@ fn cat_prints_a_compiled_model_as_text() {
     let compiled = run(&["cat", "plc_a01.mdl"]);
     assert!(mg_mdl::is_binary(&compiled));
     let text = String::from_utf8(run(&["cat", "plc_a01.mdl", "--text"])).unwrap();
-    assert!(
-        text.to_ascii_lowercase().contains("newmodel plc_a01"),
-        "{}",
-        &text[..200.min(text.len())]
-    );
+    let end = text.floor_char_boundary(200.min(text.len()));
+    assert!(text.to_ascii_lowercase().contains("newmodel plc_a01"), "{}", &text[..end]);
     // The text is the model: it reads as the compiled one does.
     let (a, b) =
         (mg_mdl::Model::read(&compiled).unwrap(), mg_mdl::Model::read(text.as_bytes()).unwrap());
@@ -202,5 +199,126 @@ fn the_model_spec_suite_passes() {
         assert!(stock.len() >= 14, "{} stock models", stock.len());
         let f = failed(&stock);
         assert!(f.is_empty(), "{f:#?}");
+    } else {
+        assert!(
+            !mg_testkit::corpus_required(),
+            "MOONGLOW_REQUIRE_CORPUS is set but no game install was found"
+        );
     }
+}
+
+/// A placeable with a drawn mesh under a moved node, a mesh not drawn and
+/// an animation, for `mg model info`.
+const FACTS: &str = "newmodel mg_info\nsetsupermodel mg_info NULL\nclassification placeable\n\
+setanimationscale 1\nbeginmodelgeom mg_info\n\
+node dummy mg_info\n  parent NULL\nendnode\n\
+node trimesh plane\n  parent mg_info\n  position 0 0 2\n  bitmap mg_tex\n\
+  verts 3\n    0 0 0\n    1 0 0\n    0 1 0\n\
+  faces 1\n    0 1 2 1 0 0 0 0\n\
+  tverts 3\n    0 0 0\n    1 0 0\n    0 1 0\nendnode\n\
+node trimesh hidden\n  parent mg_info\n  render 0\n\
+  verts 3\n    0 0 0\n    9 0 0\n    0 9 0\n\
+  faces 1\n    0 1 2 1 0 0 0 0\nendnode\n\
+endmodelgeom mg_info\n\
+newanim open mg_info\n  length 2\n  transtime 0.25\n  animroot mg_info\n\
+  node dummy mg_info\n    parent NULL\n  endnode\ndoneanim open mg_info\n\
+donemodel mg_info\n";
+
+#[test]
+fn model_info_gives_a_model_s_facts_from_its_text_and_compiled() {
+    let dir = mg_testkit::scratch_dir("mg-model-info");
+    let (text, binary) = (dir.join("mg_info.mdl"), dir.join("compiled/mg_info.mdl"));
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(&text, FACTS).unwrap();
+    let out = mg(&["model", "compile", text.to_str().unwrap(), binary.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let info = |p: &std::path::Path| {
+        let (ok, json) = crate::mg_json(&["model", "info", p.to_str().unwrap()]);
+        assert!(ok, "{json}");
+        json
+    };
+    let (a, b) = (info(&text), info(&binary));
+    assert_eq!((a["format"].as_str(), b["format"].as_str()), (Some("ascii"), Some("binary")));
+    assert_eq!(a["from"], text.to_str().unwrap());
+    let same = ["name", "supermodel", "classification", "nodes", "node_types", "faces"];
+    let also =
+        ["faces_rendered", "bounds", "skins", "bones", "textures", "materials", "animations"];
+    for field in same.iter().chain(&also) {
+        assert_eq!(a[field], b[field], "{field}: {a} {b}");
+    }
+    assert_eq!(a["supermodel"], serde_json::Value::Null);
+    assert_eq!(a["node_types"], serde_json::json!({ "dummy": 1, "trimesh": 2 }));
+    assert_eq!((a["faces"].as_u64(), a["faces_rendered"].as_u64()), (Some(2), Some(1)));
+    // The drawn plane alone, 2 m up: the hidden mesh is not in the box.
+    assert_eq!(a["bounds"], serde_json::json!({ "min": [0.0, 0.0, 2.0], "max": [1.0, 1.0, 2.0] }));
+    assert_eq!(a["textures"], serde_json::json!(["mg_tex"]));
+    assert_eq!(
+        a["animations"],
+        serde_json::json!([{ "name": "open", "length": 2.0, "transtime": 0.25, "events": 0 }])
+    );
+    let lines = String::from_utf8(mg(&["model", "info", text.to_str().unwrap()]).stdout).unwrap();
+    assert!(lines.contains("Faces\t2 (1 drawn), 6 vertices\n"), "{lines}");
+    assert!(lines.contains("Bounds\t0.000 0.000 2.000 to 1.000 1.000 2.000\n"), "{lines}");
+}
+
+/// A text's faces its mesh leaves out are counted apart: one whose two
+/// corners merge into one vertex (vertices 2 and 3 are at one place, with
+/// one UV, and in smoothing group 0 each corner takes the face's own
+/// normal), as the game's compiler leaves it out
+/// (nwn-mdl-spec MDL-MESH-020); one past the vertices is the reader's
+/// note, with its line. The vertices of the face left out stay (5).
+#[test]
+fn model_info_says_which_faces_of_a_text_are_left_out() {
+    let dir = mg_testkit::scratch_dir("mg-model-info-left-out");
+    let text = dir.join("mg_left.mdl");
+    std::fs::write(
+        &text,
+        "newmodel mg_left\nsetsupermodel mg_left NULL\nbeginmodelgeom mg_left\n\
+         node dummy mg_left\n  parent NULL\nendnode\n\
+         node trimesh plane\n  parent mg_left\n  bitmap mg_tex\n\
+         verts 4\n    0 0 0\n    1 0 0\n    0 1 0\n    0 1 0\n\
+         faces 3\n    0 1 2 1 0 0 0 0\n    0 2 3 0 0 0 0 0\n    0 1 7 1 0 0 0 0\n\
+         tverts 1\n    0 0 0\nendnode\nendmodelgeom mg_left\ndonemodel mg_left\n",
+    )
+    .unwrap();
+    let (ok, json) = crate::mg_json(&["model", "info", text.to_str().unwrap()]);
+    assert!(ok, "{json}");
+    assert_eq!((json["faces"].as_u64(), json["faces_left_out"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(
+        json["notes"],
+        serde_json::json!(["line 15: 1 faces refer to vertices past the 4 given and are left out"])
+    );
+    let out = mg(&["model", "info", text.to_str().unwrap()]);
+    let lines = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        lines.contains("Faces\t1 (1 drawn), 5 vertices\nLeft out\t1 faces of the text"),
+        "{lines}"
+    );
+    // A compiled model's faces are its own: none left out.
+    let binary = dir.join("compiled/mg_left.mdl");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    let out = mg(&["model", "compile", text.to_str().unwrap(), binary.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (ok, json) = crate::mg_json(&["model", "info", binary.to_str().unwrap()]);
+    assert!(ok, "{json}");
+    assert_eq!((json["faces"].as_u64(), json["faces_left_out"].as_u64()), (Some(1), Some(0)));
+}
+
+#[test]
+fn model_info_finds_a_model_by_its_name() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("mg-model-info-name");
+    std::fs::write(dir.join("mg_info.mdl"), FACTS).unwrap();
+    let run = |args: &[&str]| crate::json_out(crate::mg_on(&root, None).arg("--json").args(args));
+    let (ok, json) = run(&["model", "info", "mg_info", "--hak", dir.to_str().unwrap()]);
+    assert!(ok, "{json}");
+    assert_eq!(json["from"], format!("folder:{}", dir.display()));
+    // The game's own, by name, with its extension or without.
+    let (ok, json) = run(&["model", "info", "plc_a01.mdl"]);
+    assert!(
+        ok && json["format"] == "binary" && json["faces_rendered"].as_u64() > Some(0),
+        "{json}"
+    );
+    let (ok, json) = run(&["model", "info", "mg_zz_nowhere"]);
+    assert!(!ok && json["error"].as_str().unwrap().contains("found nowhere"), "{json}");
 }

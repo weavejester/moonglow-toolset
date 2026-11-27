@@ -48,6 +48,12 @@ fn content_file(name: &str) -> Option<&str> {
         return None;
     }
     let file = name.rsplit(['/', '\\']).next().filter(|f| !f.is_empty())?;
+    // (What [`mg_core::ResRef::is_file_name`] refuses in a resource's
+    // name: joined to the user's folder on Windows, `D:x.hak` is a file in
+    // drive D's current folder and `a.hak:b.hak` a stream of `a.hak`.)
+    if file.chars().any(|c| c == ':' || c.is_control()) {
+        return None;
+    }
     let ext = Path::new(file).extension()?.to_string_lossy().to_ascii_lowercase();
     matches!(ext.as_str(), "hak" | "tlk").then_some(file)
 }
@@ -118,13 +124,18 @@ fn same_in_archive(
     Ok(flags.into_iter().filter(|(_, same)| same.get()).map(|(name, _)| name).collect())
 }
 
-/// Where each file goes in the user folder `user_dir`: `.hak` files to
-/// `hak`, `.tlk` files to `tlk`; a `.zip`, `.7z` or `.rar` archive's haks
+/// Where each file goes: `.hak` files to the hak folder `hak_dir`, `.tlk`
+/// files to the talk table folder `tlk_dir` (the user folder's, or those
+/// `nwn.ini` aliases: `GameInstall::user_folder`); a `.zip`, `.7z` or `.rar` archive's haks
 /// and talk table alike, from the archive (wherever in it they are). An
 /// error names a file that's none of these, an archive with neither in
 /// it (or that can't be read: one protected by a password, one volume of
 /// a set), or a second talk table (a module has one).
-pub fn placements(user_dir: &Path, files: &[PathBuf]) -> Result<Vec<Placement>, String> {
+pub fn placements(
+    hak_dir: &Path,
+    tlk_dir: &Path,
+    files: &[PathBuf],
+) -> Result<Vec<Placement>, String> {
     let mut out: Vec<Placement> = Vec::new();
     for from in files {
         let ext = from.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
@@ -160,7 +171,7 @@ pub fn placements(user_dir: &Path, files: &[PathBuf]) -> Result<Vec<Placement>, 
             if is_tlk && out.iter().any(|p| p.is_tlk) {
                 return Err("a module has one talk table: choose one".into());
             }
-            let to = user_dir.join(if is_tlk { "tlk" } else { "hak" }).join(&file);
+            let to = if is_tlk { tlk_dir } else { hak_dir }.join(&file);
             let same_file = entry.is_none()
                 && std::fs::canonicalize(from)
                     .ok()
@@ -224,7 +235,9 @@ pub fn copy(placements: &[Placement], replace: bool) -> Result<usize, String> {
             There::Same => false,
         })
         .collect();
-    let part = |p: &Placement| p.to.with_extension("part");
+    // (Each beside its place under the one name Moonglow writes files by:
+    // with the extension changed, `x.hak` and `x.erf` shared `x.part`.)
+    let part = |p: &Placement| crate::sibling(&p.to, crate::WRITING);
     for p in &go {
         let dir = p.to.parent().expect("in a folder");
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -322,12 +335,19 @@ mod tests {
             ("Content/tlk/z_text.tlk", "text"),
             ("Content/readme.txt", "read me"),
             ("../z_evil.hak", "evil"),
+            // (On Windows a name with a drive's colon is written in that
+            // drive's current folder, and `a.hak:b.hak` into a stream of
+            // `a.hak`: neither is a file's name in the user folder.)
+            ("D:evil.hak", "x"),
+            ("Content/a.hak:b.hak", "x"),
+            ("Content/z_\u{7}bell.hak", "x"),
         ] {
             zip.start_file(name, options).unwrap();
             zip.write_all(data.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
-        let p = placements(&user, std::slice::from_ref(&zipped)).unwrap();
+        let p = placements(&user.join("hak"), &user.join("tlk"), std::slice::from_ref(&zipped))
+            .unwrap();
         let names: Vec<(&str, bool)> = p.iter().map(|p| (p.name.as_str(), p.is_tlk)).collect();
         assert_eq!(names, [("z_one", false), ("z_text", true), ("z_two", false)]);
         assert_eq!(p[1].to, user.join("tlk/z_text.tlk"));
@@ -335,19 +355,29 @@ mod tests {
         assert_eq!(std::fs::read_to_string(user.join("hak/z_one.hak")).unwrap(), "one");
         assert_eq!(std::fs::read_to_string(user.join("hak/z_two.HAK")).unwrap(), "two");
         assert!(!dir.join("z_evil.hak").exists() && !user.join("hak/z_evil.hak").exists());
-        let again = placements(&user, std::slice::from_ref(&zipped)).unwrap();
+        let again = placements(&user.join("hak"), &user.join("tlk"), std::slice::from_ref(&zipped))
+            .unwrap();
         assert!(again.iter().all(|p| p.there == There::Same), "{again:?}");
         // An archive with neither in it, or no archive at all.
         let empty = dir.join("empty.zip");
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&empty).unwrap());
         zip.start_file("readme.txt", options).unwrap();
         zip.finish().unwrap();
-        assert!(placements(&user, &[empty]).unwrap_err().contains("no hak or talk table"));
+        assert!(
+            placements(&user.join("hak"), &user.join("tlk"), &[empty])
+                .unwrap_err()
+                .contains("no hak or talk table")
+        );
         std::fs::write(dir.join("bad.zip"), b"not a zip").unwrap();
-        assert!(placements(&user, &[dir.join("bad.zip")]).is_err());
+        assert!(placements(&user.join("hak"), &user.join("tlk"), &[dir.join("bad.zip")]).is_err());
         // Two files of one name, in it and beside it, would go to one place.
         std::fs::write(dir.join("z_one.hak"), "one beside").unwrap();
-        let twice = placements(&user, &[zipped.clone(), dir.join("z_one.hak")]).unwrap_err();
+        let twice = placements(
+            &user.join("hak"),
+            &user.join("tlk"),
+            &[zipped.clone(), dir.join("z_one.hak")],
+        )
+        .unwrap_err();
         assert!(twice.contains("two files are named z_one.hak"), "{twice}");
         // Packed in a way this build doesn't read (BZip2, method 12): said
         // so, not taken for missing.
@@ -363,10 +393,13 @@ mod tests {
             bytes[at] = 12;
         }
         std::fs::write(&odd, bytes).unwrap();
-        let p = placements(&user, &[odd]).unwrap();
+        let p = placements(&user.join("hak"), &user.join("tlk"), &[odd]).unwrap();
         let e = copy(&p, false).unwrap_err();
         assert!(e.contains("z_odd.hak") && !e.contains("has no"), "{e}");
-        assert!(!user.join("hak/z_odd.hak").exists() && !user.join("hak/z_odd.part").exists());
+        assert!(
+            !user.join("hak/z_odd.hak").exists()
+                && !user.join("hak/z_odd.hak.moonglow-tmp").exists()
+        );
     }
 
     /// The archive fixtures (`tests/fixtures/archives`), our own text in
@@ -411,7 +444,8 @@ mod tests {
             let dir = mg_testkit::scratch_dir(&format!("mg-attach-{archive}"));
             let user = dir.join("user");
             let from = fixture(archive);
-            let p = placements(&user, std::slice::from_ref(&from)).unwrap();
+            let p = placements(&user.join("hak"), &user.join("tlk"), std::slice::from_ref(&from))
+                .unwrap();
             let names: Vec<(&str, bool)> = p.iter().map(|p| (p.name.as_str(), p.is_tlk)).collect();
             assert_eq!(names, [("z_one", false), ("z_text", true), ("z_two", false)], "{archive}");
             assert_eq!(p[0].entry.as_deref(), Some("Content/haks/z_one.hak"), "{archive}");
@@ -421,14 +455,17 @@ mod tests {
                 assert_eq!(std::fs::read_to_string(user.join(file)).unwrap(), text, "{archive}");
             }
             assert!(!user.join("hak/readme.txt").exists());
-            let again = placements(&user, std::slice::from_ref(&from)).unwrap();
+            let again =
+                placements(&user.join("hak"), &user.join("tlk"), std::slice::from_ref(&from))
+                    .unwrap();
             assert!(again.iter().all(|p| p.there == There::Same), "{archive}: {again:?}");
             // Of the same size and other bytes: different, and replaced
             // only when asked.
             let mut other = fixture_files()[1].1.clone().into_bytes();
             other[0] = b'T';
             std::fs::write(user.join("hak/z_two.HAK"), &other).unwrap();
-            let p = placements(&user, std::slice::from_ref(&from)).unwrap();
+            let p = placements(&user.join("hak"), &user.join("tlk"), std::slice::from_ref(&from))
+                .unwrap();
             let there: Vec<There> = p.iter().map(|p| p.there).collect();
             assert_eq!(there, [There::Same, There::Same, There::Different], "{archive}");
             assert_eq!(copy(&p, false).unwrap(), 0);
@@ -439,7 +476,7 @@ mod tests {
             assert!(
                 std::fs::read_dir(user.join("hak"))
                     .unwrap()
-                    .all(|f| { f.unwrap().path().extension().is_none_or(|e| e != "part") })
+                    .all(|f| { f.unwrap().path().extension().is_none_or(|e| e != "moonglow-tmp") })
             );
         }
     }
@@ -450,10 +487,12 @@ mod tests {
     fn locked_and_split_archives_are_refused_and_said_why() {
         let user = mg_testkit::scratch_dir("mg-attach-locked").join("user");
         for archive in ["locked.7z", "hidden.7z", "locked.rar", "hidden.rar"] {
-            let e = placements(&user, &[fixture(archive)]).unwrap_err();
+            let e =
+                placements(&user.join("hak"), &user.join("tlk"), &[fixture(archive)]).unwrap_err();
             assert!(e.contains(archive) && e.contains("password"), "{archive}: {e}");
         }
-        let e = placements(&user, &[fixture("split.part01.rar")]).unwrap_err();
+        let e = placements(&user.join("hak"), &user.join("tlk"), &[fixture("split.part01.rar")])
+            .unwrap_err();
         assert!(e.contains("one volume of a set"), "{e}");
         assert!(!user.exists(), "nothing written");
     }
@@ -488,8 +527,12 @@ mod tests {
             let check = |data: &[u8], what: &str| {
                 std::fs::write(&damaged, data).unwrap();
                 let _ = std::fs::remove_dir_all(&user);
-                let copied =
-                    placements(&user, std::slice::from_ref(&damaged)).and_then(|p| copy(&p, false));
+                let copied = placements(
+                    &user.join("hak"),
+                    &user.join("tlk"),
+                    std::slice::from_ref(&damaged),
+                )
+                .and_then(|p| copy(&p, false));
                 let Ok(_) = copied else { return };
                 for (file, text) in &expected {
                     let path = user.join(file);
@@ -511,7 +554,7 @@ mod tests {
 
     #[test]
     fn haks_and_a_talk_table_go_to_the_user_folder() {
-        let dir = std::env::temp_dir().join(format!("mg-attach-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-module-attach");
         let _ = std::fs::remove_dir_all(&dir);
         let (dl, user) = (dir.join("download"), dir.join("user"));
         std::fs::create_dir_all(&dl).unwrap();
@@ -523,19 +566,26 @@ mod tests {
         std::fs::write(user.join("hak/c.hak"), "old c").unwrap();
         let files: Vec<PathBuf> =
             ["a.hak", "b.hak", "c.hak", "t.tlk"].iter().map(|n| dl.join(n)).collect();
-        let p = placements(&user, &files).unwrap();
+        let p = placements(&user.join("hak"), &user.join("tlk"), &files).unwrap();
         let there: Vec<There> = p.iter().map(|p| p.there).collect();
         assert_eq!(there, [There::Nothing, There::Same, There::Different, There::Nothing]);
         assert_eq!(p[3].to, user.join("tlk/t.tlk"));
         assert_eq!(copy(&p, false).unwrap(), 2);
         assert_eq!(std::fs::read_to_string(user.join("hak/c.hak")).unwrap(), "old c");
-        assert_eq!(copy(&placements(&user, &files).unwrap(), true).unwrap(), 1);
+        assert_eq!(
+            copy(&placements(&user.join("hak"), &user.join("tlk"), &files).unwrap(), true).unwrap(),
+            1
+        );
         assert_eq!(std::fs::read_to_string(user.join("hak/c.hak")).unwrap(), "c");
         // Already in place: nothing to copy.
-        let again = placements(&user, &[user.join("hak/a.hak")]).unwrap();
+        let again =
+            placements(&user.join("hak"), &user.join("tlk"), &[user.join("hak/a.hak")]).unwrap();
         assert_eq!(again[0].there, There::Same);
-        assert!(placements(&user, &[dl.join("x.erf")]).is_err());
-        assert!(placements(&user, &[dl.join("t.tlk"), dl.join("t.tlk")]).is_err());
+        assert!(placements(&user.join("hak"), &user.join("tlk"), &[dl.join("x.erf")]).is_err());
+        assert!(
+            placements(&user.join("hak"), &user.join("tlk"), &[dl.join("t.tlk"), dl.join("t.tlk")])
+                .is_err()
+        );
 
         let mut info = Struct::new(0);
         let old = hak_list(&info, &["b".into(), "z".into()]);

@@ -8,7 +8,7 @@
 
 use mg_module::Module;
 use mg_module::doctor::{Severity, TalkTables, examine};
-use mg_resman::{GameInstall, ResMan};
+use mg_resman::GameInstall;
 use mg_testkit::{bundled_modules, corpus};
 
 /// Findings in shipped content, checked by hand and real, counted by
@@ -54,6 +54,24 @@ const KNOWN: &[(&str, &str, &str, usize)] = &[
     // Two spells (rows 807 and 809) whose FeatID names feats 3000 and
     // 2589 of a feat.2da of 1607 rows.
     ("Neverwinter Nights - Wyvern Crown of Cormyr", "2da-ref", "hak:wc_2da_shared", 2),
+    // Neighboring tiles that don't fit where the tileset has tiles that
+    // would (`tile-seam`, docs/findings.md): the plain deck beside a
+    // group's gangplank (moonseablockade, moonseabattle), and a sandbank
+    // ending at a cliff tile that has none (c1ar2000_northco).
+    ("Neverwinter Nights - Darkness over Daggerford", "tile-seam", "module", 1),
+    ("Neverwinter Nights - Tyrants of the Moonsea", "tile-seam", "module", 8),
+    // Six areas' music of the hak's ambientmusic.2da row 83, whose Resource,
+    // mus_wc_ruralguitar, is longer than 16 characters (`sound-silent`):
+    // silent in the game by the client's reading of 2026-11-11, though the
+    // game's data/mus has a file of that name; the track under the name
+    // mus_wc_ruralg (the same bytes) is the one that plays.
+    ("Neverwinter Nights - Wyvern Crown of Cormyr", "sound-silent", "module", 6),
+    // q3_area_sanctum's placed LavaLakeLoop, positional, of the stereo IMA
+    // ADPCM al_na_lavalake1.wav (`sound-silent`): the blueprint's fields
+    // were read in the client on 2026-11-11 (`client_audio`,
+    // MG_AUDIO_FORMS=stereo), silent as shipped and heard made area-wide;
+    // the area's own instance was not loaded.
+    ("XP2_Chapter2", "sound-silent", "module", 1),
 ];
 
 #[test]
@@ -65,7 +83,7 @@ fn shipped_modules_have_only_known_findings() {
     let mut total = 0;
     for path in bundled_modules(&root) {
         let m = Module::open(&path).unwrap();
-        let mut rm = ResMan::for_game(&gi).unwrap();
+        let mut rm = mg_testkit::shared_resman(&gi).unwrap();
         let (missing, wrong) = m.stack_onto(&mut rm, &gi);
         for hak in missing {
             eprintln!("{}: hak {hak} not found", path.display());
@@ -113,7 +131,7 @@ fn row_columns_hold_for_the_game_s_tables() {
     // appearance.FOOTSTEPTYPE, which the game breaks in seven rows.)
     use mg_module::doctor::{ColumnKind, column_kinds, column_kinds_as_named, row_named};
     let root = corpus!();
-    let rm = ResMan::for_game(&GameInstall::new(&root, None, "en")).unwrap();
+    let rm = mg_testkit::shared_resman(&GameInstall::new(&root, None, "en")).unwrap();
     let table = |name: &str| {
         let key = mg_resman::ResKey::parse(name, mg_core::ResType::TWODA).unwrap();
         mg_2da::TwoDa::parse(&rm.get(&key).unwrap(), mg_core::Codepage::default()).unwrap()
@@ -255,7 +273,7 @@ fn row_columns_hold_for_the_game_s_tables() {
 fn script_columns_name_the_game_s_scripts() {
     use mg_module::doctor::{ColumnKind, SCRIPT_COLUMNS, column_kinds};
     let root = corpus!();
-    let rm = ResMan::for_game(&GameInstall::new(&root, None, "en")).unwrap();
+    let rm = mg_testkit::shared_resman(&GameInstall::new(&root, None, "en")).unwrap();
     for (name, column) in SCRIPT_COLUMNS {
         let key = mg_resman::ResKey::parse(name, mg_core::ResType::TWODA).unwrap();
         let t = mg_2da::TwoDa::parse(&rm.get(&key).unwrap(), mg_core::Codepage::default()).unwrap();
@@ -292,7 +310,7 @@ fn the_game_s_own_tables_have_only_their_known_cell_faults() {
     use mg_module::doctor::{TalkTables, column_kinds_as_named, table_faults};
     let root = corpus!();
     let gi = GameInstall::new(&root, None, "en");
-    let rm = ResMan::for_game(&gi).unwrap();
+    let rm = mg_testkit::shared_resman(&gi).unwrap();
     let base = mg_tlk::Tlk::read(&std::fs::read(gi.talk_table()).unwrap()).unwrap().entries.len();
     let read = |name: &str| {
         let key = mg_resman::ResKey::parse(name, mg_core::ResType::TWODA)?;
@@ -330,4 +348,35 @@ fn the_game_s_own_tables_have_only_their_known_cell_faults() {
             .to_string(),
     );
     assert_eq!(wrong, known);
+}
+
+/// Every item blueprint of the game itself has a model the game can make
+/// (`item-model` would be a false alarm on it): the rule
+/// `mg_rules::appearance::item_without_model` finds none.
+#[test]
+fn the_game_s_own_items_all_have_a_model() {
+    let root = corpus!();
+    let gi = GameInstall::new(&root, None, "en");
+    let rm = mg_testkit::shared_resman(&gi).unwrap();
+    let table = |name: &str| {
+        let data =
+            rm.get(&mg_resman::ResKey::parse(name, mg_core::ResType::TWODA).unwrap()).unwrap();
+        mg_2da::TwoDa::parse(&data, mg_core::Codepage::default()).unwrap()
+    };
+    let (baseitems, cloaks) = (table("baseitems"), table("cloakmodel"));
+    let keys: Vec<_> = rm.entries().into_iter().map(|(k, _)| k).collect();
+    let items = keys.iter().filter(|k| k.restype == mg_core::ResType::UTI);
+    let mut seen = 0;
+    let mut said = Vec::new();
+    for k in mg_testkit::sweep(items.collect(), 3) {
+        let Ok(Ok(gff)) = rm.get(k).map(|d| mg_gff::Gff::read(&d)) else { continue };
+        seen += 1;
+        if let Some(p) =
+            mg_rules::appearance::item_without_model(&gff.root, &baseitems, Some(&cloaks), &rm)
+        {
+            said.push(format!("{k}: {p}"));
+        }
+    }
+    assert!(seen > mg_testkit::at_least(1000, 3), "only {seen} items read");
+    assert!(said.is_empty(), "{} items with no model:\n{}", said.len(), said.join("\n"));
 }

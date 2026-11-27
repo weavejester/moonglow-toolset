@@ -82,8 +82,14 @@ pub enum Cmd {
     ItemWizard,
     FullScreen,
     CommandPalette,
+    /// Quick Open: the Top Bar's field (Ctrl+P, where no command the user
+    /// gave keys has it: [`Keymap::give_way`]).
+    QuickOpen,
+    /// The area view's camera turned to face north again (the compass's
+    /// Reorient Camera; a command of Quick Open too).
+    ReorientCamera,
     SelectTiles,
-    /// The area view's placeable brush, on or off (its toolbar's Paint).
+    /// The area view's placeable brush, on or off (its tool shelf's Paint).
     PaintPlaceables,
     /// The tiles palette's tile tools: chosen as brushes, or with tiles
     /// selected in Select Tiles, at once on them
@@ -100,7 +106,10 @@ pub enum Cmd {
     TurnRight90,
     DropToGround,
     DropOntoObject,
+    SurfaceAbove,
+    SurfaceBelow,
     Overview,
+    FocusSelection,
     CameraForward,
     CameraBack,
     CameraLeft,
@@ -125,6 +134,9 @@ pub enum Cmd {
     DialogFind,
     /// The conversation editor's search, run again.
     DialogFindNext,
+    /// A bookmark put on the conversation's line chosen, or taken off (the
+    /// Node section's Bookmark; F5, as the script's Toggle Bookmark).
+    DialogBookmark,
     /// File › Close.
     Close,
     /// File › Exit.
@@ -134,6 +146,7 @@ pub enum Cmd {
     PreviousTab,
     ReopenTab,
     MaximizeWindow,
+    SplitEditor,
     /// The keys to the next pane (the module tree, the middle, the
     /// palettes), or the one before.
     NextPane,
@@ -146,6 +159,11 @@ pub enum Cmd {
     TogglePalettes,
     ToggleLog,
     HidePanels,
+    /// View › Interface Size's Zoom In, Zoom Out and Reset Zoom (egui's
+    /// own keys for its zoom, which Moonglow turns off, given the setting).
+    ZoomIn,
+    ZoomOut,
+    ResetZoom,
     NuiDelete,
     NuiDuplicate,
     NuiMoveUp,
@@ -161,7 +179,7 @@ const SHIFT: Modifiers = Modifiers::SHIFT;
 const NONE: Modifiers = Modifiers::NONE;
 
 impl Cmd {
-    pub const ALL: [Cmd; 79] = [
+    pub const ALL: [Cmd; 89] = [
         Cmd::NewModule,
         Cmd::OpenModule,
         Cmd::Save,
@@ -181,6 +199,8 @@ impl Cmd {
         Cmd::ItemWizard,
         Cmd::FullScreen,
         Cmd::CommandPalette,
+        Cmd::QuickOpen,
+        Cmd::ReorientCamera,
         Cmd::SelectTiles,
         Cmd::PaintPlaceables,
         Cmd::Eraser,
@@ -195,7 +215,10 @@ impl Cmd {
         Cmd::TurnRight90,
         Cmd::DropToGround,
         Cmd::DropOntoObject,
+        Cmd::SurfaceAbove,
+        Cmd::SurfaceBelow,
         Cmd::Overview,
+        Cmd::FocusSelection,
         Cmd::CameraForward,
         Cmd::CameraBack,
         Cmd::CameraLeft,
@@ -218,6 +241,7 @@ impl Cmd {
         Cmd::DeleteLine,
         Cmd::DialogFind,
         Cmd::DialogFindNext,
+        Cmd::DialogBookmark,
         Cmd::Close,
         Cmd::Exit,
         Cmd::CloseTab,
@@ -225,6 +249,7 @@ impl Cmd {
         Cmd::PreviousTab,
         Cmd::ReopenTab,
         Cmd::MaximizeWindow,
+        Cmd::SplitEditor,
         Cmd::NextPane,
         Cmd::PreviousPane,
         Cmd::ExpandAll,
@@ -233,6 +258,9 @@ impl Cmd {
         Cmd::TogglePalettes,
         Cmd::ToggleLog,
         Cmd::HidePanels,
+        Cmd::ZoomIn,
+        Cmd::ZoomOut,
+        Cmd::ResetZoom,
         Cmd::NuiDelete,
         Cmd::NuiDuplicate,
         Cmd::NuiMoveUp,
@@ -243,91 +271,107 @@ impl Cmd {
         Cmd::NuiUnfold,
     ];
 
-    /// The id the settings keep it by, its name and where it works.
-    pub fn about(self) -> (&'static str, &'static str, Group) {
+    /// The id the settings keep it by, its name and where it works. One
+    /// that works anywhere has no name here: it is a command of the menus
+    /// too, of the same id, and named there once
+    /// ([`crate::commands::general_name`]; the two lists of names were
+    /// kept alike by hand).
+    fn about(self) -> (&'static str, Option<&'static str>, Group) {
         use Group::*;
         match self {
-            Cmd::NewModule => ("new-module", "New Module", General),
-            Cmd::OpenModule => ("open-module", "Open Module", General),
-            Cmd::Save => ("save", "Save", General),
-            Cmd::Undo => ("undo", "Undo", General),
-            Cmd::Redo => ("redo", "Redo", General),
-            Cmd::ReplaceText => ("replace-text", "Find and Replace Text", General),
-            Cmd::AreaWizard => ("area-wizard", "Area Wizard", General),
-            Cmd::Factions => ("factions", "Faction Editor", General),
-            Cmd::Journal => ("journal", "Journal Editor", General),
-            Cmd::CompileAll => ("compile-all", "Compile All Scripts", General),
-            Cmd::TestModule => ("test-module", "Test Module", General),
-            Cmd::TestChoose => ("test-choose", "Test Module, Choose Character", General),
-            Cmd::Manual => ("manual", "User Manual", General),
-            Cmd::NewConversation => ("new-conversation", "New Conversation", General),
-            Cmd::NewScript => ("new-script", "New Script", General),
-            Cmd::CreatureWizard => ("creature-wizard", "Creature Wizard", General),
-            Cmd::ItemWizard => ("item-wizard", "Item Wizard", General),
-            Cmd::FullScreen => ("full-screen", "Full Screen", General),
-            Cmd::CommandPalette => ("command-palette", "Command Palette", General),
-            Cmd::SelectTiles => ("select-tiles", "Select Tiles or Objects", Area),
-            Cmd::PaintPlaceables => ("paint-placeables", "Paint Placeables", Area),
-            Cmd::Eraser => ("tile-eraser", "Eraser (Tiles)", Area),
-            Cmd::RefineTile => ("refine-tile", "Refine Tile", Area),
-            Cmd::NextTileAppearance => ("next-tile-appearance", "Next Tile Appearance", Area),
+            Cmd::NewModule => ("new-module", None, General),
+            Cmd::OpenModule => ("open-module", None, General),
+            Cmd::Save => ("save", None, General),
+            Cmd::Undo => ("undo", None, General),
+            Cmd::Redo => ("redo", None, General),
+            Cmd::ReplaceText => ("replace-text", None, General),
+            Cmd::AreaWizard => ("area-wizard", None, General),
+            Cmd::Factions => ("factions", None, General),
+            Cmd::Journal => ("journal", None, General),
+            Cmd::CompileAll => ("compile-all", None, General),
+            Cmd::TestModule => ("test-module", None, General),
+            Cmd::TestChoose => ("test-choose", None, General),
+            Cmd::Manual => ("manual", None, General),
+            Cmd::NewConversation => ("new-conversation", None, General),
+            Cmd::NewScript => ("new-script", None, General),
+            Cmd::CreatureWizard => ("creature-wizard", None, General),
+            Cmd::ItemWizard => ("item-wizard", None, General),
+            Cmd::FullScreen => ("full-screen", None, General),
+            Cmd::CommandPalette => ("command-palette", None, General),
+            Cmd::QuickOpen => ("quick-open", None, General),
+            Cmd::ReorientCamera => ("reorient-camera", None, General),
+            Cmd::SelectTiles => ("select-tiles", Some("Select Tiles or Objects"), Area),
+            Cmd::PaintPlaceables => ("paint-placeables", Some("Paint Placeables"), Area),
+            Cmd::Eraser => ("tile-eraser", Some("Eraser (Tiles)"), Area),
+            Cmd::RefineTile => ("refine-tile", Some("Refine Tile"), Area),
+            Cmd::NextTileAppearance => ("next-tile-appearance", Some("Next Tile Appearance"), Area),
             Cmd::PreviousTileAppearance => {
-                ("previous-tile-appearance", "Previous Tile Appearance", Area)
+                ("previous-tile-appearance", Some("Previous Tile Appearance"), Area)
             }
-            Cmd::RotateTile => ("rotate-tile", "Rotate Tile", Area),
-            Cmd::RotateTileClockwise => ("rotate-tile-clockwise", "Rotate Tile Clockwise", Area),
-            Cmd::TurnLeft => ("turn-left", "Turn Anticlockwise", Area),
-            Cmd::TurnRight => ("turn-right", "Turn Clockwise", Area),
-            Cmd::TurnLeft90 => ("turn-left-90", "Turn Anticlockwise 90°", Area),
-            Cmd::TurnRight90 => ("turn-right-90", "Turn Clockwise 90°", Area),
-            Cmd::DropToGround => ("drop", "Drop to the Ground", Area),
-            Cmd::DropOntoObject => ("drop-onto", "Drop onto the Object Below", Area),
-            Cmd::Overview => ("overview", "View the Whole Area", Area),
-            Cmd::CameraForward => ("camera-forward", "Move Camera Forward", Area),
-            Cmd::CameraBack => ("camera-back", "Move Camera Back", Area),
-            Cmd::CameraLeft => ("camera-left", "Move Camera Left", Area),
-            Cmd::CameraRight => ("camera-right", "Move Camera Right", Area),
-            Cmd::CameraTurnLeft => ("camera-turn-left", "Turn Camera Left", Area),
-            Cmd::CameraTurnRight => ("camera-turn-right", "Turn Camera Right", Area),
-            Cmd::CameraTiltUp => ("camera-tilt-up", "Tilt Camera Up", Area),
-            Cmd::CameraTiltDown => ("camera-tilt-down", "Tilt Camera Down", Area),
-            Cmd::CameraUp => ("camera-up", "Move Camera Up", Area),
-            Cmd::CameraDown => ("camera-down", "Move Camera Down", Area),
-            Cmd::Find => ("find", "Find", Script),
-            Cmd::Replace => ("replace", "Replace", Script),
-            Cmd::FindNext => ("find-next", "Find Next", Script),
-            Cmd::Bookmark => ("bookmark", "Toggle Bookmark", Script),
-            Cmd::Complete => ("complete", "Complete", Script),
-            Cmd::Definition => ("definition", "Go to Definition", Script),
-            Cmd::References => ("references", "Find References", Script),
-            Cmd::RenameSymbol => ("rename-symbol", "Rename Symbol", Script),
-            Cmd::AddLine => ("add-line", "Add Line", Conversation),
-            Cmd::DeleteLine => ("delete-line", "Delete Line", Conversation),
-            Cmd::DialogFind => ("dialog-find", "Find and Replace", Conversation),
-            Cmd::DialogFindNext => ("dialog-find-next", "Find Next", Conversation),
-            Cmd::Close => ("close", "Close", General),
-            Cmd::Exit => ("exit", "Exit", General),
-            Cmd::CloseTab => ("close-tab", "Close Tab", General),
-            Cmd::NextTab => ("next-tab", "Next Tab", General),
-            Cmd::PreviousTab => ("previous-tab", "Previous Tab", General),
-            Cmd::ReopenTab => ("reopen-tab", "Reopen Closed Tab", General),
-            Cmd::MaximizeWindow => ("maximize-window", "Maximize Window", General),
-            Cmd::NextPane => ("next-pane", "Next Pane", General),
-            Cmd::PreviousPane => ("previous-pane", "Previous Pane", General),
-            Cmd::ExpandAll => ("expand-all", "Expand All", Panes),
-            Cmd::CollapseAll => ("collapse-all", "Collapse All", Panes),
-            Cmd::ToggleTree => ("view-tree", "Module Tree", General),
-            Cmd::TogglePalettes => ("view-palettes", "Palettes Panel", General),
-            Cmd::ToggleLog => ("view-log", "Log", General),
-            Cmd::HidePanels => ("hide-panels", "Hide All Panels", General),
-            Cmd::NuiDelete => ("nui-delete", "Delete Element", Nui),
-            Cmd::NuiDuplicate => ("nui-duplicate", "Duplicate Element", Nui),
-            Cmd::NuiMoveUp => ("nui-move-up", "Move Element Up", Nui),
-            Cmd::NuiMoveDown => ("nui-move-down", "Move Element Down", Nui),
-            Cmd::NuiPrevious => ("nui-previous", "Select Previous Element", Nui),
-            Cmd::NuiNext => ("nui-next", "Select Next Element", Nui),
-            Cmd::NuiFold => ("nui-fold", "Fold Element or Select Its Parent", Nui),
-            Cmd::NuiUnfold => ("nui-unfold", "Unfold Element or Select Its First Child", Nui),
+            Cmd::RotateTile => ("rotate-tile", Some("Rotate Tile"), Area),
+            Cmd::RotateTileClockwise => {
+                ("rotate-tile-clockwise", Some("Rotate Tile Clockwise"), Area)
+            }
+            Cmd::TurnLeft => ("turn-left", Some("Turn Counterclockwise"), Area),
+            Cmd::TurnRight => ("turn-right", Some("Turn Clockwise"), Area),
+            Cmd::TurnLeft90 => ("turn-left-90", Some("Turn Counterclockwise 90°"), Area),
+            Cmd::TurnRight90 => ("turn-right-90", Some("Turn Clockwise 90°"), Area),
+            Cmd::DropToGround => ("drop", Some("Drop to the Ground"), Area),
+            Cmd::DropOntoObject => ("drop-onto", Some("Drop onto the Object Below"), Area),
+            Cmd::SurfaceAbove => ("surface-above", Some("Up to the Next Surface"), Area),
+            Cmd::SurfaceBelow => ("surface-below", Some("Down to the Next Surface"), Area),
+            Cmd::Overview => ("overview", Some("View the Whole Area"), Area),
+            Cmd::FocusSelection => ("focus-selection", Some("Focus Selection"), Area),
+            Cmd::CameraForward => ("camera-forward", Some("Move Camera Forward"), Area),
+            Cmd::CameraBack => ("camera-back", Some("Move Camera Back"), Area),
+            Cmd::CameraLeft => ("camera-left", Some("Move Camera Left"), Area),
+            Cmd::CameraRight => ("camera-right", Some("Move Camera Right"), Area),
+            Cmd::CameraTurnLeft => ("camera-turn-left", Some("Turn Camera Left"), Area),
+            Cmd::CameraTurnRight => ("camera-turn-right", Some("Turn Camera Right"), Area),
+            Cmd::CameraTiltUp => ("camera-tilt-up", Some("Tilt Camera Up"), Area),
+            Cmd::CameraTiltDown => ("camera-tilt-down", Some("Tilt Camera Down"), Area),
+            Cmd::CameraUp => ("camera-up", Some("Move Camera Up"), Area),
+            Cmd::CameraDown => ("camera-down", Some("Move Camera Down"), Area),
+            Cmd::Find => ("find", Some("Find"), Script),
+            Cmd::Replace => ("replace", Some("Replace"), Script),
+            Cmd::FindNext => ("find-next", Some("Find Next"), Script),
+            Cmd::Bookmark => ("bookmark", Some("Toggle Bookmark"), Script),
+            Cmd::Complete => ("complete", Some("Complete"), Script),
+            Cmd::Definition => ("definition", Some("Go to Definition"), Script),
+            Cmd::References => ("references", Some("Find References"), Script),
+            Cmd::RenameSymbol => ("rename-symbol", Some("Rename Symbol"), Script),
+            Cmd::AddLine => ("add-line", Some("Add Line"), Conversation),
+            Cmd::DeleteLine => ("delete-line", Some("Delete Line"), Conversation),
+            Cmd::DialogFind => ("dialog-find", Some("Find and Replace"), Conversation),
+            Cmd::DialogFindNext => ("dialog-find-next", Some("Find Next"), Conversation),
+            Cmd::DialogBookmark => ("dialog-bookmark", Some("Toggle Bookmark"), Conversation),
+            Cmd::Close => ("close", None, General),
+            Cmd::Exit => ("exit", None, General),
+            Cmd::CloseTab => ("close-tab", None, General),
+            Cmd::NextTab => ("next-tab", None, General),
+            Cmd::PreviousTab => ("previous-tab", None, General),
+            Cmd::ReopenTab => ("reopen-tab", None, General),
+            Cmd::MaximizeWindow => ("maximize-window", None, General),
+            Cmd::SplitEditor => ("split-editor", None, General),
+            Cmd::NextPane => ("next-pane", None, General),
+            Cmd::PreviousPane => ("previous-pane", None, General),
+            Cmd::ExpandAll => ("expand-all", Some("Expand All"), Panes),
+            Cmd::CollapseAll => ("collapse-all", Some("Collapse All"), Panes),
+            Cmd::ToggleTree => ("view-tree", None, General),
+            Cmd::TogglePalettes => ("view-palettes", None, General),
+            Cmd::ToggleLog => ("view-log", None, General),
+            Cmd::HidePanels => ("hide-panels", None, General),
+            Cmd::ZoomIn => ("zoom-in", None, General),
+            Cmd::ZoomOut => ("zoom-out", None, General),
+            Cmd::ResetZoom => ("reset-zoom", None, General),
+            Cmd::NuiDelete => ("nui-delete", Some("Delete Element"), Nui),
+            Cmd::NuiDuplicate => ("nui-duplicate", Some("Duplicate Element"), Nui),
+            Cmd::NuiMoveUp => ("nui-move-up", Some("Move Element Up"), Nui),
+            Cmd::NuiMoveDown => ("nui-move-down", Some("Move Element Down"), Nui),
+            Cmd::NuiPrevious => ("nui-previous", Some("Select Previous Element"), Nui),
+            Cmd::NuiNext => ("nui-next", Some("Select Next Element"), Nui),
+            Cmd::NuiFold => ("nui-fold", Some("Fold Element or Select Its Parent"), Nui),
+            Cmd::NuiUnfold => ("nui-unfold", Some("Unfold Element or Select Its First Child"), Nui),
         }
     }
 
@@ -336,7 +380,8 @@ impl Cmd {
     }
 
     pub fn name(self) -> &'static str {
-        self.about().1
+        let (id, name, _) = self.about();
+        name.unwrap_or_else(|| crate::commands::general_name(id))
     }
 
     pub fn group(self) -> Group {
@@ -367,6 +412,12 @@ impl Cmd {
             Cmd::ItemWizard => vec![k(CTRL | Modifiers::ALT, Key::I)],
             Cmd::FullScreen => vec![k(NONE, Key::F11)],
             Cmd::CommandPalette => vec![k(CTRL | SHIFT, Key::P)],
+            // (Given its key after builders had given keys of their own:
+            // it gives way to one given another command, `Keymap::give_way`.)
+            Cmd::QuickOpen => vec![k(CTRL, Key::P)],
+            // (Moonglow's: Aurora's toolbar button has no key. Given after
+            // builders had given keys of their own, it gives way too.)
+            Cmd::ReorientCamera => vec![k(CTRL | Modifiers::ALT, Key::R)],
             Cmd::SelectTiles => vec![k(NONE, Key::F10)],
             Cmd::PaintPlaceables => vec![k(NONE, Key::B)],
             // (Moonglow's tools: Aurora has none of them but the Eraser,
@@ -383,7 +434,10 @@ impl Cmd {
             Cmd::TurnRight90 => vec![k(SHIFT, Key::E)],
             Cmd::DropToGround => vec![k(NONE, Key::G)],
             Cmd::DropOntoObject => vec![k(SHIFT, Key::G)],
+            Cmd::SurfaceAbove => vec![k(NONE, Key::PageUp)],
+            Cmd::SurfaceBelow => vec![k(NONE, Key::PageDown)],
             Cmd::Overview => vec![k(NONE, Key::Num5)],
+            Cmd::FocusSelection => vec![k(NONE, Key::F), k(NONE, Key::Period)],
             Cmd::CameraForward => {
                 vec![k(NONE, Key::W), k(NONE, Key::ArrowUp), k(NONE, Key::Num8)]
             }
@@ -417,6 +471,9 @@ impl Cmd {
             // finds again (Ctrl+F4, its key for closing the module, closes a tab here).
             Cmd::DialogFind => vec![k(CTRL, Key::F), k(CTRL, Key::R)],
             Cmd::DialogFindNext => vec![k(NONE, Key::F3)],
+            // (The script's Toggle Bookmark's: Aurora's conversation editor
+            // gives its Bookmark no key. M5's W4, the owner's ruling 28.)
+            Cmd::DialogBookmark => vec![k(NONE, Key::F5)],
             // (No key at first: Ctrl+F4, Aurora's for it, closes a tab.)
             Cmd::Close => Vec::new(),
             // Aurora's.
@@ -427,16 +484,25 @@ impl Cmd {
             Cmd::PreviousTab => vec![k(CTRL | SHIFT, Key::Tab), k(CTRL, Key::PageUp)],
             Cmd::ReopenTab => vec![k(CTRL | SHIFT, Key::T)],
             Cmd::MaximizeWindow => vec![k(CTRL | SHIFT, Key::M)],
+            Cmd::SplitEditor => vec![k(CTRL, Key::Backslash)],
             Cmd::NextPane => vec![k(NONE, Key::F6)],
             Cmd::PreviousPane => vec![k(SHIFT, Key::F6)],
             // (Right and Left open and close a row; with Ctrl+Shift,
-            // every one. Ctrl and + or -, egui's zoom, are the window's.)
+            // every one. Ctrl and + or -, the interface size, are the
+            // window's.)
             Cmd::ExpandAll => vec![k(CTRL | SHIFT, Key::ArrowRight)],
             Cmd::CollapseAll => vec![k(CTRL | SHIFT, Key::ArrowLeft)],
             Cmd::ToggleTree => vec![k(CTRL | Modifiers::ALT, Key::Num1)],
             Cmd::TogglePalettes => vec![k(CTRL | Modifiers::ALT, Key::Num2)],
             Cmd::ToggleLog => vec![k(CTRL | Modifiers::ALT, Key::Num3)],
             Cmd::HidePanels => vec![k(CTRL | Modifiers::ALT, Key::Num0)],
+            // egui's and a browser's: + with Shift (US keyboards) or
+            // without (a keypad's, many others' keyboards), or the = key.
+            Cmd::ZoomIn => {
+                vec![k(CTRL, Key::Plus), k(CTRL, Key::Equals), k(CTRL | SHIFT, Key::Plus)]
+            }
+            Cmd::ZoomOut => vec![k(CTRL, Key::Minus)],
+            Cmd::ResetZoom => vec![k(CTRL, Key::Num0)],
             Cmd::NuiDelete => vec![k(NONE, Key::Delete)],
             Cmd::NuiDuplicate => vec![k(CTRL, Key::D)],
             Cmd::NuiMoveUp => vec![k(Modifiers::ALT, Key::ArrowUp)],
@@ -488,6 +554,38 @@ pub fn from_text(text: &str) -> Option<KeyboardShortcut> {
     Some(KeyboardShortcut::new(m, Key::from_name(key)?))
 }
 
+/// A shortcut as the Status Bar's hints show it, a key cap a part: its
+/// modifiers by this system's names (`Cmd` and `Option` on macOS, `mac`),
+/// then its key, as the boards name keys (`Esc`, `Page Up`).
+pub(crate) fn caps(s: &KeyboardShortcut, mac: bool) -> Vec<String> {
+    let m = s.modifiers;
+    let mut out = Vec::new();
+    if m.command || m.mac_cmd {
+        out.push(if mac { "Cmd" } else { "Ctrl" }.to_string());
+    } else if m.ctrl {
+        out.push("Ctrl".to_string());
+    }
+    if m.alt {
+        out.push(if mac { "Option" } else { "Alt" }.to_string());
+    }
+    if m.shift {
+        out.push("Shift".to_string());
+    }
+    out.push(cap_name(s.logical_key));
+    out
+}
+
+/// A key's name on its key cap: egui's, but for those the boards spell
+/// otherwise.
+fn cap_name(key: Key) -> String {
+    match key {
+        Key::Escape => "Esc".into(),
+        Key::PageUp => "Page Up".into(),
+        Key::PageDown => "Page Down".into(),
+        key => key.name().into(),
+    }
+}
+
 /// A shortcut as shown on this system (`Cmd` on macOS).
 pub fn shown(s: &KeyboardShortcut, mac: bool) -> String {
     s.format(&ModifierNames::NAMES, mac)
@@ -532,12 +630,33 @@ pub fn defaults_of(id: &str) -> Vec<KeyboardShortcut> {
 /// The keys of every command: Moonglow's, but where the settings choose
 /// others. Kept by command id: the key commands here ([`Cmd`]), and any
 /// other command (the window's, which have no keys until given some).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Keymap {
     keys: HashMap<String, Vec<KeyboardShortcut>>,
-    /// The own keys of commands that are no key commands (a plugin's).
+    /// The own keys of commands that are no key commands (a plugin's), and
+    /// those a command that gives way was left ([`Keymap::give_way`]).
     defaults: HashMap<String, Vec<KeyboardShortcut>>,
+    /// The commands whose keys the user chose (the settings', or Options ›
+    /// Keyboard's since): theirs, whatever gives way.
+    chosen_ids: std::collections::HashSet<String>,
 }
+
+/// Two key maps are one where every command has the same keys (and the
+/// same own keys): which of them the user chose is no part of it.
+impl PartialEq for Keymap {
+    fn eq(&self, other: &Keymap) -> bool {
+        self.keys == other.keys && self.defaults == other.defaults
+    }
+}
+
+impl Eq for Keymap {}
+
+/// The key commands whose own keys came after builders could give those
+/// keys to other commands: where a command that works at the same moment
+/// was given one of them (by the user, a plugin's manifest or a project's
+/// file), the key stays that command's and this one goes without it
+/// ([`Keymap::give_way`]). Quick Open's Ctrl+P.
+const GIVES_WAY: [Cmd; 3] = [Cmd::QuickOpen, Cmd::ReorientCamera, Cmd::FocusSelection];
 
 impl Default for Keymap {
     fn default() -> Keymap {
@@ -556,6 +675,25 @@ pub struct Taken {
     pub letters: bool,
 }
 
+/// Whether a text field with the keyboard uses the key itself: any key
+/// alone or with Shift but a function key and Escape (a letter, a digit
+/// or a sign types; Space, Enter, Backspace, Delete, the arrows, Home and
+/// End edit: a command given one of them fired in the field, which never
+/// saw the key), and on a Mac (`mac`) Option with a key that types, which
+/// there is a letter of its own (Option + X is `≈`, on a Polish layout
+/// `ź`: it typed, and ran Alt + X's command).
+pub(crate) fn field_s_key(s: &KeyboardShortcut, mac: bool) -> bool {
+    let m = s.modifiers;
+    let name = s.logical_key.name();
+    let function =
+        name.len() > 1 && name.starts_with('F') && name[1..].bytes().all(|b| b.is_ascii_digit());
+    let command = m.command || m.ctrl || m.mac_cmd;
+    if m.alt {
+        return mac && !command && name.chars().count() == 1;
+    }
+    !command && !function && s.logical_key != Key::Escape
+}
+
 impl Keymap {
     /// The keys with the settings' choices (by command id; an empty list
     /// takes a command's keys away). Keys that don't read are left out; an
@@ -566,7 +704,73 @@ impl Keymap {
         for (id, list) in chosen {
             keys.insert(id.clone(), list.iter().filter_map(|t| from_text(t)).collect());
         }
-        Keymap { keys, defaults: HashMap::new() }
+        let chosen_ids = chosen.keys().cloned().collect();
+        let mut map = Keymap { keys, defaults: HashMap::new(), chosen_ids };
+        map.give_way();
+        map
+    }
+
+    /// Order-independent content hash of bound shortcuts for cache keys.
+    pub(crate) fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut xor = self.keys.len() as u64;
+        for (id, list) in &self.keys {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut h);
+            list.hash(&mut h);
+            xor ^= h.finish();
+        }
+        xor
+    }
+
+    /// The key `cmd` gave way on ([`Keymap::give_way`]), and the id of the
+    /// command that has it: what Options › Keyboard says on its row.
+    pub fn gave_way_to(&self, cmd: Cmd) -> Option<(KeyboardShortcut, String)> {
+        if !GIVES_WAY.contains(&cmd) || self.chosen_ids.contains(cmd.id()) {
+            return None;
+        }
+        let group = |id: &str| Cmd::from_id(id).map_or(Group::General, Cmd::group);
+        let mine = self.keys(cmd);
+        cmd.defaults().into_iter().filter(|k| !mine.contains(k)).find_map(|k| {
+            let mut ids: Vec<&String> = (self.keys.iter())
+                .filter(|(id, keys)| {
+                    id.as_str() != cmd.id() && group(id).overlaps(cmd.group()) && keys.contains(&k)
+                })
+                .map(|(id, _)| id)
+                .collect();
+            ids.sort();
+            ids.first().map(|id| (k, (*id).clone()))
+        })
+    }
+
+    /// The commands that give way ([`GIVES_WAY`]) without each of their
+    /// own keys another command that works at the same moment has: unless
+    /// the user chose their keys, they are left the rest (none, where
+    /// that was all), as their own keys for now, so that the settings
+    /// don't keep it (the key comes back once the other command lets it
+    /// go). To be called again after a plugin's or a project's keys are
+    /// taken in ([`Keymap::set_default`]).
+    pub fn give_way(&mut self) {
+        let group = |id: &str| Cmd::from_id(id).map_or(Group::General, Cmd::group);
+        for cmd in GIVES_WAY {
+            let id = cmd.id();
+            if self.chosen_ids.contains(id) {
+                continue;
+            }
+            let own = cmd.defaults();
+            let taken = |k: &KeyboardShortcut| {
+                self.keys.iter().any(|(other, keys)| {
+                    other != id && group(other).overlaps(cmd.group()) && keys.contains(k)
+                })
+            };
+            let left: Vec<KeyboardShortcut> = own.iter().filter(|k| !taken(k)).copied().collect();
+            if left.len() == own.len() {
+                self.defaults.remove(id);
+            } else {
+                self.defaults.insert(id.to_string(), left.clone());
+            }
+            self.keys.insert(id.to_string(), left);
+        }
     }
 
     /// The own keys of a command that is no key command (a plugin's, from
@@ -590,6 +794,7 @@ impl Keymap {
             let own = self.defaults_of(&id);
             self.keys.insert(id, own);
         }
+        self.chosen_ids.clear();
     }
 
     /// The keys as a file to hand on: the commands whose keys aren't
@@ -617,6 +822,8 @@ impl Keymap {
         for (id, list) in &chosen {
             self.keys.insert(id.clone(), list.iter().filter_map(|t| from_text(t)).collect());
         }
+        self.chosen_ids = chosen.keys().cloned().collect();
+        self.give_way();
         Ok(chosen.len())
     }
 
@@ -639,6 +846,7 @@ impl Keymap {
     }
 
     pub fn set_of(&mut self, id: &str, keys: Vec<KeyboardShortcut>) {
+        self.chosen_ids.insert(id.to_string());
         self.keys.insert(id.to_string(), keys);
     }
 
@@ -690,15 +898,11 @@ impl Keymap {
     }
 
     /// [`Keymap::consume_of`] for a command of the whole window: while a
-    /// text field has the keyboard (`typing`), a key that types a
-    /// character (a letter or digit, alone or with Shift) is the field's.
+    /// text field has the keyboard (`typing`), a key the field uses is
+    /// the field's ([`field_s_key`]).
     pub fn consume_outside_text(&self, i: &mut InputState, id: &str, typing: bool) -> bool {
         let Some(keys) = self.keys.get(id) else { return false };
-        let types = |s: &KeyboardShortcut| {
-            let m = s.modifiers;
-            s.logical_key.name().chars().count() == 1
-                && !(m.command || m.ctrl || m.alt || m.mac_cmd)
-        };
+        let types = |s: &KeyboardShortcut| field_s_key(s, cfg!(target_os = "macos"));
         let mut hit = false;
         i.events.retain(|e| {
             let this = !hit && keys.iter().any(|s| is(e, s) && !(typing && types(s)));
@@ -711,7 +915,7 @@ impl Keymap {
     /// Whether `e` presses a key some command was given (a plugin's or a
     /// project's too): Alt and a letter is a menu's only where none was.
     pub fn bound(&self, e: &Event) -> bool {
-        self.keys.values().chain(self.defaults.values()).flatten().any(|s| is(e, s))
+        self.keys.values().flatten().any(|s| is(e, s))
     }
 
     /// Whether `e` presses a key of a command of `group`: a list's own key
@@ -726,6 +930,27 @@ impl Keymap {
     pub fn pressed(&self, i: &InputState, cmd: Cmd) -> bool {
         let Some(keys) = self.keys.get(cmd.id()) else { return false };
         i.events.iter().any(|e| keys.iter().any(|s| is(e, s)))
+    }
+
+    /// [`pressed`](Self::pressed), respecting active list navigation / type-ahead
+    /// (`taken`) and open text fields (`typing`): plain single-alphanumeric
+    /// shortcuts yield while a list takes typed letters, while punctuation
+    /// shortcuts (such as `.` for Focus Selection) still fire.
+    pub fn pressed_but(&self, i: &InputState, cmd: Cmd, typing: bool, taken: Taken) -> bool {
+        use egui::Key::{ArrowDown, ArrowLeft, ArrowRight, ArrowUp};
+        if typing {
+            return false;
+        }
+        let Some(keys) = self.keys.get(cmd.id()) else { return false };
+        i.events.iter().any(|e| {
+            keys.iter().any(|s| {
+                let plain = s.modifiers.is_none();
+                let name = s.logical_key.name();
+                let alnum = name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric();
+                let arrow = matches!(s.logical_key, ArrowDown | ArrowLeft | ArrowRight | ArrowUp);
+                !(taken.arrows && arrow) && !(taken.letters && alnum && plain) && is(e, s)
+            })
+        })
     }
 
     /// Whether one of the command's keys is held down. A key without
@@ -790,6 +1015,21 @@ impl Keymap {
 mod tests {
     use super::*;
 
+    /// A key's caps: its modifiers by the system's names (Cmd and Option
+    /// on macOS), then the key as the boards name it.
+    #[test]
+    fn a_shortcut_s_caps_follow_the_system() {
+        let k = KeyboardShortcut::new;
+        let caps = |s, mac| caps(&s, mac);
+        assert_eq!(caps(k(CTRL, Key::N), false), ["Ctrl", "N"]);
+        assert_eq!(caps(k(CTRL, Key::N), true), ["Cmd", "N"]);
+        assert_eq!(caps(k(CTRL | SHIFT, Key::P), false), ["Ctrl", "Shift", "P"]);
+        assert_eq!(caps(k(Modifiers::ALT, Key::X), true), ["Option", "X"]);
+        assert_eq!(caps(k(NONE, Key::PageUp), false), ["Page Up"]);
+        assert_eq!(caps(k(NONE, Key::Escape), false), ["Esc"]);
+        assert_eq!(caps(k(SHIFT, Key::F12), false), ["Shift", "F12"]);
+    }
+
     #[test]
     fn keys_go_to_a_file_and_come_back() {
         let mut keys = Keymap::default();
@@ -833,6 +1073,51 @@ mod tests {
         assert!(!map.chosen().contains_key("build-module"));
     }
 
+    /// Quick Open's Ctrl+P gives way to a command the user, a plugin or a
+    /// project gave it: Quick Open is then without a key, and the settings
+    /// don't keep that (it has Ctrl+P back once the other lets it go).
+    /// Given by the user to Quick Open too, both keep it: a conflict.
+    #[test]
+    fn quick_open_gives_ctrl_p_to_a_command_given_it() {
+        let ctrl_p = KeyboardShortcut::new(Modifiers::COMMAND, Key::P);
+        assert_eq!(Keymap::default().keys(Cmd::QuickOpen), [ctrl_p]);
+        let mut chosen = BTreeMap::new();
+        chosen.insert("build-module".to_string(), vec!["Ctrl+P".to_string()]);
+        let map = Keymap::new(&chosen);
+        assert_eq!(map.keys_of("build-module"), [ctrl_p]);
+        assert!(map.keys(Cmd::QuickOpen).is_empty(), "the user's key wins");
+        assert!(map.conflicts().is_empty(), "{:?}", map.conflicts());
+        assert_eq!(map.chosen(), chosen, "nothing kept for Quick Open");
+        // Let go of, Quick Open has it again.
+        assert_eq!(Keymap::new(&BTreeMap::new()).keys(Cmd::QuickOpen), [ctrl_p]);
+        let mut reset = map.clone();
+        reset.reset_all();
+        reset.give_way();
+        assert_eq!(reset.keys(Cmd::QuickOpen), [ctrl_p]);
+        // (An area's command too: the window's keys work over the area.)
+        let mut area = BTreeMap::new();
+        area.insert("camera-up".to_string(), vec!["Ctrl+P".to_string()]);
+        assert!(Keymap::new(&area).keys(Cmd::QuickOpen).is_empty());
+        // A plugin's own key, and a project's, win too.
+        let mut map = Keymap::default();
+        map.set_default("some-plugin.go", vec![ctrl_p]);
+        map.give_way();
+        assert!(map.keys(Cmd::QuickOpen).is_empty());
+        assert!(map.chosen().is_empty(), "{:?}", map.chosen());
+        // Chosen for Quick Open by the user as well: both have it, said.
+        chosen.insert("quick-open".to_string(), vec!["Ctrl+P".to_string()]);
+        let map = Keymap::new(&chosen);
+        assert_eq!(map.keys(Cmd::QuickOpen), [ctrl_p]);
+        assert_eq!(map.conflicts().len(), 1);
+        // Another key the user gives it is kept.
+        let mut map = Keymap::default();
+        let f1 = KeyboardShortcut::new(Modifiers::COMMAND, Key::F1);
+        map.set(Cmd::QuickOpen, vec![f1]);
+        map.set_of("build-module", vec![ctrl_p]);
+        map.give_way();
+        assert_eq!(map.keys(Cmd::QuickOpen), [f1]);
+    }
+
     /// A letter given to a command of the window stays a letter while a
     /// text field has the keyboard; a key with Ctrl, or a function key,
     /// works there too.
@@ -854,11 +1139,25 @@ mod tests {
         map.set_of("b", vec![KeyboardShortcut::new(SHIFT, Key::B)]);
         map.set_of("c", vec![KeyboardShortcut::new(CTRL, Key::B)]);
         map.set_of("d", vec![KeyboardShortcut::new(NONE, Key::F8)]);
+        map.set_of("e", vec![KeyboardShortcut::new(NONE, Key::Delete)]);
+        map.set_of("f", vec![KeyboardShortcut::new(NONE, Key::Space)]);
+        map.set_of("g", vec![KeyboardShortcut::new(SHIFT, Key::ArrowDown)]);
+        map.set_of("h", vec![KeyboardShortcut::new(CTRL, Key::Delete)]);
+        // (Option and a letter types on a Mac; Alt and a letter is a
+        // command's elsewhere, Escape and the function keys everywhere.)
+        let alt_x = KeyboardShortcut::new(Modifiers::ALT, Key::X);
+        assert!(field_s_key(&alt_x, true) && !field_s_key(&alt_x, false));
+        assert!(!field_s_key(&KeyboardShortcut::new(NONE, Key::Escape), true));
+        assert!(!field_s_key(&KeyboardShortcut::new(NONE, Key::F12), false));
         for (id, key, modifiers, when_typing) in [
             ("a", Key::B, NONE, false),
             ("b", Key::B, SHIFT, false),
             ("c", Key::B, CTRL, true),
             ("d", Key::F8, NONE, true),
+            ("e", Key::Delete, NONE, false),
+            ("f", Key::Space, NONE, false),
+            ("g", Key::ArrowDown, SHIFT, false),
+            ("h", Key::Delete, CTRL, true),
         ] {
             assert!(map.consume_outside_text(&mut press(key, modifiers), id, false), "{id}");
             let mut typing = press(key, modifiers);
@@ -962,5 +1261,24 @@ mod tests {
         let mut map = map;
         map.set(Cmd::Manual, vec![KeyboardShortcut::new(CTRL, Key::T)]);
         assert_eq!(map.conflicts().len(), 1);
+    }
+
+    #[test]
+    fn clearing_a_plugin_default_unbounds_its_shortcut() {
+        let mut map = Keymap::default();
+        let mods = Modifiers::ALT | Modifiers::SHIFT;
+        let sc = KeyboardShortcut::new(mods, Key::F11);
+        let press = egui::Event::Key {
+            key: Key::F11,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        };
+        assert!(!map.bound(&press), "shortcut must start unbound");
+        map.set_default("plugin.foo", vec![sc]);
+        assert!(map.bound(&press));
+        map.set_of("plugin.foo", Vec::new());
+        assert!(!map.bound(&press), "cleared plugin command shortcut must not remain bound");
     }
 }

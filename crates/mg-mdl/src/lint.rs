@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::keywords;
+use crate::keywords::{self, is_number};
 use crate::outline::words;
 
 /// Every line's words, as [`words`] splits them, split once: the checks
@@ -99,6 +99,11 @@ pub const MAX_FACES: usize = 32_767;
 /// A mesh's vertices: their indices are 16 bits.
 pub const MAX_VERTICES: usize = 65_535;
 pub const MAX_RESREF: usize = 16;
+/// A node's name: 32 characters, the most nwn.wiki's MDL page gives (the
+/// game's compiler keeps a longer name's first 32). Not proven in the
+/// engine: no model of the game's has a name of more than 28. Moonglow's
+/// binary writer keeps a NUL in the 32-byte field, so it cuts a name of 32
+/// to 31 without a word: the lint warns of that.
 pub const MAX_NODE_NAME: usize = 32;
 pub const MAX_LIGHTNING_SEGMENTS: f32 = 9.0;
 
@@ -119,6 +124,12 @@ struct Node {
     period: Option<(usize, f32)>,
     /// In an animation: its `animverts` (true) and `animtverts` lines.
     frames: Vec<(usize, bool)>,
+    /// Keywords the game does not read, with their lines and the one it
+    /// reads instead ([`keywords::NOT_READ`]): said at the node's end,
+    /// unless the node has that one too.
+    not_read: Vec<(usize, String, &'static str)>,
+    /// The keywords the game reads in place of others, that the node has.
+    read_instead: Vec<&'static str>,
 }
 
 struct Lint {
@@ -129,10 +140,6 @@ impl Lint {
     fn push(&mut self, line: usize, severity: Severity, message: impl Into<String>) {
         self.out.push(Diagnostic { line, severity, message: message.into() });
     }
-}
-
-fn is_number(w: &str) -> bool {
-    w.parse::<f32>().is_ok()
 }
 
 /// Checks a model's text.
@@ -176,6 +183,16 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
                         Severity::Warning,
                         format!("node names are at most {MAX_NODE_NAME} characters"),
                     );
+                } else if name.len() == MAX_NODE_NAME {
+                    l.push(
+                        at,
+                        Severity::Warning,
+                        format!(
+                            "node name of {MAX_NODE_NAME} characters: Moonglow's compiler cuts \
+                             it to {}",
+                            MAX_NODE_NAME - 1
+                        ),
+                    );
                 }
                 if !in_anim {
                     match geometry_names.get(&name.to_ascii_lowercase()) {
@@ -192,6 +209,7 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
                     if !in_anim {
                         check_node(&mut l, &n);
                     }
+                    not_read(&mut l, &n);
                     // The game divides an animated mesh's frames by the
                     // animation node's own `verts` and `tverts`: without
                     // them it crashes (nwn-mdl-spec E54).
@@ -405,7 +423,7 @@ fn node_line(
         {
             l.push(at, Severity::Warning, format!("{key} says {c}, {} follow", rows.len()));
         }
-        if !keyed && declared.is_none() && key != "aabb" {
+        if !keyed && declared.is_none() {
             l.push(at, Severity::Warning, format!("{key} needs a count"));
         }
         if in_anim {
@@ -474,7 +492,7 @@ fn node_line(
     }
     if in_anim {
         if !keywords::ANIM_NODE.contains(&key) {
-            unknown(l, at, &n.ty, w[0], key);
+            unknown(l, n, at, w[0], key);
         }
         return next;
     }
@@ -534,23 +552,23 @@ fn node_line(
         ),
         _ => {}
     }
-    unknown(l, at, &n.ty, w[0], key);
+    unknown(l, n, at, w[0], key);
     next
 }
 
 /// Reports a keyword the node's type does not use: a warning if no node
 /// uses it (a typo, most likely), a note if another type does (the game's
-/// own models carry dangly settings on skins, for one).
-fn unknown(l: &mut Lint, at: usize, ty: &str, word: &str, key: &str) {
+/// own models carry dangly settings on skins, for one). One the game
+/// doesn't read is noted at the node's end ([`not_read`]).
+fn unknown(l: &mut Lint, n: &mut Node, at: usize, word: &str, key: &str) {
     if let Some((_, instead)) = keywords::NOT_READ.iter().find(|(k, _)| *k == key) {
-        let message = if instead.is_empty() {
-            format!("{word}: the game does not read it")
-        } else {
-            format!("{word}: the game does not read it; it reads {instead}")
-        };
-        l.push(at, Severity::Info, message);
+        n.not_read.push((at, word.to_string(), instead));
         return;
     }
+    if let Some((_, instead)) = keywords::NOT_READ.iter().find(|(_, i)| *i == key) {
+        n.read_instead.push(instead);
+    }
+    let ty = n.ty.as_str();
     if keywords::known_in_node(ty, key) {
         return;
     }
@@ -558,6 +576,26 @@ fn unknown(l: &mut Lint, at: usize, ty: &str, word: &str, key: &str) {
         l.push(at, Severity::Info, format!("{word} does nothing on a {ty} node"));
     } else {
         l.push(at, Severity::Warning, format!("unknown keyword {word}: the game skips it"));
+    }
+}
+
+/// Notes the keywords of a finished node that the game doesn't read: not
+/// one whose keyword the game reads in its place the node has as well, as
+/// Moonglow's decompiler writes `setfillumcolor` (for nwnmdlcomp) and then
+/// `selfillumcolor` (Moonglow Viewer's report: every decompiled model with
+/// self-illumination opened with a column of notes on the decompiler's
+/// own text).
+fn not_read(l: &mut Lint, n: &Node) {
+    for (at, word, instead) in &n.not_read {
+        if instead.is_empty() {
+            l.push(*at, Severity::Info, format!("{word}: the game does not read it"));
+        } else if !n.read_instead.contains(instead) {
+            l.push(
+                *at,
+                Severity::Info,
+                format!("{word}: the game does not read it; it reads {instead}"),
+            );
+        }
     }
 }
 
@@ -674,6 +712,39 @@ mod tests {
         check(text).into_iter().map(|d| (d.line, d.severity, d.message)).collect()
     }
 
+    /// The rows the linter says follow a list's keyword are the rows the
+    /// reader takes: one rule of what begins a row (`inf` and `nan` are
+    /// words to the reader, numbers to `f32`'s own reading, by which the
+    /// linter counted them), and one table of the keywords that are lists
+    /// (`vertexindices` was the linter's alone: the review's M16).
+    #[test]
+    fn the_rows_counted_are_the_rows_read() {
+        let model = |list: &str| {
+            format!(
+                "newmodel box\nsetsupermodel box NULL\nclassification character\n\
+                 setanimationscale 1\nbeginmodelgeom box\nnode dummy box\n  parent NULL\nendnode\n\
+                 node trimesh plane\n  parent box\n  bitmap tex\n{list}endnode\n\
+                 endmodelgeom box\ndonemodel box\n"
+            )
+        };
+        for (end, rows) in [("inf 0 0", 2), ("nan 0 0", 2), ("+1 0 0", 3), (".5 0 0", 3)] {
+            let text = model(&format!("  verts 3\n    0 0 0\n    1 0 0\n    {end}\n"));
+            let (read, map) = crate::ascii::read_mapped(text.as_bytes()).unwrap();
+            assert_eq!(read.nodes[1].mesh().unwrap().vertices.len(), 0, "no faces: none drawn");
+            let said_by_reader = map.notes.iter().any(|n| n.message == "verts: 2 of 3 rows");
+            let said = format!("verts says 3, {rows} follow");
+            let said_by_linter = messages(&text).iter().any(|(_, _, m)| *m == said);
+            assert_eq!((said_by_reader, said_by_linter), (rows == 2, rows == 2), "{end}");
+        }
+        // A list of the linter's table alone was a keyword and loose rows
+        // to the reader: its rows are the list's to both.
+        let text = model("  vertexindices 3\n    0\n    1\n  verts 1\n    0 0 0\n");
+        let (_, map) = crate::ascii::read_mapped(text.as_bytes()).unwrap();
+        assert!(map.notes.iter().any(|n| n.message == "vertexindices: 2 of 3 rows"), "{map:?}");
+        let said = messages(&text);
+        assert!(said.iter().any(|(_, _, m)| m == "vertexindices says 3, 2 follow"), "{said:?}");
+    }
+
     const GOOD: &str = "newmodel box\nsetsupermodel box NULL\nclassification character\n\
 setanimationscale 1\nbeginmodelgeom box\nnode dummy box\n  parent NULL\nendnode\n\
 node trimesh plane\n  parent box\n  bitmap tex\n  verts 3\n    0 0 0\n    1 0 0\n    0 1 0\n\
@@ -764,6 +835,30 @@ donemodel box\n";
         assert_eq!(said("it reads selfillumcolor"), Some((7, Severity::Info)), "{found:?}");
         assert_eq!(said("it reads ambientonly"), Some((11, Severity::Info)), "{found:?}");
         assert_eq!(said("lower case only"), Some((10, Severity::Warning)), "{found:?}");
+        // With the keyword the game reads beside it in the node (before or
+        // after), as the decompiler writes the pair: nothing to say.
+        for pair in [
+            "setfillumcolor 1 1 1\n  selfillumcolor 1 1 1",
+            "selfillumcolor 1 1 1\n  setfillumcolor 1 1 1",
+        ] {
+            let text = text.replace("setfillumcolor 1 1 1", pair);
+            let found = messages(&text);
+            assert!(!found.iter().any(|(_, _, m)| m.contains("selfillumcolor")), "{found:?}");
+            assert!(found.iter().any(|(_, _, m)| m.contains("it reads ambientonly")), "{found:?}");
+        }
+        // Moonglow's decompiler writes the pair (for nwnmdlcomp and for the
+        // game), at rest and in an animation: its own text draws no note.
+        let model = crate::Model::read(
+            GOOD.replace("  bitmap tex", "  bitmap tex\n  selfillumcolor 0.5 0.5 0.5").as_bytes(),
+        )
+        .unwrap();
+        let decompiled = crate::ascii_write::to_ascii(&model, &Default::default());
+        assert!(decompiled.contains("setfillumcolor") && decompiled.contains("selfillumcolor"));
+        let found = messages(&decompiled);
+        assert!(!found.iter().any(|(_, _, m)| m.contains("does not read")), "{found:?}");
+        // The pair in another node is no excuse.
+        let apart = text.replace("  ambient_only 1", "  ambient_only 1\n  selfillumcolor 1 1 1");
+        assert!(messages(&apart).iter().any(|(_, _, m)| m.contains("it reads selfillumcolor")));
     }
 
     #[test]
@@ -863,5 +958,27 @@ donemodel box\n";
         assert!(long("\t"));
         assert!(long("\u{a0}"), "a no-break space");
         assert!(long("\u{3000}"), "an ideographic space");
+    }
+
+    #[test]
+    /// The linter's limit is the 32 characters nwn.wiki's MDL page gives
+    /// (the branch's 31 was the binary writer's, unproven in the engine);
+    /// a name of exactly 32 is warned of, as Moonglow's writer cuts it.
+    fn node_name_limit_is_the_wiki_s_32() {
+        let with_name = |len: usize| {
+            let name = "n".repeat(len);
+            format!(
+                "newmodel w\nbeginmodelgeom w\nnode dummy w\n  parent NULL\nendnode\n\
+                 node dummy {name}\n  parent w\nendnode\nendmodelgeom w\ndonemodel w\n"
+            )
+        };
+        assert!(messages(&with_name(31)).is_empty());
+        let msgs = messages(&with_name(32));
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].1, Severity::Warning);
+        assert!(msgs[0].2.contains("cuts it to 31"), "{msgs:?}");
+        let msgs = messages(&with_name(33));
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].2.contains("32"), "{:?}", msgs);
     }
 }

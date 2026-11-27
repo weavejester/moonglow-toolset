@@ -151,7 +151,12 @@ impl VarType {
             Operand::Variable(name) => Some(local(self, name)),
             Operand::Constant(c) => match self {
                 VarType::Int => c.trim().parse::<i32>().ok().map(|n| n.to_string()),
-                VarType::Float => c.trim().parse::<f32>().ok().map(|f| format!("{f:.6}")),
+                // (Not `nan`, `inf` or a number past a float, which
+                // prints as `inf`: names the compiler does not know.)
+                VarType::Float => {
+                    let f = c.trim().parse::<f32>().ok().filter(|f| f.is_finite())?;
+                    Some(format!("{f:.6}"))
+                }
                 VarType::String => Some(quote(c)),
             },
         }
@@ -242,45 +247,94 @@ pub struct Lists {
 impl Lists {
     /// Reads the lists from the game's (and the module's haks') 2DAs.
     pub fn load(game: &GameData) -> Lists {
+        use std::collections::HashMap;
         let spec = game
             .resman
             .get_named("nwscript", ResType::NSS)
             .map(|d| Spec::parse(&d))
             .unwrap_or_default();
-        let rows = |table: &str, name: &str, prefix: &str, keep: &dyn Fn(usize) -> bool| {
-            let Ok(t) = game.table(table) else { return Vec::new() };
-            let (Some(name_col), constant_col) = (t.column(name), t.column("Constant")) else {
-                return Vec::new();
+        const PREFIXES: [&str; 5] = ["CLASS_TYPE_", "GENDER_", "RACIAL_TYPE_", "FEAT_", "SKILL_"];
+        let mut by_name: HashMap<&str, Option<i64>> = HashMap::with_capacity(spec.constants.len());
+        let mut by_prefix: HashMap<(&'static str, i64), &str> = HashMap::new();
+        for c in &spec.constants {
+            let parsed = c.value.trim().parse::<i64>().ok();
+            by_name.entry(c.name.as_str()).or_insert(parsed);
+            if c.ty == "int"
+                && let Some(val) = parsed
+            {
+                for prefix in PREFIXES {
+                    if c.name.starts_with(prefix) {
+                        by_prefix.entry((prefix, val)).or_insert(c.name.as_str());
+                        break;
+                    }
+                }
+            }
+        }
+        let lookup_constant =
+            |prefix: &'static str, row: usize, declared: Option<&str>| -> String {
+                let target = row as i64;
+                if let Some(d) = declared
+                    && by_name.get(d).copied().flatten() == Some(target)
+                {
+                    return d.to_string();
+                }
+                by_prefix
+                    .get(&(prefix, target))
+                    .map(|s| (*s).to_string())
+                    .unwrap_or_else(|| row.to_string())
             };
+        let entry_of = |t: &mg_2da::TwoDa,
+                        row: usize,
+                        name_col: usize,
+                        const_col: Option<usize>,
+                        prefix: &'static str| {
+            let name = game.cell_string(t, row, name_col)?;
+            let declared = const_col.and_then(|c| t.cell(row, c));
+            Some(Entry { row, name, constant: lookup_constant(prefix, row, declared) })
+        };
+        let rows = |table: &str, name: &str, prefix: &'static str, flag_col: Option<&str>| {
+            let Ok(t) = game.table(table) else { return Vec::new() };
+            let Some(name_col) = t.column(name) else { return Vec::new() };
+            let const_col = t.column("Constant");
+            let flag_col = flag_col.and_then(|c| t.column(c));
             (0..t.len())
-                .filter(|&row| keep(row))
-                .filter_map(|row| {
-                    let name = game.cell_string(&t, row, name_col)?;
-                    let declared = constant_col.and_then(|c| t.cell(row, c));
-                    Some(Entry { row, name, constant: constant(&spec, prefix, row, declared) })
+                .filter(|&row| {
+                    flag_col.is_none_or(|c| t.cell(row, c).and_then(mg_2da::parse_int) == Some(1))
                 })
+                .filter_map(|row| entry_of(&t, row, name_col, const_col, prefix))
                 .collect::<Vec<_>>()
         };
-        let flag = |table: &str, column: &'static str| {
-            let t = game.table(table).ok();
-            move |row: usize| {
-                t.as_ref().and_then(|t| t.get(row, column)).and_then(mg_2da::parse_int).unwrap_or(0)
-                    == 1
+        let mut player_races = Vec::new();
+        let mut other_races = Vec::new();
+        if let Ok(t) = game.table("racialtypes")
+            && let Some(name_col) = t.column("Name")
+        {
+            let const_col = t.column("Constant");
+            let flag_col = t.column("PlayerRace");
+            for row in 0..t.len() {
+                if let Some(entry) = entry_of(&t, row, name_col, const_col, "RACIAL_TYPE_") {
+                    let is_player = flag_col
+                        .and_then(|c| t.cell(row, c).and_then(mg_2da::parse_int))
+                        == Some(1);
+                    if is_player {
+                        player_races.push(entry);
+                    } else {
+                        other_races.push(entry);
+                    }
+                }
             }
-        };
-        let player_class = flag("classes", "PlayerClass");
-        let player_race = flag("racialtypes", "PlayerRace");
-        let by_name = |mut v: Vec<Entry>| {
+        }
+        let by_name_sort = |mut v: Vec<Entry>| {
             v.sort_by_cached_key(|e| word_sort_key(&e.name));
             v
         };
         Lists {
-            classes: by_name(rows("classes", "Name", "CLASS_TYPE_", &player_class)),
-            genders: by_name(rows("gender", "NAME", "GENDER_", &|_| true)),
-            player_races: by_name(rows("racialtypes", "Name", "RACIAL_TYPE_", &player_race)),
-            other_races: by_name(rows("racialtypes", "Name", "RACIAL_TYPE_", &|r| !player_race(r))),
-            feats: by_name(rows("feat", "FEAT", "FEAT_", &|_| true)),
-            skills: rows("skills", "Name", "SKILL_", &|_| true),
+            classes: by_name_sort(rows("classes", "Name", "CLASS_TYPE_", Some("PlayerClass"))),
+            genders: by_name_sort(rows("gender", "NAME", "GENDER_", None)),
+            player_races: by_name_sort(player_races),
+            other_races: by_name_sort(other_races),
+            feats: by_name_sort(rows("feat", "FEAT", "FEAT_", None)),
+            skills: rows("skills", "Name", "SKILL_", None),
         }
     }
 
@@ -290,22 +344,6 @@ impl Lists {
         v.sort_by_cached_key(|e| word_sort_key(&e.name));
         v
     }
-}
-
-/// The constant naming a row: the 2DA's `Constant` if `nwscript.nss`
-/// defines it with the row's value, else any constant with the prefix and
-/// that value, else the number.
-fn constant(spec: &Spec, prefix: &str, row: usize, declared: Option<&str>) -> String {
-    let value_is_row =
-        |c: &mg_script::spec::Constant| c.value.trim().parse::<i64>().ok() == Some(row as i64);
-    if let Some(c) = declared.and_then(|d| spec.constant(d)).filter(|c| value_is_row(c)) {
-        return c.name.clone();
-    }
-    spec.constants
-        .iter()
-        .find(|c| c.ty == "int" && c.name.starts_with(prefix) && value_is_row(c))
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| row.to_string())
 }
 
 /// A class restriction: a class (or any, by hit dice) and a minimum level.
@@ -467,12 +505,15 @@ pub fn condition_script(name: &str, date: &str, c: &Condition, lists: &Lists) ->
     if !c.classes.is_empty() {
         if c.all_classes {
             for cl in &c.classes {
-                reject(&mut lines, &format!("{} < {}", class_test(cl), cl.level.unwrap_or(1)));
+                reject(
+                    &mut lines,
+                    &format!("{} < {}", class_test(cl), whole(cl.level.unwrap_or(1))),
+                );
             }
         } else {
             lines.push_str("\tint iPassed = 0;\n");
             for (i, cl) in c.classes.iter().enumerate() {
-                let test = format!("{} >= {}", class_test(cl), cl.level.unwrap_or(1));
+                let test = format!("{} >= {}", class_test(cl), whole(cl.level.unwrap_or(1)));
                 if i == 0 {
                     let _ = write!(lines, "\tif({test})\n\t\tiPassed = 1;\n");
                 } else {
@@ -551,7 +592,7 @@ pub fn condition_script(name: &str, date: &str, c: &Condition, lists: &Lists) ->
     }
     section(&mut body, "Perform skill checks", std::mem::take(&mut lines));
 
-    if let Some((n, m)) = c.random {
+    if let Some((n, m)) = c.random.map(|(n, m)| (whole(n), whole(m))) {
         reject(&mut lines, &format!("Random({m}) >= {n}"));
     }
     section(&mut body, "Add the randomness", std::mem::take(&mut lines));
@@ -572,7 +613,7 @@ pub fn action_script(name: &str, date: &str, a: &ActionScript) -> String {
     let mut body = String::new();
 
     // Rewards.
-    if let Some((gold, to_party)) = a.give_gold {
+    if let Some((gold, to_party)) = a.give_gold.map(|(n, party)| (whole(n), party)) {
         let call = match (to_party, plot) {
             (false, _) => format!("GiveGoldToCreature(GetPCSpeaker(), {gold});"),
             (true, false) => format!("RewardPartyGP({gold}, GetPCSpeaker());"),
@@ -580,7 +621,7 @@ pub fn action_script(name: &str, date: &str, a: &ActionScript) -> String {
         };
         let _ = write!(body, "\t// Give the speaker some gold\n\t{call}\n\n");
     }
-    if let Some((xp, to_party)) = a.give_xp {
+    if let Some((xp, to_party)) = a.give_xp.map(|(n, party)| (whole(n), party)) {
         let call = match (to_party, plot) {
             (false, _) => format!("\tGiveXPToCreature(GetPCSpeaker(), {xp});\n"),
             (true, false) => format!("\tRewardPartyXP({xp}, GetPCSpeaker());\n"),
@@ -607,7 +648,7 @@ pub fn action_script(name: &str, date: &str, a: &ActionScript) -> String {
     if a.take_gold.is_some() || a.take_xp.is_some() || !a.take_items.is_empty() {
         body.push('\n');
     }
-    if let Some((gold, destroy)) = a.take_gold {
+    if let Some((gold, destroy)) = a.take_gold.map(|(n, destroy)| (whole(n), destroy)) {
         let destroy = if destroy { "TRUE" } else { "FALSE" };
         let _ = write!(
             body,
@@ -615,7 +656,7 @@ pub fn action_script(name: &str, date: &str, a: &ActionScript) -> String {
              \tTakeGoldFromCreature({gold}, GetPCSpeaker(), {destroy});\n\n"
         );
     }
-    if let Some(xp) = a.take_xp {
+    if let Some(xp) = a.take_xp.map(whole) {
         let _ = write!(
             body,
             "\t// Remove some xp from the player\n\
@@ -717,10 +758,24 @@ pub fn default_name_named(
     taken: impl Fn(&str) -> bool,
 ) -> String {
     let prefix = if condition { "sc_" } else { "at_" };
-    (1..)
-        .map(|n| naming.fit(prefix, &format!("{n:03}")))
-        .find(|name| !taken(name))
-        .expect("a free name")
+    // (By the one rule for a numbered name, which ends at 9999: with every
+    // one taken, the first, for the builder to change.)
+    let free = naming.numbered(prefix, 1, &taken).map(|name| name.to_string());
+    free.unwrap_or_else(|| naming.fit(prefix, "001"))
+}
+
+/// A number as a script's `int` holds it: no more than 2,147,483,647 (the
+/// compiler adds a longer literal up without a word, to a negative
+/// number: taking 3,000,000,000 XP gave 1.29 billion).
+fn whole(n: u32) -> u32 {
+    n.min(i32::MAX as u32)
+}
+
+/// An amount of gold or XP as typed: a whole number from 1 to
+/// 2,147,483,647, what a script's `int` can give or take. `None` for
+/// anything else.
+pub fn amount(text: &str) -> Option<u32> {
+    text.trim().parse::<u32>().ok().filter(|n| (1..=i32::MAX as u32).contains(n))
 }
 
 #[cfg(test)]
@@ -793,6 +848,13 @@ mod tests {
             "GetLocalFloat(GetPCSpeaker(), \"v\") < 1.500000"
         );
         assert_eq!(check(VarType::Int, "x"), None);
+        // A float that is no number, or past what a float holds, is no
+        // value: it was written as `NaN` or `inf`, which do not compile.
+        for bad in ["nan", "NaN", "inf", "-inf", "infinity", "1e39", "-1e39"] {
+            assert_eq!(check(VarType::Float, bad), None, "{bad}");
+        }
+        assert!(check(VarType::Float, "1e38").unwrap().ends_with(".000000"));
+        assert_eq!(check(VarType::Int, "3000000000"), None);
         assert_eq!(
             check(VarType::String, "say \"hi\"").unwrap(),
             "GetLocalString(GetPCSpeaker(), \"v\") < \"say \\\"hi\\\"\""
@@ -805,5 +867,35 @@ mod tests {
         assert_eq!(default_name(false, |n| n == "at_001" || n == "at_002"), "at_003");
         let ab = crate::project_file::Naming::new("ab", "{code}_{name}");
         assert_eq!(default_name_named(true, &ab, |n| n == "ab_sc_001"), "ab_sc_002");
+        // (Every one taken: a name all the same, and an end to looking.)
+        assert_eq!(default_name(true, |_| true), "sc_001");
+    }
+
+    /// An amount is what a script's `int` holds: past 2,147,483,647 the
+    /// compiler adds the literal up to a negative number (Take XP of
+    /// 3,000,000,000 gave the player 1.29 billion). The page refuses one
+    /// (`amount`), and a script never holds one whatever it is given.
+    #[test]
+    fn amounts_are_what_an_int_holds() {
+        assert_eq!(amount(" 250 "), Some(250));
+        assert_eq!(amount("2147483647"), Some(i32::MAX as u32));
+        for bad in ["0", "-5", "2147483648", "3000000000", "ten", ""] {
+            assert_eq!(amount(bad), None, "{bad}");
+        }
+        let big = 3_000_000_000;
+        let action = ActionScript {
+            give_gold: Some((big, false)),
+            give_xp: Some((big, true)),
+            take_gold: Some((big, true)),
+            take_xp: Some(big),
+            ..Default::default()
+        };
+        let source = action_script("at_001", "2026-11-09", &action);
+        assert!(!source.contains("3000000000"), "{source}");
+        assert!(source.contains("int nXP = GetXP(GetPCSpeaker()) - 2147483647;"), "{source}");
+        assert!(source.contains("GiveGoldToCreature(GetPCSpeaker(), 2147483647);"));
+        let condition = Condition { random: Some((big, big)), ..Default::default() };
+        let source = condition_script("sc_001", "2026-11-09", &condition, &lists());
+        assert!(source.contains("Random(2147483647) >= 2147483647"), "{source}");
     }
 }

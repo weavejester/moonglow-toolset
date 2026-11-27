@@ -55,7 +55,8 @@ pub(crate) enum NuiCmd {
     /// or nothing: a window with errors, an opener or event script edited
     /// by hand, or one that does not compile, changes nothing. A script of
     /// yours that includes the opener and does not compile is printed and
-    /// keeps the compiled script it had.
+    /// keeps the compiled script it had: the window is built and saved,
+    /// and the command fails, as `mg compile` does.
     Generate {
         /// A module archive, folder or nasher project.
         module: PathBuf,
@@ -149,18 +150,12 @@ pub(crate) fn run(cli: &Cli, cmd: &NuiCmd) -> Result<Output> {
             let ws = Workspace::new(crate::open_module(module)?);
             let made =
                 mg_nui::create(&ws.module, name).with_context(|| window_text(module, name))?;
-            write(ws, made, module, name, *dry_run, Output::default())
+            write(cli, ws, made, module, name, *dry_run, Output::default())
         }
         NuiCmd::Generate { module, name, dry_run, ndb } => {
             let ws = Workspace::new(crate::open_module(module)?);
             let mut out = Output::default();
-            let gi = install(cli)?;
-            let rm = module_resman(&gi, &ws.module, &mut out)?;
-            // What `mg compile` and the window remember of the scripts
-            // they compiled is kept in one place: these are noted there.
-            let dir = build::compiled_dir();
-            let made_with = build::made_with(Some(module), None, Some(&gi.root), &rm);
-            let known = build::Remembered::kept(dir.as_deref(), Some(module), made_with);
+            let (rm, dir, known) = for_building(cli, &ws.module, module, &mut out)?;
             let how = mg_nui::Build { known: Some(&known), debug: *ndb, ..mg_nui::Build::new(&rm) };
             let made = mg_nui::generate(&ws.module, name, &how)
                 .with_context(|| window_text(module, name))?;
@@ -182,9 +177,13 @@ pub(crate) fn run(cli: &Cli, cmd: &NuiCmd) -> Result<Output> {
                     }
                 ));
             }
-            let mut out = write(ws, made.command, module, name, *dry_run, out)?;
+            let mut out = write(cli, ws, made.command, module, name, *dry_run, out)?;
             out.json["failed"] = failed["failed"].clone();
             out.json["errors"] = failed["errors"].clone();
+            // (The window is built and saved, and the exit says that a
+            // script that opens it is not: as `mg compile`, so that a
+            // pipeline goes no further with a module of old scripts.)
+            out.failed = !made.failed.is_empty();
             out.json["returns"] = serde_json::to_value(&made.refits)?;
             if out.json["saved"] == true
                 && let Some(dir) = &dir
@@ -200,7 +199,7 @@ pub(crate) fn run(cli: &Cli, cmd: &NuiCmd) -> Result<Output> {
             preview::render(cli, module, name.as_deref(), out.as_deref(), &drawn.options()?)
         }
         NuiCmd::Import { module, sources, replace, dry_run } => {
-            import(module, sources, *replace, *dry_run)
+            import(cli, module, sources, *replace, *dry_run)
         }
         NuiCmd::Schema { layout, jui } => {
             let schema = match (layout, jui) {
@@ -222,11 +221,32 @@ pub(crate) fn run(cli: &Cli, cmd: &NuiCmd) -> Result<Output> {
     }
 }
 
+/// What a window's scripts are built with: the game's and the module's
+/// resources, the folder of what was compiled, and what is remembered
+/// there of the module's scripts (`mg compile` and the window remember
+/// the scripts they compiled in one place: a build's are noted there).
+fn for_building(
+    cli: &Cli,
+    m: &Module,
+    module: &Path,
+    out: &mut Output,
+) -> Result<(mg_resman::ResMan, Option<PathBuf>, build::Remembered)> {
+    let gi = install(cli)?;
+    let rm = module_resman(&gi, m, out)?;
+    let dir = build::compiled_dir();
+    let made_with = build::made_with(Some(module), None, Some(&gi.root), &rm);
+    let known = build::Remembered::kept(dir.as_deref(), Some(module), made_with);
+    Ok((rm, dir, known))
+}
+
 /// `mg rename MODULE NAME.jui NEW`: a NUI window renamed as the NUI
 /// Creator's Rename… renames it (`mg_nui::rename`: its settings, its two
 /// scripts and the module's scripts that open it), and built again under
 /// its new name as `mg nui generate` builds, the one with the other, and
-/// saved. A window that can't be built is renamed all the same, and said.
+/// saved. A window that can't be built is renamed all the same, and said;
+/// and the exit says it, and that a script that opens the window does not
+/// compile under the new name, as `mg nui generate`'s does: the module is
+/// saved with old compiled scripts, and a pipeline should stop there.
 pub(crate) fn rename(
     cli: &Cli,
     module: &Path,
@@ -240,28 +260,29 @@ pub(crate) fn rename(
         mg_nui::rename(&ws.module, from, to, strings).with_context(|| window_text(module, from))?;
     let mut compile = json!(null);
     let mut remembered = None;
+    let mut failed = false;
     if made.build {
-        let gi = install(cli)?;
-        let rm = module_resman(&gi, &ws.module, &mut out)?;
-        let dir = build::compiled_dir();
-        let made_with = build::made_with(Some(module), None, Some(&gi.root), &rm);
-        let known = build::Remembered::kept(dir.as_deref(), Some(module), made_with);
+        let (rm, _, known) = for_building(cli, &ws.module, module, &mut out)?;
         let how = mg_nui::Build { known: Some(&known), ..mg_nui::Build::new(&rm) };
         match mg_nui::build_renamed(&ws.module, &mut made, to, &how) {
             Ok(Some(built)) => {
                 compile = compiled(&mut out, &built.failed);
+                failed = !built.failed.is_empty();
                 remembered = Some(built.remembered);
             }
             Ok(None) => {}
-            Err(e) => out.note(format!(
-                "warning: {to}'s scripts, and the scripts that open it, are not compiled under \
-                 its new name ({e}): run mg nui generate"
-            )),
+            Err(e) => {
+                failed = true;
+                out.note(format!(
+                    "warning: {to}'s scripts, and the scripts that open it, are not compiled \
+                     under its new name ({e}): run mg nui generate"
+                ));
+            }
         }
     }
     let changed: Vec<String> = made.command.edits.iter().map(|e| e.key().to_string()).collect();
     ws.apply(made.command).with_context(|| window_text(module, from))?;
-    ws.save()?;
+    crate::save_workspace_asked(cli, &mut ws, &mut out)?;
     if let (Some(now), Some(dir)) = (&remembered, build::compiled_dir())
         && let Err(e) = now.write(&build::Remembered::file(&dir, module))
     {
@@ -290,6 +311,7 @@ pub(crate) fn rename(
         made.in_scripts,
         if remembered.is_some() { ", built under its new name" } else { "" }
     ));
+    out.failed = failed;
     Ok(out)
 }
 
@@ -307,6 +329,7 @@ fn window_text(module: &Path, name: &str) -> String {
 /// Applies what `new` or `generate` made (all of it or none) and saves,
 /// or with `dry_run` only checks that it applies.
 fn write(
+    cli: &Cli,
     mut ws: Workspace,
     made: Command,
     module: &Path,
@@ -314,18 +337,13 @@ fn write(
     dry_run: bool,
     mut out: Output,
 ) -> Result<Output> {
-    let mut resources: Vec<ResKey> = Vec::new();
-    for e in &made.edits {
-        if !resources.contains(e.key()) {
-            resources.push(*e.key());
-        }
-    }
+    let resources = crate::edits::unique_keys(&made.edits);
     // (Said before it is written, a dry run too.)
     let left = left_out(&ws.module, &resources);
     ws.apply(made).with_context(|| window_text(module, name))?;
     let saved = !dry_run && !resources.is_empty();
     if saved {
-        ws.save()?;
+        crate::save_workspace_asked(cli, &mut ws, &mut out)?;
     }
     out.json = json!({
         "module": path_text(module),

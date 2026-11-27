@@ -3,18 +3,22 @@ type: Manual Page
 title: Build, verify and test
 description: Build Module, publishing to NWSync and uploading it to the web server, long work, Verify Module and the fixes beside its findings, the Round-Trip Check, Test Module, reloading haks and 2DAs, and Area Statistics.
 tags: [manual, build, verify, test, nwsync]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-11-01T22:29:44Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-25T08:49:31Z }
 ---
 
 # Build, verify and test
 
 ## Build Module
 
-**Build › Build Module…** prepares the module for play and checks it, as
-Aurora's Build does:
+**Build › Build Module** prepares the module for play and checks it, as
+Aurora's Build does. Its window has a row of what to do, **Unused**,
+**Missing Resources** and **Compile** (and **Spell Check**, grayed:
+Moonglow has no dictionary), and **Advanced Controls**, which shows
+under each what it covers, each with a check box of its own:
 
 - **Compile**: the **Scripts** (with their debug files, where **Generate
-  Debug Information** is on in Options), recalculated **Creature CR** (challenge
+  Debug Information When Compiling Scripts** is on in Options › Script
+  Editor), recalculated **Creature CR** (challenge
   ratings), **Encounters** (each encounter's creature list updated with
   its creatures' challenge ratings and appearances; creatures that no
   longer exist are removed) and **Palettes** (the custom palettes made
@@ -23,16 +27,52 @@ Aurora's Build does:
   `STRREF`; entries of the override folder's blueprints and of blueprints
   there are no more go. A plain save changes only the entries of the
   blueprints you changed: [Blueprints](05-blueprints.md#palettes)).
-- **Check that resources are available**: **Missing Resources** (scripts,
-  blueprints, conversations, models… that something in the module names
-  but neither the module, its haks nor the game has) and, if ticked,
-  **Unused** resources (in the module but used by nothing).
+- **Missing Resources**: scripts, blueprints, conversations, models…
+  that something in the module names but neither the module, its haks
+  nor the game has, by kind (Areas, Creatures, Doors and the rest, in
+  two columns).
+- **Unused**: resources in the module that nothing uses (its
+  **Scripts**, **Conversations** and **Blueprints**: see [What counts
+  as used](#what-counts-as-used)).
 
-Compile and Missing Resources are on by default, Unused off. The
-**Results** list what was found; double-click a result to open what it is
-about, and **Export…** saves the list as text. With **Build module on
-save** (Options › General), every save builds first (with Palettes
-ticked, every save makes the palettes anew, as Aurora's Build does).
+Compile and Missing Resources are on by default, Unused off, and every
+kind under them on. The window's foot has **Build** (the main button,
+which Enter presses), **Mark as Used** (on the Unused result chosen in
+Problems: [below](#what-counts-as-used)), **Export…**, which saves the
+findings as text (a line each, `Error: x.nss: message`), and **Done**
+(or Escape), which closes it. The build runs as [long work](#long-work)
+does. Once it has built, the foot says how many errors and warnings it
+found, "in Problems" ([below](#build-modules-results)). With **Build module on
+save** (Options › General), every save builds first, with the window's
+defaults rather than what is checked in it: so every save also makes the
+palettes anew, as Aurora's Build does.
+
+### Build Module's results
+
+The results go to **Problems** in the Bottom Dock, under a **Build
+Module** heading, its counts at the right of the dock's tab bar, errors
+first. Each row has its severity, its place (a link, "Go to it" in its
+tip, that opens the resource) and its message, cut where it is long
+(the tip has the whole). Click a row to choose it; the arrow keys,
+Page Up, Page Down, Home and End move the choice; Enter or a double click
+goes to the resource. A right click on a row (which chooses it) or
+Shift+F10 on the one chosen offers **Copy**, the finding as one line with
+its whole message, and **Copy All**, every finding listed under every
+heading; Ctrl+C copies the one chosen. While the build runs, the heading says "Build
+Module is running". Where the build finds nothing, the heading says "No
+problems found" and the log "No errors found". With **Build module on
+save**, the results go to Problems the same way; Problems comes to the front, and the Bottom
+Dock opens only where something was found.
+
+When the module changes after a build, the heading says "Changed since
+the check: not counted", and its findings are no longer counted in the
+Status Bar's Problems switch. A right click on the heading, or its
+**Problems Actions** button (`…`) at the right, offers **Copy These
+Findings**, **Save These Findings As…** (one a line, into a text file)
+and **Remove from Problems** (Delete with the heading focused), each on
+that heading's findings alone. Closing the module
+takes them away (Verify's too): a click on one would open another
+module's resource.
 
 ### What counts as used
 
@@ -73,14 +113,18 @@ x.nss (source and compiled)`, `x.ncs (compiled only (no source))` or
 
 A name made as a script runs (`ExecuteScript("ai_" + sMode)`, a name
 read from a variable or a 2DA of the module's own) is not seen. Name
-those in the project file: select the line and **Mark as Used** (or
-right-click it), which writes its name into
+those in the project file: choose the Unused result in Problems and
+click the Build Module window's **Mark as Used**, or right-click the
+result: **Mark as Used** (both need the module saved where the project
+file can go beside it). Its name is written into
 [the project file](03-modules.md#the-project-file-moonglowtoml)'s
 `[used]` (beside a `.mod`, `NAME.moonglow.toml`, made where there is
-none); the line goes, and so do the others it names. **Counted as
-Used**, under the results, lists what `[used]` names, with **Remove**
-beside each, and adds a name or a glob (`j_ai_*`: `*` any letters) of a
-script, a conversation or a blueprint. Aurora never reads or writes the
+none); the result leaves Problems, and so do the others it names. The
+**Counted as Used** button, on the Build Module heading in Problems (it
+shows where the build was asked for its Unused results), opens
+what `[used]` names, with **Remove** beside each, and the kind, a field and
+**Add** for a name or a glob (`j_ai_*`: `*` any letters) of a
+script, a conversation or a blueprint (Enter adds). Aurora never reads or writes the
 file, so the marks stay when the module is saved there. `mg used`
 does the same from the command line.
 
@@ -93,7 +137,7 @@ counts it as used.
 
 A server's players download its haks and talk table through NWSync:
 before joining, the game fetches them from a web server that nwserver
-names (`-nwsyncurl ADDRESS`). **Build › Publish to NWSync…** writes what
+names (`-nwsyncurl ADDRESS`). **Build › Publish to NWSync** writes what
 that web server serves into a folder, as neverwinter.nim's
 `nwn_nwsync_write` does (the same manifest, byte for byte):
 - **What goes in:** the module's haks (the first-listed hak's copy where
@@ -105,7 +149,8 @@ that web server serves into a folder, as neverwinter.nim's
   single-player module that players download whole, not for a persistent
   world.
 - **Group ID:** for servers sharing one repository.
-- **Latest:** **Make it the latest** points the repository's `latest` at
+- **Latest:** **Make it the latest (what nwserver serves unless told a
+  hash)** points the repository's `latest` at
   it; nwserver serves `latest` unless given `-nwsynchash`.
 - **Compression:** the data files are compressed with zstd at level 3,
   as `nwn_nwsync_write` compresses them (the reference library, built
@@ -118,13 +163,25 @@ that web server serves into a folder, as neverwinter.nim's
   above 19 saves little more.
 
 Publishing again writes only the changed files. It runs as the other
-long work does (see [Long work](#long-work)): a small window shows how
-far it is and has **Cancel**, which stops before the next file and
+[long work](#long-work) does; its **Cancel** stops before the next file and
 writes no manifest (`latest` stays as it was; the data files written by
 then stay, for the next publish to find). Then the window shows the
 manifest's hash (**Copy** copies it, for `-nwsynchash`). Send the
-folder to the web server: by hand, or with **Upload** (below). `mg
-nwsync` does the same from the command line.
+folder to the web server: by hand, or with **Upload** (below). The
+window asks for the **Repository folder** (**Browse…**) over the
+choices above; its foot has **Publish** (the main button), **Remove
+Unused Data** and **Upload** (grayed until an upload command is set),
+and the × on its title row, or Escape, closes it. `mg nwsync` does the
+same from the command line.
+
+Keep the server's module loaded when nobody is on it: set
+`reload-when-empty = false` under `[server]` in its `settings.tml`
+(Server Options' **Reload Module When Empty** off). The game's server
+(89.8193.37) reloads the module when its last player leaves, and the
+module reloaded is offered without its NWSync manifest: a player who
+leaves to download (the game disconnects for it) and joins again finds
+the haks missing and is turned away, whenever nobody else was on the
+server.
 
 **Remove Unused Data** tidies the folder as neverwinter.nim's
 `nwn_nwsync_prune` does: it takes away the data files that no manifest
@@ -137,7 +194,9 @@ with `-nwsynchash`: delete the manifests you no longer serve
 Data takes their data. What it can't mend it says, in the window and the
 log: `latest` naming a manifest that isn't there, a manifest without its
 `.json`, a data file a manifest needs that is missing (publish that
-module again). `mg nwsync-prune` does the same from the command line.
+module again). **Cancel** stops it before the next data file: the window
+and the log say how many it had removed by then, and the rest stay for
+the next time. `mg nwsync-prune` does the same from the command line.
 
 ### Uploading to the web server
 
@@ -199,7 +258,8 @@ rsync, rclone and `aws s3 sync` send only the files that aren't on the
 server yet: the data of a manifest already there isn't sent again.
 
 A script of your own gets `MOONGLOW_NWSYNC_FOLDER` (the folder),
-`MOONGLOW_NWSYNC_PART` (the part) and, in a project, `MOONGLOW_PROJECT`.
+`MOONGLOW_NWSYNC_PART` (the part), `MOONGLOW_MG` (the `mg` that came
+with Moonglow) and, in a project, `MOONGLOW_PROJECT`.
 **Upload after publishing and after removing unused data** runs it at
 the end of each (not after a Cancel or an error). After **Remove Unused
 Data** it sends the manifests before the data, and not `latest` (which
@@ -210,8 +270,9 @@ stays on the server until you take it away there.
 
 It runs as a project's command does: as a job, its output under its
 name as it comes and in the log, with **Cancel** (which stops it, and
-sends nothing after it); **Show Output** shows all it said afterwards,
-and **Last upload** how it ended. With `input = true` (in Options: **It
+sends nothing after it); **Show Output** opens **Command Output** on
+all it said (also File › Project › Command Output), and **Last upload**
+says how it ended. With `input = true` (in Options: **It
 reads what I type**) a line under its output gives it what you type. A
 program that asks on the terminal itself (ssh asking for a password)
 can't be answered from Moonglow: give it a key or an agent. A command
@@ -228,43 +289,68 @@ password.
 
 ## Long work
 
-Compile All Scripts, Build Module (its Build button) and Verify Module
-run in the background: a small window names the work, shows how far it
-is, and has **Cancel**. Until it is done the rest of the window takes no
+Compile All Scripts, Compile Models, Build Module (its Build button),
+Verify Module, the Round-Trip Check, Publish to NWSync, Find Instance,
+Find and Replace Text and the Hak Pak Conflict Analysis run in the
+background: a small window names the work, shows how far it is, and has
+**Cancel** in its footer (**Escape** cancels the work too). The words
+saying how far it is (`40 of 312`) are under the bar, and the right of
+the Status Bar shows the work's name and a bar as well. Until it is done the rest of the window takes no
 input, so nothing changes under the work; what it made (compiled scripts,
 say) then goes in as one step that Undo takes back. Canceled, it changes
 nothing. The build before saving (Options › General) and the compile
 before a test run wait instead, since saving and testing need their
-result.
+result. A module dropped on the window, Open, Close and the window's
+close button wait too: the log says the work is still running, and they
+are yours again once it is done or canceled.
 
 ## Verify Module
 
-**Build › Verify Module** writes to the log, as errors and warnings, what
-is missing and what is wrong with the module's custom content. To leave
+**Build › Verify Module** (or **Verify** at the Top Bar's right end)
+writes to the log, as errors and warnings, what
+is missing and what is wrong with the module's custom content. Its errors
+and warnings also go to **Problems** in the Bottom Dock, under a **Verify
+Module** heading, each with its resource as its place (Enter, a double click
+or the link go there) and its fix button beside it where one is offered;
+Problems comes to the front when anything was found. To leave
 some of it out (a hak's tileset errors you are not going to fix),
-untick its group, or one check of it, in **Options › Verify**, or name
+uncheck its group, or one of its checks, in **Options › Verify**, or name
 the hak or the tileset there; the summary line says what was left out,
-not checked. **Clear**, in the log's
-corner, empties the log before a second run.
+not checked. Verify writes no file of its own: where it found anything,
+its summary line says the findings are in Problems, where a right click
+copies or saves them (the heading's **Save These Findings As…**). **Clear Log**, on the log's
+tab bar (or View › Clear Log), empties the log before a second run.
+
+A [project](03-modules.md)'s compiled scripts are build output, so its
+tree holds its scripts as sources: Verify compiles those its build
+compiles first, in memory, so a script reference is satisfied by a
+source that compiles, and one that doesn't compile is said not compiled
+(an error). Nothing is written.
 
 **Fixes.** A problem whose right change is plain has a button beside it
-in the log that says what it does: **Retag the other as …** for a tag
+in the log, and beside the finding in Problems, whose words are the fix
+itself (in Problems, **Fix All (n)** stands beside the first of several
+findings of one check, and a check mark, **Fixed**, takes the button's
+place once it is made): **Retag the other as …** for a tag
 the project wants unique, **Move the variables to the GIT** for an
 area's variables in its ARE, **Remove the variable** for one only the
 scripts set kept in a file (`var-runtime`), **Take the transform off**
 for a static placeable's visual transform, which the game doesn't draw
-(`static-transform`; to have it drawn transformed, untick Static in its
+(`static-transform`; to have it drawn transformed, uncheck Static in its
 Properties instead), and whatever a plugin's check offers.
 Nothing changes until you click it; then the change goes in as one step,
-which **Undo** takes back, and the button says **Fixed**. A fix is
+which **Undo** takes back, and the button says **Fixed** (the module has
+changed, so Verify Module's heading in Problems then says "Changed since
+the check: not counted"). A fix is
 worked out when Verify runs, on the module as it was then: if what it
 would change has changed since (by hand, or by another fix that did more
 than set fields and take items out), the log says so, and Verify run
 again offers it anew. Fixes that take items out follow one another: of
 two variables of one object removed, the second is removed from where
-it is after the first (since Moonglow 2.13.0).
-Only the last Verify's fixes are offered, and Clear takes them away with
-the lines.
+it is after the first.
+Only the last Verify's fixes are offered, and Clear Log takes them away
+with the lines, in Problems too (the findings stay there, without their
+buttons).
 
 **Missing resources** are things something names that exist nowhere.
 - **Errors:** scripts, conversations and areas named by areas, placed
@@ -272,7 +358,12 @@ the lines.
   compiled.
 - **Warnings:**
   - what a blueprint names, which matters only once something places it;
-  - sounds and portraits.
+  - sounds and portraits. A sound kept only as `.bmu` is missing too, and
+    says so (`only mg_snd.bmu is there, which the game does not look
+    for`): the game looks for a placed sound's, a sound blueprint's and a
+    sound `PlaySound` plays only as `.wav` (read in the game), and a
+    conversation line's is taken to be looked for the same way (not
+    read).
 
 Errors come first in the log, then warnings. Objects placed from a
 blueprint the module no longer has come last, one line a blueprint with
@@ -288,33 +379,48 @@ crash Aurora with an access violation that names nothing:
 
 | Problem | Where it shows |
 | --- | --- |
-| A tileset whose `[TILES]` or `[GROUPS]` count disagrees with its sections | Aurora's "Range Check Error" when opening an area |
+| A tileset whose `[TILES]` or `[GROUPS]` count is below its sections (`set-count`, an error), or whose count of tiles, groups, terrains, crossers or rules is past its last section (a count that is no count, `Count=1869573190`: a warning; the holes it calls for are named by `set-hole`), or whose terrain, crosser or rule sections run past its count (a warning) | Aurora's "Range Check Error" when opening an area; for the others the game reads up to the count and no further |
 | A tileset whose lines end in a bare LF instead of CRLF (as an editor on Linux or macOS may save it), or with a line of more than 255 characters | the game's server never finishes loading a module that uses it: a file all in LF, one with more than 256 bytes after its last CRLF, or one with a line longer than 255 characters (however it ends; the error names the line). With only some of its lines in LF elsewhere (a warning, naming the first), the server reads them as CRLF ones |
 | A hole in a tileset: a `[TILEn]` section its count calls for that is missing, or a tile without `Model=` (a terrain's, a crosser's or a rule's section missing too) | the game draws the tile as nothing, with no walkmesh, and reads the rest; so does Moonglow, and an area's problems name the holes it uses |
 | A tile whose model is missing | Aurora crashes painting it |
 | A group whose first tile is `-1` or shared with another group, or names a tile that doesn't exist | the group won't paint, or Aurora crashes |
 | A tileset door type that isn't a `doortypes.2da` row | the door has no appearance |
 | A material (`.mtr`) naming a texture longer than 16 characters | Aurora's "Pure virtual function called" |
-| A shader program that doesn't compile: one a material names (`customshaderVS`, `customshaderFS`), one of the haks' `.shd` programs, or a stock program broken by a hak's copy of a stock include (`inc_lighting`). Named at the file and line with the shader compiler's message, the programs it breaks listed. Compiled as the game's players have them: at the game's highest settings, then at Performance and Low shader quality, with enhanced lighting off, for an opaque material and with 3 lights; a program that fails only at one of these is named with it (`fs_water (fragment, at Low shader quality)`). Programs that compiled are kept in Moonglow's cache folder, so the next Verify compiles only what changed | the game draws the meshes that use it magenta |
+| A material (`.mtr`, the one the load order gives the game) naming a texture (`texture0` to `texture5`, not `null`) that no layer holds as a `.dds`, `.tga` or `.plt` (`mtr-texture`: an error for `texture0`, its color; a warning for a map in another slot) | the game draws the material untextured, or without that normal, specular or other map |
+| A custom `.dds` of one luminance channel (a standard header, uncompressed, one gray channel; `dds-luminance`, a warning) that the game takes for the texture: no `.plt` of its name is in the load order (a creature's or an item's colored part is drawn from the PLT instead), and no `.tga` of a higher folder is drawn in its place | the game draws it in the wrong colors (a gray of 60 comes out blue, 128 dark red, 0 and 255 black; Moonglow draws it gray). Save it as a DXT1 `.dds` or a true-color `.tga` |
+| An item that names no model (`item-model`, a warning): an item blueprint, or an item a blueprint's or an area's placed creature holds or wears (a blueprint's entries name the item's blueprint; a placed creature's are the items), or an item lying in an area, none of whose models (`ItemClass` and its part number, a cloak's, a composite's three pieces) is in the load order and whose base item's `DefaultModel` is empty or missing too. An armor is the body's and not looked at. Named with the creature where there is one, or the area for an item lying in it | the game can't make the item, and the area of a creature holding or wearing it never finishes loading (the client stays on the loading screen; its log says "CreateItem: Model … nor the default model could be loaded") |
+| A shader program that doesn't compile: one a material names (`customshaderVS`, `customshaderFS`), one of the haks' `.shd` programs, or a stock program broken by a hak's copy of a stock include (`inc_lighting`). Named at the file and line with the shader compiler's message, the programs it breaks listed. A program whose includes loop, or add up to more than 8 MB of text (a file included again and again), is named the same way, at the include. Compiled as the game's players have them: at the game's highest settings, then at Performance and Low shader quality, with enhanced lighting off, for an opaque material and with 3 lights; a program that fails only at one of these is named with it (`fs_water (fragment, at Low shader quality)`). Programs that compiled are kept in Moonglow's cache folder, so the next Verify compiles only what changed | the game draws the meshes that use it magenta |
 | A 2DA row with more cells than columns (two rows run together) | Aurora's access violation; the game drops the cells |
 | `baseitems.2da` over 256 rows, `lightcolor.2da` over 32 | Aurora fails (the game is fine) |
-| A 2DA string reference past the end of its talk table (also of the item property tables, and the `Name` of the tables they name; since Moonglow 2.13.0) | "Bad Strref" |
-| A hak's 2DA row naming a row of another table that isn't there or is blank, a padding row (a feat's required feat, a spell's feat, a race's appearance, a package's class, an appearance's footsteps, an item property's cost table; some sixty columns of twelve tables, the feat, skill and spell lists that a class, a race or a package names, and a class's requirements, each by its kind: a feat, a skill, a race, a class), or naming a table that isn't there (a class's feat list, bonus feats, spells or saves table, an item property's subtypes; since Moonglow 2.13.0). A cell the hak keeps as the game has it, wrong in the game's own table too, is the game's and not said (seven appearances name footstep 30 of 18) | the feat, spell or class is missing or wrong in the game (a warning) |
+| A 2DA string reference past the end of its talk table (also of the item property tables, and the `Name` of the tables they name) | "Bad Strref" |
+| A hak's 2DA row naming a row of another table that isn't there or is blank, a padding row (a feat's required feat, a spell's feat, a race's appearance, a package's class, an appearance's footsteps, an item property's cost table; some sixty columns of twelve tables, the feat, skill and spell lists that a class, a race or a package names, and a class's requirements, each by its kind: a feat, a skill, a race, a class), or naming a table that isn't there (a class's feat list, bonus feats, spells or saves table, an item property's subtypes). A cell the hak keeps as the game has it, wrong in the game's own table too, is the game's and not said (seven appearances name footstep 30 of 18) | the feat, spell or class is missing or wrong in the game (a warning) |
+| A class's spells, where `classes.2da`, `packages.2da`, `spells.2da`, `domains.2da` or a package's spell table is the module's or a hak's (`2da-spells`): a spellcasting class's `SpellTableColumn` naming a column `spells.2da` doesn't have, and a spell a package's `SpellPref2DA` table prefers that its class can't learn (no level in its column of `spells.2da`, nor, for a class that picks domains, granted by a domain). A table of the game's whose package's class can no longer learn some of its spells (a hak's `spells.2da` took them from the class) is said once, with how many; a fault the game's own tables have too is the game's and not said | the class has no spells; an NPC leveled up by the package passes over the spell (a warning) |
 | A custom talk table the module names that isn't in its haks, the module or the `tlk` folder (or is named with `.tlk`, or, on Linux, in a different case from the file) | the game won't load the module |
 | A hak's 2DA hiding another hak's longer copy | the rows past it are lost (an older copy?) |
 | A creature, placeable, door or item naming a 2DA row that doesn't exist or whose model is missing | Aurora's area view crashes on it; in the game it has no appearance, or the game crashes (a creature with a class that doesn't exist) |
 | A waypoint whose Appearance is a `waypoint.2da` row with no flag model (a warning) | the area view draws no flag for it; the game draws no waypoint |
 | A creature, placeable, door or encounter of the PC faction, or a creature, placeable or door with no faction, which the game reads as the PC faction (a warning; not a trigger, which Aurora gives faction 0 when its blueprint has none) | the PC faction is the players' alone: the game puts such a creature in Hostile, and creatures regard the others as they regard players |
-| A static placeable whose file has a visual transform (a warning) | the game client draws a static placeable without it, merged into the area's tiles: untick Static to have it scaled, tilted or moved |
+| A static placeable whose file has a visual transform (a warning) | the game client draws a static placeable without it, merged into the area's tiles: uncheck Static to have it scaled, tilted or moved |
+| A static placeable, placed or a blueprint, with a tint's variable (`tdod_tint`, `tdod_tint_<mtr>`: a warning, `static-tint`) | the game client draws it as made, without the tint: uncheck Static to have it tinted |
+| A placeable, placed or a blueprint, whose shader parameters store a `tdodTint` for a material its tint's variables also tint (a warning, `tint-stored`) | The Domains of Dread's script sets the variables' tint over the stored one as the module loads, so the stored one is never seen: take one of the two out |
+| A placeable, placed or a blueprint, whose Appearance is past row 65535 (an error, `appearance-range`) | the game carries an object's placeables.2da row as a 16-bit number: it draws row 65536 as row 0, 65537 as row 1, another model, without a word |
 | An area with variables in its ARE (as Moonglow wrote them before 1.34.3) | the game reads an area's variables from its GIT, so a script reads 0 for them; opening the area's Variables moves them, as does its fix |
-| A tile whose model draws a `replace_tex` texture and whose `Tile_ReplaceTex` is 0 or past `replacetexture.2da` (an error, `tile-replace`) | the game crashes as it loads the area: choose a row in Tile Properties' Replacement Texture |
+| A tile whose model draws a `replace_tex` texture and whose `Tile_ReplaceTex` is 0 or past `replacetexture.2da` (an error, `tile-replace`) | the game crashes as it loads the area: choose a row in Tile Properties' Replacement texture |
+| Neighboring tiles of an area that don't fit together: a corner whose terrain or height, or an edge whose crosser (a road, a stream), one tile has and its neighbor hasn't, as an area written by hand, by a script, by a plugin's `area:set_tile`, by the tiles palette's Exact Tile or by another tool can have (a warning, `tile-seam`, naming the tile, its neighbor and what each has). What a tileset's own group makes is the tileset's and not said: its tiles that disagree with each other (ttu01's two-tile group), and on its outside a corner they disagree about or a crosser no tile outside groups has. A tile the tileset lacks, or a hole in it, is the area's problems' to name | the ground of the two tiles doesn't meet (a step, a gap, a terrain cut off), or a road or a stream stops at the edge. Painting, Aurora's and Moonglow's, chooses tiles that fit, so it doesn't make one where the tileset has them. Paint the corner or the crosser again (painting chooses tiles that fit), or choose such tiles. The game loads the area as it is: of its own 1,462 areas, two ship areas of Tyrants of the Moonsea have eight (the plain deck beside a gangplank, where the tileset has the same deck with one) and Darkness over Daggerford one (a sandbank that ends at a cliff) |
+| An area's music or ambient sound, or a placed sound's or sound blueprint's sound, that the game plays nothing of (a warning, `sound-silent`, in the Objects group). Of an area: a `MusicDay`, `MusicNight` or `MusicBattle` row of `ambientmusic.2da`, or an `AmbientSndDay` or `AmbientSndNight` row of `ambientsound.2da` (the table the module's haks give, over the game's), whose `Resource` is found nowhere, is a file of a type the game doesn't look for there (music only as `.wav`), holds what the game doesn't play there (a WAVE as music, MP3 under `.wav` as an ambient sound, a WAVE under `.bmu` as one), or is no sound at all (neither WAVE nor MP3); and a row past the table's end. Of a placed sound object or a sound blueprint, each sound of its list: MP3 under `.wav` without the `BMU V1.0` header (bare, tagged, or inside a WAVE), no sound at all, and, where the sound is positional, a stereo WAVE (a sound found nowhere or only as `.bmu` is a missing reference, above). Each names the area or blueprint, the field and the row, or the sound: `Music mg_track.bmu is a WAVE, which the game does not play as music (it must hold MP3)`, `Sound mg_wind.wav is stereo, which the game does not play from a positional sound (make it mono, or the sound area-wide)`. A `Resource` longer than 16 characters is said too (`Music mus_wc_ruralguitar is a name longer than 16 characters, which the game does not find`: read for music, an ambient row's by the same limit on names). Row 0 and a blank `Resource` are no music, and nothing is said of them; nor of the stingers (`Stinger1` to `Stinger3`), or of stereo MP3, which the game was not seen to play or not. Of the game's own content it says three things, each silent in the game by its reading: `ambientsound.2da` row 200 (`al_mus_throne2.wav`, MP3 under `.wav`), Wyvern Crown of Cormyr's music row 83 (`mus_wc_ruralguitar`; the same track as `mus_wc_ruralg` plays), and the positional blueprints `lavalakeloop` and `sludgelake`, whose sounds are stereo IMA ADPCM WAVEs, silent as shipped and heard made area-wide (and Hordes of the Underdark's `q3_area_sanctum`, which places one). A positional sound is silent on a stereo WAVE of any kind (PCM and IMA ADPCM were read) at any distance. All of it as read in the game: battle music as music (started by script; in real combat not tried), placed sounds as `PlaySound`'s. Each file is read once a run, and only its first bytes (a mebibyte at most for a bare MP3), however large the track. `--skip sound-silent` leaves it out | the area loads and plays on silent where Moonglow plays the file: music must be a `.bmu` holding MP3 (with the `BMU V1.0` header or without, or inside a WAVE whose format is MP3); an ambient sound a `.wav` holding a PCM or ADPCM WAVE, or a `.bmu` holding MP3; a placed sound a `.wav` holding a WAVE, mono where it is positional, or MP3 behind the header ([Area sounds](04-areas.md#area-sounds)) |
+| An area transition trigger (`Type` 1) whose corners run clockwise seen from above, which the game neither shows under the pointer nor lets a player click (a warning, `transition-hidden`, in the Objects group): `its points run clockwise`. Also, as a possibility, one left at another level: none of its corners within 1 m of the walkable ground under it (each one's `ZPosition` + `PointZ`), as a trigger is left when the ground is raised or lowered under it, when it is lifted by the blue arrow or Adjust Location's Z, or when Aurora pasted it: `an area transition left at another level, which the game may neither show under the pointer nor take a click on: none of its points is within 1 m of the ground (the nearest, point 1, is 1.98 m below it by its ZPosition + PointZ)`. Why 1 m: nearer than that, whether the game shows it depends on the place, and what decides it isn't known (in the game: on flat ground 0.1 m off hides one; on a slope of Darkness over Daggerford's `c1ar1900_lizard` it still shows 0.6 m above and not 1 m above; the game's own transitions 0.23 to 0.31 m off are shown). A corner alone off the ground is not said (the game shows such an outline in part and takes a click on it), nor a corner over no walkable ground, nor a generic or trap trigger. Its fix, **Put the outline in order on the ground**, does in one step to undo what **Redraw Polygon** on the same corners does: the corners counterclockwise in Aurora's order, the trigger at height 0 and each corner 0.025 m above the ground under it, where the game shows a transition on every ground it was read on (`mg verify --fix transition-hidden` makes it too). Of the game's own modules it says nothing. `--skip transition-hidden` leaves it out | the game draws an area transition only with its corners counterclockwise, near enough to the ground under it; one it doesn't draw can't be clicked either, so the player never goes through ([Areas](04-areas.md#placing-objects)) |
 | A tag the [project file](03-modules.md#the-project-file-moonglowtoml) says must be unique (`[tags] unique`) on more than one area or placed object, or one it says must be unique in each area (`unique_in_area`) on more than one of an area (a warning, `tag-unique`) | `GetObjectByTag` finds only one of them: a start waypoint copied and left behind keeps new characters there. Its fix gives the others tags of their own (`TAG_2`, `TAG_3`…; an area keeps its tag); what the scripts look for is yours to check |
 | An area the project's [claims table](03-modules.md#protected-areas) says is merged that the module no longer has (`claims-merged`), or whose Tag is not the one the table records (`claims-tag`); errors | the game keeps players' first visits by an area's ResRef and their positions by its Tag: those who were there lose them |
+| The project's [lines for typed text](03-modules.md#text-typed-into-the-talk-table) (`[talk]`) with a tenth or less left (a warning; none left, an error), lines of `mg tlk-alloc`'s map inside them, two builders' parts that share lines, or you without a part where other builders have one (`talk-range`) | text typed stays in the file once they are used; a key and a typed text, or two builders' texts, given one line |
+| The project's [palette groupings](03-modules.md#palette-groupings) (`[palette.*]`): a key, a `from` file or an entry not understood (`palette-rules`), a group no blueprint of the standard or custom palettes it is offered in falls in (`palette-group-empty`), blueprints a `from` file lists that are nowhere (`palette-list-missing`); warnings | the grouping works without what isn't understood; an empty group isn't shown in the palette, and a blueprint listed under another ResRef isn't in its group |
+| The project's [walkmesh bake](03-modules.md#baked-walkmeshes) (`[bake]`): its rules or rows file not right, or rows of its range the game's table holds already (`bake-rules`); a row of the rows file the module's haks' `placeables.2da` lacks, or has with another model (`bake-row-pending`); a row or a baked model no placeable of the module uses any longer (`bake-unused`); warnings, and an error for a rows file that can't be read | until the project's build adds a row, the game has no such row and draws nothing for a placeable of it (Moonglow draws it as the build will); rows no one uses are offered to be tidied when you save |
 | A tile model with over 10,000 faces | can crash Aurora when painting |
 | A hak over 2 GiB with files starting past that mark | the game can't read those files and doesn't look for them in lower haks (a 2DA reads as empty, a script doesn't run); nor do Aurora and nwsync |
 
 Moonglow reads a hak over 2 GiB as the game does: files that start past
-the mark are listed but can't be opened. Move them to another hak.
+the mark are listed but can't be opened. Move them to another hak: the
+[hak editor](03-modules.md#the-hak-editor) reads them where they lie, to extract them
+or to save the hak without the others.
 
 A blueprint's problems are warnings, since they matter once it's placed;
 a placed object's are errors. A hak that hides the game's own longer
@@ -342,8 +448,10 @@ something out (several separated by commas): a group (`references`,
 `tilesets`, `models`, `2das`, `objects`, `module`, `plugins`), one
 check (`set-hole`, or a plugin's, `example.tag-conventions/tag-case`),
 the missing references of one category (`references:creatures`), those
-only your own content has (`references:override`, `references:local`
-for your override folder, userpatch.ini's haks and Workshop items), a hak
+only your own content has (`references:override`,
+`references:userpatch`, `references:workshop`, or all three as
+`references:local`: your override folder, userpatch.ini's haks and
+Workshop items), a hak
 (`tdod_tiles01.hak` or `hak:tdod_tiles01`), the `override` or
 `development` folder, or one resource (a tileset, `ttr01.set`, with its
 tiles' models; a 2DA; a model). What is left out isn't checked, which
@@ -352,7 +460,9 @@ makes a Verify of a module with many haks much quicker, and the JSON's
 took.
 A finding's `fix` in the JSON is the fix it offers, as an edit file `mg
 apply` takes; `mg verify --fix CHECK` makes the fixes of a check's
-findings and saves (`--dry-run`: only says which it would make).
+findings and saves (`--dry-run`: only says which it would make). A check
+there is none of (mistyped, or a plugin's not given) fails it, so that a
+pipeline doesn't read it as nothing to fix.
 
 **Models kept as text.** A model in a hak, the override or the module
 that is text (ASCII, not compiled) is read as the game would read it
@@ -397,10 +507,12 @@ to.
 
 ## Test Module
 
-**Build › Test Module** (F9) saves the module and starts the game on it:
+**Build › Test Module** (F9, or **Test Module** at the Top Bar's right
+end, whose arrow has Choose Character) saves the module and starts the
+game on it:
 your first local character appears at the module's start location. The
 game looks for the module by name in your user folder's `modules`
-folder, so the module must be saved there (File › Save As…). The game is
+folder, so the module must be saved there (File › Save As). The game is
 started on that same user folder (`-userdirectory`): its characters,
 override and settings. To test with another, choose it in Options ›
 Folders, or start Moonglow with `--user-dir FOLDER` for one run (see
@@ -408,16 +520,21 @@ Folders, or start Moonglow with `--user-dir FOLDER` for one run (see
 **Minimize Toolset on test module** (Options › General), Moonglow's window
 is minimized.
 
-A Steam copy of the game is started so that it reaches Steam when Steam
-is running, and loads your Steam Workshop content as when you start it
-from Steam. With **Start a Steam copy of the game through Steam for a
-test** off (Options › General), the game's program is started on its
-own instead: no Steam overlay and no Workshop content, which some find
-steadier.
+A Steam copy of the game follows **Read Steam Workshop content**
+(Options › Folders), so that the test and Moonglow's views show the
+same content. Off (the default), Moonglow starts the game's program
+without Steam's app ID, as Aurora does, and the game is expected to run
+without your Workshop items (this was tried here only with Steam not
+running). On, it is started through Steam: with Steam running it loads
+the Workshop items you subscribe to (their textures and materials over
+the game's, say), as when you start it from Steam. The log says which way
+each test started. (Before 5.1.0 a separate option on General started
+every test through Steam, so a test could show Workshop content that
+Moonglow's views left out.)
 
 - **Test Module, Choose Character** (Shift+F9) opens the game's
   character selection for the module instead, so you can test with any
-  of your characters. You no longer need to rename one to sort it first.
+  of your characters.
 - **Test › Test From Here** (an area's right-click menu) starts the game at the
   point you clicked, facing the way the camera looks, using the module as
   it is now, without saving it. It writes the module to `modules` as
@@ -457,15 +574,22 @@ these changes without a restart:
 - the module's custom talk table.
 
 It looks a moment after the system says one changed (every few seconds
-where the system can't say; Options › General, on by default), or when
+where the system can't say; **Reload haks, override and development
+when they change** in Options › Folders, on by default), or when
 you choose **Tools › Reload Resources**. Palettes, previews and open areas are
 redrawn from the new files, keeping the camera, and the log says what
 was reloaded. An open area's models and textures are read again as it
 was first opened, apart from the window (which stays at hand, the area
-saying "Reading area…" meanwhile), and its textures fill in as they are
+saying "Reading area" and its name meanwhile), and its textures fill in as they are
 read.
 
 ## Area Statistics
 
 **Build › Area Statistics** shows, for the area shown last, its tiles,
-its objects and the memory its models take.
+its objects and the memory its models take. The report is a tab of the
+Bottom Dock, **Resources Used**, which comes to the front: a table of
+what is used (Tiles, Objects, Tile models, Object models, Meshes,
+Triangles, Model memory, Textures), under the area's label. Click a row
+and the arrow keys move; Ctrl+C copies the row. **Close Report**, at the
+end of the dock's tab bar (also in the command palette), closes it; it
+goes too when the module is closed.

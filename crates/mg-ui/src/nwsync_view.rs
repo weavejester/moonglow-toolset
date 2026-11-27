@@ -9,6 +9,7 @@
 //! how far it is (an upload: its output, as a project's command's) and has
 //! Cancel, and a panic in the work is said in the log, not a crash.
 
+use mg_uikit::Controls as _;
 use std::path::{Path, PathBuf};
 
 use mg_module::nwsync::{AFTER_PRUNING, AFTER_PUBLISHING, Part};
@@ -301,15 +302,22 @@ fn start_pruning(app: &mut Moonglow) {
     let Some(folder) = folder(p) else { return };
     app.settings.nwsync_repository = Some(folder.clone());
     let at = folder.clone();
-    app.start_job_anywhere(
+    // (To its end: Cancel stops it before the next data file, and what
+    // it had removed by then is said. It never looked at Cancel, so a
+    // canceled one removed everything and the log said "canceled".)
+    app.start_job_to_its_end(
         PRUNING,
-        move |_| mg_module::nwsync::prune(&folder, mg_module::nwsync::PRUNE_MIN_AGE, false),
+        move |cx| {
+            let age = mg_module::nwsync::PRUNE_MIN_AGE;
+            mg_module::nwsync::prune_until(&folder, age, false, &|| cx.progress.cancelled())
+        },
         move |app, r| {
             let Some(p) = &mut app.publish else { return };
             match r {
                 Ok(pruned) => {
                     app.log.info(format!(
-                        "NWSync repository: removed {} ({:.1} MB)",
+                        "NWSync repository: {}removed {} ({:.1} MB)",
+                        if pruned.stopped { "canceled; " } else { "" },
                         count(pruned.removed.len(), "unused data file"),
                         pruned.removed_bytes as f64 / 1048576.0
                     ));
@@ -322,8 +330,9 @@ fn start_pruning(app: &mut Moonglow) {
                     for problem in &pruned.problems {
                         app.log.warn(format!("NWSync repository: {problem}"));
                     }
+                    let stopped = pruned.stopped;
                     p.pruned = Some(pruned);
-                    if app.settings.nwsync_upload_after {
+                    if app.settings.nwsync_upload_after && !stopped {
                         upload(app, &at, &AFTER_PRUNING);
                     }
                 }
@@ -345,10 +354,10 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     let mut send = false;
     let mut show_output = false;
     let mut browse = false;
-    crate::widgets::dialog(ctx, "Publish to NWSync", &mut open)
+    let footed = crate::widgets::dialog(ctx, "Publish to NWSync", &mut open)
         .collapsible(false)
         .resizable(false)
-        .show(ctx, |ui| {
+        .show_foot(ctx, |ui| {
             ui.label(
                 "Players' games download the module's haks and talk table from a web server \
                  before they join (nwserver's -nwsyncurl). This writes what the web server serves.",
@@ -356,16 +365,20 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.horizontal(|ui| {
                     crate::widgets::field_label(ui, "Repository folder");
-                    ui.add(egui::TextEdit::singleline(&mut p.folder).desired_width(320.0));
+                    // (Browse… kept in the room: the least window.)
+                    let browse_w = ui.spacing().interact_size.x + 4.0 * ui.spacing().item_spacing.x;
+                    let room = ui.available_width() - browse_w - 24.0;
+                    let width = 320.0_f32.min(room).max(80.0);
+                    ui.add(mg_uikit::text_field(&mut p.folder).desired_width(width));
                     browse = ui.button("Browse…").clicked();
                 });
-                ui.checkbox(&mut p.with_module, "With the module itself").on_hover_text(
-                    "For a single-player module players download whole; not for a persistent world",
+                ui.check_box(&mut p.with_module, "With the module itself").on_hover_text(
+                    "For a single-player module players download whole, not a persistent world",
                 );
                 if p.with_module {
                     ui.horizontal(|ui| {
                         crate::widgets::field_label(ui, "Name");
-                        ui.text_edit_singleline(&mut p.name);
+                        ui.add(mg_uikit::text_field(&mut p.name));
                     });
                     crate::widgets::field_label(ui, "Description");
                     let field = egui::TextEdit::multiline(&mut p.description)
@@ -378,7 +391,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     ui.add(egui::DragValue::new(&mut p.group_id));
                     ui.weak("for servers sharing a repository");
                 });
-                ui.checkbox(
+                ui.check_box(
                     &mut p.latest,
                     "Make it the latest (what nwserver serves unless told a hash)",
                 );
@@ -409,8 +422,9 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             if let Some(r) = &p.pruned {
                 ui.separator();
                 ui.label(format!(
-                    "{}. Removed {} ({:.1} MB); {} kept as written in the last two weeks.",
+                    "{}. {} {} ({:.1} MB); {} kept as written in the last two weeks.",
                     count(r.manifests, "manifest"),
+                    if r.stopped { "Canceled: by then it had removed" } else { "Removed" },
                     count(r.removed.len(), "unused data file"),
                     r.removed_bytes as f64 / 1048576.0,
                     r.kept_young
@@ -429,29 +443,6 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     ui.colored_label(ui.visuals().warn_fg_color, problem);
                 }
             }
-            ui.horizontal(|ui| {
-                go = ui.add_enabled(!busy, egui::Button::new("Publish")).clicked();
-                prune = ui
-                    .add_enabled(!busy, egui::Button::new("Remove Unused Data"))
-                    .on_hover_text(
-                        "Take away the data files no manifest in the folder names, written more \
-                         than two weeks ago, as nwn_nwsync_prune does. Delete the manifests you \
-                         no longer serve (manifests/HASH and HASH.json) first.",
-                    )
-                    .clicked();
-                let tip = "Run the upload command once for each part of the folder, in turn: the \
-                           data, then the manifests, then latest (after Remove Unused Data: the \
-                           manifests, then the data), so that the web server never serves a \
-                           manifest whose data isn't there yet";
-                send = ui
-                    .add_enabled(!busy && command.is_some(), egui::Button::new("Upload"))
-                    .on_hover_text(tip)
-                    .on_disabled_hover_text(
-                        "Set an upload command in Options › Folders (or the project's \
-                         [nwsync] upload)",
-                    )
-                    .clicked();
-            });
             ui.separator();
             match &command {
                 Some(c) => {
@@ -461,7 +452,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     });
                     ui.weak(format!("Set in {}.", c.from()));
                     ui.add_enabled_ui(!busy, |ui| {
-                        ui.checkbox(
+                        ui.check_box(
                             &mut settings.nwsync_upload_after,
                             "Upload after publishing and after removing unused data",
                         );
@@ -485,7 +476,30 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     show_output = ui.small_button("Show Output").clicked();
                 });
             }
+            let upload_tip = if command.is_some() {
+                "Run the upload command for the data, then the manifests, then latest"
+            } else {
+                "Set an upload command in Options › Folders (or the project's [nwsync] upload)"
+            };
+            let foot = crate::widgets::Foot::new()
+                .main("Publish", !busy)
+                .button("Remove Unused Data", !busy)
+                .tip(
+                    "Delete data files no manifest names, older than two weeks. Remove old \
+                     manifests first.",
+                )
+                .button("Upload", !busy && command.is_some())
+                .tip(upload_tip);
+            ((), foot)
         });
+    if let Some(f) = footed {
+        go = f.pressed.main();
+        prune = f.pressed.clicked("Remove Unused Data");
+        send = f.pressed.clicked("Upload");
+        if f.pressed.cancelled() {
+            open = false;
+        }
+    }
     if show_output {
         app.project_commands.show = true;
     }

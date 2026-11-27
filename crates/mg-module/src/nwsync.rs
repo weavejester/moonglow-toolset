@@ -199,13 +199,7 @@ pub fn manifest(entries: &[(ResKey, [u8; 20], u32)]) -> Vec<u8> {
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    let part = path.with_extension("part");
-    std::fs::write(&part, data)
-        .and_then(|()| std::fs::rename(&part, path))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    crate::write_replacing_one_of_many(path, data).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Writes a manifest of `contents` (the first of a name winning) into the
@@ -250,11 +244,20 @@ pub fn write_until(
     let mut entries = Vec::with_capacity(wanted.len());
     let (mut bytes, mut on_disk, mut new_files) = (0u64, 0u64, 0usize);
     let mut done: HashSet<[u8; 20]> = HashSet::new();
+    let mut ifo_uuid: Option<String> = None;
     for (i, (key, source)) in wanted.iter().enumerate() {
         if stop() {
             return Err(CANCELED.into());
         }
         let data = source.read(key)?;
+        if o.with_module && o.uuid.is_none() && ifo_uuid.is_none() && *key == Module::info_key() {
+            ifo_uuid = mg_gff::Gff::read(&data)
+                .ok()
+                .and_then(|g| {
+                    g.root.string("Mod_UUID").map(|b| String::from_utf8_lossy(b).into_owned())
+                })
+                .filter(|s| !s.is_empty());
+        }
         if let Some(limit) = o.limit
             && data.len() as u64 > limit
         {
@@ -309,7 +312,8 @@ pub fn write_until(
         json["group_id"] = o.group_id.into();
     }
     if o.with_module {
-        json["uuid"] = o.uuid.clone().into();
+        let uuid = o.uuid.clone().or(ifo_uuid).unwrap_or_else(new_uuid);
+        json["uuid"] = uuid.into();
     }
     if !o.dry_run {
         let manifests = root.join("manifests");
@@ -379,6 +383,10 @@ pub struct Pruned {
     /// What is wrong and left as it is: `latest` naming a manifest that
     /// isn't there, a manifest without its metadata.
     pub problems: Vec<String>,
+    /// It was called off ([`prune_until`]) before every data file was
+    /// looked at: what is said removed is removed, the rest is as it was,
+    /// and `missing` is not known (empty).
+    pub stopped: bool,
 }
 
 fn is_sha1(name: &str) -> bool {
@@ -397,6 +405,18 @@ fn is_sha1(name: &str) -> bool {
 /// needs that is missing. A manifest that can't be read stops it before
 /// anything is removed (the data it names would be taken for unused).
 pub fn prune(root: &Path, min_age: u64, dry_run: bool) -> Result<Pruned, String> {
+    prune_until(root, min_age, dry_run, &|| false)
+}
+
+/// [`prune`], called off when `stop` says so (asked before each data
+/// file): what was removed by then is said ([`Pruned::stopped`]), and
+/// nothing more is.
+pub fn prune_until(
+    root: &Path,
+    min_age: u64,
+    dry_run: bool,
+    stop: &dyn Fn() -> bool,
+) -> Result<Pruned, String> {
     let manifests_dir = root.join("manifests");
     let read_dir = |d: &Path| -> Result<Vec<PathBuf>, String> {
         let mut v: Vec<PathBuf> = std::fs::read_dir(d)
@@ -463,14 +483,22 @@ pub fn prune(root: &Path, min_age: u64, dry_run: bool) -> Result<Pruned, String>
         visit: &mut dyn FnMut(&Path) -> Result<bool, String>,
         folders: &mut usize,
         dry_run: bool,
+        stopped: &std::cell::Cell<bool>,
     ) -> Result<bool, String> {
         let Ok(rd) = std::fs::read_dir(dir) else { return Ok(false) };
         let mut paths: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
         paths.sort();
         let mut empty = true;
         for p in paths {
-            let gone =
-                if p.is_dir() { walk(&p, false, visit, folders, dry_run)? } else { visit(&p)? };
+            // (Called off: what is left stays, and so does its folder.)
+            if stopped.get() {
+                return Ok(false);
+            }
+            let gone = if p.is_dir() {
+                walk(&p, false, visit, folders, dry_run, stopped)?
+            } else {
+                visit(&p)?
+            };
             empty &= gone;
         }
         if empty && !top {
@@ -483,10 +511,15 @@ pub fn prune(root: &Path, min_age: u64, dry_run: bool) -> Result<Pruned, String>
     }
     let mut folders = 0;
     let (mut removed, mut removed_bytes, mut kept_young) = (Vec::new(), 0u64, 0usize);
+    let stopped = std::cell::Cell::new(false);
     walk(
         &root.join("data").join("sha1"),
         true,
         &mut |p| {
+            if stop() {
+                stopped.set(true);
+                return Ok(false);
+            }
             let name = file_name(p).unwrap_or_default().to_ascii_lowercase();
             if named.contains_key(&name) {
                 present.insert(name);
@@ -511,12 +544,18 @@ pub fn prune(root: &Path, min_age: u64, dry_run: bool) -> Result<Pruned, String>
         },
         &mut folders,
         dry_run,
+        &stopped,
     )?;
+    out.stopped = stopped.get();
     out.removed = removed;
     out.removed_bytes = removed_bytes;
     out.kept_young = kept_young;
     out.folders = folders;
-    out.missing = named.into_iter().filter(|(sha, _)| !present.contains(sha)).collect();
+    // (Called off, not every data file was seen: which are missing is
+    // not known.)
+    if !out.stopped {
+        out.missing = named.into_iter().filter(|(sha, _)| !present.contains(sha)).collect();
+    }
     Ok(out)
 }
 
@@ -591,13 +630,26 @@ pub fn upload_parts(root: &Path, parts: &[Part]) -> Result<Vec<Part>, String> {
 /// on Windows) where it needs to be: one with a space in it, say.
 pub fn shell_quoted(path: &Path) -> String {
     let text = path.display().to_string();
-    let plain = |c: char| c.is_ascii_alphanumeric() || "/\\._-:+,@=".contains(c);
+    shell_quoted_for(&text, cfg!(windows))
+}
+
+fn shell_quoted_for(text: &str, windows: bool) -> String {
+    let plain =
+        |c: char| c.is_ascii_alphanumeric() || "/._-:+,@=".contains(c) || (windows && c == '\\');
     if !text.is_empty() && text.chars().all(plain) {
-        return text;
+        return text.to_string();
     }
-    if cfg!(windows) {
-        // (Windows' paths have no `"`.)
-        format!("\"{text}\"")
+    if windows {
+        // (Windows' paths have no `"`. A caret is no escape inside cmd's
+        // quotes, so a `%` is put between quoted parts as `^%`, where cmd
+        // takes the caret away and `%"…"^%` names no variable; and the
+        // backslashes ending a part are doubled before its `"`, as the
+        // program reading its arguments wants.)
+        let quoted = |part: &str| {
+            let tail = part.len() - part.trim_end_matches('\\').len();
+            format!("\"{part}{}\"", "\\".repeat(tail))
+        };
+        text.split('%').map(quoted).collect::<Vec<_>>().join("^%")
     } else {
         format!("'{}'", text.replace('\'', "'\\''"))
     }
@@ -608,7 +660,12 @@ pub fn shell_quoted(path: &Path) -> String {
 /// to be), `{part}` the part's name (`data`, `manifests`, `latest`). It
 /// runs in the repository's folder, so `{part}` alone names it.
 pub fn upload_command(template: &str, root: &Path, part: Part) -> String {
-    template.replace("{folder}", &shell_quoted(root)).replace("{part}", part.name())
+    upload_command_for(template, &root.display().to_string(), part, cfg!(windows))
+}
+
+/// [`upload_command`] for the shell of Windows (`cmd`) or the others.
+fn upload_command_for(template: &str, root: &str, part: Part, windows: bool) -> String {
+    template.replace("{folder}", &shell_quoted_for(root, windows)).replace("{part}", part.name())
 }
 
 #[cfg(test)]
@@ -638,7 +695,7 @@ mod tests {
 
     #[test]
     fn a_repository_written_and_read() {
-        let dir = std::env::temp_dir().join(format!("mg-nwsync-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-nwsync");
         let _ = std::fs::remove_dir_all(&dir);
         let contents = vec![
             (key("one", ResType::TWODA), Source::Bytes(Arc::from(&b"first"[..]))),
@@ -681,7 +738,7 @@ mod tests {
     /// what it can't mend.
     #[test]
     fn canceled_and_pruned() {
-        let dir = std::env::temp_dir().join(format!("mg-nwsync-prune-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-nwsync-prune");
         let _ = std::fs::remove_dir_all(&dir);
         let bytes = |b: &'static [u8]| Source::Bytes(Arc::from(b));
         let o = Options { latest: true, ..Default::default() };
@@ -718,7 +775,32 @@ mod tests {
         let p = prune(&dir, PRUNE_MIN_AGE, true).unwrap();
         assert_eq!((p.removed.clone(), p.folders), (vec![two.clone()], 2), "a dry run says");
         assert!(two.is_file(), "and leaves it");
+        // Called off before the first data file: nothing goes, and it
+        // says so; after the first that goes, the next stays.
+        let other = dir.join("data/sha1/ff/ff").join("ff".repeat(20));
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"no manifest's").unwrap();
+        age_file(&other, 15);
+        let p = prune_until(&dir, PRUNE_MIN_AGE, false, &|| true).unwrap();
+        assert!(p.stopped && p.removed.is_empty() && p.folders == 0 && p.missing.is_empty());
+        assert!(two.is_file() && other.is_file(), "called off: {p:?}");
+        let gone = std::cell::Cell::new(false);
+        let p = prune_until(&dir, PRUNE_MIN_AGE, false, &|| {
+            gone.get() || {
+                gone.set(!two.exists() || !other.exists());
+                gone.get()
+            }
+        })
+        .unwrap();
+        assert!(p.stopped, "{p:?}");
+        assert_eq!(p.removed.len(), 1, "{p:?}");
+        assert!(two.exists() != other.exists(), "one of the two went: {p:?}");
+        std::fs::create_dir_all(two.parent().unwrap()).unwrap();
+        std::fs::write(&two, b"two").unwrap();
+        age_file(&two, 15);
+        std::fs::remove_file(&other).ok();
         let p = prune(&dir, PRUNE_MIN_AGE, false).unwrap();
+        assert!(!p.stopped);
         assert_eq!(p.removed, vec![two.clone()]);
         assert!(!two.exists() && !two.parent().unwrap().exists());
         assert!(data_path(&dir, b"one").is_file() && data_path(&dir, b"three").is_file());
@@ -742,7 +824,7 @@ mod tests {
     /// command for each, the folder quoted where it needs to be.
     #[test]
     fn an_upload_s_parts_and_commands() {
-        let dir = std::env::temp_dir().join(format!("mg-nwsync-up {}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-nwsync-up dir");
         let _ = std::fs::remove_dir_all(&dir);
         assert!(upload_parts(&dir, &AFTER_PUBLISHING).unwrap_err().contains("no manifests"));
         let contents = vec![(key("a", ResType::TXT), Source::Bytes(Arc::from(&b"one"[..])))];
@@ -770,5 +852,63 @@ mod tests {
             format!("rsync -a {quoted}/latest h:/x/ # latest")
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_until_fills_module_uuid_and_shell_quoting_handles_escapes() {
+        let dir = mg_testkit::scratch_dir("mg-nwsync-uuid-quote");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut m = Module::new();
+        let mut ifo = mg_gff::Gff::new(*b"IFO ");
+        ifo.root.set(
+            "Mod_UUID",
+            mg_gff::Value::String(b"11111111-2222-4333-8444-555555555555".to_vec()),
+        );
+        m.set_info(&ifo).unwrap();
+        let install = GameInstall::new(dir.join("game"), None, "en");
+        let (contents, _) = module_contents(&m, &install, &ResMan::new(), true, None).unwrap();
+        // `module_contents` wrote a fresh UUID into `module.ifo`; `write_until`
+        // must reuse that exact UUID even when `o.uuid` is `None`.
+        let ifo_bytes = contents
+            .iter()
+            .find_map(|(k, s)| (*k == Module::info_key()).then(|| s.read(k).unwrap()))
+            .unwrap();
+        let expected_uuid = String::from_utf8(
+            mg_gff::Gff::read(&ifo_bytes).unwrap().root.string("Mod_UUID").unwrap().to_vec(),
+        )
+        .unwrap();
+        let o = Options { with_module: true, uuid: None, ..Default::default() };
+        let written = write(&dir, &contents, &o, &mut |_, _| {}).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("manifests").join(format!("{}.json", written.sha1))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["uuid"], expected_uuid);
+
+        // `with_module` without an IFO still produces a non-null v4 UUID.
+        let bare = vec![(key("a", ResType::TXT), Source::Bytes(Arc::from(&b"one"[..])))];
+        let dir2 = dir.join("bare");
+        let w2 = write(&dir2, &bare, &o, &mut |_, _| {}).unwrap();
+        let meta2: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir2.join("manifests").join(format!("{}.json", w2.sha1))).unwrap(),
+        )
+        .unwrap();
+        assert!(meta2["uuid"].as_str().is_some_and(|s| s.len() == 36));
+
+        // Shell quoting on Unix and Windows.
+        assert_eq!(shell_quoted_for("a\\b", false), "'a\\b'");
+        assert_eq!(shell_quoted_for("C:\\a b\\c", true), "\"C:\\a b\\c\"");
+        assert_eq!(shell_quoted_for("C:\\a b\\", true), "\"C:\\a b\\\\\"");
+        // A `%` outside the quotes, escaped, which cmd reads as the path:
+        // `"C:\100"^%" done\\"` is `C:\100% done\` (inside quotes a
+        // caret is kept, and the path was `C:\100^% done\`).
+        assert_eq!(shell_quoted_for("%TEMP%\\out", true), "\"\"^%\"TEMP\"^%\"\\out\"");
+        assert_eq!(shell_quoted_for("C:\\100% done\\", true), "\"C:\\100\"^%\" done\\\\\"");
+        assert_eq!(shell_quoted_for("C:\\a\\%b", true), "\"C:\\a\\\\\"^%\"b\"");
+        assert_eq!(
+            upload_command_for("copy {folder}\\{part} D:\\x", "C:\\100% done", Part::Data, true),
+            "copy \"C:\\100\"^%\" done\"\\data D:\\x"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -138,9 +138,19 @@ pub struct GpuMesh {
     /// Its place in its chunk, given back when the last mesh drawing from
     /// it is dropped.
     slot: Arc<crate::pool::Slot>,
-    /// Its shadow volume ([`crate::volume`]), made the first time it casts
-    /// one with the shadows' High quality.
-    pub(crate) volume: crate::volume::VolumeSlot,
+    /// The first of its model's meshes (in the model's order) naming the
+    /// same textures (case not counted), itself if none before does: in
+    /// static geometry (a tile, a static placeable) the client draws them
+    /// as one bucket, with that mesh's alpha and `NO_DISCARD`
+    /// (`docs/findings.md`, "Static geometry is drawn in buckets").
+    pub(crate) bucket: usize,
+    /// Where the renderer keeps its shadow volumes (from its faces' fronts,
+    /// and from both sides: [`crate::volume`]), found at once: a hint the
+    /// renderer checks (the volumes are the renderer's, let go of apart
+    /// from the mesh).
+    pub(crate) volume_at: [std::sync::atomic::AtomicU32; 2],
+    /// Cached rest upload + normal smoothing topology populated on first animation.
+    pub(crate) anim_cache: std::sync::OnceLock<crate::anim::AnimMeshCache>,
 }
 
 impl GpuMesh {
@@ -148,6 +158,25 @@ impl GpuMesh {
     /// row bind its buffers once.
     pub(crate) fn chunk(&self) -> u64 {
         self.slot.chunk.id
+    }
+}
+
+/// Each mesh's [`GpuMesh::bucket`]: the first mesh before it naming the
+/// same textures (a texture, and the same maps), case not counted.
+fn buckets(meshes: &mut [GpuMesh]) {
+    let names = |m: &Material| {
+        std::iter::once(&m.texture)
+            .chain(&m.maps)
+            .map(|t| t.as_deref().map(str::to_ascii_lowercase))
+            .collect::<Vec<_>>()
+    };
+    let keys: Vec<Option<Vec<Option<String>>>> =
+        meshes.iter().map(|m| m.material.texture.is_some().then(|| names(&m.material))).collect();
+    for (j, mesh) in meshes.iter_mut().enumerate() {
+        mesh.bucket = match &keys[j] {
+            Some(k) => keys.iter().position(|o| o.as_ref() == Some(k)).unwrap_or(j),
+            None => j,
+        };
     }
 }
 
@@ -164,6 +193,10 @@ pub struct GpuModel {
     pub shadow_only: Vec<GpuMesh>,
     /// The rest pose (model-space node transforms).
     pub rest: Vec<Mat4>,
+    /// Held while the model is: what the renderer keeps of its meshes
+    /// (their shadow volumes, [`crate::volume`]) is let go of when it
+    /// isn't.
+    pub(crate) life: Arc<()>,
 }
 
 /// The next model's [`GpuModel::id`].
@@ -210,17 +243,14 @@ impl GpuModel {
             {
                 continue;
             }
-            let vertices = mesh_vertices(m);
+            let Uploaded { vertices, originals, triangles } = uploaded(m);
             // (A face naming a vertex the mesh hasn't would draw another
             // mesh's, in the shared buffers: left out.)
             let n = vertices.len() as u32;
             let mut indices: Vec<u32> =
-                m.triangles().filter(|t| t.iter().all(|&i| i < n)).flatten().collect();
-            let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            for p in &m.vertices {
-                min = min.min(Vec3::from(*p));
-                max = max.max(Vec3::from(*p));
-            }
+                triangles.into_iter().filter(|t| t.iter().all(|&i| i < n)).flatten().collect();
+            let (min, max) = crate::reach::box_of(m.vertices.iter().map(|p| Vec3::from(*p)))
+                .unwrap_or(crate::reach::NO_BOX);
             let emissive = node.value("selfillumcolor").map_or(Vec3::ZERO, |v| {
                 Vec3::new(
                     v.first().copied().unwrap_or(0.0),
@@ -232,14 +262,8 @@ impl GpuModel {
                 MeshExtra::Skin(s)
                     if !s.bones.is_empty() && s.weights.len() == m.vertices.len() =>
                 {
-                    let data: Vec<SkinVertex> = s
-                        .weights
-                        .iter()
-                        .map(|w| SkinVertex {
-                            bones: w.map(|(b, _)| u32::from(b)),
-                            weights: w.map(|(_, x)| x),
-                        })
-                        .collect();
+                    // (A copy's its original's.)
+                    let data = skin_vertices(&originals, &s.weights, s.bones.len());
                     Some((s, data))
                 }
                 _ => None,
@@ -308,12 +332,15 @@ impl GpuModel {
                 casts: m.shadow,
                 skin,
                 slot: Arc::new(slot),
-                volume: Default::default(),
+                bucket: 0,
+                volume_at: Default::default(),
+                anim_cache: std::sync::OnceLock::new(),
             };
             if m.render { meshes.push(mesh) } else { shadow_only.push(mesh) }
         }
+        buckets(&mut meshes);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        GpuModel { id, model, meshes, shadow_only, rest }
+        GpuModel { id, model, meshes, shadow_only, rest, life: Arc::default() }
     }
 
     /// This model drawing only the first `count(mesh)` of each mesh's
@@ -338,13 +365,15 @@ impl GpuModel {
                 tangents_made: m.tangents_made,
                 casts: m.casts,
                 slot: m.slot.clone(),
-                volume: Default::default(),
+                bucket: m.bucket,
+                volume_at: Default::default(),
+                anim_cache: std::sync::OnceLock::new(),
             })
             .collect();
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // (Grass casts no shadow.)
         let (model, rest) = (self.model.clone(), self.rest.clone());
-        GpuModel { id, model, meshes, shadow_only: Vec::new(), rest }
+        GpuModel { id, model, meshes, shadow_only: Vec::new(), rest, life: Arc::default() }
     }
 }
 
@@ -357,41 +386,86 @@ pub fn hint_wants_tangents(hint: &str) -> bool {
     ["normalandspecmapped", "normaltangents"].iter().any(|h| hint.eq_ignore_ascii_case(h))
 }
 
+/// A mesh as it is uploaded: its vertices, the vertex of the model's each
+/// is (a copy's original, past the model's own), and its triangles.
+#[derive(Debug)]
+pub(crate) struct Uploaded {
+    pub(crate) vertices: Vec<Vertex>,
+    pub(crate) originals: Vec<u32>,
+    pub(crate) triangles: Vec<[u32; 3]>,
+}
+
+/// The split of a mesh's vertices for the tangents the renderer makes
+/// ([`made_tangents`]): a mesh with no tangents of its own whose texture
+/// is mirrored somewhere (a vertex reached by triangles of both
+/// handednesses) has that vertex copied, as the game's compiler copies it
+/// (`mg_mdl::compile::handedness_split`) and the client at load
+/// (`reading_tangents`): the tangent and its handedness sharp across a
+/// mirrored seam. `None` where nothing is copied (the mesh as it is), or
+/// for an animated mesh, whose vertices are written as it plays.
+fn made_split(m: &Mesh) -> Option<mg_mdl::compile::HandednessSplit> {
+    if !m.tangents.is_empty() || matches!(m.extra, MeshExtra::Anim(_)) {
+        return None;
+    }
+    mg_mdl::compile::handedness_split(m).filter(|s| !s.copies.is_empty())
+}
+
 /// Tangents for a mesh that has none (each vertex's, and the bitangent's
 /// sign), from its positions and first texture coordinates, as the engine
 /// makes them for a mesh whose material asks for normal maps (the wiki's
 /// MTR, "Renderhint"): the stock normal-mapped shaders take the tangent as
 /// it comes (`SetupTSB` normalizes it), and a zero one is a black mesh.
 /// Each face's tangent and bitangent are added to its corners'; each
-/// vertex's tangent is made at right angles to its normal. Where the
-/// texture coordinates give none (no coordinates, a face without area in
-/// them), one at right angles to the normal.
+/// vertex's tangent is made at right angles to its normal. A face flat in
+/// its texture coordinates (no coordinates, or a face without area in
+/// them) gives its normals' mean turned (y, z, x) and no bitangent, as
+/// the game's compiler and client make it
+/// (`mg_mdl::compile::triangle_tangent`, `reading_tangents_flat_in_uv`);
+/// where the sum is still none, one at right angles to the normal. A
+/// vertex on a mirrored seam
+/// is two ([`made_split`]): the list has the copies' after the mesh's own
+/// vertices'.
 pub fn made_tangents(m: &Mesh) -> Vec<[f32; 4]> {
+    made_tangents_split(m, made_split(m).as_ref())
+}
+
+fn made_tangents_split(
+    m: &Mesh,
+    split: Option<&mg_mdl::compile::HandednessSplit>,
+) -> Vec<[f32; 4]> {
     let n = m.vertices.len();
-    let (mut t, mut b) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
+    let all = n + split.map_or(0, |s| s.copies.len());
+    let original = |v: usize| split.map_or(v, |s| s.original(v, n));
+    let (mut t, mut b) = (vec![Vec3::ZERO; all], vec![Vec3::ZERO; all]);
     let uv = |v: usize| glam::Vec2::from(m.uvs[0].get(v).copied().unwrap_or([0.0, 0.0]));
-    for [i, j, k] in m.triangles() {
+    let corners: Box<dyn Iterator<Item = [u32; 3]>> = match split {
+        Some(s) => Box::new(s.triangles.iter().copied()),
+        None => Box::new(m.triangles()),
+    };
+    for (to, [i, j, k]) in corners.zip(m.triangles()) {
         let (i, j, k) = (i as usize, j as usize, k as usize);
         if i >= n || j >= n || k >= n {
             continue;
         }
+        // (The face's tangent the compiler's way, its normals' mean
+        // turned where it is flat in UV, as the client makes it:
+        // `reading_tangents_flat_in_uv`. Such a face was left out, and a
+        // vertex of such faces alone took any tangent square to its
+        // normal.)
+        let ft = Vec3::from(mg_mdl::compile::triangle_tangent(m, [i, j, k]).0);
         let p = |v: usize| Vec3::from(m.vertices[v]);
         let (e1, e2) = (p(j) - p(i), p(k) - p(i));
         let (d1, d2) = (uv(j) - uv(i), uv(k) - uv(i));
         let det = d1.x * d2.y - d2.x * d1.y;
-        if det.abs() < 1e-12 {
-            continue;
-        }
-        let r = 1.0 / det;
-        let (ft, fb) = ((e1 * d2.y - e2 * d1.y) * r, (e2 * d1.x - e1 * d2.x) * r);
-        for v in [i, j, k] {
+        let fb = if det != 0.0 { (e2 * d1.x - e1 * d2.x) / det } else { Vec3::ZERO };
+        for v in to.map(|v| v as usize).into_iter().filter(|&v| v < all) {
             t[v] += ft;
             b[v] += fb;
         }
     }
-    (0..n)
+    (0..all)
         .map(|v| {
-            let normal = Vec3::from(m.normals.get(v).copied().unwrap_or([0.0, 0.0, 1.0]))
+            let normal = Vec3::from(m.normals.get(original(v)).copied().unwrap_or([0.0, 0.0, 1.0]))
                 .normalize_or(Vec3::Z);
             let along = t[v] - normal * normal.dot(t[v]);
             let tangent = if along.length_squared() > 1e-12 {
@@ -405,22 +479,68 @@ pub fn made_tangents(m: &Mesh) -> Vec<[f32; 4]> {
         .collect()
 }
 
-/// A mesh's vertices as uploaded.
-pub fn mesh_vertices(m: &Mesh) -> Vec<Vertex> {
-    let made = if m.tangents.is_empty() { made_tangents(m) } else { Vec::new() };
-    let tangents = if m.tangents.is_empty() { &made } else { &m.tangents };
-    (0..m.vertices.len())
-        .map(|v| Vertex {
-            pos: m.vertices[v],
-            normal: m.normals.get(v).copied().unwrap_or([0.0, 0.0, 1.0]),
-            uv: m.uvs[0].get(v).copied().unwrap_or([0.0, 0.0]),
-            tangent: tangents.get(v).copied().unwrap_or([0.0; 4]),
-            color: m.colors.get(v).copied().unwrap_or([255; 4]),
-            uv1: m.uvs[1].get(v).copied().unwrap_or([0.0, 0.0]),
-            uv2: m.uvs[2].get(v).copied().unwrap_or([0.0, 0.0]),
-            uv3: m.uvs[3].get(v).copied().unwrap_or([0.0, 0.0]),
+/// A skinned mesh's bones and weights for each uploaded vertex (by the
+/// original vertex it is a copy of), bones past `bone_count` left out.
+fn skin_vertices(
+    originals: &[u32],
+    weights: &[[(u16, f32); 4]],
+    bone_count: usize,
+) -> Vec<SkinVertex> {
+    originals
+        .iter()
+        .map(|&v| &weights[v as usize])
+        .map(|w| {
+            let mut bones = [0u32; 4];
+            let mut ws = [0.0f32; 4];
+            for (slot, &(b, x)) in w.iter().enumerate() {
+                if usize::from(b) < bone_count {
+                    bones[slot] = u32::from(b);
+                    ws[slot] = x;
+                }
+            }
+            SkinVertex { bones, weights: ws }
         })
         .collect()
+}
+
+/// A mesh's vertices as uploaded (a vertex on a mirrored seam two, where
+/// the renderer makes its tangents: [`made_tangents`]).
+pub fn mesh_vertices(m: &Mesh) -> Vec<Vertex> {
+    uploaded(m).vertices
+}
+
+/// A mesh as it is uploaded ([`mesh_vertices`]), with its triangles and
+/// each vertex's original.
+pub(crate) fn uploaded(m: &Mesh) -> Uploaded {
+    let n = m.vertices.len();
+    let split = made_split(m);
+    let made =
+        if m.tangents.is_empty() { made_tangents_split(m, split.as_ref()) } else { Vec::new() };
+    let tangents = if m.tangents.is_empty() { &made } else { &m.tangents };
+    let originals: Vec<u32> =
+        (0..n as u32).chain(split.iter().flat_map(|s| s.copies.iter().copied())).collect();
+    let vertices = originals
+        .iter()
+        .enumerate()
+        .map(|(at, &v)| {
+            let v = v as usize;
+            Vertex {
+                pos: m.vertices[v],
+                normal: m.normals.get(v).copied().unwrap_or([0.0, 0.0, 1.0]),
+                uv: m.uvs[0].get(v).copied().unwrap_or([0.0, 0.0]),
+                tangent: tangents.get(at).copied().unwrap_or([0.0; 4]),
+                color: m.colors.get(v).copied().unwrap_or([255; 4]),
+                uv1: m.uvs[1].get(v).copied().unwrap_or([0.0, 0.0]),
+                uv2: m.uvs[2].get(v).copied().unwrap_or([0.0, 0.0]),
+                uv3: m.uvs[3].get(v).copied().unwrap_or([0.0, 0.0]),
+            }
+        })
+        .collect();
+    let triangles = match split {
+        Some(s) => s.triangles,
+        None => m.triangles().collect(),
+    };
+    Uploaded { vertices, originals, triangles }
 }
 
 impl GpuModel {
@@ -433,11 +553,6 @@ impl GpuModel {
     }
 }
 
-/// A node's transform relative to its parent.
-pub fn local(position: [f32; 3], orientation: [f32; 4], scale: f32) -> Mat4 {
-    crate::anim::Local::new(position, orientation, scale).matrix()
-}
-
 /// Each node's transform in model space, in the rest pose. (A node whose
 /// parent comes after it, which no model of the game's has, stands as if
 /// it had none.)
@@ -448,6 +563,68 @@ pub fn rest_pose(model: &Model) -> Vec<Mat4> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tangents made for a card whose texture is mirrored down its
+    /// middle (u from 0 at the west edge to 1 at the middle and back,
+    /// the middle's vertices shared), as `reading_tangents` reads the
+    /// client's: the middle's vertices copied, the west half's tangent +x
+    /// with handedness 1 and the east half's −x with −1, sharp down the
+    /// middle (summed over both halves, the middle's had been zero, any
+    /// tangent at right angles to the normal). A mesh with no mirrored
+    /// seam, or with tangents of its own, or animated, is as it was.
+    #[test]
+    fn made_tangents_split_a_mirrored_seam_as_the_client_does() {
+        let card = Mesh {
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [0.6, 0.0, 0.0],
+                [1.2, 0.0, 0.0],
+                [0.0, 0.0, 1.2],
+                [0.6, 0.0, 1.2],
+                [1.2, 0.0, 1.2],
+            ],
+            normals: vec![[0.0, -1.0, 0.0]; 6],
+            uvs: [
+                vec![[0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 1.0]],
+                vec![],
+                vec![],
+                vec![],
+            ],
+            faces: [[0, 1, 4], [0, 4, 3], [1, 2, 5], [1, 5, 4]]
+                .map(|vertices| mg_mdl::Face { vertices, material: 0 })
+                .to_vec(),
+            ..Default::default()
+        };
+        let up = uploaded(&card);
+        assert_eq!(up.vertices.len(), 8, "the middle's two copied");
+        assert_eq!(up.originals[6..], [1, 4]);
+        let tangent = |v: u32| up.vertices[v as usize].tangent;
+        for (k, tri) in up.triangles.iter().enumerate() {
+            let (x, hand) = if k < 2 { (1.0, 1.0) } else { (-1.0, -1.0) };
+            for &v in tri {
+                let t = tangent(v);
+                assert!((t[0] - x).abs() < 1e-5 && t[3] == hand, "triangle {k}, vertex {v}: {t:?}");
+            }
+        }
+        // The same vertices drawn as before, but for the copies.
+        for (v, o) in up.vertices.iter().zip(&up.originals) {
+            assert_eq!(v.pos, card.vertices[*o as usize]);
+            assert_eq!(v.uv, card.uvs[0][*o as usize]);
+        }
+        // No mirrored seam: as it was, every vertex and triangle.
+        let mut plain = card.clone();
+        plain.uvs[0] = plain.vertices.iter().map(|p| [p[0], p[2]]).collect();
+        let up = uploaded(&plain);
+        assert_eq!((up.vertices.len(), up.triangles.len()), (6, 4));
+        assert_eq!(up.triangles, plain.triangles().collect::<Vec<_>>());
+        // Its own tangents, or animated: not split.
+        let mut own = card.clone();
+        own.tangents = vec![[1.0, 0.0, 0.0, 1.0]; 6];
+        assert_eq!(uploaded(&own).vertices.len(), 6);
+        let mut animated = card;
+        animated.extra = MeshExtra::Anim(Default::default());
+        assert_eq!(uploaded(&animated).vertices.len(), 6);
+    }
 
     /// Tangents made for a mesh without: along +u, at right angles to the
     /// normal, the bitangent's sign by which way +v runs; one at right
@@ -476,17 +653,55 @@ mod tests {
         // Mirrored in v: the bitangent the other way.
         let down = quad(vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
         assert!(made_tangents(&down).iter().all(|t| t[0] > 0.99 && t[3] == -1.0));
-        // No coordinates: at right angles to the normal, not zero.
+        // No coordinates: the normal (+z) turned (y, z, x), +y.
         let none = quad(vec![]);
         for t in made_tangents(&none) {
-            let t = Vec3::from_slice(&t[..3]);
-            assert!((t.length() - 1.0).abs() < 1e-5 && t.z.abs() < 1e-5, "{t}");
+            assert!((Vec3::from_slice(&t[..3]) - Vec3::Y).length() < 1e-5 && t[3] == 1.0, "{t:?}");
         }
         // The model's own are kept.
         let mut own = quad(vec![[0.0, 0.0]; 4]);
         own.tangents = vec![[0.0, 1.0, 0.0, -1.0]; 4];
         assert!(mesh_vertices(&own).iter().all(|v| v.tangent == [0.0, 1.0, 0.0, -1.0]));
         assert!(mesh_vertices(&up).iter().all(|v| v.tangent[0] > 0.99));
+    }
+
+    /// A card whose texture coordinates are all one point takes its
+    /// normals' mean turned (y, z, x), made square to the normal, with
+    /// handedness 1, as the game's compiler and the client make it
+    /// (`reading_tangents_flat_in_uv`: the client painted a card facing
+    /// south −x and one facing south-west (−0.41, 0.41, −0.82)); it took
+    /// any tangent at right angles to the normal (+z, and (−0.5, 0.5,
+    /// 0.71)).
+    #[test]
+    fn a_face_flat_in_uv_takes_the_compiler_s_tangent() {
+        let card = |along: [f32; 2]| {
+            let [x, y] = along;
+            let normal = Vec3::new(x, y, 0.0).cross(Vec3::Z).normalize();
+            Mesh {
+                vertices: vec![[0.0, 0.0, 0.0], [x, y, 0.0], [x, y, 1.2], [0.0, 0.0, 1.2]],
+                normals: vec![normal.to_array(); 4],
+                uvs: [vec![[0.5, 0.5]; 4], vec![], vec![], vec![]],
+                faces: vec![
+                    mg_mdl::Face { vertices: [0, 1, 2], material: 0 },
+                    mg_mdl::Face { vertices: [0, 2, 3], material: 0 },
+                ],
+                ..Default::default()
+            }
+        };
+        // (Facing south, normal −y; facing south-west.)
+        let third = 1.0 / 6.0f32.sqrt();
+        for (along, want) in
+            [([1.2, 0.0], Vec3::NEG_X), ([0.85, -0.85], Vec3::new(-third, third, -2.0 * third))]
+        {
+            let mesh = card(along);
+            for t in made_tangents(&mesh) {
+                let got = Vec3::from_slice(&t[..3]);
+                assert!(
+                    (got - want).length() < 1e-4 && t[3] == 1.0,
+                    "{along:?}: {t:?}, not {want}"
+                );
+            }
+        }
     }
 
     /// Every texture coordinate set of a mesh is uploaded (a custom
@@ -562,5 +777,14 @@ mod tests {
         assert_eq!((binds[0], binds[1]), (Mat4::IDENTITY, rest[2]));
         // And a skin node that is itself out of range doesn't panic either.
         assert_eq!(inverse_binds(&skin, &rest, 9).len(), 2);
+    }
+
+    #[test]
+    fn skin_vertices_clamp_and_zero_out_of_range_bones() {
+        let weights = [[(1u16, 0.6), (5u16, 0.4), (0u16, 0.0), (9u16, 0.2)]];
+        let got = skin_vertices(&[0], &weights, 2);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].bones, [1, 0, 0, 0]);
+        assert_eq!(got[0].weights, [0.6, 0.0, 0.0, 0.0]);
     }
 }

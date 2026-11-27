@@ -1,5 +1,5 @@
-//! Options, key bindings, menus by the keyboard, the command palette,
-//! Help and the update check.
+//! Options, key bindings, menus by the keyboard, the command palette
+//! and Help (the update check and its install: `updates.rs`).
 
 use crate::common::*;
 
@@ -68,6 +68,103 @@ fn options_say_the_user_folder_of_this_run() {
     assert_eq!(user(&h), Some(run));
 }
 
+/// A user folder whose `nwn.ini` puts haks and talk tables elsewhere (a
+/// builder's report, Carcerian: kept with the original game beside EE):
+/// the window reads the haks from there, and Options › Folders says where
+/// each aliased folder is.
+#[test]
+fn options_say_the_folders_nwn_ini_puts_elsewhere() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = mg_testkit::scratch_dir("ui-options-aliases");
+    let (user, diamond) = (dir.join("user"), dir.join("Diamond"));
+    for d in [user.join("modules"), diamond.join("hak"), diamond.join("tlk")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(
+        user.join("nwn.ini"),
+        format!(
+            "[Alias]\nHAK={}\nTLK={}\n",
+            diamond.join("hak").display(),
+            diamond.join("tlk").display()
+        ),
+    )
+    .unwrap();
+    let mut w = mg_erf::ErfWriter::new(*b"HAK ");
+    w.add(ResRef::from_str("mg_alias").unwrap(), ResType::TWODA, b"2DA V2.0\n".to_vec()).unwrap();
+    std::fs::write(diamond.join("hak/mg_diamond.hak"), w.to_bytes().unwrap()).unwrap();
+    let settings = mg_ui::Settings {
+        game_root: Some(root),
+        user_dir: Some(user.clone()),
+        ..Default::default()
+    };
+    let mut h = window_harness(Moonglow::with_settings(settings, Box::new(NoDialogs::default())));
+    h.run();
+    let install = h.state().install.clone().unwrap();
+    assert!(install.hak_names().contains(&"mg_diamond".to_string()), "the aliased folder's hak");
+    assert_eq!(install.find_hak("mg_diamond"), Some(diamond.join("hak/mg_diamond.hak")));
+    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+    h.run();
+    let said = |sub: &str, f: &std::path::Path| {
+        format!("{sub}: {} (nwn.ini's alias, as the game reads it)", f.display())
+    };
+    h.get_by_label(&said("hak", &diamond.join("hak")));
+    h.get_by_label(&said("tlk", &diamond.join("tlk")));
+    assert!(h.query_by_label_contains("override: ").is_none(), "not aliased: not said");
+    // Not followed (an nwn.ini that is another install's): the user
+    // folder's own folders, said so and read so.
+    h.get_by_label("Follow nwn.ini's folder aliases").click();
+    h.run();
+    assert!(h.query_by_label_contains("nwn.ini's alias").is_none());
+    h.get_all_by_label("OK").last().unwrap().click();
+    settle(&mut h);
+    assert!(h.state().settings.no_nwn_aliases);
+    let install = h.state().install.clone().unwrap();
+    assert_eq!(install.user_hak_dir(), Some(user.join("hak")));
+    assert_eq!(install.find_hak("mg_diamond"), None);
+}
+
+/// A user folder that doesn't exist is said, in the log as the game data
+/// loads and under the field in Options (a builder's report: typed with a
+/// `~`, kept as typed, every hak was "not found" and nothing said why); a
+/// folder typed with a leading `~` is the home folder's.
+#[test]
+fn a_user_folder_that_does_not_exist_is_said() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let missing = mg_testkit::scratch_dir("ui-options-missing-user").join("nowhere");
+    let settings = mg_ui::Settings {
+        game_root: Some(root),
+        user_dir: Some(missing.clone()),
+        ..Default::default()
+    };
+    let mut h = window_harness(Moonglow::with_settings(settings, Box::new(NoDialogs::default())));
+    h.run();
+    let said = format!("The NWN user folder {} doesn't exist", missing.display());
+    let log = &h.state().log.entries;
+    assert!(log.iter().any(|(_, m)| m.starts_with(&said)), "{log:#?}");
+    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+    h.run();
+    h.get_by_label(&format!(
+        "{} doesn't exist: no hak, talk table or override is found there.",
+        missing.display()
+    ));
+    // Typed with a `~`: the home folder's.
+    if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
+        let settings = mg_ui::Settings {
+            user_dir: Some(std::path::PathBuf::from("~/mg-no-such-folder")),
+            ..Default::default()
+        };
+        let user = settings.install().and_then(|i| i.user_dir);
+        let home = std::path::PathBuf::from(home);
+        assert!(user.as_ref().is_none_or(|u| *u == home.join("mg-no-such-folder")), "{user:?}");
+    }
+}
+
 /// Options › OK leaves the module open, its unsaved work with it, and asks
 /// nothing: only another game or user folder has it read again, and then
 /// it is opened again.
@@ -101,7 +198,7 @@ fn options_leave_the_module_open() {
     h.run();
     h.get_by_label("General").click();
     h.run();
-    h.get_by_label("Light theme").click();
+    click_in_sight(&mut h, "Light theme");
     h.run();
     h.get_all_by_label("OK").last().unwrap().click();
     h.run();
@@ -114,6 +211,11 @@ fn options_leave_the_module_open() {
     // Another game folder: unsaved work is asked about first.
     h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
     h.run();
+    // (The game folder's, the first: out of the page's sight until
+    // scrolled to.)
+    h.get_all_by_label("Browse…").next().unwrap().scroll_to_me();
+    let browse = |h: &Harness<'_, Moonglow>| h.get_all_by_label("Browse…").next().unwrap().rect();
+    at_rest(&mut h, "the game folder's Browse…", &browse);
     h.get_all_by_label("Browse…").next().unwrap().click();
     h.run();
     h.get_all_by_label("OK").last().unwrap().click();
@@ -131,6 +233,8 @@ fn options_leave_the_module_open() {
     assert!(!h.state().has_unsaved_work());
 }
 
+/// The Command Palette is Quick Open among the commands: Ctrl+Shift+P
+/// opens the Top Bar's field with `>` typed.
 #[test]
 fn the_command_palette_finds_a_command_and_runs_it() {
     let dir = mg_testkit::scratch_dir("ui-command-palette");
@@ -139,65 +243,74 @@ fn the_command_palette_finds_a_command_and_runs_it() {
     app.open_module(&path);
     let mut h = harness(app, 1200.0, 900.0);
     h.run();
-    let open = |h: &mut Harness<'_, Moonglow>| {
-        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P);
-        h.run();
-        assert!(h.state().command_palette.is_some(), "Ctrl+Shift+P opens it");
-    };
-    let hint = "Type a command's name";
 
-    // Every command is there until something is typed; then those whose
-    // name or menu has every word.
-    open(&mut h);
-    h.get_by_label("Verify Module");
-    type_into_hint(&mut h, hint, "mod build");
+    // The commands in the menus' order until something is typed (the
+    // first 50, and how many more); then those whose name or menu has
+    // every word.
+    command_palette(&mut h, "");
+    let rows = quick_open_rows(&h);
+    assert_eq!(rows.first().map(String::as_str), Some("New Module…"), "{rows:?}");
+    h.get_by_label_contains("more: type more to narrow them");
+    h.get_by_label(mg_ui::quick_open::NAME).type_text(" mod build");
+    settle(&mut h);
     assert!(h.query_by_label("Open Module…").is_none());
     // (By name first; then the Build menu's other commands with "mod".)
-    h.get_by_label("Build Module…");
-    h.get_by_label("Verify Module");
-    // Enter runs the one chosen, and the palette closes.
+    let rows = quick_open_rows(&h);
+    assert_eq!(rows.first().map(String::as_str), Some("Build Module…"), "{rows:?}");
+    assert!(rows.iter().any(|r| r == "Verify Module"), "{rows:?}");
+    // Enter runs the one chosen, and Quick Open closes.
     h.key_press(egui::Key::Enter);
-    h.run();
-    assert!(h.state().build.is_some() && h.state().command_palette.is_none());
+    settle(&mut h);
+    assert!(h.state().build.is_some() && !h.state().quick_open.is_open());
     h.state_mut().build = None;
-    h.run();
+    settle(&mut h);
 
-    // The arrows choose among several: the second of the two editors.
-    open(&mut h);
-    type_into_hint(&mut h, hint, "editor");
-    h.get_by_label("Faction Editor");
+    // The arrows choose among several: the third of the editors (Split
+    // Editor first, a shorter name of the same tier).
+    command_palette(&mut h, "editor");
+    assert_eq!(quick_open_rows(&h), ["Split Editor", "Faction Editor", "Journal Editor"]);
     h.key_press(egui::Key::ArrowDown);
-    h.run();
+    settle(&mut h);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
     h.key_press(egui::Key::Enter);
-    h.run();
+    settle(&mut h);
     assert!(h.state().dock.find_tab(&Tab::Journal).is_some());
     assert!(h.state().dock.find_tab(&Tab::Factions).is_none());
 
     // A command that can't be chosen now is listed, and Enter leaves it.
-    open(&mut h);
-    type_into_hint(&mut h, hint, "redo");
+    command_palette(&mut h, "redo");
     h.key_press(egui::Key::Enter);
-    h.run();
-    assert!(h.state().command_palette.is_some(), "nothing to redo: nothing done");
-    // A click runs one; Escape clears what is typed (the palette stays),
-    // and Escape again closes without running anything.
+    settle(&mut h);
+    assert!(h.state().quick_open.is_open(), "nothing to redo: nothing done");
+    // Escape closes without running anything (it cleared what was typed
+    // first in the Command Palette's window).
     h.key_press(egui::Key::Escape);
-    h.run();
-    assert_eq!(h.state().command_palette.as_ref().map(|f| f.filter.as_str()), Some(""));
-    h.key_press(egui::Key::Escape);
-    h.run();
-    assert!(h.state().command_palette.is_none());
-    open(&mut h);
-    type_into_hint(&mut h, hint, "about");
-    h.get_by_label("About Moonscar Toolset").click();
-    h.run();
-    assert!(h.state().command_palette.is_none());
+    settle(&mut h);
+    assert!(!h.state().quick_open.is_open());
+    assert!(h.state().quick_open.text.is_empty());
+    // A click runs one.
+    command_palette(&mut h, "about");
+    quick_open_row(&h, "About Moonscar Toolset").click();
+    settle(&mut h);
+    assert!(!h.state().quick_open.is_open());
     h.get_by_label_contains("GNU General Public License");
-    // While it is open, keys are its own: Ctrl+N starts no module.
-    open(&mut h);
-    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
-    h.run();
-    assert!(h.state().command_palette.is_some() && h.state().ws.is_some());
+    h.state_mut().about = false;
+    settle(&mut h);
+    // While it is open, a key that types is its own: an A given to About
+    // types (as in any text field); with Ctrl, a key still runs its
+    // command (the Command Palette's window had held every key back), and
+    // Quick Open closes.
+    let about = vec!["A".to_string(), "Ctrl+B".to_string()];
+    h.state_mut().settings.key_bindings.insert("about".into(), about);
+    settle(&mut h);
+    command_palette(&mut h, "a");
+    assert_eq!(h.state().quick_open.text, ">a");
+    assert!(h.state().quick_open.is_open() && !h.state().about);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::B);
+    settle(&mut h);
+    assert!(h.state().about, "Ctrl+B runs About");
+    assert!(!h.state().quick_open.is_open(), "a command by its key closes it");
 }
 
 #[test]
@@ -221,7 +334,7 @@ fn keys_remapped_in_options_and_used() {
     h.run();
     assert!(h.query_by_label("Build Module").is_none());
     // User Manual: F1 taken away, Ctrl+M added by pressing it.
-    h.get_by_label("F1 ×").click();
+    h.get_by_label("Remove F1 from User Manual").click();
     h.run();
     h.state_mut().options.as_mut().unwrap().recording = Some(Cmd::Manual.id().to_string());
     h.run();
@@ -234,7 +347,7 @@ fn keys_remapped_in_options_and_used() {
     h.run();
     assert!(h.query_by_label_contains("is the key of both Save and User Manual").is_some());
     // The User Manual's Ctrl+S is taken away again (the only row shown).
-    h.get_by_label("Ctrl+S ×").click();
+    h.get_by_label("Remove Ctrl+S from User Manual").click();
     h.run();
     // A menu command that never had a key takes one.
     h.state_mut().options.as_mut().unwrap().recording = Some("build-module".to_string());
@@ -267,7 +380,7 @@ fn keys_remapped_in_options_and_used() {
     h.run();
     assert!(h.state().dock.find_tab(&Tab::Manual).is_some());
     // The menu shows the new key.
-    h.get_by_label("Help").click();
+    h.get_by_label("Top Bar").get_by_label("Help").click();
     h.run();
     assert!(h.query_by_label_contains("Ctrl+M").is_some() || cfg!(target_os = "macos"));
     h.key_press(egui::Key::Escape);
@@ -287,8 +400,8 @@ fn keys_remapped_in_options_and_used() {
         ws.doc(&key).unwrap().root.list("StartingList").map_or(0, <[_]>::len)
     };
     assert_eq!(starts(&mut h), 0);
-    // (The conversation editor's: the module tree and the palettes have one too.)
-    let at = h.get_all_by_label("Expand All").last().unwrap().rect().center();
+    // (Over the conversation's lines, its Root.)
+    let at = h.get_all_by_label("Root").last().unwrap().rect().center();
     h.hover_at(at);
     h.run();
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
@@ -363,6 +476,9 @@ fn menus_by_the_keyboard() {
     app.settings.no_last_area = true;
     app.open_module(&path);
     let mut h = harness(app, 1200.0, 800.0);
+    // (A window wide enough that no width folds a dock: the test reads the
+    // docks as the builder left them, M3 T14.)
+    wide_window(&mut h);
     h.run();
     let key = |h: &mut Harness<'_, Moonglow>, key: egui::Key| {
         h.key_press(key);
@@ -394,13 +510,15 @@ fn menus_by_the_keyboard() {
     key(&mut h, egui::Key::Enter);
     assert!(h.state().settings.hide_log && !h.state().settings.hide_tree);
     assert!(!shown(&h, "Hide All Panels"), "chosen, the menus close");
-    // Up from the first row is the last: Reset Layout brings the log back.
+    // Up from the first row is the last: Reset Layout, the shell's own
+    // layout (the Left Dock unfolded, the log closed).
+    h.state_mut().settings.hide_tree = true;
     key(&mut h, egui::Key::F10);
     key(&mut h, egui::Key::ArrowRight);
     key(&mut h, egui::Key::ArrowRight);
     key(&mut h, egui::Key::ArrowUp);
     key(&mut h, egui::Key::Space);
-    assert!(!h.state().settings.hide_log);
+    assert!(!h.state().settings.hide_tree && h.state().settings.hide_log, "Reset Layout");
 
     // A submenu: Tools, up to Options and three more to Tilesets; Right
     // opens it, Left closes it, and the menu stays.
@@ -429,13 +547,15 @@ fn menus_by_the_keyboard() {
     };
     alt(&mut h, egui::Key::V);
     assert!(shown(&h, "Hide All Panels") && !shown(&h, "Save As"));
+    let closed = h.state().settings.hide_log;
     key(&mut h, egui::Key::L);
     key(&mut h, egui::Key::Enter);
-    assert!(h.state().settings.hide_log, "the row the letter went to");
+    assert_ne!(h.state().settings.hide_log, closed, "the row the letter went to");
+    h.state_mut().settings.hide_tree = true;
     alt(&mut h, egui::Key::V);
     key(&mut h, egui::Key::R);
     key(&mut h, egui::Key::Enter);
-    assert!(!h.state().settings.hide_log, "Reset Layout");
+    assert!(!h.state().settings.hide_tree, "Reset Layout");
     // Alt and another menu's letter, with one open: that one.
     alt(&mut h, egui::Key::V);
     alt(&mut h, egui::Key::H);
@@ -495,7 +615,7 @@ fn menus_by_the_keyboard() {
     h.get_by_label("File").click();
     h.run();
     assert!(shown(&h, "Save As"));
-    h.get_by_label("Edit").hover();
+    menu(&h, "Edit").hover();
     h.run();
     h.run();
     h.run();
@@ -506,9 +626,13 @@ fn menus_by_the_keyboard() {
 fn the_user_manual_opens_from_help_and_follows_its_links() {
     let mut h = harness(app_with(Vec::new()), 1280.0, 800.0);
     h.run();
-    h.get_by_label("Help").click();
+    h.get_by_label("Top Bar").get_by_label("Help").click();
     h.run();
-    h.get_by_label_contains("User Manual").click();
+    // (The menu's, which says its key: the Welcome page's User Manual has
+    // the same role and none.)
+    let page =
+        |n: &egui_kittest::Node<'_>| n.accesskit_node().label().as_deref() == Some("User Manual");
+    h.get_all_by_label_contains("User Manual").find(|n| !page(n)).unwrap().click();
     h.run();
     // The contents, with the chapters beside them.
     h.get_by_label("Moonglow Toolset: User Manual");
@@ -516,17 +640,55 @@ fn the_user_manual_opens_from_help_and_follows_its_links() {
     let listed =
         |n: &egui_kittest::Node<'_>| n.accesskit_node().role() == egui::accesskit::Role::Button;
     assert!(h.get_all_by_label("Troubleshooting").any(|n| listed(&n)));
-    // A link in the text opens its chapter in place.
-    h.get_all_by_label("Getting started").find(|n| !listed(n)).unwrap().click();
+    // A link in the text opens its chapter in place. (The manual's, nearest
+    // its title: the Welcome page under it has a Getting started link too.)
+    let title = h.get_by_label("Moonglow Toolset: User Manual").rect().center();
+    let near = |n: &egui_kittest::Node<'_>| (n.rect().center() - title).length() as i32;
+    let link = h.get_all_by_label("Getting started").filter(|n| !listed(n)).min_by_key(near);
+    link.unwrap().click();
     h.run();
     h.get_by_label("What you need");
     // The chapter list picks another.
     h.get_all_by_label("Areas").find(|n| listed(n)).unwrap().click();
     h.run();
     h.get_by_label("Placing objects");
-    h.get_by_label("Help").click();
+    // A link to a heading of another chapter opens the chapter at the
+    // heading, and one to a heading of the chapter shown scrolls to it:
+    // neither is handed to the system's browser (which was asked to open
+    // "03-modules.md#claimed-areas" and "#minimaps").
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    // (The heading has its link's words where the link is the heading's
+    // name: the link is the first of them, the heading the one at the top.)
+    let at_top = |h: &Harness<'_, Moonglow>, heading: &str| {
+        let mut all = h.query_all_by_label(heading).map(|n| n.rect());
+        all.any(|at| window.contains_rect(at) && at.top() < 130.0)
+    };
+    let follow = |h: &mut Harness<'_, Moonglow>, link: &str, heading: &str| {
+        assert!(!at_top(h, heading), "{heading} is at the top already");
+        h.get_all_by_label(link).next().unwrap().scroll_to_me();
+        h.run();
+        h.get_all_by_label(link).next().unwrap().click();
+        // (Step by step: a frame's commands are that frame's.)
+        for _ in 0..4 {
+            h.step();
+            let opened = (h.output().platform_output.commands.iter())
+                .any(|c| matches!(c, egui::OutputCommand::OpenUrl(_)));
+            assert!(!opened, "{link} was handed to the browser");
+        }
+        h.run();
+        let found: Vec<egui::Rect> = h.query_all_by_label(heading).map(|n| n.rect()).collect();
+        assert!(at_top(h, heading), "{heading} is at the top of the page after {link}: {found:?}");
+    };
+    follow(&mut h, "Minimaps", "Minimaps");
+    h.get_all_by_label("The main window").find(|n| listed(n)).unwrap().click();
     h.run();
-    h.get_by_label("About Moonscar Toolset").click();
+    follow(&mut h, "whose each area is", "Claimed areas");
+    h.get_by_label("Top Bar").get_by_label("Help").click();
+    h.run();
+    // (The menu's: the Welcome page's is a link.)
+    let link = egui::accesskit::Role::Link;
+    let about = h.get_all_by_label("About Moonscar Toolset");
+    about.into_iter().find(|n| n.accesskit_node().role() != link).unwrap().click();
     h.run();
     h.get_by_label(&format!("Version {}", mg_core::release::version()));
 }
@@ -558,7 +720,10 @@ fn the_graphics_backend_is_chosen_in_options() {
     h.run();
     h.get_by_label("General").click();
     h.run();
-    h.get_by_label("Takes effect the next time Moonglow starts.");
+    // (Below the Editors section: brought into sight, its list below it.)
+    // (Contains: with WGPU_BACKEND set, the note says so after it.)
+    h.get_by_label_contains("Takes effect the next time Moonglow starts.").scroll_to_me();
+    h.run();
     let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
     let automatic =
         |n: &egui_kittest::Node<'_>| n.accesskit_node().value().as_deref() == Some("Automatic");
@@ -584,345 +749,134 @@ fn the_graphics_backend_is_chosen_in_options() {
     assert_eq!(back.graphics_backend, last);
 }
 
-/// Options › General › Toolbar buttons, Icons only: the toolbar's buttons
-/// show their glyphs alone at once, each named in its tip (with its key),
-/// and the toolbar takes less room; kept in the settings, and back to
-/// icons and text.
+/// The Top Bar draws its quick actions as icons alone, each with a tip
+/// that names it (with its key, disabled or not). Options › General has
+/// no "Toolbar buttons" since M4's U23 (Part 2, decision 6): the Top Bar's
+/// buttons are icons with tips, and every editor's header yields by its
+/// width alone.
 #[test]
-fn the_toolbar_shows_icons_only_when_asked() {
+fn the_top_bar_draws_icons_with_tips_and_options_has_no_toolbar_buttons() {
     let mut h = harness(app_with(Vec::new()), 1280.0, 800.0);
     h.run();
-    let width = |h: &Harness<'_, Moonglow>, first: &str, last: &str| {
-        h.get_by_label(last).rect().right() - h.get_by_label(first).rect().left()
-    };
-    let wide = width(&h, "🗋 New", "✔ Verify");
-    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
-    h.run();
-    h.get_by_label("General").click();
-    h.run();
-    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
-    let both = |n: &egui_kittest::Node<'_>| {
-        n.accesskit_node().value().as_deref() == Some("Icons and text")
-    };
-    h.query_all(combo).find(both).expect("the toolbar buttons' dropdown").click();
-    h.run();
-    h.get_by_label("Icons only").click();
-    h.run();
-    h.get_by_label("OK").click();
-    h.run();
-    assert!(h.state().settings.toolbar_icons_only);
-    let saved = serde_json::to_string(&h.state().settings).unwrap();
-    let back: mg_ui::Settings = serde_json::from_str(&saved).unwrap();
-    assert!(back.toolbar_icons_only, "kept");
-    let old: mg_ui::Settings = serde_json::from_str(r#"{"light_theme":true}"#).unwrap();
-    assert!(!old.toolbar_icons_only, "icons and text in settings from before");
-    h.run();
-    // The glyphs alone.
-    assert!(h.query_by_label("💾 Save").is_none() && h.query_by_label("📦 Palettes").is_none());
-    // (Named by their names for a screen reader, not by their glyphs.)
-    assert!(h.query_by_label("💾").is_none() && h.query_by_label("📦").is_none());
-    let narrow = width(&h, "New", "Verify");
-    assert!(narrow < wide * 0.6, "the toolbar narrower: {narrow} of {wide}");
-    // A tip named for the button: first where it doesn't begin so.
-    let palettes = h.get_by_label("Palettes").rect().center();
-    h.hover_at(palettes);
-    // (A tooltip waits a moment.)
-    h.run_steps(60);
-    h.get_by_label("Palettes\nBlueprint palettes");
+    let quick = [
+        ("New", mg_uikit::Icon::New),
+        ("Open", mg_uikit::Icon::Open),
+        ("Save", mg_uikit::Icon::Save),
+        ("Undo", mg_uikit::Icon::Undo),
+        ("Redo", mg_uikit::Icon::Redo),
+    ];
+    for (name, icon) in quick {
+        let r = tool(&h, name).rect();
+        assert!(icon_drawn(&h, icon, r), "{name}'s icon");
+        // (An icon button, 22 square: no words.)
+        assert!(r.width() <= mg_uikit::metrics::ICON_BUTTON + 0.5, "{name} {r:?}");
+    }
+    // A tip named for the button, with its key.
+    let new = tool(&h, "New").rect().center();
+    h.hover_at(new);
+    h.step();
+    advance_clock(&mut h, 1.5);
+    // (The tip, not the Status Bar's hint of the same command.)
+    let tips = h.query_all_by_label_contains("New module").map(|n| n.accesskit_node());
+    let tip = (tips.map(|n| n.label().or(n.value()).unwrap_or_default()))
+        .find(|t| !t.contains(": New module"))
+        .unwrap_or_default();
+    assert!(tip.starts_with("New module ("), "named, with its key: {tip}");
     // Save (disabled without a module): its tip too, with its key.
-    let save = h.get_by_label("Save").rect().center();
+    let save = tool(&h, "Save").rect().center();
     h.hover_at(save);
-    h.run_steps(60);
+    h.step();
+    advance_clock(&mut h, 1.5);
     let tip = h.get_by_label_contains("Save module").accesskit_node();
     let tip = tip.label().or(tip.value()).unwrap_or_default();
     assert!(tip.starts_with("Save module ("), "named, with its key: {tip}");
-    // Back to icons and text.
-    h.state_mut().settings.toolbar_icons_only = false;
-    h.run();
-    h.get_by_label("💾 Save");
-    assert!(h.query_by_label("Save").is_none());
+
+    // Options › General: every section, and no Toolbar buttons among them.
+    h.hover_at(egui::pos2(5.0, 790.0));
+    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+    settle(&mut h);
+    h.get_by_label("General").click();
+    settle(&mut h);
+    // (The section's, not the Welcome page's chapter link.)
+    let link = egui::accesskit::Role::Link;
+    assert!(h.get_all_by_label("Troubleshooting").any(|n| n.accesskit_node().role() != link));
+    for gone in ["Toolbar buttons", "Editors' toolbar buttons", "Icons and text", "Icons only"] {
+        assert!(h.query_by_label_contains(gone).is_none(), "{gone} is retired");
+    }
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox);
+    let toolbar = |n: &egui_kittest::Node<'_>| {
+        let v = n.accesskit_node().value().unwrap_or_default();
+        v.contains("Icons")
+    };
+    assert!(h.query_all(combo).find(toolbar).is_none(), "no Icons and text dropdown");
 }
 
-/// Options › General › Light theme.
+/// Options › General › Light theme: the window's theme follows the
+/// setting, both ways; in the Options window it changes on OK, and
+/// Cancel leaves it as it was.
 #[test]
 fn the_theme_is_set_in_options() {
+    use mg_uikit::{Theme, Tokens};
     let mut h = window_harness(app_with(Vec::new()));
     h.run();
     assert_eq!(h.ctx.theme(), egui::Theme::Dark);
-    h.state_mut().settings.light_theme = true;
-    h.run();
-    assert_eq!(h.ctx.theme(), egui::Theme::Light);
-}
-
-/// GitHub's answer for the latest release (as `/releases/latest` gives
-/// it), tagged `tag`.
-fn release_answer(tag: &str) -> String {
-    serde_json::json!({
-        "tag_name": tag,
-        "html_url": format!("https://github.com/weavejester/moonglow-toolset/releases/tag/{tag}"),
-        "draft": false,
-        "prerelease": false,
-    })
-    .to_string()
-}
-
-/// An app whose checks for updates get `answer` (never the network), and
-/// how many times it was asked.
-fn app_with_releases(
-    answer: Result<String, String>,
-) -> (Moonglow, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let asked = std::sync::Arc::new(AtomicUsize::new(0));
-    let mut app = app_with(Vec::new());
-    let counted = asked.clone();
-    app.updates.fetch = Some(std::sync::Arc::new(move || {
-        counted.fetch_add(1, Ordering::SeqCst);
-        answer.clone()
-    }));
-    (app, asked)
-}
-
-/// Help › Check for Updates… says a newer release is out, with its page,
-/// or that this one is the newest, or why GitHub couldn't be asked; a
-/// copy a package manager updates says how.
-#[test]
-fn check_for_updates_says_what_is_newest() {
-    use std::sync::atomic::Ordering;
-    let current = mg_core::release::version();
-    let (mut app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
-    // (No automatic check: switched off.)
-    app.settings.no_update_check = true;
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run();
-    assert_eq!(asked.load(Ordering::SeqCst), 0, "not asked by itself");
-    h.get_by_label("Help").click();
-    h.run();
-    h.get_by_label_contains("Check for Updates").click();
-    h.run();
-    h.get_by_label(&format!("Moonscar 99.0.0 is out (you have {current})."));
-    h.get_by_label("Open the release page");
-    assert_eq!(asked.load(Ordering::SeqCst), 1);
-    assert!(h.state().updates.notice.is_none(), "the notice is the automatic check's");
-    // The newest.
-    h.state_mut().updates.fetch =
-        Some(std::sync::Arc::new(move || Ok(release_answer(&format!("v{current}")))));
-    h.get_by_label("Check Again").click();
-    h.run();
-    h.get_by_label(&format!("Moonscar {current} is the newest."));
-    // Offline.
-    h.state_mut().updates.fetch =
-        Some(std::sync::Arc::new(|| Err("not connected to the Internet".into())));
-    h.get_by_label("Check Again").click();
-    h.run();
-    h.get_by_label("Couldn't ask GitHub: not connected to the Internet.");
-    // Installed by Scoop: still asked, and said how it is updated.
-    h.state_mut().updates.installer = Some(mg_ui::updates::Installer::Scoop);
-    h.state_mut().updates.fetch = Some(std::sync::Arc::new(|| Ok(release_answer("v99.0.0"))));
-    // (Drawn so first: the window is taller, centered again a frame
-    // later, its button elsewhere.)
-    h.run_steps(2);
-    h.get_by_label("Check Again").click();
-    h.run();
-    h.get_by_label(&format!("Moonscar 99.0.0 is out (you have {current})."));
-    h.get_by_label("This copy is updated by Scoop: scoop update moonglow.");
-    h.get_by_label("Close").click();
-    h.run();
-    assert!(h.query_by_label("Check Again").is_none());
-    // And from Help › About.
-    h.state_mut().about = true;
-    h.run();
-    h.get_by_label("Check for Updates…").click();
-    h.run();
-    h.get_by_label("Check Again");
-}
-
-/// The automatic check, due, tells of a newer release under the toolbar
-/// at start; Don't remind me about this version keeps it from telling of
-/// that one again (a later one is told), and × closes it for now.
-#[test]
-fn the_update_notice_appears_and_is_dismissed() {
-    use std::sync::atomic::Ordering;
-    let current = mg_core::release::version();
-    let told = format!("Moonscar 99.0.0 is out (you have {current}).");
-    let (app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
-    assert_eq!(app.settings.update_checked, None);
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run();
-    h.get_by_label(&told);
-    h.get_by_label("Release Page");
-    assert_eq!(asked.load(Ordering::SeqCst), 1);
-    let checked = h.state().settings.update_checked.expect("the check's time is kept");
-    assert!(checked.abs_diff(mg_ui::updates::now()) < 60);
-    // (Once: frames go on without asking again.)
-    h.run_steps(5);
-    assert_eq!(asked.load(Ordering::SeqCst), 1);
-    h.get_by_label("Don't remind me about this version").click();
-    h.run();
-    assert!(h.query_by_label(&told).is_none());
-    assert_eq!(h.state().settings.update_skipped.as_deref(), Some("99.0.0"));
-
-    // The next day: the skipped version isn't told; a later one is.
-    let mut settings = h.state().settings.clone();
-    settings.update_checked = Some(checked - mg_ui::updates::DAY);
-    let (mut app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
-    app.settings = settings.clone();
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run();
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked, a day having gone by");
-    assert!(h.query_by_label(&told).is_none(), "the skipped version isn't told again");
-    let (mut app, _) = app_with_releases(Ok(release_answer("v99.1.0")));
-    app.settings = settings;
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run();
-    h.get_by_label(&format!("Moonscar 99.1.0 is out (you have {current})."));
-    h.get_by_label("×").click();
-    h.run();
-    assert!(h.state().updates.notice.is_none());
-    assert_eq!(h.state().settings.update_skipped.as_deref(), Some("99.0.0"));
-
-    // Offline: nothing said, in the log or elsewhere.
-    let (app, asked) = app_with_releases(Err("not connected to the Internet".into()));
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run();
-    assert_eq!(asked.load(Ordering::SeqCst), 1);
-    assert!(h.state().updates.notice.is_none());
-    assert!(!h.state().log.entries.iter().any(|(_, m)| m.contains("GitHub")));
-}
-
-/// The automatic check asks at each start, not only a day after the last
-/// one: a release out since that day's check is told when Moonglow starts
-/// again (Carcerian's report on 3.1.0: the notice never came, Check for
-/// Updates… found the release). While it runs, a day between two asks.
-#[test]
-fn the_update_check_asks_at_each_start() {
-    use std::sync::atomic::Ordering;
-    let current = mg_core::release::version();
-    let (mut app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
-    // (Checked an hour ago, when nothing newer was out.)
-    app.settings.update_checked = Some(mg_ui::updates::now() - 60 * 60);
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run();
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked at start, a day not gone by");
-    h.get_by_label(&format!("Moonscar 99.0.0 is out (you have {current})."));
-    // (Looked again within the run, before a day is out: not asked.)
-    h.state_mut().updates.look_again();
-    h.run_steps(3);
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "once a day while it runs");
-}
-
-/// Options › Updates › Check for updates automatically, off: no request
-/// at start; and none where a package manager updates Moonglow, whose
-/// page says so.
-#[test]
-fn the_updates_option_turns_automatic_checks_off() {
-    use std::sync::atomic::Ordering;
-    let (mut app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
-    app.settings.update_checked = Some(mg_ui::updates::now());
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run();
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked at start, on");
-    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
-    h.run();
-    h.get_by_label("Updates").click();
-    h.run();
-    h.get_by_label("Check for updates automatically").click();
-    h.run();
-    h.get_by_label("OK").click();
-    h.run();
-    assert!(h.state().settings.no_update_check);
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "not again, switched off");
-
-    // At the next start, a day later: not asked.
-    let mut settings = h.state().settings.clone();
-    settings.update_checked = None;
-    let (mut app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
-    app.settings = settings.clone();
-    let mut h = window_harness(app);
-    h.run();
-    assert_eq!(asked.load(Ordering::SeqCst), 0, "switched off");
-    assert!(h.state().updates.notice.is_none());
-
-    // On, but installed by Flatpak: not asked, and the page says why.
-    settings.no_update_check = false;
-    let (mut app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
-    app.settings = settings;
-    app.updates.installer = Some(mg_ui::updates::Installer::Flatpak);
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run();
-    assert_eq!(asked.load(Ordering::SeqCst), 0, "a package manager updates it");
-    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
-    h.run();
-    h.get_by_label("Updates").click();
-    h.run();
-    h.get_by_label_contains("This copy is updated by Flatpak");
-    assert!(h.get_by_label("Check for updates automatically").accesskit_node().is_disabled());
-    // Help › Check for Updates… in the Flatpak, whose sandbox has no
-    // network: nothing asked, only how Flatpak updates it.
-    h.get_by_label("Cancel").click();
-    h.run();
-    mg_ui::updates::check_now(h.state_mut());
-    h.run();
-    assert_eq!(asked.load(Ordering::SeqCst), 0, "the Flatpak asks nothing");
-    h.get_by_label_contains("This copy is updated by Flatpak: flatpak update");
-    assert!(h.query_by_label("Check Again").is_none());
-    assert!(h.query_by_label_contains("Couldn't ask GitHub").is_none());
-}
-
-/// As the desktop app runs it (jobs in the background): the request goes
-/// on its own thread, the window asks while it waits, and the answer is
-/// shown when it comes; turned on in Options, the automatic check asks
-/// at once.
-#[test]
-fn the_update_check_asks_on_its_own_thread() {
-    use std::sync::atomic::Ordering;
-    let current = mg_core::release::version();
-    let (mut app, asked) = app_with_releases(Ok(release_answer("v99.0.0")));
-    app.background_jobs = true;
-    app.settings.no_update_check = true;
-    let mut h = harness(app, 1280.0, 800.0);
-    h.run_steps(2);
-    mg_ui::updates::check_now(h.state_mut());
-    h.run_steps(1);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while h.state().updates.report.is_none() {
-        assert!(std::time::Instant::now() < deadline, "no answer");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        h.run_steps(1);
+    assert_eq!(mg_uikit::applied(&h.ctx), Some(Theme::Dark), "the suite's theme, not egui's");
+    // Both ways, as the window runs: the theme's colors and the panels'.
+    for (light, theme) in [(true, Theme::Light), (false, Theme::Dark), (true, Theme::Light)] {
+        h.state_mut().settings.light_theme = light;
+        h.run();
+        assert_eq!(h.ctx.theme(), theme.egui());
+        assert_eq!(mg_uikit::applied(&h.ctx), Some(theme));
+        let t = mg_uikit::tokens(&h.ctx);
+        assert_eq!(t, if light { Tokens::LIGHT } else { Tokens::DARK });
+        assert_eq!(h.ctx.global_style().visuals.panel_fill, t.panel);
+        assert_eq!(h.ctx.global_style().spacing.interact_size.y, mg_uikit::metrics::CONTROL_HEIGHT);
     }
-    h.run_steps(2);
-    h.get_by_label(&format!("Moonscar 99.0.0 is out (you have {current})."));
-    assert!(h.query_by_label("Asking GitHub for the latest release…").is_none());
-    assert!(!h.state().updates.checking());
-    assert!(h.state().updates.notice.is_none(), "the window's check, not the automatic one");
-    assert_eq!(asked.load(Ordering::SeqCst), 1);
-
-    // Switched on in Options: asked at the next frames, not in an hour.
-    h.state_mut().updates.window = false;
-    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
-    h.run_steps(2);
-    h.get_by_label("Updates").click();
-    h.run_steps(2);
-    h.get_by_label("Check for updates automatically").click();
-    h.run_steps(2);
-    h.get_by_label("OK").click();
-    h.run_steps(1);
-    assert!(!h.state().settings.no_update_check);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while h.state().updates.notice.is_none() {
-        assert!(std::time::Instant::now() < deadline, "no notice");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        h.run_steps(1);
-    }
-    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    // In the Options window, as Interface size beside it: ticked, the
+    // theme changes on OK, not before; unticked and cancelled, it stays.
+    let options = |h: &mut Harness<'_, Moonglow>| {
+        h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+        settle(h);
+        h.get_by_label("General").click();
+        settle(h);
+        click_in_sight(h, "Light theme");
+        settle(h);
+    };
+    h.state_mut().settings.light_theme = false;
+    h.run();
+    options(&mut h);
+    assert_eq!(mg_uikit::applied(&h.ctx), Some(Theme::Dark), "not as it is ticked");
+    assert!(!h.state().settings.light_theme);
+    h.get_all_by_label("OK").last().unwrap().click();
+    settle(&mut h);
+    assert!(h.state().settings.light_theme, "on OK");
+    assert_eq!(mg_uikit::applied(&h.ctx), Some(Theme::Light));
+    options(&mut h);
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    settle(&mut h);
+    assert!(h.state().settings.light_theme, "Cancel keeps it");
+    assert_eq!(mg_uikit::applied(&h.ctx), Some(Theme::Light));
 }
 
-/// Options › General › Toolbar buttons, Icons only, in the editors'
-/// toolbars too (ShadowM's request): the script editor's and the
-/// conversation editor's buttons show their glyphs alone and take less
-/// room, each named in its tip and by its name for a screen reader; with
-/// Icons and text, their words alone, as before.
+/// The editors' headers' icon buttons, as ShadowM asked for them (once
+/// Options' "Toolbar buttons: Icons only", retired in M4's U23): the
+/// script editor's Used By an icon, named for a screen reader, with the
+/// tip saying what it does; the conversation editor's toggles named and
+/// said to be on or off; each header as wide whatever an old settings
+/// file says of the setting.
+/// `settings` as read from a file of before M4's U23 that also says
+/// `toolbar_icons_only: on` (the field retired): read whole, nothing
+/// left unread.
+fn with_old_toolbar_field(settings: &mg_ui::Settings, on: bool) -> mg_ui::Settings {
+    let text = settings.saved_text();
+    let old = text.replacen('(', &format!("(toolbar_icons_only:{on},"), 1);
+    let (read, unread) = mg_ui::Settings::read_fields(&old).expect("an old file reads");
+    assert!(unread.is_empty(), "{unread:?}");
+    read
+}
+
 #[test]
-fn the_editors_toolbars_show_icons_only_when_asked() {
+fn the_editors_headers_show_named_icons() {
     let dir = mg_testkit::scratch_dir("ui-editor-icons-only");
     let path = sample_module(&dir);
     let script = ResKey::parse("hello", ResType::NSS).unwrap();
@@ -938,23 +892,29 @@ fn the_editors_toolbars_show_icons_only_when_asked() {
     h.run();
     // (The buttons' widths together: a toolbar wraps.)
     let width = |h: &Harness<'_, Moonglow>, names: &[&str]| -> f32 {
-        names.iter().map(|n| h.get_by_label(n).rect().width()).sum()
+        // (The editor's, after the module tree's: both have an Expand All.)
+        names.iter().map(|n| h.get_all_by_label(n).last().unwrap().rect().width()).sum()
     };
     let scripts = ["Save As…", "Print…", "Open…", "Find…", "Replace…", "Definition", "Used By"];
     let lines = ["Add", "Copy", "Cut", "Paste", "Paste As Link", "Expand All", "Scripts"];
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Script(script)));
     h.run_steps(3);
     let words = width(&h, &scripts);
-    h.state_mut().settings.toolbar_icons_only = true;
+    // (An old file with the setting on: read into the window, nothing
+    // moves.)
+    h.state_mut().settings = with_old_toolbar_field(&h.state().settings, true);
     h.run_steps(3);
     let glyphs = width(&h, &scripts);
-    assert!(glyphs < words * 0.6, "the script's toolbar narrower: {glyphs} of {words}");
+    assert_eq!(glyphs, words, "the script's header as it was");
+    // (Each an icon button, named by its words, its icon drawn.)
+    let used_by = h.get_by_label("Used By").rect();
+    assert!(used_by.width() <= mg_uikit::metrics::ICON_BUTTON + 0.5, "{used_by:?}");
+    assert!(icon_drawn(&h, mg_uikit::Icon::UsedBy, used_by), "Used By's icon");
     h.get_by_label("Used By").hover();
-    // (A tooltip waits a moment.)
-    h.run_steps(60);
-    h.get_by_label("Used By\nWhere the module runs or includes this script");
+    h.step();
+    advance_clock(&mut h, 1.5);
+    h.get_by_label("Where the module runs or includes this script");
     h.hover_at(egui::pos2(5.0, 790.0));
-    h.state_mut().settings.toolbar_icons_only = false;
     h.run_steps(3);
     let tab = h.state().dock.find_tab(&Tab::Script(script)).unwrap();
     h.state_mut().dock.remove_tab(tab);
@@ -962,13 +922,159 @@ fn the_editors_toolbars_show_icons_only_when_asked() {
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Dialog(talk)));
     h.run_steps(3);
     let words = width(&h, &lines);
-    h.state_mut().settings.toolbar_icons_only = true;
+    h.state_mut().settings = with_old_toolbar_field(&h.state().settings, false);
     h.run_steps(3);
     let glyphs = width(&h, &lines);
-    assert!(glyphs < words * 0.6, "the conversation's toolbar narrower: {glyphs} of {words}");
+    assert_eq!(glyphs, words, "the conversation's header as it was");
     // The toggles still toggle, said to be on or off.
     h.get_by_label("Comments").click();
     h.run_steps(2);
     let toggled = h.get_by_label("Comments").accesskit_node().toggled();
     assert_eq!(toggled, Some(egui::accesskit::Toggled::True));
+}
+
+/// The log takes the arrow keys only from a click of its own: a click on
+/// a window lying over it is the window's (the log took the keys from
+/// any click inside its pane, a window's over it too).
+#[test]
+fn the_log_takes_the_keys_only_from_its_own_clicks() {
+    let dir = mg_testkit::scratch_dir("ui-log-keys-under-a-window");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = harness(app, 1000.0, 700.0);
+    settle(&mut h);
+    let keys = |h: &Harness<'_, Moonglow>| mg_ui::palette_view::keys_are_the_logs(&h.ctx);
+    // The log's line saying the module opened: where the log is.
+    let line = h.get_all_by_label_contains("Opened").last().expect("the log's line").rect();
+    // A window over it: the manual's, as tall as the screen has room for.
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Manual));
+    settle(&mut h);
+    let over = egui::pos2(500.0, line.center().y);
+    let window = h.ctx.layer_id_at(over).expect("a layer");
+    assert_ne!(window, egui::LayerId::background(), "the window lies over the log there");
+    click_pos(&h, over);
+    settle(&mut h);
+    assert!(!keys(&h), "a click on the window is the window's");
+    // On the log itself, beside the window: the log's.
+    let beside = egui::pos2(line.left() + 4.0, line.center().y);
+    assert_eq!(h.ctx.layer_id_at(beside), Some(egui::LayerId::background()), "the log there");
+    click_pos(&h, beside);
+    settle(&mut h);
+    assert!(keys(&h), "a click on the log gives it the keys");
+}
+
+/// The theme's chevrons and rows in the running window, in the dark
+/// theme and the light: a combo box's chevron (`text-2`, a stroke, not
+/// egui's filled triangle), a tree header's (`text-3`), and a list's row
+/// under the pointer filled `hover-row` on its own 22 points.
+#[test]
+fn the_theme_s_chevrons_and_row_hover_are_drawn() {
+    let dir = mg_testkit::scratch_dir("ui-theme-chevrons");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = harness(app, 1100.0, 800.0);
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
+    settle(&mut h);
+    // A chevron: three points, open, stroked in `color`, inside `rect`.
+    let chevrons = |h: &Harness<'_, Moonglow>, rect: egui::Rect, color: egui::Color32| {
+        drawn(h)
+            .iter()
+            .filter(|s| match s {
+                egui::Shape::Path(p) => {
+                    p.points.len() == 3
+                        && !p.closed
+                        && p.stroke.color == egui::epaint::ColorMode::Solid(color)
+                        && p.points.iter().all(|q| rect.contains(*q))
+                }
+                _ => false,
+            })
+            .count()
+    };
+    // egui's triangle: three points, closed and filled.
+    let triangles = |h: &Harness<'_, Moonglow>, rect: egui::Rect| {
+        drawn(h)
+            .iter()
+            .filter(|s| match s {
+                egui::Shape::Path(p) => {
+                    p.points.len() == 3 && p.closed && p.points.iter().all(|q| rect.contains(*q))
+                }
+                _ => false,
+            })
+            .count()
+    };
+    for light in [false, true] {
+        h.state_mut().settings.light_theme = light;
+        settle(&mut h);
+        let t = mg_uikit::tokens(&h.ctx);
+        assert_eq!(t, if light { mg_uikit::Tokens::LIGHT } else { mg_uikit::Tokens::DARK });
+        // The module tree's group headers.
+        let header = h.get_by_label_contains("Scripts (").rect();
+        let arrow = header.expand2(egui::vec2(24.0, 0.0));
+        h.hover_at(egui::pos2(header.right() + 200.0, header.top() - 200.0));
+        settle(&mut h);
+        assert!(chevrons(&h, arrow, t.text_3) >= 1, "a tree header's chevron ({light})");
+        assert_eq!(triangles(&h, arrow), 0, "no triangle by a header ({light})");
+        // A combo box's: Options › General's Interface size.
+        h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+        settle(&mut h);
+        h.get_by_label("General").click();
+        settle(&mut h);
+        let combo = h.get_by_value("100%").rect();
+        assert!(chevrons(&h, combo, t.text_2) >= 1, "a combo box's chevron ({light})");
+        assert_eq!(triangles(&h, combo), 0, "no triangle in a combo box ({light})");
+        // A list's row under the pointer: the Options' pages.
+        // (The page's row, not the Area page's words in General.)
+        let page = || egui_kittest::kittest::by().role(egui::accesskit::Role::Button).label("Area");
+        let row = h.get(page()).rect();
+        h.hover_at(row.center());
+        settle(&mut h);
+        let row = h.get(page()).rect();
+        assert_eq!(row.height(), mg_uikit::metrics::ROW_HEIGHT);
+        let fills: Vec<egui::Rect> = drawn(&h)
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) if r.fill == t.hover_row => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fills.iter().any(|f| f.y_range() == row.y_range() && f.contains(row.center())),
+            "the row lit on its own 22 points ({light}): {fills:?} for {row:?}"
+        );
+        h.get_all_by_label("Cancel").last().unwrap().click();
+        settle(&mut h);
+    }
+}
+
+/// Each Options page keeps its own place in its scroll: the Area page
+/// scrolled down to its Editing section, General opens at its top (its
+/// Editors heading in sight under the page's top), and Area comes back
+/// where it was left.
+#[test]
+fn each_options_page_keeps_its_own_scroll() {
+    use mg_ui::OptionsPage as P;
+    let mut h = harness(app_with(Vec::new()), 1100.0, 700.0);
+    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+    settle(&mut h);
+    let page = |h: &mut Harness<'_, Moonglow>, p: P| {
+        h.state_mut().options.as_mut().unwrap().page = p;
+        settle(h);
+    };
+    page(&mut h, P::Area);
+    // (The page list's first row stands at the pages' top.)
+    let top = h.get_by_label("Folders").rect().top();
+    h.get_by_label("Editing").scroll_to_me();
+    settle(&mut h);
+    let editing = h.get_by_label("Editing").rect().top();
+    page(&mut h, P::General);
+    let editors = h.get_by_label("Editors").rect();
+    assert!(editors.top() >= top - 4.0, "General at its top: {editors:?}, the list's top {top}");
+    page(&mut h, P::Area);
+    let back = h.get_by_label("Editing").rect().top();
+    assert!((back - editing).abs() < 2.0, "Area where it was left: {back} against {editing}");
 }

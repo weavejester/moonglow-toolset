@@ -35,7 +35,135 @@ pub struct Symbol {
     pub custom: bool,
 }
 
-/// The side lists' tabs.
+/// Symbols available to a script: its own and its includes' declarations, plus
+/// the shared `nwscript.nss` spec symbols, merged lazily in sorted name order
+/// (`own` before `spec` on equal names).
+#[derive(Debug, Clone, Default)]
+pub struct SymbolSet {
+    pub own: Arc<Vec<Symbol>>,
+    pub spec: Arc<Vec<Symbol>>,
+}
+
+impl SymbolSet {
+    /// Total symbol count (`own` plus `spec`).
+    pub fn len(&self) -> usize {
+        self.own.len() + self.spec.len()
+    }
+
+    /// Whether neither `own` nor `spec` has symbols.
+    pub fn is_empty(&self) -> bool {
+        self.own.is_empty() && self.spec.is_empty()
+    }
+
+    /// Whether `other` is this very set (the same `own` and `spec`). A
+    /// cache that asks this holds the set it was made from: keyed by the
+    /// sets' addresses alone, a set dropped and another made where it was
+    /// took the old one's answer (review D3).
+    pub fn same(&self, other: &SymbolSet) -> bool {
+        Arc::ptr_eq(&self.own, &other.own) && Arc::ptr_eq(&self.spec, &other.spec)
+    }
+
+    /// Sorted iterator yielding all symbols (`own` before `spec` on ties).
+    pub fn iter(&self) -> SymbolIter<'_> {
+        SymbolIter { own: &self.own, spec: &self.spec, i: 0, j: 0 }
+    }
+
+    /// Binary search by exact identifier name (`own` before `spec`).
+    pub fn find_by_name(&self, name: &str) -> Option<&Symbol> {
+        let i = self.own.partition_point(|s| s.name.as_str() < name);
+        if let Some(s) = self.own.get(i)
+            && s.name == name
+        {
+            return Some(s);
+        }
+        let j = self.spec.partition_point(|s| s.name.as_str() < name);
+        self.spec.get(j).filter(|s| s.name == name)
+    }
+
+    /// Completion candidates starting with `prefix` (custom first, then by name).
+    pub fn completions(&self, prefix: &str) -> Vec<Symbol> {
+        completions_from(self.own.iter().chain(self.spec.iter()), prefix)
+    }
+}
+
+/// Lazy 2-way merge iterator over a [`SymbolSet`].
+#[derive(Debug)]
+pub struct SymbolIter<'a> {
+    own: &'a [Symbol],
+    spec: &'a [Symbol],
+    i: usize,
+    j: usize,
+}
+
+impl<'a> SymbolIter<'a> {
+    /// Yields `(is_own, index_in_vec, symbol)` in sorted order.
+    pub(crate) fn next_indexed(&mut self) -> Option<(bool, usize, &'a Symbol)> {
+        match (self.own.get(self.i), self.spec.get(self.j)) {
+            (Some(a), Some(b)) => {
+                if a.name <= b.name {
+                    let idx = self.i;
+                    self.i += 1;
+                    Some((true, idx, a))
+                } else {
+                    let idx = self.j;
+                    self.j += 1;
+                    Some((false, idx, b))
+                }
+            }
+            (Some(a), None) => {
+                let idx = self.i;
+                self.i += 1;
+                Some((true, idx, a))
+            }
+            (None, Some(b)) => {
+                let idx = self.j;
+                self.j += 1;
+                Some((false, idx, b))
+            }
+            (None, None) => None,
+        }
+    }
+}
+
+impl<'a> Iterator for SymbolIter<'a> {
+    type Item = &'a Symbol;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_indexed().map(|(_, _, s)| s)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = (self.own.len() - self.i) + (self.spec.len() - self.j);
+        (rem, Some(rem))
+    }
+}
+
+struct SymbolJob {
+    key: ResKey,
+    h: u64,
+    /// The includes it read (their names, in lower case), as they were
+    /// as it began: one of them edited since, what it finds is of the
+    /// text before ([`ScriptTools::invalidate_dependents`]).
+    reads: Vec<String>,
+    rx: std::sync::mpsc::Receiver<(Vec<Symbol>, Vec<ResKey>)>,
+}
+
+#[derive(Default)]
+struct PendingSymbolJob(Option<SymbolJob>);
+
+impl Clone for PendingSymbolJob {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl std::fmt::Debug for PendingSymbolJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PendingSymbolJob").field(&self.0.as_ref().map(|j| (j.key, j.h))).finish()
+    }
+}
+
+/// What the Reference panel lists (its segmented control's choices).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SideTab {
     #[default]
@@ -45,14 +173,31 @@ pub enum SideTab {
     Templates,
 }
 
-/// The bottom panel's tabs.
+/// The script's panels of the Bottom Dock (M4's U13: Compiler and
+/// Bookmarks, its own, and the global Search Results; Help, its own too
+/// since 5.2.0, is asked forward by [`ScriptTools::help_forward`]): the one
+/// a script asked to the front last ([`ScriptTools::info`],
+/// [`ScriptTools::ask_forward`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InfoTab {
     #[default]
     Compiler,
-    Help,
     Bookmarks,
     SearchResults,
+}
+
+/// A Bottom Dock panel asked to the front ([`ScriptTools::ask_forward`]):
+/// by the script `from` (none: a search not of one script's), opening the
+/// dock where it is closed if `open` (a search's hits, a compile that
+/// failed), else only where it is open. The docks act on it as the next
+/// frame begins (`shell::bottom_forward`): the main window's Bottom Dock
+/// where `from` is the docked script in front (or for a search, where it
+/// does not float), its window's bottom pane where it floats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Forward {
+    pub(crate) from: Option<ResKey>,
+    pub(crate) tab: InfoTab,
+    pub(crate) open: bool,
 }
 
 /// A compiler message, with where it points if it says.
@@ -109,7 +254,20 @@ pub struct Search {
     pub in_open: bool,
     /// The script the window works on.
     pub script: Option<ResKey>,
-    pub results: Vec<(ResKey, usize, String)>,
+}
+
+/// The most lines Search Results keeps (Find In Files, References): a
+/// common word has tens of thousands in a large module's scripts, more
+/// than anyone reads through.
+pub const MAX_RESULTS: usize = 10_000;
+
+/// What the log says after a count of `found` results where not all are
+/// kept ([`MAX_RESULTS`]); nothing where they are.
+pub fn results_cut(found: usize) -> String {
+    match found > MAX_RESULTS {
+        true => format!(": the first {MAX_RESULTS} are in Search Results"),
+        false => String::new(),
+    }
 }
 
 /// An open completion list.
@@ -159,6 +317,12 @@ pub struct OpenScript {
     /// The script a Shift+click or Shift+arrow selects from: the one
     /// clicked or moved to last.
     pub anchor: Option<ResKey>,
+    /// The scripts listed (those of `scripts` that the name typed and
+    /// what is shown leave) and their names, and what they were made
+    /// for: made again when that changes, not every frame.
+    pub(crate) listed: Vec<(ResKey, ScriptFrom)>,
+    pub(crate) names: Vec<ResKey>,
+    pub(crate) listed_for: Option<(String, ScriptsShown)>,
 }
 
 /// The editor tools' state (shared by the open script editors).
@@ -169,10 +333,64 @@ pub struct ScriptTools {
     /// Scripts to open in the external editor once their editor has them
     /// (opened from the module tree, with the option on).
     pub(crate) open_externally: std::collections::HashSet<ResKey>,
+    /// What the Reference panel lists, and its filter.
     pub side: SideTab,
     pub filter: String,
+    /// The Bottom Dock panel a script asked to the front last.
     pub info: InfoTab,
+    /// The asks of this frame, until the docks act on them as the next
+    /// frame begins (`shell::bottom_forward`).
+    pub(crate) forward: Vec<Forward>,
+    /// Counts what the Bottom Dock panels show changing (a compile's
+    /// messages, a bookmark, a search's hits): each panel drawn notes the
+    /// count it showed and the pass ([`ScriptTools::bottom_drawn`]); one
+    /// drawn this pass before the change is drawn again
+    /// (`shell::follow_bottom`), and nothing is asked for otherwise.
+    pub(crate) made: u64,
+    /// The pass a Bottom Dock panel was last drawn in and the least count
+    /// ([`ScriptTools::made`]) a panel drawn in it showed.
+    pub(crate) bottom_drawn: Option<(u64, u64)>,
+    /// The Bottom Dock panel (its keys) to take the keyboard's focus as
+    /// it is drawn (F6 to it): from the script's text, so that what is
+    /// typed then goes nowhere.
+    pub(crate) list_focus: Option<crate::palette_view::Keys>,
+    /// The function or constant the Help panel shows.
     pub help: Option<Symbol>,
+    /// Text the Reference panel put in (a double click on a name), for the
+    /// script's editor to put in at its cursor once it is drawn (the panel
+    /// is drawn before it).
+    pub(crate) insert: Option<(ResKey, String)>,
+    /// Help asked to the front by the script it names (a double click on
+    /// a name in its text, its Go to Definition, a click in its Reference's
+    /// list): where that script is docked, the Help panel brought to the
+    /// front of the Bottom Dock, opened, once a script is the editor in
+    /// front (`shell::help_forward`); where it floats, to the front of its
+    /// window's bottom pane.
+    pub(crate) help_forward: Option<ResKey>,
+    /// The Reference panel's filter to take the keyboard's focus as it is
+    /// drawn (F6 to it).
+    pub(crate) reference_focus: bool,
+    /// The Help panel to take the keyboard's focus as it is drawn (F6 to
+    /// it): from the script's text, so that what is typed then goes
+    /// nowhere rather than into the script.
+    pub(crate) help_focus: bool,
+    /// The name Reference's list was last scrolled to, or clicked: a name
+    /// Help shows that differs (chosen by the cursor in the text, Go to
+    /// Definition) scrolls the list to it once.
+    pub(crate) list_at: Option<String>,
+    /// What the Reference panel showed as it was last drawn: the pass
+    /// (`Context::cumulative_pass_nr`), the script, its symbols' list and
+    /// the name marked chosen. Drawn before the editor, it is drawn again
+    /// where the editor changed them in the same pass, and only then: a
+    /// Reference not drawn this pass (behind Help's tab, the dock folded)
+    /// asks for nothing (M4's U12 review, A1).
+    pub(crate) reference_drawn: Option<(u64, ResKey, Option<SymbolSet>, Option<String>)>,
+    /// What the Help panel showed as it was last drawn: the pass and the
+    /// name, drawn again where the editor chose another in that pass.
+    pub(crate) help_drawn: Option<(u64, Option<String>)>,
+    /// What Help shows of the name, laid out once (in the editor's colors)
+    /// and kept while it is shown.
+    pub(crate) help_read: Option<Arc<crate::script_reference::HelpRead>>,
     pub messages: Vec<Message>,
     pub search: Search,
     pub completion: Option<Completion>,
@@ -187,18 +405,32 @@ pub struct ScriptTools {
     pub convert_indent: Option<(ResKey, bool, bool)>,
     /// A step of a script's own history to take, back (`false`) or again
     /// (`true`), once its editor is drawn: Edit › Undo or Redo, or the
-    /// toolbar's, while the script is the one worked in
+    /// Top Bar's, while the script is the one worked in
     /// (`script_view::undo_target`).
     pub(crate) undo: Option<(ResKey, bool)>,
     /// A script's editor to give the keys back to once it is drawn (a
     /// menu opened from it closed with nothing chosen).
     pub(crate) keys_back: Option<ResKey>,
+    /// The script the Find or Replace window works on, while that window
+    /// has the keys: Edit › Undo and Redo are that script's then.
+    pub(crate) find_keys: Option<ResKey>,
     /// The script whose editor had the keyboard last.
     pub(crate) last_typed: Option<ResKey>,
     /// `nwscript.nss`, parsed once.
     pub spec: Option<Arc<Spec>>,
+    /// Its symbols by name, and the spec they were built from.
+    spec_symbols: Option<(Arc<Spec>, Arc<Vec<Symbol>>)>,
     /// Symbols of each script (with its includes), by its text.
-    pub symbols: HashMap<ResKey, (u64, Arc<Vec<Symbol>>)>,
+    pub symbols: HashMap<ResKey, (u64, SymbolSet)>,
+    /// Transitive `#include` keys recorded per script for targeted invalidation.
+    symbol_deps: HashMap<ResKey, Vec<ResKey>>,
+    /// Cached filtered list for the Reference panel.
+    pub(crate) ref_cache: Option<crate::script_reference::RefCache>,
+    /// Background symbol extraction job for large scripts.
+    symbol_job: PendingSymbolJob,
+    /// How many symbol jobs have gone to a worker (for tests: one can come
+    /// back between two frames a test looks at).
+    pub(crate) symbol_jobs_started: usize,
     /// Each script's text when its editor was last drawn, and the
     /// workspace revision then: an include edited or the module changed
     /// leaves other scripts' symbols and live checks out of date.
@@ -215,6 +447,20 @@ pub struct ScriptTools {
 const TEMPLATES_KEPT: f64 = 2.0;
 
 impl ScriptTools {
+    /// The script Help was asked to the front by, while the docks have not
+    /// yet brought it ([`ScriptTools::help_forward`]): for tests.
+    #[doc(hidden)]
+    pub fn help_forward_pending(&self) -> Option<ResKey> {
+        self.help_forward
+    }
+
+    /// Gives `key`'s editor the keyboard once it is drawn, as a menu
+    /// closed with nothing chosen does (for tests).
+    #[doc(hidden)]
+    pub fn keys_back_for_test(&mut self, key: ResKey) {
+        self.keys_back = Some(key);
+    }
+
     /// [`templates`], read at most [`TEMPLATES_KEPT`] seconds ago from the
     /// same folders, else now.
     pub(crate) fn templates(
@@ -241,10 +487,9 @@ impl ScriptTools {
 
 /// A script's text as a number, to tell when it changed.
 pub(crate) fn hash(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+    // (egui's hasher: std's took a third of a millisecond a frame on a
+    // script of 14,000 lines, this a twentieth.)
+    egui::epaint::util::hash(text)
 }
 
 fn from_spec(spec: &Spec) -> Vec<Symbol> {
@@ -272,7 +517,15 @@ fn from_spec(spec: &Spec) -> Vec<Symbol> {
 /// The symbols declared by a script and (recursively) its includes;
 /// `source` loads an include's text.
 pub fn script_symbols(text: &str, source: &mut dyn FnMut(&str) -> Option<String>) -> Vec<Symbol> {
+    script_symbols_with_deps(text, source).0
+}
+
+fn script_symbols_with_deps(
+    text: &str,
+    source: &mut dyn FnMut(&str) -> Option<String>,
+) -> (Vec<Symbol>, Vec<ResKey>) {
     let mut out = Vec::new();
+    let mut deps = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut queue = vec![text.to_string()];
     while let Some(src) = queue.pop() {
@@ -311,11 +564,13 @@ pub fn script_symbols(text: &str, source: &mut dyn FnMut(&str) -> Option<String>
         }
         for inc in &o.includes {
             let name = inc.name.to_ascii_lowercase();
-            if seen.len() < 64
-                && seen.insert(name.clone())
-                && let Some(text) = source(&name)
-            {
-                queue.push(text);
+            if seen.len() < 64 && seen.insert(name.clone()) {
+                if let Some(k) = nss(&name) {
+                    deps.push(k);
+                }
+                if let Some(text) = source(&name) {
+                    queue.push(text);
+                }
             }
         }
     }
@@ -323,15 +578,60 @@ pub fn script_symbols(text: &str, source: &mut dyn FnMut(&str) -> Option<String>
     // with the documentation of whichever has some: BioWare's includes
     // document a prototype with `//` lines, or only the definition, with a
     // `/* … */` block.)
-    let mut unique: Vec<Symbol> = Vec::new();
-    for s in out {
-        match unique.iter_mut().find(|u| u.name == s.name && u.kind == s.kind) {
-            Some(u) if u.doc.is_empty() => u.doc = s.doc,
-            Some(_) => {}
-            None => unique.push(s),
+    // (Found by name and kind in a map: looked through, nwscript.nss's
+    // 6,000 symbols took 10 ms.)
+    let mut kept = vec![false; out.len()];
+    let mut docs = Vec::new();
+    {
+        let mut first = std::collections::HashMap::with_capacity(out.len());
+        let mut documented = std::collections::HashSet::new();
+        for (i, s) in out.iter().enumerate() {
+            match first.entry((s.name.as_str(), s.kind)) {
+                std::collections::hash_map::Entry::Occupied(f) => {
+                    let f: usize = *f.get();
+                    if out[f].doc.is_empty() && !s.doc.is_empty() && documented.insert(f) {
+                        docs.push((f, i));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(i);
+                    kept[i] = true;
+                }
+            }
         }
     }
-    unique
+    for (to, from) in docs {
+        out[to].doc = std::mem::take(&mut out[from].doc);
+    }
+    let syms = out.into_iter().zip(kept).filter(|(_, k)| *k).map(|(s, _)| s).collect();
+    (syms, deps)
+}
+
+const ASYNC_SYMBOL_BYTES: usize = 16_384;
+
+fn collect_includes(
+    text: &str,
+    source: &mut dyn FnMut(&str) -> Option<String>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = vec![text.to_string()];
+    while let Some(src) = queue.pop() {
+        if !src.contains("include") {
+            continue;
+        }
+        for inc in mg_script::lex::includes(src.as_bytes()) {
+            let Some(name) = src.get(inc.name).map(str::to_ascii_lowercase) else { continue };
+            if seen.len() < 64
+                && seen.insert(name.clone())
+                && let Some(inc_src) = source(&name)
+            {
+                queue.push(inc_src.clone());
+                out.insert(name, inc_src);
+            }
+        }
+    }
+    out
 }
 
 impl ScriptTools {
@@ -347,7 +647,106 @@ impl ScriptTools {
              Scripts on Save is off)"
         );
         self.messages.push(Message::new(key, said, None, false));
-        self.info = InfoTab::Compiler;
+        self.ask_forward(Some(key), InfoTab::Compiler, false);
+    }
+
+    /// The Bottom Dock panel `tab` asked to the front by the script `from`
+    /// (none: a search not of one script's), the dock opened where it is
+    /// closed if `open` ([`Forward`]); what the panels show changed
+    /// ([`ScriptTools::made`]).
+    pub(crate) fn ask_forward(&mut self, from: Option<ResKey>, tab: InfoTab, open: bool) {
+        self.info = tab;
+        self.forward.push(Forward { from, tab, open });
+        self.made += 1;
+    }
+
+    /// Clears all cached symbol tables, dependency edges, and pending jobs.
+    pub(crate) fn clear_symbols(&mut self) {
+        self.symbols.clear();
+        self.symbol_deps.clear();
+        self.ref_cache = None;
+        self.symbol_job.0 = None;
+    }
+
+    /// Drops cached symbol tables of other scripts that depend on `edited` (or
+    /// have no recorded dependency list yet).
+    pub(crate) fn invalidate_dependents(&mut self, edited: ResKey) {
+        let deps = &self.symbol_deps;
+        self.symbols
+            .retain(|k, _| *k == edited || deps.get(k).is_some_and(|d| !d.contains(&edited)));
+        self.symbol_deps.retain(|k, _| self.symbols.contains_key(k));
+        if self.ref_cache.as_ref().is_some_and(|c| !self.symbols.contains_key(&c.key)) {
+            self.ref_cache = None;
+        }
+        // (A worker reading another script's symbols with `edited` as it
+        // was among its includes: what it finds is let go, and read again
+        // once that script's editor asks. Its result had been kept with
+        // the include's old declarations: review D4 of the adversarial
+        // branch.)
+        let name = edited.resref.to_lowercase().to_string();
+        if edited.restype == ResType::NSS
+            && self
+                .symbol_job
+                .0
+                .as_ref()
+                .is_some_and(|j| j.key != edited && j.reads.contains(&name))
+        {
+            self.symbol_job.0 = None;
+        }
+    }
+
+    /// Whether a background symbol extraction job is currently running.
+    pub(crate) fn reading_symbols(&self) -> bool {
+        self.symbol_job.0.is_some()
+    }
+
+    fn ensure_spec_symbols(
+        &mut self,
+        load_spec: impl FnOnce() -> Option<Spec>,
+    ) -> Arc<Vec<Symbol>> {
+        if self.spec.is_none() {
+            self.spec = Some(Arc::new(load_spec().unwrap_or_default()));
+        }
+        let spec = self.spec.as_ref().expect("loaded");
+        match &self.spec_symbols {
+            Some((made, symbols)) if Arc::ptr_eq(made, spec) => symbols.clone(),
+            _ => {
+                let mut symbols = from_spec(spec);
+                symbols.sort_by(|a, b| a.name.cmp(&b.name));
+                let symbols = Arc::new(symbols);
+                self.spec_symbols = Some((spec.clone(), symbols.clone()));
+                symbols
+            }
+        }
+    }
+
+    /// Polls any in-flight background symbol extraction job, applying completed
+    /// results and requesting a UI repaint when `repaint` is set.
+    pub(crate) fn poll_symbol_job(&mut self, ctx: &egui::Context, repaint: bool) {
+        let Some(job) = self.symbol_job.0.as_ref() else { return };
+        match job.rx.try_recv() {
+            Ok((mut own, deps)) => {
+                let (key, h) = (job.key, job.h);
+                self.symbol_job.0 = None;
+                own.sort_by(|a, b| a.name.cmp(&b.name));
+                let spec = self.ensure_spec_symbols(|| None);
+                if self.seen.get(&key).is_none_or(|&cur| cur == h) {
+                    let set = SymbolSet { own: Arc::new(own), spec };
+                    self.symbols.insert(key, (h, set));
+                    self.symbol_deps.insert(key, deps);
+                    if self.ref_cache.as_ref().is_some_and(|c| c.key == key) {
+                        self.ref_cache = None;
+                    }
+                    if repaint {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.symbol_job.0 = None;
+            }
+        }
     }
 
     /// All symbols a script can use: its own and its includes' (custom),
@@ -363,28 +762,85 @@ impl ScriptTools {
         text: &str,
         load_spec: impl FnOnce() -> Option<Spec>,
         source: &mut dyn FnMut(&str) -> Option<String>,
-    ) -> Arc<Vec<Symbol>> {
-        if self.spec.is_none() {
-            self.spec = Some(Arc::new(load_spec().unwrap_or_default()));
-        }
-        if let Some((cached, symbols)) = self.symbols.get(&key)
+    ) -> SymbolSet {
+        self.symbols_for_inner(key, h, typing, text, load_spec, source, None)
+    }
+
+    /// UI variant of [`Self::symbols_for`] that offloads re-parsing huge scripts
+    /// (> 16 KiB) after an edit to a background worker thread when `background` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn symbols_for_ui(
+        &mut self,
+        key: ResKey,
+        h: u64,
+        typing: bool,
+        text: &str,
+        load_spec: impl FnOnce() -> Option<Spec>,
+        source: &mut dyn FnMut(&str) -> Option<String>,
+        ctx: &egui::Context,
+        background: bool,
+    ) -> SymbolSet {
+        self.poll_symbol_job(ctx, true);
+        self.symbols_for_inner(key, h, typing, text, load_spec, source, background.then_some(ctx))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn symbols_for_inner(
+        &mut self,
+        key: ResKey,
+        h: u64,
+        typing: bool,
+        text: &str,
+        load_spec: impl FnOnce() -> Option<Spec>,
+        source: &mut dyn FnMut(&str) -> Option<String>,
+        ctx: Option<&egui::Context>,
+    ) -> SymbolSet {
+        let spec_symbols = self.ensure_spec_symbols(load_spec);
+        if let Some((cached, set)) = self.symbols.get(&key)
             && (*cached == h || typing)
         {
-            return symbols.clone();
+            return set.clone();
         }
-        let mut all = script_symbols(text, source);
-        all.extend(from_spec(self.spec.as_ref().expect("loaded")));
-        // By name, as the side lists show them (not sorted every frame);
-        // of one name, the script's own before nwscript's.
-        all.sort_by(|a, b| a.name.cmp(&b.name));
-        let all = Arc::new(all);
-        self.symbols.insert(key, (h, all.clone()));
-        all
+        if let Some(ctx) = ctx
+            && text.len() > ASYNC_SYMBOL_BYTES
+            && let Some((_, existing)) = self.symbols.get(&key)
+        {
+            if let Some(job) = self.symbol_job.0.as_ref()
+                && job.key == key
+                && job.h == h
+            {
+                return existing.clone();
+            }
+            let existing = existing.clone();
+            let owned_text = text.to_string();
+            let includes = collect_includes(text, source);
+            let reads = includes.keys().cloned().collect();
+            let ctx_bg = ctx.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let res =
+                    script_symbols_with_deps(&owned_text, &mut |name| includes.get(name).cloned());
+                let _ = tx.send(res);
+                ctx_bg.request_repaint();
+            });
+            self.symbol_job.0 = Some(SymbolJob { key, h, reads, rx });
+            self.symbol_jobs_started += 1;
+            return existing;
+        }
+        let (mut own, deps) = script_symbols_with_deps(text, source);
+        own.sort_by(|a, b| a.name.cmp(&b.name));
+        let set = SymbolSet { own: Arc::new(own), spec: spec_symbols };
+        self.symbols.insert(key, (h, set.clone()));
+        self.symbol_deps.insert(key, deps);
+        set
     }
 }
 
 /// The byte index of a character index.
 pub fn byte_index(text: &str, chars: usize) -> usize {
+    if text.is_ascii() {
+        return chars.min(text.len());
+    }
     text.char_indices().nth(chars).map_or(text.len(), |(b, _)| b)
 }
 
@@ -407,7 +863,12 @@ pub fn line_moved(text: &str, at: usize, lines: isize) -> usize {
 
 /// The character index of a byte index.
 pub fn char_index(text: &str, bytes: usize) -> usize {
-    text[..bytes.min(text.len())].chars().count()
+    if text.is_ascii() {
+        return bytes.min(text.len());
+    }
+    // (A byte inside a character, as a place of another text may be:
+    // that character's index.)
+    text.char_indices().take_while(|(b, _)| *b < bytes).count()
 }
 
 /// The character index where a line (0-based) starts.
@@ -416,20 +877,21 @@ pub fn line_start(text: &str, line: usize) -> usize {
         return 0;
     }
     let mut n = 0;
-    for (i, c) in text.chars().enumerate() {
-        if c == '\n' {
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
             n += 1;
             if n == line {
-                return i + 1;
+                return char_index(text, i + 1);
             }
         }
     }
-    text.chars().count()
+    if text.is_ascii() { text.len() } else { text.chars().count() }
 }
 
 /// The line (0-based) of a character index.
 pub fn line_of(text: &str, chars: usize) -> usize {
-    text.chars().take(chars).filter(|c| *c == '\n').count()
+    let b = byte_index(text, chars);
+    text.as_bytes()[..b].iter().filter(|&&c| c == b'\n').count()
 }
 
 fn is_ident(c: char) -> bool {
@@ -438,18 +900,46 @@ fn is_ident(c: char) -> bool {
 
 /// The identifier ending at a character index: its start and text.
 pub fn word_before(text: &str, chars: usize) -> (usize, String) {
-    let before: Vec<char> = text.chars().take(chars).collect();
-    let start = before.iter().rposition(|c| !is_ident(*c)).map_or(0, |p| p + 1);
-    (start, before[start..].iter().collect())
+    // (From the character's byte backwards, as `word_at`: every character
+    // before the cursor was copied out, each frame a completion list was
+    // open.)
+    let at = byte_index(text, chars);
+    let before = text[..at].char_indices().rev().find(|(_, c)| !is_ident(*c));
+    let start = before.map_or(0, |(i, c)| i + c.len_utf8());
+    let word = &text[start..at];
+    // (An index past the text's end is its end.)
+    let chars = if at == text.len() { chars.min(text.chars().count()) } else { chars };
+    (chars - word.chars().count(), word.to_string())
+}
+
+/// Whether the characters `from..to` of `text` hold a line end.
+pub fn spans_lines(text: &str, from: usize, to: usize) -> bool {
+    let (a, b) = (byte_index(text, from.min(to)), byte_index(text, from.max(to)));
+    text.as_bytes()[a..b].contains(&b'\n')
+}
+
+/// The text of each of `lines` (0-based) of `text`, trimmed, in one pass
+/// over it; a line it does not have is empty.
+pub fn lines_text(text: &str, lines: impl IntoIterator<Item = usize>) -> HashMap<usize, &str> {
+    let mut found: HashMap<usize, &str> = lines.into_iter().map(|l| (l, "")).collect();
+    let Some(last) = found.keys().copied().max() else { return found };
+    for (i, line) in text.lines().enumerate().take(last.saturating_add(1)) {
+        if let Some(text) = found.get_mut(&i) {
+            *text = line.trim();
+        }
+    }
+    found
 }
 
 /// What a new line begins with, started at character `at`: the spaces and
 /// tabs its line begins with (those before `at`), so that the new line is
 /// as far in as the one it is started from, as in Aurora.
 pub fn new_line_indent(text: &str, at: usize) -> String {
-    let before: String = text.chars().take(at).collect();
-    let line = before.rsplit('\n').next().unwrap_or_default();
-    line.chars().take_while(|c| *c == ' ' || *c == '\t').collect()
+    let b = byte_index(text, at);
+    let line_start = text[..b].rfind('\n').map_or(0, |i| i + 1);
+    let line = &text[line_start..b];
+    let n = line.bytes().take_while(|&c| c == b' ' || c == b'\t').count();
+    line[..n].to_string()
 }
 
 /// One step of indentation: a tab, or `width` spaces; as the script is
@@ -540,8 +1030,9 @@ impl Indent {
         if self.tabs {
             return "\t".into();
         }
-        let before: String = text.chars().take(at).collect();
-        let line = before.rsplit('\n').next().unwrap_or_default();
+        let b = byte_index(text, at);
+        let line_start = text[..b].rfind('\n').map_or(0, |i| i + 1);
+        let line = &text[line_start..b];
         let column = line.chars().fold(0, |col, c| {
             if c == '\t' { (col / self.width + 1) * self.width } else { col + 1 }
         });
@@ -562,32 +1053,39 @@ pub fn indent_lines(
     indent: Indent,
 ) -> (String, usize, usize) {
     let unit = indent.unit();
-    let chars: Vec<char> = text.chars().collect();
-    let (from, to) = (from.min(chars.len()), to.min(chars.len()).max(from.min(chars.len())));
-    let start = chars[..from].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+    let from_b = byte_index(text, from);
+    let to_b = byte_index(text, to).max(from_b);
+    let start_b = text[..from_b].rfind('\n').map_or(0, |i| i + 1);
     // A selection ending at a line's start leaves that line alone.
-    let last = if to > from && chars[to - 1] == '\n' { to - 1 } else { to };
-    let end = chars[last..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| last + i);
-    let block: String = chars[start..end].iter().collect();
-    let lines: Vec<String> = block
-        .split('\n')
-        .map(|line| {
-            // (An empty line is left empty: no trailing spaces.)
-            if !outdent {
-                return if line.is_empty() { String::new() } else { format!("{unit}{line}") };
+    let last_b = if to_b > from_b && text.as_bytes()[to_b - 1] == b'\n' { to_b - 1 } else { to_b };
+    let end_b = text[last_b..].find('\n').map_or(text.len(), |i| last_b + i);
+    let block = &text[start_b..end_b];
+    let mut new_block = String::with_capacity(block.len() + unit.len() * 4);
+    for (idx, line) in block.split('\n').enumerate() {
+        if idx > 0 {
+            new_block.push('\n');
+        }
+        // (An empty line is left empty: no trailing spaces.)
+        if !outdent {
+            if !line.is_empty() {
+                new_block.push_str(&unit);
+                new_block.push_str(line);
             }
-            if let Some(rest) = line.strip_prefix('\t') {
-                return rest.to_string();
-            }
-            let spaces = line.chars().take(indent.width).take_while(|&c| c == ' ').count();
-            line[spaces..].to_string()
-        })
-        .collect();
-    let new_block = lines.join("\n");
-    let head: String = chars[..start].iter().collect();
-    let tail: String = chars[end..].iter().collect();
-    let new_end = start + new_block.chars().count();
-    (format!("{head}{new_block}{tail}"), start, new_end)
+        } else if let Some(rest) = line.strip_prefix('\t') {
+            new_block.push_str(rest);
+        } else {
+            let spaces = line.bytes().take(indent.width).take_while(|&b| b == b' ').count();
+            new_block.push_str(&line[spaces..]);
+        }
+    }
+    let start_char = char_index(text, start_b);
+    let new_block_chars =
+        if new_block.is_ascii() { new_block.len() } else { new_block.chars().count() };
+    let mut out = String::with_capacity(start_b + new_block.len() + (text.len() - end_b));
+    out.push_str(&text[..start_b]);
+    out.push_str(&new_block);
+    out.push_str(&text[end_b..]);
+    (out, start_char, start_char + new_block_chars)
 }
 
 /// `text` with each line's indentation (the spaces and tabs it begins
@@ -596,23 +1094,31 @@ pub fn indent_lines(
 /// left of a step stays spaces (a ` * ` under `/*`, a column lined up).
 pub fn convert_indentation(text: &str, tabs: bool, width: usize) -> String {
     let width = width.max(1);
-    let lines: Vec<String> = text
-        .split('\n')
-        .map(|line| {
-            let rest = line.trim_start_matches([' ', '\t']);
-            let lead = &line[..line.len() - rest.len()];
-            let columns = lead
-                .chars()
-                .fold(0, |col, c| if c == '\t' { (col / width + 1) * width } else { col + 1 });
-            let lead = if tabs {
-                format!("{}{}", "\t".repeat(columns / width), " ".repeat(columns % width))
-            } else {
-                " ".repeat(columns)
-            };
-            format!("{lead}{rest}")
-        })
-        .collect();
-    lines.join("\n")
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let rest = line.trim_start_matches([' ', '\t']);
+        let lead = &line[..line.len() - rest.len()];
+        let columns = lead
+            .bytes()
+            .fold(0, |col, b| if b == b'\t' { (col / width + 1) * width } else { col + 1 });
+        if tabs {
+            for _ in 0..(columns / width) {
+                out.push('\t');
+            }
+            for _ in 0..(columns % width) {
+                out.push(' ');
+            }
+        } else {
+            for _ in 0..columns {
+                out.push(' ');
+            }
+        }
+        out.push_str(rest);
+    }
+    out
 }
 
 /// [`convert_indentation`] of the lines a selection (character indexes
@@ -630,31 +1136,103 @@ pub fn convert_indentation_in(
     if from == to {
         return convert_indentation(text, tabs, width);
     }
-    let chars: Vec<char> = text.chars().collect();
-    let (from, to) = (from.min(chars.len()), to.min(chars.len()));
-    let start = chars[..from].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
-    let last = if chars[to - 1] == '\n' { to - 1 } else { to };
-    let end = chars[last..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| last + i);
-    let (head, block, tail): (String, String, String) = (
-        chars[..start].iter().collect(),
-        chars[start..end].iter().collect(),
-        chars[end..].iter().collect(),
-    );
-    format!("{head}{}{tail}", convert_indentation(&block, tabs, width))
+    let from_b = byte_index(text, from);
+    let to_b = byte_index(text, to).max(from_b);
+    let start_b = text[..from_b].rfind('\n').map_or(0, |i| i + 1);
+    let last_b = if to_b > from_b && text.as_bytes()[to_b - 1] == b'\n' { to_b - 1 } else { to_b };
+    let end_b = text[last_b..].find('\n').map_or(text.len(), |i| last_b + i);
+    let converted = convert_indentation(&text[start_b..end_b], tabs, width);
+    let mut out = String::with_capacity(start_b + converted.len() + (text.len() - end_b));
+    out.push_str(&text[..start_b]);
+    out.push_str(&converted);
+    out.push_str(&text[end_b..]);
+    out
 }
 
 /// The identifier around a character index.
 pub fn word_at(text: &str, chars: usize) -> Option<String> {
-    let all: Vec<char> = text.chars().collect();
-    let mut start = chars.min(all.len());
-    while start > 0 && is_ident(all[start - 1]) {
-        start -= 1;
+    // (From the character's byte on: a script's characters were all
+    // copied out, a frame's millisecond in a script of 14,000 lines.)
+    let at = byte_index(text, chars);
+    let before = text[..at].char_indices().rev().find(|(_, c)| !is_ident(*c));
+    let start = before.map_or(0, |(i, c)| i + c.len_utf8());
+    let end = text[at..].find(|c| !is_ident(c)).map_or(text.len(), |i| at + i);
+    (end > start).then(|| text[start..end].to_string())
+}
+
+/// Where `pat` is found in `hay`, each match's first character: matches
+/// don't overlap, from the text's start (as Replace All replaces them).
+/// Without Match case, letter by letter with case and accents aside
+/// ([`mg_core::text::same_letter`]), so what is found is as long as `pat`.
+fn matches(hay: &[char], pat: &[char], o: &SearchOptions) -> Vec<usize> {
+    let mut found = Vec::new();
+    let Some(last) = hay.len().checked_sub(pat.len()).filter(|_| !pat.is_empty()) else {
+        return found;
+    };
+    let same =
+        |a: char, b: char| if o.match_case { a == b } else { mg_core::text::same_letter(a, b) };
+    let whole = |s: usize| {
+        let before = s == 0 || !is_ident(hay[s - 1]);
+        let after = hay.get(s + pat.len()).is_none_or(|&c| !is_ident(c));
+        !o.whole_word || (before && after)
+    };
+    let mut s = 0;
+    while s <= last {
+        if hay[s..s + pat.len()].iter().zip(pat).all(|(&h, &p)| same(h, p)) && whole(s) {
+            found.push(s);
+            s += pat.len();
+        } else {
+            s += 1;
+        }
     }
-    let mut end = chars.min(all.len());
-    while end < all.len() && is_ident(all[end]) {
-        end += 1;
+    found
+}
+
+fn whole_at(text: &str, start_b: usize, end_b: usize) -> bool {
+    let before = text[..start_b].chars().next_back().is_none_or(|c| !is_ident(c));
+    let after = text[end_b..].chars().next().is_none_or(|c| !is_ident(c));
+    before && after
+}
+
+fn byte_matches(text: &str, needle: &str, o: &SearchOptions) -> Option<(Vec<usize>, usize)> {
+    if needle.is_empty() {
+        return Some((Vec::new(), 0));
     }
-    (end > start).then(|| all[start..end].iter().collect())
+    if o.match_case {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(rel) = text[at..].find(needle) {
+            let s = at + rel;
+            let e = s + needle.len();
+            if !o.whole_word || whole_at(text, s, e) {
+                out.push(s);
+                at = e;
+            } else {
+                at = s + text[s..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        return Some((out, needle.len()));
+    }
+    if text.is_ascii() && needle.is_ascii() {
+        let hay = text.as_bytes();
+        let pat = needle.as_bytes();
+        let mut out = Vec::new();
+        if let Some(last) = hay.len().checked_sub(pat.len()) {
+            let mut s = 0;
+            while s <= last {
+                if hay[s..s + pat.len()].eq_ignore_ascii_case(pat)
+                    && (!o.whole_word || whole_at(text, s, s + pat.len()))
+                {
+                    out.push(s);
+                    s += pat.len();
+                } else {
+                    s += 1;
+                }
+            }
+        }
+        return Some((out, pat.len()));
+    }
+    None
 }
 
 /// The next match of `needle` from a character index (wrapping around),
@@ -665,28 +1243,22 @@ pub fn find(text: &str, needle: &str, from: usize, o: &SearchOptions) -> Option<
     if needle.is_empty() {
         return None;
     }
+    if let Some((found, _)) = byte_matches(text, needle, o) {
+        let from_b = byte_index(text, from);
+        let pick = if o.backwards {
+            found.iter().rev().find(|b| **b < from_b).or(found.last())
+        } else {
+            found.iter().find(|b| **b >= from_b).or(found.first())
+        };
+        let pat_chars = if needle.is_ascii() { needle.len() } else { needle.chars().count() };
+        return pick.map(|&b| {
+            let s = char_index(text, b);
+            (s, s + pat_chars)
+        });
+    }
     let hay: Vec<char> = text.chars().collect();
     let pat: Vec<char> = needle.chars().collect();
-    let last = hay.len().checked_sub(pat.len())?;
-    let same =
-        |a: char, b: char| if o.match_case { a == b } else { mg_core::text::same_letter(a, b) };
-    let whole = |s: usize| {
-        let before = s == 0 || !is_ident(hay[s - 1]);
-        let after = hay.get(s + pat.len()).is_none_or(|&c| !is_ident(c));
-        !o.whole_word || (before && after)
-    };
-    // (Matches don't overlap, from the text's start: as Replace All
-    // replaces them.)
-    let mut matches = Vec::new();
-    let mut s = 0;
-    while s <= last {
-        if hay[s..s + pat.len()].iter().zip(&pat).all(|(&h, &p)| same(h, p)) && whole(s) {
-            matches.push(s);
-            s += pat.len();
-        } else {
-            s += 1;
-        }
-    }
+    let matches = matches(&hay, &pat, o);
     let pick = if o.backwards {
         matches.iter().rev().find(|s| **s < from).or(matches.last())
     } else {
@@ -700,8 +1272,30 @@ pub fn find(text: &str, needle: &str, from: usize, o: &SearchOptions) -> Option<
 /// replaces. (Replace compared the selection itself, A to Z alone and
 /// whole words or not, and refused what Find had found: "É" for "é".)
 pub fn is_match_at(text: &str, needle: &str, start: usize, end: usize, o: &SearchOptions) -> bool {
-    let forward = SearchOptions { backwards: false, ..o.clone() };
-    start != end && find(text, needle, start, &forward) == Some((start, end))
+    if start >= end || needle.is_empty() {
+        return false;
+    }
+    let sb = byte_index(text, start);
+    let eb = byte_index(text, end);
+    if sb >= eb {
+        return false;
+    }
+    if o.whole_word && !whole_at(text, sb, eb) {
+        return false;
+    }
+    let sub = &text[sb..eb];
+    if o.match_case {
+        return sub == needle;
+    }
+    let mut sc = sub.chars();
+    let mut nc = needle.chars();
+    loop {
+        match (sc.next(), nc.next()) {
+            (Some(a), Some(b)) if mg_core::text::same_letter(a, b) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
 }
 
 /// Every line containing `needle`: (0-based line, the line's text).
@@ -716,29 +1310,56 @@ pub fn find_lines(text: &str, needle: &str, o: &SearchOptions) -> Vec<(usize, St
 }
 
 /// Replaces every match; returns the new text and how many were replaced.
+/// The matches are those of the text as it is ([`matches`]: what Find
+/// finds one after another), each replaced once, in one pass: what a
+/// replacement leaves is not looked through again. (It was, from the
+/// text's start for each match: two spaces for one left about half of a
+/// run, and a name used a thousand times took a thousand passes.)
 pub fn replace_all(text: &str, needle: &str, with: &str, o: &SearchOptions) -> (String, usize) {
-    let mut out = text.to_string();
-    let mut n = 0;
-    let mut from = 0;
-    let forward = SearchOptions { backwards: false, ..o.clone() };
-    while let Some((s, e)) = find(&out, needle, from, &forward) {
-        if s < from || n > out.len() {
-            break;
-        }
-        let (bs, be) = (byte_index(&out, s), byte_index(&out, e));
-        out.replace_range(bs..be, with);
-        from = s + with.chars().count();
-        n += 1;
+    if needle.is_empty() {
+        return (text.to_string(), 0);
     }
-    (out, n)
+    if let Some((found, pat_bytes)) = byte_matches(text, needle, o) {
+        if found.is_empty() {
+            return (text.to_string(), 0);
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        for &b in &found {
+            out.push_str(&text[at..b]);
+            out.push_str(with);
+            at = b + pat_bytes;
+        }
+        out.push_str(&text[at..]);
+        return (out, found.len());
+    }
+    let hay: Vec<char> = text.chars().collect();
+    let pat: Vec<char> = needle.chars().collect();
+    let found = matches(&hay, &pat, o);
+    if found.is_empty() {
+        return (text.to_string(), 0);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for &s in &found {
+        out.extend(&hay[at..s]);
+        out.push_str(with);
+        at = s + pat.len();
+    }
+    out.extend(&hay[at..]);
+    (out, found.len())
 }
 
 /// Completion candidates: symbols starting with the prefix (any case),
 /// custom ones first, then by name.
 pub fn completions(symbols: &[Symbol], prefix: &str) -> Vec<Symbol> {
+    completions_from(symbols.iter(), prefix)
+}
+
+fn completions_from<'a>(symbols: impl Iterator<Item = &'a Symbol>, prefix: &str) -> Vec<Symbol> {
     let p = prefix.to_ascii_lowercase();
     let mut out: Vec<Symbol> =
-        symbols.iter().filter(|s| s.name.to_ascii_lowercase().starts_with(&p)).cloned().collect();
+        symbols.filter(|s| s.name.to_ascii_lowercase().starts_with(&p)).cloned().collect();
     out.sort_by(|a, b| b.custom.cmp(&a.custom).then_with(|| a.name.cmp(&b.name)));
     out.dedup_by(|a, b| a.name == b.name);
     out.truncate(200);
@@ -920,6 +1541,18 @@ mod tests {
         assert_eq!(byte_index(t, 6), 7, "é is two bytes");
         assert_eq!(word_before("x = GetFir", 10), (4, "GetFir".into()));
         assert_eq!(word_at("int nCount;", 6).as_deref(), Some("nCount"));
+        assert_eq!(word_at("int nCount;", 4).as_deref(), Some("nCount"));
+        assert_eq!(word_at("int nCount;", 10).as_deref(), Some("nCount"));
+        assert_eq!(word_at("int nCount;", 11), None);
+        assert_eq!(word_at("nA", 0).as_deref(), Some("nA"));
+        assert_eq!(word_at("nA", 2).as_deref(), Some("nA"));
+        assert_eq!(word_at("nA", 9).as_deref(), Some("nA"), "past the end: the last word");
+        assert_eq!(
+            word_at("// é sA = ü;", 6).as_deref(),
+            Some("sA"),
+            "after a letter of two bytes"
+        );
+        assert_eq!(word_at("é", 1), None);
     }
 
     #[test]
@@ -954,6 +1587,69 @@ mod tests {
         assert_eq!(find(tree, "arbol", 0, &exact), Some((10, 15)));
         assert_eq!(replace_all(tree, "arbol", "roble", &o), ("// roble, roble".into(), 2));
         assert_eq!(find_lines("Árbol\nx\narbol", "arbol", &o).len(), 2);
+    }
+
+    /// The word before the cursor, the lines a selection spans and the
+    /// bookmarked lines' texts are read where they are, not through a copy
+    /// of the text's characters or a walk from its top for each: as the
+    /// plain way has them.
+    #[test]
+    fn the_cursor_s_word_a_selection_s_lines_and_marked_lines_texts() {
+        let text = "int n\u{e9}e = GetLo\n  caf\u{e9}_x;\n\nlast";
+        let plain = |chars: usize| {
+            let before: Vec<char> = text.chars().take(chars).collect();
+            let start = before.iter().rposition(|c| !is_ident(*c)).map_or(0, |p| p + 1);
+            (start, before[start..].iter().collect::<String>())
+        };
+        for chars in 0..text.chars().count() + 3 {
+            assert_eq!(word_before(text, chars), plain(chars), "at {chars}");
+        }
+        assert_eq!(word_before(text, 15), (10, "GetLo".into()));
+        assert_eq!(word_before("", 4), (0, String::new()));
+        for (from, to) in [(0, 3), (0, 15), (0, 16), (15, 16), (16, 15), (16, 16), (30, 99)] {
+            let (a, b) = (from.min(to), from.max(to));
+            let plain = text.chars().skip(a).take(b - a).any(|c| c == '\n');
+            assert_eq!(spans_lines(text, from, to), plain, "{from}..{to}");
+        }
+        let texts = lines_text(text, [1, 3, 0, 9]);
+        assert_eq!(texts[&0], "int n\u{e9}e = GetLo");
+        assert_eq!((texts[&1], texts[&3], texts[&9]), ("caf\u{e9}_x;", "last", ""));
+        assert!(lines_text(text, []).is_empty());
+    }
+
+    /// A selection kept from a longer text (the external editor emptied
+    /// the file in the frame a conversion was pending) converts the line
+    /// it is held to, and nothing of an empty text: it read the character
+    /// before the text's start.
+    #[test]
+    fn convert_indentation_of_a_selection_past_the_text_s_end() {
+        assert_eq!(convert_indentation_in("", true, 4, 3, 9), "");
+        assert_eq!(convert_indentation_in("    a\n    b", true, 4, 30, 90), "    a\n\tb");
+        assert_eq!(convert_indentation_in("    a\n    b\n", true, 4, 30, 90), "    a\n    b\n");
+        assert_eq!(convert_indentation_in("    a\n    b\n", true, 4, 2, 6), "\ta\n    b\n");
+    }
+
+    /// Replace All replaces the matches the text has, each once: a needle
+    /// that overlaps itself is not missed in what a replacement leaves
+    /// (two spaces for one left three of four), and a text of many
+    /// matches is gone through once, not once a match.
+    #[test]
+    fn replace_all_replaces_each_match_of_the_text_once() {
+        let o = SearchOptions::default();
+        assert_eq!(replace_all("    ", "  ", " ", &o), ("  ".into(), 2));
+        assert_eq!(replace_all("a\n\n\n\n\n\nb", "\n\n\n", "\n\n", &o), ("a\n\n\n\nb".into(), 2));
+        assert_eq!(replace_all("aaa", "a", "aa", &o), ("aaaaaa".into(), 3));
+        assert_eq!(replace_all("abc", "", "x", &o), ("abc".into(), 0));
+        assert_eq!(replace_all("ab", "abc", "x", &o), ("ab".into(), 0));
+        // A megabyte with 5,000 matches (each pass copied the text).
+        let line = format!("    int nValue = GetLocalInt(oPC, \"{}\");\n", "x".repeat(180));
+        let text = line.repeat(5_000);
+        assert!(text.len() > 1_000_000);
+        let started = std::time::Instant::now();
+        let (out, n) = replace_all(&text, "GetLocalInt", "GetInt", &o);
+        assert_eq!(n, 5_000);
+        assert_eq!(out, text.replace("GetLocalInt", "GetInt"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]
@@ -998,6 +1694,60 @@ mod tests {
         let adds: Vec<bool> =
             symbols.iter().filter(|s| s.name == "Add").map(|s| s.custom).collect();
         assert_eq!(adds, [true, false], "the script's own first");
+    }
+
+    /// A long script's symbols read on a worker (`symbols_for_ui`) with an
+    /// include as it was: the include edited meanwhile, what the worker
+    /// found is let go, and the script's symbols are the edited include's.
+    /// They had been kept with its old declarations (review D4).
+    #[test]
+    fn a_worker_s_symbols_go_when_an_include_it_read_is_edited() {
+        let (main, inc) = (super::nss("big").unwrap(), super::nss("inc_a").unwrap());
+        let ctx = egui::Context::default();
+        let mut tools = super::ScriptTools::default();
+        let filler: String = (0..1200).map(|i| format!("int nFill{i} = {i};\n")).collect();
+        let text = format!("#include \"inc_a\"\n{filler}void main() {{}}\n");
+        assert!(text.len() > super::ASYNC_SYMBOL_BYTES);
+        let include = |name: &'static str| {
+            move |n: &str| (n == "inc_a").then(|| format!("void {name}();\nvoid {name}() {{}}\n"))
+        };
+        let names = |s: &super::SymbolSet| -> Vec<String> {
+            s.own.iter().map(|s| s.name.clone()).filter(|n| n.ends_with("Name")).collect()
+        };
+        let first = tools.symbols_for_ui(
+            main,
+            1,
+            false,
+            &text,
+            || None,
+            &mut include("OldName"),
+            &ctx,
+            true,
+        );
+        assert_eq!(names(&first), ["OldName"]);
+        // Typed in: read on a worker, the include as it is now.
+        let typed = format!("{text}// typed\n");
+        tools.symbols_for_ui(main, 2, false, &typed, || None, &mut include("OldName"), &ctx, true);
+        assert!(tools.reading_symbols(), "read on a worker");
+        // The include edited in its own editor before the worker is done.
+        tools.seen.insert(inc, 7);
+        tools.invalidate_dependents(inc);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tools.reading_symbols() && std::time::Instant::now() < deadline {
+            tools.poll_symbol_job(&ctx, false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let now = tools.symbols_for_ui(
+            main,
+            2,
+            false,
+            &typed,
+            || None,
+            &mut include("NewName"),
+            &ctx,
+            true,
+        );
+        assert_eq!(names(&now), ["NewName"], "the edited include's");
     }
 
     /// The templates' folders are read again a couple of seconds on, or

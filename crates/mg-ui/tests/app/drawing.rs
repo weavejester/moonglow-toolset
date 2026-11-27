@@ -32,6 +32,55 @@ fn model_viewer_plays_animations() {
     assert!(img.width() > 0);
 }
 
+/// The model viewer's Shadow switch (on unless turned off, kept in the
+/// settings): the model casts the sun's shadow on a ground under it that
+/// is otherwise unseen, so the picture with it on differs from the one
+/// with it off only where the shadow darkens the background, below the
+/// model; the switch in the toolbar turns it off, and the settings keep
+/// that.
+#[test]
+fn the_model_viewer_s_model_casts_its_shadow_on_an_unseen_ground() {
+    let root = mg_testkit::corpus!();
+    let Some(rs) = gpu() else { return };
+    let mut app = game_app(&root, None);
+    app.set_render_state(rs.clone());
+    app.settings.game_shaders = Some(false);
+    assert!(app.settings.model_shadows(), "on by default");
+    let key = ResKey::parse("plc_a01", ResType::MDL).unwrap();
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
+    let mut h = gpu_harness(app, rs, 900.0, 700.0);
+    h.run_steps(3);
+    let rect = h
+        .state()
+        .dock
+        .iter_leaves()
+        .find(|(_, l)| l.tabs.contains(&Tab::Model(key)))
+        .map(|(_, l)| l.viewport)
+        .unwrap();
+    let ppp = h.ctx.pixels_per_point();
+    let picture = |h: &mut Harness<'_, Moonglow>| {
+        let img = h.render().expect("render");
+        let (x0, y0) = ((rect.min.x * ppp) as u32 + 4, (rect.min.y * ppp) as u32 + 60);
+        let (x1, y1) = ((rect.max.x * ppp) as u32 - 4, (rect.max.y * ppp) as u32 - 4);
+        (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = img.get_pixel(x, y).0;
+                (y, u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]))
+            })
+            .collect::<Vec<_>>()
+    };
+    let shadowed = picture(&mut h);
+    h.get_by_label("Shadow").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.model_shadows, Some(false), "kept in the settings");
+    let plain = picture(&mut h);
+    let darker = shadowed.iter().zip(&plain).filter(|((_, s), (_, p))| s + 24 < *p).count();
+    let lighter = shadowed.iter().zip(&plain).filter(|((_, s), (_, p))| *s > p + 6).count();
+    assert!(darker > 400, "the shadow: {darker} pixels darker");
+    assert_eq!(lighter, 0, "nothing lighter with the shadow");
+}
+
 /// The model viewer's wheel is the area view's: the wheel zooms, Shift
 /// and Ctrl with it zoom finer, a pinch zooms, and a sideways scroll pans
 /// (it had the wheel alone, and Shift or Ctrl with it did nothing).
@@ -269,6 +318,110 @@ fn the_area_view_is_lit_by_objects_lights_and_illumination() {
     assert!(!greener(g), "no lamp with the lighting off: {g:?}");
 }
 
+/// Light Shadows are cast only where Creature Shadows are on (the
+/// review's R4, the owner's decision of 10 November 2026; the client's
+/// Creature Shadow Detail Off takes the lights' shadows away too,
+/// `docs/research/notes_shaders.md`): in a tic01 room without the sun's
+/// or moon's shadows, an ogre beside a lamp post (placeables.2da row 73)
+/// casts one from the lamp with both ticked, none with Creature Shadows
+/// unticked and Light Shadows left ticked, and casts it again, Light
+/// Shadows as they were, when Creature Shadows are ticked again. The
+/// pictures go to `target/test-output/ui-area-light-shadows-shots/`.
+#[test]
+fn light_shadows_are_cast_only_with_creature_shadows() {
+    let prepare = |m: &mut mg_module::Module, game: &mg_rules::GameData, area: ResRef| {
+        use mg_module::instances::{Placement, Placing, instance};
+        let key = ResKey::new(area, ResType::ARE);
+        let mut are = m.gff(&key).unwrap().unwrap();
+        for (label, v) in [("SunShadows", 0u8), ("MoonShadows", 0), ("ShadowOpacity", 100)] {
+            are.root.set(label, mg_gff::Value::Byte(v));
+        }
+        // (Dim, as the client's reading's room: the shadow shows.)
+        for label in ["SunAmbientColor", "SunDiffuseColor", "MoonAmbientColor", "MoonDiffuseColor"]
+        {
+            are.root.set(label, mg_gff::Value::Dword(0x30_3030));
+        }
+        m.set_gff(key, &are).unwrap();
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        let ogre = ResKey::parse("nw_ogre01", ResType::UTC).unwrap();
+        let ogre = Gff::read(&game.resman.get(&ogre).unwrap()).unwrap();
+        let at = Placement { position: [20.0, 22.0, 0.0], rotation: 270f32.to_radians() };
+        let mut c = instance(&placing, ResType::UTC, &ogre.root, at, &[]).unwrap();
+        // (Standing still: no scripts.)
+        let scripts: Vec<String> = c
+            .fields
+            .iter()
+            .map(|f| f.label.to_string_lossy())
+            .filter(|l| l.starts_with("Script"))
+            .collect();
+        for label in scripts {
+            c.set(&label, mg_gff::Value::resref(ResRef::EMPTY));
+        }
+        git.root.set("Creature List", mg_gff::Value::List(vec![c]));
+        let mut lamp = mg_module::blueprints::placeable(ResRef::EMPTY, "Lamp Post", 0);
+        lamp.root.set("Appearance", mg_gff::Value::Dword(73));
+        lamp.root.set("Static", mg_gff::Value::Byte(0));
+        let at = Placement { position: [22.5, 22.0, 0.0], rotation: 0.0 };
+        let lamp = instance(&placing, ResType::UTP, &lamp.root, at, &[]).unwrap();
+        git.root.set("Placeable List", mg_gff::Value::List(vec![lamp]));
+        m.set_gff(git_key, &git).unwrap();
+    };
+    let Some((mut h, area)) = area_harness_with("light-shadows", "tic01", None, 4, None, &prepare)
+    else {
+        return;
+    };
+    if let Some(o) = h.state_mut().area_views.get_mut(&area).and_then(|v| v.orbit.as_mut()) {
+        o.target = glam::Vec3::new(20.0, 22.0, 0.0);
+        (o.distance, o.pitch, o.yaw) = (14.0, 0.9, (-90f32).to_radians());
+    }
+    let dir = mg_testkit::scratch_dir("ui-area-light-shadows-shots");
+    let cast = |h: &Harness<'_, Moonglow>| {
+        h.state().viewport.as_ref().map_or(0, |v| v.renderer.drawn.light_shadows)
+    };
+    // Frames until `done` holds of what was drawn (three at least, so that
+    // one is drawn after the change), within a deadline.
+    let until = |h: &mut Harness<'_, Moonglow>, what: &str, done: &dyn Fn(usize) -> bool| {
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        loop {
+            h.run_steps(1);
+            frames += 1;
+            if frames >= 3 && done(cast(h)) {
+                return;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(60), "{what}: {}", cast(h));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let kinds = |h: &Harness<'_, Moonglow>| {
+        let v = &h.state().area_views[&area];
+        (v.creature_shadows, v.light_shadows)
+    };
+    assert_eq!(kinds(&h), (true, true), "both at first");
+    until(&mut h, "the ogre's shadow from the lamp", &|n| n == 1);
+    // The floor west of the ogre, away from the lamp: where its shadow
+    // falls.
+    let ppp = h.ctx.pixels_per_point();
+    let behind = screen(&h, area, glam::Vec3::new(18.8, 22.0, 0.0));
+    let floor = |img: &image::RgbaImage| mean_around(img, ppp, behind, 6.0).iter().sum::<f32>();
+    let both = h.render().unwrap();
+    both.save(dir.join("both.png")).unwrap();
+    h.state_mut().area_views.get_mut(&area).unwrap().creature_shadows = false;
+    until(&mut h, "no light shadow without creature shadows", &|n| n == 0);
+    let none = h.render().unwrap();
+    none.save(dir.join("no-creature-shadows.png")).unwrap();
+    eprintln!("the floor behind the ogre: {} with both, {} without", floor(&both), floor(&none));
+    assert!(floor(&both) < floor(&none) * 0.9, "{} {}", floor(&both), floor(&none));
+    assert_eq!(kinds(&h), (false, true), "Light Shadows kept as left");
+    assert!(!h.state().settings.no_light_shadows, "and stored so");
+    h.state_mut().area_views.get_mut(&area).unwrap().creature_shadows = true;
+    until(&mut h, "the lamp's shadow again", &|n| n == 1);
+    h.render().unwrap().save(dir.join("both-again.png")).unwrap();
+}
+
 /// Opens `area` again as the desktop app opens one (the window kept going:
 /// read on a thread of its own, its textures apart, read anew), and runs
 /// frames until it is drawn whole: whether a frame went by before it was
@@ -443,12 +596,70 @@ fn reload_resources_reads_an_area_again_on_a_thread() {
         std::thread::sleep(std::time::Duration::from_millis(5));
         h.run_steps(1);
     }
+    // (The textures too: the renderer kept those it had by name, so one
+    // repainted in the override, or missing and now there, was drawn as
+    // before. The review's B15. Waited for, not run for six frames: read
+    // on threads, on a busy machine they took longer.)
+    let started = std::time::Instant::now();
+    loop {
+        h.run_steps(1);
+        let renderer = &h.state().viewport.as_ref().unwrap().renderer;
+        if renderer.textures_read() > 0 && renderer.drawn.textures_pending == 0 {
+            break;
+        }
+        let waited = started.elapsed() < std::time::Duration::from_secs(30);
+        assert!(waited, "the area's textures are read again");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     h.run_steps(6);
     h.state_mut().background_jobs = false;
     assert_eq!(h.state().area_views[&area].orbit, camera, "the camera stays");
     let again = view_picture(&mut h, area);
     let differ = here.pixels().zip(again.pixels()).filter(|(a, b)| a != b).count();
     assert_eq!(differ, 0, "{differ} pixels differ");
+}
+
+/// Textures read apart (as the desktop app reads them) are shown in the
+/// first frame after the last of them is read, not at the animations'
+/// next step: the frames a 60th of a second apart, a picture drawn while
+/// textures were being read is drawn again at once when all are, though
+/// its step (40 ms) is not due. (Waiting for it kept Tyrants of the
+/// Moonsea's largest area's opening two steps longer than its reading:
+/// 175 ms where 110.)
+#[test]
+fn an_area_is_drawn_again_as_soon_as_its_textures_are_read() {
+    let Some((app, rs, area)) = area_app("textures-at-once", "ttr01", None, 4, None, &|_, _, _| {})
+    else {
+        return;
+    };
+    let mut h = area_gpu_harness(app, rs, 1100.0, 800.0);
+    h.run_steps(6);
+    h.state_mut().background_jobs = true;
+    let mut redrawn = 0;
+    for _ in 0..3 {
+        // (Read anew, apart, the camera moved a little: the next picture
+        // waits for them.)
+        h.state_mut().viewport.as_mut().unwrap().renderer.clear_textures();
+        let view = h.state_mut().area_views.get_mut(&area).unwrap();
+        view.orbit.as_mut().unwrap().distance *= 1.01;
+        h.run_steps(1);
+        let pending = |h: &Harness<'_, Moonglow>| {
+            h.state().viewport.as_ref().unwrap().renderer.drawn.textures_pending
+        };
+        assert!(pending(&h) > 0, "the picture waits for its textures");
+        let started = std::time::Instant::now();
+        while h.state_mut().viewport.as_mut().unwrap().renderer.textures_still_read() > 0 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(30), "not read");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let pictures = h.state().area_views[&area].pictures;
+        h.run_steps(1);
+        if h.state().area_views[&area].pictures > pictures {
+            redrawn += 1;
+        }
+    }
+    h.state_mut().background_jobs = false;
+    assert_eq!(redrawn, 3, "drawn again in the frame after the last texture was read");
 }
 
 /// Another module with an area of the same name shows its own area, not
@@ -518,13 +729,13 @@ fn the_area_view_s_shaders_switch_draws_with_the_game_s_shaders() {
     assert!(h.state().settings.game_shaders());
     let drawn = |h: &Harness<'_, Moonglow>| h.state().viewport.as_ref().unwrap().renderer.drawn;
     until_the_game_draws(&mut h);
-    h.get_by_label("🎨 Shaders").click();
+    area_click(&mut h, "Shaders");
     h.run_steps(3);
     assert_eq!(h.state().settings.game_shaders, Some(false));
     let pictures = h.state().area_views[&area].pictures;
     assert!(pictures > 0);
     assert_eq!(drawn(&h).game, 0);
-    h.get_by_label("🎨 Shaders").click();
+    area_click(&mut h, "Shaders");
     h.run_steps(1);
     // (Its programs made while the view goes on: Moonglow's shader first.)
     assert!(drawn(&h).game_pending > 0 || drawn(&h).game > 0, "{:?}", drawn(&h));
@@ -539,7 +750,7 @@ fn the_area_view_s_shaders_switch_draws_with_the_game_s_shaders() {
     let saved = serde_json::to_string(&h.state().settings).unwrap();
     let read: mg_ui::Settings = serde_json::from_str(&saved).unwrap();
     assert!(read.game_shaders());
-    h.get_by_label("🎨 Shaders").click();
+    area_click(&mut h, "Shaders");
     h.run_steps(3);
     assert_eq!(h.state().settings.game_shaders, Some(false));
     assert_eq!(drawn(&h).game, 0);
@@ -600,6 +811,8 @@ fn a_stock_interior_looks_alike_with_the_shaders_on_and_off() {
     else {
         return;
     };
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
     let dir = mg_testkit::scratch_dir("ui-interior-shaders");
     let (w, d) = (are.root.int("Width").unwrap() as f32, are.root.int("Height").unwrap() as f32);
     {
@@ -623,15 +836,9 @@ fn a_stock_interior_looks_alike_with_the_shaders_on_and_off() {
             h.run_steps(3);
         }
         let r = h.state().area_views[&area].rect;
+        let ppp = h.ctx.pixels_per_point();
         let img = h.render().expect("render");
-        let img = image::imageops::crop_imm(
-            &img,
-            r.min.x as u32 + 8,
-            r.min.y as u32 + 8,
-            r.width() as u32 - 16,
-            r.height() as u32 - 16,
-        )
-        .to_image();
+        let img = crop_rect(&img, r, ppp, 8.0);
         img.save(dir.join(if on { "on.png" } else { "off.png" })).unwrap();
         img
     };
@@ -733,15 +940,9 @@ fn a_builders_area_in_the_view_draws_as_the_comparison() {
             }
             h.run_steps(frames);
             let r = h.state().area_views[&area].rect;
+            let ppp = h.ctx.pixels_per_point();
             let img = h.render().expect("render");
-            let img = image::imageops::crop_imm(
-                &img,
-                r.min.x as u32,
-                r.min.y as u32,
-                r.width() as u32,
-                r.height() as u32,
-            )
-            .to_image();
+            let img = crop_rect(&img, r, ppp, 0.0);
             img.save(dir.join(format!("{name}_{}.png", if on { "on" } else { "off" }))).unwrap();
             pictures.push(img);
         }
@@ -879,7 +1080,7 @@ fn tdod_s_wind_shaders_move_in_the_area_view() {
         h.run_steps(30);
         shot(&mut h, "off_b")
     }];
-    h.get_by_label("🎨 Shaders").click();
+    area_click(&mut h, "Shaders");
     until_the_game_draws(&mut h);
     let on_a = shot(&mut h, "on_a");
     h.run_steps(30);
@@ -1037,48 +1238,6 @@ fn tdod_s_inc_lighting_changes_the_area_view_through_the_load_order() {
 }
 
 #[test]
-fn preview_window_shows_the_chosen_blueprint() {
-    // (A creature of the module's with a first and a last name.)
-    let guard = |m: &mut mg_module::Module, _: &mg_rules::GameData, _: ResRef| {
-        let text = |t: &str| {
-            mg_gff::Value::LocString(LocString::from_text(Language::ENGLISH, Gender::Male, t))
-        };
-        let mut guard = Gff::new(*b"UTC ");
-        guard.root.set("FirstName", text("Hent"));
-        guard.root.set("LastName", text("Fynolds"));
-        m.set(ResKey::parse("guard001", ResType::UTC).unwrap(), guard.to_bytes().unwrap());
-    };
-    let Some((mut h, _area)) = area_harness_with("preview", "ttr01", None, 4, None, &guard) else {
-        return;
-    };
-    h.get_by_label("👁 Preview").click();
-    h.run_steps(2);
-    h.get_by_label("Choose a blueprint in the palette.");
-    // A waypoint: its fields.
-    h.state_mut().palette.selected = ResKey::parse("nw_waypoint001", ResType::UTW);
-    h.run_steps(2);
-    h.get_by_label("Blueprint ResRef");
-    h.get_by_label("nw_waypoint001");
-    // A chest: also in 3D.
-    let chest = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
-    h.state_mut().palette.selected = Some(chest);
-    h.run_steps(3);
-    h.get_by_label("plc_chest1");
-    assert!(
-        h.state().model_views.contains_key(&mg_ui::model_view::Source::Resource(chest)),
-        "the 3D view"
-    );
-    // An item: also its inventory icon.
-    h.state_mut().palette.selected = ResKey::parse("nw_wswls001", ResType::UTI);
-    h.run_steps(3);
-    h.get_by_label("Item icon");
-    // A creature: by its first and last names, as the module tree names it.
-    h.state_mut().palette.selected = ResKey::parse("guard001", ResType::UTC);
-    h.run_steps(3);
-    h.get_by_label("Hent Fynolds");
-}
-
-#[test]
 fn a_preview_follows_its_blueprint_s_editor() {
     let root = mg_testkit::corpus!();
     let Some(rs) = gpu() else { return };
@@ -1192,7 +1351,7 @@ fn a_store_s_preview_lists_what_it_sells() {
     let path = sample_module(&dir);
     let mut app = game_app(&root, None);
     app.open_module(&path);
-    app.open_palette = false;
+    app.palette_dock = false;
     // The thieves' store of Hordes of the Underdark (its jewelry page has
     // rings and amulets), as the palette's double click opens it.
     let key = ResKey::parse("x2_storethief001", ResType::UTM).unwrap();
@@ -1365,7 +1524,7 @@ fn grass_is_set_in_area_properties_and_grown_in_the_view() {
     assert_eq!(grown(&h), [(GRASS_MATERIAL, "grass".to_string())]);
     // In the picture, and gone with the toolbar's switch.
     let with = h.render().expect("render");
-    h.get_by_label(&format!("{} Grass", "🌿")).click();
+    area_click(&mut h, "Grass");
     h.run_steps(3);
     assert!(h.state().settings.no_grass);
     let without = h.render().expect("render");
@@ -1375,7 +1534,7 @@ fn grass_is_set_in_area_properties_and_grown_in_the_view() {
         .filter(|(a, b)| (0..3).any(|c| a[c].abs_diff(b[c]) > 24))
         .count();
     assert!(changed > 20_000, "the grass changed {changed} pixels");
-    h.get_by_label(&format!("{} Grass", "🌿")).click();
+    area_click(&mut h, "Grass");
     h.run_steps(3);
     assert!(!h.state().settings.no_grass);
 
@@ -1575,6 +1734,10 @@ fn grass_thinned_with_distance_looks() {
 #[test]
 fn grass_covers_the_whole_view() {
     let Some((mut h, area)) = area_harness_sized("grass-far", "ttr01", None, 32) else { return };
+    // (A view as large as the test's points want, whatever the toolbars
+    // above it take: the grass far off is what is looked at.)
+    h.set_size(egui::vec2(1600.0, 1000.0));
+    h.run_steps(3);
     let dir = mg_testkit::output_dir("ui-area-grass-far");
     // (The views: the target, pitch, yaw and distance; and the points
     // far off in each where the grass must show.)
@@ -1628,10 +1791,14 @@ fn grass_covers_the_whole_view() {
             );
             // (Close, a square of a few meters: grass grows in clumps, and
             // one of 40 pixels may fall between two.)
-            let half = if name == "close" { 80 } else { 20 };
-            let (x0, y0) = (at.x as u32 - half, at.y as u32 - half);
-            let changed = (x0..x0 + 2 * half)
-                .flat_map(|x| (y0..y0 + 2 * half).map(move |y| (x, y)))
+            let ppp = h.ctx.pixels_per_point();
+            let half = ((if name == "close" { 80.0 } else { 20.0 }) * ppp).round() as u32;
+            let (cx, cy) = pos_to_pixel(at, ppp);
+            let (x0, y0) = (cx.saturating_sub(half), cy.saturating_sub(half));
+            let x1 = (cx + half).min(shots[0].width());
+            let y1 = (cy + half).min(shots[0].height());
+            let changed = (x0..x1)
+                .flat_map(|x| (y0..y1).map(move |y| (x, y)))
                 .filter(|&(x, y)| {
                     let (a, b) = (shots[0].get_pixel(x, y), shots[1].get_pixel(x, y));
                     (0..3).any(|c| a[c].abs_diff(b[c]) > 12)
@@ -1711,4 +1878,568 @@ fn grass_sways_in_the_wind_with_either_shader() {
             assert!(count > all / 100, "the grass sways in wind {wind}, {shader}'s: {count}");
         }
     }
+}
+
+/// A builder's tinted placeables and wallpaper (The Domains of Dread's
+/// colorway trial of 2026-11-06: its module `MG_TINT_MODULE`, opened from
+/// a copy, with the user folder `MG_TEST_USER` that holds its haks;
+/// skipped without), drawn by the game's shaders as the client drew them
+/// (`docs/design/colorways.md` in that project): the rug with
+/// `tdod_tint` blue beside the reference rug, its static copy untinted,
+/// and the wallpaper the area's `tdod_wallpaper`. The locals taken out,
+/// as in the Variables window, the rug and the wallpaper are drawn as
+/// made at once. Pictures in `target/test-output/ui-tint-trial/`.
+#[test]
+#[ignore]
+fn a_builders_tinted_placeables_and_wallpaper_draw_tinted() {
+    let Some(module) = std::env::var_os("MG_TINT_MODULE").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: MG_TINT_MODULE names no module");
+        return;
+    };
+    let (Some(root), Some(rs)) = (mg_testkit::nwn_root(), gpu()) else { return };
+    let dir = mg_testkit::scratch_dir("ui-tint-trial");
+    let path = dir.join("trial.mod");
+    std::fs::copy(&module, &path).unwrap();
+    let user = std::env::var_os("MG_TEST_USER").map(std::path::PathBuf::from);
+    let install = mg_resman::GameInstall::new(&root, user, "en");
+    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    app.set_render_state(rs.clone());
+    app.settings.game_shaders = Some(true);
+    app.open_module(&path);
+    let area = ResRef::from_str("tt_room").unwrap();
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Area(area)));
+    let mut h = area_gpu_harness(app, rs, 1100.0, 800.0);
+    h.run_steps(3);
+    h.state_mut().area_views.get_mut(&area).unwrap().grid = false;
+    // Looking north over the rugs (as the client's first picture), then
+    // west along the wall papered on its north face (as its second).
+    let orbits = [
+        (glam::Vec3::new(10.0, 12.0, 0.0), 270f32, 55f32, 14f32),
+        (glam::Vec3::new(10.5, 13.0, 2.0), 0.0, 10.0, 5.0),
+    ];
+    let ppp = h.ctx.pixels_per_point();
+    let blue = |c: [f32; 3]| c[2] - c[0];
+    // The rugs' middles (their models lie a little east of their
+    // positions): tinted, the reference and the static one; and the wall.
+    let points = [(5.6, 12.0, 0.0), (11.0, 12.0, 0.0), (15.6, 12.0, 0.0), (8.0, 10.1, 2.0)];
+    let look = |h: &mut Harness<'_, Moonglow>, name: &str| -> [[f32; 3]; 4] {
+        let mut out = [[0.0; 3]; 4];
+        for (i, (target, yaw, pitch, distance)) in orbits.into_iter().enumerate() {
+            h.state_mut().area_views.get_mut(&area).unwrap().orbit =
+                Some(mg_ui::area_view::Orbit {
+                    target,
+                    yaw: yaw.to_radians(),
+                    pitch: pitch.to_radians(),
+                    distance,
+                });
+            h.hover_at(egui::pos2(5.0, 5.0));
+            h.run_steps(3);
+            until_the_game_draws(h);
+            let img = h.render().unwrap();
+            img.save(dir.join(format!("{name}_{i}.png"))).unwrap();
+            let picked: &[usize] = if i == 0 { &[0, 1, 2] } else { &[3] };
+            for &p in picked {
+                let (x, y, z) = points[p];
+                let at = screen(h, area, glam::Vec3::new(x, y, z));
+                out[p] = mean_around(&img, ppp, at, 6.0);
+            }
+        }
+        eprintln!("{name}: rug, reference, static, wall {out:?}");
+        out
+    };
+    let [rug, plain, static_rug, wallpaper] = look(&mut h, "tinted");
+    assert!(blue(rug) > blue(plain) + 20.0, "the rug is blue: {rug:?} against {plain:?}");
+    assert!((blue(static_rug) - blue(plain)).abs() < 8.0, "the static one is not: {static_rug:?}");
+    // The locals taken out: the rug's and the area's.
+    let cleared = |path: mg_edit::GffPath| mg_edit::Edit::SetField {
+        key: ResKey::new(area, ResType::GIT),
+        path,
+        label: "VarTable".into(),
+        value: Some(mg_gff::Value::List(Vec::new())),
+    };
+    let edits = vec![
+        cleared(mg_edit::GffPath::root().item("Placeable List", 0)),
+        cleared(mg_edit::GffPath::root()),
+    ];
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Untint", edits)));
+    let [rug_after, plain_after, _, wallpaper_after] = look(&mut h, "untinted");
+    assert!((blue(rug_after) - blue(plain_after)).abs() < 8.0, "as made: {rug_after:?}");
+    let differ = (0..3).map(|c| (wallpaper[c] - wallpaper_after[c]).abs()).sum::<f32>();
+    assert!(differ > 15.0, "the wallpaper as made: {wallpaper:?} then {wallpaper_after:?}");
+}
+
+/// The builder's tinted rug (as above: `MG_TINT_MODULE`, `MG_TEST_USER`),
+/// its tint picked on its Variables page: while the swatch's picker is
+/// dragged across, the area view draws the rug in the color being picked
+/// (a builder's report: it showed only once set, a command at each step
+/// of the drag). Pictures in `target/test-output/ui-tint-picking/`.
+#[test]
+#[ignore]
+fn a_tint_being_picked_draws_on_the_rug() {
+    let Some(module) = std::env::var_os("MG_TINT_MODULE").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: MG_TINT_MODULE names no module");
+        return;
+    };
+    let (Some(root), Some(rs)) = (mg_testkit::nwn_root(), gpu()) else { return };
+    let dir = mg_testkit::scratch_dir("ui-tint-picking");
+    let path = dir.join("trial.mod");
+    std::fs::copy(&module, &path).unwrap();
+    let user = std::env::var_os("MG_TEST_USER").map(std::path::PathBuf::from);
+    let install = mg_resman::GameInstall::new(&root, user, "en");
+    let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
+    app.set_render_state(rs.clone());
+    app.settings.game_shaders = Some(true);
+    app.open_module(&path);
+    let area = ResRef::from_str("tt_room").unwrap();
+    let git = ResKey::new(area, ResType::GIT);
+    let rug = mg_edit::GffPath::root().item("Placeable List", 0);
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Area(area)));
+    app.blueprint_pages.insert((git, rug.clone()), "Variables");
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Instance { area, path: rug.clone() }));
+    let mut h = area_gpu_harness(app, rs, 1400.0, 800.0);
+    h.run_steps(3);
+    let at = h.state().dock.find_tab(&Tab::Instance { area, path: rug.clone() }).unwrap();
+    if let Some(w) = h.state_mut().dock.get_window_state_mut(at.surface) {
+        w.set_position(egui::pos2(840.0, 120.0)).set_size(egui::vec2(540.0, 420.0));
+    }
+    h.state_mut().area_views.get_mut(&area).unwrap().grid = false;
+    h.state_mut().area_views.get_mut(&area).unwrap().orbit = Some(mg_ui::area_view::Orbit {
+        target: glam::Vec3::new(8.0, 12.0, 0.0),
+        yaw: 270f32.to_radians(),
+        pitch: 55f32.to_radians(),
+        distance: 10.0,
+    });
+    h.run_steps(3);
+    until_the_game_draws(&mut h);
+    let ppp = h.ctx.pixels_per_point();
+    let middle = glam::Vec3::new(5.6, 12.0, 0.0);
+    let look = |h: &mut Harness<'_, Moonglow>, name: &str| -> [f32; 3] {
+        h.run_steps(3);
+        until_the_game_draws(h);
+        let img = h.render().unwrap();
+        img.save(dir.join(format!("{name}.png"))).unwrap();
+        let at = screen(h, area, middle);
+        let c = mean_around(&img, ppp, at, 6.0);
+        eprintln!("{name}: the rug {c:?}");
+        c
+    };
+    let before = look(&mut h, "before");
+    // (The first of its colors: `tdod_tint`.)
+    let swatch = |h: &Harness<'_, Moonglow>| {
+        h.get_all_by(|n| n.role() == egui::accesskit::Role::ColorWell).next().unwrap().rect()
+    };
+    let well = swatch(&h);
+    h.get_all_by(|n| n.role() == egui::accesskit::Role::ColorWell).next().unwrap().click();
+    h.run_steps(3);
+    // Across the picker's square toward its red corner, the button held.
+    let point = |x: f32, y: f32| egui::pos2(well.left() + 20.0 + x, well.bottom() + 60.0 + y);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(egui::Event::PointerMoved(point(0.0, 0.0)));
+    h.event(button(point(0.0, 0.0), true));
+    for i in 1..=10 {
+        h.event(egui::Event::PointerMoved(point(i as f32 * 3.0, i as f32 * 2.0)));
+        h.run();
+    }
+    let picking = look(&mut h, "picking");
+    h.event(button(point(30.0, 20.0), false));
+    h.run_steps(2);
+    let differ = (0..3).map(|c| (before[c] - picking[c]).abs()).sum::<f32>();
+    assert!(differ > 15.0, "drawn as picked: {before:?} then {picking:?}");
+}
+
+/// One source shown in two places in a frame (the Preview panel's
+/// blueprint, and its model's own tab) shared one view and one set of
+/// targets, made twice a frame at two sizes, both pictures sampling the
+/// last (the review's B19). The tab keeps its view (the Preview panel is
+/// drawn after the editor area, as the Preview window was), and the
+/// Preview panel shows the picture the tab drew, fitted, a line over it
+/// saying so (the owner's ruling 19, "one shared preview", M5's W6): one
+/// picture drawn a pass, shown in both places ([`shared_once_a_pass`]).
+#[test]
+fn a_preview_shown_twice_in_a_frame_is_drawn_once() {
+    let Some((mut h, _area)) = area_harness("preview-twice") else { return };
+    let chest = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Model(chest)));
+    h.state_mut().palette.selected = Some(chest);
+    h.state_mut().actions.push(mg_ui::Action::ShowPanel(mg_ui::Panel::Preview));
+    settle(&mut h);
+    let dir = mg_testkit::scratch_dir("ui-preview-twice");
+    h.render().expect("render").save(dir.join("twice.png")).unwrap();
+    let source = mg_ui::model_view::Source::Resource(chest);
+    assert!(h.state().model_views[&source].holds_targets(), "drawn in the one place");
+    let said: Vec<egui::Rect> =
+        (h.query_all_by_label(mg_ui::model_view::SHOWN_ELSEWHERE)).map(|n| n.rect()).collect();
+    assert_eq!(said.len(), 1, "and said in the other");
+    let preview = h.state().preview_panel_rect().expect("the Preview panel");
+    assert!(preview.contains(said[0].center()), "said in the Preview panel: {said:?} {preview:?}");
+    shared_once_a_pass(&mut h, &source, preview, "a model's tab");
+    // Its tab closed: the Preview panel draws it.
+    close_tab(h.state_mut(), &Tab::Model(chest));
+    settle(&mut h);
+    assert!(h.query_by_label(mg_ui::model_view::SHOWN_ELSEWHERE).is_none());
+    assert!(h.state().model_views[&source].holds_targets());
+    h.render().expect("render").save(dir.join("once.png")).unwrap();
+}
+
+/// The Preview panel's shared picture steers the one camera: a drag over
+/// it turns the view, and the frame that shows it is asked for at once
+/// (the picture was drawn this pass already, before the drag moved the
+/// camera; without the ask, the last step of a drag showed only at the
+/// next event). The view paused, nothing else asks for frames.
+#[test]
+fn the_shared_preview_s_drag_turns_the_one_camera_at_once() {
+    use mg_ui::model_view::{SHARED_PICTURE, Source};
+    let Some((mut h, _area)) = area_harness("preview-shared-drag") else { return };
+    let chest = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Model(chest)));
+    h.state_mut().palette.selected = Some(chest);
+    h.state_mut().actions.push(mg_ui::Action::ShowPanel(mg_ui::Panel::Preview));
+    settle(&mut h);
+    let source = Source::Resource(chest);
+    h.state_mut().model_views.get_mut(&source).unwrap().playing = false;
+    settle(&mut h);
+    let shared = h.get_by_label(SHARED_PICTURE).rect();
+    let (at, to) = (shared.center(), shared.center() + egui::vec2(40.0, 0.0));
+    let was = h.state().model_views[&source].orbit;
+    h.hover_at(at);
+    h.step();
+    h.drag_at(at);
+    h.step();
+    h.hover_at(to);
+    h.step();
+    let now = h.state().model_views[&source].orbit;
+    assert!((now.yaw - was.yaw).abs() > 0.1, "turned: {was:?} {now:?}");
+    // (What the drag's pass asked for, read in the pass after it.)
+    h.step();
+    let asked = h.ctx.repaint_causes().iter().any(|c| c.file.ends_with("model_view.rs"));
+    assert!(asked, "a frame asked for: {:?}", h.ctx.repaint_causes());
+    h.drop_at(to);
+    settle(&mut h);
+}
+
+/// The view of `source`, drawn in one place and shown in the Preview
+/// panel (`preview`, its rect) as well: over a few frames it draws one
+/// picture a pass and the panel shows that picture each pass (one render,
+/// not two); the panel's shared picture stands in the panel and is the
+/// model's picture, not an empty one (its pixels differ across it).
+fn shared_once_a_pass(
+    h: &mut Harness<'_, Moonglow>,
+    source: &mg_ui::model_view::Source,
+    preview: egui::Rect,
+    name: &str,
+) {
+    let counts = |h: &Harness<'_, Moonglow>| {
+        let v = &h.state().model_views[source];
+        (v.renders(), v.followed(), v.drawn_in().unwrap_or(0))
+    };
+    let (r0, f0, p0) = counts(h);
+    h.run_steps(6);
+    let (r1, f1, p1) = counts(h);
+    let (renders, followed, passes) = (r1 - r0, f1 - f0, p1 - p0);
+    assert!(renders >= 6, "{name}: drawn each frame: {renders}");
+    assert!(renders <= passes, "{name}: once a pass at most: {renders} in {passes}");
+    assert_eq!(followed, renders, "{name}: the panel shows each picture drawn, not its own");
+    let shared = h.get_by_label(mg_ui::model_view::SHARED_PICTURE).rect();
+    assert!(preview.contains_rect(shared), "{name}: in the Preview panel: {shared:?}");
+    let image = h.render().expect("render");
+    let ppp = h.ctx.pixels_per_point();
+    let at = |x: f32, y: f32| {
+        let (x, y) = ((x * ppp) as u32, (y * ppp) as u32);
+        image.get_pixel(x.min(image.width() - 1), y.min(image.height() - 1)).0
+    };
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..9 {
+        for j in 0..9 {
+            let x = shared.left() + shared.width() * (i as f32 + 0.5) / 9.0;
+            let y = shared.top() + shared.height() * (j as f32 + 0.5) / 9.0;
+            seen.insert(at(x, y));
+        }
+    }
+    assert!(seen.len() > 3, "{name}: a picture, not one color: {seen:?}");
+}
+
+/// The same with the blueprint's own editor open, the blueprint also
+/// chosen in the palette (since M4's U11 its model is its own Preview
+/// panel's, not its Appearance page's). Docked in front of the area, the
+/// docks are the blueprint's: its Preview draws it, the palette's is not
+/// drawn, nothing is said. As a floating window, its window's pane draws
+/// it (the window is drawn with the editor area) and the main Right
+/// Dock's Preview, beside the area, shows that picture, saying so
+/// (drawn after the editor area while an open tab may show its model,
+/// `model_view::a_tab_may_show`; the owner's ruling 19).
+#[test]
+fn a_blueprint_s_own_preview_keeps_its_view_beside_the_palette_s() {
+    const ELSEWHERE: &str = mg_ui::model_view::SHOWN_ELSEWHERE;
+    for docked in [true, false] {
+        let name = if docked { "preview-page-docked" } else { "preview-page-floating" };
+        let Some((mut h, _area)) = area_harness(name) else { return };
+        // (Wide enough for a floating window's form and pane.)
+        h.set_size(egui::vec2(2200.0, 1000.0));
+        let bandit = ResKey::parse("nw_bandit001", ResType::UTC).unwrap();
+        let place = if docked { "middle" } else { "window" };
+        h.state_mut().settings.window_places = vec![("creature".to_string(), place.to_string())];
+        {
+            let app = h.state_mut();
+            let data = app.game.as_ref().unwrap().resman.get(&bandit).unwrap();
+            app.ws.as_mut().unwrap().view(bandit, mg_gff::Gff::read(&data).unwrap());
+            app.blueprint_pages.insert((bandit, mg_edit::GffPath::root()), "Appearance");
+            app.actions.push(mg_ui::Action::OpenTab(Tab::Blueprint(bandit)));
+            app.palette.selected = Some(bandit);
+            app.actions.push(mg_ui::Action::ShowPanel(mg_ui::Panel::Preview));
+        }
+        settle(&mut h);
+        let at = h.state().dock.find_tab(&Tab::Blueprint(bandit)).expect("the editor");
+        assert_eq!(at.surface.is_main(), docked, "{name}: where the editor is");
+        let source = mg_ui::model_view::Source::Resource(bandit);
+        let view = h.state().model_views.get(&source).expect("a view of the bandit");
+        assert!(view.holds_targets(), "{name}: drawn in the one place");
+        let headers = h.query_all_by_label(mg_ui::model_view::MODEL_HEADER).count();
+        assert_eq!(headers, 1, "{name}: one viewer");
+        let said: Vec<egui::Rect> = h.query_all_by_label(ELSEWHERE).map(|n| n.rect()).collect();
+        if docked {
+            assert!(said.is_empty(), "{name}: nothing said: {said:?}");
+            let row = mg_uikit::header::records(&h.ctx, mg_ui::model_view::MODEL_HEADER);
+            let dock = h.state().right_dock_rect().expect("the Right Dock");
+            assert!(dock.contains_rect(row[0].row), "{name}: in the blueprint's Preview");
+        } else {
+            assert_eq!(said.len(), 1, "{name}: said in the other place");
+            let preview = h.state().preview_panel_rect().expect("the Preview panel");
+            assert!(preview.contains(said[0].center()), "{name}: said in the dock: {said:?}");
+            shared_once_a_pass(&mut h, &source, preview, name);
+        }
+        // The editor closed: the palette's Preview draws the model.
+        close_tab(h.state_mut(), &Tab::Blueprint(bandit));
+        h.state_mut().actions.push(mg_ui::Action::ShowPanel(mg_ui::Panel::Preview));
+        settle(&mut h);
+        assert!(h.query_by_label(ELSEWHERE).is_none(), "{name}: the Preview draws it");
+        assert!(h.state().model_views[&source].holds_targets());
+        assert_eq!(h.query_all_by_label(mg_ui::model_view::MODEL_HEADER).count(), 1);
+    }
+}
+
+/// The owner's ruling 19 ("one shared preview", M5's W6), what "the
+/// same" is: a blueprint floating with its own Preview and the palette's
+/// Preview beside the area read the same copy of it (the module's, with
+/// the editor's unsaved edits written in: `model_view::resource_data`),
+/// so they are one view, one picture a pass, an edit in the editor seen in
+/// both; the palette's choice another blueprint, each place draws its own,
+/// nothing shared.
+#[test]
+fn one_shared_preview_shows_the_editor_s_edits_and_two_blueprints_draw_apart() {
+    use mg_ui::model_view::{SHOWN_ELSEWHERE, Source};
+    let Some((mut h, _area)) = area_harness("preview-shared-edit") else { return };
+    h.set_size(egui::vec2(2200.0, 1000.0));
+    let key = ResKey::parse("live_shared", ResType::UTC).unwrap();
+    let set = |label: &str, value: mg_gff::Value| mg_edit::Edit::SetField {
+        key,
+        path: mg_edit::GffPath::root(),
+        label: label.into(),
+        value: Some(value),
+    };
+    {
+        let app = h.state_mut();
+        let game = app.game.as_deref().unwrap();
+        let data = game.resman.get_named("nw_bandit001", ResType::UTC).unwrap().into_owned();
+        app.actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+            "copy",
+            vec![
+                mg_edit::Edit::SetResource { key, data: Some(data) },
+                set("Appearance_Type", mg_gff::Value::Word(6)),
+                set("Appearance_Head", mg_gff::Value::Byte(1)),
+            ],
+        )));
+        app.settings.window_places = vec![("creature".to_string(), "window".to_string())];
+        app.actions.push(mg_ui::Action::OpenTab(Tab::Blueprint(key)));
+        app.palette.selected = Some(key);
+        app.actions.push(mg_ui::Action::ShowPanel(mg_ui::Panel::Preview));
+    }
+    settle(&mut h);
+    let source = Source::Resource(key);
+    let head = |h: &Harness<'_, Moonglow>| -> Vec<String> {
+        let p = h.state().model_views[&source].preview().expect("a preview");
+        p.parts.iter().map(|p| p.model.clone()).filter(|m| m.contains("_head")).collect()
+    };
+    assert_eq!(head(&h), ["pmh0_head001"]);
+    let preview = h.state().preview_panel_rect().expect("the Preview panel");
+    assert_eq!(h.query_all_by_label(SHOWN_ELSEWHERE).count(), 1, "shared");
+    shared_once_a_pass(&mut h, &source, preview, "as saved");
+    // An edit in the editor, not saved: the one view shows it, in both.
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "Head",
+        vec![set("Appearance_Head", mg_gff::Value::Byte(3))],
+    )));
+    h.run_steps(4);
+    assert_eq!(head(&h), ["pmh0_head003"], "the edit seen");
+    assert_eq!(h.query_all_by_label(SHOWN_ELSEWHERE).count(), 1, "still shared");
+    shared_once_a_pass(&mut h, &source, preview, "edited");
+    // Another blueprint chosen in the palette: two views, each drawn.
+    let chest = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+    h.state_mut().palette.selected = Some(chest);
+    h.state_mut().actions.push(mg_ui::Action::ShowPanel(mg_ui::Panel::Preview));
+    h.run_steps(6);
+    let counts = |h: &Harness<'_, Moonglow>, s: &Source| {
+        let v = &h.state().model_views[s];
+        (v.renders(), v.followed())
+    };
+    let other = Source::Resource(chest);
+    let (a0, b0) = (counts(&h, &source), counts(&h, &other));
+    h.run_steps(6);
+    let (a1, b1) = (counts(&h, &source), counts(&h, &other));
+    assert!(a1.0 - a0.0 >= 6 && b1.0 - b0.0 >= 6, "both drawn: {a0:?} {a1:?} {b0:?} {b1:?}");
+    assert_eq!((a1.1 - a0.1, b1.1 - b0.1), (0, 0), "nothing shared");
+    assert_eq!(h.query_all_by_label(SHOWN_ELSEWHERE).count(), 0);
+}
+
+/// The sky under a high camera: Chapter1's `map_m1q1a` seen whole, from
+/// above, in a window 2559 by 800 (the widest before the wide layout, its
+/// area view about four times as wide as it is high), with Moonglow's
+/// shaders and the game's. The view's sides look about 57° off straight
+/// down: the skybox stood at ground level around a camera 151 m up, and
+/// the game's horizon fade, in the area's fog color (khaki), filled them
+/// (M3 T15, seen in T14's pictures). The sky now stands under the camera
+/// as under the game's farthest at that pitch (`GAME_CAMERA_REACH`, 25 m
+/// from its target: here 25 m over the sky's ground), whose picture at
+/// that angle is the fade's dark lower band over the sky: the sides show
+/// 44% of the fog color's sum. Held from both sides: the sky at the
+/// camera itself showed 27%, 12 m under it 35%, 100 m under it 99% (the
+/// fog color), so it is between 39% and 50%. Pictures in
+/// `target/test-output/ui-sky-high/`.
+#[test]
+fn the_sky_under_a_camera_higher_than_the_game_s() {
+    let Some(root) = mg_testkit::nwn_root() else { return };
+    let Some(rs) = gpu() else { return };
+    let mut app = game_app(&root, None);
+    app.set_render_state(rs.clone());
+    app.settings.no_last_area = true;
+    app.open_module(&root.join("data/nwm/Chapter1.nwm"));
+    let area = ResRef::from_str("map_m1q1a").unwrap();
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Area(area)));
+    // (The view 1951 by 460, as the game's picture it was held against
+    // was taken: the area's header row, M4's U3, is 18 points lower than
+    // the two rows of toolbar it replaced at this width.)
+    let mut h = area_gpu_harness(app, rs, 2559.0, 782.0);
+    let dir = mg_testkit::scratch_dir("ui-sky-high");
+    // (The area's sun fog color, as the view draws the fade in it.)
+    let fog = [152.0, 145.0, 103.0];
+    // The mean of a strip 20 points wide at `x0` across the view `r`'s
+    // middle half.
+    let strip = |img: &image::RgbaImage, r: egui::Rect, x0: f32| -> [f64; 3] {
+        let mut sum = [0.0; 3];
+        let mut n = 0.0;
+        for y in (r.min.y + r.height() / 4.0) as u32..(r.max.y - r.height() / 4.0) as u32 {
+            for x in x0 as u32..x0 as u32 + 20 {
+                let p = img.get_pixel(x, y);
+                for c in 0..3 {
+                    sum[c] += p[c] as f64;
+                }
+                n += 1.0;
+            }
+        }
+        sum.map(|s| s / n)
+    };
+    for shaders in [false, true] {
+        h.state_mut().settings.game_shaders = Some(shaders);
+        if shaders {
+            until_the_game_draws(&mut h);
+        }
+        // Until the view has drawn and its picture rests: the strips the
+        // same in two pictures a step apart (its textures, read apart,
+        // come in over some frames).
+        let start = std::time::Instant::now();
+        let mut last = None;
+        let (img, r) = loop {
+            h.run_steps(1);
+            let Some(view) = h.state().area_views.get(&area).filter(|v| v.pictures > 0) else {
+                assert!(start.elapsed().as_secs() < 60, "the view never drew");
+                continue;
+            };
+            let r = view.rect;
+            let img = h.render().expect("render");
+            let now =
+                [r.min.x + 4.0, r.center().x - 10.0, r.max.x - 24.0].map(|x| strip(&img, r, x));
+            if last == Some(now) {
+                break (img, r);
+            }
+            last = Some(now);
+            assert!(start.elapsed().as_secs() < 60, "the picture never rested: {now:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let view = &h.state().area_views[&area];
+        let eye = view.orbit.as_ref().map(|o| o.camera().eye).unwrap();
+        assert!(eye.z > 100.0, "seen whole from high up: {eye}");
+        assert!(r.width() > 3.5 * r.height(), "a wide view: {r:?}");
+        img.save(dir.join(format!("shaders-{shaders}.png"))).unwrap();
+        let strip = |x0: f32| strip(&img, r, x0);
+        let middle = strip(r.center().x - 10.0);
+        assert!(middle.iter().sum::<f64>() > 60.0, "the area drawn: {middle:?}");
+        for (side, x0) in [("left", r.min.x + 4.0), ("right", r.max.x - 24.0)] {
+            let seen = strip(x0);
+            let share = seen.iter().sum::<f64>() / fog.iter().sum::<f64>();
+            assert!(
+                (0.39..0.5).contains(&share),
+                "{side}, shaders {shaders}: the fade's dark band over the sky as under the \
+                 game's farthest camera (44% of the fog color), not {:.0}%: {seen:?}",
+                share * 100.0
+            );
+        }
+    }
+}
+
+#[test]
+fn idle_model_view_keeps_rendered_picture_across_frames() {
+    let root = mg_testkit::corpus!();
+    let Some(rs) = gpu() else { return };
+    let mut app = game_app(&root, None);
+    app.settings.game_shaders = Some(false);
+    app.set_render_state(rs.clone());
+    let key = ResKey::parse("plc_a01", ResType::MDL).unwrap();
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
+    let mut h = gpu_harness(app, rs, 900.0, 700.0);
+    h.run_steps(2);
+    let source = mg_ui::model_view::Source::Resource(key);
+    let (r0, g0) = {
+        let v = &h.state().model_views[&source];
+        (v.renders(), v.gpu_renders())
+    };
+    assert!(g0 >= 1, "rendered once: {g0}");
+    h.run_steps(6);
+    let (r1, g1) = {
+        let v = &h.state().model_views[&source];
+        (v.renders(), v.gpu_renders())
+    };
+    assert!(r1 - r0 >= 6, "shown each frame: {} -> {}", r0, r1);
+    assert_eq!(g1, g0, "idle model view skipped redundant GPU renders");
+    h.state_mut().model_views.get_mut(&source).unwrap().orbit.yaw += 0.25;
+    h.run_steps(2);
+    let g2 = h.state().model_views[&source].gpu_renders();
+    assert!(g2 > g1, "camera change triggered re-render: {g1} -> {g2}");
+}
+
+/// Options › Area › Largest textures changed: a model view kept idle draws
+/// its picture again, with the textures read at the new size (the review's
+/// C-9: it kept the old picture until the camera moved).
+#[test]
+fn an_idle_model_view_is_drawn_again_at_another_texture_size() {
+    let root = mg_testkit::corpus!();
+    let Some(rs) = gpu() else { return };
+    let mut app = game_app(&root, None);
+    app.settings.game_shaders = Some(false);
+    app.set_render_state(rs.clone());
+    let key = ResKey::parse("plc_a01", ResType::MDL).unwrap();
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
+    let mut h = gpu_harness(app, rs, 900.0, 700.0);
+    settle(&mut h);
+    let source = mg_ui::model_view::Source::Resource(key);
+    let renders = |h: &Harness<'_, Moonglow>| h.state().model_views[&source].gpu_renders();
+    let before = renders(&h);
+    h.run_steps(3);
+    assert_eq!(renders(&h), before, "kept while idle");
+    h.state_mut().settings.texture_limit = Some(256);
+    h.run_steps(3);
+    assert!(renders(&h) > before, "drawn again at the new size: {before} -> {}", renders(&h));
 }

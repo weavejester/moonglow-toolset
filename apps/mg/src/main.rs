@@ -5,6 +5,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod added;
+mod bake;
 mod claims;
 mod diff;
 mod edits;
@@ -15,14 +17,16 @@ mod plugins;
 mod search;
 mod serve;
 mod test;
+mod texture;
 mod tlk_alloc;
+mod twoda_set;
 mod usage;
 mod watch;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mg_core::{Codepage, ResType, StrRef};
-use mg_erf::{Erf, ErfWriter};
+use mg_erf::Erf;
 use mg_gff::Gff;
 use mg_module::{Module, ModuleLocation};
 use mg_resman::{GameInstall, ResKey, ResMan};
@@ -50,6 +54,11 @@ struct Cli {
     /// read them.
     #[arg(long, global = true)]
     workshop: bool,
+    /// Don't follow the user directory's nwn.ini folder aliases (HAK=,
+    /// TLK=…): its own hak/, tlk/ and the rest, as Options › Folders'
+    /// switch has the window read them.
+    #[arg(long, global = true)]
+    no_aliases: bool,
     /// Print the result as one JSON object, for scripts and build
     /// pipelines (warnings in its "notes"; an error as {"error": …}).
     #[arg(long, global = true)]
@@ -60,8 +69,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List the contents of an ERF archive (mod, hak, erf, nwm, sav).
-    Ls { archive: PathBuf },
+    /// List the contents of an ERF archive (mod, hak, erf, nwm, sav): each
+    /// resource's size and name.
+    Ls {
+        archive: PathBuf,
+        /// Each resource's SHA-256 too (read whole: a hak of gigabytes
+        /// takes seconds).
+        #[arg(long)]
+        sha256: bool,
+    },
     /// Unpack an ERF archive into a directory.
     Unpack { archive: PathBuf, out: PathBuf },
     /// Pack a directory's files into an ERF archive (type from the extension).
@@ -76,7 +92,8 @@ enum Cmd {
         #[arg(long)]
         compile_models: bool,
     },
-    /// Convert GFF to JSON (neverwinter.nim / nasher format), or JSON to GFF.
+    /// Convert GFF to JSON (neverwinter.nim / nasher format, written in
+    /// `nwn_gff`'s notation), or JSON to GFF.
     Gff {
         input: PathBuf,
         /// Output file (default: stdout for JSON).
@@ -109,13 +126,42 @@ enum Cmd {
         /// module itself, are in the load order too.
         #[arg(long)]
         module: Option<PathBuf>,
+        #[command(flatten)]
+        added: added::Added,
     },
-    /// Print a resource from the game's load order to stdout.
+    /// Print a resource from the game's load order to stdout; or, with
+    /// --to, write many into a folder, each with the layer it came from,
+    /// its size and its SHA-256 (one run reads every archive once).
+    /// Fails if a resource is found nowhere (with --to, once the rest are
+    /// written).
     Cat {
-        resource: String,
+        /// `name.ext`, e.g. `classes.2da`; with --to, as many as needed.
+        #[arg(value_name = "RESOURCE", required_unless_present = "list")]
+        resources: Vec<String>,
+        /// With --to: more names from a file, a line each (`-`: standard
+        /// input; blank lines and lines beginning with `#` passed over).
+        #[arg(long, value_name = "FILE", requires = "to")]
+        list: Option<PathBuf>,
+        /// Write each resource into this folder (made if missing) by its
+        /// name, rather than to standard output.
+        #[arg(long, value_name = "FOLDER")]
+        to: Option<PathBuf>,
+        /// With --to: write over files of the same names in the folder.
+        #[arg(long, requires = "to")]
+        force: bool,
+        /// With --to: say what would be written (and its size and
+        /// SHA-256); write nothing.
+        #[arg(long, requires = "to")]
+        dry_run: bool,
         /// A compiled model (.mdl) as the text it compiles from.
         #[arg(long)]
         text: bool,
+        /// A module (.mod, folder or nasher project) whose haks, and the
+        /// module itself, are in the load order too.
+        #[arg(long)]
+        module: Option<PathBuf>,
+        #[command(flatten)]
+        added: added::Added,
     },
     /// List the resource layers in load order with their sizes.
     Layers,
@@ -459,6 +505,38 @@ enum Cmd {
         /// nasher project it is in, else its own folder)
         #[arg(long)]
         beside: Option<PathBuf>,
+        /// The talk table (a .tlk, or a nasher project's .tlk.json) a
+        /// strref column's custom strings (16777216 and on) are held to
+        /// (default: the folder's own, where it has one; with none, they
+        /// are not looked up)
+        #[arg(long)]
+        tlk: Option<PathBuf>,
+    },
+    /// Set cells of a 2DA file and save it as it is laid out (its columns'
+    /// widths, its rows' labels, its line ends): in the row of a number,
+    /// the one row whose column has a value, or a row added at the end.
+    /// Each cell `COLUMN=VALUE` (`COLUMN=` or `COLUMN=****`: empty).
+    #[command(name = "2da-set")]
+    TwodaSet {
+        table: PathBuf,
+        /// `COLUMN=VALUE`, as many as needed.
+        #[arg(value_name = "COLUMN=VALUE", required = true)]
+        cells: Vec<String>,
+        /// The row by its number.
+        #[arg(long, conflicts_with_all = ["matching", "append"])]
+        row: Option<usize>,
+        /// The row whose column has this value (one row must).
+        #[arg(long = "where", value_name = "COLUMN=VALUE", conflicts_with = "append")]
+        matching: Option<String>,
+        /// A row added at the end, its other cells empty.
+        #[arg(long)]
+        append: bool,
+        /// Write the table here rather than over the file.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Say what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// What differs between two talk tables (.tlk), by line. With --base
     /// (the table both were made from), the two merged, as `mg 2da-diff`
@@ -489,8 +567,8 @@ enum Cmd {
     /// side). Lists merge by item: an area's placed objects by object
     /// (added by both: both kept), the area list as a union, variables by
     /// name and type, feats, classes, spells, haks and journal entries by
-    /// what they are; other lists by place. Each file is a GFF or nasher's JSON of
-    /// one, told by its contents. The merge is written over OURS (or -o),
+    /// what they are; other lists by place. Each file is a GFF, nasher's JSON,
+    /// or NWNT of one, told by its contents. The merge is written over OURS (or -o),
     /// in OURS's form, and a merge that is OURS leaves the file as it was:
     /// git's merge driver (`mg merge-gff %O %A %B --path %P`; the manual's
     /// Modules chapter, "Merging in git", has the lines for .gitattributes
@@ -520,6 +598,37 @@ enum Cmd {
         /// above the file (a folder with a nasher.cfg).
         #[arg(long, value_name = "DIR")]
         project: Option<PathBuf>,
+    },
+    /// Merge two copies of a project's claims table (moonglow.toml's
+    /// `[claims] file`), both made from BASE, row by row by their Area:
+    /// what one side changed of an area (claimed, released, handed on,
+    /// merged, taken out) is taken, both sides' new areas are kept (theirs
+    /// after ours, numbered on), and an area both changed, each its own way,
+    /// is a conflict (the merge fails and nothing is written, unless
+    /// --prefer takes a side). Written over OURS (or -o): git's merge
+    /// driver (`mg merge-claims %O %A %B --path %P`; the manual's Modules
+    /// chapter, "Merging in git", has the lines for .gitattributes and
+    /// .git/config). Two builders each claiming a new area add a line under
+    /// the same number, which git's own merge calls a conflict
+    #[command(name = "merge-claims")]
+    MergeClaims {
+        /// The table both were made from (git's %O).
+        base: PathBuf,
+        /// Ours (git's %A): the merge is written here.
+        ours: PathBuf,
+        /// Theirs (git's %B).
+        theirs: PathBuf,
+        /// Whose row an area both changed takes: ours or theirs (then the
+        /// merge is written, and succeeds).
+        #[arg(long)]
+        prefer: Option<String>,
+        /// Write the merge here instead of over OURS.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// The table's path in the repository (git's %P): its name in the
+        /// report.
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Write a custom talk table from strings kept by name (a .toml or
     /// .json file: `key = "text"`, in groups if you like), each on a line
@@ -554,6 +663,11 @@ enum Cmd {
         /// another line now than there.
         #[arg(long)]
         against: Option<PathBuf>,
+        /// The project whose lines for text typed in the window
+        /// (`moonglow.toml`'s `[talk]`) new keys pass over (default: the
+        /// one in the names file's folder or a folder above it).
+        #[arg(long)]
+        project: Option<PathBuf>,
     },
     /// Follow a module kept as files (a nasher project or a module
     /// folder) while you edit it: a changed script is compiled, with the
@@ -653,7 +767,8 @@ enum Cmd {
     /// changed are compiled again. A NUI window (NAME.jui) goes with its
     /// settings and its two scripts, the scripts that open it follow, and
     /// it is built again under its new name, as the NUI Creator's Rename…
-    /// does.
+    /// does (a script that opens it and does not compile then is printed,
+    /// and the command fails, the rename saved).
     Rename {
         module: PathBuf,
         /// `name.ext` of the resource to rename.
@@ -664,13 +779,30 @@ enum Cmd {
         #[arg(long)]
         strings: bool,
     },
-    /// Write a conversation as plain text, CSV, Twine (Twee) or Ink, by the
-    /// output's extension (.txt, .csv, .twee, .ink).
+    /// Write conversations as plain text, CSV, Twine (Twee) or Ink: one to
+    /// a file, by its extension (.txt, .csv, .twee, .ink: `mg
+    /// dialog-export MODULE greet.dlg greet.ink`); or several into a folder
+    /// with --to, each as NAME.ink (or .twee, .txt, .csv) after its name
+    /// (`mg dialog-export MODULE greet.dlg guard.dlg --to stories --format
+    /// ink`; --all for every one), as the window's Export writes them.
     DialogExport {
         module: PathBuf,
-        /// The conversation, `name.dlg`.
-        dialog: String,
-        output: PathBuf,
+        /// The conversations, `name.dlg`. Without --to: one, then the file
+        /// to write it to.
+        #[arg(value_name = "NAME.dlg")]
+        names: Vec<String>,
+        /// The folder to write each conversation into (made if missing).
+        #[arg(long, value_name = "FOLDER")]
+        to: Option<PathBuf>,
+        /// With --to: what to write them as (ink, twine, text, csv).
+        #[arg(long, requires = "to", value_parser = ["ink", "twine", "text", "csv"])]
+        format: Option<String>,
+        /// With --to: every conversation of the module.
+        #[arg(long, requires = "to")]
+        all: bool,
+        /// With --to: write over files of the same names in the folder.
+        #[arg(long, requires = "to")]
+        force: bool,
         /// A CSV's column for a language to translate into (`fr`, `de`,
         /// `it`, `es`, `pl`), though no line has text in it yet; more than
         /// once for several. The languages lines have text in have theirs.
@@ -678,14 +810,20 @@ enum Cmd {
         languages: Vec<String>,
     },
     /// Read a Twine (.twee) or Ink (.ink) story into a module as a
-    /// conversation (replacing one of the same name) and save; or, from a
-    /// .csv export, read back the text of the conversation's lines.
+    /// conversation and save (one of the same name is replaced only with
+    /// --force); or, from a .csv export, read back the text of the
+    /// conversation's lines.
     DialogImport {
         module: PathBuf,
         file: PathBuf,
         /// The conversation's name (default: the file's).
         #[arg(long)]
         name: Option<String>,
+        /// A story: replace the conversation of that name, if the module
+        /// has one (what the story does not say of it, its end scripts
+        /// among them, stays as that one has it).
+        #[arg(long)]
+        force: bool,
     },
     /// Write a talk table (a .tlk file) as JSON, as nwn_tlk writes it, or as
     /// CSV (a row a line: StrRef, text, the feminine table's text if a
@@ -816,8 +954,9 @@ enum Cmd {
         remove_var: Vec<String>,
         /// Make each area's placeables static, where nothing is lost by
         /// it: not those that are Useable, are tilted, scaled or moved by
-        /// a visual transform, or have a script, a conversation, a trap,
-        /// an inventory or an animation switched on. The game loads and
+        /// a visual transform, have a script, a conversation, a trap, an
+        /// inventory or an animation switched on, or are flickering lights
+        /// Moonglow made. The game loads and
         /// draws static placeables more cheaply.
         #[arg(long, conflicts_with = "dynamic_placeables")]
         static_placeables: bool,
@@ -892,6 +1031,37 @@ enum Cmd {
         #[arg(long)]
         area: Option<String>,
     },
+    /// Bake placed placeables' walkmeshes to their visual transforms
+    /// (the area view's Position › Bake Walkmesh to Transform): each gets a
+    /// copy of its model whose walkmesh is moved as the model is drawn, in
+    /// the project's hak (moonglow.toml's [bake]), and a placeables.2da row
+    /// in the project's rows file, which the project's build adds to the
+    /// table; its Appearance names that row, and the module is saved. The
+    /// same model and transform share one bake. With --unbake, each goes
+    /// back to the row it copies.
+    BakeWalkmesh {
+        module: PathBuf,
+        /// The area (its ResRef).
+        #[arg(long)]
+        area: String,
+        /// A placeable of the area: its number in the area's placeables,
+        /// from 0 (`mg find MODULE --type utp --area AREA` gives it).
+        /// Repeatable.
+        #[arg(long, required = true)]
+        object: Vec<usize>,
+        /// Set each back to the row its bake copies.
+        #[arg(long)]
+        unbake: bool,
+        /// Say what would be made; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Plugins whose handlers look at what is saved, as for `mg set`.
+        #[arg(long)]
+        plugins: Vec<PathBuf>,
+        /// A plugin's warning of the save stops it too, as a refusal does.
+        #[arg(long)]
+        strict: bool,
+    },
     /// Build a nasher project's module: compile its scripts and pack its
     /// target as nasher does (filters, modName and the rest). Fails if a
     /// script doesn't compile, unless --keep-going. A target that packs a
@@ -939,14 +1109,30 @@ enum Cmd {
         replace: bool,
     },
     /// Write an area's minimap as a PNG: each tile's picture, turned as the
-    /// tile is, as the game's map shows it.
+    /// tile is, as the game's map shows it; with --map-notes, its enabled
+    /// map notes marked as the game's map marks them. With --to, several
+    /// areas' (or --all), each NAME.png in a folder.
     Minimap {
         module: PathBuf,
-        /// The area's resref.
-        area: String,
-        /// The PNG to write.
-        out: PathBuf,
-        /// Pixels a tile (default: the pictures' size).
+        /// The areas' resrefs. Without --to: one, then the PNG to write.
+        #[arg(value_name = "AREA")]
+        names: Vec<String>,
+        /// The folder to write each area's minimap into (made if missing).
+        #[arg(long, value_name = "FOLDER")]
+        to: Option<PathBuf>,
+        /// With --to: every area of the module.
+        #[arg(long, requires = "to")]
+        all: bool,
+        /// With --to: write over files of the same names in the folder.
+        #[arg(long, requires = "to")]
+        force: bool,
+        /// Mark the map notes the game's map shows (waypoints whose map note
+        /// is enabled), as it marks them; their text and where each is are
+        /// in --json's output (`map_notes`).
+        #[arg(long)]
+        map_notes: bool,
+        /// Pixels a tile, 1 to 1024 (default: the pictures' size, 16 to
+        /// 256); the picture is at most 256 MiB (8192 by 8192 pixels).
         #[arg(long)]
         size: Option<u32>,
     },
@@ -980,6 +1166,14 @@ enum Cmd {
         /// for any value; repeatable.
         #[arg(long = "where")]
         fields: Vec<String>,
+        /// The blueprints of a palette grouping's group (the project
+        /// file's `[palette.*]`): `kind/Tables`, `kind/Other` for those no
+        /// group takes; the grouping by its id or its title. Those of the
+        /// standard palettes (the game's and the haks') and the module's
+        /// custom ones it is offered in; --type, --name and --resref narrow
+        /// them.
+        #[arg(long = "palette-group", conflicts_with_all = ["tag", "area", "placed", "fields"])]
+        palette_group: Option<String>,
     },
     /// Find a module's blueprints, placed objects, areas and the rest by
     /// what they hold: variables, item properties, classes, feats, spells,
@@ -1007,6 +1201,8 @@ enum Cmd {
         /// The module whose haks (and blueprints) to look in.
         #[arg(long)]
         module: Option<PathBuf>,
+        #[command(flatten)]
+        added: added::Added,
         /// The game's own files too.
         #[arg(long)]
         all: bool,
@@ -1022,6 +1218,12 @@ enum Cmd {
     Model {
         #[command(subcommand)]
         cmd: ModelCmd,
+    },
+    /// Textures: convert between TGA, PNG and DDS; their facts; PLTs
+    /// split into PNGs and joined again.
+    Texture {
+        #[command(subcommand)]
+        cmd: texture::TextureCmd,
     },
     /// Check that Moonglow keeps a module as it is: saves a copy (the
     /// module is not touched), opens it again and compares every resource
@@ -1117,16 +1319,29 @@ enum Cmd {
         #[arg(long, value_name = "COMMAND")]
         upload: Option<String>,
     },
-    /// Import an ERF into a module and save it. What the ERF was made
-    /// from (stamped by Moonglow's export) is said, with a warning when
-    /// the module's git checkout is at another commit now: the ERF was
-    /// made from older work, and copying it in undoes what changed since.
+    /// Import an ERF, or loose files and folders, into a module and save
+    /// it. What an ERF was made from (stamped by Moonglow's export) is
+    /// said, with a warning when the module's git checkout is at another
+    /// commit now: the ERF was made from older work, and copying it in
+    /// undoes what changed since. Files are resources by their names
+    /// (`guard.utc`), a folder's with those of the folders in it, as
+    /// `mg export --files` writes them; what is no resource of a module's
+    /// (no ResRef, no type, a GFF that doesn't read as its type, a
+    /// resource given twice, module.ifo, an archive) is refused and
+    /// named. A script that comes without its compiled script is compiled,
+    /// with the module's scripts that include it.
     Import {
         module: PathBuf,
-        erf: PathBuf,
-        /// Overwrite resources the module already has.
+        /// An `.erf` (alone), or files and folders.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+        /// Overwrite resources the module already has (without it, those
+        /// are skipped and named).
         #[arg(long)]
         overwrite: bool,
+        /// Say what would be imported; change and save nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Set fields of one of a module's resources and save: each
     /// `FIELD=VALUE`, the field a path from the resource's root (`Tag`,
@@ -1151,6 +1366,9 @@ enum Cmd {
         /// own plugins do too, as you allowed them.
         #[arg(long)]
         plugins: Vec<PathBuf>,
+        /// A plugin's warning of the save stops it too, as a refusal does.
+        #[arg(long)]
+        strict: bool,
     },
     /// Apply a file of edits (JSON: fields set and removed, list items
     /// inserted and removed, resources written and removed) to a module and
@@ -1165,6 +1383,9 @@ enum Cmd {
         /// Plugins whose handlers look at what is saved, as for `mg set`.
         #[arg(long)]
         plugins: Vec<PathBuf>,
+        /// A plugin's warning of the save stops it too, as a refusal does.
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -1188,6 +1409,24 @@ enum ModelCmd {
         input: PathBuf,
         /// The text to write.
         output: PathBuf,
+    },
+    /// A model's facts: its nodes by kind, faces (all, and those of the
+    /// meshes the game draws), vertices, the box its drawn meshes fill at
+    /// rest, its skins with their faces and the bones their weights move
+    /// (and the bones of all of them), the textures and
+    /// materials it names, its supermodel and its own animations with
+    /// their lengths. Text or compiled alike; a text's faces the game's
+    /// compiler leaves out are counted apart, with the reader's notes.
+    Info {
+        /// A model's file, or a model's name (`plc_a01`, `plc_a01.mdl`)
+        /// found in the game's load order.
+        model: String,
+        /// A module (.mod, folder or nasher project) whose haks, and the
+        /// module itself, are in the load order too.
+        #[arg(long)]
+        module: Option<PathBuf>,
+        #[command(flatten)]
+        added: added::Added,
     },
 }
 
@@ -1215,19 +1454,42 @@ enum PluginCmd {
     Allow {
         /// The project: a module folder, a nasher project's folder or its
         /// nasher.cfg.
-        project: PathBuf,
+        #[arg(required_unless_present = "prune")]
+        project: Option<PathBuf>,
         /// The plugins' ids (`mg plugin list --project` shows them); none:
         /// every one of the project's.
         ids: Vec<String>,
         /// Keep them off.
         #[arg(long)]
         deny: bool,
+        /// Instead, take out the answers kept for projects no longer on
+        /// disk (a removed checkout or worktree), and list them. A project
+        /// on a drive not mounted is not on disk either: mount it first.
+        #[arg(long, conflicts_with_all = ["project", "ids", "deny"])]
+        prune: bool,
     },
     /// Check plugins: the manifest reads, and the code registers what it
     /// declares. Exits with an error if one does not. A file is a
     /// plugin's archive: checked as the installer checks it, and its code
     /// as it is in the archive.
     Check { folders: Vec<PathBuf> },
+    /// Tidy what is kept of plugins' settings, where it is not as their
+    /// manifests declare: a value not of its kind, or of a setting none
+    /// declares, taken out (the default is used, as it was); one in the
+    /// other file than its scope's moved there. For the project's own
+    /// plugins and those named, in the project's files and Moonglow's own
+    /// (of scope user). Another plugin's table is left alone.
+    Tidy {
+        /// The project: a module folder, a nasher project's folder or its
+        /// nasher.cfg.
+        project: PathBuf,
+        /// More plugins' folders (installed ones, say), whose settings the
+        /// project's files keep too.
+        plugins: Vec<PathBuf>,
+        /// Say what would be done, and do nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run a plugin's command on a module and save: its edits applied as
     /// one command, all or none. The plugin runs sandboxed, as in the
     /// window.
@@ -1274,6 +1536,10 @@ enum PluginCmd {
         /// A form's field, `ID=VALUE` (the others take their defaults).
         #[arg(long)]
         answer: Vec<String>,
+        /// A JSON file of forms' fields' values by id (`{ "sell": 140 }`),
+        /// under the --answer given.
+        #[arg(long, value_name = "FILE")]
+        answers: Option<PathBuf>,
         /// A file or folder for the plugin where it asks for one, in the
         /// order it asks.
         #[arg(long)]
@@ -1286,14 +1552,57 @@ enum PluginCmd {
         #[arg(long)]
         yes: bool,
         /// A setting of the plugin for this run, `ID=VALUE` (repeatable),
-        /// over what the project's files hold and the defaults. What the
-        /// plugin sets itself is kept in the project's files (but for a
-        /// setting of scope "user": mg keeps none).
+        /// over what the project's files and saved user plugin settings hold,
+        /// above the defaults. What the plugin sets itself is kept in the
+        /// project's files (or in `plugin-settings.json` for scope "user").
         #[arg(long, value_name = "ID=VALUE")]
         setting: Vec<String>,
         /// Print the edits it would make; change nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Run a plugin's exporter on a module (API 0.6), as File › Export ›
+    /// (its title) does: it writes the file OUT, or into the folder OUT
+    /// for an exporter to a folder (made if it isn't there). The module is
+    /// not changed; nothing else is written.
+    Export {
+        module: PathBuf,
+        /// The plugin's folder.
+        plugin: PathBuf,
+        /// The exporter's id (`mg plugin list` shows them).
+        exporter: String,
+        /// The file (or the folder) to write.
+        out: PathBuf,
+        #[command(flatten)]
+        job: plugins::JobArgs,
+    },
+    /// Run a plugin's importer on a module (API 0.6), as File › Import ›
+    /// (its title) does: it reads SOURCE, a file or a folder, and its edits
+    /// are applied as one command, all or none, and saved.
+    Import {
+        module: PathBuf,
+        /// The plugin's folder.
+        plugin: PathBuf,
+        /// The importer's id (`mg plugin list` shows them).
+        importer: String,
+        /// The file (or the folder) it reads.
+        source: PathBuf,
+        #[command(flatten)]
+        job: plugins::JobArgs,
+    },
+    /// Run a plugin's wizard on a module (API 0.6): each page answered
+    /// from --answers and --answer (by field id; the rest take their
+    /// defaults), then its Finish, whose edits are applied as one command
+    /// and saved. A page whose check objects is an error, and nothing is
+    /// saved.
+    Wizard {
+        module: PathBuf,
+        /// The plugin's folder.
+        plugin: PathBuf,
+        /// The wizard's id (`mg plugin list` shows them).
+        wizard: String,
+        #[command(flatten)]
+        job: plugins::JobArgs,
     },
     /// Run a plugin's own tests: the files `tests/*.toml` in its folder,
     /// each naming a fixture module and the checks, commands and events to
@@ -1543,8 +1852,6 @@ fn undescribed_vars(
     out.json = json!({ "undescribed": p.variables.undescribed, "not_described": rows });
 }
 
-/// What the module's project file (`moonglow.toml`) said that wasn't
-/// understood, as notes.
 /// `mg used`: the project file's `[used]`, listed after the changes asked
 /// for.
 fn used(module: &Path, add: &[String], remove: &[String], kind: &str) -> Result<Output> {
@@ -1582,6 +1889,8 @@ fn used(module: &Path, add: &[String], remove: &[String], kind: &str) -> Result<
     Ok(out)
 }
 
+/// What the module's project file (`moonglow.toml`) said that wasn't
+/// understood, as notes.
 fn project_file_notes(m: &Module, out: &mut Output) {
     let p = &m.project_file;
     for line in p.errors.iter().chain(&p.warnings) {
@@ -1601,6 +1910,10 @@ struct Output {
     failed: bool,
     /// Written already (cat's bytes, the language server).
     done: bool,
+    /// The JSON is a document (a GFF's, which `mg gff` reads back), not a
+    /// report: the notes go to standard error with `--json` too, and not
+    /// among its fields.
+    document: bool,
 }
 
 impl Output {
@@ -1631,7 +1944,9 @@ impl Output {
         }
         let mut out = io::stdout().lock();
         if json {
-            if let serde_json::Value::Object(o) = &mut self.json
+            if self.document {
+                self.notes.iter().for_each(|n| eprintln!("{n}"));
+            } else if let serde_json::Value::Object(o) = &mut self.json
                 && !self.notes.is_empty()
             {
                 o.insert("notes".into(), self.notes.into());
@@ -1654,10 +1969,6 @@ impl Output {
 /// to carry.
 static OPENED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Opens a module, as every command does. A `.mod` with its module
-/// folder beside it (Aurora's module directory, which the window asks
-/// about) is the `.mod`, as the game's server reads it: the output says
-/// so, once, and that the folder is left as it is.
 /// Sends an NWSync repository to the web server: the builder's command
 /// `template` run in the repository's folder for each of `parts` it has,
 /// in turn, each only after the one before succeeded
@@ -1689,8 +2000,13 @@ fn nwsync_upload(
         let mut c = {
             use std::os::windows::process::CommandExt;
             let mut c = std::process::Command::new("cmd");
-            // (As typed: cmd reads its own quotes.)
-            c.arg("/C").raw_arg(&text);
+            // (As typed: cmd reads its own quotes. With /S it takes off
+            // exactly the pair the text is put in here: after /C alone, a
+            // text beginning with a quoted program that has another quoted
+            // argument, `"C:\My Tools\send.cmd" "{folder}"`, lost its first
+            // and last quote. The window's commands are run the same way:
+            // `mg_ui::project_commands::shell`.)
+            c.arg("/S").arg("/C").raw_arg(format!("\"{text}\""));
             c
         };
         #[cfg(not(windows))]
@@ -1705,6 +2021,10 @@ fn nwsync_upload(
             .env("MOONGLOW_NWSYNC_PART", part.name());
         if let Some(root) = project {
             c.env("MOONGLOW_PROJECT", root);
+        }
+        // (This mg, for a script that runs it, as the window gives its own.)
+        if let Ok(mg) = std::env::current_exe().and_then(std::fs::canonicalize) {
+            c.env("MOONGLOW_MG", mg);
         }
         let status = c.status().with_context(|| format!("running {text}"))?;
         if !status.success() {
@@ -1724,6 +2044,10 @@ fn nwsync_upload(
     Ok(sent)
 }
 
+/// Opens a module, as every command does. A `.mod` with its module
+/// folder beside it (Aurora's module directory, which the window asks
+/// about) is the `.mod`, as the game's server reads it: the output says
+/// so, once, and that the folder is left as it is.
 pub(crate) fn open_module(path: &Path) -> std::result::Result<Module, mg_module::ModuleError> {
     let m = Module::open(path)?;
     if let Some(folder) = mg_module::folder::beside_mod(path) {
@@ -1811,6 +2135,9 @@ fn model_file(cli: &Cli, cmd: &ModelCmd) -> Result<Output> {
         ModelCmd::Compile { input, output } | ModelCmd::Decompile { input, output } => {
             (input, output)
         }
+        ModelCmd::Info { model, module, added } => {
+            return model_info(cli, model, module.as_deref(), added);
+        }
     };
     let data = std::fs::read(input).with_context(|| format!("{}", input.display()))?;
     let mut out = Output::new(serde_json::json!({
@@ -1834,9 +2161,10 @@ fn model_file(cli: &Cli, cmd: &ModelCmd) -> Result<Output> {
         ModelCmd::Decompile { .. } => {
             let text =
                 mg_mdl::decompile_with(&data, &models).map_err(|e| anyhow::anyhow!("{e}"))?;
-            std::fs::write(output, text)?;
+            write_bytes_whole(output, text.as_ref())?;
             out.note(format!("wrote {}", output.display()));
         }
+        ModelCmd::Info { .. } => unreachable!("answered above"),
         ModelCmd::Compile { .. } => {
             let name = input.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
             let name = name.to_ascii_lowercase();
@@ -1844,7 +2172,7 @@ fn model_file(cli: &Cli, cmd: &ModelCmd) -> Result<Output> {
             let compiled =
                 mg_mdl::compile::compile_named_with(&data, &name, &models, &|_| None, &materials)
                     .map_err(|e| anyhow::anyhow!("{}: {e}", input.display()))?;
-            std::fs::write(output, &compiled.binary)?;
+            write_bytes_whole(output, &compiled.binary)?;
             // (With the linter's notes on the text.)
             let mut said = compiled.notes;
             said.extend(mg_module::models::linter_notes(&String::from_utf8_lossy(&data)));
@@ -1860,6 +2188,110 @@ fn model_file(cli: &Cli, cmd: &ModelCmd) -> Result<Output> {
             out.json["compiler_notes"] = notes.into();
             out.note(format!("wrote {}", output.display()));
         }
+    }
+    Ok(out)
+}
+
+/// `mg model info`: a model's facts ([`mg_mdl::facts::Facts`]), from its
+/// file, or by its name from the load order (with a module's haks and
+/// those `--hak` gives).
+fn model_info(
+    cli: &Cli,
+    model: &str,
+    module: Option<&Path>,
+    added: &added::Added,
+) -> Result<Output> {
+    use serde_json::json;
+    let mut out = Output::default();
+    let file = Path::new(model);
+    let (data, from) = if file.is_file() {
+        let data = std::fs::read(file).with_context(|| path_text(file))?;
+        (data, path_text(file))
+    } else {
+        let name = model.strip_suffix(".mdl").unwrap_or(model);
+        let key = ResKey::parse(name, ResType::MDL)
+            .with_context(|| format!("{model}: no such file, nor a model's name"))?;
+        let rm = resman_with(cli, module, added, &mut out)?;
+        let at = rm.find(&key).with_context(|| format!("{key} is found nowhere"))?;
+        let data = rm.get_in(at, &key)?.into_owned();
+        (data, rm.layers()[at].label.clone())
+    };
+    let binary = mg_mdl::is_binary(&data);
+    let (m, map) = match binary {
+        true => (mg_mdl::binary::read(&data), None),
+        false => match mg_mdl::ascii::read_mapped(&data) {
+            Ok((m, map)) => (Ok(m), Some(map)),
+            Err(e) => (Err(e), None),
+        },
+    };
+    let m = m.map_err(|e| anyhow::anyhow!("{model}: {e}"))?;
+    let f = mg_mdl::facts::Facts::of(&m);
+    let format = if binary { "binary" } else { "ascii" };
+    // (A text's faces that its mesh leaves out once its vertices are
+    // merged, two corners on one vertex, as the game's compiler leaves
+    // them out (nwn-mdl-spec MDL-MESH-020): its rows less the mesh's
+    // faces. Rows past its vertices are the reader's notes.)
+    let left_out: usize = (map.iter().flat_map(|map| m.nodes.iter().zip(&map.meshes)))
+        .filter_map(|(node, source)| Some((node.mesh()?, source.as_ref()?)))
+        .map(|(mesh, source)| source.faces.len().saturating_sub(mesh.faces.len()))
+        .sum();
+    for n in map.iter().flat_map(|map| &map.notes) {
+        out.note(format!("line {}: {}", n.line, n.message));
+    }
+    let classification = format!("{:?}", f.classification).to_lowercase();
+    let bounds = f.bounds.map(|(min, max)| json!({ "min": min, "max": max }));
+    out.json = json!({
+        "model": model,
+        "from": from,
+        "format": format,
+        "name": f.name,
+        "supermodel": f.supermodel,
+        "classification": classification,
+        "animation_scale": f.animation_scale,
+        "nodes": f.nodes,
+        "node_types": f.node_types,
+        "faces": f.faces,
+        "faces_rendered": f.faces_rendered,
+        "faces_left_out": left_out,
+        "vertices": f.vertices,
+        "bounds": bounds,
+        "skins": (f.skins.iter())
+            .map(|(node, bones, faces)| json!({ "node": node, "bones": bones, "faces": faces }))
+            .collect::<Vec<_>>(),
+        "bones": f.bones,
+        "textures": f.textures,
+        "materials": f.materials,
+        "animations": (f.animations.iter())
+            .map(|(name, length, transtime, events)| json!({
+                "name": name, "length": length, "transtime": transtime, "events": events,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let list = |v: &mut dyn Iterator<Item = String>| v.collect::<Vec<_>>().join(", ");
+    out.line(format!("Name\t{} ({format}, from {from})", f.name));
+    out.line(format!("Supermodel\t{}", f.supermodel.as_deref().unwrap_or("NULL")));
+    out.line(format!("Classification\t{classification}"));
+    let types = list(&mut f.node_types.iter().map(|(t, n)| format!("{n} {t}")));
+    out.line(format!("Nodes\t{} ({types})", f.nodes));
+    out.line(format!("Faces\t{} ({} drawn), {} vertices", f.faces, f.faces_rendered, f.vertices));
+    if left_out > 0 {
+        out.line(format!(
+            "Left out\t{left_out} faces of the text: two corners on one vertex once merged, \
+             as the game's compiler leaves them out"
+        ));
+    }
+    let shown = |v: mg_mdl::Vec3| format!("{:.3} {:.3} {:.3}", v[0], v[1], v[2]);
+    out.line(match f.bounds {
+        Some((min, max)) => format!("Bounds\t{} to {}", shown(min), shown(max)),
+        None => "Bounds\tnone (no mesh drawn)".to_string(),
+    });
+    for (node, bones, faces) in &f.skins {
+        out.line(format!("Skin\t{node}: {bones} bones, {faces} faces"));
+    }
+    out.line(format!("Textures\t{}", list(&mut f.textures.iter().cloned())));
+    out.line(format!("Materials\t{}", list(&mut f.materials.iter().cloned())));
+    for (name, length, _, _) in &f.animations {
+        out.line(format!("Animation\t{name}: {length} s"));
     }
     Ok(out)
 }
@@ -1882,6 +2314,7 @@ fn install(cli: &Cli) -> Result<GameInstall> {
     }
     gi.userpatch = cli.userpatch;
     gi.workshop = cli.workshop;
+    gi.aliases = !cli.no_aliases;
     Ok(gi)
 }
 
@@ -1951,6 +2384,64 @@ fn path_text(p: &Path) -> String {
     p.display().to_string()
 }
 
+/// Writes a file whole or not at all, as `mg_module::write_replacing_with`
+/// does it (a file beside `path`, flushed to the disk and put in its
+/// place), for a file that is streamed: `fill` writes it, and a failure
+/// of its own (a file that can't be read, the command stopped) leaves
+/// what was at `path` as it was too, never a part of the new.
+pub(crate) fn write_whole(
+    path: &Path,
+    fill: impl FnOnce(&mut io::BufWriter<std::fs::File>) -> Result<()>,
+) -> Result<()> {
+    // (The rule is mg-module's; `fill`'s own error is carried past it.)
+    let mut said = None;
+    let written = mg_module::write_replacing_with(path, |file| {
+        fill(file).map_err(|e| {
+            said = Some(e);
+            io::Error::other("not written")
+        })
+    });
+    match (written, said) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(e)) => Err(e),
+        (Err(e), None) => Err(e.into()),
+    }
+    .with_context(|| path_text(path))
+}
+
+/// [`write_whole`] for a file's bytes at hand.
+pub(crate) fn write_bytes_whole(path: &Path, bytes: &[u8]) -> Result<()> {
+    mg_module::write_replacing(path, bytes).with_context(|| path_text(path))
+}
+
+/// A project's root folder, from its folder or its `nasher.cfg`.
+pub(crate) fn project_root(path: &Path) -> Result<PathBuf> {
+    let root = match path.file_name() {
+        Some(n) if n == "nasher.cfg" => {
+            path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
+        }
+        _ => path,
+    };
+    if !root.is_dir() {
+        bail!("{}: not a project's folder", root.display());
+    }
+    Ok(root.to_path_buf())
+}
+
+/// [`write_bytes_whole`] for one of the many files a command writes into
+/// a folder (an archive unpacked, a picture an area): whole or not at
+/// all, but not flushed to the disk file by file.
+fn write_one_of_many(path: &Path, bytes: &[u8]) -> Result<()> {
+    mg_module::write_replacing_one_of_many(path, bytes).with_context(|| path_text(path))
+}
+
+fn module_changed(before: &mg_module::Module, after: &mg_module::Module) -> bool {
+    before.file_type != after.file_type
+        || before.description != after.description
+        || before.len() != after.len()
+        || before.keys().any(|k| mg_edit::resource_differs(before, after, k))
+}
+
 /// Compile results: errors as lines and as JSON; warnings as notes, each
 /// once (an include's is every includer's) with how many scripts it was
 /// met in, and as JSON.
@@ -1980,6 +2471,21 @@ fn compiled(out: &mut Output, results: &[mg_module::build::ScriptResult]) -> ser
     })
 }
 
+/// Each script compiled, as JSON: why, and whether its compiled script
+/// and debug file are new or differ.
+fn compiled_scripts(outcomes: &[mg_module::build::Outcome]) -> serde_json::Value {
+    let list: Vec<_> = (outcomes.iter())
+        .map(|o| {
+            serde_json::json!({
+                "script": o.script.resref.to_string(), "why": o.why.id(),
+                "ok": o.error.is_none(), "changed": o.compiled.is_changed(),
+                "debug_changed": o.debug.is_changed(),
+            })
+        })
+        .collect();
+    list.into()
+}
+
 /// What the window and `mg` remember of the scripts of `module` they
 /// compiled with what `made_with` says (`mg_module::build::Remembered`),
 /// kept in Moonglow's data folder: nothing, where none of it was made
@@ -2003,131 +2509,53 @@ fn remember(out: &mut Output, module: &Path, now: &mg_module::build::Remembered)
 fn run(cli: &Cli) -> Result<Output> {
     use serde_json::json;
     let out = match &cli.cmd {
-        Cmd::Ls { archive } => {
-            let data = std::fs::read(archive).with_context(|| path_text(archive))?;
+        Cmd::Ls { archive, sha256 } => {
+            // (Mapped, not read: a hak is gigabytes, and its names are in
+            // its first pages.)
+            let data = mg_key::map_file(archive).with_context(|| path_text(archive))?;
             let erf = Erf::read(&data)?;
+            // (Each resource's hash, asked for: its bytes read once.)
+            let hashes: Vec<Option<String>> = (erf.entries.iter())
+                .map(|e| match sha256 {
+                    true => erf
+                        .data(e)
+                        .map(|d| Some(mg_core::sha1::hex(&mg_core::sha256::sha256(&d))))
+                        .with_context(|| format!("{}: {}", archive.display(), e.filename())),
+                    false => Ok(None),
+                })
+                .collect::<Result<_>>()?;
+            let resources = (erf.entries.iter().zip(&hashes)).map(|(e, hash)| match hash {
+                Some(hash) => json!({ "name": e.filename(), "size": e.size, "sha256": hash }),
+                None => json!({ "name": e.filename(), "size": e.size }),
+            });
             let mut out = Output::new(json!({
                 "archive": path_text(archive),
                 "type": String::from_utf8_lossy(&erf.file_type).trim(),
-                "resources": erf.entries.iter().map(|e| json!({ "name": e.filename(), "size": e.size })).collect::<Vec<_>>(),
+                "resources": resources.collect::<Vec<_>>(),
             }));
-            for e in &erf.entries {
-                out.line(format!("{:>10}  {}", e.size, e.filename()));
+            for (e, hash) in erf.entries.iter().zip(&hashes) {
+                match hash {
+                    Some(hash) => out.line(format!("{:>10}  {hash}  {}", e.size, e.filename())),
+                    None => out.line(format!("{:>10}  {}", e.size, e.filename())),
+                }
             }
             out
         }
         Cmd::Unpack { archive, out: dir } => {
-            let data = std::fs::read(archive).with_context(|| path_text(archive))?;
+            // (Mapped: each resource is read as it is written out.)
+            let data = mg_key::map_file(archive).with_context(|| path_text(archive))?;
             let erf = Erf::read(&data)?;
             std::fs::create_dir_all(dir)?;
             for e in &erf.entries {
                 let path = ResKey::new(e.resref, e.restype).path_in(dir)?;
-                std::fs::write(path, erf.data(e)?)?;
+                write_one_of_many(&path, &erf.data(e)?)?;
             }
             let mut out =
                 Output::new(json!({ "folder": path_text(dir), "files": erf.entries.len() }));
             out.note(format!("unpacked {} files", erf.entries.len()));
             out
         }
-        Cmd::Pack { dir, archive, compile_models } => {
-            let ext =
-                archive.extension().and_then(|e| e.to_str()).unwrap_or("erf").to_ascii_uppercase();
-            let mut file_type = [b' '; 4];
-            file_type[..ext.len().min(4)].copy_from_slice(&ext.as_bytes()[..ext.len().min(4)]);
-            let mut w = ErfWriter::new(file_type);
-            let mut paths: Vec<PathBuf> =
-                std::fs::read_dir(dir)?.flatten().map(|e| e.path()).collect();
-            paths.sort();
-            // The models kept as text, compiled (asked for): their bytes
-            // in place of the files'.
-            let mut compiled: std::collections::HashMap<ResKey, Vec<u8>> = Default::default();
-            let (mut made, mut left, mut said) = (Vec::new(), Vec::new(), Vec::new());
-            if *compile_models {
-                let mut models = Vec::new();
-                for p in paths.iter().filter(|p| p.is_file()) {
-                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                    // (Materials too: a mesh with no render hint takes its
-                    // material's.)
-                    if let Ok(key) = resource_key(name)
-                        && matches!(key.restype, mg_core::ResType::MDL | mg_core::ResType::MTR)
-                    {
-                        models.push((key, std::fs::read(p)?));
-                    }
-                }
-                let files: Vec<(ResKey, &[u8])> =
-                    models.iter().map(|(k, d)| (*k, d.as_slice())).collect();
-                let game = install(cli).ok().and_then(|gi| ResMan::for_game(&gi).ok());
-                let lookup = |name: &str, t: mg_core::ResType| {
-                    let rm = game.as_ref()?;
-                    rm.get_named(name, t).ok().map(|d| d.into_owned())
-                };
-                for c in mg_module::models::compile_models(&files, &lookup) {
-                    match c.result {
-                        Ok((binary, notes)) => {
-                            for (line, note) in notes {
-                                let at =
-                                    if line > 0 { format!(" line {line}") } else { String::new() };
-                                said.push(format!("{}{at}: {note}", c.model));
-                            }
-                            made.push(c.model.to_string());
-                            compiled.insert(c.model, binary);
-                        }
-                        Err(why) => left.push((c.model.to_string(), why)),
-                    }
-                }
-                if game.is_none() && !left.is_empty() {
-                    said.push(
-                        "no game install found: supermodels were looked for in the directory only"
-                            .into(),
-                    );
-                }
-            }
-            for p in paths.iter().filter(|p| p.is_file()) {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                let key = resource_key(name)?;
-                let data = match compiled.remove(&key) {
-                    Some(binary) => binary,
-                    None => std::fs::read(p)?,
-                };
-                w.add(key.resref, key.restype, data)?;
-            }
-            // Streamed: a hak can be gigabytes.
-            let mut file = io::BufWriter::new(std::fs::File::create(archive)?);
-            w.write_to(&mut file)?;
-            file.flush()?;
-            let past = w.past_read_limit();
-            let mut out = Output::new(json!({
-                "archive": path_text(archive),
-                "files": w.len(),
-                "past_read_limit": past.iter().map(|(r, t)| format!("{r}.{t}")).collect::<Vec<_>>(),
-                "models_compiled": made,
-                "models_left_as_text": left
-                    .iter()
-                    .map(|(m, why)| json!({ "model": m, "why": why }))
-                    .collect::<Vec<_>>(),
-                "model_notes": said,
-            }));
-            out.note(format!("packed {} files", w.len()));
-            if *compile_models {
-                out.note(format!("compiled {} models kept as text", made.len()));
-            }
-            for (model, why) in &left {
-                out.note(format!("warning: {model} goes in as text: {why}"));
-            }
-            for note in &said {
-                out.note(note.clone());
-            }
-            if let Some(first) = past.first() {
-                out.note(format!(
-                    "warning: {} file(s) from {}.{} on start past 2 GiB into the archive, \
-                     which the game can't read; split it into two",
-                    past.len(),
-                    first.0,
-                    first.1
-                ));
-            }
-            out
-        }
+        Cmd::Pack { dir, archive, compile_models } => cmd_pack(cli, dir, archive, *compile_models)?,
         Cmd::Gff { input, output, module, names } => {
             let m = module.as_deref().map(crate::open_module).transpose()?;
             let codepage = m.as_ref().map_or(Codepage::WINDOWS_1252, |m| module_codepage(cli, m));
@@ -2159,33 +2587,45 @@ fn run(cli: &Cli) -> Result<Output> {
             out.notes.splice(0..0, notes.notes);
             out
         }
-        Cmd::Set { module, resource, fields, remove, dry_run, plugins } => {
+        Cmd::Set { module, resource, fields, remove, dry_run, plugins, strict } => {
             let m = crate::open_module(module)?;
             let codepage = module_codepage(cli, &m);
             let mut notes = Output::default();
-            let guard = save_guard(cli, &m, plugins, &mut notes)?;
+            let guard = save_guard(cli, &m, plugins, &mut notes)?.map(|g| g.strict(*strict));
+            let gi = install(cli).ok();
+            let gi = gi.as_ref();
             let mut out =
-                edits::set(m, resource, fields, remove, *dry_run, codepage, guard.as_ref())?;
+                edits::set(m, resource, fields, remove, *dry_run, codepage, guard.as_ref(), gi)?;
             out.notes.splice(0..0, notes.notes);
             out
         }
-        Cmd::Apply { module, edits, dry_run, plugins } => {
+        Cmd::BakeWalkmesh { module, area, object, unbake, dry_run, plugins, strict } => {
+            let asked = bake::Asked {
+                module,
+                area,
+                objects: object,
+                unbake: *unbake,
+                dry_run: *dry_run,
+                plugins,
+                strict: *strict,
+            };
+            bake::run(cli, &asked)?
+        }
+        Cmd::Apply { module, edits, dry_run, plugins, strict } => {
             let m = crate::open_module(module)?;
             let codepage = module_codepage(cli, &m);
             let mut notes = Output::default();
-            let guard = save_guard(cli, &m, plugins, &mut notes)?;
-            let mut out = edits::apply(m, edits, *dry_run, codepage, guard.as_ref())?;
+            let guard = save_guard(cli, &m, plugins, &mut notes)?.map(|g| g.strict(*strict));
+            let gi = install(cli).ok();
+            let gi = gi.as_ref();
+            let mut out = edits::apply(m, edits, *dry_run, codepage, guard.as_ref(), gi)?;
             out.notes.splice(0..0, notes.notes);
             out
         }
-        Cmd::Which { resource, module } => {
-            let gi = install(cli)?;
+        Cmd::Which { resource, module, added } => {
             let key = resource_key(resource)?;
             let mut out = Output::default();
-            let rm = match module {
-                Some(path) => module_resman(&gi, &crate::open_module(path)?, &mut out)?,
-                None => ResMan::for_game(&gi)?,
-            };
+            let rm = resman_with(cli, module.as_deref(), added, &mut out)?;
             // Every copy, highest first: the first is the one the game reads.
             let copies = rm.copies(&key);
             let Some(&top) = copies.first() else { bail!("{key} not found") };
@@ -2205,8 +2645,25 @@ fn run(cli: &Cli) -> Result<Output> {
             }
             out
         }
-        Cmd::Cat { resource, text } => {
-            let rm = ResMan::for_game(&install(cli)?)?;
+        Cmd::Cat { resources, list, to, force, dry_run, text, module, added } => {
+            let mut notes = Output::default();
+            let rm = resman_with(cli, module.as_deref(), added, &mut notes)?;
+            if let Some(dir) = to {
+                let names = added::names(resources, list.as_deref())?;
+                let asked = added::Many {
+                    names: &names,
+                    dir,
+                    text: *text,
+                    force: *force,
+                    dry_run: *dry_run,
+                };
+                let mut out = added::many(&rm, &asked)?;
+                out.notes.splice(0..0, notes.notes);
+                return Ok(out);
+            }
+            let [resource] = &resources[..] else {
+                bail!("{} resources: give --to FOLDER to write them into", resources.len())
+            };
             let key = resource_key(resource)?;
             let data = rm.get(&key)?;
             // (A model that is text already is printed as it is.)
@@ -2217,7 +2674,7 @@ fn run(cli: &Cli) -> Result<Output> {
                 Some(Err(mg_mdl::DecompileError::NotBinary)) | None => data,
                 Some(Err(e)) => anyhow::bail!("{key}: {e}"),
             };
-            if cli.json {
+            let mut out = if cli.json {
                 // Text as text; other bytes as hexadecimal.
                 let text = std::str::from_utf8(&data).ok().map(str::to_string);
                 let hex = text
@@ -2233,7 +2690,9 @@ fn run(cli: &Cli) -> Result<Output> {
             } else {
                 io::stdout().lock().write_all(&data)?;
                 Output { done: true, ..Default::default() }
-            }
+            };
+            out.notes = notes.notes;
+            out
         }
         Cmd::Layers => {
             let rm = ResMan::for_game(&install(cli)?)?;
@@ -2283,7 +2742,14 @@ fn run(cli: &Cli) -> Result<Output> {
         Cmd::Plugin { cmd } => match cmd {
             PluginCmd::List { folders, project } => plugins::list(folders, project.as_deref())?,
             PluginCmd::Check { folders } => plugins::check(folders)?,
-            PluginCmd::Allow { project, ids, deny } => plugins::allow(project, ids, *deny)?,
+            PluginCmd::Tidy { project, plugins: dirs, dry_run } => {
+                plugins::tidy(project, dirs, *dry_run)?
+            }
+            PluginCmd::Allow { prune: true, .. } => plugins::prune()?,
+            PluginCmd::Allow { project, ids, deny, .. } => {
+                // (Clap requires a project without --prune.)
+                plugins::allow(project.as_deref().unwrap_or(Path::new(".")), ids, *deny)?
+            }
             // (A plugin that reads no game data needs no game.)
             PluginCmd::Test { plugin, module } => {
                 plugins::test(install(cli).ok().as_ref(), plugin, module.as_deref())?
@@ -2299,13 +2765,14 @@ fn run(cli: &Cli) -> Result<Output> {
                 by,
                 open,
                 answer,
+                answers,
                 file,
                 hak_dir,
                 yes,
                 setting,
                 dry_run,
             } => {
-                let host = plugins::CliHost::new(answer, file, *yes)?;
+                let host = plugins::CliHost::new(answer, answers.as_deref(), file, *yes)?;
                 // (A plugin that reads no game data needs no game.)
                 let gi = install(cli).ok();
                 let hak_dir = hak_dir.as_deref();
@@ -2322,22 +2789,10 @@ fn run(cli: &Cli) -> Result<Output> {
                     ),
                     false => None,
                 };
-                let selected = |n: &String| {
-                    mg_plugin::Selected::parse(n).map_err(|e| anyhow::anyhow!("--select {e}"))
-                };
-                // (A layer's copy is only ever open, as the window has it.)
-                let chosen = |n: &String| match selected(n)? {
-                    mg_plugin::Selected::Copy { .. } => {
-                        anyhow::bail!("--select {n}: a layer's copy is only --open")
-                    }
-                    s => Ok(s),
-                };
-                let selection = mg_plugin::Selection {
-                    selected: select.iter().map(chosen).collect::<Result<_>>()?,
-                    open: open.as_ref().map(selected).transpose()?,
-                };
+                let selection = plugins::selection_of(select, open.as_ref())?;
                 let what = plugins::What {
                     id: command,
+                    kind: plugins::Kind::Command,
                     changed,
                     selection,
                     settings: setting,
@@ -2345,6 +2800,22 @@ fn run(cli: &Cli) -> Result<Output> {
                     by: by.as_deref(),
                 };
                 plugins::run(gi.as_ref(), module, plugin, &what, host, hak_dir, *dry_run)?
+            }
+            PluginCmd::Export { module, plugin, exporter, out, job } => {
+                let gi = install(cli).ok();
+                plugins::export(gi.as_ref(), module, plugin, exporter, out, job)?
+            }
+            PluginCmd::Import { module, plugin, importer, source, job } => {
+                let gi = install(cli).ok();
+                let what = job.what(importer, plugins::Kind::Import(source))?;
+                let hak_dir = job.hak_dir.as_deref();
+                plugins::run(gi.as_ref(), module, plugin, &what, job.host()?, hak_dir, job.dry_run)?
+            }
+            PluginCmd::Wizard { module, plugin, wizard, job } => {
+                let gi = install(cli).ok();
+                let what = job.what(wizard, plugins::Kind::Wizard)?;
+                let hak_dir = job.hak_dir.as_deref();
+                plugins::run(gi.as_ref(), module, plugin, &what, job.host()?, hak_dir, job.dry_run)?
             }
             PluginCmd::Pack { plugin, output } => plugins::pack(plugin, output.as_deref())?,
             PluginCmd::Install { file, folder, replace } => {
@@ -2358,13 +2829,8 @@ fn run(cli: &Cli) -> Result<Output> {
         }
         Cmd::BuilderCode { project, code, clear } => {
             use mg_module::project_file::{DEFAULT_PATTERN, ProjectFile};
-            let root = match project.file_name() {
-                Some(n) if n == "nasher.cfg" => project.parent().unwrap_or(Path::new(".")),
-                _ => project.as_path(),
-            };
-            if !root.is_dir() {
-                bail!("{}: not a project's folder", root.display());
-            }
+            let root = project_root(project)?;
+            let root = root.as_path();
             // (A code that holds claims in the team's table, not yours
             // before: said.)
             let taken = code.as_deref().and_then(|c| {
@@ -2509,7 +2975,7 @@ fn run(cli: &Cli) -> Result<Output> {
             let description = mg_module::stamp::describe(comment, &stamp);
             let erf =
                 mg_module::transfer::export_erf(&m, &plan.resources, &description, !keep_factions)?;
-            std::fs::write(output, erf)?;
+            write_bytes_whole(output, &erf)?;
             out.json = json!({
                 "erf": path_text(output),
                 "resources": plan.resources.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -2524,6 +2990,8 @@ fn run(cli: &Cli) -> Result<Output> {
         }
         Cmd::Compile { module, uncompiled, all, ndb } => {
             let mut m = crate::open_module(module)?;
+            // (What the save writes, for the project's plugins to see.)
+            let was = m.clone();
             let mut out = Output::default();
             let gi = install(cli)?;
             let rm = module_resman(&gi, &m, &mut out)?;
@@ -2548,10 +3016,17 @@ fn run(cli: &Cli) -> Result<Output> {
                     .collect()
             });
             let pass = build::compile_changed(&mut m, &rm, None, &known, only, *ndb);
+            let outcomes = build::outcomes(&pass, &was, &m);
             out.json = compiled(&mut out, &pass.results);
-            m.save()?;
+            out.json["compiled_scripts"] = compiled_scripts(&outcomes);
+            if module_changed(&was, &m) {
+                save_asked(cli, &was, &mut m, &mut out)?;
+            }
             remember(&mut out, module, &pass.now);
             let failed = out.json["failed"].as_u64().unwrap_or(0) as usize;
+            // (What compiled is saved, and the exit says that not all did:
+            // a pipeline goes no further with a module of old scripts.)
+            out.failed = failed > 0;
             if *uncompiled {
                 out.note(format!(
                     "compiled {} scripts, {failed} failed",
@@ -2696,18 +3171,30 @@ fn run(cli: &Cli) -> Result<Output> {
                 out.line(line);
             }
             if let Some(file) = junit {
-                std::fs::write(file, ran.report.junit(&ran.name, ran.seconds))
-                    .with_context(|| path_text(file))?;
+                write_bytes_whole(file, ran.report.junit(&ran.name, ran.seconds).as_bytes())?;
             }
             out.failed = !ran.ok();
             out.notes = ran.notes.clone();
             out.note(ran.summary());
             out
         }
-        Cmd::TwodaCheck { paths, beside } => {
+        Cmd::TwodaSet { table, cells, row, matching, append, output, dry_run } => {
+            let asked = twoda_set::Asked {
+                table,
+                row: *row,
+                matching: matching.as_deref(),
+                append: *append,
+                cells,
+                output: output.as_ref(),
+                dry_run: *dry_run,
+            };
+            twoda_set::run(&asked, Codepage::default())?
+        }
+        Cmd::TwodaCheck { paths, beside, tlk } => {
             // (A table that names nothing of the game's needs no game.)
             let game = install(cli).ok().and_then(|gi| mg_rules::GameData::open(&gi).ok());
-            diff::check(paths, beside.as_deref(), game.as_ref(), Codepage::default())?
+            let (beside, tlk) = (beside.as_deref(), tlk.as_deref());
+            diff::check(paths, beside, tlk, game.as_ref(), Codepage::default())?
         }
         Cmd::TwodaDiff { a, b, base, output, edits, prefer, resource } => diff::twoda(
             &diff::Args {
@@ -2744,7 +3231,18 @@ fn run(cli: &Cli) -> Result<Output> {
                 project: project.as_deref(),
             })?
         }
-        Cmd::TlkAlloc { table, from, map, constants, prefix, start, check, against } => {
+        Cmd::MergeClaims { base, ours, theirs, prefer, output, path } => {
+            merge::merge_claims(&merge::Args {
+                base,
+                ours,
+                theirs,
+                prefer: prefer.as_deref(),
+                output: output.as_deref(),
+                path: path.as_deref(),
+                project: None,
+            })?
+        }
+        Cmd::TlkAlloc { table, from, map, constants, prefix, start, check, against, project } => {
             tlk_alloc::run(&tlk_alloc::Args {
                 table,
                 from,
@@ -2754,201 +3252,10 @@ fn run(cli: &Cli) -> Result<Output> {
                 start: *start,
                 check: *check,
                 against: against.as_ref(),
+                project: project.as_ref(),
             })?
         }
-        Cmd::Watch {
-            project,
-            target,
-            dev_dir,
-            test,
-            test_filter,
-            r#mod,
-            ndb,
-            serve,
-            dir,
-            port,
-            passwords,
-            env,
-            preload,
-            server_args,
-        } => {
-            let gi = install(cli)?;
-            let name = serve::module_name(project);
-            // (Held while it runs: another server of the project takes
-            // another.)
-            let scratch = (*serve && dir.is_none()).then(|| serve::run_dir("serve", project));
-            let server_dir = serve.then(|| {
-                let dir = dir.clone().or_else(|| scratch.as_ref().map(|s| s.dir.clone()));
-                let dir = dir.expect("one or the other");
-                std::path::absolute(&dir).unwrap_or(dir)
-            });
-            let dev_dir = match (dev_dir, &server_dir) {
-                (Some(dir), _) => dir.clone(),
-                (None, Some(server)) => server.join("development"),
-                (None, None) => bail!("where to? --dev-dir FOLDER, or --serve"),
-            };
-            std::fs::create_dir_all(&dev_dir).with_context(|| path_text(&dev_dir))?;
-            let served = server_dir.as_ref().map(|d| d.join("modules").join(format!("{name}.mod")));
-            let build_to = served.clone().or(r#mod.clone());
-            let say = |v: serde_json::Value, lines: Vec<String>| serve::say(cli.json, &v, &lines);
-            let resman = |m: &Module| -> Result<ResMan> {
-                let mut notes = Output::default();
-                let mut rm = module_resman(&gi, m, &mut notes)?;
-                for note in notes.notes {
-                    say(json!({ "event": "note", "note": note }), vec![format!("mg: {note}")]);
-                }
-                // With --test: the tests' include (`mg_test`), as `mg test`
-                // gives its copy, for them to compile where the module has
-                // none of its own (beneath everything: not put into it).
-                if *test {
-                    let mut include = mg_resman::MemContainer::new();
-                    let name = mg_module::testing::INCLUDE_NAME;
-                    let key = ResKey::parse(name, ResType::NSS).expect("a resource name");
-                    include.insert(key, mg_module::testing::INCLUDE.as_bytes().to_vec());
-                    rm.add(0, "mg test", mg_resman::LayerClass::Directory, include);
-                }
-                Ok(rm)
-            };
-            let also = |w: &watch::Watcher| -> Result<()> {
-                // (The module built for the server, also where it was asked for.)
-                if let (Some(to), Some(served)) = (r#mod, &served) {
-                    std::fs::copy(served, to).with_context(|| path_text(to))?;
-                }
-                let _ = w;
-                Ok(())
-            };
-            // With --test: the module's tests, as `mg test` runs them (in a
-            // server of their own, on a copy), on the module as the watch
-            // has it, after a change taken up (not one that didn't compile).
-            let tested = |w: &watch::Watcher, step: &watch::Step| {
-                if !*test {
-                    return;
-                }
-                if !step.errors.is_empty() {
-                    let note = "tests not run: the module doesn't compile";
-                    say(json!({ "event": "note", "note": note }), vec![format!("mg: {note}")]);
-                    return;
-                }
-                let config = test::Config {
-                    module: project.clone(),
-                    filter: test_filter.clone(),
-                    tests: Vec::new(),
-                    own_driver: false,
-                    settle: 0.0,
-                    timeout: 120.0,
-                    serve: serve::Config { name: "Moonglow test run".into(), ..Default::default() },
-                };
-                let resman = |m: &Module, notes: &mut Vec<String>| {
-                    let mut out = Output::default();
-                    let rm = module_resman(&gi, m, &mut out)?;
-                    notes.append(&mut out.notes);
-                    Ok(rm)
-                };
-                match test::run_on(&gi, &config, w.module().clone(), resman, &mut |_| {}) {
-                    Ok(ran) => {
-                        let mut v = ran.json();
-                        v["event"] = json!("tested");
-                        v["notes"] = json!(ran.notes);
-                        let notes = ran.notes.iter().map(|n| format!("mg: {n}"));
-                        let lines = notes.chain(ran.lines()).chain([format!(
-                            "mg: tests {}: {}",
-                            if ran.ok() { "passed" } else { "failed" },
-                            ran.summary()
-                        )]);
-                        say(v, lines.collect());
-                    }
-                    Err(e) => {
-                        let note = format!("tests not run: {e:#}");
-                        say(json!({ "event": "note", "note": note }), vec![format!("mg: {note}")]);
-                    }
-                }
-            };
-            let module = watch::open(project, target.as_deref())?;
-            let mut rm = resman(&module)?;
-            let (mut w, first) = watch::Watcher::start(
-                module,
-                project,
-                target.as_deref(),
-                &dev_dir,
-                build_to,
-                *ndb,
-                &rm,
-            )?;
-            also(&w)?;
-            say(
-                json!({
-                    "event": "watching", "project": path_text(project),
-                    "dev_dir": path_text(&dev_dir), "compiled": first.compiled,
-                    "errors": first.errors,
-                }),
-                [first.text(&dev_dir), vec![format!("mg: watching {}", project.display())]]
-                    .concat(),
-            );
-            tested(&w, &first);
-            let Some(server_dir) = server_dir else {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if let Some(step) = w.look(&rm)? {
-                        if !step.rebuild.is_empty() {
-                            rm = resman(w.module())?;
-                            also(&w)?;
-                        }
-                        say(step.json(), step.text(&dev_dir));
-                        tested(&w, &step);
-                    }
-                }
-            };
-            let config = serve::Config {
-                module: served.clone().expect("with --serve"),
-                dir: Some(server_dir),
-                port: *port,
-                name: "Moonglow test server".into(),
-                passwords: passwords.clone(),
-                env: env.clone(),
-                preload: preload.clone(),
-                stdin: true,
-                args: server_args.clone(),
-                // (The project's own talk table, made for the server.)
-                project: Some(project.clone()),
-                ..Default::default()
-            };
-            let mut wrong: Option<anyhow::Error> = None;
-            let end = serve::serve(&gi, &config, &mut |e| {
-                if let (Some(v), Some(t)) = (serve::json(e), serve::text(e)) {
-                    say(v, vec![t]);
-                }
-                if *e != serve::Event::Idle {
-                    return serve::Flow::Continue;
-                }
-                let step = match w.look(&rm) {
-                    Ok(Some(step)) => step,
-                    Ok(None) => return serve::Flow::Continue,
-                    Err(e) => {
-                        wrong = Some(e);
-                        return serve::Flow::Stop;
-                    }
-                };
-                say(step.json(), step.text(&dev_dir));
-                tested(&w, &step);
-                if step.rebuild.is_empty() {
-                    return serve::Flow::Continue;
-                }
-                match resman(w.module()).and_then(|new| also(&w).map(|()| new)) {
-                    Ok(new) => rm = new,
-                    Err(e) => {
-                        wrong = Some(e);
-                        return serve::Flow::Stop;
-                    }
-                }
-                serve::Flow::Restart
-            })?;
-            if let Some(e) = wrong {
-                return Err(e);
-            }
-            let failed = !matches!(end, serve::End::Stopped);
-            serve::say_ended(cli.json, &serve::how(end), failed);
-            Output { done: true, failed, ..Default::default() }
-        }
+        Cmd::Watch { .. } => cmd_watch(cli)?,
         Cmd::Lsp { codepage, module } => {
             if cli.json {
                 bail!("mg lsp speaks the Language Server Protocol, which is JSON already");
@@ -2982,9 +3289,15 @@ fn run(cli: &Cli) -> Result<Output> {
             let mut out = Output::default();
             let codepage = scripts_codepage(cli, &m);
             let (usages, mentions, run) = if *tag {
+                // (A tag as the files have it: an object's in the module's
+                // codepage, a script's string in the scripts'. Asked as
+                // UTF-8, a tag with a letter outside ASCII was found
+                // nowhere: as the window's Find References asks.)
+                let tag = module_codepage(cli, &m).encode_lossy(name);
+                let spelled = codepage.encode_lossy(name);
                 (
-                    mg_module::rename::tag_usages(&m, name),
-                    mg_module::rename::mentions(&m, name, false, codepage),
+                    mg_module::rename::tag_usages_of(&m, &tag),
+                    mg_module::rename::mentions_of(&m, &spelled, false, codepage),
                     Vec::new(),
                 )
             } else {
@@ -3008,7 +3321,9 @@ fn run(cli: &Cli) -> Result<Output> {
                 };
                 (
                     mg_module::rename::usages(&m, key),
-                    mg_module::rename::mentions(&m, &key.resref.to_string(), true, codepage),
+                    // (The name's own bytes: as text, a byte above 0x7F
+                    // was two.)
+                    mg_module::rename::mentions_of(&m, key.resref.as_bytes(), true, codepage),
                     run,
                 )
             };
@@ -3052,59 +3367,112 @@ fn run(cli: &Cli) -> Result<Output> {
                 return nui::rename(cli, module, &from.resref.to_string(), to, *strings);
             }
             let mut m = crate::open_module(module)?;
-            let to = mg_core::ResRef::from_str(to).map_err(|e| anyhow::anyhow!("{to}: {e}"))?;
+            // (What the save writes, for the project's plugins to see.)
+            let was = m.clone();
+            let to = mg_core::ResRef::typed(to).map_err(|e| anyhow::anyhow!("{to}: {e}"))?;
+            if to.is_empty() {
+                bail!("give the new name");
+            }
             let report = mg_module::rename::rename(&mut m, from, to, *strings)?;
             let mut out = Output::default();
             let mut compile = json!(null);
+            let mut rm = None;
             if !report.recompile.is_empty() {
-                let rm = module_resman(&install(cli)?, &m, &mut out)?;
-                let results = mg_module::rename::recompile(&mut m, &rm, &report, None, false);
+                let game = rm.insert(module_resman(&install(cli)?, &m, &mut out)?);
+                let results = mg_module::rename::recompile(&mut m, game, &report, None, false);
                 compile = compiled(&mut out, &results);
             }
-            m.save()?;
+            save_asked(cli, &was, &mut m, &mut out)?;
             let codepage = scripts_codepage(cli, &m);
-            let left = mg_module::rename::mentions(&m, &from.resref.to_string(), true, codepage);
+            let left = mg_module::rename::mentions_of(&m, from.resref.as_bytes(), true, codepage);
             for x in &left {
                 out.note(format!(
                     "warning: {} line {} still spells {}: {}",
                     x.script, x.line, from.resref, x.text
                 ));
             }
+            // A script's name in the haks' tables, which are not the
+            // module's to rewrite (where the game is found, to read them).
+            let mut hak_cells = Vec::new();
+            if matches!(from.restype, ResType::NSS | ResType::NCS | ResType::NDB) {
+                if rm.is_none() {
+                    rm = install(cli).ok().and_then(|gi| module_resman(&gi, &m, &mut out).ok());
+                }
+                if let Some(game) = &rm {
+                    hak_cells = mg_module::rename::hak_scripts(game, from.resref);
+                }
+            }
+            if let Some(w) = mg_module::rename::hak_scripts_warning(from.resref, &hak_cells) {
+                out.note(format!("warning: {w}"));
+            }
             out.json = json!({
                 "from": from.to_string(),
                 "to": to.to_string(),
                 "references": report.references,
                 "in_scripts": report.in_scripts,
+                "in_tables": report.in_tables,
+                "hak_cells": hak_cells.iter().map(|c| c.place()).collect::<Vec<_>>(),
                 "changed": report.changed.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "compiled": compile,
             });
+            let in_tables = match report.in_tables {
+                0 => String::new(),
+                n => format!(" {n} in the module's 2DAs,"),
+            };
             out.note(format!(
-                "renamed {from} to {to}: {} references, {} in scripts, {} scripts compiled again",
+                "renamed {from} to {to}: {} references, {} in scripts,{in_tables} {} scripts \
+                 compiled again",
                 report.references,
                 report.in_scripts,
                 report.recompile.len()
             ));
             out
         }
-        Cmd::DialogExport { module, dialog, output, languages } => {
+        Cmd::DialogExport { module, names, to, format, all, force, languages } => {
             use mg_module::dialog_io::Format;
-            let m = crate::open_module(module)?;
-            let key = ResKey::from_filename(dialog).context("give the conversation as name.dlg")?;
-            let g = m.gff(&key).with_context(|| format!("{key} is not in the module"))??;
-            let f = Format::of(output).context("the output must end .txt, .csv, .twee or .ink")?;
             let languages = (languages.iter())
                 .map(|c| {
                     mg_core::Language::from_short_code(c)
                         .with_context(|| format!("{c:?} isn't a language (fr, de, it, es, pl)"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if !languages.is_empty() && f != Format::Csv {
-                bail!("--language is for a CSV: Twine and Ink carry the English text");
+            let csv_only = |f: Format| {
+                if !languages.is_empty() && f != Format::Csv {
+                    bail!("--language is for a CSV: Twine and Ink carry the English text");
+                }
+                Ok(())
+            };
+            if let Some(dir) = to {
+                let f = match format.as_deref() {
+                    Some("ink") => Format::Ink,
+                    Some("twine") => Format::Twine,
+                    Some("text") => Format::Text,
+                    Some("csv") => Format::Csv,
+                    _ => bail!("--to needs --format: ink, twine, text or csv"),
+                };
+                csv_only(f)?;
+                let m = crate::open_module(module)?;
+                return dialog_export_into(cli, &m, names, *all, dir, f, *force, &languages);
             }
+            let [dialog, output] = names.as_slice() else {
+                bail!(
+                    "give one conversation and the file to write (name.dlg OUT.ink), or \
+                     conversations and --to FOLDER --format FORMAT"
+                );
+            };
+            let output = Path::new(output);
+            let m = crate::open_module(module)?;
+            let key = ResKey::from_filename(dialog).context("give the conversation as name.dlg")?;
+            if key.restype != ResType::DLG {
+                bail!("{dialog}: not a conversation (.dlg)");
+            }
+            let g = m.gff(&key).with_context(|| format!("{key} is not in the module"))??;
+            let f = Format::of(output).context("the output must end .txt, .csv, .twee or .ink")?;
+            csv_only(f)?;
             // (Its lines as the module's own table reads them, if any.)
             let title = key.resref.to_string();
             let text = f.write_in(&g, &title, module_codepage(cli, &m), &languages);
-            std::fs::write(output, text.as_bytes())?;
+            write_bytes_whole(output, text.as_bytes())?;
             Output::new(
                 json!({ "conversation": key.to_string(), "file": path_text(output), "format": f.name() }),
             )
@@ -3119,7 +3487,7 @@ fn run(cli: &Cli) -> Result<Output> {
                 "csv" => (t.to_csv_as(!*base).into_bytes(), "csv"),
                 _ => anyhow::bail!("the output must end .json or .csv"),
             };
-            std::fs::write(output, text)?;
+            write_bytes_whole(output, text.as_ref())?;
             Output::new(json!({
                 "table": path_text(table),
                 "file": path_text(output),
@@ -3166,7 +3534,9 @@ fn run(cli: &Cli) -> Result<Output> {
                 _ => anyhow::bail!("the file must end .json or .csv"),
             }
             .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
-            if !dry_run && (changed > 0 || added > 0 || !table.is_file()) {
+            // (A table no line of which changed is not written again.)
+            let saved = !dry_run && (changed > 0 || added > 0 || !table.is_file());
+            if saved {
                 t.save().map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             let mut out = Output::new(json!({
@@ -3174,15 +3544,15 @@ fn run(cli: &Cli) -> Result<Output> {
                 "changed": changed,
                 "added": added,
                 "lines": t.len(),
-                "saved": !dry_run,
+                "saved": saved,
             }));
             out.line(format!(
                 "{changed} lines changed, {added} added{}",
-                if *dry_run { " (nothing written)" } else { "" }
+                if saved { "" } else { " (nothing written)" }
             ));
             out
         }
-        Cmd::DialogImport { module, file, name } => {
+        Cmd::DialogImport { module, file, name, force } => {
             use mg_module::dialog_io::Format;
             let mut m = crate::open_module(module)?;
             let stem = file.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase());
@@ -3197,8 +3567,23 @@ fn run(cli: &Cli) -> Result<Output> {
             // A story is a conversation of its own; a text export goes
             // back into the conversation it came from.
             let format = Format::of(file);
-            let g = if let Some(read) = format.and_then(|f| f.read(&source)) {
-                read.map_err(|e| anyhow::anyhow!("{e}"))?
+            // (What a story does not say of the conversation it replaces,
+            // its end scripts among them, stays as that one has it.)
+            let replaced = m.gff(&key).and_then(Result::ok);
+            let g = if let Some(read) = format.and_then(|f| f.read_over(&source, replaced.as_ref()))
+            {
+                let g = read.map_err(|e| anyhow::anyhow!("{e}"))?;
+                // (A story is a whole conversation: the one of its name,
+                // which may only share the file's name, is not written
+                // over without a word, as `mg dialog-export --to` writes
+                // over no file.)
+                if !*force && m.contains(&key) {
+                    bail!(
+                        "{key} is in the module: nothing written (--force replaces it, or \
+                         --name NAME makes the story another conversation)"
+                    );
+                }
+                g
             } else if let Some(format) =
                 format.filter(|f| f.reads() == mg_module::dialog_io::Reads::Text)
             {
@@ -3214,8 +3599,9 @@ fn run(cli: &Cli) -> Result<Output> {
             } else {
                 bail!("{}: not a .twee, .ink or .csv file", file.display())
             };
+            let was = m.clone();
             m.set_gff(key, &g)?;
-            m.save()?;
+            save_asked(cli, &was, &mut m, &mut out)?;
             let lines = mg_module::dialog::nodes(&g, mg_module::dialog::Kind::Entry).len()
                 + mg_module::dialog::nodes(&g, mg_module::dialog::Kind::Reply).len();
             out.json =
@@ -3251,6 +3637,8 @@ fn run(cli: &Cli) -> Result<Output> {
                 kinds = TextKind::PLAYERS.to_vec();
             }
             let mut m = crate::open_module(module)?;
+            // (What the save writes, for the project's plugins to see.)
+            let was = m.clone();
             let game = Some(module_codepage(cli, &m));
             let o =
                 Options { match_case: *match_case, whole_word: *whole_word, regex: *regex, game };
@@ -3288,7 +3676,10 @@ fn run(cli: &Cli) -> Result<Output> {
                 for w in edits::objects_made_twice(&m, &tags) {
                     out.note(w);
                 }
-                m.save()?;
+                if n > 0 && module_changed(&was, &m) {
+                    keep_palettes(install(cli).ok().as_ref(), &mut m, &was, &mut out);
+                    save_asked(cli, &was, &mut m, &mut out)?;
+                }
                 replaced = n;
                 out.note(format!("replaced {n} times in {} strings", hits.len() - errors.len()));
             }
@@ -3300,372 +3691,11 @@ fn run(cli: &Cli) -> Result<Output> {
             });
             out
         }
-        Cmd::Areas {
-            module,
-            areas,
-            text,
-            tileset,
-            interior,
-            exterior,
-            underground,
-            above_ground,
-            natural,
-            artificial,
-            wheres,
-            where_var,
-            music,
-            sets,
-            vars,
-            remove_var,
-            static_placeables,
-            dynamic_placeables,
-            grass,
-            remove_grass,
-            tileset_grass,
-            lighting_scheme,
-            lighting,
-            tile_lights,
-            seed,
-            all,
-            dry_run,
-            names,
-        } => {
-            use mg_module::areas::{self, Change, Filter};
-            let resref =
-                |s: &String| mg_core::ResRef::from_str(s).map_err(|e| anyhow::anyhow!("{s}: {e}"));
-            // `--interior` or `--exterior`: so, not so, or either.
-            let kind = |yes: bool, no: bool| if yes { Some(true) } else { no.then_some(false) };
-            let mut has: Vec<areas::Has> = Vec::new();
-            for w in wheres {
-                has.push(areas::Has::parse_field(w).map_err(anyhow::Error::msg)?);
-            }
-            for v in where_var {
-                has.push(areas::Has::parse_var(v).map_err(anyhow::Error::msg)?);
-            }
-            let mut filter = Filter {
-                only: areas.iter().map(resref).collect::<Result<_>>()?,
-                text: text.clone(),
-                tileset: tileset.as_ref().map(resref).transpose()?,
-                interior: kind(*interior, *exterior),
-                underground: kind(*underground, *above_ground),
-                natural: kind(*natural, *artificial),
-                has,
-            };
-            let mut changes: Vec<Change> = Vec::new();
-            for s in sets {
-                changes.push(Change::parse_set(s).map_err(anyhow::Error::msg)?);
-            }
-            for v in vars {
-                changes.push(Change::parse_var(v).map_err(anyhow::Error::msg)?);
-            }
-            changes.extend(remove_var.iter().cloned().map(Change::RemoveVar));
-            if *static_placeables {
-                changes.push(Change::StaticPlaceables);
-            }
-            if *dynamic_placeables {
-                changes.push(Change::DynamicPlaceables);
-            }
-            let mut m = crate::open_module(module)?;
-            let mut out = Output::default();
-            // The game's data where there is a game: the areas' names as
-            // the module tree shows them, and the rows named.
-            let game = game_data_if_any(cli, &m, &mut out);
-            // A surface material by surfacemat.2da's label (the module's
-            // haks' over the game's).
-            let material = |name: &str| -> Option<u32> {
-                let t = game.as_ref()?.table("surfacemat").ok()?;
-                (0..t.len())
-                    .find(|&r| t.get(r, "Label").is_some_and(|l| l.eq_ignore_ascii_case(name)))
-                    .map(|r| r as u32)
-            };
-            for g in grass {
-                let o = mg_module::grass::GrassOverride::parse(g, material)
-                    .map_err(anyhow::Error::msg)?;
-                changes.push(Change::Grass(o));
-            }
-            for name in remove_grass {
-                let m = name.trim().parse().ok().or_else(|| material(name.trim()));
-                let m = m.ok_or_else(|| anyhow::anyhow!("{name}: not a surface material"))?;
-                changes.push(Change::RemoveGrass(m));
-            }
-            if let Some(on) = tileset_grass {
-                let on = areas::yes_no(on)
-                    .ok_or_else(|| anyhow::anyhow!("--tileset-grass {on:?}: yes or no"))?;
-                changes.push(Change::TilesetGrass(on));
-            }
-            // A lighting scheme, from the game's environment.2da (the
-            // module's haks' over it): before the fields `--set` sets.
-            if let Some(text) = lighting_scheme {
-                install(cli).context("--lighting-scheme reads the game's environment.2da")?;
-                let game =
-                    game.as_ref().context("--lighting-scheme: the game's data can't be read")?;
-                let row = mg_module::new::Scheme::find(game, text)
-                    .map_err(|e| anyhow::anyhow!("--lighting-scheme {e}"))?;
-                let scheme = mg_module::new::Scheme::read(game, row)?;
-                changes.insert(0, Change::LightingScheme(scheme));
-            }
-            // Lighting kept in Moonglow's data folder (or a file of it):
-            // after the scheme, before `--set`.
-            if let Some(name) = lighting {
-                let dir = mg_module::lighting::dir();
-                let saved = mg_module::lighting::read(dir.as_deref(), name)
-                    .map_err(|e| anyhow::anyhow!("--lighting {e}"))?;
-                let at = usize::from(matches!(changes.first(), Some(Change::LightingScheme(_))));
-                let name = name.trim().to_string();
-                changes.insert(at, Change::Lighting(Box::new(saved), name, *tile_lights));
-            }
-            if seed.is_some() && lighting_scheme.is_none() && lighting.is_none() {
-                anyhow::bail!("--seed picks the tiles' lights of --lighting-scheme or --lighting");
-            }
-            // A variable's type, where none is given: its description's
-            // (`variables.toml`), where the project describes it.
-            let mut described_notes = Vec::new();
-            for c in &mut changes {
-                let Change::Var { name, kind, .. } = c else { continue };
-                let Some(d) = m.project_file.variables.describe(name) else { continue };
-                let file = m.project_file.variables.file();
-                if d.runtime {
-                    described_notes.push(format!(
-                        "{name}: {file}:{} says the scripts set it while the server runs \
-                         (runtime), never in a file: set here, it is there from the start",
-                        d.line
-                    ));
-                }
-                if !d.belongs_on(mg_module::var_desc::Owner::Area) {
-                    described_notes.push(format!(
-                        "{name}: {file}:{} says it goes on {}, not on an area",
-                        d.line,
-                        d.on.iter().map(|o| o.name()).collect::<Vec<_>>().join(", ")
-                    ));
-                }
-                let Some(t) = d.var_type.filter(|t| t.field_type().is_some()) else { continue };
-                match *kind {
-                    None => *kind = Some(t.code()),
-                    Some(k) if k != t.code() => described_notes.push(format!(
-                        "{name}: set as {} as given, and {file}:{} says it is {}",
-                        mg_module::vars::VarType::of(k.into()).map_or("?", |t| t.name()),
-                        d.line,
-                        t.name()
-                    )),
-                    Some(_) => {}
-                }
-            }
-            let cp = module_codepage(cli, &m);
-            let language = game.as_ref().map_or(mg_core::Language::ENGLISH, |g| g.language);
-            let shown = |n: &mg_core::LocString| mg_rules::shown(game.as_ref(), n, language, cp);
-            let listed = areas::list_named(&m, &shown);
-            for a in listed.iter().filter(|a| !a.listed) {
-                out.note(format!("warning: {}", areas::unlisted_warning(a.resref)));
-            }
-            for a in &filter.only {
-                if !listed.iter().any(|l| l.resref == *a) {
-                    bail!("{a} is not an area of the module");
-                }
-            }
-            // What they must hold: a row given by its label or name (a
-            // field's, `--music`'s) is its number, from the game's table
-            // (the module's haks' over it), read only when one is so given.
-            let by_name = |field: &str, v: &str| {
-                areas::row_table(field).is_some() && mg_2da::parse_int(v.trim()).is_none()
-            };
-            let named = filter.has.iter().any(|h| match h {
-                areas::Has::Field { label, value: Some(v) } => by_name(label, v),
-                _ => false,
-            });
-            let music_row = music.as_deref().filter(|m| mg_2da::parse_int(m.trim()).is_none());
-            if named || music_row.is_some() {
-                install(cli).context("a row named, not numbered, reads the game's 2DAs")?;
-                let game =
-                    game.as_ref().context("the game's data can't be read for a row's name")?;
-                for h in &mut filter.has {
-                    let areas::Has::Field { label, value: Some(v) } = h else { continue };
-                    let Some(table) = areas::row_table(label).filter(|_| by_name(label, v)) else {
-                        continue;
-                    };
-                    let row =
-                        game.row_of(&table, v).map_err(|e| anyhow::anyhow!("{label}={v}: {e}"))?;
-                    *v = row.to_string();
-                }
-                if let Some(text) = music_row {
-                    let table = areas::row_table("MusicDay").expect("music is a row");
-                    let row =
-                        game.row_of(&table, text).map_err(|e| anyhow::anyhow!("--music {e}"))?;
-                    filter.has.push(areas::Has::Music(row));
-                }
-            }
-            if let Some(n) = music.as_deref().and_then(|m| mg_2da::parse_int(m.trim())) {
-                filter.has.push(areas::Has::Music(n.into()));
-            }
-            let mut held = areas::HoldsCache::default();
-            let chosen: Vec<&areas::AreaInfo> = listed
-                .iter()
-                .filter(|a| filter.matches(a))
-                .filter(|a| {
-                    filter.has.is_empty()
-                        || held.of(&m, a.resref, cp).is_some_and(|h| filter.holds(h))
-                })
-                .collect();
-            if !changes.is_empty() && filter.is_empty() && !*all {
-                bail!("name areas or give a filter, or pass --all to change every area");
-            }
-            let resrefs: Vec<mg_core::ResRef> = chosen.iter().map(|a| a.resref).collect();
-            let codepage = module_codepage(cli, &m);
-            // What Make Placeables Static leaves dynamic, and why (read
-            // before the change, by the project's rules).
-            let mut left_dynamic = Vec::new();
-            if *static_placeables {
-                let rules = m.project_file.make_static.clone().with_scripts(&m);
-                for &area in &resrefs {
-                    let key = ResKey::new(area, ResType::GIT);
-                    let Some(Ok(git)) = m.gff(&key) else { continue };
-                    let list = git.root.list("Placeable List").unwrap_or(&[]);
-                    for (i, why) in areas::static_plan(&git.root, &rules).kept {
-                        let tag = list[i].string("Tag").unwrap_or_default();
-                        let tag = codepage.decode(tag).into_owned();
-                        left_dynamic.push((area, i, tag, why.describe()));
-                    }
-                }
-            }
-            // (The tiles' lights picked at random, as Aurora picks them,
-            // with a number that picks them again: a dry run's are a
-            // run's with it.)
-            let scheme = changes
-                .iter()
-                .any(|c| matches!(c, Change::LightingScheme(_) | Change::Lighting(..)));
-            let seed = seed.unwrap_or_else(|| {
-                use std::hash::{BuildHasher, Hasher};
-                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-                h.write_u32(std::process::id());
-                h.finish() >> 16
-            });
-            // A field that holds a row, given by the row's label or name
-            // (`MusicDay=mus_cave`): its number, from the game's table (the
-            // module's haks' over it), read only when one is so given.
-            let named_row = |c: &Change| match c {
-                Change::Set { field, value } => {
-                    areas::row_table(field).is_some() && mg_2da::parse_int(value.trim()).is_none()
-                }
-                _ => false,
-            };
-            if changes.iter().any(named_row) {
-                install(cli).context("a row named, not numbered, reads the game's 2DAs")?;
-                game.as_ref().context("the game's data can't be read for a row's name")?;
-            }
-            for c in changes.iter_mut().filter(|c| named_row(c)) {
-                let Change::Set { field, value } = c else { continue };
-                let (Some(table), Some(game)) = (areas::row_table(field), &game) else { continue };
-                let row = game.row_of(&table, value);
-                *value = row.map_err(|e| anyhow::anyhow!("{field}={value}: {e}"))?.to_string();
-            }
-            // (With --names: the name of the row a field's number stands for.)
-            let name_of = |field: &str, v: &Option<String>| -> Option<String> {
-                let (table, game) = (areas::row_table(field)?, game.as_ref()?);
-                let row = mg_2da::parse_int(v.as_deref()?).filter(|_| *names)?;
-                game.row_name(&table, i64::from(row))
-            };
-            let named = |field: &str, v: &Option<String>| match name_of(field, v) {
-                Some(name) => v.as_ref().map(|v| format!("{v} ({name})")),
-                None => v.clone(),
-            };
-            let done = areas::apply(&mut m, &resrefs, &changes, codepage, seed)
-                .map_err(anyhow::Error::msg)?;
-            // (An area given a tag another object has: said, as `mg set`.)
-            let retagged: Vec<mg_core::ResRef> =
-                done.iter().filter(|c| c.what == "Tag").map(|c| c.area).collect();
-            for w in edits::areas_made_twice(&m, &retagged) {
-                out.note(w);
-            }
-            if scheme && !done.is_empty() {
-                out.note(format!(
-                    "the tiles' lights were picked with --seed {seed} (the same with it again)"
-                ));
-            }
-            project_file_notes(&m, &mut out);
-            for n in described_notes {
-                out.note(n);
-            }
-            let kinds = |flags: u32| {
-                let word = |bit: u32, yes: &'static str, no: &'static str| {
-                    if flags & bit != 0 { yes } else { no }
-                };
-                [
-                    word(areas::INTERIOR, "interior", "exterior"),
-                    word(areas::UNDERGROUND, "underground", "above ground"),
-                    word(areas::NATURAL, "natural", "artificial"),
-                ]
-                .join(", ")
-            };
-            if changes.is_empty() {
-                for a in &chosen {
-                    out.line(format!(
-                        "{}\t{}\t{}\t{}",
-                        a.resref,
-                        a.name,
-                        a.tileset,
-                        kinds(a.flags)
-                    ));
-                }
-                out.note(format!("{} of {} areas", chosen.len(), listed.len()));
-            } else {
-                let text = |v: &Option<String>| v.clone().unwrap_or_else(|| "(none)".into());
-                for c in &done {
-                    out.line(format!(
-                        "{}\t{}\t{} -> {}",
-                        c.area,
-                        c.what,
-                        text(&named(&c.what, &c.from)),
-                        text(&named(&c.what, &c.to))
-                    ));
-                }
-                for (area, i, tag, why) in &left_dynamic {
-                    out.note(format!("{area}: placeable {i} {tag} left dynamic: {why}"));
-                }
-                let changed: std::collections::BTreeSet<_> = done.iter().map(|c| c.area).collect();
-                if *dry_run {
-                    out.note(format!(
-                        "would change {} of {} areas chosen",
-                        changed.len(),
-                        chosen.len()
-                    ));
-                } else {
-                    if !done.is_empty() {
-                        m.save()?;
-                    }
-                    out.note(format!("changed {} of {} areas chosen", changed.len(), chosen.len()));
-                }
-            }
-            out.json = json!({
-                "areas": chosen.iter().map(|a| json!({
-                    "resref": a.resref.to_string(),
-                    "name": a.name,
-                    "tag": a.tag,
-                    "tileset": a.tileset.to_string(),
-                    "listed": a.listed,
-                    "interior": a.flags & areas::INTERIOR != 0,
-                    "underground": a.flags & areas::UNDERGROUND != 0,
-                    "natural": a.flags & areas::NATURAL != 0,
-                })).collect::<Vec<_>>(),
-                "changes": done.iter().map(|c| json!({
-                    "area": c.area.to_string(),
-                    "field": c.what,
-                    "from": c.from,
-                    "to": c.to,
-                    "from_name": name_of(&c.what, &c.from),
-                    "to_name": name_of(&c.what, &c.to),
-                })).collect::<Vec<_>>(),
-                "left_dynamic": left_dynamic.iter().map(|(area, i, tag, why)| json!({
-                    "area": area.to_string(),
-                    "index": i,
-                    "tag": tag,
-                    "why": why,
-                })).collect::<Vec<_>>(),
-                "dry_run": *dry_run,
-                "seed": scheme.then_some(seed),
-            });
-            out
-        }
+        Cmd::Areas { .. } => cmd_areas(cli)?,
         Cmd::UpdateInstances { module, blueprints, area } => {
             let mut m = crate::open_module(module)?;
+            // (What the save writes, for the project's plugins to see.)
+            let was = m.clone();
             let gi = install(cli)?;
             let wanted: Vec<ResKey> = if blueprints.is_empty() {
                 m.keys()
@@ -3683,6 +3713,9 @@ fn run(cli: &Cli) -> Result<Output> {
                     bail!("{k} is not in the module");
                 }
             }
+            // (Asked for each placed object and each item held: a set, not
+            // the list gone through for each.)
+            let is_wanted: std::collections::HashSet<ResKey> = wanted.iter().copied().collect();
             let mut out = Output::default();
             let game = game_data_in(&gi, &m, &mut out)?;
             let only = area
@@ -3703,7 +3736,7 @@ fn run(cli: &Cli) -> Result<Output> {
                     mg_module::instances::with_placing(&game, Some(&m), |placing, read| {
                         let blueprint = |t: mg_core::ResType, r: mg_core::ResRef| {
                             let k = ResKey::new(r, t);
-                            if wanted.contains(&k) { read(k) } else { None }
+                            if is_wanted.contains(&k) { read(k) } else { None }
                         };
                         // The items the area's objects hold (in chests, creatures'
                         // packs and hands, stores, bags) first, then the objects.
@@ -3719,7 +3752,7 @@ fn run(cli: &Cli) -> Result<Output> {
                             .map_or((root, held), |(new, n)| (new, n + held))
                     });
                 if let (new, n @ 1..) = updated {
-                    let mut g = git.clone();
+                    let mut g = git;
                     g.root = new;
                     m.set_gff(key, &g)?;
                     out.line(format!("{a}: {n}"));
@@ -3728,7 +3761,7 @@ fn run(cli: &Cli) -> Result<Output> {
                 }
             }
             if total > 0 {
-                m.save()?;
+                save_asked(cli, &was, &mut m, &mut out)?;
             }
             out.json = json!({ "updated": total, "areas": by_area, "blueprints": wanted.len() });
             out.note(format!("updated {total} objects from {} blueprints", wanted.len()));
@@ -3746,7 +3779,7 @@ fn run(cli: &Cli) -> Result<Output> {
                 if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
                     std::fs::create_dir_all(dir)?;
                 }
-                std::fs::write(&path, &bytes)?;
+                write_bytes_whole(&path, &bytes)?;
                 let lines = mg_tlk::Tlk::read(&bytes).map_or(0, |t| t.entries.len());
                 let mut out = Output::new(
                     json!({ "compiled": null, "packed": path_text(&path), "lines": lines }),
@@ -3769,23 +3802,25 @@ fn run(cli: &Cli) -> Result<Output> {
             // it keeps them among its sources.)
             let made_with = mg_module::build::made_with(Some(project), None, Some(&gi.root), &rm);
             let known = remembered(project, made_with);
+            let before = m.clone();
             let pass = mg_module::build::compile_changed(&mut m, &rm, None, &known, None, *ndb);
             let results = &pass.results;
+            let outcomes = mg_module::build::outcomes(&pass, &before, &m);
             let mut compile = compiled(&mut out, results);
+            compile["compiled_scripts"] = compiled_scripts(&outcomes);
             compile["unchanged"] = json!(pass.scripts.saturating_sub(results.len()));
             remember(&mut out, project, &pass.now);
             let failed = compile["failed"].as_u64().unwrap_or(0) as usize;
             if failed > 0 && !keep_going {
-                // The compiler's messages, then the failure.
-                if cli.json {
-                    out.json = json!({ "compiled": compile, "packed": null });
-                    out.failed = true;
-                    return Ok(out);
+                // The compiler's messages, the notes (a hak not found is
+                // often why), then the failure.
+                if !cli.json {
+                    let all = results.len();
+                    out.note(format!("mg: {failed} of {all} scripts failed to compile"));
                 }
-                for l in &out.text {
-                    println!("{l}");
-                }
-                bail!("{failed} of {} scripts failed to compile", results.len());
+                out.json = json!({ "compiled": compile, "packed": null });
+                out.failed = true;
+                return Ok(out);
             }
             // (The models kept as text compiled on the way in, where the
             // project file's `[pack] compile_models` asks: each against its
@@ -3795,10 +3830,9 @@ fn run(cli: &Cli) -> Result<Output> {
             let (path, bytes, models) =
                 m.target_archive_with(&lookup)?.context("not a nasher project")?;
             let path = output.clone().unwrap_or(path);
-            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&path, bytes)?;
+            // (Whole or not at all: a build interrupted leaves the last
+            // good module, not half of this one.)
+            write_bytes_whole(&path, &bytes)?;
             let left = match compile["unchanged"].as_u64().unwrap_or(0) {
                 0 => String::new(),
                 n => format!(" ({n} as they were when last compiled)"),
@@ -3854,55 +3888,15 @@ fn run(cli: &Cli) -> Result<Output> {
             ));
             out
         }
-        Cmd::Import { module, erf, overwrite } => {
-            let mut m = crate::open_module(module)?;
-            let data = std::fs::read(erf)?;
-            let gi = install(cli)?;
-            let mut out = Output::default();
-            let rm = module_resman(&gi, &m, &mut out)?;
-            let plan = mg_module::transfer::plan_import(&m, &data, &rm)?;
-            for r in &plan.missing {
-                out.note(format!(
-                    "warning: {} needs {:?} {}, found nowhere",
-                    r.from, r.kind, r.target
-                ));
-            }
-            // Where the archive came from, and whether the module has moved
-            // on since (said before anything is imported).
-            let stamp = mg_module::transfer::archive_stamp(&data);
-            let base_warning = stamp.as_ref().and_then(|s| mg_module::stamp::compare(s, &m));
-            match &stamp {
-                Some(s) => out.note(format!("made from {}", s.summary())),
-                None => out.note("the archive doesn't say what it was made from (no stamp)"),
-            }
-            if let Some(w) = &base_warning {
-                out.note(format!("warning: {w}"));
-            }
-            let s = mg_module::transfer::import_erf(&mut m, &data, |_| *overwrite)?;
-            m.save()?;
-            let names = |v: &[ResKey]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
-            out.json = json!({
-                "added": names(&s.added),
-                "replaced": names(&s.replaced),
-                "skipped": names(&s.skipped),
-                "new_areas": s.new_areas.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "stamp": stamp.as_ref().map(stamp_json),
-                "base_warning": base_warning,
-            });
-            out.note(format!(
-                "imported {} new, replaced {}, skipped {} existing; new areas: {:?}",
-                s.added.len(),
-                s.replaced.len(),
-                s.skipped.len(),
-                s.new_areas.iter().map(|a| a.to_string()).collect::<Vec<_>>()
-            ));
-            out
+        Cmd::Import { module, paths, overwrite, dry_run } => {
+            cmd_import(cli, module, paths, *overwrite, *dry_run)?
         }
         Cmd::Attach { module, files, replace } => {
             use mg_module::attach::{There, copy, hak_list, placements};
             let gi = install(cli)?;
-            let user = gi.user_dir.context("no user folder; pass --user-dir")?;
-            let placed = placements(&user, files).map_err(anyhow::Error::msg)?;
+            let folder = |sub| gi.user_folder(sub).context("no user folder; pass --user-dir");
+            let placed =
+                placements(&folder("hak")?, &folder("tlk")?, files).map_err(anyhow::Error::msg)?;
             let differ: Vec<String> = placed
                 .iter()
                 .filter(|p| p.there == There::Different)
@@ -3914,8 +3908,10 @@ fn run(cli: &Cli) -> Result<Output> {
                     differ.join(", ")
                 );
             }
-            let copied = copy(&placed, *replace).map_err(anyhow::Error::msg)?;
+            // (The module first: one that can't be opened, or has no
+            // module.ifo that reads, leaves the user folder as it is.)
             let mut m = crate::open_module(module)?;
+            let was = m.clone();
             let mut info = m.info()?;
             let haks: Vec<String> =
                 placed.iter().filter(|p| !p.is_tlk).map(|p| p.name.clone()).collect();
@@ -3928,264 +3924,29 @@ fn run(cli: &Cli) -> Result<Output> {
                 info.root.set("Mod_CustomTlk", mg_gff::Value::String(name));
             }
             m.set_info(&info)?;
+            // (The project's plugins asked, then the files copied, last,
+            // just before the save: a refusal copies nothing.)
+            let mut out = Output::default();
+            let guard = save_guard(cli, &m, &[], &mut out)?;
+            if let Some(g) = &guard {
+                g.before(&was, &m, &mut out)?;
+            }
+            let copied = copy(&placed, *replace).map_err(anyhow::Error::msg)?;
             m.save()?;
-            let mut out =
-                Output::new(json!({ "copied": copied, "haks": m.haks()?, "custom_tlk": tlk }));
+            if let Some(g) = &guard {
+                g.after(&was, &m, &mut out);
+            }
+            out.json = json!({ "copied": copied, "haks": m.haks()?, "custom_tlk": tlk });
             out.note(format!(
                 "copied {copied} file(s); the module has {} hak(s) attached",
                 m.haks()?.len()
             ));
             out
         }
-        Cmd::Minimap { module, area, out: png, size } => {
-            let m = crate::open_module(module)?;
-            let gi = install(cli)?;
-            let mut out = Output::default();
-            let rm = module_resman(&gi, &m, &mut out)?;
-            let key = ResKey::parse(area, ResType::ARE).context("not an area name")?;
-            let data = rm.get(&key).with_context(|| format!("{area}.are"))?;
-            let are = mg_gff::Gff::read(&data)?;
-            let set = mg_module::minimap::tileset(&rm, &are.root).map_err(anyhow::Error::msg)?;
-            let image = mg_module::minimap::minimap(&rm, &are.root, &set, *size)
-                .map_err(anyhow::Error::msg)?;
-            std::fs::write(png, mg_module::minimap::png(&image).map_err(anyhow::Error::msg)?)?;
-            out.json =
-                json!({ "file": path_text(png), "width": image.width, "height": image.height });
-            out.note(format!("{}×{} pixels", image.width, image.height));
-            out
-        }
-        Cmd::Find { module, types, tag, name, resref, area, placed, blueprints, fields } => {
-            let m = crate::open_module(module)?;
-            let types = parse_types(
-                types,
-                |t| mg_rules::ObjectKind::from_restype(t).is_some(),
-                "a blueprint type (utc, utp, …)",
-            )?;
-            // (Names are matched and shown in the module's own letters, as
-            // the module tree shows them: the talk table's where a name has
-            // none of its own, another language's where it has no English.)
-            let cp = module_codepage(cli, &m);
-            let mut notes = Output::default();
-            let game = game_data_if_any(cli, &m, &mut notes);
-            let q = mg_module::query::Query {
-                types,
-                tag: tag.clone(),
-                name: name.clone(),
-                resref: resref.clone(),
-                area: area
-                    .as_deref()
-                    .map(mg_core::ResRef::from_str)
-                    .transpose()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
-                placed: if *placed {
-                    Some(true)
-                } else if *blueprints {
-                    Some(false)
-                } else {
-                    None
-                },
-                fields: fields
-                    .iter()
-                    .map(|f| match f.split_once('=') {
-                        Some((l, v)) => (l.trim().to_string(), Some(v.to_string())),
-                        None => (f.trim().to_string(), None),
-                    })
-                    .collect(),
-                typed_fields: Vec::new(),
-            };
-            // A field that holds a row, given by the row's label or name
-            // (`Appearance_Type=Human`): for each type the field names a
-            // row of, that row's number (`Appearance` is a placeables.2da
-            // row for a placeable, doortypes.2da's for a door).
-            let mut q = q;
-            let types = match q.types.is_empty() {
-                true => mg_rules::ObjectKind::ALL.map(|k| k.restype()).to_vec(),
-                false => q.types.clone(),
-            };
-            let table_of = |t: ResType, label: &str| {
-                mg_rules::rows::row_table(t.extension().unwrap_or_default(), &[], label)
-            };
-            let named = |(label, value): &(String, Option<String>)| {
-                value.as_deref().is_some_and(|v| {
-                    !v.contains('*')
-                        && mg_2da::parse_int(v.trim()).is_none()
-                        && types.iter().any(|t| table_of(*t, label).is_some())
-                })
-            };
-            if q.fields.iter().any(named) {
-                let game =
-                    (game.as_ref()).context("a row named, not numbered, reads the game's 2DAs")?;
-                let (rows, plain): (Vec<_>, Vec<_>) = q.fields.drain(..).partition(named);
-                q.fields = plain;
-                for (label, value) in rows {
-                    let value = value.unwrap_or_default();
-                    let mut values = Vec::new();
-                    let mut why = Vec::new();
-                    for &t in &types {
-                        let Some(table) = table_of(t, &label) else { continue };
-                        match game.row_of(&table, &value) {
-                            Ok(row) => values.push((t, row.to_string())),
-                            Err(e) => why.push(e),
-                        }
-                    }
-                    if values.is_empty() {
-                        bail!("{label}={value}: {}", why.join("; "));
-                    }
-                    q.typed_fields.push((label, values));
-                }
-            }
-            let language = game.as_ref().map_or(mg_core::Language::ENGLISH, |g| g.language);
-            let shown = |ls: &mg_core::LocString| mg_rules::shown(game.as_ref(), ls, language, cp);
-            let found = mg_module::query::find_named(&m, &q, &shown);
-            let mut out = Output::new(json!({
-                "found": found.iter().map(|f| json!({
-                    "kind": if f.placed.is_some() { "placed" } else { "blueprint" },
-                    "type": f.restype.extension(),
-                    "resref": f.resref.map(|r| r.to_lowercase().to_string()),
-                    "tag": f.tag,
-                    "name": f.name,
-                    "area": f.placed.map(|(a, _)| a.to_string()),
-                    "index": f.placed.map(|(_, i)| i),
-                    "position": f.position,
-                })).collect::<Vec<_>>(),
-            }));
-            for f in &found {
-                let what = format!(
-                    "{}\t{}\t{}\t{}",
-                    f.restype.extension().unwrap_or("?"),
-                    f.resref.map(|r| r.to_lowercase().to_string()).unwrap_or_default(),
-                    f.tag,
-                    f.name
-                );
-                match (f.placed, f.position) {
-                    (Some((a, i)), Some([x, y, z])) => {
-                        out.line(format!("{a}[{i}]\t{what}\t{x:.2}, {y:.2}, {z:.2}"))
-                    }
-                    (Some((a, i)), None) => out.line(format!("{a}[{i}]\t{what}")),
-                    _ => out.line(format!("blueprint\t{what}")),
-                }
-            }
-            out.notes.extend(notes.notes);
-            out.note(format!("{} found", found.len()));
-            out
-        }
-        Cmd::Nwsync {
-            module,
-            repository,
-            with_module,
-            uuid,
-            name,
-            description,
-            group_id,
-            no_latest,
-            limit_file_size,
-            force,
-            dry_run,
-            level,
-            upload,
-        } => {
-            let m = crate::open_module(module)?;
-            // (The command found before anything is written.)
-            let project = m
-                .location
-                .as_ref()
-                .and_then(mg_module::project_file::ProjectFile::root_of)
-                .map(Path::to_path_buf);
-            let upload = match upload {
-                None => None,
-                Some(Some(c)) => Some(c.clone()),
-                Some(None) => match m.project_file.nwsync_upload.as_ref().map(|c| c.run.clone()) {
-                    Some(Some(c)) => Some(c),
-                    Some(None) => bail!(
-                        "the project's [nwsync] upload names no command for this system: give \
-                         one, --upload \"COMMAND\""
-                    ),
-                    None => bail!(
-                        "no upload command: the module's project names none ([nwsync] upload in \
-                         moonglow.toml): give one, --upload \"rsync -a {{part}} \
-                         you@host:/srv/nwsync/\""
-                    ),
-                },
-            };
-            let gi = install(cli)?;
-            let mut out = Output::default();
-            let rm = module_resman(&gi, &m, &mut out)?;
-            // (Its name and description in the module's letters.)
-            let codepage = mg_rules::text_codepage(&rm, game_language(&gi));
-            let info = mg_module::query::info_in(&m, codepage)?;
-            let own_uuid = m
-                .info()?
-                .root
-                .string("Mod_UUID")
-                .map(|u| String::from_utf8_lossy(u).into_owned())
-                .filter(|u| !u.is_empty());
-            let uuid = with_module
-                .then(|| uuid.clone().or(own_uuid).unwrap_or_else(mg_module::nwsync::new_uuid));
-            let (contents, missing) =
-                mg_module::nwsync::module_contents(&m, &gi, &rm, *with_module, uuid.as_deref())
-                    .map_err(anyhow::Error::msg)?;
-            if !missing.is_empty() {
-                bail!("haks not found: {}", missing.join(", "));
-            }
-            let o = mg_module::nwsync::Options {
-                with_module: *with_module,
-                name: name.clone().unwrap_or(if *with_module { info.name } else { String::new() }),
-                description: description.clone().unwrap_or(if *with_module {
-                    info.description
-                } else {
-                    String::new()
-                }),
-                uuid,
-                group_id: *group_id,
-                latest: !no_latest,
-                limit: (*limit_file_size > 0).then(|| limit_file_size * 1024 * 1024),
-                force: *force,
-                dry_run: *dry_run,
-                level: *level,
-            };
-            let w = mg_module::nwsync::write(repository, &contents, &o, &mut |_, _| {})
-                .map_err(anyhow::Error::msg)?;
-            let parts = &mg_module::nwsync::AFTER_PUBLISHING[..if *no_latest { 2 } else { 3 }];
-            let uploaded = match &upload {
-                Some(_) if *dry_run => {
-                    out.note("nothing uploaded: a dry run");
-                    Vec::new()
-                }
-                Some(c) => {
-                    nwsync_upload(repository, c, parts, project.as_deref(), cli.json, &mut out)?
-                }
-                None => Vec::new(),
-            };
-            out.json = json!({
-                "repository": path_text(repository),
-                "sha1": w.sha1,
-                "files": w.files,
-                "bytes": w.bytes,
-                "on_disk_bytes": w.on_disk,
-                "new_files": w.new_files,
-                "dry_run": *dry_run,
-                "uploaded": uploaded,
-            });
-            out.line(w.sha1.clone());
-            out.note(format!(
-                "manifest {}: {} files, {:.1} MB ({:.1} MB compressed, {} data files new){}",
-                w.sha1,
-                w.files,
-                w.bytes as f64 / 1048576.0,
-                w.on_disk as f64 / 1048576.0,
-                w.new_files,
-                if *dry_run { "; nothing written" } else { "" }
-            ));
-            if uploaded.is_empty() {
-                out.note(format!(
-                    "serve {} on a web server, and start nwserver with -nwsyncurl <its address>",
-                    repository.display()
-                ));
-            } else {
-                out.note(format!("uploaded: {} sent", uploaded.join(", ")));
-            }
-            out
-        }
+        Cmd::Minimap { .. } => cmd_minimap(cli)?,
+        Cmd::Find { palette_group: Some(_), .. } => cmd_find_palette(cli)?,
+        Cmd::Find { .. } => cmd_find(cli)?,
+        Cmd::Nwsync { .. } => cmd_nwsync(cli)?,
         Cmd::NwsyncPrune { repository, min_age, dry_run, upload } => {
             let p = mg_module::nwsync::prune(repository, *min_age, *dry_run)
                 .map_err(anyhow::Error::msg)?;
@@ -4252,7 +4013,7 @@ fn run(cli: &Cli) -> Result<Output> {
                 set.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
             let path =
                 output.clone().unwrap_or_else(|| set.with_file_name(format!("{stem}palstd.itp")));
-            std::fs::write(&path, gff.to_bytes()?)?;
+            write_bytes_whole(&path, &gff.to_bytes()?)?;
             // (Leaves, in the folders a terrain too.)
             let count = |id: usize| match gff.root.get("MAIN") {
                 Some(mg_gff::Value::List(c)) => c.get(id).map_or(0, mg_module::tileset::leaves),
@@ -4278,9 +4039,16 @@ fn run(cli: &Cli) -> Result<Output> {
         }
         Cmd::Roundtrip { module, keep } => roundtrip(module, keep.as_deref())?,
         Cmd::Model { cmd } => model_file(cli, cmd)?,
-        Cmd::ModelFiles { what, out, module, all, force, dry_run } => {
+        Cmd::Texture { cmd } => match cmd {
+            texture::TextureCmd::Convert(a) => texture::convert(cli, a)?,
+            texture::TextureCmd::Info(a) => texture::info(cli, a)?,
+            texture::TextureCmd::PltSplit(a) => texture::plt_split(cli, a)?,
+            texture::TextureCmd::PltJoin(a) => texture::plt_join(a)?,
+        },
+        Cmd::ModelFiles { what, out, module, added, all, force, dry_run } => {
             let gi = install(cli)?;
-            model_files(&gi, what, out, module.as_deref(), *all, *force, *dry_run)?
+            let asked = ModelFiles { all: *all, force: *force, dry_run: *dry_run };
+            model_files(&gi, what, out, module.as_deref(), added, &asked)?
         }
         Cmd::Search(args) => search::run(cli, args)?,
         Cmd::Info { module } => {
@@ -4336,16 +4104,1211 @@ fn run(cli: &Cli) -> Result<Output> {
     Ok(out)
 }
 
+fn cmd_pack(cli: &Cli, dir: &Path, archive: &Path, compile_models: bool) -> Result<Output> {
+    use serde_json::json;
+    let ext = archive.extension().and_then(|e| e.to_str()).unwrap_or("erf").to_ascii_uppercase();
+    let mut file_type = [b' '; 4];
+    file_type[..ext.len().min(4)].copy_from_slice(&ext.as_bytes()[..ext.len().min(4)]);
+    let header = mg_erf::Header { file_type, ..Default::default() };
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    // The models kept as text, compiled (asked for): their bytes
+    // in place of the files'.
+    let mut compiled: std::collections::HashMap<ResKey, Vec<u8>> = Default::default();
+    let (mut made, mut left, mut said) = (Vec::new(), Vec::new(), Vec::new());
+    if compile_models {
+        let mut models = Vec::new();
+        for p in paths.iter().filter(|p| p.is_file()) {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            // (Materials too: a mesh with no render hint takes its
+            // material's.)
+            if let Ok(key) = resource_key(name)
+                && matches!(key.restype, mg_core::ResType::MDL | mg_core::ResType::MTR)
+            {
+                models.push((key, std::fs::read(p)?));
+            }
+        }
+        let files: Vec<(ResKey, &[u8])> = models.iter().map(|(k, d)| (*k, d.as_slice())).collect();
+        let game = install(cli).ok().and_then(|gi| ResMan::for_game(&gi).ok());
+        let lookup = |name: &str, t: mg_core::ResType| {
+            let rm = game.as_ref()?;
+            rm.get_named(name, t).ok().map(|d| d.into_owned())
+        };
+        for c in mg_module::models::compile_models(&files, &lookup) {
+            match c.result {
+                Ok((binary, notes)) => {
+                    for (line, note) in notes {
+                        let at = if line > 0 { format!(" line {line}") } else { String::new() };
+                        said.push(format!("{}{at}: {note}", c.model));
+                    }
+                    made.push(c.model.to_string());
+                    compiled.insert(c.model, binary);
+                }
+                Err(why) => left.push((c.model.to_string(), why)),
+            }
+        }
+        if game.is_none() && !left.is_empty() {
+            said.push(
+                "no game install found: supermodels were looked for in the directory only".into(),
+            );
+        }
+    }
+    // Each file by its size, read when its turn comes to be written (without
+    // `--compile-models`, archive payloads are streamed rather than held in memory;
+    // `--compile-models` reads `.mdl` and `.mtr` inputs first to compile them),
+    // into a file beside the archive that takes its place when it is whole
+    // (a failure half way leaves the archive that was).
+    let mut entries = Vec::new();
+    let mut sources: Vec<Result<Vec<u8>, &Path>> = Vec::new();
+    for p in paths.iter().filter(|p| p.is_file()) {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let key = resource_key(name)?;
+        let source = match compiled.remove(&key) {
+            Some(binary) => Ok(binary),
+            None => Err(p.as_path()),
+        };
+        let size = match &source {
+            Ok(binary) => binary.len() as u64,
+            Err(p) => std::fs::metadata(p).with_context(|| path_text(p))?.len(),
+        };
+        entries.push((key.resref, key.restype, size));
+        sources.push(source);
+    }
+    write_whole(archive, |file| {
+        mg_erf::write_streamed(file, &header, &entries, |i| match &sources[i] {
+            Ok(binary) => Ok(std::borrow::Cow::Borrowed(&binary[..])),
+            Err(p) => std::fs::read(p).map(std::borrow::Cow::Owned),
+        })?;
+        Ok(())
+    })?;
+    let past = mg_erf::past_read_limit(&header, &entries);
+    let mut out = Output::new(json!({
+        "archive": path_text(archive),
+        "files": entries.len(),
+        "past_read_limit": past.iter().map(|(r, t)| format!("{r}.{t}")).collect::<Vec<_>>(),
+        "models_compiled": made,
+        "models_left_as_text": left
+            .iter()
+            .map(|(m, why)| json!({ "model": m, "why": why }))
+            .collect::<Vec<_>>(),
+        "model_notes": said,
+    }));
+    out.note(format!("packed {} files", entries.len()));
+    if compile_models {
+        out.note(format!("compiled {} models kept as text", made.len()));
+    }
+    for (model, why) in &left {
+        out.note(format!("warning: {model} goes in as text: {why}"));
+    }
+    for note in &said {
+        out.note(note.clone());
+    }
+    if let Some(first) = past.first() {
+        out.note(format!(
+            "warning: {} file(s) from {}.{} on start past 2 GiB into the archive, \
+             which the game can't read; split it into two",
+            past.len(),
+            first.0,
+            first.1
+        ));
+    }
+    Ok(out)
+}
+
+fn cmd_watch(cli: &Cli) -> Result<Output> {
+    use serde_json::json;
+    let Cmd::Watch {
+        project,
+        target,
+        dev_dir,
+        test,
+        test_filter,
+        r#mod,
+        ndb,
+        serve,
+        dir,
+        port,
+        passwords,
+        env,
+        preload,
+        server_args,
+    } = &cli.cmd
+    else {
+        unreachable!()
+    };
+    let gi = install(cli)?;
+    let name = serve::module_name(project);
+    // (Held while it runs: another server of the project takes
+    // another.)
+    let scratch = (*serve && dir.is_none()).then(|| serve::run_dir("serve", project));
+    let server_dir = serve.then(|| {
+        let dir = dir.clone().or_else(|| scratch.as_ref().map(|s| s.dir.clone()));
+        let dir = dir.expect("one or the other");
+        std::path::absolute(&dir).unwrap_or(dir)
+    });
+    // (Before anything is made in it: not the player's own folder.)
+    if let Some(dir) = &server_dir {
+        serve::refuse_dir(&gi, dir, None)?;
+    }
+    let dev_dir = match (dev_dir, &server_dir) {
+        (Some(dir), _) => dir.clone(),
+        (None, Some(server)) => server.join("development"),
+        (None, None) => bail!("where to? --dev-dir FOLDER, or --serve"),
+    };
+    std::fs::create_dir_all(&dev_dir).with_context(|| path_text(&dev_dir))?;
+    let served = server_dir.as_ref().map(|d| d.join("modules").join(format!("{name}.mod")));
+    let build_to = served.clone().or(r#mod.clone());
+    let say = |v: serde_json::Value, lines: Vec<String>| serve::say(cli.json, &v, &lines);
+    let resman = |m: &Module| -> Result<ResMan> {
+        let mut notes = Output::default();
+        let mut rm = module_resman(&gi, m, &mut notes)?;
+        for note in notes.notes {
+            say(json!({ "event": "note", "note": note }), vec![format!("mg: {note}")]);
+        }
+        // With --test: the tests' include (`mg_test`), as `mg test`
+        // gives its copy, for them to compile where the module has
+        // none of its own (beneath everything: not put into it).
+        if *test {
+            let mut include = mg_resman::MemContainer::new();
+            let name = mg_module::testing::INCLUDE_NAME;
+            let key = ResKey::parse(name, ResType::NSS).expect("a resource name");
+            include.insert(key, mg_module::testing::INCLUDE.as_bytes().to_vec());
+            rm.add(0, "mg test", mg_resman::LayerClass::Directory, include);
+        }
+        Ok(rm)
+    };
+    let also = |w: &watch::Watcher| -> Result<()> {
+        // (The module built for the server, also where it was asked for.)
+        if let (Some(to), Some(served)) = (r#mod, &served) {
+            std::fs::copy(served, to).with_context(|| path_text(to))?;
+        }
+        let _ = w;
+        Ok(())
+    };
+    // With --test: the module's tests, as `mg test` runs them (in a
+    // server of their own, on a copy), on the module as the watch
+    // has it, after a change taken up (not one that didn't compile).
+    let tested = |w: &watch::Watcher, step: &watch::Step| {
+        if !*test {
+            return;
+        }
+        if !step.errors.is_empty() {
+            let note = "tests not run: the module doesn't compile";
+            say(json!({ "event": "note", "note": note }), vec![format!("mg: {note}")]);
+            return;
+        }
+        let config = test::Config {
+            module: project.clone(),
+            filter: test_filter.clone(),
+            tests: Vec::new(),
+            own_driver: false,
+            settle: 0.0,
+            timeout: 120.0,
+            serve: serve::Config { name: "Moonglow test run".into(), ..Default::default() },
+        };
+        let resman = |m: &Module, notes: &mut Vec<String>| {
+            let mut out = Output::default();
+            let rm = module_resman(&gi, m, &mut out)?;
+            notes.append(&mut out.notes);
+            Ok(rm)
+        };
+        match test::run_on(&gi, &config, w.module().clone(), resman, &mut |_| {}) {
+            Ok(ran) => {
+                let mut v = ran.json();
+                v["event"] = json!("tested");
+                v["notes"] = json!(ran.notes);
+                let notes = ran.notes.iter().map(|n| format!("mg: {n}"));
+                let lines = notes.chain(ran.lines()).chain([format!(
+                    "mg: tests {}: {}",
+                    if ran.ok() { "passed" } else { "failed" },
+                    ran.summary()
+                )]);
+                say(v, lines.collect());
+            }
+            Err(e) => {
+                let note = format!("tests not run: {e:#}");
+                say(json!({ "event": "note", "note": note }), vec![format!("mg: {note}")]);
+            }
+        }
+    };
+    let module = watch::open(project, target.as_deref())?;
+    let mut rm = resman(&module)?;
+    let (mut w, first) =
+        watch::Watcher::start(module, project, target.as_deref(), &dev_dir, build_to, *ndb, &rm)?;
+    also(&w)?;
+    say(
+        json!({
+            "event": "watching", "project": path_text(project),
+            "dev_dir": path_text(&dev_dir), "compiled": first.compiled,
+            "errors": first.errors,
+        }),
+        [first.text(&dev_dir), vec![format!("mg: watching {}", project.display())]].concat(),
+    );
+    tested(&w, &first);
+    let Some(server_dir) = server_dir else {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Some(step) = w.look(&rm)? {
+                if !step.rebuild.is_empty() {
+                    rm = resman(w.module())?;
+                    also(&w)?;
+                }
+                say(step.json(), step.text(&dev_dir));
+                tested(&w, &step);
+            }
+        }
+    };
+    let config = serve::Config {
+        module: served.clone().expect("with --serve"),
+        dir: Some(server_dir),
+        port: *port,
+        name: "Moonglow test server".into(),
+        passwords: passwords.clone(),
+        env: env.clone(),
+        preload: preload.clone(),
+        stdin: true,
+        args: server_args.clone(),
+        // (The project's own talk table, made for the server.)
+        project: Some(project.clone()),
+        ..Default::default()
+    };
+    let mut wrong: Option<anyhow::Error> = None;
+    let end = serve::serve(&gi, &config, &mut |e| {
+        if let (Some(v), Some(t)) = (serve::json(e), serve::text(e)) {
+            say(v, vec![t]);
+        }
+        if *e != serve::Event::Idle {
+            return serve::Flow::Continue;
+        }
+        let step = match w.look(&rm) {
+            Ok(Some(step)) => step,
+            Ok(None) => return serve::Flow::Continue,
+            Err(e) => {
+                wrong = Some(e);
+                return serve::Flow::Stop;
+            }
+        };
+        say(step.json(), step.text(&dev_dir));
+        tested(&w, &step);
+        if let Err(e) = also(&w) {
+            wrong = Some(e);
+            return serve::Flow::Stop;
+        }
+        if step.rebuild.is_empty() {
+            return serve::Flow::Continue;
+        }
+        match resman(w.module()) {
+            Ok(new) => rm = new,
+            Err(e) => {
+                wrong = Some(e);
+                return serve::Flow::Stop;
+            }
+        }
+        serve::Flow::Restart
+    })?;
+    if let Some(e) = wrong {
+        return Err(e);
+    }
+    let failed = !matches!(end, serve::End::Stopped);
+    serve::say_ended(cli.json, &serve::how(end), failed);
+    Ok(Output { done: true, failed, ..Default::default() })
+}
+
+fn cmd_areas(cli: &Cli) -> Result<Output> {
+    use mg_module::areas::{self, Change, Filter};
+    use serde_json::json;
+    let Cmd::Areas {
+        module,
+        areas,
+        text,
+        tileset,
+        interior,
+        exterior,
+        underground,
+        above_ground,
+        natural,
+        artificial,
+        wheres,
+        where_var,
+        music,
+        sets,
+        vars,
+        remove_var,
+        static_placeables,
+        dynamic_placeables,
+        grass,
+        remove_grass,
+        tileset_grass,
+        lighting_scheme,
+        lighting,
+        tile_lights,
+        seed,
+        all,
+        dry_run,
+        names,
+    } = &cli.cmd
+    else {
+        unreachable!()
+    };
+    let resref = |s: &String| mg_core::ResRef::from_str(s).map_err(|e| anyhow::anyhow!("{s}: {e}"));
+    // `--interior` or `--exterior`: so, not so, or either.
+    let kind = |yes: bool, no: bool| if yes { Some(true) } else { no.then_some(false) };
+    let mut has: Vec<areas::Has> = Vec::new();
+    for w in wheres {
+        has.push(areas::Has::parse_field(w).map_err(anyhow::Error::msg)?);
+    }
+    for v in where_var {
+        has.push(areas::Has::parse_var(v).map_err(anyhow::Error::msg)?);
+    }
+    let mut filter = Filter {
+        only: areas.iter().map(resref).collect::<Result<_>>()?,
+        text: text.clone(),
+        tileset: tileset.as_ref().map(resref).transpose()?,
+        interior: kind(*interior, *exterior),
+        underground: kind(*underground, *above_ground),
+        natural: kind(*natural, *artificial),
+        has,
+    };
+    let mut changes: Vec<Change> = Vec::new();
+    for s in sets {
+        changes.push(Change::parse_set(s).map_err(anyhow::Error::msg)?);
+    }
+    for v in vars {
+        changes.push(Change::parse_var(v).map_err(anyhow::Error::msg)?);
+    }
+    changes.extend(remove_var.iter().cloned().map(Change::RemoveVar));
+    if *static_placeables {
+        changes.push(Change::StaticPlaceables);
+    }
+    if *dynamic_placeables {
+        changes.push(Change::DynamicPlaceables);
+    }
+    let mut m = crate::open_module(module)?;
+    // (What the save writes, for the project's plugins to see.)
+    let was = m.clone();
+    let mut out = Output::default();
+    // The game's data where there is a game: the areas' names as
+    // the module tree shows them, and the rows named.
+    let game = game_data_if_any(cli, &m, &mut out);
+    // (Lights Moonglow made that flicker stay dynamic, as the game's
+    // placeables.2da tells them: the game plays no static one's flicker.)
+    if *static_placeables && let Some(t) = game.as_ref().and_then(|g| g.table("placeables").ok()) {
+        m.project_file.make_static.flickering_rows = mg_module::lights::flickering_rows(&t);
+    }
+    // A surface material by surfacemat.2da's label (the module's
+    // haks' over the game's).
+    let material = |name: &str| -> Option<u32> {
+        let t = game.as_ref()?.table("surfacemat").ok()?;
+        (0..t.len())
+            .find(|&r| t.get(r, "Label").is_some_and(|l| l.eq_ignore_ascii_case(name)))
+            .map(|r| r as u32)
+    };
+    for g in grass {
+        let o = mg_module::grass::GrassOverride::parse(g, material).map_err(anyhow::Error::msg)?;
+        changes.push(Change::Grass(o));
+    }
+    for name in remove_grass {
+        let m = name.trim().parse().ok().or_else(|| material(name.trim()));
+        let m = m.ok_or_else(|| anyhow::anyhow!("{name}: not a surface material"))?;
+        changes.push(Change::RemoveGrass(m));
+    }
+    if let Some(on) = tileset_grass {
+        let on = areas::yes_no(on)
+            .ok_or_else(|| anyhow::anyhow!("--tileset-grass {on:?}: yes or no"))?;
+        changes.push(Change::TilesetGrass(on));
+    }
+    // A lighting scheme, from the game's environment.2da (the
+    // module's haks' over it): before the fields `--set` sets.
+    if let Some(text) = lighting_scheme {
+        install(cli).context("--lighting-scheme reads the game's environment.2da")?;
+        let game = game.as_ref().context("--lighting-scheme: the game's data can't be read")?;
+        let row = mg_module::new::Scheme::find(game, text)
+            .map_err(|e| anyhow::anyhow!("--lighting-scheme {e}"))?;
+        let scheme = mg_module::new::Scheme::read(game, row)?;
+        changes.insert(0, Change::LightingScheme(scheme));
+    }
+    // Lighting kept in Moonglow's data folder (or a file of it):
+    // after the scheme, before `--set`.
+    if let Some(name) = lighting {
+        let dir = mg_module::lighting::dir();
+        let saved = mg_module::lighting::read(dir.as_deref(), name)
+            .map_err(|e| anyhow::anyhow!("--lighting {e}"))?;
+        let at = usize::from(matches!(changes.first(), Some(Change::LightingScheme(_))));
+        let name = name.trim().to_string();
+        changes.insert(at, Change::Lighting(Box::new(saved), name, *tile_lights));
+    }
+    if seed.is_some() && lighting_scheme.is_none() && lighting.is_none() {
+        anyhow::bail!("--seed picks the tiles' lights of --lighting-scheme or --lighting");
+    }
+    // A variable's type, where none is given: its description's
+    // (`variables.toml`), where the project describes it.
+    let mut described_notes = Vec::new();
+    for c in &mut changes {
+        let Change::Var { name, kind, .. } = c else { continue };
+        let Some(d) = m.project_file.variables.describe(name) else { continue };
+        let file = m.project_file.variables.file();
+        if d.runtime {
+            described_notes.push(format!(
+                "{name}: {file}:{} says the scripts set it while the server runs \
+                 (runtime), never in a file: set here, it is there from the start",
+                d.line
+            ));
+        }
+        if !d.belongs_on(mg_module::var_desc::Owner::Area) {
+            described_notes.push(format!(
+                "{name}: {file}:{} says it goes on {}, not on an area",
+                d.line,
+                d.on.iter().map(|o| o.name()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        let Some(t) = d.var_type.filter(|t| t.field_type().is_some()) else { continue };
+        match *kind {
+            None => *kind = Some(t.code()),
+            Some(k) if k != t.code() => described_notes.push(format!(
+                "{name}: set as {} as given, and {file}:{} says it is {}",
+                mg_module::vars::VarType::of(k.into()).map_or("?", |t| t.name()),
+                d.line,
+                t.name()
+            )),
+            Some(_) => {}
+        }
+    }
+    let cp = codepage_with(cli, &m, game.as_ref());
+    let language = game.as_ref().map_or(mg_core::Language::ENGLISH, |g| g.language);
+    let shown = |n: &mg_core::LocString| mg_rules::shown(game.as_ref(), n, language, cp);
+    let listed = areas::list_named_in(&m, &shown, cp);
+    for a in listed.iter().filter(|a| !a.listed) {
+        out.note(format!("warning: {}", areas::unlisted_warning(a.resref)));
+    }
+    for a in &filter.only {
+        if !listed.iter().any(|l| l.resref == *a) {
+            bail!("{a} is not an area of the module");
+        }
+    }
+    // What they must hold: a row given by its label or name (a
+    // field's, `--music`'s) is its number, from the game's table
+    // (the module's haks' over it), read only when one is so given.
+    let by_name = |field: &str, v: &str| {
+        areas::row_table(field).is_some() && mg_2da::parse_int(v.trim()).is_none()
+    };
+    let named = filter.has.iter().any(|h| match h {
+        areas::Has::Field { label, value: Some(v) } => by_name(label, v),
+        _ => false,
+    });
+    let music_row = music.as_deref().filter(|m| mg_2da::parse_int(m.trim()).is_none());
+    if named || music_row.is_some() {
+        install(cli).context("a row named, not numbered, reads the game's 2DAs")?;
+        let game = game.as_ref().context("the game's data can't be read for a row's name")?;
+        for h in &mut filter.has {
+            let areas::Has::Field { label, value: Some(v) } = h else { continue };
+            let Some(table) = areas::row_table(label).filter(|_| by_name(label, v)) else {
+                continue;
+            };
+            let row = game.row_of(&table, v).map_err(|e| anyhow::anyhow!("{label}={v}: {e}"))?;
+            *v = row.to_string();
+        }
+        if let Some(text) = music_row {
+            let table = areas::row_table("MusicDay").expect("music is a row");
+            let row = game.row_of(&table, text).map_err(|e| anyhow::anyhow!("--music {e}"))?;
+            filter.has.push(areas::Has::Music(row));
+        }
+    }
+    if let Some(n) = music.as_deref().and_then(|m| mg_2da::parse_int(m.trim())) {
+        filter.has.push(areas::Has::Music(n.into()));
+    }
+    let compiled = filter.compiled();
+    let mut held = areas::HoldsCache::default();
+    let chosen: Vec<&areas::AreaInfo> = listed
+        .iter()
+        .filter(|a| compiled.matches(a))
+        .filter(|a| {
+            filter.has.is_empty() || held.of(&m, a.resref, cp).is_some_and(|h| filter.holds(h))
+        })
+        .collect();
+    if !changes.is_empty() && filter.is_empty() && !*all {
+        bail!("name areas or give a filter, or pass --all to change every area");
+    }
+    let resrefs: Vec<mg_core::ResRef> = chosen.iter().map(|a| a.resref).collect();
+    let codepage = cp;
+    // What Make Placeables Static leaves dynamic, and why (read
+    // before the change, by the project's rules).
+    let mut left_dynamic = Vec::new();
+    if *static_placeables {
+        let rules = m.project_file.make_static.clone().with_scripts(&m);
+        for &area in &resrefs {
+            let key = ResKey::new(area, ResType::GIT);
+            let Some(Ok(git)) = m.gff(&key) else { continue };
+            let list = git.root.list("Placeable List").unwrap_or(&[]);
+            for (i, why) in areas::static_plan_in(&git.root, &rules, codepage).kept {
+                let tag = list[i].string("Tag").unwrap_or_default();
+                let tag = codepage.decode(tag).into_owned();
+                left_dynamic.push((area, i, tag, why.describe()));
+            }
+        }
+    }
+    // (The tiles' lights picked at random, as Aurora picks them,
+    // with a number that picks them again: a dry run's are a
+    // run's with it.)
+    let scheme =
+        changes.iter().any(|c| matches!(c, Change::LightingScheme(_) | Change::Lighting(..)));
+    let seed = seed.unwrap_or_else(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.finish() >> 16
+    });
+    // A field that holds a row, given by the row's label or name
+    // (`MusicDay=mus_cave`): its number, from the game's table (the
+    // module's haks' over it), read only when one is so given.
+    let named_row = |c: &Change| match c {
+        Change::Set { field, value } => {
+            areas::row_table(field).is_some() && mg_2da::parse_int(value.trim()).is_none()
+        }
+        _ => false,
+    };
+    if changes.iter().any(named_row) {
+        install(cli).context("a row named, not numbered, reads the game's 2DAs")?;
+        game.as_ref().context("the game's data can't be read for a row's name")?;
+    }
+    for c in changes.iter_mut().filter(|c| named_row(c)) {
+        let Change::Set { field, value } = c else { continue };
+        let (Some(table), Some(game)) = (areas::row_table(field), &game) else { continue };
+        let row = game.row_of(&table, value);
+        *value = row.map_err(|e| anyhow::anyhow!("{field}={value}: {e}"))?.to_string();
+    }
+    // (With --names: the name of the row a field's number stands for.)
+    let name_of = |field: &str, v: &Option<String>| -> Option<String> {
+        let (table, game) = (areas::row_table(field)?, game.as_ref()?);
+        let row = mg_2da::parse_int(v.as_deref()?).filter(|_| *names)?;
+        game.row_name(&table, i64::from(row))
+    };
+    let named = |field: &str, v: &Option<String>| match name_of(field, v) {
+        Some(name) => v.as_ref().map(|v| format!("{v} ({name})")),
+        None => v.clone(),
+    };
+    let done =
+        areas::apply(&mut m, &resrefs, &changes, codepage, seed).map_err(anyhow::Error::msg)?;
+    // (An area given a tag another object has: said, as `mg set`.)
+    let retagged: Vec<mg_core::ResRef> =
+        done.iter().filter(|c| c.what == "Tag").map(|c| c.area).collect();
+    for w in edits::areas_made_twice(&m, &retagged) {
+        out.note(w);
+    }
+    if scheme && !done.is_empty() {
+        out.note(format!(
+            "the tiles' lights were picked with --seed {seed} (the same with it again)"
+        ));
+    }
+    project_file_notes(&m, &mut out);
+    for n in described_notes {
+        out.note(n);
+    }
+    let kinds = |flags: u32| {
+        let word = |bit: u32, yes: &'static str, no: &'static str| {
+            if flags & bit != 0 { yes } else { no }
+        };
+        [
+            word(areas::INTERIOR, "interior", "exterior"),
+            word(areas::UNDERGROUND, "underground", "above ground"),
+            word(areas::NATURAL, "natural", "artificial"),
+        ]
+        .join(", ")
+    };
+    if changes.is_empty() {
+        for a in &chosen {
+            out.line(format!("{}\t{}\t{}\t{}", a.resref, a.name, a.tileset, kinds(a.flags)));
+        }
+        out.note(format!("{} of {} areas", chosen.len(), listed.len()));
+    } else {
+        let text = |v: &Option<String>| v.clone().unwrap_or_else(|| "(none)".into());
+        for c in &done {
+            out.line(format!(
+                "{}\t{}\t{} -> {}",
+                c.area,
+                c.what,
+                text(&named(&c.what, &c.from)),
+                text(&named(&c.what, &c.to))
+            ));
+        }
+        for (area, i, tag, why) in &left_dynamic {
+            out.note(format!("{area}: placeable {i} {tag} left dynamic: {why}"));
+        }
+        let changed: std::collections::BTreeSet<_> = done.iter().map(|c| c.area).collect();
+        if *dry_run {
+            out.note(format!("would change {} of {} areas chosen", changed.len(), chosen.len()));
+        } else {
+            if !done.is_empty() {
+                save_asked(cli, &was, &mut m, &mut out)?;
+            }
+            out.note(format!("changed {} of {} areas chosen", changed.len(), chosen.len()));
+        }
+    }
+    out.json = json!({
+        "areas": chosen.iter().map(|a| json!({
+            "resref": a.resref.to_string(),
+            "name": a.name,
+            "tag": a.tag,
+            "tileset": a.tileset.to_string(),
+            "listed": a.listed,
+            "interior": a.flags & areas::INTERIOR != 0,
+            "underground": a.flags & areas::UNDERGROUND != 0,
+            "natural": a.flags & areas::NATURAL != 0,
+        })).collect::<Vec<_>>(),
+        "changes": done.iter().map(|c| json!({
+            "area": c.area.to_string(),
+            "field": c.what,
+            "from": c.from,
+            "to": c.to,
+            "from_name": name_of(&c.what, &c.from),
+            "to_name": name_of(&c.what, &c.to),
+        })).collect::<Vec<_>>(),
+        "left_dynamic": left_dynamic.iter().map(|(area, i, tag, why)| json!({
+            "area": area.to_string(),
+            "index": i,
+            "tag": tag,
+            "why": why,
+        })).collect::<Vec<_>>(),
+        "dry_run": *dry_run,
+        "seed": scheme.then_some(seed),
+    });
+    Ok(out)
+}
+
+fn cmd_import(
+    cli: &Cli,
+    module: &Path,
+    paths: &[PathBuf],
+    overwrite: bool,
+    dry_run: bool,
+) -> Result<Output> {
+    use serde_json::json;
+    let mut m = crate::open_module(module)?;
+    // (What the save writes, for the project's plugins to see.)
+    let was = m.clone();
+    // One archive: its resources; else files and folders.
+    let archive = match paths {
+        [one] if one.is_file() && is_archive(one) => Some(std::fs::read(one)?),
+        _ => None,
+    };
+    let incoming = match &archive {
+        Some(data) => mg_module::transfer::Incoming::archive(data)?,
+        None => {
+            if let Some(gone) = paths.iter().find(|p| !p.exists()) {
+                bail!("{}: no such file or folder", gone.display());
+            }
+            mg_module::transfer::Incoming::files(paths)
+        }
+    };
+    let gi = install(cli)?;
+    let mut out = Output::default();
+    let rm = module_resman(&gi, &m, &mut out)?;
+    let plan = mg_module::transfer::plan_import_of(&m, &incoming, &rm);
+    for r in &plan.refused {
+        out.note(format!("warning: not imported: {}: {}", r.what, r.why));
+    }
+    for r in &plan.missing {
+        out.note(format!("warning: {} needs {:?} {}, found nowhere", r.from, r.kind, r.target));
+    }
+    for w in &plan.warnings {
+        out.note(format!("warning: {w}"));
+    }
+    // Where the archive came from, and whether the module has moved
+    // on since (said before anything is imported).
+    let stamp = archive.as_deref().and_then(mg_module::transfer::archive_stamp);
+    let base_warning = stamp.as_ref().and_then(|s| mg_module::stamp::compare(s, &m));
+    match &stamp {
+        Some(s) => out.note(format!("made from {}", s.summary())),
+        None if archive.is_some() => {
+            out.note("the archive doesn't say what it was made from (no stamp)")
+        }
+        None => {}
+    }
+    if let Some(w) = &base_warning {
+        out.note(format!("warning: {w}"));
+    }
+    let s = mg_module::transfer::import_incoming(&mut m, &incoming, |_| overwrite)?;
+    // Scripts that came without their compiled scripts, and those
+    // that include them: compiled (with a debug file where the
+    // module keeps one of any of them).
+    let debug = (s.to_compile.iter()).any(|k| m.contains(&ResKey::new(k.resref, ResType::NDB)));
+    let compiled = mg_module::build::compile_named_with(&mut m, &rm, &s.to_compile, None, debug);
+    let failed: Vec<String> =
+        (compiled.iter()).filter(|r| r.result.is_err()).map(|r| r.script.to_string()).collect();
+    for r in compiled.iter().filter(|r| r.result.is_err()) {
+        if let Err(e) = &r.result {
+            out.note(format!("warning: {} doesn't compile: {e}", r.script));
+        }
+    }
+    if module_changed(&was, &m) {
+        keep_palettes(Some(&gi), &mut m, &was, &mut out);
+        if !dry_run {
+            save_asked(cli, &was, &mut m, &mut out)?;
+        }
+    }
+    let names = |v: &[ResKey]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+    out.json = json!({
+        "added": names(&s.added),
+        "replaced": names(&s.replaced),
+        "skipped": names(&s.skipped),
+        "new_areas": s.new_areas.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "refused": plan.refused.iter().map(|r| json!({"file": r.what, "why": r.why}))
+            .collect::<Vec<_>>(),
+        "compiled": names(&s.to_compile).into_iter().filter(|n| !failed.contains(n))
+            .collect::<Vec<_>>(),
+        "not_compiled": failed,
+        "warnings": plan.warnings,
+        "stamp": stamp.as_ref().map(stamp_json),
+        "base_warning": base_warning,
+        "dry_run": dry_run,
+    });
+    if !s.skipped.is_empty() {
+        out.note(format!(
+            "kept the module's own (--overwrite replaces them): {}",
+            names(&s.skipped).join(", ")
+        ));
+    }
+    out.note(format!(
+        "{} {} new, replaced {}, skipped {} existing{}; new areas: {:?}",
+        if dry_run { "would import" } else { "imported" },
+        s.added.len(),
+        s.replaced.len(),
+        s.skipped.len(),
+        match plan.refused.len() {
+            0 => String::new(),
+            n => format!(", refused {n}"),
+        },
+        s.new_areas.iter().map(|a| a.to_string()).collect::<Vec<_>>()
+    ));
+    Ok(out)
+}
+
+fn cmd_minimap(cli: &Cli) -> Result<Output> {
+    use mg_core::ResRef;
+    use serde_json::json;
+    let Cmd::Minimap { module, names, to, all, force, map_notes, size } = &cli.cmd else {
+        unreachable!()
+    };
+    let m = crate::open_module(module)?;
+    let gi = install(cli)?;
+    let mut out = Output::default();
+    let rm = module_resman(&gi, &m, &mut out)?;
+    let codepage = mg_rules::text_codepage(&rm, game_language(&gi));
+    let draw = |area: ResRef| -> Result<(mg_module::minimap::Drawn, Vec<u8>)> {
+        let key = ResKey::new(area, ResType::ARE);
+        let data = rm.get(&key).with_context(|| format!("{area}.are"))?;
+        let are = mg_gff::Gff::read(&data)?;
+        let git = match map_notes {
+            true => {
+                let key = ResKey::new(area, ResType::GIT);
+                let data = rm.get(&key).with_context(|| format!("{area}.git"))?;
+                Some(mg_gff::Gff::read(&data)?)
+            }
+            false => None,
+        };
+        let drawn = mg_module::minimap::draw(
+            &rm,
+            &are.root,
+            git.as_ref().map(|g| &g.root),
+            *size,
+            codepage,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let png = mg_module::minimap::png(&drawn.image).map_err(anyhow::Error::msg)?;
+        Ok((drawn, png))
+    };
+    let described = |area: ResRef, file: &Path, d: &mg_module::minimap::Drawn| {
+        let mut j = json!({
+            "area": area.to_string(),
+            "file": path_text(file),
+            "width": d.image.width,
+            "height": d.image.height,
+        });
+        if *map_notes {
+            j["map_notes"] = (d.notes.iter())
+                .map(|(n, [x, y])| {
+                    json!({ "tag": n.tag, "text": n.text, "x": x, "y": y,
+                            "position": n.position })
+                })
+                .collect();
+        }
+        j
+    };
+    if let Some(dir) = to {
+        let mut areas: Vec<ResRef> = Vec::new();
+        let mut failed: Vec<(String, String)> = Vec::new();
+        if *all {
+            let mut keys: Vec<ResKey> = m.keys_of(ResType::ARE).copied().collect();
+            keys.sort();
+            areas.extend(keys.iter().map(|k| k.resref));
+        }
+        for name in names {
+            let name = name.strip_suffix(".are").unwrap_or(name);
+            match ResRef::from_str(&name.to_ascii_lowercase()) {
+                Ok(a) if !areas.contains(&a) => areas.push(a),
+                Ok(_) => {}
+                Err(_) => failed.push((name.to_string(), "not an area name".into())),
+            }
+        }
+        if areas.is_empty() && failed.is_empty() {
+            bail!("name the areas, or pass --all for every one");
+        }
+        let existing: Vec<String> =
+            (areas.iter()).map(|a| format!("{a}.png")).filter(|f| dir.join(f).exists()).collect();
+        if !existing.is_empty() && !force {
+            bail!(
+                "{} has {} of these files already ({}): --force writes over them",
+                dir.display(),
+                existing.len(),
+                existing.join(", ")
+            );
+        }
+        std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
+        let mut written = Vec::new();
+        for area in areas {
+            let path = dir.join(format!("{area}.png"));
+            let wrote = draw(area).and_then(|(d, png)| {
+                write_one_of_many(&path, &png)?;
+                Ok(d)
+            });
+            match wrote {
+                Ok(d) => {
+                    out.line(format!("{area}\t{}", path_text(&path)));
+                    written.push(described(area, &path, &d));
+                }
+                Err(e) => failed.push((area.to_string(), format!("{e:#}"))),
+            }
+        }
+        for (what, why) in &failed {
+            out.note(format!("error: {what}: {why}"));
+        }
+        out.note(format!("{} minimaps written to {}", written.len(), dir.display()));
+        out.failed = !failed.is_empty();
+        let failed: Vec<_> = failed.iter().map(|(a, e)| json!({ "area": a, "error": e })).collect();
+        out.json = json!({ "written": written, "failed": failed });
+        return Ok(out);
+    }
+    let [area, png] = names.as_slice() else {
+        bail!("give one area and the PNG to write (AREA OUT.png), or areas and --to FOLDER");
+    };
+    let area = area.strip_suffix(".are").unwrap_or(area);
+    let area = ResRef::from_str(&area.to_ascii_lowercase()).ok().context("not an area name")?;
+    let png = Path::new(png);
+    let (d, data) = draw(area)?;
+    write_bytes_whole(png, &data)?;
+    out.json = described(area, png, &d);
+    out.note(format!("{}×{} pixels", d.image.width, d.image.height));
+    if *map_notes {
+        out.note(format!("{} map notes marked", d.notes.len()));
+    }
+    Ok(out)
+}
+
+fn cmd_find_palette(cli: &Cli) -> Result<Output> {
+    let Cmd::Find { module, types, name, resref, palette_group: Some(spec), .. } = &cli.cmd else {
+        unreachable!()
+    };
+    let m = crate::open_module(module)?;
+    let types = parse_types(
+        types,
+        |t| mg_rules::ObjectKind::from_restype(t).is_some(),
+        "a blueprint type (utc, utp, …)",
+    )?;
+    let mut notes = Output::default();
+    let game = game_data_if_any(cli, &m, &mut notes)
+        .context("a palette group's blueprints are read from the palettes, with the game's data")?;
+    let mut out = palette_group_found(&m, &game, spec, &types, name.as_deref(), resref.as_deref())?;
+    out.notes.splice(0..0, notes.notes);
+    project_file_notes(&m, &mut out);
+    Ok(out)
+}
+
+fn cmd_find(cli: &Cli) -> Result<Output> {
+    use serde_json::json;
+    let Cmd::Find { module, types, tag, name, resref, area, placed, blueprints, fields, .. } =
+        &cli.cmd
+    else {
+        unreachable!()
+    };
+    let m = crate::open_module(module)?;
+    let types = parse_types(
+        types,
+        |t| mg_rules::ObjectKind::from_restype(t).is_some(),
+        "a blueprint type (utc, utp, …)",
+    )?;
+    // (Names are matched and shown in the module's own letters, as
+    // the module tree shows them: the talk table's where a name has
+    // none of its own, another language's where it has no English.)
+    let mut notes = Output::default();
+    let game = game_data_if_any(cli, &m, &mut notes);
+    let cp = codepage_with(cli, &m, game.as_ref());
+    let mut q = mg_module::query::Query {
+        types,
+        tag: tag.clone(),
+        name: name.clone(),
+        resref: resref.clone(),
+        area: area
+            .as_deref()
+            .map(mg_core::ResRef::from_str)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        placed: if *placed {
+            Some(true)
+        } else if *blueprints {
+            Some(false)
+        } else {
+            None
+        },
+        fields: fields
+            .iter()
+            .map(|f| match f.split_once('=') {
+                Some((l, v)) => (l.trim().to_string(), Some(v.to_string())),
+                None => (f.trim().to_string(), None),
+            })
+            .collect(),
+        typed_fields: Vec::new(),
+    };
+    // A field that holds a row, given by the row's label or name
+    // (`Appearance_Type=Human`): for each type the field names a
+    // row of, that row's number (`Appearance` is a placeables.2da
+    // row for a placeable, doortypes.2da's for a door).
+    let types = match q.types.is_empty() {
+        true => mg_rules::ObjectKind::ALL.map(|k| k.restype()).to_vec(),
+        false => q.types.clone(),
+    };
+    let table_of = |t: ResType, label: &str| {
+        mg_rules::rows::row_table(t.extension().unwrap_or_default(), &[], label)
+    };
+    let named = |(label, value): &(String, Option<String>)| {
+        value.as_deref().is_some_and(|v| {
+            !v.contains('*')
+                && mg_2da::parse_int(v.trim()).is_none()
+                && types.iter().any(|t| table_of(*t, label).is_some())
+        })
+    };
+    if q.fields.iter().any(named) {
+        let game = (game.as_ref()).context("a row named, not numbered, reads the game's 2DAs")?;
+        let (rows, plain): (Vec<_>, Vec<_>) = q.fields.drain(..).partition(named);
+        q.fields = plain;
+        for (label, value) in rows {
+            let value = value.unwrap_or_default();
+            let mut values = Vec::new();
+            let mut why = Vec::new();
+            for &t in &types {
+                let Some(table) = table_of(t, &label) else { continue };
+                match game.row_of(&table, &value) {
+                    Ok(row) => values.push((t, row.to_string())),
+                    Err(e) => why.push(e),
+                }
+            }
+            if values.is_empty() {
+                bail!("{label}={value}: {}", why.join("; "));
+            }
+            q.typed_fields.push((label, values));
+        }
+    }
+    let language = game.as_ref().map_or(mg_core::Language::ENGLISH, |g| g.language);
+    let shown = |ls: &mg_core::LocString| mg_rules::shown(game.as_ref(), ls, language, cp);
+    let found = mg_module::query::find_named_in(&m, &q, &shown, cp);
+    let mut out = Output::new(json!({
+        "found": found.iter().map(|f| json!({
+            "kind": if f.placed.is_some() { "placed" } else { "blueprint" },
+            "type": f.restype.extension(),
+            "resref": f.resref.map(|r| r.to_lowercase().to_string()),
+            "tag": f.tag,
+            "name": f.name,
+            "area": f.placed.map(|(a, _)| a.to_string()),
+            "index": f.placed.map(|(_, i)| i),
+            "position": f.position,
+        })).collect::<Vec<_>>(),
+    }));
+    for f in &found {
+        let what = format!(
+            "{}\t{}\t{}\t{}",
+            f.restype.extension().unwrap_or("?"),
+            f.resref.map(|r| r.to_lowercase().to_string()).unwrap_or_default(),
+            f.tag,
+            f.name
+        );
+        match (f.placed, f.position) {
+            (Some((a, i)), Some([x, y, z])) => {
+                out.line(format!("{a}[{i}]\t{what}\t{x:.2}, {y:.2}, {z:.2}"))
+            }
+            (Some((a, i)), None) => out.line(format!("{a}[{i}]\t{what}")),
+            _ => out.line(format!("blueprint\t{what}")),
+        }
+    }
+    out.notes.extend(notes.notes);
+    out.note(format!("{} found", found.len()));
+    Ok(out)
+}
+
+fn cmd_nwsync(cli: &Cli) -> Result<Output> {
+    use serde_json::json;
+    let Cmd::Nwsync {
+        module,
+        repository,
+        with_module,
+        uuid,
+        name,
+        description,
+        group_id,
+        no_latest,
+        limit_file_size,
+        force,
+        dry_run,
+        level,
+        upload,
+    } = &cli.cmd
+    else {
+        unreachable!()
+    };
+    let m = crate::open_module(module)?;
+    // (The command found before anything is written.)
+    let project = m
+        .location
+        .as_ref()
+        .and_then(mg_module::project_file::ProjectFile::root_of)
+        .map(Path::to_path_buf);
+    let upload = match upload {
+        None => None,
+        Some(Some(c)) => Some(c.clone()),
+        Some(None) => match m.project_file.nwsync_upload.as_ref().map(|c| c.run.clone()) {
+            Some(Some(c)) => Some(c),
+            Some(None) => bail!(
+                "the project's [nwsync] upload names no command for this system: give \
+                 one, --upload \"COMMAND\""
+            ),
+            None => bail!(
+                "no upload command: the module's project names none ([nwsync] upload in \
+                 moonglow.toml): give one, --upload \"rsync -a {{part}} \
+                 you@host:/srv/nwsync/\""
+            ),
+        },
+    };
+    let gi = install(cli)?;
+    let mut out = Output::default();
+    let rm = module_resman(&gi, &m, &mut out)?;
+    // (Its name and description in the module's letters.)
+    let codepage = mg_rules::text_codepage(&rm, game_language(&gi));
+    let info = mg_module::query::info_in(&m, codepage)?;
+    let own_uuid = m
+        .info()?
+        .root
+        .string("Mod_UUID")
+        .map(|u| String::from_utf8_lossy(u).into_owned())
+        .filter(|u| !u.is_empty());
+    let uuid =
+        with_module.then(|| uuid.clone().or(own_uuid).unwrap_or_else(mg_module::nwsync::new_uuid));
+    let (contents, missing) =
+        mg_module::nwsync::module_contents(&m, &gi, &rm, *with_module, uuid.as_deref())
+            .map_err(anyhow::Error::msg)?;
+    if !missing.is_empty() {
+        bail!("haks not found: {}", missing.join(", "));
+    }
+    let o = mg_module::nwsync::Options {
+        with_module: *with_module,
+        name: name.clone().unwrap_or(if *with_module { info.name } else { String::new() }),
+        description: description.clone().unwrap_or(if *with_module {
+            info.description
+        } else {
+            String::new()
+        }),
+        uuid,
+        group_id: *group_id,
+        latest: !no_latest,
+        limit: (*limit_file_size > 0).then(|| limit_file_size * 1024 * 1024),
+        force: *force,
+        dry_run: *dry_run,
+        level: *level,
+    };
+    let w = mg_module::nwsync::write(repository, &contents, &o, &mut |_, _| {})
+        .map_err(anyhow::Error::msg)?;
+    let parts = &mg_module::nwsync::AFTER_PUBLISHING[..if *no_latest { 2 } else { 3 }];
+    let uploaded = match &upload {
+        Some(_) if *dry_run => {
+            out.note("nothing uploaded: a dry run");
+            Vec::new()
+        }
+        Some(c) => nwsync_upload(repository, c, parts, project.as_deref(), cli.json, &mut out)?,
+        None => Vec::new(),
+    };
+    out.json = json!({
+        "repository": path_text(repository),
+        "sha1": w.sha1,
+        "files": w.files,
+        "bytes": w.bytes,
+        "on_disk_bytes": w.on_disk,
+        "new_files": w.new_files,
+        "dry_run": *dry_run,
+        "uploaded": uploaded,
+    });
+    out.line(w.sha1.clone());
+    out.note(format!(
+        "manifest {}: {} files, {:.1} MB ({:.1} MB compressed, {} data files new){}",
+        w.sha1,
+        w.files,
+        w.bytes as f64 / 1048576.0,
+        w.on_disk as f64 / 1048576.0,
+        w.new_files,
+        if *dry_run { "; nothing written" } else { "" }
+    ));
+    if uploaded.is_empty() {
+        out.note(format!(
+            "serve {} on a web server, and start nwserver with -nwsyncurl <its address>",
+            repository.display()
+        ));
+    } else {
+        out.note(format!("uploaded: {} sent", uploaded.join(", ")));
+    }
+    Ok(out)
+}
+
 /// The codepage of a module's text ([`mg_rules::text_codepage`]):
 /// Windows-1252, or the table of an `encoding.2da` in its haks (which
 /// takes the game install to find them: without one, Windows-1252).
+///
+/// Found once a run for a list of haks: it takes the game's resource
+/// manager and every hak's index for one table, and a command asks more
+/// than once. (A command that has the game's data or a resource manager
+/// for the module reads it from that: [`codepage_with`].)
 fn module_codepage(cli: &Cli, m: &Module) -> Codepage {
-    let own = Codepage::WINDOWS_1252;
     let haks = m.haks().unwrap_or_default();
+    let mut found = CODEPAGES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, codepage)) = found.iter().find(|(of, _)| *of == haks) {
+        return *codepage;
+    }
+    let codepage = read_codepage(cli, &haks);
+    found.push((haks, codepage));
+    codepage
+}
+
+/// The codepages [`module_codepage`] found in this run, by the haks they
+/// were read from (the install is one a run).
+static CODEPAGES: std::sync::Mutex<Vec<(Vec<String>, Codepage)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How often this run built a resource manager to find a codepage.
+#[cfg(test)]
+static CODEPAGES_READ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn read_codepage(cli: &Cli, haks: &[String]) -> Codepage {
+    #[cfg(test)]
+    CODEPAGES_READ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let own = Codepage::WINDOWS_1252;
     let Ok(gi) = install(cli) else { return own };
     let Ok(mut rm) = ResMan::for_game(&gi) else { return own };
-    let _ = rm.add_haks(&gi, &haks);
+    let _ = rm.add_haks(&gi, haks);
     mg_rules::text_codepage(&rm, game_language(&gi))
+}
+
+/// [`module_codepage`] for a command that may have the game's data for
+/// the module already (the same table, read from what is open: the game
+/// and the haks are not opened again for it).
+pub(crate) fn codepage_with(cli: &Cli, m: &Module, game: Option<&mg_rules::GameData>) -> Codepage {
+    match game {
+        Some(game) => game.text_codepage(),
+        None => module_codepage(cli, m),
+    }
 }
 
 /// The install's language (English where its code is none the game has).
@@ -4371,6 +5334,53 @@ fn save_guard(
     plugins::save_guard(gi.as_ref(), m, dirs, out)
 }
 
+/// Saves a module a command changed, as `mg set` saves: the project's own
+/// plugins (as the builder allowed them) are asked first (`resource-saving`:
+/// a refusal stops it, nothing written) and told after (`resource-saved`),
+/// of what differs from `was`. Every command that changes a module's
+/// resources saves through this, [`save_workspace_asked`] or a guard of
+/// its own ([`save_guard`]: `mg set`, `mg apply`, `mg attach`, `mg
+/// bake-walkmesh`, `mg plugin run`, `mg verify --fix`): one that saved
+/// with `m.save()` wrote what the project's plugin refuses of another
+/// (the manual lists them, in Plugins).
+fn save_asked(cli: &Cli, was: &Module, m: &mut Module, out: &mut Output) -> Result<()> {
+    let guard = save_guard(cli, m, &[], out)?;
+    if let Some(g) = &guard {
+        g.before(was, m, out)?;
+    }
+    m.save()?;
+    if let Some(g) = &guard {
+        g.after(was, m, out);
+    }
+    Ok(())
+}
+
+/// [`save_asked`] for a command that edits through a workspace: what
+/// differs is told from the module as it was opened.
+pub(crate) fn save_workspace_asked(
+    cli: &Cli,
+    ws: &mut mg_edit::Workspace,
+    out: &mut Output,
+) -> Result<()> {
+    ws.flush()?;
+    let Some(guard) = save_guard(cli, &ws.module, &[], out)? else {
+        ws.save()?;
+        return Ok(());
+    };
+    let was = ws.saved().clone();
+    guard.before(&was, &ws.module, out)?;
+    ws.save()?;
+    guard.after(&was, &ws.module, out);
+    Ok(())
+}
+
+/// Whether `mg import` takes `path` as an archive whose resources it
+/// imports (`.erf`, or a hak or module as an ERF) rather than as a file.
+fn is_archive(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).and_then(ResType::from_extension);
+    matches!(ext, Some(ResType::ERF | ResType::HAK | ResType::MOD | ResType::NWM))
+}
+
 /// An export's stamp ([`mg_module::stamp`]) as JSON.
 fn stamp_json(s: &mg_module::stamp::Stamp) -> serde_json::Value {
     serde_json::json!({
@@ -4381,6 +5391,114 @@ fn stamp_json(s: &mg_module::stamp::Stamp) -> serde_json::Value {
         "module": s.module,
         "tag": s.tag,
     })
+}
+
+/// `mg find --palette-group GROUPING/GROUP`: the group's blueprints in
+/// the standard palettes (the game's and the haks') and the module's
+/// custom ones the grouping is offered in, as the palette pane's Group by
+/// shows them, each with its palette, Tag, name and category.
+fn palette_group_found(
+    m: &Module,
+    game: &mg_rules::GameData,
+    spec: &str,
+    types: &[ResType],
+    name: Option<&str>,
+    resref: Option<&str>,
+) -> Result<Output> {
+    use mg_module::palette::{BlueprintKind, Palette, PaletteName};
+    use mg_module::palette_groups::{OTHER, members};
+    let groupings = &m.project_file.palette;
+    let all = || -> String {
+        let all: Vec<String> =
+            groupings.list.iter().map(|g| format!("{} ({})", g.id, g.title)).collect();
+        match all.is_empty() {
+            true => "the project file has none ([palette.*] in moonglow.toml)".into(),
+            false => format!("the project's are {}", all.join(", ")),
+        }
+    };
+    let (which, group) = spec.split_once('/').with_context(|| {
+        format!("--palette-group {spec}: a grouping and one of its groups, kind/Tables")
+    })?;
+    let Some(g) = groupings.find(which) else {
+        bail!("--palette-group {spec}: there is no grouping {which:?}: {}", all());
+    };
+    let at = match group.trim() {
+        o if o.eq_ignore_ascii_case(OTHER) => None,
+        named => Some(g.group(named).with_context(|| {
+            let names: Vec<&str> = g.groups.iter().map(|x| x.name.as_str()).collect();
+            format!(
+                "--palette-group {spec}: {} has no group {named:?}: its groups are {}, and {OTHER}",
+                g.title,
+                names.join(", ")
+            )
+        })?),
+    };
+    let text = |n: &PaletteName| n.text(game);
+    let tag = |key: &ResKey| -> String {
+        let data =
+            m.get(key).map(<[u8]>::to_vec).or_else(|| game.resman.get(key).ok().map(Into::into));
+        data.and_then(|d| Gff::read(&d).ok())
+            .and_then(|g| {
+                g.root.string("Tag").map(|t| mg_module::palette::text_of(t, game.codepage()))
+            })
+            .unwrap_or_default()
+    };
+    let mut json = Vec::new();
+    let mut out = Output::default();
+    for kind in BlueprintKind::ALL {
+        let ext = kind.restype().extension().unwrap_or_default();
+        if !g.offered(kind) || (!types.is_empty() && !types.contains(&kind.restype())) {
+            continue;
+        }
+        if at.is_some_and(|i| !g.group_offered(&g.groups[i], kind)) {
+            continue;
+        }
+        let standard =
+            (game.resman.get_named(&format!("{}palstd", kind.name()), ResType::ITP).ok())
+                .and_then(|d| Gff::read(&d).ok());
+        // (The custom palette as the pane's Custom shows it: the module's
+        // file, or, where it has none, the one Build's Palettes would make
+        // of its and its haks' blueprints.)
+        let custom = match mg_module::palette::update_custom_palette(m, m, game, kind) {
+            Ok(Some(made)) => Some(made),
+            _ => m.gff(&kind.custom_key()).and_then(Result::ok),
+        };
+        for (source, palette) in [("standard", standard), ("custom", custom)] {
+            let Some(palette) = palette else { continue };
+            for b in members(&Palette::read(&palette), kind, g, at, &text) {
+                let folded = mg_core::text::fold(&b.name);
+                let named = name.is_none_or(|n| {
+                    n.split_whitespace().all(|w| folded.contains(&mg_core::text::fold(w)))
+                });
+                let refd = resref.is_none_or(|r| mg_module::query::glob(r, &b.resref.to_string()));
+                if !named || !refd {
+                    continue;
+                }
+                let key = ResKey::new(b.resref, kind.restype());
+                let t = tag(&key);
+                let r = b.resref.to_lowercase().to_string();
+                out.line(format!("{source}\t{ext}\t{r}\t{t}\t{}\t{}", b.name, b.category));
+                json.push(serde_json::json!({
+                    "kind": "blueprint",
+                    "type": ext,
+                    "resref": r,
+                    "tag": t,
+                    "name": b.name,
+                    "palette": source,
+                    "category": b.category,
+                }));
+            }
+        }
+    }
+    let group_name = at.map_or(OTHER, |i| g.groups[i].name.as_str());
+    out.note(format!("{} found in {} › {group_name}", json.len(), g.title));
+    out.json = serde_json::json!({
+        "grouping": g.id,
+        "title": g.title,
+        "group": group_name,
+        "found": json,
+    });
+    Ok(out)
 }
 
 /// The game's data for a module ([`Module::game_data`]: the game, the
@@ -4406,6 +5524,44 @@ pub(crate) fn game_data_if_any(
     game_data_in(&gi, m, out)
         .map_err(|e| out.note(format!("warning: the game's data can't be read: {e:#}")))
         .ok()
+}
+
+/// Brings the module's custom palettes up to date with the blueprints a
+/// command changed (`before`: the module as the command opened it), as a
+/// save in the window does (`update_custom_palettes`): `mg set`, `mg
+/// apply`, `mg import`, `mg replace` and the plugins' commands from `mg
+/// plugin run` keep them as `mg rename` does (`mg update-instances`
+/// changes the objects placed from blueprints, not the blueprints). The
+/// game is read only when a blueprint changed; without
+/// it (no install), the palettes are left as they are, and that is said.
+pub(crate) fn keep_palettes(
+    gi: Option<&GameInstall>,
+    m: &mut Module,
+    before: &Module,
+    out: &mut Output,
+) {
+    use mg_module::palette::BlueprintKind;
+    // (A module without custom palettes gets none made.)
+    let kept = BlueprintKind::ALL.iter().any(|k| m.contains(&k.custom_key()));
+    if !kept || !mg_module::palette::blueprints_changed(m, before) {
+        return;
+    }
+    // (What the game's data lacks is said by the command's own reading.)
+    let Some(game) = gi.and_then(|gi| game_data_in(gi, m, &mut Output::default()).ok()) else {
+        out.note(
+            "warning: the custom palettes are not brought up to date without the game's data \
+             (the next save in Moonglow or a Build does it)",
+        );
+        return;
+    };
+    match mg_module::palette::update_kept_custom_palettes(m, before, &game) {
+        Ok(0) => {}
+        Ok(n) => out.note(format!(
+            "{n} custom palette{} brought up to date",
+            if n == 1 { "" } else { "s" }
+        )),
+        Err(e) => out.note(format!("warning: the custom palettes: {e}")),
+    }
 }
 
 /// The game's data put together for a module, with what it lacks said as
@@ -4439,6 +5595,24 @@ fn module_resman(gi: &GameInstall, m: &Module, out: &mut Output) -> Result<ResMa
     Ok(rm)
 }
 
+/// The resman `mg which` and `mg cat` read from: the game's, with a
+/// module's haks and the module where one is given, and the archives and
+/// folders given with `--hak` over them.
+fn resman_with(
+    cli: &Cli,
+    module: Option<&Path>,
+    added: &added::Added,
+    out: &mut Output,
+) -> Result<ResMan> {
+    let gi = install(cli)?;
+    let mut rm = match module {
+        Some(path) => module_resman(&gi, &crate::open_module(path)?, out)?,
+        None => ResMan::for_game(&gi)?,
+    };
+    added.stack_onto(&mut rm)?;
+    Ok(rm)
+}
+
 /// A word of `mg verify --skip`: something Verify can leave out.
 fn verify_skip(word: &str) -> std::result::Result<String, String> {
     mg_module::doctor::Skip::parse(&[word])?;
@@ -4457,12 +5631,30 @@ struct Fixes<'a> {
 /// [`mg_edit::fix::Guard`]) and saves. The findings fixed, by place in
 /// `found`, and the report's lines and JSON.
 fn make_fixes(
+    gi: &GameInstall,
     m: &Module,
     found: &[mg_edit::fix::Found],
     asked: &Fixes<'_>,
+    declared: &[String],
     out: &mut Output,
 ) -> Result<(Vec<usize>, serde_json::Value, Vec<String>)> {
     use mg_edit::fix::Guard;
+    // A check no one has (mistyped, or a plugin's not given): an error, so
+    // that a pipeline does not read it as "nothing to fix". One there is
+    // whose findings have no fix: said, and nothing to do.
+    let known = |c: &str| {
+        mg_module::doctor::Check::ALL.iter().any(|k| k.id() == c) || declared.iter().any(|d| d == c)
+    };
+    if let Some(check) = asked.checks.iter().find(|c| !known(c)) {
+        let theirs = if declared.is_empty() {
+            " (a plugin's check is its id, a slash and the check's, of a plugin --plugins names \
+             or the project's)"
+                .to_string()
+        } else {
+            format!(" (the plugins' are {})", declared.join(", "))
+        };
+        bail!("--fix {check}: there is no such check{theirs}");
+    }
     let chosen: Vec<(usize, &mg_edit::fix::Fix)> = found
         .iter()
         .enumerate()
@@ -4471,8 +5663,21 @@ fn make_fixes(
         .collect();
     for check in asked.checks {
         if !chosen.iter().any(|(i, _)| found[*i].finding.check == *check) {
-            out.note(format!("warning: --fix {check}: no finding of that check has a fix"));
+            out.note(format!("--fix {check}: no finding of that check has a fix"));
         }
+    }
+    // (A fix that asks runs a plugin's command, which asks the user: not
+    // here.)
+    let (chosen, asking): (Vec<_>, Vec<_>) =
+        chosen.into_iter().partition(|(_, f)| f.asks.is_none());
+    for (i, fix) in &asking {
+        let f = &found[*i].finding;
+        let asks = fix.asks.as_ref().map(|a| a.command.as_str()).unwrap_or_default();
+        out.note(format!(
+            "warning: not fixed: {} › {}: {:?} asks (the plugin's command {asks}): make it in \
+             the window, or run the command with mg plugin run",
+            f.check, f.resource, fix.label
+        ));
     }
     let mut guard = Guard::new(m, chosen.iter().map(|(_, f)| *f));
     let mut ws = mg_edit::Workspace::new(m.clone());
@@ -4505,7 +5710,16 @@ fn make_fixes(
         }
     }
     if !fixed.is_empty() && !asked.dry_run {
+        // (The project's own plugins asked first, as `mg set` asks them.)
+        ws.flush()?;
+        let guard = plugins::save_guard(Some(gi), m, &[], out)?;
+        if let Some(g) = &guard {
+            g.before(m, &ws.module, out)?;
+        }
         ws.save()?;
+        if let Some(g) = &guard {
+            g.after(m, &ws.module, out);
+        }
     }
     let made = serde_json::json!({ "made": made, "refused": refused, "dry_run": asked.dry_run });
     Ok((fixed, made, lines))
@@ -4530,60 +5744,95 @@ fn verify(
     times: &mut mg_module::doctor::Timings,
 ) -> Result<Output> {
     use mg_module::doctor::Group;
-    let m = times.time("open the module", || crate::open_module(path))?;
+    let mut m = times.time("open the module", || crate::open_module(path))?;
     let mut out = Output::default();
     project_file_notes(&m, &mut out);
     let rm = times.time("the game and the haks", || module_resman(gi, &m, &mut out))?;
-    // (Every GFF of the module read once for both.)
-    let references = if show_unused || !skip.group(Group::References) {
+    // A project's compiled scripts are build output (its tree holds only
+    // sources): those its build compiles are compiled here, in memory, as
+    // the window compiles them as it opens it, so a script reference is
+    // satisfied by a source that compiles; one that doesn't stays "not
+    // compiled". Nothing is written.
+    let failed = times.time("the project's scripts compiled", || {
+        mg_module::build::compiled_for_checks(&mut m, &rm)
+    });
+    if failed > 0 {
+        out.note(format!(
+            "{failed} of the project's scripts didn't compile (`mg compile` says why): what \
+             names them is said not compiled"
+        ));
+    }
+    // (Every GFF of the module read once for the unused and the missing.)
+    let references = show_unused.then(|| {
         times.time("the module's references", || mg_module::verify::module_references(&m))
-    } else {
-        Vec::new()
-    };
+    });
     // (The scripts the game's tables run, as the module sees them, count
     // as used, and what the module reaches in its haks and the game names.)
-    let unused = if show_unused {
-        let also = mg_module::verify::also_used(&m, &references, &rm);
-        mg_module::verify::unused_of(&m, &references, &also)
-    } else {
-        Vec::new()
+    let unused = match &references {
+        Some(references) => mg_module::verify::unused_in(&m, references, &rm),
+        None => Vec::new(),
     };
-    let mut missing = if skip.group(Group::References) {
-        Vec::new()
-    } else {
-        times.time("missing references", || mg_module::verify::missing_of(&m, &rm, references))
-    };
-    let count = |data: Vec<u8>| mg_tlk::Tlk::read(&data).map(|t| t.entries.len()).ok();
-    let (base, custom) = times.time("the talk tables", || {
-        let base = std::fs::read(gi.talk_table()).ok().and_then(count).unwrap_or(0);
+    let read_tlk = |data: Vec<u8>| mg_tlk::Tlk::read(&data).ok();
+    let (base_table, custom_table) = times.time("the talk tables", || {
+        let base = std::fs::read(gi.talk_table()).ok().and_then(read_tlk);
         let language = mg_core::Language::from_short_code(&gi.language);
         let custom = match mg_module::talk::of_module(&m, &rm, &gi.tlk_dirs(), language) {
-            mg_module::talk::Custom::Found { found, .. } => found.tlk_bytes().ok().and_then(count),
+            mg_module::talk::Custom::Found { found, .. } => found.tlk().ok(),
             _ => None,
         };
         (base, custom)
     });
+    let custom = custom_table.as_ref().map(|t| t.entries.len());
+    let base = base_table.as_ref().map_or(0, |t| t.entries.len());
     let tlk = mg_module::doctor::TalkTables { base, custom };
     // (The shader programs that compiled, and what was found of the haks'
     // models, kept for the next run, where the window keeps its own.)
     let cache = mg_module::doctor::Cache::user();
-    let mut findings = mg_module::doctor::examine_groups(&m, &rm, tlk, skip, times, cache.as_ref());
+    // (The palettes' names as the palettes show them, in the game's
+    // letters.)
+    let game_codepage = mg_rules::text_codepage(&rm, game_language(gi));
+    let palette_name = |n: &mg_module::palette::PaletteName| match n {
+        mg_module::palette::PaletteName::StrRef(r) => {
+            let r = mg_core::StrRef(*r);
+            let table = if r.is_custom() { custom_table.as_ref() } else { base_table.as_ref() };
+            table.and_then(|t| t.text_in(r, game_codepage)).unwrap_or_default()
+        }
+        mg_module::palette::PaletteName::Text(t) => mg_module::palette::text_of(t, game_codepage),
+    };
+    // What is missing, and the custom content's problems: put together
+    // where the window's Verify Module puts them together.
+    let checked = mg_module::verify::Verify {
+        module: &m,
+        compiled: None,
+        resman: &rm,
+        tlk,
+        custom_tlk: custom_table.as_ref(),
+        codepage: game_codepage,
+        palette_name: &palette_name,
+        skip,
+        cache: cache.as_ref(),
+        references,
+    };
+    let (mut missing, mut findings) =
+        mg_module::verify::run(checked, times, &mut |_| true).context("Verify was stopped")?;
     // The plugins' checks, beside the doctor's (none run when they are
     // left out).
+    let mut declared = Vec::new();
     let theirs = if skip.group(Group::Plugins) {
         Vec::new()
     } else {
-        times.time("plugins", || plugins::findings(gi, &m, plugins, skip, &mut out))?
+        times
+            .time("plugins", || plugins::findings(gi, &m, plugins, skip, &mut out, &mut declared))?
     };
     findings.extend(theirs.iter().map(|f| f.finding.clone()));
     skip.leave_out(&mut missing, &mut findings);
     // Each finding with its fix, if it has one.
-    let found = mg_edit::fix::attach(&m, findings, &theirs);
-    let codepage = mg_rules::text_codepage(&rm, game_language(gi));
+    let found = mg_edit::fix::attach_on(&m, Some(&rm), findings, &theirs);
+    let codepage = game_codepage;
     let (fixed, made, fix_lines) = if asked.checks.is_empty() {
         (Vec::new(), serde_json::Value::Null, Vec::new())
     } else {
-        make_fixes(&m, &found, asked, &mut out)?
+        make_fixes(gi, &m, &found, asked, &declared, &mut out)?
     };
     let findings: Vec<&mg_module::doctor::Finding> = found.iter().map(|f| &f.finding).collect();
     let errors = missing.iter().filter(|x| x.is_error()).count()
@@ -4615,6 +5864,8 @@ fn verify(
             "uncompiled": x.uncompiled,
             "only_userpatch": x.only_local == Some(mg_module::verify::Local::Userpatch),
             "only_in": x.only_local.map(mg_module::verify::Local::id),
+            // (A sound there only as a .bmu, which the game doesn't look for.)
+            "found_as": x.found_as.and_then(ResType::extension),
         })).collect::<Vec<_>>(),
         "findings": found.iter().map(|x| { let f = &x.finding; serde_json::json!({
             "severity": severity(f.severity),
@@ -4688,22 +5939,35 @@ fn verify(
     Ok(out)
 }
 
-/// `mg model-files`: the files the game draws a model or a blueprint with.
+/// `mg model-files`'s switches.
+struct ModelFiles {
+    all: bool,
+    force: bool,
+    dry_run: bool,
+}
+
+/// `mg model-files`: the files the game draws a model or a blueprint with,
+/// from the game, a module's haks and the archives and folders `--hak`
+/// gives (over the rest).
 fn model_files(
     gi: &GameInstall,
     what: &str,
     dir: &Path,
     module: Option<&Path>,
-    all: bool,
-    force: bool,
-    dry_run: bool,
+    added: &added::Added,
+    asked: &ModelFiles,
 ) -> Result<Output> {
+    let ModelFiles { all, force, dry_run } = *asked;
     let mut out = Output::default();
     let m = match module {
         Some(path) => crate::open_module(path)?,
         None => Module::new(),
     };
-    let game = plugins::game_for(Some(gi), &m, &mut out).context("the game data")?;
+    // (The haks given are over the module's by their priority; the
+    // game's tables are read from them all, once asked for.)
+    let mut game = mg_rules::GameData::open(gi).context("the game data")?;
+    added.stack_onto(&mut game.resman)?;
+    let game = said(m.game_data_over(game, gi)?, &mut out)?;
     // (A blueprint's file and its fields, with its look's row.)
     let mut blueprint = None;
     // An area: what the game draws it with, after its own .are and .git.
@@ -4796,10 +6060,10 @@ fn model_files(
     for (name, origin, _, text) in &chosen {
         if !dry_run {
             match text {
-                Some(text) => std::fs::write(dir.join(name), text)?,
+                Some(text) => write_one_of_many(&dir.join(name), text)?,
                 None => {
                     let key = ResKey::from_filename(name).context("a resource's name")?;
-                    std::fs::write(key.path_in(dir)?, game.resman.get(&key)?)?;
+                    write_one_of_many(&key.path_in(dir)?, &game.resman.get(&key)?)?;
                 }
             }
         }
@@ -4832,13 +6096,105 @@ fn model_files(
     Ok(out)
 }
 
+/// `mg dialog-export --to`: each conversation named (every one, with
+/// `all`) written into `dir` as `NAME.ext` in `format`, as the window's
+/// Export as Ink… and the rest write them. Files of those names in the
+/// folder are written over only with `force`; one that can't be written
+/// (not in the module, not readable) is named with why, the rest are
+/// written, and the command fails.
+#[allow(clippy::too_many_arguments)]
+fn dialog_export_into(
+    cli: &Cli,
+    m: &Module,
+    names: &[String],
+    all: bool,
+    dir: &Path,
+    format: mg_module::dialog_io::Format,
+    force: bool,
+    languages: &[mg_core::Language],
+) -> Result<Output> {
+    let mut keys: Vec<ResKey> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    if all {
+        keys.extend(m.keys_of(ResType::DLG).copied());
+        keys.sort();
+    }
+    for name in names {
+        match ResKey::from_filename(name).filter(|k| k.restype == ResType::DLG) {
+            Some(k) if !keys.contains(&k) => keys.push(k),
+            Some(_) => {}
+            None => failed.push((name.clone(), "give a conversation as name.dlg".into())),
+        }
+    }
+    if keys.is_empty() && failed.is_empty() {
+        bail!("name the conversations (name.dlg), or pass --all for every one");
+    }
+    let file = |k: &ResKey| format!("{}.{}", k.resref, format.extensions()[0]);
+    let existing: Vec<String> =
+        keys.iter().map(file).filter(|name| dir.join(name).exists()).collect();
+    if !existing.is_empty() && !force {
+        bail!(
+            "{} has {} of these files already ({}): --force writes over them",
+            dir.display(),
+            existing.len(),
+            existing.join(", ")
+        );
+    }
+    std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
+    let codepage = module_codepage(cli, m);
+    let mut out = Output::default();
+    let mut written = Vec::new();
+    for key in &keys {
+        let g = match m.gff(key) {
+            None => Err(format!("{key} is not in the module")),
+            Some(Err(e)) => Err(e.to_string()),
+            Some(Ok(g)) => Ok(g),
+        };
+        let path = dir.join(file(key));
+        let wrote = g.and_then(|g| {
+            let text = format.write_in(&g, &key.resref.to_string(), codepage, languages);
+            mg_module::write_replacing_one_of_many(&path, text.as_bytes())
+                .map_err(|e| format!("{}: {e}", path.display()))
+        });
+        match wrote {
+            Ok(()) => {
+                out.line(format!("{key}\t{}", path_text(&path)));
+                written.push(serde_json::json!({ "conversation": key.to_string(), "file": path_text(&path) }));
+            }
+            Err(e) => failed.push((key.to_string(), e)),
+        }
+    }
+    for (what, why) in &failed {
+        out.note(format!("error: {what}: {why}"));
+    }
+    out.note(format!(
+        "{} conversations written as {} to {}",
+        written.len(),
+        format.name(),
+        dir.display()
+    ));
+    out.failed = !failed.is_empty();
+    out.json = serde_json::json!({
+        "folder": path_text(dir),
+        "format": format.name(),
+        "written": written,
+        "failed": failed
+            .iter()
+            .map(|(what, why)| serde_json::json!({ "conversation": what, "error": why }))
+            .collect::<Vec<_>>(),
+    });
+    Ok(out)
+}
+
 /// `mg roundtrip`: a module saved and read back, and each GFF and 2DA of
 /// it written anew, compared with what it was.
 fn roundtrip(path: &Path, keep: Option<&Path>) -> Result<Output> {
     let original = crate::open_module(path)?;
     let copy = match keep {
         Some(k) => k.to_path_buf(),
-        None => std::env::temp_dir().join(format!("mg-roundtrip-{}.mod", std::process::id())),
+        // (In the run's own folder: a name anyone could guess in the
+        // system's temporary folder could be made, or linked, first.)
+        None => mg_module::build::own_scratch_dir()?.join("roundtrip.mod"),
     };
     if keep.is_some() && copy.exists() {
         bail!("{} is there already", copy.display());
@@ -4872,15 +6228,10 @@ fn roundtrip(path: &Path, keep: Option<&Path>) -> Result<Output> {
     Ok(out)
 }
 
-/// Puts the name of the row each field's number stands for beside it, in
-/// a GFF's JSON (`mg gff --names`): `"row"` in a field's object, which
-/// `from_json` sets aside, and `"__row"` on a list's item whose place is
-/// a row; `path` the labels of the fields and lists it is under.
-/// `mg gff --names`: beside each field's number, what it stands for
-/// (`mg_rules::rows::meaning`, as the window's fields view names it): a
-/// row of a table, a faction of `factions` (the module's), an animation,
-/// a talk-table string; and on each item of a list whose items stand for
-/// something by themselves (a creature's skills, a store's pages).
+/// Annotates GFF JSON numbers for `mg gff --names`: `"row"` inside a field
+/// object (`mg_rules::rows::meaning`) or `"__row"` on items of a table-indexed
+/// list (such as skills or store pages), naming table rows, module `factions`,
+/// animations, and talk-table strings; `path` tracks enclosing field/list labels.
 fn name_rows(
     s: &mut serde_json::Map<String, serde_json::Value>,
     game: &mg_rules::GameData,
@@ -4946,7 +6297,7 @@ fn gff(
         let value: serde_json::Value = serde_json::from_slice(&data)?;
         let gff = mg_gff::from_json(&value, cp)?;
         let out = output.context("writing GFF needs --output")?;
-        std::fs::write(out, gff.to_bytes()?)?;
+        write_bytes_whole(out, &gff.to_bytes()?)?;
         return Ok(Output::new(serde_json::json!({ "written": path_text(out) })));
     }
     let is_gff = input
@@ -4963,17 +6314,87 @@ fn gff(
         let file_type = String::from_utf8_lossy(&gff.file_type).into_owned();
         name_rows(root, game, factions, &file_type, &mut Vec::new());
     }
+    // (Written as neverwinter.nim's nwn_gff writes it, its notation of
+    // floats and its string escapes: serde's spelled 2.5e-7 and 1.5e16
+    // otherwise, the same values. --json gives the value itself.)
+    let text = || mg_gff::to_json_text(&value, mg_gff::TextStyle::default());
     match output {
         Some(o) => {
-            std::fs::write(o, serde_json::to_string_pretty(&value)? + "\n")?;
+            write_bytes_whole(o, text().as_bytes())?;
             Ok(Output::new(serde_json::json!({ "written": path_text(o) })))
         }
         // The GFF as JSON is the output, with --json or without.
-        None if json => Ok(Output::new(value)),
+        None if json => Ok(Output { json: value, document: true, ..Default::default() }),
         None => {
             let mut out = Output::default();
-            out.line(serde_json::to_string_pretty(&value)?);
+            out.line(text().trim_end_matches('\n'));
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file is written whole or not at all: one that fails half way
+    /// leaves what was there, and nothing beside it.
+    #[test]
+    fn a_file_is_written_whole_or_not_at_all() {
+        let dir = mg_testkit::scratch_dir("mg-write-whole");
+        let path = dir.join("out/built.mod");
+        write_bytes_whole(&path, b"the last good build").unwrap();
+        let failed = write_whole(&path, |file| {
+            file.write_all(b"half of the ne")?;
+            bail!("the disk is full")
+        });
+        let why = format!("{:#}", failed.unwrap_err());
+        assert!(why.contains("built.mod") && why.contains("the disk is full"), "{why}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"the last good build");
+        let beside = |dir: &Path| std::fs::read_dir(dir).unwrap().count();
+        assert_eq!(beside(&dir.join("out")), 1, "no temporary file left");
+        write_whole(&path, |file| Ok(file.write_all(b"the new build")?)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the new build");
+        assert_eq!(beside(&dir.join("out")), 1);
+    }
+
+    /// A module's codepage is found once a run for its haks, however
+    /// often a command asks, and is what reading it afresh gives; a
+    /// command with the game's data open reads it from that.
+    #[test]
+    fn a_module_s_codepage_is_found_once_a_run() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let root = mg_testkit::corpus!();
+        let root = root.to_str().unwrap();
+        let cli = <Cli as clap::Parser>::parse_from([
+            "mg",
+            "--root",
+            root,
+            "--no-user-dir",
+            "ls",
+            "x.hak",
+        ]);
+        let mut m = Module::new();
+        let mut info = Gff::new(*b"IFO ");
+        let haks = ["mg_codepage_test_hak".to_string()];
+        info.root.set("Mod_HakList", mg_module::attach::hak_list(&info.root, &haks));
+        m.set_info(&info).unwrap();
+        assert_eq!(m.haks().unwrap(), haks);
+        let before = CODEPAGES_READ.load(SeqCst);
+        let first = module_codepage(&cli, &m);
+        assert_eq!(CODEPAGES_READ.load(SeqCst), before + 1);
+        for _ in 0..3 {
+            assert_eq!(module_codepage(&cli, &m), first);
+        }
+        assert_eq!(CODEPAGES_READ.load(SeqCst), before + 1, "read once");
+        assert_eq!(first, read_codepage(&cli, &haks));
+        // With the game's data open, nothing more is built for it.
+        let gi = install(&cli).unwrap();
+        let game = game_data_in(&gi, &m, &mut Output::default()).unwrap();
+        let read = CODEPAGES_READ.load(SeqCst);
+        assert_eq!(codepage_with(&cli, &m, Some(&game)), first);
+        assert_eq!(CODEPAGES_READ.load(SeqCst), read);
+        assert_eq!(codepage_with(&cli, &m, None), first);
+        assert_eq!(CODEPAGES_READ.load(SeqCst), read);
     }
 }

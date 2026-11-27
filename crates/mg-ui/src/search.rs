@@ -7,11 +7,12 @@
 //! variable set or removed, an event's script, a field: `mg_edit::found`),
 //! edited together, or its areas chosen in Edit Areas Together.
 
+use mg_uikit::Controls as _;
 use std::collections::BTreeMap;
 
 use egui::Ui;
 use mg_core::{Codepage, ResRef, ResType};
-use mg_edit::found::{self, Change};
+use mg_edit::found::{self, Change, Entry};
 use mg_edit::{Command, GffPath};
 use mg_module::search::{
     self, AppearanceOf, FieldValue, Hit, Object, PropertyParts, Query, Search, VarType,
@@ -19,6 +20,7 @@ use mg_module::search::{
 use mg_resman::ResKey;
 use mg_rules::{Choice, ChoiceColumns, GameData, ObjectKind};
 
+use crate::row_copy;
 use crate::{Action, Moonglow, Tab};
 
 /// What the window looks for.
@@ -116,6 +118,9 @@ pub struct Condition {
     pub min_rank: u8,
     /// A class's levels, from and to.
     pub levels: (u8, u8),
+    /// A spell's class: the class it is known or memorized as (none: any
+    /// class's, or a special ability).
+    pub class: Option<usize>,
     pub of: AppearanceOf,
     /// The item property type's parts, for the type they are of.
     pub parts: Option<((usize, Option<usize>), PropertyParts)>,
@@ -138,6 +143,7 @@ impl Default for Condition {
             param: None,
             min_rank: 1,
             levels: (1, TOP_LEVEL),
+            class: None,
             of: AppearanceOf::Creature,
             parts: None,
             not: false,
@@ -175,7 +181,9 @@ impl Condition {
                 max: self.levels.1.into(),
             },
             Kind::Feat => Search::Feat(row("a feat")? as i64),
-            Kind::Spell => Search::Spell(row("a spell")? as i64),
+            Kind::Spell => {
+                Search::Spell { spell: row("a spell")? as i64, class: self.class.map(|c| c as i64) }
+            }
             Kind::Skill => Search::Skill { skill: row("a skill")?, min_rank: self.min_rank },
             Kind::Appearance => {
                 Search::Appearance { of: self.of, row: row("an appearance")? as i64 }
@@ -208,7 +216,7 @@ impl Condition {
             }
             Kind::Class => Search::Class(0),
             Kind::Feat => Search::Feat(0),
-            Kind::Spell => Search::Spell(0),
+            Kind::Spell => Search::Spell { spell: 0, class: None },
             Kind::Skill => Search::Skill { skill: 0, min_rank: 1 },
             Kind::Appearance => Search::Appearance { of: self.of, row: 0 },
             _ => return None,
@@ -236,11 +244,31 @@ pub enum Act {
     RemoveVariable,
     SetScript,
     SetField,
+    AddFeat,
+    RemoveFeat,
+    AddClass,
+    RemoveClass,
+    AddProperty,
+    RemoveProperty,
+    AddItem,
+    RemoveItem,
 }
 
 impl Act {
-    pub const ALL: [Act; 4] =
-        [Act::SetVariable, Act::RemoveVariable, Act::SetScript, Act::SetField];
+    pub const ALL: [Act; 12] = [
+        Act::SetVariable,
+        Act::RemoveVariable,
+        Act::SetScript,
+        Act::SetField,
+        Act::AddFeat,
+        Act::RemoveFeat,
+        Act::AddClass,
+        Act::RemoveClass,
+        Act::AddProperty,
+        Act::RemoveProperty,
+        Act::AddItem,
+        Act::RemoveItem,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -248,6 +276,14 @@ impl Act {
             Act::RemoveVariable => "Remove a variable",
             Act::SetScript => "Set an event's script",
             Act::SetField => "Set a field",
+            Act::AddFeat => "Add a feat",
+            Act::RemoveFeat => "Remove a feat",
+            Act::AddClass => "Add a class",
+            Act::RemoveClass => "Remove a class",
+            Act::AddProperty => "Add an item property",
+            Act::RemoveProperty => "Remove an item property",
+            Act::AddItem => "Add an item",
+            Act::RemoveItem => "Remove an item",
         }
     }
 }
@@ -261,8 +297,15 @@ pub struct ActDraft {
     pub var_type: VarType,
     /// A variable's or field's value, a script's name.
     pub value: String,
+    /// A field set is added where it is missing (Add where missing; off
+    /// unless ticked: `found::Change::SetField`'s `add`).
+    pub add: bool,
     /// The event (its field's label).
     pub event: Option<String>,
+    /// The entry added or removed: a feat, a class (its level, as
+    /// `levels.0`), an item property and its parts, picked as a
+    /// condition's are.
+    pub entry: Condition,
     /// What the last change did.
     pub said: Option<String>,
 }
@@ -274,15 +317,18 @@ impl Default for ActDraft {
             name: String::new(),
             var_type: VarType::Int,
             value: String::new(),
+            add: false,
             event: None,
+            entry: Condition { levels: (1, 1), ..Condition::default() },
             said: None,
         }
     }
 }
 
 impl ActDraft {
-    /// The change asked, or what it still needs.
-    pub fn change(&self) -> Result<Change, String> {
+    /// The change asked, or what it still needs (the game's data names a
+    /// feat, a class and an item property, and makes the property).
+    pub fn change(&self, game: Option<&GameData>) -> Result<Change, String> {
         let name = self.name.trim().to_string();
         let needs_name = |what: &str| {
             if name.is_empty() { Err(format!("Type the {what}")) } else { Ok(name.clone()) }
@@ -298,8 +344,72 @@ impl ActDraft {
                 event: self.event.clone().ok_or("Choose an event")?,
                 script: self.value.trim().to_string(),
             },
-            Act::SetField => {
-                Change::SetField { label: needs_name("field's label")?, value: self.value.clone() }
+            Act::SetField => Change::SetField {
+                label: needs_name("field's label")?,
+                value: self.value.clone(),
+                add: self.add,
+            },
+            Act::AddFeat | Act::RemoveFeat | Act::AddClass | Act::RemoveClass => {
+                let class = matches!(self.act, Act::AddClass | Act::RemoveClass);
+                let row =
+                    self.entry.row.ok_or(if class { "Choose a class" } else { "Choose a feat" })?;
+                let mut c = self.entry.clone();
+                c.kind = if class { Kind::Class } else { Kind::Feat };
+                let named = c.table().map(|t| listed(game, &t)).unwrap_or_default();
+                let name = mg_rules::choice_text(&named, row as i64);
+                let entry = if class {
+                    Entry::Class { class: row as i32, level: i16::from(self.entry.levels.0.max(1)) }
+                } else {
+                    Entry::Feat(row as u16)
+                };
+                let add = matches!(self.act, Act::AddFeat | Act::AddClass);
+                if add {
+                    Change::AddEntry { entry, name }
+                } else {
+                    Change::RemoveEntry { entry, name }
+                }
+            }
+            Act::AddProperty | Act::RemoveProperty => {
+                let game = game.ok_or("Item properties need the game's data")?;
+                let row = self.entry.row.ok_or("Choose a property")? as u16;
+                let t = game.property_type(row).ok_or("Not a property the game has")?;
+                let (subtype, value, param) = (
+                    self.entry.subtype.map(|s| s as u16),
+                    self.entry.cost.map(|v| v as u16),
+                    self.entry.param.map(|v| v as u8),
+                );
+                // Its first subtype, value and parameter, but those chosen.
+                let mut p = game.new_property(&t, 0);
+                if let Some(s) = subtype {
+                    p.subtype = s;
+                    p.param1 = game.property_param_table(&t, s).unwrap_or(255);
+                    p.param1_value = match p.param1 {
+                        255 => 0,
+                        table => game.property_params(table).first().map_or(0, |c| c.row as u8),
+                    };
+                }
+                if let Some(v) = value {
+                    p.cost_value = v;
+                }
+                if let Some(v) = param {
+                    p.param1_value = v;
+                }
+                let entry = Entry::Property { property: p, subtype, value, param };
+                if self.act == Act::AddProperty {
+                    Change::AddEntry { entry, name: game.property_text(&p) }
+                } else {
+                    Change::RemoveEntry { entry, name: t.name }
+                }
+            }
+            Act::AddItem | Act::RemoveItem => {
+                let name = needs_name("item blueprint's resref")?.to_ascii_lowercase();
+                let r = ResRef::from_str(&name).map_err(|e| format!("{name:?}: {e}"))?;
+                let entry = Entry::Item(r);
+                if self.act == Act::AddItem {
+                    Change::AddEntry { entry, name }
+                } else {
+                    Change::RemoveEntry { entry, name }
+                }
             }
         })
     }
@@ -340,6 +450,8 @@ pub(crate) struct KeptCondition {
     param: Option<usize>,
     min_rank: u8,
     levels: [u8; 2],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class: Option<usize>,
     of: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     not: bool,
@@ -361,6 +473,8 @@ pub(crate) struct KeptSearch {
     placed: Option<bool>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     regex: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    haks_and_game: bool,
 }
 
 impl Condition {
@@ -377,6 +491,7 @@ impl Condition {
             param: self.param,
             min_rank: self.min_rank,
             levels: [self.levels.0, self.levels.1],
+            class: self.class,
             of: APPEARANCES.iter().find(|(a, _)| *a == self.of).map_or("", |a| a.1).into(),
             not: self.not,
         }
@@ -400,6 +515,7 @@ impl Condition {
                 [0, 0] => d.levels,
                 [a, b] => (a.clamp(1, TOP_LEVEL), b.clamp(1, TOP_LEVEL)),
             },
+            class: k.class,
             of: APPEARANCES.iter().find(|(_, n)| *n == k.of).map_or(d.of, |a| a.0),
             parts: None,
             not: k.not,
@@ -423,6 +539,8 @@ pub struct AdvancedSearch {
     pub placed: Option<bool>,
     /// Names and texts are regular expressions (not `*` patterns).
     pub regex: bool,
+    /// The haks' and the game's blueprints are searched too (read-only).
+    pub haks_and_game: bool,
     /// What was found, for the query in `searched`.
     pub hits: Vec<Hit>,
     pub searched: Option<Query>,
@@ -432,6 +550,15 @@ pub struct AdvancedSearch {
     pub act: ActDraft,
     /// The events the objects found have (script fields' labels).
     pub events: Vec<String>,
+    /// The module's revision (`Workspace::revision`) the hits were found
+    /// at. A hit is a place (`keep.git /Creature List[3]`): once the
+    /// module has changed (an object deleted, an Undo, a file read again)
+    /// another object may stand there, so nothing acts on the hits before
+    /// they are found again.
+    pub found_at: Option<u64>,
+    /// Why a click did not do what it says (the hits were found again
+    /// first), until the next Find or change.
+    pub note: Option<String>,
 }
 
 impl AdvancedSearch {
@@ -444,7 +571,8 @@ impl AdvancedSearch {
             || self.object.is_some()
             || self.placed.is_some()
             || self.any
-            || self.regex;
+            || self.regex
+            || self.haks_and_game;
         asked.then(|| KeptSearch {
             conditions: std::iter::once(&self.first)
                 .chain(&self.and)
@@ -454,6 +582,7 @@ impl AdvancedSearch {
             object: self.object.and_then(|t| t.extension()).map(str::to_string),
             placed: self.placed,
             regex: self.regex,
+            haks_and_game: self.haks_and_game,
         })
     }
 
@@ -468,6 +597,7 @@ impl AdvancedSearch {
         self.object = k.object.as_deref().and_then(ResType::from_extension);
         self.placed = k.placed;
         self.regex = k.regex;
+        self.haks_and_game = k.haks_and_game;
     }
 
     /// The query the window asks, or what it still needs.
@@ -484,14 +614,19 @@ impl AdvancedSearch {
             types: self.object.into_iter().collect(),
             placed: self.placed,
             regex: self.regex,
+            haks_and_game: self.haks_and_game,
         };
         q.check().map_err(|e| format!("Not a regular expression: {e}"))?;
         Ok(q)
     }
 
-    /// The hits ticked.
+    /// The hits ticked (a hak's or the game's blueprint never is: it is
+    /// read-only).
     pub fn chosen(&self) -> Vec<&Hit> {
-        self.hits.iter().zip(&self.ticked).filter(|(_, t)| **t).map(|(h, _)| h).collect()
+        (self.hits.iter().zip(&self.ticked))
+            .filter(|(h, t)| **t && h.layer.is_none())
+            .map(|(h, _)| h)
+            .collect()
     }
 }
 
@@ -509,32 +644,81 @@ impl Moonglow {
         let cp = game.map_or(Codepage::WINDOWS_1252, GameData::codepage);
         // (Asked again, only what changed since is read.)
         draft.hits = self.search_kept.search(&ws.module, &q, game, cp);
-        draft.ticked = vec![true; draft.hits.len()];
+        draft.ticked = draft.hits.iter().map(|h| h.layer.is_none()).collect();
         draft.events = found::events(&ws.module, &draft.hits.iter().collect::<Vec<_>>());
+        let asked_anew = draft.searched.as_ref() != Some(&q);
         draft.searched = Some(q);
-        // (A change's field follows what is looked for.)
-        if let Some(field) = draft.first.field() {
+        draft.found_at = Some(ws.revision());
+        // (A field to set follows what is looked for, when another thing
+        // is looked for. Every search wrote the field's label over the
+        // name, which is a variable's and an item's too: a variable typed
+        // as nBoss was Appearance_Type after the search a change ends
+        // with, and the next change set a variable of that name.)
+        if asked_anew
+            && draft.act.act == Act::SetField
+            && let Some(field) = draft.first.field()
+        {
             draft.act.name = field;
         }
     }
 
+    /// Whether the module changed since `draft`'s hits were found (its
+    /// pending edits written first): they are found again then, all
+    /// ticked, with a note of why, and the caller does nothing with them
+    /// this time. The hits name places, and whatever stands there now
+    /// would be changed, opened or edited together.
+    pub fn found_again(&mut self, draft: &mut AdvancedSearch) -> bool {
+        let Some(ws) = self.ws.as_mut() else { return false };
+        if let Err(e) = ws.flush() {
+            self.log.error(e.to_string());
+            return true;
+        }
+        if draft.searched.is_none() || draft.found_at == Some(ws.revision()) {
+            return false;
+        }
+        // (What was asked then, not what the fields say now.)
+        let asked = draft.searched.clone();
+        let game = self.game.as_deref();
+        let cp = game.map_or(Codepage::WINDOWS_1252, GameData::codepage);
+        if let Some(q) = &asked {
+            draft.hits = self.search_kept.search(&ws.module, q, game, cp);
+            draft.ticked = draft.hits.iter().map(|h| h.layer.is_none()).collect();
+            draft.events = found::events(&ws.module, &draft.hits.iter().collect::<Vec<_>>());
+            draft.found_at = Some(ws.revision());
+        }
+        draft.note = Some(
+            "The module changed since this was found. Found again, everything checked: look the \
+             list over first."
+                .into(),
+        );
+        true
+    }
+
     /// Makes the window's change to what it found and ticked, in one
-    /// step, then finds again.
+    /// step, then finds again. Where the module changed since they were
+    /// found, they are found again and nothing is changed
+    /// ([`Moonglow::found_again`]).
     pub fn change_found(&mut self, draft: &mut AdvancedSearch) {
-        let change = match draft.act.change() {
+        let change = match draft.act.change(self.game.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 draft.act.said = Some(e);
                 return;
             }
         };
+        if self.found_again(draft) {
+            draft.act.said = draft.note.clone();
+            return;
+        }
+        draft.note = None;
         let Some(ws) = self.ws.as_mut() else { return };
         if let Err(e) = ws.flush() {
             self.log.error(e.to_string());
             return;
         }
         let cp = self.game.as_deref().map_or(Codepage::WINDOWS_1252, GameData::codepage);
-        let out = match found::edits(&ws.module, &draft.chosen(), &change, cp) {
+        let game = self.game.as_deref();
+        let out = match found::edits(&ws.module, &draft.chosen(), &change, cp, game) {
             Ok(out) => out,
             Err(e) => {
                 draft.act.said = Some(e);
@@ -550,9 +734,17 @@ impl Moonglow {
             return;
         }
         let label = format!("{} on {} found", change.describe(), out.changed);
-        if let Err(e) = self.apply(Command::new(label.clone(), out.edits)) {
-            draft.act.said = Some(e.to_string());
-            return;
+        match self.apply_or_ask(Command::new(label.clone(), out.edits), None) {
+            Ok(true) => {}
+            // (Held: the Protected Area window names what it would change.)
+            Ok(false) => {
+                draft.act.said = Some("Asked first: it changes a protected area".into());
+                return;
+            }
+            Err(e) => {
+                draft.act.said = Some(e.to_string());
+                return;
+            }
         }
         draft.act.said = Some(format!("{label}{left}"));
         self.advanced_search(draft);
@@ -585,7 +777,7 @@ fn row_picker_in(
     if choices.is_empty() {
         let mut on = row.is_some() || any.is_none();
         if any.is_some() {
-            ui.checkbox(&mut on, "");
+            ui.check_box(&mut on, "");
         }
         let mut n = row.unwrap_or(0);
         ui.add_enabled(on, egui::DragValue::new(&mut n).range(0..=65535))
@@ -612,11 +804,15 @@ fn row_picker_in(
     }
 }
 
-/// The choices of a table, as the game names them.
-pub(crate) fn choices(game: Option<&GameData>, table: &mg_rules::rows::RowTable) -> Vec<Choice> {
-    let Some(game) = game else { return Vec::new() };
+/// The choices of a table as the game data keeps them (`Arc<Vec<Choice>>`),
+/// shared rather than copying whole tables on every frame.
+pub(crate) fn listed(
+    game: Option<&GameData>,
+    table: &mg_rules::rows::RowTable,
+) -> std::sync::Arc<Vec<Choice>> {
+    let Some(game) = game else { return Default::default() };
     let columns = ChoiceColumns { name: table.name, label: table.label };
-    game.choice_list(table.table, columns).map(|c| c.to_vec()).unwrap_or_default()
+    game.choice_list(table.table, columns).unwrap_or_default()
 }
 
 /// A condition's rows of the window's grid; `salt` keeps its widgets'
@@ -624,7 +820,7 @@ pub(crate) fn choices(game: Option<&GameData>, table: &mg_rules::rows::RowTable)
 fn condition_ui(ui: &mut Ui, c: &mut Condition, game: Option<&GameData>, salt: &str) -> bool {
     let mut find = false;
     let text = |ui: &mut Ui, value: &mut String, hint: &str| -> bool {
-        let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(260.0));
+        let r = ui.add(mg_uikit::text_field(value).hint_text(hint).desired_width(260.0));
         r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
     };
     let id = |name: &str| format!("advanced-search-{name}{salt}");
@@ -648,7 +844,7 @@ fn condition_ui(ui: &mut Ui, c: &mut Condition, game: Option<&GameData>, salt: &
             let table = c.table().expect("a table");
             crate::widgets::field_label(ui, "Property");
             let was = c.row;
-            row_picker(ui, &id("property"), &choices(game, &table), &mut c.row, None);
+            row_picker(ui, &id("property"), &listed(game, &table), &mut c.row, None);
             if c.row != was {
                 (c.subtype, c.cost, c.param) = (None, None, None);
             }
@@ -706,11 +902,25 @@ fn condition_ui(ui: &mut Ui, c: &mut Condition, game: Option<&GameData>, salt: &
             };
             crate::widgets::field_label(ui, label);
             let table = c.table().expect("a table");
-            row_picker(ui, &id("row"), &choices(game, &table), &mut c.row, None);
+            row_picker(ui, &id("row"), &listed(game, &table), &mut c.row, None);
             ui.end_row();
+            if c.kind == Kind::Spell {
+                crate::widgets::field_label(ui, "As class")
+                    .on_hover_text("Creatures that know or have memorized it as this class");
+                let classes = Search::Class(0).table().expect("the classes' table");
+                row_picker(
+                    ui,
+                    &id("spell-class"),
+                    &listed(game, &classes),
+                    &mut c.class,
+                    Some("Any"),
+                );
+                ui.end_row();
+            }
             if c.kind == Kind::Skill {
                 crate::widgets::field_label(ui, "At least");
-                ui.add(egui::DragValue::new(&mut c.min_rank).range(1..=127).suffix(" rank(s)"));
+                let suffix = rank_suffix(c.min_rank);
+                ui.add(egui::DragValue::new(&mut c.min_rank).range(1..=127).suffix(suffix));
                 ui.end_row();
             }
             if c.kind == Kind::Class {
@@ -740,9 +950,8 @@ fn condition_ui(ui: &mut Ui, c: &mut Condition, game: Option<&GameData>, salt: &
             ui.horizontal(|ui| {
                 let hint = if c.number { "e.g. 103, 1.5 or 5..10" } else { "text it contains" };
                 find |= text(ui, &mut c.value, hint);
-                ui.checkbox(&mut c.number, "Number").on_hover_text(
-                    "Number fields holding this number (103, 1.5) or one in a range (5..10, \
-                     5.., ..10)",
+                ui.check_box(&mut c.number, "Number").on_hover_text(
+                    "Number fields holding this number (103, 1.5) or in a range (5..10)",
                 );
             });
             ui.end_row();
@@ -761,7 +970,7 @@ fn kind_choice(ui: &mut Ui, c: &mut Condition, id: &str) {
         |k| k.label(),
     );
     if c.kind != was {
-        (c.row, c.subtype, c.cost, c.param) = (None, None, None, None);
+        (c.row, c.subtype, c.cost, c.param, c.class) = (None, None, None, None, None);
     }
 }
 
@@ -790,7 +999,7 @@ fn search_ui(ui: &mut Ui, d: &mut AdvancedSearch, game: Option<&GameData>) -> bo
             crate::widgets::field_label(ui, label).on_hover_text(hover);
             ui.horizontal(|ui| {
                 kind_choice(ui, c, &format!("advanced-search-kind-{i}"));
-                ui.checkbox(&mut c.not, "Not")
+                ui.check_box(&mut c.not, "Not")
                     .on_hover_text("Leave out the objects that meet this condition");
                 if ui.small_button("Remove").clicked() {
                     remove = Some(i);
@@ -819,9 +1028,7 @@ fn search_ui(ui: &mut Ui, d: &mut AdvancedSearch, game: Option<&GameData>) -> bo
                 .width(260.0)
                 .show(ui, &mut d.any, &[false, true], meeting)
                 .on_hover_text(
-                    "All: what the first finds, where the same object meets the others. Any: \
-                     what each finds. Either way, less the objects meeting a condition ticked \
-                     Not",
+                    "All: objects every condition finds. Any: objects any condition finds.",
                 );
             ui.end_row();
         }
@@ -851,11 +1058,13 @@ fn search_ui(ui: &mut Ui, d: &mut AdvancedSearch, game: Option<&GameData>) -> bo
         });
         ui.end_row();
         ui.label("");
-        ui.checkbox(&mut d.regex, "Regular expressions").on_hover_text(
-            "Names and texts (a variable's name and value, a script's name, a field's label \
-             and text) are regular expressions, not * patterns: found anywhere unless \
-             anchored (^kz_(rent|own)$), letters A to Z in either case",
+        ui.check_box(&mut d.regex, "Regular expressions").on_hover_text(
+            "Names and texts are regular expressions, found anywhere unless anchored (^kz_)",
         );
+        ui.end_row();
+        ui.label("");
+        ui.check_box(&mut d.haks_and_game, "The haks' and the game's blueprints too")
+            .on_hover_text("Also the haks' and the game's blueprints, read-only");
         ui.end_row();
     });
     if let Some(i) = remove {
@@ -865,11 +1074,20 @@ fn search_ui(ui: &mut Ui, d: &mut AdvancedSearch, game: Option<&GameData>) -> bo
 }
 
 /// What can be opened together from what is ticked: blueprints of one
-/// type, objects of one kind placed in one area.
+/// type; objects of one kind placed in areas (one or several), each its
+/// area and its path in the area's GIT; the items placed objects hold
+/// (`kind` none), apart from those lying in an area and from the item
+/// blueprints, which have pages of their own.
 #[derive(Debug, Clone, PartialEq)]
 enum Together {
     Blueprints(ResType, Vec<ResKey>),
-    Placed { area: ResRef, kind: ObjectKind, paths: Vec<GffPath> },
+    /// `areas`: how many areas they are in (worked out once, with the
+    /// groups: not each frame the buttons are drawn).
+    Placed {
+        kind: Option<ObjectKind>,
+        objects: Vec<(ResRef, GffPath)>,
+        areas: usize,
+    },
 }
 
 impl Together {
@@ -877,11 +1095,12 @@ impl Together {
         match self {
             Together::Blueprints(_, keys) if keys.len() == 1 => Tab::Blueprint(keys[0]),
             Together::Blueprints(_, keys) => Tab::Blueprints(keys.clone()),
-            Together::Placed { area, paths, .. } if paths.len() == 1 => {
-                Tab::Instance { area: *area, path: paths[0].clone() }
+            Together::Placed { objects, .. } if objects.len() == 1 => {
+                let (area, path) = objects[0].clone();
+                Tab::Instance { area, path }
             }
-            Together::Placed { area, paths, .. } => {
-                Tab::Instances { area: *area, paths: paths.clone() }
+            Together::Placed { objects, .. } => {
+                Tab::Instances { objects: objects.as_slice().into() }
             }
         }
     }
@@ -891,11 +1110,15 @@ impl Together {
 /// in (or is).
 fn together(hits: &[&Hit]) -> (Vec<Together>, Vec<ResRef>) {
     let mut blueprints: BTreeMap<ResType, Vec<ResKey>> = BTreeMap::new();
-    let mut placed: BTreeMap<(ResRef, &'static str), Vec<GffPath>> = BTreeMap::new();
+    let mut placed: BTreeMap<Option<ObjectKind>, Vec<(ResRef, GffPath)>> = BTreeMap::new();
     let mut areas: Vec<ResRef> = Vec::new();
+    // (Each area looked for in a set, not the list: a persistent world's
+    // 8,800 hits in 300 areas were a scan of the list a hit, most of a
+    // frame of the window, every frame it showed.)
+    let mut areas_seen = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
     for h in hits {
-        if matches!(h.key.restype, ResType::ARE | ResType::GIT) && !areas.contains(&h.key.resref) {
+        if matches!(h.key.restype, ResType::ARE | ResType::GIT) && areas_seen.insert(h.key.resref) {
             areas.push(h.key.resref);
         }
         let Some(o): Option<Object> = h.object() else { continue };
@@ -910,34 +1133,48 @@ fn together(hits: &[&Hit]) -> (Vec<Together>, Vec<ResRef>) {
             && let Some(kind) = ObjectKind::from_list(list)
         {
             placed
-                .entry((o.key.resref, kind.list()))
+                .entry(Some(kind))
                 .or_default()
-                .push(GffPath::root().item(list, i));
+                .push((o.key.resref, GffPath::root().item(list, i)));
+        } else if o.placed() && crate::blueprint::held_item(&o.path) {
+            // (An item a placed object holds, or a store sells: not one in
+            // a bag, edited with the bag.)
+            placed.entry(None).or_default().push((o.key.resref, o.path));
         }
     }
     let mut out: Vec<Together> =
         blueprints.into_iter().map(|(t, keys)| Together::Blueprints(t, keys)).collect();
-    out.extend(placed.into_iter().map(|((area, list), paths)| Together::Placed {
-        area,
-        kind: ObjectKind::from_list(list).expect("a placed object's list"),
-        paths,
+    // (The held items after the kinds of object placed.)
+    let (held, kinds): (Vec<_>, Vec<_>) = placed.into_iter().partition(|(k, _)| k.is_none());
+    out.extend(kinds.into_iter().chain(held).map(|(kind, objects)| {
+        let areas = Tab::areas_of(&objects).len();
+        Together::Placed { kind, objects, areas }
     }));
     (out, areas)
 }
 
 /// The change to make, and its button; true when it is asked.
-fn act_ui(ui: &mut Ui, d: &mut AdvancedSearch, n: usize) -> bool {
+fn act_ui(ui: &mut Ui, d: &mut AdvancedSearch, n: usize, game: Option<&GameData>) -> bool {
     let mut go = false;
+    // (The field of what was looked for, offered as the one to set.)
+    let offered = d.first.field();
     let a = &mut d.act;
     egui::Grid::new("advanced-search-act").num_columns(2).show(ui, |ui| {
         crate::widgets::field_label(ui, "Change");
+        let was = a.act;
         crate::widgets::dropdown("advanced-search-act")
             .selected_text(a.act.label())
             .width(260.0)
             .show(ui, &mut a.act, &Act::ALL, |a| a.label());
+        if a.act != was
+            && a.act == Act::SetField
+            && let Some(field) = offered
+        {
+            a.name = field;
+        }
         ui.end_row();
         let edit = |ui: &mut Ui, v: &mut String, hint: &str| {
-            ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(260.0));
+            ui.add(mg_uikit::text_field(v).hint_text(hint).desired_width(260.0));
         };
         match a.act {
             Act::SetVariable | Act::RemoveVariable => {
@@ -964,6 +1201,40 @@ fn act_ui(ui: &mut Ui, d: &mut AdvancedSearch, n: usize) -> bool {
                 edit(ui, &mut a.name, "its label, e.g. Appearance_Type");
                 ui.end_row();
             }
+            Act::AddFeat | Act::RemoveFeat | Act::AddClass | Act::RemoveClass => {
+                let class = matches!(a.act, Act::AddClass | Act::RemoveClass);
+                let kind = if class { Kind::Class } else { Kind::Feat };
+                if a.entry.kind != kind {
+                    (a.entry.kind, a.entry.row) = (kind, None);
+                }
+                crate::widgets::field_label(ui, if class { "Class" } else { "Feat" });
+                let table = a.entry.table().expect("a table");
+                row_picker(
+                    ui,
+                    "advanced-search-act-row",
+                    &listed(game, &table),
+                    &mut a.entry.row,
+                    None,
+                );
+                ui.end_row();
+                if a.act == Act::AddClass {
+                    crate::widgets::field_label(ui, "Level");
+                    ui.add(egui::DragValue::new(&mut a.entry.levels.0).range(1..=TOP_LEVEL))
+                        .on_hover_text("The class's level on each creature it is added to");
+                    ui.end_row();
+                }
+            }
+            Act::AddProperty | Act::RemoveProperty => {
+                if a.entry.kind != Kind::ItemProperty {
+                    (a.entry.kind, a.entry.row) = (Kind::ItemProperty, None);
+                }
+                condition_ui(ui, &mut a.entry, game, "-act");
+            }
+            Act::AddItem | Act::RemoveItem => {
+                crate::widgets::field_label(ui, "Item");
+                edit(ui, &mut a.name, "its blueprint's resref, e.g. nw_it_torch001");
+                ui.end_row();
+            }
         }
         if a.act == Act::SetVariable {
             crate::widgets::field_label(ui, "Type");
@@ -978,8 +1249,13 @@ fn act_ui(ui: &mut Ui, d: &mut AdvancedSearch, n: usize) -> bool {
             edit(ui, &mut a.value, "the value");
             ui.end_row();
         }
+        if a.act == Act::SetField {
+            ui.label("");
+            ui.add(mg_uikit::Checkbox::new(&mut a.add, "Add where missing")).on_hover_text(ADD_TIP);
+            ui.end_row();
+        }
     });
-    let ok = a.change();
+    let ok = a.change(game);
     ui.horizontal(|ui| {
         let button = egui::Button::new(format!("Change {n} Found"));
         go = ui
@@ -996,6 +1272,57 @@ fn act_ui(ui: &mut Ui, d: &mut AdvancedSearch, n: usize) -> bool {
     go
 }
 
+/// A result as one line of text (its menu's Copy, a line of Copy All):
+/// its place as listed, the layer it is read from where it is not the
+/// module's, and what matched, "area_01 › Chest: Gold 50".
+pub fn hit_line(app: &mut Moonglow, h: &mg_module::search::Hit) -> String {
+    let place = place_shown(app, h);
+    match &h.layer {
+        Some(layer) => format!("{place} ({layer}): {}", h.matched),
+        None => format!("{place}: {}", h.matched),
+    }
+}
+
+/// A hit's place as its row shows it, with areas named as the rest of
+/// the window names them (Options › General: Show areas by name).
+fn place_shown(app: &mut Moonglow, h: &mg_module::search::Hit) -> String {
+    let of_area = matches!(h.key.restype, ResType::ARE | ResType::GIT);
+    if !of_area || !app.settings.area_names {
+        return h.place.clone();
+    }
+    let name = crate::tabs::area_label(app, h.key.resref);
+    h.place.replacen(&h.key.resref.to_lowercase().to_string(), &name, 1)
+}
+
+type TogetherGroups = (std::sync::Arc<Vec<Together>>, std::sync::Arc<Vec<ResRef>>);
+
+/// Cached summary derived from the current hit list and tick vector so idle
+/// frames do not scan 8,800+ hits or rebuild `together` when collapsed.
+#[derive(Clone, Default)]
+struct SearchUiCache {
+    sig: (usize, usize, Option<u64>, Option<ResKey>, Option<ResKey>, u64),
+    ticked_count: usize,
+    outside_count: usize,
+    together: Option<TogetherGroups>,
+    /// Whether a plugin's command fits the ticked hits, for the commands
+    /// it was worked out with (held: by their list's address and length,
+    /// another list made at the same address took the old one's answer).
+    ticked_fits: Option<(std::sync::Arc<[crate::plugins::PluginCommand]>, bool)>,
+}
+
+fn ticked_hash(ticked: &[bool]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325 ^ (ticked.len() as u64);
+    for &b in ticked {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn hit_selected(h: &Hit) -> mg_plugin::Selected {
+    crate::plugins::selected_at(h.key, &h.path)
+}
+
 /// The Advanced Search tab.
 pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     if app.ws.is_none() {
@@ -1004,24 +1331,11 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     }
     let mut draft = std::mem::take(&mut app.advanced_search);
     let (mut find, mut go, mut change) = (false, None, false);
-    // The places, with areas named as the rest of the window names them
-    // (Options › General: Show areas by name).
-    let places: Vec<String> = draft
-        .hits
-        .iter()
-        .map(|h| {
-            let of_area = matches!(h.key.restype, ResType::ARE | ResType::GIT);
-            if !of_area || !app.settings.area_names {
-                return h.place.clone();
-            }
-            let name = crate::tabs::area_label(app, h.key.resref);
-            h.place.replacen(&h.key.resref.to_lowercase().to_string(), &name, 1)
-        })
-        .collect();
     let game = app.game.clone();
     ui.weak(
         "The module's blueprints, placed objects (and the items they hold), areas and \
-         conversations, by what they hold.",
+         conversations, by what they hold; and, checked below, the haks' and the game's \
+         blueprints.",
     );
     if game.is_none() {
         ui.weak("The game's data isn't loaded: choose rows by number.");
@@ -1038,114 +1352,371 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     if draft.searched.is_some() && !current {
         ui.weak("Find again for what's asked now.");
     }
+    if let Some(note) = &draft.note {
+        ui.colored_label(ui.visuals().warn_fg_color, note);
+    }
     let mut open = Vec::new();
     let mut choose_areas = None;
+    // (A result's menu's Copy or Copy All: its text made after the rows.)
+    let mut copy = None;
     if draft.searched.is_some() {
         ui.separator();
         draft.ticked.resize(draft.hits.len(), true);
         if draft.hits.is_empty() {
-            ui.weak("Nothing in the module holds it.");
+            ui.weak(match draft.searched.as_ref().is_some_and(|q| q.haks_and_game) {
+                true => "Nothing in the module, its haks or the game holds it.",
+                false => "Nothing in the module holds it.",
+            });
         } else {
-            let chosen = draft.chosen();
-            let n = chosen.len();
-            let (groups, areas) = together(&chosen);
-            // (Areas named as the list names them.)
-            let mut area_name = |area: ResRef| match app.settings.area_names {
-                true => crate::tabs::area_label(app, area),
-                false => area.to_lowercase().to_string(),
-            };
-            let labels: Vec<String> = groups
-                .iter()
-                .map(|g| match g {
-                    Together::Blueprints(t, keys) => {
-                        let kind = ObjectKind::from_restype(*t).map_or("", ObjectKind::name);
-                        format!("Edit {} {kind} blueprint(s) Together", keys.len())
-                    }
-                    Together::Placed { area, kind, paths } => format!(
-                        "Edit {} {}(s) in {} Together",
-                        paths.len(),
-                        kind.name(),
-                        area_name(*area)
-                    ),
-                })
-                .collect();
+            let sig = (
+                draft.hits.len(),
+                draft.hits.as_ptr() as usize,
+                draft.found_at,
+                draft.hits.first().map(|h| h.key),
+                draft.hits.last().map(|h| h.key),
+                ticked_hash(&draft.ticked),
+            );
+            let cache_id = egui::Id::new("advanced-search-ui-cache");
+            let mut cache: SearchUiCache = ui.data(|d| d.get_temp(cache_id)).unwrap_or_default();
+            let mut cache_dirty = false;
+            if cache.sig != sig {
+                let ticked_count = draft
+                    .hits
+                    .iter()
+                    .zip(&draft.ticked)
+                    .filter(|(h, t)| **t && h.layer.is_none())
+                    .count();
+                let outside_count = draft.hits.iter().filter(|h| h.layer.is_some()).count();
+                cache = SearchUiCache {
+                    sig,
+                    ticked_count,
+                    outside_count,
+                    together: None,
+                    ticked_fits: None,
+                };
+                cache_dirty = true;
+            }
+            let n = cache.ticked_count;
+            let outside = cache.outside_count;
             ui.horizontal(|ui| {
                 ui.label(format!("{} found:", draft.hits.len()));
-                if ui.small_button("Tick All").clicked() {
-                    draft.ticked.fill(true);
+                if outside > 0 {
+                    ui.weak(format!("({outside} of them the haks' or the game's, read-only)"));
                 }
-                if ui.small_button("Tick None").clicked() {
+                if ui.small_button("Check All").clicked() {
+                    for (t, h) in draft.ticked.iter_mut().zip(&draft.hits) {
+                        *t = h.layer.is_none();
+                    }
+                }
+                if ui.small_button("Check None").clicked() {
                     draft.ticked.fill(false);
                 }
             });
-            egui::CollapsingHeader::new(format!("Change the {n} ticked"))
+            egui::CollapsingHeader::new(format!("Change the {n} checked"))
+                .icon(mg_uikit::collapsing_icon)
                 .id_salt("advanced-search-change")
-                .show(ui, |ui| change = act_ui(ui, &mut draft, n));
-            egui::CollapsingHeader::new(format!("Edit the {n} ticked together"))
+                .show(ui, |ui| change = act_ui(ui, &mut draft, n, app.game.as_deref()));
+            let area_names = app.settings.area_names;
+            egui::CollapsingHeader::new(format!("Edit the {n} checked together"))
+                .icon(mg_uikit::collapsing_icon)
                 .id_salt("advanced-search-together")
                 .show(ui, |ui| {
+                    let (groups, areas) = cache
+                        .together
+                        .get_or_insert_with(|| {
+                            cache_dirty = true;
+                            let chosen = draft.chosen();
+                            let (g, a) = together(&chosen);
+                            (std::sync::Arc::new(g), std::sync::Arc::new(a))
+                        })
+                        .clone();
                     if groups.is_empty() && areas.is_empty() {
-                        ui.weak("Blueprints of one type, objects of one kind placed in one area");
+                        ui.weak(
+                            "Blueprints of one type, objects of one kind placed in areas, \
+                             the items they hold",
+                        );
                     }
                     ui.horizontal_wrapped(|ui| {
-                        for (g, text) in groups.iter().zip(labels) {
+                        for g in groups.iter() {
+                            let text = match g {
+                                Together::Blueprints(t, keys) => {
+                                    let kind =
+                                        ObjectKind::from_restype(*t).map_or("", ObjectKind::name);
+                                    blueprints_together(kind, keys.len())
+                                }
+                                Together::Placed { kind, objects, areas } => {
+                                    let area = objects[0].0;
+                                    let place = match *areas {
+                                        1 if area_names => crate::tabs::area_label(app, area),
+                                        1 => area.to_lowercase().to_string(),
+                                        n => format!("{n} areas"),
+                                    };
+                                    placed_together(*kind, objects.len(), &place)
+                                }
+                            };
                             if ui.button(text).clicked() {
                                 open.push(g.tab());
                             }
                         }
                         if !areas.is_empty()
                             && ui
-                                .button(format!("Choose {} Area(s)…", areas.len()))
+                                .button(format!(
+                                    "Choose {} {}…",
+                                    areas.len(),
+                                    if areas.len() == 1 { "Area" } else { "Areas" }
+                                ))
                                 .on_hover_text(
-                                    "Edit Areas Together, with the areas of what is ticked \
-                                     ticked",
+                                    "Edit Areas Together with the areas of the checked results",
                                 )
                                 .clicked()
                         {
-                            choose_areas = Some(areas.clone());
+                            choose_areas = Some((*areas).clone());
                         }
                     });
                 });
-        }
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            for (i, h) in draft.hits.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut draft.ticked[i], "");
-                    let hover = format!("{} {}", h.key, h.path);
-                    if ui.link(&places[i]).on_hover_text(hover).clicked() {
-                        go = Some(i);
+            let commands = app.plugin_menu_commands_cached();
+            // What a plugin's command is run on from a ticked row: every
+            // ticked hit's. Whether a command fits it is worked out once,
+            // when a ticked row in sight first asks, and kept until the
+            // hits, the ticks or the commands change.
+            let for_these = |c: &std::sync::Arc<[crate::plugins::PluginCommand]>| {
+                std::sync::Arc::ptr_eq(c, &commands)
+            };
+            let mut ticked_fits =
+                cache.ticked_fits.as_ref().filter(|(c, _)| for_these(c)).map(|(_, f)| *f);
+            let mut menu_actions = Vec::new();
+            // (Only the rows in sight are named and laid out; the others
+            // take a row's room, as Find References' do.)
+            mg_uikit::show_rows(
+                egui::ScrollArea::vertical().auto_shrink(false),
+                ui,
+                draft.hits.len(),
+                |ui, range| {
+                    for i in range {
+                        let place = place_shown(app, &draft.hits[i]);
+                        // (Each row exactly a row's room: rows of another
+                        // height made the list's height change with what
+                        // is in sight, and its scroll bar came and went.)
+                        let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                        let layout = egui::Layout::left_to_right(egui::Align::Center);
+                        ui.allocate_ui_with_layout(size, layout, |ui| {
+                            ui.set_min_height(size.y);
+                            ui.set_max_height(size.y);
+                            // (The row's own response first, under its tick
+                            // and link: a right click on it opens its menu
+                            // too. Not a Tab stop: its link is.)
+                            let room = egui::Rect::from_min_size(ui.cursor().min, size);
+                            let whole =
+                                ui.interact(room, ui.id().with(("hit-row", i)), egui::Sense::CLICK);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            let h = &draft.hits[i];
+                            let mine = h.layer.is_none();
+                            let tick = mg_uikit::Checkbox::without_text(&mut draft.ticked[i]);
+                            let tick = ui.add_enabled(mine, tick);
+                            let r = ui.link(place).on_hover_ui(|ui| {
+                                ui.label(match &h.layer {
+                                    Some(layer) => {
+                                        format!(
+                                            "{} {}\nRead from {layer}: read-only",
+                                            h.key, h.path
+                                        )
+                                    }
+                                    None => format!("{} {}", h.key, h.path),
+                                });
+                            });
+                            if h.layer.is_some() {
+                                tick.on_disabled_hover_text(
+                                    "Read-only: the module has no copy of it",
+                                );
+                            }
+                            if r.clicked() {
+                                go = Some(i);
+                            }
+                            if let Some(layer) = &h.layer {
+                                ui.label(egui::RichText::new(format!("({layer})")).italics());
+                            }
+                            // (Cut at the row's end, whole in its tip; not
+                            // selectable, a right click on it the row's.)
+                            let matched = egui::RichText::new(&h.matched).weak();
+                            ui.add(egui::Label::new(matched).selectable(false))
+                                .on_hover_text(&h.matched);
+                            // Its menu: the plugins' commands for it, or
+                            // (one of those ticked) for each ticked; then
+                            // Copy and Copy All (every result, ticked or
+                            // not: the ticks say what a change takes, not
+                            // what is chosen).
+                            let is_ticked = draft.ticked[i];
+                            let fits = if commands.is_empty() {
+                                false
+                            } else if is_ticked {
+                                *ticked_fits.get_or_insert_with(|| {
+                                    let mut kinds: Vec<mg_plugin::Target> =
+                                        (draft.hits.iter().zip(&draft.ticked))
+                                            .filter(|(_, t)| **t)
+                                            .map(|(h, _)| hit_selected(h).target())
+                                            .collect::<Option<Vec<_>>>()
+                                            .unwrap_or_default();
+                                    kinds.sort();
+                                    kinds.dedup();
+                                    commands.iter().any(|c| c.fits(&kinds))
+                                })
+                            } else {
+                                let alone = [hit_selected(h)];
+                                commands.iter().any(|c| c.fits(&crate::plugins::kinds_of(&alone)))
+                            };
+                            // (Shift+F10 and Ctrl+C where the keyboard is
+                            // on its link, the row's menu's and its focus's
+                            // id.)
+                            let row = r | whole;
+                            let (keyed, ctrl_c) = row_copy::focused_keys(ui, &row);
+                            if ctrl_c {
+                                copy = Some((row_copy::Asked::Row, i));
+                            }
+                            let actions = &mut menu_actions;
+                            let asked = row_copy::row_menu(ui, &row, keyed, |ui| {
+                                if !fits {
+                                    return false;
+                                }
+                                let on: Vec<mg_plugin::Selected> = if is_ticked {
+                                    let mut on: Vec<mg_plugin::Selected> =
+                                        (draft.hits.iter().zip(&draft.ticked))
+                                            .filter(|(_, t)| **t)
+                                            .map(|(h, _)| hit_selected(h))
+                                            .collect();
+                                    on.dedup();
+                                    on
+                                } else {
+                                    vec![hit_selected(h)]
+                                };
+                                crate::plugins::menu_on(ui, &commands, &on, actions);
+                                true
+                            });
+                            if asked.is_some() {
+                                copy = asked.map(|a| (a, i));
+                            }
+                        });
                     }
-                    ui.weak(&h.matched);
-                });
+                },
+            );
+            app.actions.extend(menu_actions);
+            if let Some(fits) = ticked_fits
+                && !cache.ticked_fits.as_ref().is_some_and(|(c, f)| for_these(c) && *f == fits)
+            {
+                cache.ticked_fits = Some((commands.clone(), fits));
+                cache_dirty = true;
             }
-        });
+            if cache_dirty {
+                ui.data_mut(|d| d.insert_temp(cache_id, cache));
+            }
+        }
+    }
+    match copy {
+        Some((row_copy::Asked::Row, i)) => {
+            let line = hit_line(app, &draft.hits[i]);
+            ui.ctx().copy_text(line);
+        }
+        Some((row_copy::Asked::All, _)) => {
+            let all: Vec<String> = draft.hits.iter().map(|h| hit_line(app, h)).collect();
+            ui.ctx().copy_text(row_copy::lines(all));
+        }
+        None => {}
     }
     if find && draft.query().is_ok() {
         draft.act.said = None;
+        draft.note = None;
         app.advanced_search(&mut draft);
     }
     if change {
         app.change_found(&mut draft);
     }
+    // (A place opened or edited together is the hit's as it was found:
+    // in a module changed since, they are found again instead.)
+    let acts = go.is_some() || !open.is_empty() || choose_areas.is_some();
+    if acts && app.found_again(&mut draft) {
+        (go, choose_areas) = (None, None);
+        open.clear();
+    }
     if let Some(i) = go {
-        let usage = draft.hits[i].usage();
-        app.go_to_usage(&usage);
+        let h = &draft.hits[i];
+        match &h.layer {
+            // (A hak's or the game's: its copy, to look at.)
+            Some(layer) => {
+                let tab = Tab::ResourceCopy { key: h.key, layer: layer.clone() };
+                app.actions.push(Action::OpenTab(tab));
+            }
+            None => {
+                let usage = h.usage();
+                app.go_to_usage(&usage);
+            }
+        }
     }
     for tab in open {
         app.actions.push(Action::OpenTab(tab));
     }
     if let Some(areas) = choose_areas {
-        app.area_chooser = Some(crate::area_props::AreaChooser {
-            chosen: areas.into_iter().collect(),
-            ..Default::default()
-        });
+        app.area_chooser = Some(crate::area_props::AreaChooser::of(areas));
+        crate::tool_sections::bring(app, crate::shell::Panel::AreasTogether);
     }
     app.advanced_search = draft;
+}
+
+/// Add where missing's tip.
+pub const ADD_TIP: &str = "Also gives the field to those without it, where their kind of object \
+     has it, instead of the game's default";
+
+/// Skill's "At least" field's suffix: " rank" for one, " ranks" else.
+fn rank_suffix(n: u8) -> &'static str {
+    if n == 1 { " rank" } else { " ranks" }
+}
+
+/// Edit Together's button for `n` blueprints of `kind` (its name).
+fn blueprints_together(kind: &str, n: usize) -> String {
+    let word = if n == 1 { "blueprint" } else { "blueprints" };
+    format!("Edit {n} {kind} {word} Together")
+}
+
+/// Edit Together's button for `n` objects of `kind` placed (`None`: items
+/// placed objects hold) in `place`: an area, as the window names areas,
+/// or how many.
+fn placed_together(kind: Option<ObjectKind>, n: usize, place: &str) -> String {
+    let noun = match (kind, n) {
+        (Some(kind), 1) => kind.name().to_string(),
+        (Some(kind), _) => kind.label().to_lowercase(),
+        (None, 1) => "held item".to_string(),
+        (None, _) => "held items".to_string(),
+    };
+    format!("Edit {n} {noun} in {place} Together")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wave 3's counted words: one rank, one blueprint, one creature,
+    /// and the plurals past one.
+    #[test]
+    fn counted_labels_say_one_and_more() {
+        assert_eq!(rank_suffix(1), " rank");
+        assert_eq!(rank_suffix(2), " ranks");
+        assert_eq!(rank_suffix(127), " ranks");
+        let creature = ObjectKind::Creature.name();
+        assert_eq!(
+            blueprints_together(creature, 1),
+            format!("Edit 1 {creature} blueprint Together")
+        );
+        assert_eq!(
+            blueprints_together(creature, 3),
+            format!("Edit 3 {creature} blueprints Together")
+        );
+        let (creature, door) = (Some(ObjectKind::Creature), Some(ObjectKind::Door));
+        assert_eq!(placed_together(creature, 1, "start"), "Edit 1 creature in start Together");
+        assert_eq!(placed_together(creature, 2, "start"), "Edit 2 creatures in start Together");
+        assert_eq!(placed_together(door, 1, "Inn"), "Edit 1 door in Inn Together");
+        assert_eq!(placed_together(door, 4, "Inn"), "Edit 4 doors in Inn Together");
+        assert_eq!(placed_together(door, 4, "3 areas"), "Edit 4 doors in 3 areas Together");
+        assert_eq!(placed_together(None, 1, "Inn"), "Edit 1 held item in Inn Together");
+        assert_eq!(placed_together(None, 5, "2 areas"), "Edit 5 held items in 2 areas Together");
+    }
 
     /// A search is kept to each placed object kind by its type and the
     /// name the toolset calls it by, then to areas, conversations and the
@@ -1160,6 +1731,38 @@ mod tests {
         assert_eq!(object_label(Some(ResType::UTM)), "Stores");
         assert_eq!(object_label(Some(ResType::IFO)), "The module");
         assert_eq!(object_label(None), "Everything");
+    }
+
+    /// The areas of the hits are each named once, in the order their
+    /// first hit came, as a look through the list made them.
+    #[test]
+    fn the_hits_areas_are_named_once_in_their_order() {
+        let hit = |area: &str, t: ResType| Hit {
+            key: ResKey::new(ResRef::from_str(area).unwrap(), t),
+            path: GffPath::root(),
+            place: String::new(),
+            matched: String::new(),
+            object: t,
+            carried: None,
+            spawned: None,
+            layer: None,
+        };
+        let names = ["b", "a", "b", "c", "a", "d", "c"];
+        let mut hits: Vec<Hit> = names.iter().map(|n| hit(n, ResType::GIT)).collect();
+        hits.push(hit("e", ResType::ARE));
+        hits.push(hit("f", ResType::UTC));
+        let chosen: Vec<&Hit> = hits.iter().collect();
+        let mut looked: Vec<ResRef> = Vec::new();
+        for h in &chosen {
+            if matches!(h.key.restype, ResType::ARE | ResType::GIT)
+                && !looked.contains(&h.key.resref)
+            {
+                looked.push(h.key.resref);
+            }
+        }
+        let (_, areas) = together(&chosen);
+        assert_eq!(areas, looked);
+        assert_eq!(areas.len(), 5);
     }
 
     /// The conditions ticked Not are those the query leaves out, the
@@ -1188,5 +1791,28 @@ mod tests {
         again.ask_again(&old);
         assert!(!again.any && !again.first.not);
         assert!(AdvancedSearch { any: true, ..Default::default() }.kept().is_some());
+    }
+
+    /// A spell's class and the haks' and the game's blueprints are asked,
+    /// and a session keeps them.
+    #[test]
+    fn a_spell_s_class_and_the_haks_and_game_are_asked_and_kept() {
+        let d = AdvancedSearch {
+            first: Condition {
+                kind: Kind::Spell,
+                row: Some(107),
+                class: Some(2),
+                ..Default::default()
+            },
+            haks_and_game: true,
+            ..Default::default()
+        };
+        let q = d.query().unwrap();
+        assert_eq!(q.search, Search::Spell { spell: 107, class: Some(2) });
+        assert!(q.haks_and_game);
+        let mut again = AdvancedSearch::default();
+        again.ask_again(&d.kept().unwrap());
+        assert_eq!((again.first.class, again.haks_and_game), (Some(2), true));
+        assert!(AdvancedSearch { haks_and_game: true, ..Default::default() }.kept().is_some());
     }
 }

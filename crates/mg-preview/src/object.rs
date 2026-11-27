@@ -5,8 +5,7 @@ use mg_gff::Struct;
 use mg_rules::{GameData, ObjectKind};
 
 use crate::{
-    Lookup, Part, Preview, PreviewError, PreviewLight, appearance, cell, cell_f32, cell_int,
-    env_map,
+    Lookup, Part, Preview, PreviewError, PreviewLight, appearance, cell, cell_f32, env_map,
 };
 
 /// The map a placeable whose appearance's `Reflection` is `default`
@@ -50,9 +49,9 @@ pub fn placeable(game: &GameData, utp: &Struct) -> Result<Preview, PreviewError>
     }
     let mut lights = Vec::new();
     let illuminated = utp.integer("LightState").is_none_or(|v| v != 0);
-    if let Some(c) = cell_int(&table, r, "LightColor").filter(|&c| c > 0) {
+    if let Some(c) = mg_rules::placeables::light_color(&table, r) {
         let colors = game.table("lightcolor")?;
-        let ch = |col| cell_f32(&colors, c as usize, col).unwrap_or(0.0);
+        let ch = |col| cell_f32(&colors, c, col).unwrap_or(0.0);
         let offset = |col| cell_f32(&table, r, col).unwrap_or(0.0);
         lights.push(PreviewLight {
             offset: Vec3::new(
@@ -74,7 +73,7 @@ pub fn placeable(game: &GameData, utp: &Struct) -> Result<Preview, PreviewError>
         5 => "off",
         _ => "default",
     };
-    Ok(Preview { base, parts: Vec::new(), idle: Some(idle.into()), lights })
+    Ok(Preview { base, idle: Some(idle.into()), lights, ..Preview::model("") })
 }
 
 /// A waypoint (UTW fields): the flag of its `Appearance`, waypoint.2da
@@ -93,7 +92,7 @@ pub fn waypoint(game: &GameData, utw: &Struct) -> Result<Preview, PreviewError> 
 /// (a store has no appearance).
 pub fn store(game: &GameData) -> Result<Preview, PreviewError> {
     const MARKER: &str = "gi_store";
-    if !(Lookup { game }).has_model(MARKER) {
+    if !Lookup::of(game).has_model(MARKER) {
         return Err(PreviewError::NoModel(MARKER.into()));
     }
     Ok(Preview::model(MARKER))
@@ -109,7 +108,7 @@ pub fn sound(game: &GameData, uts: &Struct) -> Result<Preview, PreviewError> {
         (true, true) => "gi_sound_rndm",
         (true, false) => "gi_sound_pos",
     };
-    if !(Lookup { game }).has_model(marker) {
+    if !Lookup::of(game).has_model(marker) {
         return Err(PreviewError::NoModel(marker.into()));
     }
     Ok(Preview::model(marker))
@@ -127,10 +126,5 @@ pub fn door(game: &GameData, utd: &Struct) -> Result<Preview, PreviewError> {
         2 => "opened2",
         _ => "closed",
     };
-    Ok(Preview {
-        base: Part::new(model),
-        parts: Vec::new(),
-        idle: Some(idle.into()),
-        lights: Vec::new(),
-    })
+    Ok(Preview { idle: Some(idle.into()), ..Preview::model(&model) })
 }

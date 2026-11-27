@@ -67,6 +67,14 @@ pub fn git_list(restype: ResType) -> Option<(&'static str, u32)> {
 /// points, metres.
 pub const OUTLINE_LIFT: f32 = 0.025;
 
+/// A trigger's `PointZ` that puts the point on ground of height `ground`
+/// (plus [`OUTLINE_LIFT`]) where the trigger's `ZPosition` is
+/// `z_position`: the game takes the point's height as `ZPosition` +
+/// `PointZ` (read in the client: `transition_outlines.rs`).
+pub fn outline_point_z(ground: f32, z_position: f32) -> f32 {
+    ground + OUTLINE_LIFT - z_position
+}
+
 /// A default value (a field Aurora writes when the blueprint lacks it).
 enum D {
     Byte(u8),
@@ -275,52 +283,9 @@ const ITEM_ORDER: &[&str] = &[
     "VarTable",
 ];
 
-const PLACEABLE_ORDER: &[&str] = &[
-    "Tag",
-    "LocName",
-    "Description",
-    "TemplateResRef",
-    "AutoRemoveKey",
-    "CloseLockDC",
-    "Conversation",
-    "Interruptable",
-    "Faction",
-    "Plot",
-    "KeyRequired",
-    "Lockable",
-    "Locked",
-    "OpenLockDC",
-    "PortraitId",
-    "TrapDetectable",
-    "TrapDetectDC",
-    "TrapDisarmable",
-    "DisarmDC",
-    "TrapFlag",
-    "TrapOneShot",
-    "TrapType",
-    "KeyName",
-    "AnimationState",
-    "Appearance",
-    "HP",
-    "CurrentHP",
-    "Hardness",
-    "Fort",
-    "Ref",
-    "Will",
-    "OnClosed",
-    "OnDamaged",
-    "OnDeath",
-    "OnDisarm",
-    "OnHeartbeat",
-    "OnLock",
-    "OnMeleeAttacked",
-    "OnOpen",
-    "OnSpellCastAt",
-    "OnTrapTriggered",
-    "OnUnlock",
-    "OnUserDefined",
-    "OnClick",
-    "VarTable",
+/// A placeable's fields after the situated ones and `VarTable`, in
+/// Aurora's order.
+const PLACEABLE_OWN_ORDER: &[&str] = &[
     "HasInventory",
     "BodyBag",
     "Static",
@@ -507,8 +472,7 @@ const MODEL_PARTS: [&str; 3] = ["ModelPart1", "ModelPart2", "ModelPart3"];
 /// An item property's fields in Aurora's order.
 const PROPERTY_ORDER: &[&str] =
     &["PropertyName", "Subtype", "CostTable", "CostValue", "Param1", "Param1Value", "ChanceAppear"];
-const ITEM_COLORS: [&str; 6] =
-    ["Leather1Color", "Leather2Color", "Cloth1Color", "Cloth2Color", "Metal1Color", "Metal2Color"];
+use crate::blueprints::COLORS as ITEM_COLORS;
 
 /// A placeable's and a door's common defaults (situated objects).
 const SITUATED: &[(&str, D)] = &[
@@ -578,54 +542,9 @@ const DOOR: &[(&str, D)] = &[
     ("OnFailToOpen", D::ResRef),
 ];
 
-/// The order Aurora writes a door in (a placeable: the situated fields,
-/// then its own).
-const DOOR_ORDER: &[&str] = &[
-    "Tag",
-    "LocName",
-    "Description",
-    "TemplateResRef",
-    "AutoRemoveKey",
-    "CloseLockDC",
-    "Conversation",
-    "Interruptable",
-    "Faction",
-    "Plot",
-    "KeyRequired",
-    "Lockable",
-    "Locked",
-    "OpenLockDC",
-    "PortraitId",
-    "TrapDetectable",
-    "TrapDetectDC",
-    "TrapDisarmable",
-    "DisarmDC",
-    "TrapFlag",
-    "TrapOneShot",
-    "TrapType",
-    "KeyName",
-    "AnimationState",
-    "Appearance",
-    "HP",
-    "CurrentHP",
-    "Hardness",
-    "Fort",
-    "Ref",
-    "Will",
-    "OnClosed",
-    "OnDamaged",
-    "OnDeath",
-    "OnDisarm",
-    "OnHeartbeat",
-    "OnLock",
-    "OnMeleeAttacked",
-    "OnOpen",
-    "OnSpellCastAt",
-    "OnTrapTriggered",
-    "OnUnlock",
-    "OnUserDefined",
-    "OnClick",
-    "VarTable",
+/// A door's fields after the situated ones and `VarTable`, in Aurora's
+/// order.
+const DOOR_OWN_ORDER: &[&str] = &[
     "LinkedTo",
     "LinkedToFlags",
     "LoadScreenID",
@@ -776,35 +695,53 @@ fn renew(s: &mut Struct, old: &str, new: &str) {
     }
 }
 
-/// Puts a struct's fields in `order` (`#parts` stands for `parts`, each
-/// followed by its EE twin); fields not named follow in their own order.
-fn arrange(s: &mut Struct, order: &[&str], parts: &[&str]) {
-    let mut labels: Vec<String> = Vec::new();
-    for label in order {
-        if *label == "#parts" {
-            for part in parts {
-                labels.push(part.to_string());
-                labels.push(mg_rules::items::wide_label(part));
+type RankTable = std::collections::HashMap<Vec<u8>, usize>;
+
+fn build_ranks(order: &[&str], parts: &[&str], extra_after_parts: &[&str]) -> RankTable {
+    let mut table = RankTable::new();
+    let mut rank = 0usize;
+    let mut push = |bytes: &[u8]| {
+        table.entry(bytes.to_vec()).or_insert_with(|| {
+            let r = rank;
+            rank += 1;
+            r
+        });
+    };
+    for &label in order {
+        if label == "#parts" {
+            for &part in parts {
+                push(part.as_bytes());
+                push(mg_rules::items::wide_label(part).as_bytes());
+            }
+            for &extra in extra_after_parts {
+                push(extra.as_bytes());
             }
         } else {
-            labels.push(label.to_string());
+            push(label.as_bytes());
         }
     }
-    let rank = |f: &mg_gff::Field| {
-        let l = f.label.to_string_lossy();
-        labels.iter().position(|x| *x == l).unwrap_or(labels.len())
-    };
-    s.fields.sort_by_key(rank);
+    table
+}
+
+/// Puts a struct's fields in `ranks` order; fields not named follow in their own order.
+fn arrange_by_ranks(s: &mut Struct, ranks: &RankTable) {
+    s.fields.sort_by_cached_key(|f| ranks.get(f.label.as_bytes()).copied().unwrap_or(usize::MAX));
+}
+
+fn property_ranks() -> &'static RankTable {
+    static RANKS: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+    RANKS.get_or_init(|| build_ranks(PROPERTY_ORDER, &[], &[]))
 }
 
 /// An item's fields in Aurora's order: its parts and then its colors where
 /// the order has `#parts`.
 fn arrange_item(s: &mut Struct) {
-    let parts: Vec<&str> = MODEL_PARTS.iter().chain(&ARMOR_PARTS).copied().collect();
-    let mut order: Vec<&str> = ITEM_ORDER.to_vec();
-    let after_parts = order.iter().position(|l| *l == "#parts").map_or(order.len(), |i| i + 1);
-    order.splice(after_parts..after_parts, ITEM_COLORS);
-    arrange(s, &order, &parts);
+    static RANKS: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+    let ranks = RANKS.get_or_init(|| {
+        let parts: Vec<&str> = MODEL_PARTS.iter().chain(&ARMOR_PARTS).copied().collect();
+        build_ranks(ITEM_ORDER, &parts, &ITEM_COLORS)
+    });
+    arrange_by_ranks(s, ranks);
 }
 
 /// An item as a placed object holds it (in its inventory, a store page or
@@ -930,7 +867,7 @@ fn item_fields(p: &Placing<'_>, bp: &Struct, depth: u32) -> Struct {
         // Aurora writes every property's struct id as 0 (a few game
         // blueprints have others: nw_storgenral003's items).
         property.id = 0;
-        arrange(property, PROPERTY_ORDER, &[]);
+        arrange_by_ranks(property, property_ranks());
     }
     s.set("PropertiesList", Value::List(properties));
     // (Its fields are put in Aurora's order by who asked, once the fields
@@ -970,8 +907,11 @@ fn held_list(p: &Placing<'_>, s: &mut Struct, list: &str, depth: u32) {
 /// The instance of a blueprint of `restype` at `at`, as Aurora places it.
 /// Triggers and encounters take their outline from `outline`: points
 /// relative to the position in X and Y, and at their own height (the
-/// ground under them plus [`OUTLINE_LIFT`]); Aurora stands them at their
-/// first point, at height 0.
+/// ground under them plus [`OUTLINE_LIFT`]), in the order given. Aurora
+/// stands a trigger at its first click, at height 0, and saves its points
+/// in its own order ([`outline_order`]: counterclockwise, from the point
+/// of smallest X), so the stand point (0, 0) is not always the first;
+/// the area view orders a drawn outline so before it comes here.
 pub fn instance(
     p: &Placing<'_>,
     restype: ResType,
@@ -1091,12 +1031,7 @@ pub fn instance(
             fill(&mut s, SOUND);
             let looping = s.integer("Looping").unwrap_or(0) != 0;
             let positional = s.integer("Positional").unwrap_or(0) != 0;
-            let priority = match (looping, positional) {
-                (true, false) => 2,
-                (true, true) => 3,
-                (false, false) => 19,
-                (false, true) => 20,
-            };
+            let priority = crate::blueprints::sound_priority(looping, positional);
             s.set("Priority", Value::Byte(priority));
             let mut sounds = s.list("Sounds").unwrap_or(&[]).to_vec();
             sounds.iter_mut().for_each(|w| w.id = 0);
@@ -1145,26 +1080,56 @@ pub fn instance(
     Some(s)
 }
 
+/// The order Aurora writes a placeable or a door in: the situated fields
+/// (as [`SITUATED`] lists them), `VarTable`, then the type's own.
+fn situated_order(own: &[&'static str]) -> Vec<&'static str> {
+    SITUATED
+        .iter()
+        .map(|(label, _)| *label)
+        .chain(["VarTable"])
+        .chain(own.iter().copied())
+        .collect()
+}
+
 /// Puts a placed object's fields in the order Aurora writes its type
 /// (items are written in order).
 fn arrange_as(restype: ResType, s: &mut Struct) {
-    let order: Vec<&str> = match restype {
+    let ranks: &'static RankTable = match restype {
         ResType::UTC => {
-            let mut order = CREATURE_ORDER.to_vec();
-            let after = order.iter().position(|l| *l == "#parts").map_or(order.len(), |i| i + 1);
-            order.splice(after..after, CREATURE_COLORS);
-            order
+            static R: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+            R.get_or_init(|| build_ranks(CREATURE_ORDER, &creature_parts(), &CREATURE_COLORS))
         }
-        ResType::UTP => PLACEABLE_ORDER.to_vec(),
-        ResType::UTM => STORE_ORDER.to_vec(),
-        ResType::UTS => SOUND_ORDER.to_vec(),
-        ResType::UTW => WAYPOINT_ORDER.to_vec(),
-        ResType::UTT => TRIGGER_ORDER.to_vec(),
-        ResType::UTE => ENCOUNTER_ORDER.to_vec(),
-        ResType::UTD => DOOR_ORDER.to_vec(),
+        ResType::UTP => {
+            static R: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+            R.get_or_init(|| build_ranks(&situated_order(PLACEABLE_OWN_ORDER), &[], &[]))
+        }
+        ResType::UTM => {
+            static R: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+            R.get_or_init(|| build_ranks(STORE_ORDER, &[], &[]))
+        }
+        ResType::UTS => {
+            static R: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+            R.get_or_init(|| build_ranks(SOUND_ORDER, &[], &[]))
+        }
+        ResType::UTW => {
+            static R: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+            R.get_or_init(|| build_ranks(WAYPOINT_ORDER, &[], &[]))
+        }
+        ResType::UTT => {
+            static R: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+            R.get_or_init(|| build_ranks(TRIGGER_ORDER, &[], &[]))
+        }
+        ResType::UTE => {
+            static R: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+            R.get_or_init(|| build_ranks(ENCOUNTER_ORDER, &[], &[]))
+        }
+        ResType::UTD => {
+            static R: std::sync::OnceLock<RankTable> = std::sync::OnceLock::new();
+            R.get_or_init(|| build_ranks(&situated_order(DOOR_OWN_ORDER), &[], &[]))
+        }
         _ => return,
     };
-    arrange(s, &order, &creature_parts());
+    arrange_by_ranks(s, ranks);
 }
 
 /// Where a placed object stands, as [`instance`] writes it (the inverse
@@ -1176,9 +1141,15 @@ pub fn placement_of(restype: ResType, s: &Struct) -> (Placement, Vec<[f32; 3]>) 
 }
 
 /// What Update Instances keeps of a placed object besides where it
-/// stands: its visual transform (EE's list, or the older struct) and an
-/// encounter's spawn points.
-const KEPT: [&str; 3] = ["VisTransformList", "VisualTransform", "SpawnPointList"];
+/// stands: its visual transform (EE's list, or the older struct), an
+/// encounter's spawn points, its lock ([`mg_rules::placement::LOCKED`]),
+/// and an outline's own color (Moonglow's,
+/// [`mg_rules::placement::OUTLINE_COLOR`]: marks of the placed object
+/// that no blueprint has).
+const KEPT: [&str; 5] = {
+    let [list, older] = crate::placement::VISUAL_TRANSFORM_FIELDS;
+    [list, older, "SpawnPointList", mg_rules::placement::LOCKED, mg_rules::placement::OUTLINE_COLOR]
+};
 
 /// Update Instances (Aurora's palette › Update Instances, with every area
 /// or one): the placed objects of the blueprints `blueprint` returns,
@@ -1196,12 +1167,12 @@ pub fn update(
     blueprint: &dyn Fn(ResType, ResRef) -> Option<Struct>,
     which: &dyn Fn(&str, usize) -> bool,
 ) -> Option<(Struct, usize)> {
-    let mut out = git.clone();
+    let mut out: Option<Struct> = None;
     let mut count = 0;
     for kind in ObjectKind::ALL {
         let (list, restype, field) = (kind.list(), kind.restype(), kind.resref_field());
-        let Some(items) = out.list_mut(list) else { continue };
-        for (i, s) in items.iter_mut().enumerate() {
+        let Some(items) = git.list(list) else { continue };
+        for (i, s) in items.iter().enumerate() {
             if !which(list, i) {
                 continue;
             }
@@ -1211,11 +1182,12 @@ pub fn update(
                 continue;
             };
             let Some(made) = remade(p, restype, s, &bp) else { continue };
-            *s = made;
+            let dest = out.get_or_insert_with(|| git.clone());
+            dest.list_mut(list).expect("list checked")[i] = made;
             count += 1;
         }
     }
-    (count > 0).then_some((out, count))
+    out.map(|out| (out, count))
 }
 
 /// Placed object `old` (of blueprint type `restype`) made again from
@@ -1396,26 +1368,48 @@ pub fn update_held(
     blueprint: &dyn Fn(ResRef) -> Option<Struct>,
     which: WhichHeld<'_>,
 ) -> Option<(Struct, usize)> {
+    fn set_at(root: &mut Struct, at: &[(&'static str, usize)], made: Struct) {
+        let mut cur = root;
+        for &(list, idx) in &at[..at.len() - 1] {
+            cur = &mut cur.list_mut(list).expect("list exists")[idx];
+        }
+        let &(list, idx) = at.last().expect("non-empty path");
+        cur.list_mut(list).expect("list exists")[idx] = made;
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn remake(
         p: &Placing<'_>,
-        s: &mut Struct,
+        git: &Struct,
+        s: &Struct,
         list: &'static str,
         at: &mut Held,
         depth: u32,
         blueprint: &dyn Fn(ResRef) -> Option<Struct>,
         which: WhichHeld<'_>,
+        out: &mut Option<Struct>,
         count: &mut usize,
     ) {
         if depth > 6 {
             return;
         }
         for &inner in held_lists(list) {
-            let Some(items) = s.list_mut(inner) else { continue };
-            for (i, held) in items.iter_mut().enumerate() {
+            let Some(items) = s.list(inner) else { continue };
+            for (i, held) in items.iter().enumerate() {
                 at.push((inner, i));
                 if !holds_items(list, inner) {
-                    remake(p, held, "Placeable List", at, depth + 1, blueprint, which, count);
+                    remake(
+                        p,
+                        git,
+                        held,
+                        "Placeable List",
+                        at,
+                        depth + 1,
+                        blueprint,
+                        which,
+                        out,
+                        count,
+                    );
                 } else if which(at)
                     && let Some(bp) = held.resref("TemplateResRef").and_then(blueprint)
                 {
@@ -1427,25 +1421,26 @@ pub fn update_held(
                             made.set(&label, f.value.clone());
                         }
                     }
-                    *held = made;
+                    let root = out.get_or_insert_with(|| git.clone());
+                    set_at(root, at, made);
                     *count += 1;
                 } else {
-                    remake(p, held, "ItemList", at, depth + 1, blueprint, which, count);
+                    remake(p, git, held, "ItemList", at, depth + 1, blueprint, which, out, count);
                 }
                 at.pop();
             }
         }
     }
-    let mut out = git.clone();
+    let mut out: Option<Struct> = None;
     let mut count = 0;
     for list in ObjectKind::ALL.map(ObjectKind::list) {
-        let Some(objects) = out.list_mut(list) else { continue };
-        for (i, s) in objects.iter_mut().enumerate() {
+        let Some(objects) = git.list(list) else { continue };
+        for (i, s) in objects.iter().enumerate() {
             let mut at: Held = vec![(list, i)];
-            remake(p, s, list, &mut at, 0, blueprint, which, &mut count);
+            remake(p, git, s, list, &mut at, 0, blueprint, which, &mut out, &mut count);
         }
     }
-    (count > 0).then_some((out, count))
+    out.map(|out| (out, count))
 }
 
 /// The waypoint Aurora's Create Waypoint makes for a creature (one of its
@@ -1501,6 +1496,69 @@ fn points(outline: &[[f32; 3]], id: u32, labels: [&str; 3]) -> Vec<Struct> {
         .collect()
 }
 
+/// The signed area of an outline's X and Y: positive when its points run
+/// counterclockwise seen from above (X east, Y north), negative when
+/// clockwise, 0 for fewer than three points or all on one line.
+pub fn signed_area(xy: &[[f32; 2]]) -> f32 {
+    let n = xy.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let twice: f64 = (0..n)
+        .map(|i| {
+            let (a, b) = (xy[i], xy[(i + 1) % n]);
+            f64::from(a[0]) * f64::from(b[1]) - f64::from(b[0]) * f64::from(a[1])
+        })
+        .sum();
+    (twice / 2.0) as f32
+}
+
+/// The order Aurora saves a trigger's outline in, as indices into `xy`
+/// (the points' X and Y, relative to the trigger's position, in the
+/// order clicked): counterclockwise (a clockwise drawing is reversed),
+/// starting at the point of smallest X, of those the one of smallest Y.
+/// Measured in Aurora (`transition-triggers/04-base.mod` and
+/// `05-concave.mod`, `docs/findings.md`): a concave outline is kept as
+/// drawn, and the comparison is exact (a corner clicked 2e-6 west of the
+/// first is first). The game draws an area transition only when its
+/// points run counterclockwise. An outline of fewer than three points, or
+/// with no area (all on one line), keeps the order given. Encounters' are
+/// not ordered: Aurora's was not measured, and the game draws none.
+pub fn outline_order(xy: &[[f32; 2]]) -> Vec<usize> {
+    let n = xy.len();
+    let area = signed_area(xy);
+    if n < 3 || area == 0.0 || !area.is_finite() {
+        return (0..n).collect();
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    if area < 0.0 {
+        order.reverse();
+    }
+    let first = (0..n)
+        .min_by(|&a, &b| {
+            let (p, q) = (xy[order[a]], xy[order[b]]);
+            p[0].total_cmp(&q[0]).then(p[1].total_cmp(&q[1]))
+        })
+        .unwrap_or(0);
+    order.rotate_left(first);
+    order
+}
+
+/// Whether a trigger's outline (its `Geometry`) is in [`outline_order`]
+/// already: counterclockwise from its point of smallest X. One that
+/// keeps the order given (fewer than three points, no area) is.
+pub fn in_outline_order(points: &[Struct]) -> bool {
+    let xy = trigger_xy(points);
+    outline_order(&xy).iter().enumerate().all(|(i, &k)| i == k)
+}
+
+/// A trigger's outline points' X and Y (`PointX`, `PointY`; 0 where one
+/// lacks them).
+pub fn trigger_xy(points: &[Struct]) -> Vec<[f32; 2]> {
+    let f = |p: &Struct, l: &str| p.float(l).unwrap_or(0.0);
+    points.iter().map(|p| [f(p, "PointX"), f(p, "PointY")]).collect()
+}
+
 /// Whether a creature's appearance is part-based (appearance.2da
 /// `MODELTYPE` P).
 fn part_based(game: &GameData, s: &Struct) -> bool {
@@ -1550,6 +1608,98 @@ mod tests {
         assert!(w.float("XOrientation").unwrap().abs() < 1e-6);
         assert_eq!(w.float("YOrientation"), Some(1.0));
         assert_eq!(w.get("MapNoteEnabled"), Some(&Value::Byte(1)));
+    }
+
+    /// Aurora's eight measured drawings (`docs/findings.md`, from
+    /// `transition-triggers/04-base.mod`, `05-concave.mod`, `01-painted.mod`):
+    /// the clicks relative to the first, and the order Aurora saved them in.
+    #[test]
+    fn an_outline_is_saved_in_aurora_s_order() {
+        type Case<'a> = (&'a str, &'a [[f32; 2]], &'a [usize]);
+        let cases: [Case<'_>; 8] = [
+            (
+                "clockwise, from the first",
+                &[[0.0, 0.0], [1.0, 5.0], [6.0, 4.0], [5.0, 0.0]],
+                &[0, 3, 2, 1],
+            ),
+            ("counterclockwise", &[[0.0, 0.0], [5.0, 0.0], [6.0, 4.0], [1.0, 5.0]], &[0, 1, 2, 3]),
+            // (Reversed, which no rotation of the clicks gives; P2 is
+            // 1.9e-6 east of P1, so P1 stays first.)
+            (
+                "five corners, clockwise",
+                &[[0.0, 0.0], [1.9e-6, 4.0], [3.0, 6.0], [6.0, 4.0], [5.0, 0.0]],
+                &[0, 4, 3, 2, 1],
+            ),
+            // (P2 is 1.9e-6 west of the first click: first.)
+            (
+                "clockwise, P2 west",
+                &[[0.0, 0.0], [-1.9e-6, 4.0], [5.0, 4.0], [4.0, 0.0]],
+                &[1, 0, 3, 2],
+            ),
+            // (P4 is 0.019 west of the first click: first.)
+            (
+                "counterclockwise, P4 west",
+                &[[0.0, 0.0], [6.0, 0.0], [6.0, 5.0], [-0.019, 5.0]],
+                &[3, 0, 1, 2],
+            ),
+            // (P1 and P4 at X 0: the smaller Y, P1.)
+            ("a tie in X", &[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &[0, 1, 2, 3]),
+            ("a big quad", &[[0.0, 0.0], [7.776, 0.5], [7.0, 5.61], [0.3, 5.0]], &[0, 1, 2, 3]),
+            (
+                "concave, kept as drawn",
+                &[[0.0, 0.0], [8.0, 0.0], [8.0, 4.5], [4.0, 1.5], [0.0, 4.5]],
+                &[0, 1, 2, 3, 4],
+            ),
+        ];
+        for (what, clicks, saved) in cases {
+            assert_eq!(outline_order(clicks), saved, "{what}");
+            let ordered: Vec<[f32; 2]> = saved.iter().map(|&i| clicks[i]).collect();
+            assert!(signed_area(&ordered) > 0.0, "{what}: counterclockwise");
+            // In order already: ordered again, the same.
+            assert_eq!(outline_order(&ordered), (0..clicks.len()).collect::<Vec<_>>(), "{what}");
+        }
+        // A tie in X and Y alike (a corner clicked twice): the earlier.
+        let twice = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 0.0]];
+        assert_eq!(outline_order(&twice)[0], 0);
+    }
+
+    /// A point's height is `ZPosition` + `PointZ`: on ground 5 m up, a
+    /// trigger at height 0 has its points at 5.025, one at height -5 at
+    /// 10.025 and one at 2 at 3.025.
+    #[test]
+    fn an_outline_point_stands_on_the_ground_against_its_trigger_s_height() {
+        for (z, point) in [(0.0, 5.025), (-5.0, 10.025), (2.0, 3.025)] {
+            let got = outline_point_z(5.0, z);
+            assert!((got - point).abs() < 1e-5, "{z}: {got}");
+            assert!((z + got - 5.025).abs() < 1e-5);
+        }
+    }
+
+    /// Fewer than three points, points on one line and points that aren't
+    /// numbers keep the order given, and nothing panics.
+    #[test]
+    fn a_degenerate_outline_keeps_its_order() {
+        let keeps = |xy: &[[f32; 2]]| outline_order(xy) == (0..xy.len()).collect::<Vec<_>>();
+        assert!(keeps(&[]));
+        assert!(keeps(&[[3.0, 1.0]]));
+        assert!(keeps(&[[3.0, 1.0], [0.0, 0.0]]));
+        assert!(keeps(&[[3.0, 3.0], [2.0, 2.0], [1.0, 1.0], [0.0, 0.0]]), "on one line");
+        assert!(keeps(&[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]), "one point thrice");
+        assert!(keeps(&[[f32::NAN, 0.0], [4.0, 0.0], [4.0, 4.0]]));
+        assert!(keeps(&[[f32::INFINITY, 0.0], [4.0, 0.0], [4.0, 4.0]]));
+        assert_eq!(signed_area(&[[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]]), 2.0);
+        assert_eq!(signed_area(&[[0.0, 0.0], [0.0, 2.0], [2.0, 0.0]]), -2.0);
+        let points: Vec<Struct> = [[0.0, 0.0], [0.0, 2.0], [2.0, 0.0]]
+            .iter()
+            .map(|[x, y]| {
+                let mut p = Struct::new(3);
+                p.set("PointX", Value::Float(*x));
+                p.set("PointY", Value::Float(*y));
+                p
+            })
+            .collect();
+        assert!(!in_outline_order(&points), "clockwise");
+        assert!(in_outline_order(&[points[0].clone(), points[2].clone(), points[1].clone()]));
     }
 
     #[test]
@@ -1611,9 +1761,15 @@ mod tests {
         let mut point = Struct::new(0);
         point.set("X", Value::Float(6.0));
         encounter.set("SpawnPointList", Value::List(vec![point]));
+        let own = mg_rules::placement::OUTLINE_COLOR;
+        encounter.set(own, Value::Dword(0x0020_C0F0));
         let new = replaced(&p, ResType::UTE, &encounter, &blueprint("NEW")).unwrap();
         assert_eq!(new.list("SpawnPointList"), encounter.list("SpawnPointList"));
         assert_eq!(new.list("Geometry"), encounter.list("Geometry"));
+        assert_eq!(new.get(own), Some(&Value::Dword(0x0020_C0F0)), "its outline color");
+        encounter.remove(own);
+        let new = replaced(&p, ResType::UTE, &encounter, &blueprint("NEW")).unwrap();
+        assert!(new.get(own).is_none(), "none where it had none");
 
         let mut chest = instance(&p, ResType::UTP, &old_bp, at, &[]).unwrap();
         let mut scale = Struct::new(6);
@@ -1897,5 +2053,34 @@ mod tests {
         whole.set("Pickpocketable", Value::Byte(1));
         let worn = equipped_item(&listed_item(&whole, 0, 0, 0), 0x80);
         assert_eq!((worn.id, labels(&worn)), (0x80, labels(&whole)));
+    }
+
+    #[test]
+    fn remade_and_update_preserve_placed_object_lock() {
+        let game = game();
+        let none = |_: ResRef| None;
+        let placing = Placing { game: &game, item: &none };
+        let resref = ResRef::from_str("chair01").unwrap();
+        let mut bp = Struct::new(0);
+        bp.set("TemplateResRef", Value::resref(resref));
+        bp.set("LocName", Value::LocString(mg_core::LocString::default()));
+        bp.set("Appearance", Value::Dword(1));
+
+        let at = Placement { position: [1.0, 2.0, 0.0], rotation: 0.0 };
+        let mut old = instance(&placing, ResType::UTP, &bp, at, &[]).unwrap();
+        old.set(mg_rules::placement::LOCKED, Value::Byte(1));
+
+        let one = remade(&placing, ResType::UTP, &old, &bp).unwrap();
+        assert_eq!(one.integer(mg_rules::placement::LOCKED), Some(1));
+
+        let mut git = Struct::new(u32::MAX);
+        git.set("Placeable List", Value::List(vec![old]));
+        let (updated, count) =
+            update(&placing, &git, &|_, _| Some(bp.clone()), &|_, _| true).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            updated.list("Placeable List").unwrap()[0].integer(mg_rules::placement::LOCKED),
+            Some(1)
+        );
     }
 }

@@ -13,8 +13,10 @@ use thiserror::Error;
 
 pub mod fix;
 pub mod found;
+pub mod lists;
 pub mod tags;
 pub mod terrain;
+pub mod transition;
 pub mod wire;
 
 #[derive(Debug, Error)]
@@ -100,13 +102,26 @@ impl Command {
 pub fn edits_between(before: &Module, after: &Module) -> Vec<Edit> {
     let changed = after
         .keys()
-        .filter(|k| after.get(k) != before.get(k))
+        .filter(|k| resource_differs(before, after, k))
         .map(|k| Edit::SetResource { key: *k, data: after.get(k).map(<[u8]>::to_vec) });
     let gone = before
         .keys()
         .filter(|k| !after.contains(k))
         .map(|k| Edit::SetResource { key: *k, data: None });
     changed.chain(gone).collect()
+}
+
+/// Whether resource `key` is another in module `b` than in `a` (or in one
+/// alone). A module made from another (a copy that work is staged on)
+/// shares what it did not set again, and what is shared is the same
+/// without its bytes being read: finding the three scripts a rename
+/// changed does not read a module of 600 MB twice.
+pub fn resource_differs(a: &Module, b: &Module, key: &ResKey) -> bool {
+    match (a.shared(key), b.shared(key)) {
+        (Some(a), Some(b)) => !std::sync::Arc::ptr_eq(a, b) && a != b,
+        (None, None) => false,
+        _ => true,
+    }
 }
 
 /// An open module with its parsed documents and edit history.
@@ -121,17 +136,91 @@ pub struct Workspace {
     /// Documents shown that aren't the module's (the game's blueprints, to
     /// look at): [`Workspace::doc`] gives them, nothing edits or saves them.
     viewed: HashMap<ResKey, Gff>,
-    undo: Vec<Command>,
-    redo: Vec<Command>,
-    /// Commands applied since the last save (undo past it counts down).
-    changes_since_save: isize,
+    /// The commands to undo and redo, each with its step's number
+    /// ([`Workspace::last_step`]).
+    undo: Vec<(u64, Command)>,
+    redo: Vec<(u64, Command)>,
+    /// The step on top of the undo history when the module was opened or
+    /// last saved (0: none), where Undo and Redo come back to the saved
+    /// state.
+    saved_at: u64,
+    /// The saved state can't be come back to by Undo or Redo (a command
+    /// applied over what Undo took back past the save, the saved step
+    /// amended or withdrawn, the history dropped with changes unsaved,
+    /// recovered work): changed until the next save.
+    unsaved: bool,
     /// Moves on every change (apply, undo, redo), for views that cache.
     revision: u64,
+    /// The revision it was opened at ([`Workspace::identity`]).
+    identity: u64,
     /// [`Workspace::rewrites`], by resource.
     rewrites: HashMap<ResKey, u64>,
     /// The resources as opened or last saved ([`Workspace::saved`]).
     saved: Module,
+    /// What the edits being run touched, until the revision moves.
+    touching: Vec<Touched>,
+    /// What each of the last revisions touched ([`Workspace::touched_since`]),
+    /// by the revision it made; `None` where that is not known (the module
+    /// changed outside the edit history: [`Workspace::derive`],
+    /// [`Workspace::adopt`]).
+    touched: std::collections::VecDeque<(u64, Option<Vec<Touched>>)>,
+    /// The revision each resource was last touched at, and the last one
+    /// made outside the edit history ([`Workspace::changed_at`]).
+    last_touched: HashMap<ResKey, u64>,
+    outside: u64,
+    /// The saved copies [`Workspace::differs_from_saved`] has read, by
+    /// resource, each with the saved data it was read from (held, so that
+    /// it is told from data saved later by what it is, never by an address
+    /// freed and given again). Dropped as the resource is taken out, or
+    /// the module saved; [`Workspace::forget_saved_copies`] drops those of
+    /// resources no longer shown.
+    saved_read: std::sync::Mutex<HashMap<ResKey, SavedCopy>>,
+    /// The resources as the module was opened (or made), sharing their
+    /// data: never moved by a save, for [`Workspace::changed_since_opened`].
+    opened: Module,
+    /// [`Workspace::changed_since_opened`]'s answer at a revision, and its
+    /// verdict on each resource that differs from the opened one by its
+    /// data, with the data it was told from (held, as `saved_read`'s are):
+    /// a change then costs the resources it changed, not every GFF of the
+    /// session read again.
+    opened_diff: std::sync::Mutex<OpenedDiff>,
 }
+
+/// [`Workspace::opened_diff`].
+#[derive(Debug, Default)]
+struct OpenedDiff {
+    answer: Option<(u64, std::sync::Arc<ChangedSinceOpened>)>,
+    verdicts: HashMap<ResKey, (std::sync::Arc<[u8]>, bool)>,
+}
+
+/// What [`Workspace::changed_since_opened`] finds: the resources the
+/// module has whose content is not what it was when the module was opened
+/// (new ones among them), in the module's order, and those it had then and
+/// has no longer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChangedSinceOpened {
+    pub changed: Vec<ResKey>,
+    pub removed: Vec<ResKey>,
+}
+
+/// A saved resource's data and the document read from it
+/// ([`Workspace::differs_from_saved`]).
+type SavedCopy = (std::sync::Arc<[u8]>, std::sync::Arc<Gff>);
+
+/// What an edit touched ([`Workspace::touched_since`]): the resource, the
+/// struct in it (a field set there, an item put into or taken out of one
+/// of its lists), and the field or list's label; or the resource as a
+/// whole (set or removed, `whole`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Touched {
+    pub key: ResKey,
+    pub path: GffPath,
+    pub label: String,
+    pub whole: bool,
+}
+
+/// How many revisions back [`Workspace::touched_since`] can tell.
+const TOUCHED_KEPT: usize = 64;
 
 /// A module's resources alone, sharing their data.
 fn resources_of(module: &Module) -> Module {
@@ -152,26 +241,181 @@ fn first_revision() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32
 }
 
+/// A number for a step of Undo that no other step has had, in any
+/// workspace of this process ([`Workspace::last_step`]).
+fn next_step() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Workspace {
     pub fn new(module: Module) -> Workspace {
+        let first = first_revision();
         Workspace {
             saved: resources_of(&module),
+            opened: resources_of(&module),
             module,
             docs: HashMap::new(),
             edited: HashSet::new(),
             viewed: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
-            changes_since_save: 0,
-            revision: first_revision(),
+            saved_at: 0,
+            unsaved: false,
+            revision: first,
+            identity: first,
             rewrites: HashMap::new(),
+            touching: Vec::new(),
+            touched: std::collections::VecDeque::new(),
+            last_touched: HashMap::new(),
+            outside: 0,
+            saved_read: Default::default(),
+            opened_diff: Default::default(),
         }
+    }
+
+    /// The resources changed since the module was opened in this
+    /// workspace (or made), by any route (commands, files read again from
+    /// outside, what is made at a save), saves or not: compared by content
+    /// with what they were then, so an edit undone, or a field set back
+    /// by hand, does not count, and a GFF written out in Moonglow's layout
+    /// of what it held then does not either. Documents edited and not yet
+    /// flushed are compared by what they hold. Kept by revision (a menu
+    /// asks every frame it is open): every change of content moves it (a
+    /// flush writes what the documents held already).
+    pub fn changed_since_opened(&self) -> std::sync::Arc<ChangedSinceOpened> {
+        let mut diff = self.opened_diff.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, answer)) = &diff.answer
+            && *at == self.revision
+        {
+            return answer.clone();
+        }
+        let mut changed = Vec::new();
+        for key in self.module.keys() {
+            let differs = match self.docs.get(key).filter(|_| self.edited.contains(key)) {
+                Some(doc) => self.doc_differs_from_opened(key, doc),
+                None => self.data_differs_from_opened(key, &mut diff.verdicts),
+            };
+            if differs {
+                changed.push(*key);
+            }
+        }
+        let removed: Vec<ResKey> =
+            self.opened.keys().filter(|k| !self.module.contains(k)).copied().collect();
+        // (Verdicts on resources since set back or taken out let go.)
+        let module = &self.module;
+        diff.verdicts.retain(|k, (data, _)| {
+            module.shared(k).is_some_and(|d| std::sync::Arc::ptr_eq(d, data))
+        });
+        let answer = std::sync::Arc::new(ChangedSinceOpened { changed, removed });
+        diff.answer = Some((self.revision, answer.clone()));
+        answer
+    }
+
+    /// Whether resource `key`'s data in the module is not what it was
+    /// opened with: by its data, or, for a GFF whose bytes differ, by what
+    /// the two documents hold (`verdicts` keeps that answer by the data).
+    fn data_differs_from_opened(
+        &self,
+        key: &ResKey,
+        verdicts: &mut HashMap<ResKey, (std::sync::Arc<[u8]>, bool)>,
+    ) -> bool {
+        let (Some(now), Some(then)) = (self.module.shared(key), self.opened.shared(key)) else {
+            return true;
+        };
+        if std::sync::Arc::ptr_eq(now, then) {
+            return false;
+        }
+        if let Some((data, differs)) = verdicts.get(key)
+            && std::sync::Arc::ptr_eq(data, now)
+        {
+            return *differs;
+        }
+        let differs = now[..] != then[..]
+            && (!key.restype.is_gff()
+                || match (Gff::read(now), Gff::read(then)) {
+                    (Ok(a), Ok(b)) => a != b,
+                    _ => true,
+                });
+        verdicts.insert(*key, (now.clone(), differs));
+        differs
+    }
+
+    /// Whether an edited document holds other than the resource it was
+    /// opened with.
+    fn doc_differs_from_opened(&self, key: &ResKey, doc: &Gff) -> bool {
+        let Some(then) = self.opened.shared(key) else { return true };
+        if doc.to_bytes().is_ok_and(|b| b[..] == then[..]) {
+            return false;
+        }
+        !Gff::read(then).is_ok_and(|g| g == *doc)
+    }
+
+    /// The revision at which resource `key` last changed (an edit of it,
+    /// or a change made outside the edit history, which may have changed
+    /// any): what a view of it alone can keep what it made by, rather
+    /// than the module's [`Workspace::revision`], which every edit of any
+    /// resource moves.
+    pub fn changed_at(&self, key: &ResKey) -> u64 {
+        self.last_touched.get(key).copied().unwrap_or(0).max(self.outside)
+    }
+
+    /// What the module's changes since `revision` (an earlier
+    /// [`Workspace::revision`]) touched, in the order made: commands,
+    /// their amendments, undo and redo alike. `None` where that isn't
+    /// known: too far back, or a change made outside the edit history
+    /// since. For a view of a resource to read again only what changed of
+    /// it (an area's objects), and nothing for another's change.
+    pub fn touched_since(&self, revision: u64) -> Option<Vec<Touched>> {
+        if revision == self.revision {
+            return Some(Vec::new());
+        }
+        // (Each change moves the revision by one, and is kept: the one
+        // after `revision` must be among those kept.)
+        let first = self.touched.front()?.0;
+        if revision >= self.revision || revision + 1 < first {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (r, t) in &self.touched {
+            if *r > revision {
+                out.extend(t.as_ref()?.iter().cloned());
+            }
+        }
+        Some(out)
+    }
+
+    /// The revision moves on: what the edits run touched is kept for
+    /// [`Workspace::touched_since`] (`known`: `None` where it isn't known).
+    fn moved(&mut self, known: bool) {
+        self.revision += 1;
+        let touched = std::mem::take(&mut self.touching);
+        for t in &touched {
+            self.last_touched.insert(t.key, self.revision);
+        }
+        if !known {
+            self.outside = self.revision;
+        }
+        self.touched.push_back((self.revision, known.then_some(touched)));
+        while self.touched.len() > TOUCHED_KEPT {
+            self.touched.pop_front();
+        }
+    }
+
+    fn touch(&mut self, key: &ResKey, path: &GffPath, label: &str, whole: bool) {
+        self.touching.push(Touched { key: *key, path: path.clone(), label: label.into(), whole });
     }
 
     /// A number that changes whenever the module does (through commands),
     /// and that no other workspace has had.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// A number that tells this workspace from every other: the module
+    /// opened again, or another with the same resources, has another.
+    pub fn identity(&self) -> u64 {
+        self.identity
     }
 
     /// How many times resource `key` was replaced whole or had a list at
@@ -217,6 +461,11 @@ impl Workspace {
         self.viewed.insert(key, gff);
     }
 
+    /// A document only looked at ([`Workspace::view`]), as given.
+    pub fn viewed_doc(&self, key: &ResKey) -> Option<&Gff> {
+        self.viewed.get(key).filter(|_| self.is_viewed(key))
+    }
+
     /// Whether `key` is a document only looked at ([`Workspace::view`]).
     pub fn is_viewed(&self, key: &ResKey) -> bool {
         self.viewed.contains_key(key) && !self.module.contains(key)
@@ -239,35 +488,95 @@ impl Workspace {
 
     /// Whether there are changes since opening or the last save.
     pub fn is_modified(&self) -> bool {
-        self.changes_since_save != 0
+        self.unsaved || self.top_step() != self.saved_at
+    }
+
+    /// The step on top of the undo history (0: none).
+    fn top_step(&self) -> u64 {
+        self.undo.last().map_or(0, |(step, _)| *step)
+    }
+
+    /// How many commands Undo can take back: a command's place in the
+    /// history, for what is kept beside it (a talk-table line typed with a
+    /// field, undone with it).
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// How many commands Redo can put back.
+    pub fn redo_depth(&self) -> usize {
+        self.redo.len()
     }
 
     pub fn can_undo(&self) -> Option<&str> {
-        self.undo.last().map(|c| c.label.as_str())
+        self.undo.last().map(|(_, c)| c.label.as_str())
     }
 
     pub fn can_redo(&self) -> Option<&str> {
-        self.redo.last().map(|c| c.label.as_str())
+        self.redo.last().map(|(_, c)| c.label.as_str())
+    }
+
+    /// The number of the step Undo would take back next: each command
+    /// applied gets its own (no other workspace's step has it), which it
+    /// keeps while it is undone and redone (what a command did outside the
+    /// module, a hak written, follows its step by it). None: nothing to
+    /// undo.
+    pub fn last_step(&self) -> Option<u64> {
+        self.undo.last().map(|(n, _)| *n)
+    }
+
+    /// The number of the step Redo would make again next.
+    pub fn next_redo_step(&self) -> Option<u64> {
+        self.redo.last().map(|(n, _)| *n)
+    }
+
+    /// Whether a step (by its number) can still be undone or redone.
+    pub fn has_step(&self, step: u64) -> bool {
+        self.undo.iter().chain(&self.redo).any(|(n, _)| *n == step)
+    }
+
+    /// Whether a step (by its number) is made: Undo would take it back,
+    /// and has not.
+    pub fn step_done(&self, step: u64) -> bool {
+        self.undo.iter().any(|(n, _)| *n == step)
+    }
+
+    /// Makes the last `n` commands one step of Undo, named `label`, with
+    /// the number of the last of them; false (nothing changed) where
+    /// there are fewer.
+    pub fn join_last(&mut self, n: usize, label: impl Into<String>) -> bool {
+        if n < 2 || self.undo.len() < n {
+            return n == 1 && !self.undo.is_empty();
+        }
+        let last = self.undo.split_off(self.undo.len() - n);
+        let step = last.last().map_or(0, |(s, _)| *s);
+        // (Undone, the last is taken back first.)
+        let edits = last.into_iter().rev().flat_map(|(_, c)| c.edits).collect();
+        self.undo.push((step, Command::new(label, edits)));
+        true
     }
 
     /// The edits [`Workspace::undo`] would run next (the last command's
     /// inverse), to see what they move before they are run.
     pub fn peek_undo(&self) -> Option<&Command> {
-        self.undo.last()
+        self.undo.last().map(|(_, c)| c)
     }
 
     /// The edits [`Workspace::redo`] would run next.
     pub fn peek_redo(&self) -> Option<&Command> {
-        self.redo.last()
+        self.redo.last().map(|(_, c)| c)
     }
 
     /// Applies a command; on failure nothing is changed.
     pub fn apply(&mut self, cmd: Command) -> Result<(), EditError> {
         let inverse = self.run(&cmd)?;
-        self.undo.push(inverse);
+        self.undo.push((next_step(), inverse));
+        // (What Redo held is gone: the saved state too, if it was there.)
+        if self.redo.iter().any(|(step, _)| *step == self.saved_at) {
+            self.unsaved = true;
+        }
         self.redo.clear();
-        self.changes_since_save += 1;
-        self.revision += 1;
+        self.moved(true);
         Ok(())
     }
 
@@ -275,33 +584,36 @@ impl Workspace {
     /// reverts both (a value derived from what the command changed, such as
     /// an item's cost). On failure nothing is changed.
     pub fn amend(&mut self, edits: Vec<Edit>) -> Result<(), EditError> {
-        let Some(label) = self.undo.last().map(|c| c.label.clone()) else {
+        let Some(label) = self.undo.last().map(|(_, c)| c.label.clone()) else {
             return Err(EditError::NothingToAmend);
         };
         let inverse = self.run(&Command::new(label, edits))?;
-        let last = self.undo.last_mut().expect("checked above");
+        // (The saved step is no longer what was saved.)
+        if self.top_step() == self.saved_at {
+            self.unsaved = true;
+        }
+        let last = &mut self.undo.last_mut().expect("checked above").1;
         // Undo reverts the amendment first, then the command.
         let earlier = std::mem::replace(&mut last.edits, inverse.edits);
         last.edits.extend(earlier);
-        self.revision += 1;
+        self.moved(true);
         Ok(())
     }
 
     /// Undoes the last command; returns its label. On failure nothing is
     /// changed and the command stays to be undone.
     pub fn undo(&mut self) -> Result<Option<String>, EditError> {
-        let Some(inverse) = self.undo.pop() else { return Ok(None) };
+        let Some((step, inverse)) = self.undo.pop() else { return Ok(None) };
         let forward = match self.run(&inverse) {
             Ok(forward) => forward,
             Err(e) => {
-                self.undo.push(inverse);
+                self.undo.push((step, inverse));
                 return Err(e);
             }
         };
         let label = forward.label.clone();
-        self.redo.push(forward);
-        self.changes_since_save -= 1;
-        self.revision += 1;
+        self.redo.push((step, forward));
+        self.moved(true);
         Ok(Some(label))
     }
 
@@ -309,40 +621,45 @@ impl Workspace {
     /// redo (a draft withdrawn, such as a window's changes shown as they
     /// are made and then cancelled). Returns its label.
     pub fn withdraw(&mut self) -> Result<Option<String>, EditError> {
-        let Some(inverse) = self.undo.pop() else { return Ok(None) };
+        let Some((step, inverse)) = self.undo.pop() else { return Ok(None) };
         let label = match self.run(&inverse) {
             Ok(forward) => forward.label,
             Err(e) => {
-                self.undo.push(inverse);
+                self.undo.push((step, inverse));
                 return Err(e);
             }
         };
-        self.changes_since_save -= 1;
-        self.revision += 1;
+        // (Forgotten: Redo can't bring the saved state back.)
+        if step == self.saved_at {
+            self.unsaved = true;
+        }
+        self.moved(true);
         Ok(Some(label))
     }
 
     /// Redoes the last undone command; returns its label. On failure
     /// nothing is changed and the command stays to be redone.
     pub fn redo(&mut self) -> Result<Option<String>, EditError> {
-        let Some(forward) = self.redo.pop() else { return Ok(None) };
+        let Some((step, forward)) = self.redo.pop() else { return Ok(None) };
         let inverse = match self.run(&forward) {
             Ok(inverse) => inverse,
             Err(e) => {
-                self.redo.push(forward);
+                self.redo.push((step, forward));
                 return Err(e);
             }
         };
         let label = inverse.label.clone();
-        self.undo.push(inverse);
-        self.changes_since_save += 1;
-        self.revision += 1;
+        self.undo.push((step, inverse));
+        self.moved(true);
         Ok(Some(label))
     }
 
     /// Runs the edits in order and returns the command that reverses them.
     /// If one fails, the ones already run are reverted.
     fn run(&mut self, cmd: &Command) -> Result<Command, EditError> {
+        let saved_edited = self.edited.clone();
+        let saved_rewrites = self.rewrites.clone();
+        let saved_touching_len = self.touching.len();
         let mut inverses: Vec<Vec<Edit>> = Vec::with_capacity(cmd.edits.len());
         for e in &cmd.edits {
             match self.run_edit(e) {
@@ -351,8 +668,16 @@ impl Workspace {
                     for inv in inverses.into_iter().rev().flatten() {
                         let _ = self.run_edit(&inv);
                     }
+                    self.edited = saved_edited;
+                    self.rewrites = saved_rewrites;
+                    self.touching.truncate(saved_touching_len);
                     return Err(err);
                 }
+            }
+        }
+        for e in &cmd.edits {
+            if let Edit::SetResource { key, data: None } = e {
+                self.forget_saved_copies(|k| k != key);
             }
         }
         let edits = inverses.into_iter().rev().flatten().collect();
@@ -368,6 +693,7 @@ impl Workspace {
                 // the undo copy must include them.
                 self.write_back(key)?;
                 self.docs.remove(key);
+                self.touch(key, &GffPath::root(), "", true);
                 let old = self.module.get(key).map(<[u8]>::to_vec);
                 match data {
                     Some(d) => self.module.set(*key, d.clone()),
@@ -381,6 +707,7 @@ impl Workspace {
             Edit::SetField { key, path, label, value: None }
                 if let Some(back) = self.removed_in_place(key, path, label)? =>
             {
+                self.touch(key, path, label, false);
                 let s = self.struct_at(key, path)?;
                 let old = s.remove(label);
                 if path.0.is_empty() && matches!(old, Some(Value::List(_))) {
@@ -389,6 +716,7 @@ impl Workspace {
                 Ok(back)
             }
             Edit::SetField { key, path, label, value } => {
+                self.touch(key, path, label, false);
                 let s = self.struct_at(key, path)?;
                 let old = s.get(label).cloned();
                 let list = |v: &Option<Value>| matches!(v, Some(Value::List(_)));
@@ -418,22 +746,28 @@ impl Workspace {
                 }])
             }
             Edit::InsertItem { key, path, list, index, item } => {
+                self.touch(key, path, list, false);
                 let s = self.struct_at(key, path)?;
-                // (A list made for the item goes again with it.)
+                let invalid = |message: String| EditError::Invalid { key: *key, message };
+                // (A list made for the item goes again with it. Nothing is
+                // made before the edit is known to go through: a refused
+                // one leaves the struct as it was.)
                 let made = s.get(list).is_none();
+                let len = match s.get(list) {
+                    None => 0,
+                    Some(Value::List(items)) => items.len(),
+                    Some(_) => return Err(invalid(format!("{path}/{list} is not a list"))),
+                };
+                if *index > len {
+                    return Err(invalid(format!("{path}/{list}: no position {index}")));
+                }
                 if made {
+                    if Label::new(list).is_err() {
+                        return Err(invalid(format!("label {list:?} is too long")));
+                    }
                     s.set(list, Value::List(Vec::new()));
                 }
-                let items = s.list_mut(list).ok_or_else(|| EditError::Invalid {
-                    key: *key,
-                    message: format!("{path}/{list} is not a list"),
-                })?;
-                if *index > items.len() {
-                    return Err(EditError::Invalid {
-                        key: *key,
-                        message: format!("{path}/{list}: no position {index}"),
-                    });
-                }
+                let items = s.list_mut(list).expect("a list, or just made");
                 items.insert(*index, item.clone());
                 if path.0.is_empty() {
                     self.rewritten(key);
@@ -450,6 +784,7 @@ impl Workspace {
                 }])
             }
             Edit::RemoveItem { key, path, list, index } => {
+                self.touch(key, path, list, false);
                 let s = self.struct_at(key, path)?;
                 let items = s.list_mut(list).filter(|l| *index < l.len()).ok_or_else(|| {
                     EditError::Invalid {
@@ -492,11 +827,13 @@ impl Workspace {
         }
         let old = s.clone();
         let Some((step, parent)) = path.0.split_last() else {
-            let doc = self.doc_mut(key)?;
-            let bytes = doc
-                .to_bytes()
-                .map_err(|e| EditError::Invalid { key: *key, message: e.to_string() })?;
-            return Ok(Some(vec![Edit::SetResource { key: *key, data: Some(bytes) }]));
+            // (The resource as the module holds the document, written
+            // back as any edited one is: a file still as it was saved
+            // keeps its own bytes, so the undo gives those back and not
+            // Moonglow's layout of them.)
+            self.write_back(key)?;
+            let data = self.module.get(key).map(<[u8]>::to_vec);
+            return Ok(Some(vec![Edit::SetResource { key: *key, data }]));
         };
         let parent = GffPath(parent.to_vec());
         Ok(Some(match step {
@@ -516,10 +853,13 @@ impl Workspace {
     /// The struct at `path` of document `key`, to change: the document
     /// counts as edited ([`Workspace::flush`] writes it back).
     fn struct_at(&mut self, key: &ResKey, path: &GffPath) -> Result<&mut Struct, EditError> {
-        self.edited.insert(*key);
         let doc = self.doc_mut(key)?;
-        path.get_mut(&mut doc.root)
-            .ok_or_else(|| EditError::BadPath { key: *key, path: path.clone() })
+        if path.get(&doc.root).is_none() {
+            return Err(EditError::BadPath { key: *key, path: path.clone() });
+        }
+        self.edited.insert(*key);
+        let doc = self.docs.get_mut(key).expect("just loaded");
+        Ok(path.get_mut(&mut doc.root).expect("path validated"))
     }
 
     /// Writes the documents edited since the last flush back into the
@@ -553,17 +893,98 @@ impl Workspace {
         // tries it again.)
         let bytes =
             gff.to_bytes().map_err(|e| EditError::Invalid { key: *key, message: e.to_string() })?;
-        let holds = |data: &[u8]| data == &bytes[..] || Gff::read(data).is_ok_and(|g| g == *gff);
-        if let Some(saved) = self.saved.get(key).filter(|d| holds(d)) {
-            if self.module.get(key) != Some(saved) {
-                let saved = saved.to_vec();
-                self.module.set(*key, saved);
+        let saved = self.saved.shared(key);
+        let matches_saved = match saved {
+            Some(s) if s[..] == bytes[..] => true,
+            Some(_) => self.parsed_saved(key).is_some_and(|parsed| *parsed == *gff),
+            None => false,
+        };
+        if matches_saved {
+            let saved = saved.expect("matched above");
+            let current = self.module.shared(key);
+            if !current.is_some_and(|c| std::sync::Arc::ptr_eq(c, saved) || c[..] == saved[..]) {
+                self.module.set(*key, saved.to_vec());
             }
-        } else if !self.module.get(key).is_some_and(holds) {
-            self.module.set(*key, bytes);
+        } else {
+            match self.module.shared(key) {
+                Some(cur) if cur[..] == bytes[..] => {}
+                Some(cur) if saved.is_some_and(|s| std::sync::Arc::ptr_eq(cur, s)) => {
+                    self.module.set(*key, bytes);
+                }
+                Some(cur) if Gff::read(cur).is_ok_and(|g| g == *gff) => {}
+                _ => {
+                    self.module.set(*key, bytes);
+                }
+            }
         }
         self.edited.remove(key);
         Ok(())
+    }
+
+    fn parsed_saved(&self, key: &ResKey) -> Option<std::sync::Arc<Gff>> {
+        let saved = self.saved.shared(key)?;
+        let Ok(mut read) = self.saved_read.lock() else { return None };
+        match read.get(key) {
+            Some((was, g)) if std::sync::Arc::ptr_eq(was, saved) => Some(g.clone()),
+            _ => {
+                let g = std::sync::Arc::new(Gff::read(saved).ok()?);
+                read.insert(*key, (saved.clone(), g.clone()));
+                Some(g)
+            }
+        }
+    }
+
+    /// Whether resource `key` differs from the module as opened or last
+    /// saved ([`Workspace::saved`]): a document edited and not yet flushed
+    /// is compared by what it holds (an edit and its undo, or a field set
+    /// back by hand, leave it as saved), anything else by the module's
+    /// data. The saved copy is read once and kept until the resource is
+    /// saved again or taken out ([`Workspace::forget_saved_copies`] lets go
+    /// of others): a change then costs the comparison alone, which stops at
+    /// the first difference (the game's largest GIT, Tyrants of the
+    /// Moonsea's 1.3 MB `zhentkeepwar`, in release: 1.1 ms for a change to
+    /// its last placeable, under a microsecond for one to its root, where
+    /// writing it out and reading the saved copy each time took 3.2 ms). A
+    /// view that asks after each change asks
+    /// [`Workspace::differs_from_saved_at_once`] first, and this only once
+    /// the resource has rested.
+    pub fn differs_from_saved(&self, key: &ResKey) -> bool {
+        if let Some(differs) = self.differs_from_saved_at_once(key) {
+            return differs;
+        }
+        let Some(gff) = self.docs.get(key) else {
+            return true;
+        };
+        let Some(parsed) = self.parsed_saved(key) else {
+            return true;
+        };
+        *parsed != *gff
+    }
+
+    /// [`Workspace::differs_from_saved`] where it is told without comparing
+    /// a document with its saved copy (by the module's data, or a resource
+    /// new since the save): `None` where only that comparison tells (a
+    /// document edited and not flushed).
+    pub fn differs_from_saved_at_once(&self, key: &ResKey) -> Option<bool> {
+        if !(self.edited.contains(key) && self.docs.contains_key(key)) {
+            return Some(resource_differs(&self.saved, &self.module, key));
+        }
+        self.saved.shared(key).is_none().then_some(true)
+    }
+
+    /// Lets go of the saved copies read for [`Workspace::differs_from_saved`]
+    /// of the resources `keep` turns down (a view no longer showing them).
+    pub fn forget_saved_copies(&self, keep: impl Fn(&ResKey) -> bool) {
+        if let Ok(mut read) = self.saved_read.lock() {
+            read.retain(|k, _| keep(k));
+        }
+    }
+
+    /// How many saved copies [`Workspace::differs_from_saved`] holds (for
+    /// tests).
+    #[doc(hidden)]
+    pub fn saved_copies(&self) -> usize {
+        self.saved_read.lock().map_or(0, |r| r.len())
     }
 
     /// How many documents hold edits [`Workspace::flush`] has not yet
@@ -576,8 +997,10 @@ impl Workspace {
     pub fn save(&mut self) -> Result<(), EditError> {
         self.flush()?;
         self.module.save()?;
-        self.changes_since_save = 0;
+        self.saved_at = self.top_step();
+        self.unsaved = false;
         self.saved = resources_of(&self.module);
+        self.forget_saved_copies(|_| false);
         Ok(())
     }
 
@@ -586,8 +1009,10 @@ impl Workspace {
     pub fn save_as(&mut self, location: &mg_module::ModuleLocation) -> Result<(), EditError> {
         self.flush()?;
         self.module.save_as(location)?;
-        self.changes_since_save = 0;
+        self.saved_at = self.top_step();
+        self.unsaved = false;
         self.saved = resources_of(&self.module);
+        self.forget_saved_copies(|_| false);
         Ok(())
     }
 
@@ -616,7 +1041,7 @@ impl Workspace {
         // (They are read again from what `make` left.)
         self.docs.clear();
         self.edited.clear();
-        self.revision += 1;
+        self.moved(false);
         Ok(made)
     }
 
@@ -653,19 +1078,22 @@ impl Workspace {
         }
         let touched =
             |c: &Command| c.edits.iter().any(|e| changes.iter().any(|(k, _)| k == e.key()));
-        let dropped = self.undo.iter().chain(&self.redo).any(touched);
+        let dropped = self.undo.iter().chain(&self.redo).any(|(_, c)| touched(c));
         if dropped {
+            // (Changed stays changed, saved stays saved.)
+            self.unsaved = self.is_modified();
+            self.saved_at = 0;
             self.undo.clear();
             self.redo.clear();
         }
-        self.revision += 1;
+        self.moved(false);
         Ok(dropped)
     }
 
     /// Counts the module as changed since it was saved (recovered work
     /// that is not in its file yet).
     pub fn mark_modified(&mut self) {
-        self.changes_since_save = self.changes_since_save.max(1);
+        self.unsaved = true;
     }
 }
 
@@ -691,6 +1119,113 @@ mod tests {
         g.root.items_mut(&git::CREATURE_LIST).push(c);
         m.set_gff(key("area", ResType::GIT), &g).unwrap();
         Workspace::new(m)
+    }
+
+    /// The edits between a module and a copy that work was staged on are
+    /// those of what the copy set again, removed or added, found without
+    /// reading what the two share: 4,000 resources of 32 MB (one
+    /// allocation, shared) would be 256 GB to compare.
+    #[test]
+    fn the_edits_between_a_module_and_its_copy_read_only_what_changed() {
+        let big: std::sync::Arc<[u8]> = vec![7u8; 32 << 20].into();
+        let mut before = Module::new();
+        let name = |i: usize| key(&format!("r{i:04}"), ResType::NSS);
+        for i in 0..4000 {
+            before.set(name(i), big.clone());
+        }
+        let mut after = before.clone();
+        after.set(name(7), b"changed".to_vec());
+        // (Set again to what it was: another allocation, the same bytes.)
+        after.set(name(8), vec![7u8; 32 << 20]);
+        after.remove(&name(9));
+        after.set(name(4000), b"new".to_vec());
+        let started = std::time::Instant::now();
+        let edits = edits_between(&before, &after);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        let set =
+            |i: usize, data: &[u8]| Edit::SetResource { key: name(i), data: Some(data.into()) };
+        let gone = Edit::SetResource { key: name(9), data: None };
+        assert_eq!(edits, [set(7, b"changed"), set(4000, b"new"), gone]);
+        assert!(edits_between(&before, &before.clone()).is_empty());
+        assert!(!resource_differs(&before, &after, &name(8)));
+        assert!(resource_differs(&before, &after, &name(9)));
+        assert!(!resource_differs(&before, &after, &name(5000)));
+    }
+
+    /// What the changes since a revision touched: each command's, undo's
+    /// and redo's edits, by resource and place (a field's struct, a
+    /// list's); nothing for the revision itself; unknown (`None`) past a
+    /// change made outside the history, a failed command touching nothing,
+    /// and too far back to tell.
+    #[test]
+    fn what_changes_since_a_revision_touched() {
+        let mut ws = workspace();
+        let git = key("area", ResType::GIT);
+        let at = GffPath::root().item("Creature List", 0);
+        let tag = |v: &str| Edit::SetField {
+            key: git,
+            path: at.clone(),
+            label: "Tag".into(),
+            value: Some(Value::String(v.as_bytes().to_vec())),
+        };
+        let start = ws.revision();
+        assert_eq!(ws.touched_since(start), Some(Vec::new()));
+        let ifo_key = key("module", ResType::IFO);
+        let (git_was, ifo_was) = (ws.changed_at(&git), ws.changed_at(&ifo_key));
+        ws.apply(Command::new("tag", vec![tag("A")])).unwrap();
+        // (When each changed last: the GIT now, the IFO as it was.)
+        assert_eq!(ws.changed_at(&git), ws.revision());
+        assert_ne!(ws.changed_at(&git), git_was);
+        assert_eq!(ws.changed_at(&ifo_key), ifo_was);
+        let one = Touched { key: git, path: at.clone(), label: "Tag".into(), whole: false };
+        assert_eq!(ws.touched_since(start), Some(vec![one.clone()]));
+        let after = ws.revision();
+        ws.undo().unwrap();
+        ws.redo().unwrap();
+        assert_eq!(ws.touched_since(after), Some(vec![one.clone(), one.clone()]), "undo, redo");
+        assert_eq!(ws.touched_since(start).map(|t| t.len()), Some(3));
+        // A creature put in: the list at the root.
+        let made = Edit::InsertItem {
+            key: git,
+            path: GffPath::root(),
+            list: "Creature List".into(),
+            index: 1,
+            item: mg_gff::Struct::new(4),
+        };
+        let was = ws.revision();
+        ws.apply(Command::new("add", vec![made])).unwrap();
+        let t = ws.touched_since(was).unwrap();
+        assert_eq!((t[0].path.is_root(), t[0].label.as_str()), (true, "Creature List"));
+        // A command that fails touches nothing, and moves nothing.
+        let was = ws.revision();
+        let bad = Edit::SetField {
+            key: git,
+            path: GffPath::root().item("Creature List", 9),
+            label: "Tag".into(),
+            value: None,
+        };
+        assert!(ws.apply(Command::new("bad", vec![tag("B"), bad])).is_err());
+        assert_eq!(ws.revision(), was);
+        assert_eq!(ws.touched_since(was), Some(Vec::new()));
+        // A whole resource.
+        let ifo = key("module", ResType::IFO);
+        ws.apply(Command::new("set", vec![Edit::SetResource { key: ifo, data: None }])).unwrap();
+        assert!(ws.touched_since(was).unwrap()[0].whole);
+        // Made outside the history: not known past it, and any resource
+        // may have changed.
+        let before = ws.revision();
+        ws.derive(|_| ()).unwrap();
+        assert_eq!(ws.changed_at(&key("anything", ResType::NSS)), ws.revision());
+        assert_eq!(ws.touched_since(before), None);
+        assert_eq!(ws.touched_since(start), None);
+        assert_eq!(ws.touched_since(ws.revision()), Some(Vec::new()));
+        // Too far back.
+        let was = ws.revision();
+        for n in 0..TOUCHED_KEPT + 1 {
+            ws.apply(Command::new("tag", vec![tag(&n.to_string())])).unwrap();
+        }
+        assert_eq!(ws.touched_since(was), None);
+        assert_eq!(ws.touched_since(ws.revision() - 3).map(|t| t.len()), Some(3));
     }
 
     /// A document given to look at is read, not edited, and gives way to
@@ -754,10 +1289,60 @@ mod tests {
         ws.adopt(&[(item, None)]).unwrap();
         assert!(!ws.module.contains(&item));
         // Saved: what was saved.
-        let dir = std::env::temp_dir().join(format!("mg-edit-saved-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-edit-saved");
         ws.save_as(&mg_module::ModuleLocation::Archive(dir.join("m.mod"))).unwrap();
         assert_eq!(ws.saved().get(&ifo_key), ws.module.get(&ifo_key));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Each step of Undo has a number of its own, kept while it is undone
+    /// and redone (what a command wrote outside the module follows its
+    /// step by it), no other workspace's; one dropped from Redo by a new
+    /// command is gone.
+    #[test]
+    fn a_step_keeps_its_number_through_undo_and_redo() {
+        let mut ws = workspace();
+        let set = |n: u8| {
+            Command::new(
+                "XP scale",
+                vec![Edit::SetField {
+                    key: key("module", ResType::IFO),
+                    path: GffPath::root(),
+                    label: "Mod_XPScale".into(),
+                    value: Some(Value::Byte(n)),
+                }],
+            )
+        };
+        assert_eq!(ws.last_step(), None);
+        ws.apply(set(1)).unwrap();
+        let first = ws.last_step().unwrap();
+        ws.apply(set(2)).unwrap();
+        let second = ws.last_step().unwrap();
+        assert_ne!(first, second);
+        ws.undo().unwrap();
+        assert_eq!((ws.last_step(), ws.next_redo_step()), (Some(first), Some(second)));
+        ws.redo().unwrap();
+        assert_eq!(ws.last_step(), Some(second), "redone, it is the same step");
+        ws.undo().unwrap();
+        ws.apply(set(3)).unwrap();
+        assert!(!ws.has_step(second), "dropped from Redo by a new command");
+        assert!(ws.has_step(first));
+        let mut other = workspace();
+        other.apply(set(1)).unwrap();
+        assert!(!ws.has_step(other.last_step().unwrap()), "another workspace's steps are its own");
+        // The last commands joined into one step: one Undo takes them all
+        // back, the last taken back first.
+        assert!(ws.step_done(first) && !ws.step_done(second));
+        ws.apply(set(4)).unwrap();
+        ws.apply(set(5)).unwrap();
+        let last = ws.last_step();
+        assert!(ws.join_last(3, "All three"));
+        assert_eq!((ws.last_step(), ws.can_undo()), (last, Some("All three")));
+        ws.undo().unwrap();
+        ws.flush().unwrap();
+        let info = Gff::read(ws.module.get(&key("module", ResType::IFO)).unwrap()).unwrap();
+        assert_eq!(info.root.get("Mod_XPScale"), Some(&Value::Byte(1)), "back before the three");
+        assert!(!ws.join_last(9, "Too many"));
     }
 
     #[test]
@@ -1031,6 +1616,57 @@ mod tests {
     }
 
     #[test]
+    fn a_new_edit_after_an_undo_past_the_save_is_unsaved_work() {
+        let dir = mg_testkit::scratch_dir("mg-edit-undone");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ws = workspace();
+        let k = key("module", ResType::IFO);
+        let set = |label: &str, v: i32| {
+            Command::new(
+                label,
+                vec![Edit::SetField {
+                    key: k,
+                    path: GffPath::root(),
+                    label: label.into(),
+                    value: Some(Value::Int(v)),
+                }],
+            )
+        };
+        let place = mg_module::ModuleLocation::Archive(dir.join("m.mod"));
+        ws.apply(set("A", 1)).unwrap();
+        ws.save_as(&place).unwrap();
+        assert!(!ws.is_modified());
+        // Undo past the save, then another edit: one step back, one on,
+        // and the module is the saved one less A, with B.
+        ws.undo().unwrap();
+        assert!(ws.is_modified());
+        ws.apply(set("B", 2)).unwrap();
+        assert!(ws.is_modified(), "not the saved module");
+        ws.undo().unwrap();
+        assert!(ws.is_modified(), "the saved state is beyond Redo now");
+        // Undo and Redo around the save still come back to it.
+        ws.save_as(&place).unwrap();
+        ws.apply(set("C", 3)).unwrap();
+        ws.undo().unwrap();
+        assert!(!ws.is_modified());
+        ws.redo().unwrap();
+        ws.save_as(&place).unwrap();
+        ws.undo().unwrap();
+        ws.redo().unwrap();
+        assert!(!ws.is_modified());
+        // Recovered work stays unsaved whatever Undo takes back.
+        ws.mark_modified();
+        ws.undo().unwrap();
+        assert!(ws.is_modified());
+        // The saved step amended is no longer what was saved.
+        ws.redo().unwrap();
+        ws.save_as(&place).unwrap();
+        ws.amend(set("D", 4).edits).unwrap();
+        assert!(ws.is_modified());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_withdrawn_command_leaves_nothing_to_redo() {
         let mut ws = workspace();
         let k = key("module", ResType::IFO);
@@ -1074,12 +1710,12 @@ mod tests {
             )
         };
         let before = ws.doc(&k).unwrap().clone();
-        ws.undo.push(bad());
+        ws.undo.push((0, bad()));
         assert!(ws.undo().is_err());
         assert_eq!(ws.can_undo(), Some("Bad"));
         assert_eq!(ws.can_redo(), None);
         ws.undo.clear();
-        ws.redo.push(bad());
+        ws.redo.push((0, bad()));
         assert!(ws.redo().is_err());
         assert_eq!(ws.can_redo(), Some("Bad"));
         assert_eq!(ws.can_undo(), None);
@@ -1112,6 +1748,26 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(*ws.doc(&k).unwrap(), before);
         assert!(ws.can_undo().is_none());
+        // An item for a list the struct has not, at a place an empty list
+        // has not, or under a label no field can have: refused, and no
+        // empty list is left behind (a long label was a panic).
+        let insert = |list: &str, index| {
+            Command::new(
+                "Insert",
+                vec![Edit::insert_item(k, GffPath::root(), list, index, Struct::new(0))],
+            )
+        };
+        for (list, index) in [("No Such List", 1), ("AListNamedTooLongForGff", 0)] {
+            assert!(ws.apply(insert(list, index)).is_err(), "{list} at {index}");
+            assert_eq!(*ws.doc(&k).unwrap(), before, "{list} at {index}");
+            ws.flush().unwrap();
+            assert_eq!(Gff::read(ws.module.get(&k).unwrap()).unwrap(), before);
+        }
+        assert!(ws.can_undo().is_none());
+        // (At its start, the list is made for the item, and goes with it.)
+        ws.apply(insert("No Such List", 0)).unwrap();
+        ws.undo().unwrap();
+        assert_eq!(*ws.doc(&k).unwrap(), before);
     }
 
     #[test]
@@ -1223,6 +1879,96 @@ mod tests {
         assert_eq!(ws.module.get(&info), Some(&other[..]), "the document only read, still not");
     }
 
+    /// Whether a resource differs from the module as saved: edited (and
+    /// flushed or not), undone back, new, taken out.
+    #[test]
+    fn a_resource_differs_from_saved_until_saved_or_undone() {
+        let mut ws = workspace();
+        let k = key("area", ResType::GIT);
+        let other = key("module", ResType::IFO);
+        let set = |v: i32| {
+            Command::new(
+                "Extra",
+                vec![Edit::SetField {
+                    key: k,
+                    path: GffPath::root(),
+                    label: "Extra".into(),
+                    value: Some(Value::Int(v)),
+                }],
+            )
+        };
+        assert!(!ws.differs_from_saved(&k));
+        ws.apply(set(3)).unwrap();
+        assert!(ws.differs_from_saved(&k), "edited, not flushed");
+        assert!(!ws.differs_from_saved(&other), "only the resource edited");
+        ws.flush().unwrap();
+        assert!(ws.differs_from_saved(&k), "flushed into the module, not saved");
+        ws.undo().unwrap();
+        assert!(!ws.differs_from_saved(&k), "undone back to what is saved");
+        // A new resource, and one taken out.
+        let script = key("new_script", ResType::NSS);
+        ws.apply(Command::new(
+            "New script",
+            vec![Edit::SetResource { key: script, data: Some(b"void main(){}".to_vec()) }],
+        ))
+        .unwrap();
+        assert!(ws.differs_from_saved(&script));
+        ws.apply(Command::new("Gone", vec![Edit::SetResource { key: k, data: None }])).unwrap();
+        assert!(ws.differs_from_saved(&k), "taken out");
+    }
+
+    /// The saved copies read for the comparison are let go of as the
+    /// module is saved and as their resource is taken out, or let go of by
+    /// the view; and one read before a save is never taken for the saved
+    /// data after it, whatever its address (taken out and saved, made anew
+    /// and saved, edited and undone: as saved).
+    #[test]
+    fn the_saved_copies_go_with_a_save_or_their_resource() {
+        let dir = std::env::temp_dir().join(format!("mg-edit-saved-copies-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.mod");
+        let mut m = Module::new();
+        m.set_gff(key("area", ResType::GIT), &Gff::new(*b"GIT ")).unwrap();
+        m.save_as(&mg_module::ModuleLocation::Archive(path.clone())).unwrap();
+        let mut ws = Workspace::new(Module::open(&path).unwrap());
+        let k = key("area", ResType::GIT);
+        let set = |v: i32| {
+            Command::new(
+                "Extra",
+                vec![Edit::SetField {
+                    key: k,
+                    path: GffPath::root(),
+                    label: "Extra".into(),
+                    value: Some(Value::Int(v)),
+                }],
+            )
+        };
+        ws.apply(set(1)).unwrap();
+        assert!(ws.differs_from_saved(&k));
+        assert_eq!(ws.saved_copies(), 1, "read once");
+        ws.save().unwrap();
+        assert_eq!(ws.saved_copies(), 0, "let go of with the save");
+        ws.apply(set(2)).unwrap();
+        assert!(ws.differs_from_saved(&k));
+        ws.forget_saved_copies(|_| false);
+        assert_eq!(ws.saved_copies(), 0, "let go of by the view");
+        assert!(ws.differs_from_saved(&k));
+        // Taken out: its copy goes.
+        ws.apply(Command::new("Gone", vec![Edit::SetResource { key: k, data: None }])).unwrap();
+        assert_eq!(ws.saved_copies(), 0, "let go of with its resource");
+        // Saved without it, made anew and saved, edited and undone.
+        ws.save().unwrap();
+        let fresh = Gff::new(*b"GIT ").to_bytes().unwrap();
+        ws.apply(Command::new("New", vec![Edit::SetResource { key: k, data: Some(fresh) }]))
+            .unwrap();
+        ws.save().unwrap();
+        ws.apply(set(3)).unwrap();
+        assert!(ws.differs_from_saved(&k));
+        ws.undo().unwrap();
+        assert!(!ws.differs_from_saved(&k), "as saved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn flush_and_resource_edits() {
         let mut ws = workspace();
@@ -1321,5 +2067,187 @@ mod tests {
             .unwrap();
         ws.undo().unwrap();
         assert_eq!(ws.module.get(&one), Some(&one_bytes[..]), "a resource replaced, undone");
+    }
+
+    /// A field of the root that is not its last, removed and put back by
+    /// Undo (which puts the resource back whole, to keep the field's
+    /// place): the file's own bytes again, not Moonglow's layout of them.
+    #[test]
+    fn a_root_field_removed_and_undone_gives_the_bytes_back() {
+        let mut g = Gff::new(*b"ARE ");
+        g.root.set("VarTable", Value::List(vec![Struct::new(0)]));
+        g.root.set("Width", Value::Int(4));
+        let mut bytes = g.to_bytes().unwrap();
+        bytes.extend_from_slice(&[0; 8]);
+        let k = key("one", ResType::ARE);
+        let mut m = Module::new();
+        m.set(k, bytes.clone());
+        let mut ws = Workspace::new(m);
+        let remove = |label: &str| {
+            let (path, label) = (GffPath::root(), label.into());
+            Command::new("Remove", vec![Edit::SetField { key: k, path, label, value: None }])
+        };
+        ws.apply(remove("VarTable")).unwrap();
+        ws.flush().unwrap();
+        assert_ne!(ws.module.get(&k), Some(&bytes[..]));
+        ws.undo().unwrap();
+        ws.flush().unwrap();
+        assert_eq!(ws.module.get(&k), Some(&bytes[..]), "undone");
+        assert_eq!(*ws.doc(&k).unwrap(), g);
+        // After another edit of the document, the undo is the document
+        // as it then was.
+        ws.apply(set_extra(k, Some(Value::Int(3)))).unwrap();
+        ws.apply(remove("VarTable")).unwrap();
+        ws.undo().unwrap();
+        assert_eq!(ws.doc(&k).unwrap().root.int("Extra"), Some(3));
+        assert!(ws.doc(&k).unwrap().root.list("VarTable").is_some());
+        ws.undo().unwrap();
+        ws.flush().unwrap();
+        assert_eq!(ws.module.get(&k), Some(&bytes[..]), "both undone");
+    }
+
+    #[test]
+    fn failed_command_rollback_preserves_rewrites_edited_and_saved_copies() {
+        let dir = mg_testkit::scratch_dir("mg-edit-rollback-saved");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("m.mod");
+        let k1 = key("one", ResType::ARE);
+        let k2 = key("two", ResType::ARE);
+        let k3 = key("three", ResType::ARE);
+        let mut m = Module::new();
+        for k in [k1, k2, k3] {
+            m.set_gff(k, &Gff::new(*b"ARE ")).unwrap();
+        }
+        m.save_as(&mg_module::ModuleLocation::Archive(path.clone())).unwrap();
+        let mut ws = Workspace::new(Module::open(&path).unwrap());
+        ws.apply(Command::new(
+            "Touch k1",
+            vec![Edit::SetField {
+                key: k1,
+                path: GffPath::root(),
+                label: "Extra".into(),
+                value: Some(Value::Int(2)),
+            }],
+        ))
+        .unwrap();
+        assert!(ws.differs_from_saved(&k1));
+        assert_eq!(ws.saved_copies(), 1);
+        assert_eq!(ws.unflushed(), 1);
+        assert_eq!(ws.rewrites(&k2), 0);
+
+        let err = ws
+            .apply(Command::new(
+                "Partial fail",
+                vec![
+                    Edit::insert_item(k2, GffPath::root(), "VarTable", 0, Struct::new(0)),
+                    Edit::SetResource { key: k3, data: None },
+                    Edit::SetField {
+                        key: k2,
+                        path: GffPath::root().field("Missing"),
+                        label: "X".into(),
+                        value: Some(Value::Int(1)),
+                    },
+                ],
+            ))
+            .unwrap_err();
+        assert!(matches!(err, EditError::BadPath { .. }), "{err:?}");
+        assert_eq!(ws.rewrites(&k2), 0);
+        assert_eq!(ws.rewrites(&k3), 0);
+        assert_eq!(ws.unflushed(), 1);
+        assert_eq!(ws.saved_copies(), 1);
+        assert!(ws.module.contains(&k3));
+    }
+
+    /// What changed since the module was opened: an edit, and not once it
+    /// is undone; still after a save (the session is the workspace's, not
+    /// the save's); not a GFF set back to what it held, written out in
+    /// another layout; a new resource, one imported (a command setting it
+    /// whole), one read again from outside and one made outside the
+    /// history (a compiled script); not one taken out (`removed`). Another
+    /// workspace (the module opened again) starts with none.
+    #[test]
+    fn what_changed_since_the_module_was_opened() {
+        let mut ws = workspace();
+        let git = key("area", ResType::GIT);
+        let ifo_key = key("module", ResType::IFO);
+        let none = ChangedSinceOpened::default();
+        assert_eq!(*ws.changed_since_opened(), none);
+        let tag = |v: &str| Edit::SetField {
+            key: git,
+            path: GffPath::root().item("Creature List", 0),
+            label: "Tag".into(),
+            value: Some(Value::String(v.as_bytes().to_vec())),
+        };
+        // An edit, not flushed: told by the document.
+        ws.apply(Command::new("tag", vec![tag("A")])).unwrap();
+        assert_eq!(ws.unflushed(), 1);
+        assert_eq!(ws.changed_since_opened().changed, [git]);
+        // Undone: as opened.
+        ws.undo().unwrap();
+        assert_eq!(*ws.changed_since_opened(), none);
+        ws.redo().unwrap();
+        // Saved: still changed in the session.
+        let dir = mg_testkit::scratch_dir("mg-edit-changed-since-opened");
+        ws.save_as(&mg_module::ModuleLocation::Archive(dir.join("m.mod"))).unwrap();
+        assert!(!ws.is_modified());
+        assert_eq!(ws.changed_since_opened().changed, [git]);
+        // Undone after the save, and saved again: the GIT is written as
+        // Moonglow lays it out, but holds what it held when opened.
+        ws.undo().unwrap();
+        ws.save().unwrap();
+        assert_eq!(*ws.changed_since_opened(), none);
+        // A new resource, and one imported over another (set whole).
+        let script = key("new_script", ResType::NSS);
+        let fresh = |k: ResKey, data: &[u8]| Edit::SetResource { key: k, data: Some(data.into()) };
+        ws.apply(Command::new("new", vec![fresh(script, b"void main() {}")])).unwrap();
+        let mut info = Gff::new(*b"IFO ");
+        info.root.write(&ifo::MOD_XP_SCALE, 50);
+        let info = info.to_bytes().unwrap();
+        ws.apply(Command::new("import", vec![fresh(ifo_key, &info)])).unwrap();
+        let changed = ws.changed_since_opened();
+        assert_eq!(changed.changed, [ifo_key, script], "in the module's order");
+        // Taken out: removed, not changed; a new one taken out is neither.
+        let gone = |k: ResKey| Edit::SetResource { key: k, data: None };
+        ws.apply(Command::new("delete", vec![gone(git), gone(script)])).unwrap();
+        let changed = ws.changed_since_opened();
+        assert_eq!(changed.changed, [ifo_key]);
+        assert_eq!(changed.removed, [git]);
+        // Outside the history: a compiled script made (derive), a file read
+        // again from outside (adopt).
+        let ncs = key("compiled", ResType::NCS);
+        ws.derive(|m| m.set(ncs, b"NCS V1.0".to_vec())).unwrap();
+        let outside = key("outside", ResType::NSS);
+        ws.adopt(&[(outside, Some(b"void main() {}".to_vec().into()))]).unwrap();
+        let changed = ws.changed_since_opened();
+        assert_eq!(changed.changed, [ifo_key, ncs, outside]);
+        // The module opened again: a new session.
+        let again = Workspace::new(ws.module.clone());
+        assert_eq!(*again.changed_since_opened(), none);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A field set back by hand counts as unchanged, edited or flushed; a
+    /// resource whose bytes differ but reads as the same document does
+    /// too, and the answer is kept while nothing changes.
+    #[test]
+    fn a_field_set_back_by_hand_is_not_a_change() {
+        let mut ws = workspace();
+        let ifo_key = key("module", ResType::IFO);
+        let xp = |v: u8| Edit::SetField {
+            key: ifo_key,
+            path: GffPath::root(),
+            label: "Mod_XPScale".into(),
+            value: Some(Value::Byte(v)),
+        };
+        ws.apply(Command::new("xp", vec![xp(20)])).unwrap();
+        assert_eq!(ws.changed_since_opened().changed, [ifo_key]);
+        ws.flush().unwrap();
+        assert_eq!(ws.changed_since_opened().changed, [ifo_key]);
+        ws.apply(Command::new("xp", vec![xp(10)])).unwrap();
+        assert!(ws.changed_since_opened().changed.is_empty());
+        ws.flush().unwrap();
+        let first = ws.changed_since_opened();
+        assert!(first.changed.is_empty());
+        assert!(std::sync::Arc::ptr_eq(&first, &ws.changed_since_opened()), "kept");
     }
 }

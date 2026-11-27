@@ -12,32 +12,32 @@
 //!
 //! Needs the game and the off-screen display; run by hand, one client at a
 //! time:
-//! `DISPLAY=:2 cargo test -p mg-corpus-tests --release --test client_render batch5 -- --ignored --nocapture --test-threads 1`.
+//! `DISPLAY=$D cargo test -p mg-corpus-tests --release --test client_render batch5 -- --ignored --nocapture --test-threads 1`.
 
 use super::readings::{INVISIBLE, Reading, placeables_with};
 use super::*;
 
 /// The game's program `name` (a `.shd`), its line ends Unix's.
-fn program(game: &GameData, name: &str) -> String {
+pub(super) fn program(game: &GameData, name: &str) -> String {
     let src =
         game.resman.get_named(name, ResType::SHD).unwrap_or_else(|e| panic!("{name}.shd: {e}"));
     String::from_utf8_lossy(&src).replace("\r\n", "\n")
 }
 
 /// `src` with `find` (which must be there) replaced by `with`.
-fn patched(src: &str, find: &str, with: &str) -> String {
+pub(super) fn patched(src: &str, find: &str, with: &str) -> String {
     assert!(src.contains(find), "{find:?} not in the program");
     src.replacen(find, with, 1)
 }
 
 /// The game read with no user directory of ours.
-fn base_game() -> GameData {
+pub(super) fn base_game() -> GameData {
     let root = mg_testkit::nwn_root().expect("the game (NWN_ROOT)");
     GameData::open(&GameInstall::new(&root, None, "en")).unwrap()
 }
 
 /// The client's settings with skyboxes on.
-fn with_skybox(settings: &str) -> String {
+pub(super) fn with_skybox(settings: &str) -> String {
     let s = settings.replace(
         "[graphics.skyboxes]\n\t\tenabled = false",
         "[graphics.skyboxes]\n\t\tenabled = true",
@@ -48,7 +48,7 @@ fn with_skybox(settings: &str) -> String {
 
 /// The mean colour of `r` (fractions, top-left origin) in each picture of
 /// `dir` named in `names` (those there), printed after `what`.
-fn region_means(dir: &Path, what: &str, r: [f32; 4], names: &[&str]) -> Vec<[f32; 3]> {
+pub(super) fn region_means(dir: &Path, what: &str, r: [f32; 4], names: &[&str]) -> Vec<[f32; 3]> {
     let mut out = Vec::new();
     let mut line = format!("{what:28}");
     for name in names {
@@ -476,6 +476,94 @@ fn reading_tangents() {
     eprintln!("{}", dir.display());
 }
 
+/// A model of three standing cards 1.2 m square drawn by [`reading_tangents`]'
+/// custom pair (`renderhint NormalAndSpecMapped`), west to east: one
+/// facing south whose texture coordinates are all one point, the same
+/// turned to face south-west, and one facing south with its texture laid
+/// out (u along +x: the tangent the others are told from).
+fn flat_uv_cards(name: &str) -> String {
+    // (Corner 1 is `along` from corner 0, 2 is above it, 3 above corner 0.)
+    let card = |card: &str, x: f32, along: [f32; 2], tverts: &str| {
+        let (ax, ay) = (along[0], along[1]);
+        format!(
+            "node trimesh {card}\n  parent {name}\n  position {x} 0 0\n  orientation 0 0 0 0\n  \
+             ambient 1 1 1\n  diffuse 1 1 1\n  specular 0 0 0\n  shininess 1\n  bitmap mgtan\n  \
+             renderhint NormalAndSpecMapped\n  render 1\n  shadow 0\n  verts 4\n    0 0 0\n    \
+             {ax} {ay} 0\n    {ax} {ay} 1.2\n    0 0 1.2\n  tverts 4\n{tverts}  faces 2\n    \
+             0 1 2 1 0 1 2 0\n    0 2 3 1 0 2 3 0\nendnode\n"
+        )
+    };
+    let point = "    0.5 0.5 0\n".repeat(4);
+    let laid = "    0 0 0\n    1 0 0\n    1 1 0\n    0 1 0\n";
+    let nodes = [
+        card("flat", -2.4, [1.2, 0.0], &point),
+        card("flatsw", -0.4, [0.85, -0.85], &point),
+        card("laid", 1.4, [1.2, 0.0], laid),
+    ];
+    super::batch4::probe_model(name, &nodes)
+}
+
+/// The tangent the client gives a face flat in its texture coordinates
+/// (the review's R29: the game's compiler takes such a face's normals'
+/// mean turned (y, z, x), handedness 1, where Moonglow's made tangents
+/// left the face out and took any tangent at right angles to the normal):
+/// [`flat_uv_cards`] painted by [`reading_tangents`]' custom pair (the
+/// tangent in the world × 0.5 + 0.5; `MG_TAN_PAINT=handedness`: its
+/// handedness), the back row ASCII (`mg_tanf`, the client making the
+/// tangents at load), the front row the same compiled by nwnmdlcomp
+/// (`mg_tanfc`); Moonglow's area view beside it, Shaders on.
+///
+/// What each rule paints: the south-facing card (normal −y) the
+/// compiler's −x (0, 128, 128), Moonglow's old +z (128, 128, 255); the
+/// south-west one (normal (−0.71, −0.71, 0)) the compiler's (−0.41,
+/// 0.41, −0.82) (75, 180, 23), Moonglow's old (−0.5, 0.5, 0.71) (64,
+/// 191, 218); the laid-out card +x (255, 128, 128).
+///
+/// Seen (2026-11-10): the client takes the compiler's rule. The ASCII
+/// cards painted (0, 127, 128), (75, 180, 23) and (255, 128, 128),
+/// handedness +1 all three; Moonglow's area view beside it (128, 127,
+/// 255) and (64, 191, 218) for the two flat ones before the fix
+/// (`made_tangents` now turns the normals' mean as the compiler does).
+/// The cards compiled by nwnmdlcomp have no tangents (gray: it keeps no
+/// render hint, as `reading_tangents` saw).
+#[test]
+#[ignore]
+fn reading_tangents_flat_in_uv() {
+    let base = base_game();
+    let dir = scratch_dir("client_reading_tangents_flat_in_uv_compile");
+    let compiled = super::batch4::nwnmdlcomp(&dir, "mg_tanfc", &flat_uv_cards("mg_tanfc"));
+    let (table, first) = placeables_with(&base, &[("mg_tanf", 0), ("mg_tanfc", 0)]);
+    let overrides = [
+        ("mg_tanf.mdl", flat_uv_cards("mg_tanf").into_bytes()),
+        ("mg_tanfc.mdl", compiled),
+        ("mgtanvs.shd", TANGENT_VS.as_bytes().to_vec()),
+        ("mgtanfs.shd", tangent_fs().into_bytes()),
+        (
+            "mgtan.mtr",
+            b"texture0 mgwhite\ncustomshadervs mgtanvs\ncustomshaderfs mgtanfs\n".to_vec(),
+        ),
+        ("mgwhite.tga", super::white_tga()),
+        ("placeables.2da", table.into_bytes()),
+    ];
+    let light = Lighting { ambient: 0x606060, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
+    let mut r = Reading::new("tangents_flat_in_uv", "tic01", light, &overrides);
+    r.place(first, [20.0, 25.0, 0.0], 0.0, &[("Static", Value::Byte(0))]);
+    r.place(first + 1, [20.0, 23.0, 0.0], 0.0, &[("Static", Value::Byte(0))]);
+    let (dir, client) = r.shoot_beside(INVISIBLE, SETTINGS, &|_| {});
+    // The colors most painted on the client's picture (the cards' paint
+    // is flat: each card one color).
+    let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
+    for p in client.data.chunks(4) {
+        *counts.entry([p[0] & 0xF8, p[1] & 0xF8, p[2] & 0xF8]).or_default() += 1;
+    }
+    let mut most: Vec<_> = counts.into_iter().collect();
+    most.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (c, n) in most.iter().take(12) {
+        eprintln!("{c:?}: {n} px");
+    }
+    eprintln!("{}", dir.display());
+}
+
 /// Moonglow's side of `batch3.rs`'s `reading_light_shadows` (no client):
 /// the same dim tic01 room, the ogre at (20, 22) and the lamp posts of
 /// each case, drawn by the area view from the reference camera with the
@@ -494,18 +582,25 @@ fn reading_tangents() {
 #[test]
 #[ignore]
 fn moonglow_light_shadows() {
-    let cases: [super::batch3::LampCase; 8] = [
+    let cases: [super::batch3::LampCase; 15] = [
         ("near_1.5", &[(20.0, 23.5)], 270.0),
+        ("near_2", &[(20.0, 24.0)], 270.0),
         ("near_3", &[(20.0, 25.0)], 270.0),
+        ("near_4", &[(20.0, 26.0)], 270.0),
         ("near_5", &[(20.0, 27.0)], 270.0),
+        ("near_6", &[(20.0, 28.0)], 270.0),
         ("near_7", &[(20.0, 29.0)], 270.0),
+        ("near_8", &[(20.0, 30.0)], 270.0),
         ("near_9", &[(20.0, 31.0)], 270.0),
+        ("near_10", &[(20.0, 32.0)], 270.0),
+        ("near_11", &[(20.0, 33.0)], 270.0),
+        ("near_12", &[(20.0, 34.0)], 270.0),
         ("equal_we", &[(17.5, 22.0), (22.5, 22.0)], 270.0),
         ("equal_ns", &[(20.0, 24.5), (20.0, 19.5)], 270.0),
         ("equal_ns_east", &[(20.0, 24.5), (20.0, 19.5)], 0.0),
     ];
     let only = std::env::var("MG_CASES").ok();
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -784,7 +879,7 @@ fn sway_of(img: &Rgba) -> (Option<u32>, [f32; 2], usize) {
 /// A texture 64 square, blue, its green the texture's v (0 at the bottom,
 /// 252 at the top) and its red the u in four steps: what part of it a
 /// pixel shows.
-fn gradient_tga() -> Vec<u8> {
+pub(super) fn gradient_tga() -> Vec<u8> {
     // (Bottom row first, BGRA.)
     let mut t = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 64, 0, 32, 0];
     for y in 0..64u8 {

@@ -1,11 +1,12 @@
 //! Item lists as inventories (a store's pages, a placeable's contents):
 //! where a new item goes, and the list with its Remove buttons.
 
+use mg_uikit::Controls as _;
 use std::collections::HashMap;
 
 use egui::Ui;
 use mg_core::ResRef;
-use mg_edit::{Command, Edit, GffPath};
+use mg_edit::{Command, Edit, GffPath, lists};
 use mg_gff::{Struct, Value};
 use mg_module::palette::BlueprintKind;
 use mg_resman::ResKey;
@@ -15,7 +16,7 @@ use crate::Action;
 use crate::images::{ICON_MAX, Picture};
 
 /// An inventory is a grid this many cells wide.
-pub(super) const GRID_WIDTH: u32 = 10;
+pub(super) const GRID_WIDTH: u32 = mg_rules::levelup::INVENTORY_WIDTH as u32;
 
 /// What an item's base item says about it: its baseitems.2da `StorePanel`
 /// and its size in cells.
@@ -196,18 +197,16 @@ impl Form<'_> {
     }
 
     fn base_item_fit(&self, base: i64) -> ItemFit {
-        let table = self.app.game.as_deref().and_then(|g| g.table("baseitems").ok());
-        let cell = |col: &str| {
-            let t = table.as_ref()?;
-            t.get_int(usize::try_from(base).ok()?, col).and_then(|v| u32::try_from(v).ok())
-        };
-        ItemFit {
-            panel: cell("StorePanel"),
-            w: cell("InvSlotWidth").unwrap_or(1).clamp(1, GRID_WIDTH),
-            // (A hak's 2DA may say anything: kept within reason, so the
-            // places' sums in `place` cannot overflow.)
-            h: cell("InvSlotHeight").unwrap_or(1).clamp(1, 255),
-        }
+        let game = self.app.game.as_deref();
+        let row = usize::try_from(base).ok();
+        let panel = game.zip(row).and_then(|(g, row)| {
+            let v = g.table("baseitems").ok()?.get_int(row, "StorePanel")?;
+            u32::try_from(v).ok()
+        });
+        // (The room it takes by the one reading of it, which keeps what a
+        // hak's 2DA says within the grid: `GameData::inventory_size`.)
+        let (w, h) = game.zip(row).map_or((1, 1), |(g, row)| g.inventory_size(row));
+        ItemFit { panel, w: u32::from(w), h: u32::from(h) }
     }
 
     /// The whole item a placed object holds for blueprint `resref` (`id`:
@@ -246,8 +245,7 @@ impl Form<'_> {
             .iter()
             .map(|it| {
                 let fit = self.entry_fit(it);
-                let x = it.integer("Repos_PosX").unwrap_or(0) as u32;
-                let y = it.integer("Repos_Posy").unwrap_or(0) as u32;
+                let (x, y) = lists::placed_at(it);
                 (x, y, fit.w, fit.h)
             })
             .collect();
@@ -257,7 +255,7 @@ impl Form<'_> {
             Added::Item(item) => self.carried(item, id),
         };
         let fit = self.added_fit(added);
-        let (x, y) = place(&taken, fit.w, fit.h);
+        let (x, y) = lists::place(&taken, GRID_WIDTH, fit.w, fit.h);
         mg_module::instances::listed_item(&item, id, x as u16, y as u16)
     }
 
@@ -309,19 +307,6 @@ pub(super) enum Added {
     Item(Struct),
 }
 
-/// The first free place for a `w`×`h` item, row by row, among `taken`
-/// rectangles (x, y, w, h).
-pub(super) fn place(taken: &[(u32, u32, u32, u32)], w: u32, h: u32) -> (u32, u32) {
-    let free = |x: u32, y: u32| {
-        taken
-            .iter()
-            .all(|&(tx, ty, tw, th)| x + w <= tx || tx + tw <= x || y + h <= ty || ty + th <= y)
-    };
-    (0..)
-        .find_map(|y| (0..=GRID_WIDTH - w).find(|&x| free(x, y)).map(|x| (x, y)))
-        .expect("an empty row fits any item")
-}
-
 /// Whether a creature's item has its flag (`Dropable`, `Pickpocketable`)
 /// set: a byte, 0 (or left out, as the engine reads it) when not.
 pub(super) fn flag_on(item: &Struct, flag: &str) -> bool {
@@ -363,6 +348,49 @@ pub(super) fn flag_edit(
     Some(Edit::SetField { key, path, label: flag.into(), value })
 }
 
+/// One of an object's items that a drag, Copy or Cut carries: the list
+/// it is in (`ItemList`, or a creature's `Equip_ItemList`), its place
+/// there, and the item itself, as it is.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Carried {
+    pub list: &'static str,
+    pub index: usize,
+    pub item: Struct,
+}
+
+impl Carried {
+    /// Its place among an object's items: a creature's slots first (in
+    /// their order), then its list.
+    fn order(&self) -> (bool, usize) {
+        (self.list != "Equip_ItemList", self.index)
+    }
+}
+
+/// What a row's drag, Copy or Cut carries (`row`): the items `selected`
+/// (every list's of the object) where the row is one of them, in their
+/// order; else the row alone.
+pub(super) fn carried_with(row: Carried, selected: &[Carried]) -> Vec<Carried> {
+    let is_row = |c: &Carried| (c.list, c.index) == (row.list, row.index);
+    if !selected.iter().any(is_row) {
+        return vec![row];
+    }
+    let mut all = selected.to_vec();
+    all.sort_by_key(Carried::order);
+    all
+}
+
+/// The edits that take `carried` (each with the item it takes) out of the
+/// object at `source`: within a list from the last place to the first, so
+/// that each place is still the item's as its edit runs.
+pub(super) fn removals(source: &(ResKey, GffPath), carried: &[Carried]) -> Vec<(Edit, Struct)> {
+    let mut sorted: Vec<&Carried> = carried.iter().collect();
+    sorted.sort_by_key(|c| (c.list, std::cmp::Reverse(c.index)));
+    let (key, path) = source;
+    let take =
+        |c: &&Carried| (Edit::remove_item(*key, path.clone(), c.list, c.index), c.item.clone());
+    sorted.iter().map(take).collect()
+}
+
 /// An item dragged in an inventory page: from the item palette, from a
 /// list of items (a backpack, a container, a store's page), or from a
 /// creature's equipment. `owner` tells whose list it is from (a drop on
@@ -371,13 +399,15 @@ pub(super) fn flag_edit(
 pub(crate) enum Dragged {
     Palette(ResRef),
     /// `source`: the document and the object in it whose `ItemList` it is;
-    /// `item`: the item itself, as it is there.
+    /// `item`: the item itself, as it is there; `more`: the other items
+    /// of the object selected with it, carried along.
     Listed {
         owner: egui::Id,
         source: (ResKey, GffPath),
         index: usize,
         resref: ResRef,
         item: Struct,
+        more: Vec<Carried>,
     },
     /// `source`: the creature whose `Equip_ItemList` it is.
     Equipped {
@@ -386,20 +416,139 @@ pub(crate) enum Dragged {
         index: usize,
         resref: ResRef,
         item: Struct,
+        more: Vec<Carried>,
     },
 }
 
 impl Dragged {
-    /// The edit that takes a dragged item out of where it came from (a
-    /// move to another object's inventory).
-    pub(super) fn removal(&self) -> Option<Edit> {
-        let (list, (key, path), index) = match self {
-            Dragged::Palette(_) => return None,
-            Dragged::Listed { source, index, .. } => ("ItemList", source, *index),
-            Dragged::Equipped { source, index, .. } => ("Equip_ItemList", source, *index),
-        };
-        Some(Edit::remove_item(*key, path.clone(), list, index))
+    /// How many items it carries.
+    pub(super) fn count(&self) -> usize {
+        match self {
+            Dragged::Palette(_) => 1,
+            Dragged::Listed { more, .. } | Dragged::Equipped { more, .. } => 1 + more.len(),
+        }
     }
+
+    /// Whose items it carries (none: the palette's).
+    pub(super) fn owner(&self) -> Option<egui::Id> {
+        match self {
+            Dragged::Palette(_) => None,
+            Dragged::Listed { owner, .. } | Dragged::Equipped { owner, .. } => Some(*owner),
+        }
+    }
+
+    /// The item the drag began on: its list and its place there.
+    pub(super) fn lead(&self) -> Option<(&'static str, usize)> {
+        match self {
+            Dragged::Palette(_) => None,
+            Dragged::Listed { index, .. } => Some(("ItemList", *index)),
+            Dragged::Equipped { index, .. } => Some(("Equip_ItemList", *index)),
+        }
+    }
+
+    /// The items it carries, in their order (a creature's slots', then its
+    /// list's); the one the drag began on among them. None: the palette's.
+    pub(super) fn carried(&self) -> Vec<Carried> {
+        let (list, index, item, more) = match self {
+            Dragged::Palette(_) => return Vec::new(),
+            Dragged::Listed { index, item, more, .. } => ("ItemList", index, item, more),
+            Dragged::Equipped { index, item, more, .. } => ("Equip_ItemList", index, item, more),
+        };
+        let mut all = more.clone();
+        all.push(Carried { list, index: *index, item: item.clone() });
+        all.sort_by_key(Carried::order);
+        all
+    }
+
+    /// The edits that take the dragged items out of where they came from
+    /// (a move to another object's inventory), each with the item it
+    /// takes.
+    pub(super) fn removals(&self) -> Vec<(Edit, Struct)> {
+        match self {
+            Dragged::Palette(_) => Vec::new(),
+            Dragged::Listed { source, .. } | Dragged::Equipped { source, .. } => {
+                removals(source, &self.carried())
+            }
+        }
+    }
+}
+
+/// While several items are dragged, how many, beside the pointer (once a
+/// frame, whichever inventory asks first). It takes no pointer: a drop
+/// lands under it.
+pub(super) fn show_count(ctx: &egui::Context) {
+    let Some(dragged) = egui::DragAndDrop::payload::<Dragged>(ctx) else { return };
+    let n = dragged.count();
+    let Some(at) = ctx.pointer_latest_pos().filter(|_| n > 1) else { return };
+    let id = egui::Id::new("inventory-carried-count");
+    let pass = ctx.cumulative_pass_nr();
+    if ctx.data(|d| d.get_temp::<u64>(id)) == Some(pass) {
+        return;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, pass));
+    egui::Area::new(id)
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .fixed_pos(at + egui::vec2(16.0, 16.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(format!("{n} items")));
+        });
+}
+
+/// The name of the step that adds `n` items to an inventory: `one` for a
+/// single item (each inventory's own), or one that says how many and how
+/// (`moved` from another place, `pasted`).
+pub(super) fn adding_name(one: &str, n: usize, moved: bool, pasted: bool) -> String {
+    match (n > 1, moved, pasted) {
+        (false, true, _) => "Move item".into(),
+        (false, ..) => one.into(),
+        (true, true, _) => format!("Move {n} items"),
+        (true, false, true) => format!("Paste {n} items"),
+        (true, false, false) => format!("Add {n} items"),
+    }
+}
+
+/// The rows selected in an item list that keeps its own selection (a
+/// placeable's, a store's page): Ctrl and Shift select several. Let go
+/// when the list's length changes (its places then mean other items).
+#[derive(Clone, Default)]
+struct Rows {
+    rows: std::collections::BTreeSet<usize>,
+    anchor: Option<usize>,
+    len: usize,
+}
+
+/// The rows selected in the list kept at `id`, which has `len` items now.
+pub(super) fn selected_rows(ui: &Ui, id: egui::Id, len: usize) -> Vec<usize> {
+    let rows: Option<Rows> = ui.data(|d| d.get_temp(id));
+    match rows {
+        Some(r) if r.len == len => r.rows.into_iter().collect(),
+        // (Let go for good: the list back at its old length later holds
+        // other items at those places.)
+        Some(_) => {
+            ui.data_mut(|d| d.remove::<Rows>(id));
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// What the list kept at `id` (`len` items) does with its rows: `clicked`
+/// selected (alone; with Ctrl, added or taken away; with Shift, the rows
+/// from the one clicked last); all let go once some were `moved`.
+pub(super) fn select_rows(ui: &Ui, id: egui::Id, len: usize, clicked: Option<usize>, moved: bool) {
+    if moved {
+        ui.data_mut(|d| d.remove::<Rows>(id));
+        return;
+    }
+    let Some(row) = clicked else { return };
+    let mut r: Rows =
+        ui.data(|d| d.get_temp(id)).filter(|r: &Rows| r.len == len).unwrap_or_default();
+    r.len = len;
+    let listed: Vec<usize> = (0..len).collect();
+    let m = ui.input(|i| i.modifiers);
+    crate::widgets::select_in_list(&mut r.rows, &mut r.anchor, &listed, row, m.command, m.shift);
+    ui.data_mut(|d| d.insert_temp(id, r));
 }
 
 /// Whose items a page's are: the document and the object in it.
@@ -417,7 +566,7 @@ pub(super) fn dropped_on(ui: &Ui, rect: egui::Rect) -> Option<Dragged> {
     if !over {
         return None;
     }
-    let stroke = egui::Stroke::new(1.5, ui.visuals().selection.stroke.color);
+    let stroke = egui::Stroke::new(1.5, mg_uikit::tokens(ui.ctx()).accent);
     ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
     if ui.input(|i| i.pointer.any_released()) {
         egui::DragAndDrop::clear_payload(ui.ctx());
@@ -431,7 +580,6 @@ pub(super) fn dropped_on(ui: &Ui, rect: egui::Rect) -> Option<Dragged> {
 pub(super) enum Ask {
     Equip,
     Open,
-    Copy,
     Find,
 }
 
@@ -442,9 +590,13 @@ pub(super) struct ListOut {
     pub clicked: Option<usize>,
     pub dropped: Option<Dragged>,
     pub asked: Option<(usize, Ask)>,
-    /// A row dragged to another place in the list: the edits that move it,
-    /// to make together.
+    /// Rows dragged to another place in the list: the edits that move
+    /// them, to make together.
     pub moved: Vec<Edit>,
+    /// What Copy (a row's menu, Ctrl+C over the list) and Cut (a row's
+    /// menu, Ctrl+X) were asked for: the rows selected, or the one row.
+    pub copy: Vec<Carried>,
+    pub cut: Vec<Carried>,
     /// Paste was asked for (the header's button, a row's menu, Ctrl+V over
     /// the list).
     pub paste: bool,
@@ -461,26 +613,33 @@ pub(super) struct ItemLook<'a> {
     pub row: &'a mut dyn FnMut(usize, &Struct) -> Row,
     /// A store's Infinite column.
     pub infinite: bool,
-    /// The selected items (a creature's, for their options).
+    /// The selected items: a drag, Copy or Cut of one of them carries
+    /// them all.
     pub selected: &'a [usize],
+    /// The object's items selected in its other lists (a creature's
+    /// equipment), carried along with the list's.
+    pub also: &'a [Carried],
     /// Its items can be equipped (a creature's backpack): the rows' menu
     /// offers it.
     pub equip: bool,
     /// How many items are copied, to paste (0: none).
     pub copied: usize,
-    /// The item blueprints in the palettes, by resref: a row whose
-    /// blueprint is one offers Find in Palette.
+    /// The item blueprints in the palettes, keyed by resref. A row offers
+    /// Find in Palette only if its blueprint is listed here.
     pub palette: &'a HashMap<ResRef, String>,
 }
 
-/// An item's Find in Palette, in a right-click menu: on where its
-/// blueprint is in the palettes (`found`). Whether it was clicked.
+/// Find in Palette's tip.
+const FIND_IN_PALETTE_TIP: &str = "Choose the item's blueprint in the item palette";
+
+/// Adds Find in Palette to an item's right-click menu. The button is
+/// enabled only if the item's blueprint is in a palette (`found`).
+/// Returns whether it was clicked.
 pub(super) fn find_in_palette_button(ui: &mut Ui, found: bool) -> bool {
     ui.add_enabled(found, egui::Button::new("Find in Palette"))
-        .on_hover_text("Choose the item's blueprint in the palette on the left")
+        .on_hover_text(FIND_IN_PALETTE_TIP)
         .on_disabled_hover_text(
-            "The item's blueprint is in neither palette (a blueprint removed, or one from a hak \
-             the module does not use)",
+            "The item's blueprint is in neither palette. It may be gone, or in an unused hak.",
         )
         .clicked()
 }
@@ -498,7 +657,18 @@ pub(super) fn item_list(
     items: &[Struct],
     look: ItemLook<'_>,
 ) -> ListOut {
-    let ItemLook { row: make, infinite, selected, equip, copied, palette } = look;
+    let ItemLook { row: make, infinite, selected, also, equip, copied, palette } = look;
+    show_count(ui.ctx());
+    // Every item of the object selected, as a drag, Copy or Cut carries
+    // them.
+    let mut chosen: Vec<Carried> = also.to_vec();
+    let listed = |&i: &usize| {
+        let item = items.get(i)?.clone();
+        Some(Carried { list: "ItemList", index: i, item })
+    };
+    chosen.extend(selected.iter().filter_map(listed));
+    let carry = |i: usize| carried_with(listed(&i).expect("a row"), &chosen);
+    let (mut copy, mut cut) = (Vec::new(), Vec::new());
     let mut clicked = None;
     let mut asked = None;
     let (mut paste, mut moved) = (false, Vec::new());
@@ -536,17 +706,38 @@ pub(super) fn item_list(
             ui.allocate_ui_with_layout(cell, centered, |ui| ui.strong("Infinite"));
         });
     }
-    // The list fills what is left of the page's visible height.
-    let height = (ui.clip_rect().bottom() - ui.cursor().top()).max(200.0);
+    // The list fills what is left of the page's visible height (or a fixed
+    // cap inside the Properties panel's all-pages scroll so it never depends
+    // on scroll position).
+    let height = if super::panel_scroll(ui) {
+        240.0
+    } else {
+        (ui.clip_rect().bottom() - ui.cursor().top()).max(200.0)
+    };
     // Each row's height as it was last drawn (0: not yet), for the rows
     // out of sight, which take their room only; one never drawn takes
     // the middle height of those that were.
+    #[derive(Clone)]
+    struct ItemHeights {
+        heights: Vec<f32>,
+        guess: f32,
+    }
     let heights_id = egui::Id::new(("item-heights", key, path.to_string()));
-    let mut heights: Vec<f32> = ui.data(|d| d.get_temp(heights_id)).unwrap_or_default();
-    heights.resize(items.len(), 0.0);
-    let mut drawn: Vec<f32> = heights.iter().copied().filter(|h| *h > 0.0).collect();
-    drawn.sort_by(f32::total_cmp);
-    let guess = drawn.get(drawn.len() / 2).copied().unwrap_or(ICON_MAX.y / 2.0 + 4.0);
+    let mut stored =
+        ui.data(|d| d.get_temp::<std::sync::Arc<ItemHeights>>(heights_id)).unwrap_or_else(|| {
+            std::sync::Arc::new(ItemHeights { heights: Vec::new(), guess: ICON_MAX.y / 2.0 + 4.0 })
+        });
+    let mut modified = stored.heights.len() != items.len();
+    if modified {
+        let mut next = stored.heights.clone();
+        next.resize(items.len(), 0.0);
+        let mut drawn: Vec<f32> = next.iter().copied().filter(|h| *h > 0.0).collect();
+        drawn.sort_by(f32::total_cmp);
+        let guess = drawn.get(drawn.len() / 2).copied().unwrap_or(ICON_MAX.y / 2.0 + 4.0);
+        stored = std::sync::Arc::new(ItemHeights { heights: next, guess });
+    }
+    let guess = stored.guess;
+    let mut updated: Vec<(usize, f32)> = Vec::new();
     let list = egui::ScrollArea::vertical()
         .id_salt(("items", key, path.to_string()))
         .max_height(height)
@@ -555,13 +746,35 @@ pub(super) fn item_list(
         .show(ui, |ui| {
             // (Room to drop on, in an empty list too.)
             ui.set_min_height(48.0);
+            // (Rows that meet: each as tall as its icon, at least a row.)
+            mg_uikit::list_rows(ui);
+            let width = ui.available_width() - gutter;
+            let clip_top = ui.clip_rect().top();
+            let clip_bottom = ui.clip_rect().bottom();
+            let spacing_y = ui.spacing().item_spacing.y;
+            let x_vis = ui
+                .clip_rect()
+                .x_range()
+                .intersects(egui::Rangef::new(ui.cursor().min.x, ui.cursor().min.x + width));
+            let mut y = ui.cursor().top();
+            let mut skipped_h = 0.0f32;
+            let mut skipped_n = 0usize;
             for (i, it) in items.iter().enumerate() {
-                let width = ui.available_width() - gutter;
-                let known = if heights[i] > 0.0 { heights[i] } else { guess };
-                let room = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, known));
-                if !ui.is_rect_visible(room) {
-                    ui.allocate_space(egui::vec2(width, known));
+                let known = if stored.heights[i] > 0.0 { stored.heights[i] } else { guess };
+                let visible = x_vis && y + known >= clip_top && y <= clip_bottom;
+                if !visible {
+                    skipped_h += known;
+                    skipped_n += 1;
+                    y += known + spacing_y;
                     continue;
+                }
+                if skipped_n > 0 {
+                    ui.allocate_space(egui::vec2(
+                        width,
+                        skipped_h + (skipped_n - 1) as f32 * spacing_y,
+                    ));
+                    skipped_h = 0.0;
+                    skipped_n = 0;
                 }
                 let resref = entry_resref(it);
                 let (layers, n) = make(i, it);
@@ -570,21 +783,24 @@ pub(super) fn item_list(
                 // and potions compact.
                 let height = crate::images::icon_size(layers, ICON_MAX).y + 4.0;
                 let row = egui::vec2(width, height.max(ui.spacing().interact_size.y));
-                heights[i] = row.y;
+                if (stored.heights[i] - row.y).abs() > f32::EPSILON {
+                    updated.push((i, row.y));
+                }
                 let (rect, _) = ui.allocate_exact_size(row, egui::Sense::hover());
+                y = ui.cursor().top();
                 if ui.rect_contains_pointer(rect) {
                     hovered = Some(i);
-                    // One of the list's own rows let go here takes this
-                    // place (a line shows where).
-                    if let Some(Dragged::Listed { owner, index, .. }) =
-                        egui::DragAndDrop::payload::<Dragged>(ui.ctx()).as_deref()
-                        && *owner == whose
-                        && *index != i
+                    // The list's own rows let go here take this place (a
+                    // line shows where), the one dragged and those
+                    // selected with it, in their order.
+                    if let Some(d) = egui::DragAndDrop::payload::<Dragged>(ui.ctx())
+                        && let Some(rows) = own_rows(&d, whose)
+                        && !rows.contains(&i)
                     {
-                        let line = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+                        let line = egui::Stroke::new(2.0, mg_uikit::tokens(ui.ctx()).accent);
                         ui.painter().hline(rect.x_range(), rect.top(), line);
                         if ui.input(|i| i.pointer.any_released()) {
-                            reorder = Some((*index, i));
+                            reorder = Some((rows, i));
                         }
                     }
                 }
@@ -597,7 +813,7 @@ pub(super) fn item_list(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Remove").clicked() {
                         edits.push((
-                            "Remove item",
+                            "Remove Item",
                             Edit::remove_item(key, path.clone(), "ItemList", i),
                         ));
                     }
@@ -607,7 +823,7 @@ pub(super) fn item_list(
                             egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
                         ui.allocate_ui_with_layout(cell, centered, |ui| {
                             let mut on = it.integer("Infinite").unwrap_or(0) != 0;
-                            if ui.checkbox(&mut on, "").on_hover_text("Infinite").changed() {
+                            if ui.check_box(&mut on, "").on_hover_text("Infinite").changed() {
                                 edits.push((
                                     "Infinite store item",
                                     Edit::SetField {
@@ -635,21 +851,28 @@ pub(super) fn item_list(
                     // Dragged: onto a slot to equip it, or out of a slot's
                     // list into another.
                     if r.drag_started() {
+                        let mut more = carry(i);
+                        more.retain(|c| (c.list, c.index) != ("ItemList", i));
                         r.dnd_set_drag_payload(Dragged::Listed {
                             owner: whose,
                             source: (key, path.clone()),
                             index: i,
                             resref,
                             item: it.clone(),
+                            more,
                         });
                     }
-                    r.context_menu(|ui| {
+                    mg_uikit::context_menu(&r, |ui| {
                         if equip && ui.button("Equip").clicked() {
                             asked = Some((i, Ask::Equip));
                             ui.close();
                         }
+                        if ui.button("Cut").clicked() {
+                            cut = carry(i);
+                            ui.close();
+                        }
                         if ui.button("Copy").clicked() {
-                            asked = Some((i, Ask::Copy));
+                            copy = carry(i);
                             ui.close();
                         }
                         if ui.add_enabled(copied > 0, egui::Button::new("Paste")).clicked() {
@@ -658,7 +881,7 @@ pub(super) fn item_list(
                         }
                         if ui.button("Remove").clicked() {
                             edits.push((
-                                "Remove item",
+                                "Remove Item",
                                 Edit::remove_item(key, path.clone(), "ItemList", i),
                             ));
                             ui.close();
@@ -668,13 +891,12 @@ pub(super) fn item_list(
                             ui.close();
                         }
                         // Properties last, as in Aurora's menus.
-                        ui.separator();
+                        mg_uikit::menu_separator(ui);
                         if ui
                             .button("Properties")
                             .on_hover_text(
-                                "The item's properties: a placed object's item is its own; a \
-                                 blueprint's is its blueprint (the module's to edit, the \
-                                 game's to look at)",
+                                "Open the item's properties (a blueprint's item opens its \
+                                 blueprint)",
                             )
                             .clicked()
                         {
@@ -684,38 +906,76 @@ pub(super) fn item_list(
                     });
                 });
             }
+            if skipped_n > 0 {
+                ui.allocate_space(egui::vec2(
+                    width,
+                    skipped_h + (skipped_n - 1) as f32 * spacing_y,
+                ));
+            }
         });
-    ui.data_mut(|d| d.insert_temp(heights_id, heights));
-    // A row moved within the list: out of its place and in before the row
-    // it was let go on.
+    if !updated.is_empty() {
+        modified = true;
+        let inner = std::sync::Arc::make_mut(&mut stored);
+        for (i, h) in updated {
+            inner.heights[i] = h;
+        }
+        let mut drawn: Vec<f32> = inner.heights.iter().copied().filter(|h| *h > 0.0).collect();
+        drawn.sort_by(f32::total_cmp);
+        inner.guess = drawn.get(drawn.len() / 2).copied().unwrap_or(ICON_MAX.y / 2.0 + 4.0);
+    }
+    if modified {
+        ui.data_mut(|d| d.insert_temp(heights_id, stored));
+    }
+    // Rows moved within the list: out of their places and in, in their
+    // order, before the row they were let go on.
     if let Some((from, to)) = reorder
-        && let Some(item) = items.get(from)
+        && from.iter().all(|&i| i < items.len())
     {
         egui::DragAndDrop::clear_payload(ui.ctx());
-        let at = if from < to { to - 1 } else { to };
-        moved = vec![
-            Edit::remove_item(key, path.clone(), "ItemList", from),
-            Edit::insert_item(key, path.clone(), "ItemList", at, item.clone()),
-        ];
+        let at = to - from.iter().filter(|&&i| i < to).count();
+        let source = (key, path.clone());
+        let rows: Vec<Carried> = from.iter().filter_map(listed).collect();
+        moved = removals(&source, &rows).into_iter().map(|(e, _)| e).collect();
+        for (k, c) in rows.into_iter().enumerate() {
+            moved.push(Edit::insert_item(key, path.clone(), "ItemList", at + k, c.item));
+        }
     }
-    // Ctrl+C on the row under the pointer (else the one selected), Ctrl+V
+    // Ctrl+C and Ctrl+X on the row under the pointer (with those selected
+    // where it is one of them; with none under it, those selected), Ctrl+V
     // over the list: while nothing is typed in.
     let over = ui.rect_contains_pointer(list.inner_rect);
     if over && ui.ctx().memory(|m| m.focused().is_none()) {
         let event = |f: fn(&egui::Event) -> bool| ui.input(|i| i.events.iter().any(f));
-        if event(|e| matches!(e, egui::Event::Copy))
-            && let Some(i) = hovered.or(selected.first().copied())
-        {
-            asked = Some((i, Ask::Copy));
+        let under = || match hovered {
+            Some(i) => carry(i),
+            None => {
+                let mut all = chosen.clone();
+                all.sort_by_key(Carried::order);
+                all
+            }
+        };
+        if event(|e| matches!(e, egui::Event::Copy)) {
+            copy = under();
+        }
+        if event(|e| matches!(e, egui::Event::Cut)) {
+            cut = under();
         }
         if copied > 0 && event(|e| matches!(e, egui::Event::Paste(_))) {
             paste = true;
         }
     }
-    // An item let go over the list (not one of its own).
-    let dropped = dropped_on(ui, list.inner_rect)
-        .filter(|d| !matches!(d, Dragged::Listed { owner, .. } if *owner == whose));
-    ListOut { edits, clicked, dropped, asked, moved, paste }
+    // An item let go over the list (not of its own rows alone).
+    let dropped = dropped_on(ui, list.inner_rect).filter(|d| own_rows(d, whose).is_none());
+    ListOut { edits, clicked, dropped, asked, moved, paste, copy, cut }
+}
+
+/// The rows of the list `whose` that `dragged` carries, in their order,
+/// where it carries that list's rows alone (a move within the list).
+fn own_rows(dragged: &Dragged, whose: egui::Id) -> Option<Vec<usize>> {
+    let Dragged::Listed { owner, .. } = dragged else { return None };
+    let carried = dragged.carried();
+    let rows = carried.iter().all(|c| c.list == "ItemList");
+    (*owner == whose && rows).then(|| carried.iter().map(|c| c.index).collect())
 }
 
 /// Where an item added to an inventory goes ([`Form::add_items`]): the
@@ -746,14 +1006,14 @@ impl Form<'_> {
         &mut self,
         base: &GffPath,
         items: &[Struct],
-        adds: Vec<Added>,
-        taken: Vec<Edit>,
+        incoming: Incoming,
         edits: Vec<(&'static str, Edit)>,
     ) {
-        let what = if taken.is_empty() { "Add item" } else { "Move item" };
+        let Incoming { adds, taken, pasted } = incoming;
+        let what = adding_name("Add item", adds.len(), !taken.is_empty(), pasted);
         let here =
             |_: &mut Self, _: &Added| Bin { path: base.clone(), items: items.to_vec(), page: None };
-        self.add_items(what, &adds, taken, here, |_| {});
+        self.add_items(&what, &adds, taken, here, |_| {});
         for (what, edit) in edits {
             self.app.actions.push(Action::Apply(Command::new(what, vec![edit])));
         }
@@ -814,12 +1074,12 @@ impl Form<'_> {
         self.app.actions.push(Action::Apply(Command::new(what, together)));
     }
 
-    /// Copy, Find in Palette and Properties from a row's menu, a row moved within the
-    /// list, and what there is to add to it: the items pasted, one dragged
-    /// from the palette, one dragged from another object's inventory
-    /// (moved out of it, unless Ctrl is held: then a copy; either way the
-    /// item as it is there). What to add, and the edits that take the
-    /// moved ones from where they were.
+    /// Copy, Cut, Find in Palette and Properties from a row's menu, rows
+    /// moved within the list, and what there is to add to it: the items
+    /// pasted, one dragged from the palette, those dragged from another
+    /// object's inventory (moved out of it, unless Ctrl is held: then
+    /// copies; either way each item as it is there). What to add, and the
+    /// edits that take the moved ones from where they were.
     pub(super) fn list_events(
         &mut self,
         ui: &Ui,
@@ -827,17 +1087,19 @@ impl Form<'_> {
         out: &mut ListOut,
         whose: egui::Id,
         at: &GffPath,
-    ) -> (Vec<Added>, Vec<Edit>) {
+    ) -> Incoming {
         let (mut adds, mut removals) = (Vec::new(), Vec::new());
+        if !out.copy.is_empty() {
+            let _ = self.copy_items(ui, &out.copy);
+        }
+        if !out.cut.is_empty() {
+            let cut = std::mem::take(&mut out.cut);
+            self.cut_items(ui, &(self.key, at.clone()), &cut);
+        }
         match out.asked {
             Some((i, Ask::Open)) => {
                 if let Some(entry) = items.get(i) {
                     self.item_properties(at, "ItemList", i, entry);
-                }
-            }
-            Some((i, Ask::Copy)) => {
-                if let Some(item) = items.get(i).filter(|e| !entry_resref(e).is_empty()) {
-                    self.copy_item(ui, item);
                 }
             }
             Some((i, Ask::Find)) => {
@@ -849,50 +1111,92 @@ impl Form<'_> {
         }
         if !out.moved.is_empty() {
             let moved = std::mem::take(&mut out.moved);
-            self.app.actions.push(Action::Apply(Command::new("Move item", moved)));
+            let n = moved.len() / 2;
+            let what = if n > 1 { format!("Move {n} items") } else { "Move item".into() };
+            self.app.actions.push(Action::Apply(Command::new(what, moved)));
         }
         if out.paste {
             adds.extend(self.app.item_clip.iter().cloned().map(Added::Item));
         }
         match &out.dropped {
             Some(Dragged::Palette(r)) => adds.push(Added::Blueprint(*r)),
-            Some(
-                d @ (Dragged::Listed { owner, item, .. } | Dragged::Equipped { owner, item, .. }),
-            ) if *owner != whose => {
-                adds.push(Added::Item(item.clone()));
-                removals.extend(self.taking(ui, d));
+            Some(d) if d.owner() != Some(whose) => {
+                adds.extend(d.carried().into_iter().map(|c| Added::Item(c.item)));
+                removals.extend(self.taking(ui, d).into_iter().map(|(e, _)| e));
             }
             _ => {}
         }
-        (adds, removals)
+        Incoming { adds, taken: removals, pasted: out.paste }
     }
 
-    /// The edit that takes an item dropped here from where it was dragged
-    /// from: none with Ctrl held (a copy), nor from the game's blueprint
-    /// shown to look at (which nothing changes: a copy too).
-    pub(super) fn taking(&self, ui: &Ui, dragged: &Dragged) -> Vec<Edit> {
+    /// The edits that take the items dropped here from where they were
+    /// dragged from, each with the item it takes: none with Ctrl held
+    /// (copies), nor from the game's blueprint shown to look at (which
+    /// nothing changes: copies too).
+    pub(super) fn taking(&self, ui: &Ui, dragged: &Dragged) -> Vec<(Edit, Struct)> {
         if ui.input(|i| i.modifiers.command) {
             return Vec::new();
         }
         let viewed = |e: &Edit| self.app.ws.as_ref().is_some_and(|ws| ws.is_viewed(e.key()));
-        dragged.removal().into_iter().filter(|e| !viewed(e)).collect()
+        dragged.removals().into_iter().filter(|(e, _)| !viewed(e)).collect()
     }
 
-    /// Copies an item as this inventory holds it, to paste into an
-    /// inventory: pasted, it is carried as a drag carries it ([`carried`]:
-    /// as it is into a placed object from one, made from its blueprint
-    /// between a placed object and a blueprint).
+    /// Copies items as this inventory holds them, in their order, to paste
+    /// into an inventory: pasted, each is carried as a drag carries it
+    /// ([`carried`]: as it is into a placed object from one, made from its
+    /// blueprint between a placed object and a blueprint). An entry that
+    /// names no blueprint is left out.
     ///
     /// [`carried`]: Self::carried
-    pub(super) fn copy_item(&mut self, ui: &Ui, item: &Struct) {
-        self.app.item_clip = vec![item.clone()];
-        crate::widgets::mark_clipboard(ui.ctx(), "1 item");
+    /// Returns those copied.
+    pub(super) fn copy_items(&mut self, ui: &Ui, items: &[Carried]) -> Vec<Carried> {
+        let named = items.iter().filter(|c| !entry_resref(&c.item).is_empty());
+        let copied: Vec<Carried> = named.cloned().collect();
+        if copied.is_empty() {
+            return copied;
+        }
+        let n = copied.len();
+        self.app.item_clip = copied.iter().map(|c| c.item.clone()).collect();
+        let what = if n == 1 { "1 item".to_string() } else { format!("{n} items") };
+        crate::widgets::mark_clipboard(ui.ctx(), &what);
+        copied
     }
+
+    /// Cut: `items` of the object at `source` copied ([`Form::copy_items`])
+    /// and taken out of it, all in one step; one not copied stays.
+    pub(super) fn cut_items(&mut self, ui: &Ui, source: &(ResKey, GffPath), items: &[Carried]) {
+        let copied = self.copy_items(ui, items);
+        let edits: Vec<Edit> = removals(source, &copied).into_iter().map(|(e, _)| e).collect();
+        let n = edits.len();
+        if n == 0 {
+            return;
+        }
+        let what = if n > 1 { format!("Cut {n} items") } else { "Cut item".into() };
+        self.app.actions.push(Action::Apply(Command::new(what, edits)));
+    }
+}
+
+/// What an inventory's list brings in to add: the items (pasted,
+/// dropped), the edits that take those moved from where they were, and
+/// whether they were pasted.
+#[derive(Default)]
+pub(super) struct Incoming {
+    pub adds: Vec<Added>,
+    pub taken: Vec<Edit>,
+    pub pasted: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Find in Palette's tip names no side: the page's item palette is
+    /// at the left of the slots in a wide page, over them in a narrow one.
+    #[test]
+    fn find_in_palette_s_tip_names_no_side() {
+        let tip = FIND_IN_PALETTE_TIP;
+        assert!(!tip.contains("left") && !tip.contains("right"), "{tip}");
+    }
 
     fn item(fields: &[(&str, u8)]) -> Struct {
         let mut s = Struct::new(0);
@@ -958,6 +1262,74 @@ mod tests {
         ws.undo().unwrap();
         ws.flush().unwrap();
         assert_eq!(ws.module.get(&key).unwrap(), &before[..], "undone: the bytes it had");
+    }
+
+    /// An item whose file has a place below 0 (an INT of -1) is at 0 for
+    /// the next one's place: cast to an unsigned number it was at the far
+    /// end of what the field holds, and its place and width overflowed
+    /// when added (the review's B29). Placed as Advanced Search's Add an
+    /// Item places one: by the one rule (`mg_edit::lists`).
+    #[test]
+    fn an_item_at_a_place_below_zero_is_at_the_grid_s_start() {
+        let mut at_minus = item(&[]);
+        at_minus.set("Repos_PosX", Value::Int(-1));
+        at_minus.set("Repos_Posy", Value::Int(-7));
+        assert_eq!(lists::placed_at(&at_minus), (0, 0));
+        assert_eq!(lists::placed_at(&item(&[])), (0, 0), "left out");
+        let (x, y) = lists::placed_at(&at_minus);
+        assert_eq!(place(&[(x, y, 1, 1)], 1, 1), (1, 0), "beside it");
+        // (The far end of what a field holds: no row wraps.)
+        assert_eq!(place(&[(u32::MAX, u32::MAX, 2, 2)], 1, 1), (0, 0));
+    }
+
+    /// Several carried: the selection in its order (the slots', then the
+    /// list's) where the row is in it, else the row alone; taken out from
+    /// the last place to the first within each list; the step named for
+    /// how many, a single item's as before.
+    #[test]
+    fn several_items_are_carried_in_their_order() {
+        let c = |list, index| Carried { list, index, item: item(&[("Dropable", index as u8)]) };
+        let selected = [c("ItemList", 4), c("Equip_ItemList", 3), c("ItemList", 1)];
+        let at = |all: &[Carried]| all.iter().map(|c| (c.list, c.index)).collect::<Vec<_>>();
+        let all = carried_with(c("ItemList", 1), &selected);
+        assert_eq!(at(&all), [("Equip_ItemList", 3), ("ItemList", 1), ("ItemList", 4)]);
+        assert_eq!(at(&carried_with(c("ItemList", 2), &selected)), [("ItemList", 2)]);
+        let key = ResKey::parse("bandit", mg_core::ResType::UTC).unwrap();
+        let source = (key, GffPath::root());
+        let taken: Vec<_> = removals(&source, &all)
+            .into_iter()
+            .map(|(e, it)| match e {
+                Edit::RemoveItem { list, index, .. } => (list, index, it == c("x", index).item),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let want = [("Equip_ItemList", 3, true), ("ItemList", 4, true), ("ItemList", 1, true)];
+        assert_eq!(taken, want.map(|(l, i, s)| (l.to_string(), i, s)));
+        // The drag that began on the list's row 4 carries the three.
+        let d = Dragged::Listed {
+            owner: egui::Id::new("o"),
+            source,
+            index: 4,
+            resref: ResRef::EMPTY,
+            item: c("ItemList", 4).item,
+            more: vec![c("Equip_ItemList", 3), c("ItemList", 1)],
+        };
+        assert_eq!((d.count(), d.lead()), (3, Some(("ItemList", 4))));
+        assert_eq!(at(&d.carried()), at(&all));
+        // Of its own list, not the list's rows alone: not a move within it.
+        assert_eq!(own_rows(&d, egui::Id::new("o")), None);
+        assert_eq!(own_rows(&d, egui::Id::new("other")), None);
+        // Names.
+        assert_eq!(adding_name("Add item", 1, false, true), "Add item");
+        assert_eq!(adding_name("Add store item", 1, true, false), "Move item");
+        assert_eq!(adding_name("Add item", 3, true, false), "Move 3 items");
+        assert_eq!(adding_name("Add item", 2, false, true), "Paste 2 items");
+        assert_eq!(adding_name("Add store item", 2, false, false), "Add 2 items");
+    }
+
+    /// (The grid's rule, at the inventory's width.)
+    fn place(taken: &[(u32, u32, u32, u32)], w: u32, h: u32) -> (u32, u32) {
+        lists::place(taken, GRID_WIDTH, w, h)
     }
 
     #[test]

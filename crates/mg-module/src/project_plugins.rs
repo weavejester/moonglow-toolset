@@ -47,20 +47,48 @@ pub const DEFAULT_FOLDER: &str = "plugins";
 pub const DECIDED: &str = "project_plugins";
 
 /// A setting's value as a file holds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum SettingValue {
     Text(String),
     Int(i64),
     Bool(bool),
+    /// A number with a fraction (plugin API 0.5).
+    Float(f64),
+    /// A list of texts (plugin API 0.5).
+    List(Vec<String>),
 }
 
+/// Two values are one where they are of one kind and alike; numbers with
+/// a fraction by their bits (a value kept is one read or set, not one
+/// worked out).
+impl PartialEq for SettingValue {
+    fn eq(&self, other: &SettingValue) -> bool {
+        match (self, other) {
+            (SettingValue::Text(a), SettingValue::Text(b)) => a == b,
+            (SettingValue::Int(a), SettingValue::Int(b)) => a == b,
+            (SettingValue::Bool(a), SettingValue::Bool(b)) => a == b,
+            (SettingValue::Float(a), SettingValue::Float(b)) => a.to_bits() == b.to_bits(),
+            (SettingValue::List(a), SettingValue::List(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SettingValue {}
+
 impl std::fmt::Display for SettingValue {
-    /// As TOML writes it: `"text"`, `3`, `true`.
+    /// As TOML writes it: `"text"`, `3`, `true`, `1.5`, `["a", "b"]`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SettingValue::Text(t) => write!(f, "{t:?}"),
             SettingValue::Int(n) => write!(f, "{n}"),
             SettingValue::Bool(b) => write!(f, "{b}"),
+            SettingValue::Float(x) if x.fract() == 0.0 && x.is_finite() => write!(f, "{x:.1}"),
+            SettingValue::Float(x) => write!(f, "{x}"),
+            SettingValue::List(items) => {
+                let items: Vec<String> = items.iter().map(|t| format!("{t:?}")).collect();
+                write!(f, "[{}]", items.join(", "))
+            }
         }
     }
 }
@@ -104,12 +132,20 @@ impl PluginRules {
 /// What is wrong with a folder named for the project's plugins: it is to
 /// be inside the project (no absolute path, no `..`).
 pub fn folder_problem(folder: &str) -> Option<String> {
-    let f = folder.trim().replace('\\', "/");
+    inside_problem(folder, "folder")
+}
+
+/// What is wrong with a path the project's file names (`what`: a
+/// `folder`, a `file`): it is to be inside the project (no absolute
+/// path, no `..`). The one rule for every path the file names: the file
+/// comes with a checkout.
+pub(crate) fn inside_problem(path: &str, what: &str) -> Option<String> {
+    let f = path.trim().replace('\\', "/");
     if f.is_empty() {
         return Some("empty".into());
     }
     if f.starts_with('/') || f.contains(':') {
-        return Some("it is to be a folder of the project, from its root".into());
+        return Some(format!("it is to be a {what} of the project, from its root"));
     }
     if f.split('/').any(|p| p == "..") {
         return Some("it is to be inside the project (no ..)".into());
@@ -125,9 +161,20 @@ fn stored(value: &DeValue) -> Result<SettingValue, String> {
             .map(SettingValue::Int)
             .map_err(|_| "a number too large".to_string()),
         DeValue::Boolean(b) => Ok(SettingValue::Bool(*b)),
-        DeValue::Float(_) => Err("a number with a fraction".into()),
+        DeValue::Float(x) => x
+            .as_str()
+            .replace('_', "")
+            .parse()
+            .map(SettingValue::Float)
+            .map_err(|_| "a number that does not read".to_string()),
         DeValue::Datetime(_) => Err("a date".into()),
-        DeValue::Array(_) => Err("a list".into()),
+        DeValue::Array(items) => (items.iter())
+            .map(|i| match i.get_ref() {
+                DeValue::String(s) => Ok(s.to_string()),
+                _ => Err("a list of other than texts".to_string()),
+            })
+            .collect::<Result<Vec<String>, String>>()
+            .map(SettingValue::List),
         DeValue::Table(_) => Err("a table".into()),
     }
 }
@@ -211,13 +258,10 @@ pub(crate) fn invalid(e: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
 }
 
-/// A file's text read for editing (none there: empty).
+/// A file's text read for editing (none there: empty); an error for one
+/// that is not UTF-8 ([`crate::project_file::text_to_rewrite`]).
 pub(crate) fn document(path: &Path, name: &str) -> std::io::Result<toml_edit::DocumentMut> {
-    let text = match std::fs::read(path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
+    let text = crate::project_file::text_to_rewrite(path, name)?;
     text.parse::<toml_edit::DocumentMut>().map_err(|e| {
         let line = e.span().map_or(1, |s| crate::project_file::line_of(&text, s.start));
         invalid(format!("{name}:{line}: {} (mend it first)", e.message().trim()))
@@ -263,6 +307,42 @@ fn value_of(v: &SettingValue) -> toml_edit::Value {
         SettingValue::Text(t) => t.as_str().into(),
         SettingValue::Int(n) => (*n).into(),
         SettingValue::Bool(b) => (*b).into(),
+        SettingValue::Float(x) => (*x).into(),
+        SettingValue::List(items) => {
+            toml_edit::Value::Array(items.iter().map(String::as_str).collect())
+        }
+    }
+}
+
+fn table_is_uncommented_empty(t: &toml_edit::Table) -> bool {
+    let said = t.decor().prefix().and_then(|p| p.as_str()).is_some_and(|p| p.contains('#'));
+    t.is_empty() && !said
+}
+
+fn remove_plugin_setting(plugins: &mut toml_edit::Table, id: &str, name: &str) {
+    if let Some(t) = plugins.get_mut(id).and_then(|i| i.as_table_mut()) {
+        t.remove(name);
+        if table_is_uncommented_empty(t) {
+            plugins.remove(id);
+        }
+        return;
+    }
+    let Some(at) = id.match_indices('.').map(|(i, _)| i).find(|&i| {
+        plugins.get(&id[..i]).is_some_and(|t| {
+            t.as_table().is_some_and(|t| {
+                let rest = &id[i + 1..];
+                t.get(rest).is_some_and(|x| x.is_table()) || rest.contains('.')
+            })
+        })
+    }) else {
+        return;
+    };
+    let (head, rest) = (&id[..at], &id[at + 1..]);
+    if let Some(sub) = plugins.get_mut(head).and_then(|i| i.as_table_mut()) {
+        remove_plugin_setting(sub, rest, name);
+        if table_is_uncommented_empty(sub) {
+            plugins.remove(head);
+        }
     }
 }
 
@@ -293,17 +373,7 @@ pub fn with_setting(
                 }
             }
         }
-        None => {
-            if let Some(t) = plugin_table(plugins, id) {
-                t.remove(name);
-                // (Left empty, it goes; but not a comment written over it.)
-                let said =
-                    t.decor().prefix().and_then(|p| p.as_str()).is_some_and(|p| p.contains('#'));
-                if t.is_empty() && !said {
-                    plugins.remove(id);
-                }
-            }
-        }
+        None => remove_plugin_setting(plugins, id, name),
     }
     Ok(())
 }
@@ -348,8 +418,8 @@ mod tests {
     fn the_team_s_and_the_builder_s_plugin_tables_are_read() {
         let p = read(
             "[plugins]\nfolder = \"tools/plugins\"\n\n[plugins.\"tdod.rules\"]\nclaims = \
-             \"data/claims.toml\"\nmax = 3\nstrict = true\nratio = 0.5\n\n[plugins.x.y]\nz = \
-             \"w\"\n",
+             \"data/claims.toml\"\nmax = 3\nstrict = true\nratio = 0.5\nkinds = [\"a\", \"b\"]\n\
+             mixed = [1, \"b\"]\nwhen = 1979-05-27\n\n[plugins.x.y]\nz = \"w\"\n",
             "[plugins.\"tdod.rules\"]\ncode = \"ab\"\n",
         );
         assert_eq!(p.warnings, Vec::<String>::new());
@@ -361,8 +431,13 @@ mod tests {
         assert_eq!(team.values["claims"].value, Ok(SettingValue::Text("data/claims.toml".into())));
         assert_eq!(team.values["max"].value, Ok(SettingValue::Int(3)));
         assert_eq!(team.values["strict"].value, Ok(SettingValue::Bool(true)));
-        assert_eq!(team.values["ratio"].value, Err("a number with a fraction".into()));
+        // (Since plugin API 0.5: a number with a fraction, and a list of texts.)
+        assert_eq!(team.values["ratio"].value, Ok(SettingValue::Float(0.5)));
         assert_eq!(team.values["ratio"].at, "moonglow.toml:8");
+        let ab = SettingValue::List(vec!["a".into(), "b".into()]);
+        assert_eq!(team.values["kinds"].value, Ok(ab));
+        assert_eq!(team.values["mixed"].value, Err("a list of other than texts".into()));
+        assert_eq!(team.values["when"].value, Err("a date".into()));
         // (Unquoted, the id's parts nest.)
         assert_eq!(r.team["x.y"].values["z"].value, Ok(SettingValue::Text("w".into())));
         assert_eq!(r.own["tdod.rules"].values["code"].value, Ok(SettingValue::Text("ab".into())));
@@ -415,6 +490,16 @@ mod tests {
         );
         with_setting(&mut doc, "o.p", "on", Some(&SettingValue::Bool(true))).unwrap();
         assert!(doc.to_string().ends_with("\n[plugins.\"o.p\"]\non = true\n"), "{doc}");
+        // (A number with a fraction, a list.)
+        let list = SettingValue::List(vec!["x".into(), "y z".into()]);
+        with_setting(&mut doc, "o.p", "scale", Some(&SettingValue::Float(1.5))).unwrap();
+        with_setting(&mut doc, "o.p", "words", Some(&list)).unwrap();
+        assert!(
+            doc.to_string().ends_with("on = true\nscale = 1.5\nwords = [\"x\", \"y z\"]\n"),
+            "{doc}"
+        );
+        with_setting(&mut doc, "o.p", "scale", None).unwrap();
+        with_setting(&mut doc, "o.p", "words", None).unwrap();
         // Taken out; a table left empty goes.
         with_setting(&mut doc, "o.p", "on", None).unwrap();
         with_setting(&mut doc, "t.r", "name", None).unwrap();
@@ -467,5 +552,21 @@ mod tests {
                 let _ = with_setting(&mut doc, "c.d", "y", None);
             }
         }
+    }
+
+    #[test]
+    fn removing_last_setting_of_nested_table_prunes_empty_tables() {
+        let mut doc: toml_edit::DocumentMut =
+            "[plugins.a.b]\nx = 1\n[plugins.c.d]\ny = 2\n[plugins.c.e]\nz = 3\n# keep comment\n[plugins.f.g]\nk = 4\n"
+                .parse()
+                .unwrap();
+        with_setting(&mut doc, "a.b", "x", None).unwrap();
+        with_setting(&mut doc, "c.d", "y", None).unwrap();
+        with_setting(&mut doc, "f.g", "k", None).unwrap();
+        let out = doc.to_string();
+        assert!(!out.contains("[plugins.a"), "{out}");
+        assert!(!out.contains("[plugins.c.d]"), "{out}");
+        assert!(out.contains("[plugins.c.e]"), "{out}");
+        assert!(out.contains("[plugins.f.g]"), "{out}");
     }
 }

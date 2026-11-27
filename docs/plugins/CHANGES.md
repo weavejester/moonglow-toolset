@@ -3,7 +3,7 @@ type: Changelog
 title: Plugin API changes
 description: What changed in each version of the plugin API, and what a plugin written for the version before has to change.
 tags: [plugins, api, changelog]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T03:31:49Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-09T00:38:51Z }
 ---
 
 # Plugin API changes
@@ -13,6 +13,272 @@ Moonglow runs a plugin only if it has that API; while the API is at 0.x,
 each version may change what the one before had. This file lists each
 version's changes and what a plugin written for the version before has
 to change.
+
+## 0.10
+
+In Moonglow 5.4.0. Only an addition: a plugin written for 0.9 or
+before runs as it is, and has nothing to change. A plugin that uses
+what is new says `api = "0.10"`.
+
+- **Seeds for `ctx.terrain`**, so that an area painted by a plugin can
+  be made again tile for tile. `ctx.terrain:seed(n)` begins the job's
+  random choices again from `n` (the tiles and lights chosen from then
+  on, `new_area`'s too); `ctx.terrain:open(area, { seed = n })` gives
+  that area random choices of its own, whatever else the job does. The
+  same calls in the same order on the same tiles choose the same tiles
+  again. Without a seed, each run chooses anew, as before.
+
+  ```lua
+  ctx.terrain:seed(1234)
+  local area = ctx.terrain:open("market", { seed = 7 })
+  area:paint(2, 3, "Grass")
+  ```
+
+## 0.9
+
+In Moonglow 3.18.0. Only an addition: a plugin written for 0.8 or
+before runs as it is, and has nothing to change. A plugin that uses
+what is new says `api = "0.9"`, so that an older Moonglow refuses it
+with the reason rather than failing in its panel.
+
+- A panel's **fields**: an element `{ type = "field", kind = …, id,
+  label, value, … }`, a form's field in a panel (`kind` is what a form's
+  field's `type` is: `"text"`, `"number"`, `"check"`, `"choice"`,
+  `"color"`; `value` is what it shows; `min`, `max`, `choices` and a
+  color's `variable` as a form's). Moonglow keeps each field's value, by
+  its id, while the panel is drawn again: the field takes the `value`
+  the handler gives when it is not the one it gave the last time, and
+  otherwise keeps what the user set. A color's `variable` draws the
+  color on the placed objects selected while its picker is open, as a
+  form's does. With `command`, one of the plugin's commands, the field
+  runs it when the user sets it: a color when its picker closes, text
+  when it is left, a number when it is let go, a check or a choice at
+  once. The example `tint-panel` is a panel whose color field shows the
+  tint of the placeable selected and sets it.
+
+  ```lua
+  mg.panel("tint", function(ctx)
+    return {
+      { type = "field", kind = "color", id = "tint", label = "Tint",
+        value = "#2a4d8f", variable = "tdod_tint", command = "set-tint" },
+    }
+  end)
+  ```
+
+- `ctx.values`: a command run from a panel (its button, a list's item,
+  a field set) gets the panel's fields' values, by field id, as a form's
+  come back. Run from anywhere else (a menu, a key, a fix, `mg plugin
+  run`), and in every other handler, it is an empty table. A plugin's
+  own test gives a command's with `values = { … }`.
+- A choice's options (a form's and a panel's) may be `{ text =
+  "Crimson", color = "#a01010" }`: a swatch of the color is drawn before
+  the text, in the list and in the box. Its value is still the text.
+- The window of a plugin's job (its questions and forms) is headed by
+  the command's title alone (`Tint`, not `Pick tint: Tint`; the plugin's
+  name shows on hover), and no longer dims the window behind it.
+
+Since Moonglow 4.0.0, still as API 0.9, a plugin meets limits and
+refusals it did not before ([Limits](../manual/17-plugin-api.md#limits)).
+A plugin that stayed within what the manual said has nothing to change;
+one that leaned on what follows fails where it used to go on:
+
+- What Moonglow holds for a job besides the plugin's own 256 MB (the
+  tables and talk tables it makes, the pictures it has decoded, its
+  edits and the files it wants written) may be 512 MB: the call that
+  would go past that fails, and the job with it unless it catches the
+  error. What the plugin has let go of does not count.
+- `folder:files()` fails on a folder of more than 20,000 files; it
+  returned the first 20,000 without a word.
+- `ctx.edit:write`, `write_bytes` and `write_gff` refuse a new resource
+  whose name no file can have (`a/b.nss`): a folder module or a nasher
+  project could not be saved with it. A resource the module has already
+  is written as before.
+- A number that is not finite (`0/0`, `math.huge`) is refused where a
+  plugin or its user gives one: a form's `default`, `min` and `max` (and
+  a `min` above its `max`), an answer of `mg plugin run --answer`, a
+  float field set with `ctx.edit:set` past a float's range, a pixel's
+  place in `image:pixel`.
+- `mg.image` refuses a picture of more than 64 million pixels by its
+  header, before decoding it, and `ctx.game:bytes` reads no more than
+  64 MB of a file put into a hak with `folder:to_hak`, as `folder:bytes`
+  does.
+- A plugin's folder of more than 16 MB or 500 files is refused before
+  any of it is read, and `mg plugin check`, `mg plugin pack` and an
+  archive about to be installed give a plugin's code 5 seconds to load.
+- `ctx.edit:set` of a ResRef field keeps a letter outside ASCII as the
+  module's codepage has it (`café_01`), and `ctx.module:gff`, `text` and
+  the like take a resource's name as such a field reads (`œuvre.dlg`, a
+  Polish module's letters) as well as the way `ctx.module:resources()`
+  lists it.
+- A choice (a form's field, a panel's) has at most 2,000 options, each
+  of at most 1,000 characters; one of more, or with a longer option, is
+  refused with the reason (the form is not shown, the panel shows the
+  error). An option's text is its value, so it is not cut.
+- A number field starts within its `min` and `max`: what it is given
+  outside them (or 0, given nothing, with a `min` above it) is held to
+  them. A panel's number field no longer runs its `command` when the
+  panel is drawn with such a value.
+- A panel's button or item that names a place (`on`, `open`) acts only
+  on the module the panel was drawn from. Clicked after the module
+  changed (and before the panel was drawn again), it does nothing, the
+  log says so, and the panel is drawn again; a panel whose manifest
+  says `refresh = "edits"` is seldom caught so. A button that names no
+  place runs on what is selected, as before.
+
+What an installed plugin's events were allowed (a folder, a yes to
+write) is kept for its code, by a digest of its files, as a project's
+plugin's is: an author who edits an installed plugin's files by hand,
+under the same version, is asked its questions again. What an earlier
+Moonglow kept by the plugin's id and version is kept for its code as it
+is at its first event, once; a user who upgrades is not asked again for
+plugins nobody touched.
+
+## 0.8
+
+In Moonglow 3.16.0. Only an addition: a plugin written for 0.7 or
+before runs as it is. A plugin that uses a color field says
+`api = "0.8"`, so that an older Moonglow refuses it with the reason
+rather than failing at the form.
+
+- A form's field (`ctx.ui:form`, a wizard's page) may be a **color**:
+  `type = "color"`, its `default` and its value `"#rrggbb"`. Its swatch
+  opens the picker the Properties windows have (paste a color into it,
+  copy one out). With `variable`, the name of a string variable, the
+  placed objects the command was run on are drawn in the area with that
+  variable set to the color while it is being picked, as the Variables
+  page draws a tint being picked; nothing is set until the plugin sets
+  it. `mg plugin run` takes one as `--answer ID=#rrggbb`. The example
+  `pick-tint` is a right-click command that picks a placeable's
+  `tdod_tint`.
+
+  ```lua
+  local answers = ctx.ui:form({
+    title = "Tint",
+    fields = {
+      { id = "tint", label = "Color", type = "color", default = "#2a4d8f", variable = "tdod_tint" },
+    },
+  })
+  ```
+
+## 0.7
+
+In Moonglow 3.14.0. Only an addition: a plugin written for 0.6 or
+before runs as it is. A plugin that puts its commands in submenus says
+`api = "0.7"`; a manifest with `menu` and an earlier `api` is refused,
+with the reason.
+
+- Submenus: a `[command]`'s `menu` names the submenu it is in, nested
+  with `›` (or `>`) between the names, in every menu the command is in
+  (its right-click menus and the Plugins menu). Each submenu is made
+  once, where the first command naming it is, its commands in the
+  manifest's order; a command without `menu` stays in the menu itself.
+  The Command Palette, Options › Keyboard, the Plugins window and `mg
+  plugin list` name the command by its whole path (`Make › Crafting ›
+  Workbench…`), and `mg plugin list --json` gives it as `menu`.
+
+  ```ini
+  [command]
+  id = "workbench"
+  title = "Workbench…"
+  for = "placeable"
+  menu = "Make › Crafting"
+  ```
+
+## 0.6
+
+In Moonglow 3.3.0. Only additions: a plugin written for 0.5 or before
+runs as it is. A plugin that uses what is new says `api = "0.6"`; a
+manifest with any of the new sections and an earlier `api` is refused,
+with the reason. The design is the proposal's "API 0.6".
+
+- Exporters: `[exporter]` (`id`, `title`, `hint`, `to = "file"` or
+  `"folder"`, `extension`, `for`) and `mg.exporter(id, function(ctx,
+  out))`, in File › Export: the user chooses the file or the folder
+  first, and the exporter writes it with `out:write(bytes)` (a folder's
+  files with `out:write(name, bytes)`; `out.name` is its name). It only
+  reads; one that edits, or writes a hak or elsewhere, fails. With
+  `for`, it exports what is selected, and is offered only then. `mg
+  plugin export MODULE PLUGIN ID OUT`.
+- Importers: `[importer]` (`id`, `title`, `hint`, `from = "file"` or
+  `"folder"`, `extensions`) and `mg.importer(id, function(ctx, source))`,
+  in File › Import: `source` is the file or the folder the user chose,
+  as `ctx.ui:open_file` and `open_folder` give them; its edits are one
+  step of Undo, named by what it returns or "Import" and its title. `mg
+  plugin import MODULE PLUGIN ID SOURCE`.
+- Wizards: `[wizard]` (`id`, `title`, `hint`) and `mg.wizard(id, {
+  pages = { … }, finish = function(ctx, answers) })`, in the Wizards
+  menu: pages asked in turn with Back, Next and Finish (each a table, or
+  a function of the answers so far, nil to skip it; `check` keeps a page
+  with what is wrong), `answers` by field id, the edits at Finish as one
+  step of Undo, Cancel making nothing. `mg plugin wizard MODULE PLUGIN
+  ID`, its pages answered by `--answers FILE` (JSON) and `--answer`;
+  `mg plugin run` takes `--answers` too.
+- Panels: `[panel]` (`id`, `title`, `hint`, `refresh = "edits,
+  selection"`) and `mg.panel(id, function(ctx) return { … } end)`, a pane
+  of Plugins › Panels showing the elements it returns (`heading`,
+  `text`, `value`, `separator`, `button` running one of the plugin's
+  commands, `list` of items that open what they name or run a command),
+  drawn by Moonglow; run beside the window, within 250 ms, at most 2,000
+  elements; it only reads. Not in `mg`.
+- A plugin's own tests: `export`, `import`, `wizard` and `panel`, with
+  `to` and `content` (an export's file and what it has) and `shows`
+  (what a panel shows). `mg plugin list` lists the new kinds.
+- The host: `Question::Page` and `Answer::Page` (a wizard's page and its
+  answer), and `Host::interactive` (whether a page's check that objects
+  asks again, or ends the wizard).
+
+## 0.5
+
+In Moonglow 3.3.0. Only additions: a plugin written for 0.4 or before
+runs as it is. A plugin that uses what is new says `api = "0.5"`; a
+manifest that declares what 0.5 added and says an earlier API is
+refused, with the reason.
+
+- `area:batch(f)`: an area's strokes made at once. Its tiles are read
+  once, `f`'s strokes made on them (what it reads back is what they
+  left), and the tiles that changed go in when it returns, as one edit
+  of the area's tile list; if it fails, none of them. A stroke that
+  changes many tiles outside a batch is one edit of the list too.
+- Settings of three more kinds, `float` (a number with a fraction,
+  with `min` and `max`), `list` (texts; with `choices`, each one of
+  them) and `color` (`"#rrggbb"`); a `string` held to a `pattern` (a
+  regular expression its whole text matches); a `path` whose form picks
+  a folder (`pick = "folder"`). `ctx.settings` reads a float as a
+  number and a list as a table of texts, and `ctx.settings:set` takes
+  them so. A manifest with any of these and an earlier `api` is refused.
+- A command's `for` (and an event's) takes a kind's placed objects
+  alone (`"placed creature"`) or its blueprints alone (`"creature
+  blueprint"`), where `"creature"` is both; `tile`, the tiles selected
+  in an area's view (an entry's `kind` `"tile"`, with `index`, `x` and
+  `y`); and another resource's type (`nss`, `dlg`…). The commands are
+  also in the menus of a palette's category and a module tree's group
+  (run on every one of them), a Properties window's tab, the script
+  editor, and the rows of Find References and Advanced Search; an
+  area's are in the area view's menu with objects selected too (**The
+  Area**). From the Plugins menu, a command runs on what is chosen in
+  the pane last clicked in. `ctx.open.together` lists those edited
+  together in one Properties window. `mg plugin run --select` takes a
+  tile as `tavern.are/Tile_List[5]`.
+- A fix that asks: `ctx.fix(label, { command = "retag", on = s? })`,
+  a finding's fix whose button runs one of the plugin's commands on what
+  the finding is about (`on`, or the finding's resource), which asks with
+  its form. It records no edits; `mg verify --fix` does not make it.
+- Events: `resource-created` fires for the Script Wizard, New Script
+  (`by = "new-script"`), a new NUI window (`"new-nui"`) and an import
+  (`"import"`), and an event's `for` takes a resource's type (`nss`);
+  Save As asks the `resource-saving` handlers as Save does;
+  `ctx.event.changed` gives a script's (a text's) lines that differ;
+  the time at-once handlers have is set in Manage Plugins; `mg set` and
+  `mg apply` take `--strict`, and `mg rename`, `replace`, `areas`,
+  `update-instances` and `import` run the project's plugins' save events.
+- A plugin's tests: `haks` and `written` hold what a job writes
+  outside the module (nothing is written); `mg plugin test` takes a
+  folder of plugins; `mg plugin check` reads the test files; Manage
+  Plugins runs them (Run Tests).
+- Settings of scope `user` are kept in Moonglow's own folder
+  (`plugin-settings.json`), which `mg` reads and keeps too: with `mg
+  plugin run` a plugin reads the values the user set in the window, and
+  what it sets of that scope is kept.
 
 ## 0.4
 

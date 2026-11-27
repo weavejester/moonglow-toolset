@@ -10,12 +10,48 @@ use mg_resman::ResKey;
 use mg_ui::{Action, Moonglow, NoDialogs, Tab};
 use serde_json::{Value, json};
 
+/// `Moonglow` on `install` sharing immutable base KEY/BIF archives and
+/// `dialog.tlk` via `mg_testkit::shared_resman`.
+fn game_app(install: mg_resman::GameInstall, dialogs: NoDialogs) -> Moonglow {
+    static TLK: mg_testkit::Shared<(std::path::PathBuf, String), std::sync::Arc<mg_tlk::Tlk>> =
+        mg_testkit::Shared::new();
+    let resman = mg_testkit::shared_resman(&install).expect("shared game resman");
+    let key = (install.root.clone(), install.language.clone());
+    let tlk = TLK.get(&key, || {
+        std::sync::Arc::new(mg_rules::GameData::open_tlk(&install).expect("open dialog.tlk"))
+    });
+    let game = mg_rules::GameData::with_shared_tlk(resman, tlk);
+    Moonglow::new_with_game(Some(install), Some(game), Box::new(dialogs))
+}
+
+fn shared_gpu() -> Option<&'static mg_render::Gpu> {
+    static GPU: std::sync::OnceLock<Option<mg_render::Gpu>> = std::sync::OnceLock::new();
+    GPU.get_or_init(|| {
+        let g = mg_render::Gpu::headless();
+        if g.is_none() {
+            eprintln!("skipped: no GPU adapter");
+        }
+        g
+    })
+    .as_ref()
+}
+
 /// A module with the window `name` in it, new, and its tab opening.
 fn app_with(name: &str, dialogs: NoDialogs) -> Moonglow {
     let mut app = Moonglow::new(None, Box::new(dialogs));
     app.ws = Some(mg_edit::Workspace::new(mg_module::Module::new()));
     app.run(Action::NewNui(name.into()));
     app
+}
+
+/// Insert… › Close Window: the snippet's menu row, not the Close Window of
+/// the script's window's bar (a window of its own: its own name).
+fn insert_close_window(h: &mut Harness<'_, Moonglow>) {
+    let bars: Vec<egui::Rect> = h.query_all_by_label("Close Window").map(|n| n.rect()).collect();
+    h.get_by_label("Insert…").click();
+    h.run();
+    let row = h.get_all_by_label("Close Window").find(|n| !bars.contains(&n.rect()));
+    row.expect("Insert… › Close Window").click();
 }
 
 fn app() -> Moonglow {
@@ -56,11 +92,39 @@ fn undo(h: &mut Harness<'_, Moonglow>) {
 fn creator(mut app: Moonglow, size: [u32; 2]) -> Harness<'static, Moonglow> {
     app.settings.window_sizes.retain(|(kind, _)| kind != "nui");
     app.settings.window_sizes.push(("nui".into(), size));
+    let mut recorded = false;
     let mut h = Harness::builder()
         .with_size(egui::vec2(size[0] as f32 + 100.0, size[1] as f32 + 150.0))
-        .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+        .build_ui_state(
+            move |ui, app: &mut Moonglow| {
+                if !recorded {
+                    recorded = true;
+                    mg_uikit::header::record_headers(ui.ctx());
+                }
+                app.ui(ui);
+            },
+            app,
+        );
     h.run();
     h
+}
+
+/// Scrolls the last widget labeled `label` into its scroll area's view,
+/// waits until it stays still there (the scroll is animated: still for a
+/// few frames in a row), and clicks it. Out of sight, kittest's click at
+/// its center is on whatever is drawn there.
+fn click_last_in_sight(h: &mut Harness<'_, Moonglow>, label: &str) {
+    h.get_all_by_label(label).last().unwrap().scroll_to_me();
+    let started = std::time::Instant::now();
+    let (mut last, mut still) = (None, 0);
+    while still < 4 {
+        h.run_steps(1);
+        let rect = h.get_all_by_label(label).last().unwrap().rect();
+        still = if last == Some(rect) { still + 1 } else { 0 };
+        assert!(started.elapsed().as_secs() < 30, "{label} never came to rest in sight");
+        last = Some(rect);
+    }
+    h.get_all_by_label(label).last().unwrap().click();
 }
 
 /// Closes the window Edit code opened the script in, over the Creator's.
@@ -68,6 +132,90 @@ fn close_script(h: &mut Harness<'_, Moonglow>, script: ResKey) {
     let dock = &mut h.state_mut().dock;
     let tab = dock.find_tab(&Tab::Script(script)).expect("the script's tab");
     dock.remove_tab(tab);
+    h.run();
+}
+
+/// Clicks the first widget labeled `label`, brought into its scroll
+/// area's sight first: the Right Dock's sections (or a floating designer's
+/// right pane) scroll, and a click out of sight lands on whatever is drawn
+/// there.
+#[track_caller]
+fn click_seen(h: &mut Harness<'_, Moonglow>, label: &str) {
+    h.get_all_by_label(label).next().unwrap().scroll_to_me();
+    let started = std::time::Instant::now();
+    let (mut last, mut still) = (None, 0);
+    while still < 4 {
+        h.run_steps(1);
+        let rect = h.get_all_by_label(label).next().unwrap().rect();
+        still = if last == Some(rect) { still + 1 } else { 0 };
+        assert!(started.elapsed().as_secs() < 30, "{label} never came to rest in sight");
+        last = Some(rect);
+    }
+    h.get_all_by_label(label).next().unwrap().click();
+    h.run();
+}
+
+/// The editor's `label` where the Right Dock has one too (Properties'
+/// Add Handler beside the Bindings page's): the leftmost.
+fn leftmost<'t>(h: &'t Harness<'_, Moonglow>, label: &'t str) -> egui_kittest::Node<'t> {
+    h.get_all_by_label(label).min_by(|a, b| a.rect().left().total_cmp(&b.rect().left())).unwrap()
+}
+
+/// The designer's header's control `name` (M4's U18: the kit's header,
+/// `mg_ui::nui_names`), through More where it went there (opened for it).
+#[track_caller]
+fn nui_tool<'t>(h: &'t mut Harness<'_, Moonglow>, name: &'t str) -> egui_kittest::Node<'t> {
+    use mg_uikit::header::{self, Place};
+    let header_name = mg_ui::nui_names::NUI_HEADER;
+    let records = header::records(&h.ctx, header_name);
+    let rec = records.into_iter().next().expect("the designer's header");
+    let place = rec.places.iter().find(|(n, _)| n == name).map(|(_, p)| *p);
+    static MORE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let more = MORE.get_or_init(|| header::more_name(header_name)).as_str();
+    if place == Some(Place::More) && h.query_by_label(more).is_none() {
+        h.get_by_label(header_name).get_by_label(header::MORE).click();
+        h.run();
+    }
+    let h: &'t Harness<'_, Moonglow> = h;
+    match place {
+        Some(Place::More) => h.get_by_label(more).get_by_label(name),
+        Some(Place::Row | Place::Icon) => h.get_by_label(header_name).get_by_label(name),
+        other => panic!("{name} in the designer's header: {other:?} ({:?})", rec.places),
+    }
+}
+
+/// Clicks the header's control `name` ([`nui_tool`]) and runs the frames
+/// that follow.
+#[track_caller]
+fn nui_click(h: &mut Harness<'_, Moonglow>, name: &str) {
+    nui_tool(h, name).click();
+    h.run();
+}
+
+/// The page `name` chosen in the header's switch.
+#[track_caller]
+fn page(h: &mut Harness<'_, Moonglow>, name: &str) {
+    nui_tool(h, mg_ui::nui_names::PAGE).get_by_label(name).click();
+    h.run();
+}
+
+/// The View popover opened (the header's).
+#[track_caller]
+fn view(h: &mut Harness<'_, Moonglow>) {
+    nui_click(h, mg_ui::nui_names::VIEW);
+}
+
+/// `choice` chosen in the View popover's combo box `row` (Layout, UI
+/// scale, State, Screen), the popover then closed with Escape.
+#[track_caller]
+fn view_choose(h: &mut Harness<'_, Moonglow>, row: &str, choice: &str) {
+    view(h);
+    let combo = egui_kittest::kittest::by().role(egui::accesskit::Role::ComboBox).label(row);
+    h.get(combo).click();
+    h.run();
+    h.get_all_by_label(choice).last().unwrap().click();
+    h.run();
+    h.key_press(egui::Key::Escape);
     h.run();
 }
 
@@ -84,11 +232,9 @@ fn a_control_duplicated_from_its_menu_is_one_undo_step() {
     let before = h.state().ws.as_ref().unwrap().module.get(&key).unwrap().to_vec();
     h.get_by_label("Canvas Button · Close").click();
     h.run();
-    h.get_by_label("Element actions").scroll_to_me();
+    h.get_by_label("Element Actions").click();
     h.run();
-    h.get_by_label("Element actions").click();
-    h.run();
-    h.get_by_label_contains("Duplicate element").click();
+    h.get_by_label_contains("Duplicate Element").click();
     h.run();
     let ws = h.state_mut().ws.as_mut().unwrap();
     let doc = mg_nui::parse(ws.module.get(&key).unwrap()).unwrap();
@@ -98,14 +244,15 @@ fn a_control_duplicated_from_its_menu_is_one_undo_step() {
     assert_eq!(ws.module.get(&key).unwrap(), before);
 }
 
-/// The pages' buttons stay in one row, of one height, in a narrow window.
+/// The pages' switch stays in one row, of one height, in a narrow window
+/// (the header's, M4's U18: Design, Bindings, Events & Variants, Images).
 #[test]
 fn the_pages_stay_in_one_row_in_a_narrow_window() {
     for width in [1200, 820, 640] {
-        let h = creator(app(), [width, 850]);
-        let first = h.get_by_label("Design").rect();
-        for label in ["Bindings", "Events & variants", "Event script…", "Advanced"] {
-            let rect = h.get_by_label(label).rect();
+        let mut h = creator(app(), [width, 850]);
+        let first = nui_tool(&mut h, mg_ui::nui_names::PAGE).get_by_label("Design").rect();
+        for label in ["Bindings", "Events & Variants", "Images"] {
+            let rect = nui_tool(&mut h, mg_ui::nui_names::PAGE).get_by_label(label).rect();
             assert!((rect.center().y - first.center().y).abs() < 0.1, "{width}: {label}: {rect:?}");
             assert!((rect.height() - first.height()).abs() < 0.1, "{width}: {label}: {rect:?}");
         }
@@ -119,19 +266,27 @@ fn a_bind_made_for_a_property_and_its_handler_are_undone_on_the_design_page() {
     h.get_by_label("Canvas Label · Label").click();
     h.run();
     let before = document(&h);
-    h.get_by_label("+ New bind for property").click();
-    h.run();
-    // (The dialog's Cancel, drawn after the one under the editor.)
-    h.get_all_by_label("Cancel").last().unwrap().click();
+    click_seen(&mut h, "New Bind for a Property");
+    // (The dialog's Cancel, beside its Create: the header's is the
+    // editor's.)
+    let create = h.get_by_label("Create").rect().center();
+    let cancel = h
+        .get_all_by_label("Cancel")
+        .min_by(|a, b| {
+            let (a, b) = (a.rect().center().distance(create), b.rect().center().distance(create));
+            a.total_cmp(&b)
+        })
+        .unwrap();
+    cancel.click();
     h.run();
     assert_eq!(document(&h), before);
-    h.get_by_label("+ New bind for property").click();
-    h.run();
+    click_seen(&mut h, "New Bind for a Property");
     h.get_by_label("Create").click();
     h.run();
     assert_eq!(document(&h)["root"]["children"][0]["value"], json!({"bind":"label_value"}));
-    // A bound value offers its change first.
-    h.get_all_by_label("+ Add handler").last().unwrap().click();
+    // A bound value offers its change first. (The button is at the foot
+    // of the properties' pane, below its edge until scrolled to.)
+    click_last_in_sight(&mut h, "Add Handler");
     h.run();
     assert_eq!(settings(&h).bindings["label_value"].value, json!("Label"));
     assert!(settings(&h).handlers.iter().any(|r| r.event == "watch"
@@ -144,7 +299,7 @@ fn a_bind_made_for_a_property_and_its_handler_are_undone_on_the_design_page() {
     h.run();
     assert_eq!(document(&h), before);
     assert!(!settings(&h).bindings.contains_key("label_value"));
-    h.get_by_label("Property binding");
+    h.get_by_label("Property Binding");
     h.get_by_label("Canvas Label · Label");
 }
 
@@ -156,11 +311,9 @@ fn handlers_follow_a_renamed_control_and_go_with_a_deleted_one() {
     let script = |h: &Harness<'_, Moonglow>| text(h.state(), script_key);
     h.get_by_label("Canvas Button · Close").click();
     h.run();
-    h.get_by_label("Edit code").click();
-    h.run();
+    click_seen(&mut h, "Edit Code");
     close_script(&mut h, script_key);
-    h.get_by_label("Element ID").click();
-    h.run();
+    click_seen(&mut h, "Element ID");
     h.get_by_label("Element ID").type_text("_x");
     h.run();
     // (Set when the field is left.)
@@ -174,9 +327,8 @@ fn handlers_follow_a_renamed_control_and_go_with_a_deleted_one() {
     assert!(!script(&h).contains(r#""mg_close""#));
     assert!(!mg_nui::edited_outside("nui_test", &script(&h)));
     // Deleting the control takes its handler away; its code stays.
+    // (Its row in Layers: they have the keys.)
     h.get_all_by_label("Button · Close").next().unwrap().click();
-    h.run();
-    h.hover_at(h.get_by_label("Layers").rect().center());
     h.run();
     h.key_press(egui::Key::Delete);
     h.run();
@@ -224,7 +376,7 @@ fn picture_fields_take_a_file_from_disk() {
     h.run();
     h.get_by_label_contains("Canvas Image").click();
     h.run();
-    h.get_all_by_label("From disk…").next().unwrap().click();
+    h.get_all_by_label("From Disk…").next().unwrap().click();
     h.run();
     h.run();
     let module = &h.state().ws.as_ref().unwrap().module;
@@ -234,7 +386,7 @@ fn picture_fields_take_a_file_from_disk() {
     h.get_by_label("Draw layer 1 · Image").click();
     h.run();
     h.run();
-    h.get_all_by_label("From disk…").last().unwrap().click();
+    h.get_all_by_label("From Disk…").last().unwrap().click();
     h.run();
     h.run();
     assert!(
@@ -253,7 +405,7 @@ fn picture_fields_take_a_file_from_disk() {
     assert!(!h.state().log.entries.iter().any(|(_, line)| line.contains("c40e2b2-1610-41b takes")));
 }
 
-/// Advanced › Images: a picture from disk into the module, used as the
+/// Images page: a picture from disk into the module, used as the
 /// window's background, then moved into a new hak the module lists. The
 /// user folder is a scratch one.
 #[test]
@@ -275,19 +427,16 @@ fn images_from_disk_go_into_the_module_and_a_hak() {
         ..Default::default()
     };
     let install = mg_resman::GameInstall::new(mg_testkit::corpus!(), Some(user.clone()), "en");
-    let mut app = Moonglow::new(Some(install), Box::new(dialogs));
+    let mut app = game_app(install, dialogs);
     let mut module = mg_module::Module::new();
     module.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
     app.ws = Some(mg_edit::Workspace::new(module));
     app.run(Action::NewNui("pictures".into()));
     let mut h = creator(app, [1100, 900]);
     h.run();
-    h.get_by_label("Advanced").click();
-    h.run();
-    h.get_by_label("Images").click();
-    h.run();
+    page(&mut h, "Images");
     let key = ResKey::parse("my_bg", ResType::TGA).unwrap();
-    h.get_by_label("Add images from disk…").click();
+    h.get_by_label("Add Images from Disk…").click();
     h.run();
     assert!(h.state().ws.as_ref().unwrap().module.contains(&key));
     // Name it in the window: it is listed, and can be the background.
@@ -297,7 +446,7 @@ fn images_from_disk_go_into_the_module_and_a_hak() {
     doc["root"]["children"] = json!([{"type":"image","value":"my_bg","height":40.0}]);
     h.state_mut().ws.as_mut().unwrap().module.set(jui, serde_json::to_vec(&doc).unwrap());
     h.run();
-    h.get_by_label("Use as background").click();
+    h.get_by_label("Use as Background").click();
     h.run();
     let doc: Value =
         serde_json::from_slice(h.state().ws.as_ref().unwrap().module.get(&jui).unwrap()).unwrap();
@@ -306,7 +455,7 @@ fn images_from_disk_go_into_the_module_and_a_hak() {
         (back["image"].clone(), back["image_aspect"].clone(), back["order"].clone()),
         (json!("my_bg"), json!(5), json!(-1))
     );
-    h.get_by_label("Move module images into a new hak").click();
+    h.get_by_label("Move Module Images into a New Hak").click();
     h.run();
     let ws = h.state_mut().ws.as_mut().unwrap();
     assert!(!ws.module.contains(&key), "the picture left the module");
@@ -328,7 +477,7 @@ fn images_from_disk_go_into_the_module_and_a_hak() {
     h.run();
     h.get_by_label("nui_images.hak").click();
     h.run();
-    h.get_by_label("Add images to nui_images.hak…").click();
+    h.get_by_label("Add Images to nui_images.hak…").click();
     h.run();
     let written = mg_module::hak_edit::Hak::open(&hak).unwrap();
     let icon = ResKey::parse("my_icon", ResType::TGA).unwrap();
@@ -346,7 +495,7 @@ fn images_from_disk_go_into_the_module_and_a_hak() {
     let frame = ResKey::parse("my_frame", ResType::TGA).unwrap();
     h.state_mut().dialogs =
         Box::new(NoDialogs { open_many: vec![vec![third.clone()]], ..Default::default() });
-    h.get_by_label("Add images to nui_images.hak…").click();
+    h.get_by_label("Add Images to nui_images.hak…").click();
     h.run();
     let has = |h: &Harness<'_, Moonglow>, k: ResKey| {
         h.state().haks[0].hak.items().iter().any(|i| i.key == k)
@@ -363,7 +512,7 @@ fn images_from_disk_go_into_the_module_and_a_hak() {
     std::fs::write(&fourth, &tga).unwrap();
     h.state_mut().dialogs =
         Box::new(NoDialogs { open_many: vec![vec![fourth]], ..Default::default() });
-    h.get_by_label("Add images to nui_images.hak…").click();
+    h.get_by_label("Add Images to nui_images.hak…").click();
     h.run();
     assert!(has(&h, ResKey::parse("my_glow", ResType::TGA).unwrap()));
     assert!(h.state().haks[0].hak.is_dirty());
@@ -385,22 +534,25 @@ fn edit_code_opens_the_event_script_at_the_handler_s_section() {
     h.get_by_label("Canvas Button · Close").click();
     h.run();
     // Edit code writes the handlers' sections and opens the script at this one.
-    h.get_by_label("Edit code").click();
-    h.run();
+    click_seen(&mut h, "Edit Code");
     let text = script(&h);
     assert!(text.contains("// mg:begin click mg_close"));
     assert!(h.state().dock.find_tab(&Tab::Script(script_key)).is_some());
     let at = mg_nui::handler_offset(&text, "click mg_close").unwrap();
-    assert!(h.state().script_tools.jump.is_none_or(|(k, i)| k == script_key && i == at));
+    let state = egui::text_edit::TextEditState::load(&h.ctx, egui::Id::new(("script", script_key)))
+        .expect("script editor state");
+    let r = state.cursor.char_range().expect("script cursor range");
+    assert_eq!(usize::from(r.primary.index), at, "cursor jumped to handler offset {at}");
+    assert!(h.state().script_tools.jump.is_none(), "jump consumed by script editor");
     // Insert adds ready-made code to the handler, after what is there.
     close_script(&mut h, script_key);
-    h.get_by_label("Insert…").click();
-    h.run();
-    h.get_by_label("Close window").click();
+    insert_close_window(&mut h);
     h.run();
     assert_eq!(script(&h).matches("NuiDestroy(oPlayer, nToken);").count(), 2);
-    // Event script… opens the whole script; Undo takes the insert back.
-    h.get_by_label("Event script…").click();
+    // Event script… (the source group's, M4's U19) opens the whole script;
+    // Undo takes the insert back.
+    view_choose(&mut h, "Layout", "Split source");
+    h.get_by_label("Event Script…").click();
     h.run();
     assert_eq!(script(&h).matches("NuiDestroy(oPlayer, nToken);").count(), 2);
     h.state_mut().ws.as_mut().unwrap().undo().unwrap();
@@ -419,8 +571,7 @@ fn edit_code_leaves_a_script_written_by_hand_as_it_is() {
     let mut h = creator(app, [1200, 850]);
     h.get_by_label("Canvas Button · Close").click();
     h.run();
-    h.get_by_label("Edit code").click();
-    h.run();
+    click_seen(&mut h, "Edit Code");
     assert_eq!(text(h.state(), script), manual);
     assert!(h.state().dock.find_tab(&Tab::Script(script)).is_some());
 }
@@ -434,8 +585,7 @@ fn the_creator_writes_into_an_event_script_typed_in_after_storing_what_was_typed
     let script = ResKey::parse("nui_test_e", ResType::NSS).unwrap();
     h.get_by_label("Canvas Button · Close").click();
     h.run();
-    h.get_by_label("Edit code").click();
-    h.run();
+    click_seen(&mut h, "Edit Code");
     let written = text(h.state(), script);
     let at = mg_nui::handler_offset(&written, "click mg_close").unwrap();
     h.state_mut().script_tools.jump = Some((script, at));
@@ -446,9 +596,7 @@ fn the_creator_writes_into_an_event_script_typed_in_after_storing_what_was_typed
     assert!(typed.contains("int nTyped = 1; ") && typed != written, "{typed}");
     assert_eq!(text(h.state(), script), written, "typed, not saved");
     close_script(&mut h, script);
-    h.get_by_label("Insert…").click();
-    h.run();
-    h.get_by_label("Close window").click();
+    insert_close_window(&mut h);
     h.run();
     let now = text(h.state(), script);
     assert!(now.contains("int nTyped = 1; "), "what was typed is kept: {now}");
@@ -468,8 +616,7 @@ fn a_color_picked_is_set_when_its_picker_closes() {
     let mut h = harness();
     h.get_by_label("Canvas Label · Label").click();
     h.run();
-    h.get_by_label("+ Add property").click();
-    h.run();
+    click_seen(&mut h, "Add Property");
     h.get_by_label("Foreground color").click();
     h.run();
     let white = json!({"r":255,"g":255,"b":255,"a":255});
@@ -499,8 +646,7 @@ fn add_property_adds_a_color_and_a_window_s_size_limits() {
     h.get_by_label("Canvas Label · Label").click();
     h.run();
     let before = document(&h);
-    h.get_by_label("+ Add property").click();
-    h.run();
+    click_seen(&mut h, "Add Property");
     h.get_by_label("Foreground color").click();
     h.run();
     assert!(h.query_by_label("Foreground color").is_some(), "new color field must be expanded");
@@ -514,17 +660,16 @@ fn add_property_adds_a_color_and_a_window_s_size_limits() {
     h.run();
     h.get_by_label("Window").click();
     h.run();
-    h.get_by_label("+ Add property").scroll_to_me();
+    h.get_by_label("Add Property").scroll_to_me();
     h.run();
-    h.get_by_label("+ Add property").click();
-    h.run();
+    click_seen(&mut h, "Add Property");
     h.query_all_by_label("Window size limits")
         .find(|n| n.accesskit_node().role() != egui::accesskit::Role::Label)
         .expect("Add window limits menu entry")
         .click();
     h.run();
     assert!(h.query_by_label("Minimum width").is_some(), "new limits must be expanded");
-    assert!(h.query_by_label("Advanced properties").is_none());
+    assert!(h.query_by_label("Advanced Properties").is_none());
     let limited = document(&h);
     assert_eq!(limited["size_constraint"], json!({"x":0.0,"y":0.0,"w":0.0,"h":0.0}));
     assert!(
@@ -540,13 +685,13 @@ fn draw_layers_start_unclipped_and_clipping_written_by_hand_is_turned_off() {
     h.run();
     h.get_by_label("Canvas Button · Close").click();
     h.run();
-    h.get_by_label("Draw layers").scroll_to_me();
+    h.get_by_label("Draw Layers").scroll_to_me();
     h.run();
-    h.get_by_label("Draw layers").click();
+    h.get_by_label("Draw Layers").click();
     h.run();
-    h.get_by_label("+ Draw primitive").scroll_to_me();
+    h.get_by_label("Draw Primitive").scroll_to_me();
     h.run();
-    h.get_by_label("+ Draw primitive").click();
+    h.get_by_label("Draw Primitive").click();
     h.run();
     h.get_by_label("Rectangle").click();
     h.run();
@@ -561,7 +706,7 @@ fn draw_layers_start_unclipped_and_clipping_written_by_hand_is_turned_off() {
     doc["root"]["children"][1]["draw_list_scissor"] = json!(true);
     h.state_mut().ws.as_mut().unwrap().module.set(key, serde_json::to_vec(&doc).unwrap());
     h.run();
-    h.get_all_by_label("Turn it off").next().unwrap().click();
+    h.get_all_by_label("Turn It Off").next().unwrap().click();
     h.run();
     let doc = document(&h);
     assert_eq!(doc["root"]["children"][1]["draw_list_scissor"], false);
@@ -575,7 +720,7 @@ fn opening_draw_layers_changes_nothing() {
     h.get_by_label("Canvas Button · Close").click();
     h.run();
     let before = document(&h);
-    h.get_by_label("Draw layers").click();
+    h.get_by_label("Draw Layers").click();
     h.run();
     assert_eq!(document(&h), before, "Opening Draw layers must not add null draw_list");
     h.get_by_label("Canvas Label · Label").click();
@@ -594,8 +739,7 @@ fn add_property_offers_hover_properties_on_controls_only() {
         h.get_by_label("Canvas Button · Close").click();
         h.run();
         let before = document(&h);
-        h.get_by_label("+ Add property").click();
-        h.run();
+        click_seen(&mut h, "Add Property");
         h.query_by_label(label)
             .expect("Supported element property missing from Add property")
             .click();
@@ -605,7 +749,7 @@ fn add_property_offers_hover_properties_on_controls_only() {
         if key == "disabled_tooltip" {
             assert!(h.query_by_label("Tooltips").is_some());
             assert!(h.query_by_label(label).is_some(), "Added tooltip must be visible immediately");
-            assert!(h.query_by_label("Advanced properties").is_none());
+            assert!(h.query_by_label("Advanced Properties").is_none());
         }
         assert!(
             !mg_nui::validate(&authored, &Settings::default())
@@ -617,8 +761,7 @@ fn add_property_offers_hover_properties_on_controls_only() {
         h.run();
         h.get_by_label("Window").click();
         h.run();
-        h.get_by_label("+ Add property").click();
-        h.run();
+        click_seen(&mut h, "Add Property");
         assert!(h.query_by_label(label).is_none(), "Element-only property on Window");
     }
 }
@@ -627,18 +770,16 @@ fn add_property_offers_hover_properties_on_controls_only() {
 fn interact_still_adds_duplicates_and_deletes_controls() {
     let mut h = harness();
     h.run();
-    h.get_by_label("Interact").click();
+    nui_click(&mut h, "Interact");
     h.run();
     let original = document(&h);
-    h.get_by_label("Button").click();
-    h.run();
+    // (The Components panel's, scrolled into its section's sight.)
+    click_seen(&mut h, "Button");
     let added = document(&h);
     assert_eq!(added["root"]["children"].as_array().unwrap().len(), 3);
-    h.get_by_label("Element actions").scroll_to_me();
+    h.get_by_label("Element Actions").click();
     h.run();
-    h.get_by_label("Element actions").click();
-    h.run();
-    h.get_by_label_contains("Duplicate element").click();
+    h.get_by_label_contains("Duplicate Element").click();
     h.run();
     assert_eq!(document(&h)["root"]["children"].as_array().unwrap().len(), 4);
     // Delete over the simulated controls must never delete a design element.
@@ -647,7 +788,9 @@ fn interact_still_adds_duplicates_and_deletes_controls() {
     h.key_press(egui::Key::Delete);
     h.run();
     assert_eq!(document(&h)["root"]["children"].as_array().unwrap().len(), 4);
-    h.hover_at(h.get_by_label("Layers").rect().center());
+    // (The copy's row in Layers, after the control it is a copy of: they
+    // have the keys, the copy chosen.)
+    h.get_all_by_label("Button · Button").last().unwrap().click();
     h.run();
     h.key_press(egui::Key::Delete);
     h.run();
@@ -664,12 +807,9 @@ fn a_window_resized_on_the_canvas_is_one_undo_step() {
     for live in [false, true] {
         let mut h = harness();
         h.run();
-        h.get_by_label("UI scale 100%").click();
-        h.run();
-        h.get_by_label("150%").click();
-        h.run();
+        view_choose(&mut h, "UI scale", "150%");
         if live {
-            h.get_by_label("Interact").click();
+            nui_click(&mut h, "Interact");
             h.run();
         }
         h.get_by_label("Canvas window").click();
@@ -721,6 +861,47 @@ fn a_window_resized_on_the_canvas_is_one_undo_step() {
     }
 }
 
+/// What the canvas works out of the window (its layout, the pictures and
+/// strings it names) is kept from one frame to the next while nothing can
+/// have changed the window, and worked out again after an edit on the
+/// canvas, an Undo made in the module between frames, and in Interact;
+/// what is drawn follows each (in a debug build, as the tests run, each
+/// value kept is also worked out again and compared).
+#[test]
+fn the_canvas_keeps_its_layout_only_while_the_window_is_unchanged() {
+    let mut h = harness();
+    h.run();
+    let kept = |h: &Harness<'_, Moonglow>| h.state().nui_kept(&key());
+    let closes = |h: &Harness<'_, Moonglow>| h.query_all_by_label("Canvas Button · Close").count();
+    let (generation, carried) = kept(&h);
+    h.run_steps(6);
+    let (now, carried_now) = kept(&h);
+    assert_eq!(now, generation, "frames that change nothing are of one generation");
+    assert!(carried_now >= carried + 5, "the layout kept: {carried} then {carried_now}");
+    // An edit on the canvas: a control duplicated.
+    h.get_by_label("Canvas Button · Close").click();
+    h.run();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+    h.run();
+    assert!(kept(&h).0 > now, "a new generation after the edit");
+    assert_eq!(closes(&h), 2, "the duplicate drawn");
+    let edited = kept(&h).0;
+    h.run_steps(4);
+    assert_eq!(kept(&h).0, edited, "and kept again once nothing changes");
+    // Undo in the module, between frames.
+    undo(&mut h);
+    assert!(kept(&h).0 > edited, "a new generation after Undo");
+    assert_eq!(closes(&h), 1, "the duplicate gone from the canvas");
+    // Interact: a session of the same window, kept with it.
+    nui_click(&mut h, "Interact");
+    h.run();
+    assert!(h.state().nui_interacts(&key()));
+    let interacting = kept(&h).0;
+    h.run_steps(4);
+    assert_eq!(kept(&h).0, interacting, "Interact's frames that change nothing");
+    assert_eq!(closes(&h), 1);
+}
+
 #[test]
 fn keys_duplicate_move_delete_undo_and_redo() {
     let mut h = harness();
@@ -759,11 +940,12 @@ fn a_control_selected_on_the_canvas_is_revealed_in_collapsed_layers() {
         h.get_all_by_label("Button · Close")
             .any(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
     );
-    h.get_by_label("Collapse all").click();
+    // (The layers': the module tree has the same pair.)
+    h.get_by_label("Outliner Header").get_by_label("Collapse All").click();
     h.run();
     assert!(h.query_by_label("Collapse Column").is_none());
     assert!(h.query_by_label("Expand Column").is_none());
-    h.get_by_label("Expand all").click();
+    h.get_by_label("Outliner Header").get_by_label("Expand All").click();
     h.run();
     assert!(
         h.get_all_by_label("Button · Close")
@@ -825,13 +1007,15 @@ fn a_list_resized_on_the_canvas_is_one_undo_step_and_escape_calls_it_off() {
 #[test]
 fn new_nui_window_asks_for_its_name() {
     let mut h = harness();
-    // (From the command palette, as Tools › New NUI Window… gives it.)
+    // (From the Command Palette, Quick Open among the commands, as Tools ›
+    // New NUI Window… gives it.)
     h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P);
     h.run();
-    let hint = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
-        n.placeholder() == Some("Type a command's name")
+    let field = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+        n.label().as_deref() == Some(mg_ui::quick_open::NAME)
+            && n.role() != egui::accesskit::Role::Button
     };
-    h.get(egui_kittest::kittest::by().predicate(hint)).type_text("New NUI Window");
+    h.get(egui_kittest::kittest::by().predicate(field)).type_text("New NUI Window");
     h.run();
     h.key_press(egui::Key::Enter);
     h.run();
@@ -849,6 +1033,7 @@ fn new_nui_window_asks_for_its_name() {
     assert!(h.state().log.entries.iter().any(|(_, line)| line.contains("fifteen_letters")));
     assert!(name(&h).is_some(), "the window stays, for the name to be mended");
     h.get_all_by_role(egui::accesskit::Role::TextInput)
+        .filter(|n| n.accesskit_node().label().as_deref() != Some("Quick Open"))
         .find(|n| n.accesskit_node().value().as_deref() == Some("fifteen_letters"))
         .expect("the name, as it was typed")
         .click();
@@ -932,8 +1117,7 @@ fn deleting_a_window_says_its_script_s_unsaved_text_and_undo_brings_it_back() {
     let script = ResKey::parse("nui_test_e", ResType::NSS).unwrap();
     h.get_by_label("Canvas Button · Close").click();
     h.run();
-    h.get_by_label("Edit code").click();
-    h.run();
+    click_seen(&mut h, "Edit Code");
     h.state_mut().script_tools.jump = Some((script, 0));
     h.run();
     h.event(egui::Event::Text("// typed\n".into()));
@@ -960,10 +1144,7 @@ fn deleting_a_window_says_its_script_s_unsaved_text_and_undo_brings_it_back() {
 #[test]
 fn cancel_after_a_build_leaves_a_window_that_builds() {
     let root = mg_testkit::corpus!();
-    let mut app = Moonglow::new(
-        Some(mg_resman::GameInstall::new(root, None, "en")),
-        Box::new(NoDialogs::default()),
-    );
+    let mut app = game_app(mg_resman::GameInstall::new(root, None, "en"), NoDialogs::default());
     let mut m = mg_module::Module::new();
     m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
     app.ws = Some(mg_edit::Workspace::new(m));
@@ -996,6 +1177,45 @@ fn cancel_after_a_build_leaves_a_window_that_builds() {
     assert!(built(h.state()), "the scripts are those of the window as it was");
     h.state_mut().run(build);
     assert!(built(h.state()), "and Build goes through");
+}
+
+/// The same with the Creator's tab closed (Close, Close All, Ctrl+W: what
+/// `CloseTabs` does) and Options' "Closing a window cancels its changes"
+/// on: the window as it was, its scripts those of the window as it was.
+#[test]
+fn closing_the_creator_after_a_build_cancels_when_asked() {
+    let root = mg_testkit::corpus!();
+    let mut app = game_app(mg_resman::GameInstall::new(root, None, "en"), NoDialogs::default());
+    app.settings.close_cancels = true;
+    let mut m = mg_module::Module::new();
+    m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
+    app.ws = Some(mg_edit::Workspace::new(m));
+    app.run(Action::NewNui("nui_test".into()));
+    let build = Action::GenerateNui { name: "nui_test".into(), export: false };
+    app.run(build.clone());
+    let built = |app: &Moonglow| {
+        let module = &app.ws.as_ref().unwrap().module;
+        let name = |t| ResKey::new(key().resref, t);
+        let window = mg_nui::parse(module.get(&name(ResType::JUI)).unwrap()).unwrap();
+        let settings = Settings::parse(module.get(&name(ResType::TXT)).unwrap()).unwrap();
+        mg_nui::is_current(module, "nui_test", &window, &settings)
+    };
+    let mut h = creator(app, [1200, 850]);
+    h.state_mut().run(Action::OpenTab(Tab::Nui(key())));
+    h.run();
+    let opened = document(&h);
+    h.get_all_by_label("Button · Close").next().unwrap().click();
+    h.run();
+    h.key_press(egui::Key::Delete);
+    h.run();
+    h.state_mut().run(build);
+    h.run();
+    assert_ne!(document(&h), opened);
+    h.state_mut().actions.push(Action::CloseTabs(vec![Tab::Nui(key())]));
+    h.run_steps(3);
+    assert!(h.state().dock.find_tab(&Tab::Nui(key())).is_none(), "closed");
+    assert_eq!(document(&h), opened, "as it was");
+    assert!(built(h.state()), "the scripts are those of the window as it was");
 }
 
 /// Cancel leaves the event script's code: what was written in its
@@ -1046,14 +1266,17 @@ fn cancel_sets_back_the_window_and_keeps_the_code_written_in_the_event_script() 
 /// took it for one.
 #[test]
 fn text_that_is_no_object_is_no_window() {
+    let mut h = creator(app(), [1200, 850]);
+    h.state_mut().run(Action::OpenTab(Tab::Nui(key())));
     for text in ["[]", "7", "\"window\""] {
-        let mut app = app();
         let edit = mg_edit::Edit::SetResource { key: key(), data: Some(text.as_bytes().to_vec()) };
-        app.run(Action::Apply(mg_edit::Command::new("By hand", vec![edit])));
-        let mut h = creator(app, [1200, 850]);
-        h.state_mut().run(Action::OpenTab(Tab::Nui(key())));
+        h.state_mut().run(Action::Apply(mg_edit::Command::new("By hand", vec![edit])));
         h.run_steps(3);
         assert!(h.state().dock.find_tab(&Tab::Nui(key())).is_some(), "{text}");
+        assert!(
+            h.query_by_label_contains("A window is a JSON object").is_some(),
+            "{text}: expected non-object error message"
+        );
     }
 }
 
@@ -1138,7 +1361,10 @@ fn keys_are_left_to_a_text_field_a_menu_and_what_is_outside_the_editor() {
     h.run();
     let before = document(&h);
     // Search text gets Delete and clipboard keys even with an element selected.
-    h.get_all_by_role(egui::accesskit::Role::TextInput).next().unwrap().click();
+    // (The editor's own search: the module tree has a Filter field too.)
+    let search =
+        |n: &egui_kittest::kittest::AccessKitNode<'_>| n.placeholder() == Some("Find a control…");
+    h.get(egui_kittest::kittest::by().predicate(search)).click();
     h.run();
     h.key_press(egui::Key::Delete);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
@@ -1147,7 +1373,7 @@ fn keys_are_left_to_a_text_field_a_menu_and_what_is_outside_the_editor() {
     assert_eq!(document(&h), before);
     h.get_by_label("Canvas Button · Close").click();
     h.run();
-    h.get_by_label("Element actions").click();
+    h.get_by_label("Element Actions").click();
     h.run();
     h.key_press(egui::Key::Delete);
     h.run();
@@ -1191,7 +1417,7 @@ fn a_control_dragged_from_the_palette_lands_where_it_is_dropped_in_layers() {
             let mut h = harness();
             h.run();
             if live {
-                h.get_by_label("Interact").click();
+                nui_click(&mut h, "Interact");
                 h.run();
             }
             let before = document(&h);
@@ -1226,7 +1452,7 @@ fn a_control_dragged_from_the_palette_onto_the_canvas_joins_that_container() {
         let mut h = creator(app(), [1200, 850]);
         h.run();
         if live {
-            h.get_by_label("Interact").click();
+            nui_click(&mut h, "Interact");
             h.run();
         }
         let from = h.get_by_label("Row").rect().center();
@@ -1253,18 +1479,13 @@ fn source_typed_is_the_module_s_when_its_field_is_left_even_if_it_does_not_read(
     let mut h = creator(app(), [1200, 850]);
     h.run();
     let before = h.state().ws.as_ref().unwrap().module.get(&key).unwrap().to_vec();
-    h.get_by_label("Advanced").click();
-    h.run();
-    h.get_by_label("JUI source").click();
-    h.run();
-    h.get_all_by_role(egui::accesskit::Role::MultilineTextInput).next().unwrap().click();
+    // (The source group, M4's U19: its switch on JUI Source.)
+    view_choose(&mut h, "Layout", "Split source");
+    h.get_by_label(mg_ui::nui_names::SOURCE_TEXT).click();
     h.run();
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     h.run();
-    h.get_all_by_role(egui::accesskit::Role::MultilineTextInput)
-        .next()
-        .unwrap()
-        .type_text("invalid draft");
+    h.get_by_label(mg_ui::nui_names::SOURCE_TEXT).type_text("invalid draft");
     h.run();
     // A draft is the tab's until its field is left: then it is the
     // module's, also one that doesn't read.
@@ -1279,9 +1500,8 @@ fn source_typed_is_the_module_s_when_its_field_is_left_even_if_it_does_not_read(
     assert_eq!(ws.module.get(&key).unwrap(), before);
     ws.redo().unwrap();
     assert_eq!(ws.module.get(&key).unwrap(), draft);
-    h.get_by_label("Design").click();
-    h.run();
-    h.get_by_label_contains("The window's JSON doesn't read");
+    page(&mut h, "Design");
+    assert!(h.query_all_by_label_contains("The window's JSON doesn't read").next().is_some());
 }
 
 /// Split source's canvas shows the window as it is typed, where it reads,
@@ -1289,15 +1509,11 @@ fn source_typed_is_the_module_s_when_its_field_is_left_even_if_it_does_not_read(
 #[test]
 fn split_source_shows_on_the_canvas_what_is_typed() {
     let mut h = harness();
-    h.get_by_value("Editor").click();
-    h.run();
-    h.get_by_label("Split source").click();
-    h.run();
+    view_choose(&mut h, "Layout", "Split source");
     let before = document(&h);
     let mut typed = before.clone();
     typed["root"]["children"][0]["value"] = json!("Typed live");
-    let field = || egui::accesskit::Role::MultilineTextInput;
-    h.get_all_by_role(field()).next().unwrap().click();
+    h.get_by_label(mg_ui::nui_names::SOURCE_TEXT).click();
     h.run();
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     h.run();
@@ -1331,6 +1547,7 @@ fn an_empty_option_and_picture_name_say_what_goes_in_them() {
     h.run();
     let hinted = |h: &Harness<'_, Moonglow>, hint: &str| {
         h.get_all_by_role(egui::accesskit::Role::TextInput)
+            .filter(|n| n.accesskit_node().label().as_deref() != Some("Quick Open"))
             .any(|n| n.accesskit_node().placeholder() == Some(hint))
     };
     h.get_by_label_contains("Canvas Image").click();
@@ -1352,8 +1569,7 @@ fn a_sixteen_letter_name_and_settings_that_do_not_read_open() {
     module.set(ResKey::new(key.resref, ResType::TXT), b"unrelated text".to_vec());
     app.actions.push(Action::OpenTab(Tab::Nui(key)));
     let mut h = creator(app, [1200, 850]);
-    h.get_by_label("Bindings").click();
-    h.run();
+    page(&mut h, "Bindings");
 }
 
 /// Code typed into the window's event script is built without saving it
@@ -1361,10 +1577,7 @@ fn a_sixteen_letter_name_and_settings_that_do_not_read_open() {
 #[test]
 fn build_takes_the_window_s_own_scripts_as_typed() {
     let root = mg_testkit::corpus!();
-    let mut app = Moonglow::new(
-        Some(mg_resman::GameInstall::new(root, None, "en")),
-        Box::new(NoDialogs::default()),
-    );
+    let mut app = game_app(mg_resman::GameInstall::new(root, None, "en"), NoDialogs::default());
     let mut m = mg_module::Module::new();
     m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
     let other = ResKey::parse("other", ResType::NSS).unwrap();
@@ -1425,10 +1638,7 @@ fn build_adds_what_it_compiled_to_the_compile_memory() {
     let mut m = mg_module::Module::new();
     m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
     m.save_as(&mg_module::ModuleLocation::Archive(path.clone())).unwrap();
-    let mut app = Moonglow::new(
-        Some(mg_resman::GameInstall::new(root, None, "en")),
-        Box::new(NoDialogs::default()),
-    );
+    let mut app = game_app(mg_resman::GameInstall::new(root, None, "en"), NoDialogs::default());
     app.ws = Some(mg_edit::Workspace::new(mg_module::Module::open(&path).unwrap()));
     let kept = dir.join("compiled");
     std::fs::create_dir_all(&kept).unwrap();
@@ -1456,10 +1666,7 @@ fn build_adds_what_it_compiled_to_the_compile_memory() {
 #[test]
 fn export_says_the_pictures_it_leaves_behind() {
     let root = mg_testkit::corpus!();
-    let mut app = Moonglow::new(
-        Some(mg_resman::GameInstall::new(root, None, "en")),
-        Box::new(NoDialogs::default()),
-    );
+    let mut app = game_app(mg_resman::GameInstall::new(root, None, "en"), NoDialogs::default());
     let mut m = mg_module::Module::new();
     m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
     app.ws = Some(mg_edit::Workspace::new(m));
@@ -1480,10 +1687,7 @@ fn export_says_the_pictures_it_leaves_behind() {
 #[test]
 fn export_compiles_the_window_s_files_and_leaves_the_module_s_events() {
     let root = mg_testkit::corpus!();
-    let mut app = Moonglow::new(
-        Some(mg_resman::GameInstall::new(root, None, "en")),
-        Box::new(NoDialogs::default()),
-    );
+    let mut app = game_app(mg_resman::GameInstall::new(root, None, "en"), NoDialogs::default());
     let mut m = mg_module::Module::new();
     let mut info = mg_gff::Gff::new(*b"IFO ");
     info.root.set("Mod_OnNuiEvent", mg_gff::Value::ResRef(b"my_event".to_vec()));
@@ -1600,13 +1804,9 @@ fn windows_written_by_hand_reach_every_page_and_interact() {
         ws.module.set(ResKey::parse("nui_test", ResType::TXT).unwrap(), settings.bytes());
         let mut h = creator(app, [1200, 850]);
         h.run();
-        if let Some(interact) = h.query_by_label("Interact") {
-            interact.click();
-            h.run();
-        }
-        for page in ["Bindings", "Events & variants", "Design"] {
-            h.get_by_label(page).click();
-            h.run();
+        nui_click(&mut h, "Interact");
+        for name in ["Bindings", "Events & Variants", "Images", "Design"] {
+            page(&mut h, name);
         }
     }
 }
@@ -1678,7 +1878,7 @@ fn text_typed_is_set_when_layers_selects_another_control() {
     h.run();
     h.get_by_label("Element ID").type_text("_typed");
     h.run();
-    let row = h.get_all_by_label("Label · Label").next().expect("its row in Layers").rect();
+    let row = h.get_all_by_label("Label · Label").next().expect("its row in the Outliner").rect();
     h.hover_at(row.center());
     h.run();
     h.drag_at(row.center());
@@ -1689,6 +1889,57 @@ fn text_typed_is_set_when_layers_selects_another_control() {
     // (The label is selected now: its text is in Properties.)
     h.get_by_label("Text");
     assert!(after["root"]["children"][0]["id"].is_null(), "the label has no ID of its own");
+}
+
+/// A long list of problems (a window written by a script, a mistake a
+/// control) lays out the lines in sight, a line a finding, errors first:
+/// it laid out every finding in every frame, on every page of the tab.
+/// The first one's link still selects its control, and a fix still fixes.
+#[test]
+fn a_long_list_of_problems_lays_out_the_lines_in_sight() {
+    let mut h = harness();
+    h.run();
+    let mut window = document(&h);
+    let controls: Vec<Value> = (0..600)
+        .map(|i| match i % 2 {
+            0 => json!({"type":"textedit","label":format!("Name {i}"),"max":0}),
+            _ => json!({"type":"label","value":format!("Label {i}"),
+                "draw_list":[],"draw_list_scissor":true}),
+        })
+        .collect();
+    window["root"]["children"] = controls.into();
+    h.state_mut().ws.as_mut().unwrap().module.set(key(), serde_json::to_vec(&window).unwrap());
+    h.run();
+    // (New errors opened the list.)
+    let marks = |h: &Harness<'_, Moonglow>, mark: &str| h.query_all_by_label(mark).count();
+    let errors = marks(&h, "Error");
+    assert!((3..30).contains(&errors), "{errors} lines of 600 errors are laid out");
+    assert_eq!(marks(&h, "Warning"), 0, "the errors come first");
+    assert!(h.query_by_label("Text input · Name 0 › Max").is_some());
+    assert!(h.query_by_label("Text input · Name 598 › Max").is_none(), "far down the list");
+    // Each on a line of its own, one under the other.
+    let tops: Vec<f32> = h.query_all_by_label("Error").map(|n| n.rect().top()).collect();
+    assert!(tops.windows(2).all(|t| t[1] - t[0] > 10.0 && t[1] - t[0] < 30.0), "{tops:?}");
+    h.get_by_label("Text input · Name 0 › Max").click();
+    h.run();
+    assert!(h.query_by_label("Placeholder").is_some(), "the text input's properties show");
+    // With the errors gone, the warnings are the lines, their fixes beside
+    // them: Turn It Off, of a draw list's clip.
+    let mut window = document(&h);
+    for control in window["root"]["children"].as_array_mut().unwrap() {
+        if control["type"] == "textedit" {
+            control["max"] = json!(40);
+            control["value"] = json!({"bind": "name"});
+        }
+    }
+    h.state_mut().ws.as_mut().unwrap().module.set(key(), serde_json::to_vec(&window).unwrap());
+    h.run();
+    assert!(marks(&h, "Error") < 5, "the text inputs' errors are gone");
+    let fixes = marks(&h, "Turn It Off");
+    assert!((3..30).contains(&fixes), "{fixes} fixes in sight");
+    h.get_all_by_label("Turn It Off").next().unwrap().click();
+    h.run();
+    assert_eq!(document(&h)["root"]["children"][1]["draw_list_scissor"], false);
 }
 
 /// A problem's link, pressed and released in one frame while a field of
@@ -1736,6 +1987,20 @@ fn a_number_dragged_is_one_undo_step() {
     h.run();
     let (before, at) = (document(&h), revision(&h));
     let height = before["root"]["children"][1]["height"].as_f64().expect("a button's height");
+    // (Brought into the Properties panel's sight: its Property Binding is
+    // over it since M4's U18.)
+    let spin =
+        |n: &egui_kittest::Node<'_>| n.accesskit_node().role() == egui::accesskit::Role::SpinButton;
+    h.get_all_by_label("Height").find(spin).unwrap().scroll_to_me();
+    let started = std::time::Instant::now();
+    let (mut last, mut still) = (None, 0);
+    while still < 4 {
+        h.run_steps(1);
+        let rect = h.get_all_by_label("Height").find(spin).unwrap().rect();
+        still = if last == Some(rect) { still + 1 } else { 0 };
+        assert!(started.elapsed().as_secs() < 30, "Height never came to rest in sight");
+        last = Some(rect);
+    }
     let field = h
         .get_all_by_label("Height")
         .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
@@ -1765,16 +2030,16 @@ fn a_number_dragged_is_one_undo_step() {
 #[test]
 fn a_selection_undo_takes_away_is_cleared() {
     let mut h = harness();
-    h.get_by_label("Toggle button").click();
-    h.run();
+    click_seen(&mut h, "Toggle Button");
     // (Added last, and selected: Properties shows its ID.)
     assert_eq!(document(&h)["root"]["children"].as_array().unwrap().len(), 3);
     h.get_by_label("Element ID");
-    h.get_by_label("Draw layers").click();
+    // (Its heading is below the properties' pane's edge until scrolled to.)
+    click_last_in_sight(&mut h, "Draw Layers");
     h.run();
-    h.get_by_label("+ Draw primitive").scroll_to_me();
+    h.get_by_label("Draw Primitive").scroll_to_me();
     h.run();
-    h.get_by_label("+ Draw primitive").click();
+    h.get_by_label("Draw Primitive").click();
     h.run();
     h.get_by_label("Rectangle").click();
     h.run();
@@ -1789,9 +2054,8 @@ fn a_selection_undo_takes_away_is_cleared() {
     assert!(h.query_by_label("Element ID").is_none(), "no control's properties");
     assert!(h.query_by_label("Draw layer 1 · Rectangle").is_none());
     // The pages that don't show the selection draw too.
-    for page in ["Bindings", "Events & variants", "Design"] {
-        h.get_by_label(page).click();
-        h.run();
+    for name in ["Bindings", "Events & Variants", "Images", "Design"] {
+        page(&mut h, name);
     }
 }
 
@@ -1804,17 +2068,15 @@ fn events_harness(action: mg_nui::Action) -> Harness<'static, Moonglow> {
     };
     app.ws.as_mut().unwrap().module.set(ResKey::new(key().resref, ResType::TXT), settings.bytes());
     let mut h = creator(app, [1100, 1100]);
-    h.get_by_label("Events & variants").click();
-    h.run();
+    page(&mut h, "Events & Variants");
     h
 }
 
 #[test]
 fn the_bindings_page_adds_a_bind_s_change_handler() {
     let mut h = events_harness(mg_nui::Action::Close);
-    h.get_by_label("Bindings").click();
-    h.run();
-    h.get_by_label("+ Create bind").click();
+    page(&mut h, "Bindings");
+    h.get_by_label("Create Bind").click();
     h.run();
     h.get_by_label("Bind name").click();
     h.run();
@@ -1823,7 +2085,7 @@ fn the_bindings_page_adds_a_bind_s_change_handler() {
     h.get_by_label("Create").click();
     h.run();
     let before = settings(&h);
-    h.get_by_label("+ Add handler").click();
+    leftmost(&h, "Add Handler").click();
     h.run();
     let after = settings(&h);
     assert!(
@@ -1839,9 +2101,8 @@ fn the_bindings_page_adds_a_bind_s_change_handler() {
 #[test]
 fn binds_are_renamed_and_deleted_with_their_handlers() {
     let mut h = events_harness(mg_nui::Action::Close);
-    h.get_by_label("Bindings").click();
-    h.run();
-    h.get_by_label("+ Create bind").click();
+    page(&mut h, "Bindings");
+    h.get_by_label("Create Bind").click();
     h.run();
     h.get_by_label("Bind name").click();
     h.run();
@@ -1849,7 +2110,7 @@ fn binds_are_renamed_and_deleted_with_their_handlers() {
     h.run();
     h.get_by_label("Create").click();
     h.run();
-    h.get_by_label("+ Add handler").click();
+    leftmost(&h, "Add Handler").click();
     h.run();
     h.get_by_label("Name").click();
     h.run();
@@ -1873,7 +2134,8 @@ fn binds_are_renamed_and_deleted_with_their_handlers() {
 fn a_drag_in_the_editor_does_not_move_its_window() {
     let mut h = events_harness(mg_nui::Action::Close);
     let place = |h: &Harness<'_, Moonglow>| {
-        (h.get_by_label("Swap layout variants").rect(), h.get_by_label("Bindings").rect())
+        let pages = h.get_by_label(mg_ui::nui_names::NUI_HEADER);
+        (h.get_by_label("Swap Layout Variants").rect(), pages.get_by_label("Bindings").rect())
     };
     let before = place(&h);
     let from = before.0.center();
@@ -1886,9 +2148,8 @@ fn a_drag_in_the_editor_does_not_move_its_window() {
     h.drop_at(from + egui::vec2(60.0, 30.0));
     h.run();
     assert_eq!(place(&h), before);
-    h.get_by_label("Bindings").click();
-    h.run();
-    h.get_by_label("+ Create bind");
+    page(&mut h, "Bindings");
+    h.get_by_label("Create Bind");
 }
 
 /// The Creator's Import… brings windows in from the files chosen, as `mg
@@ -1914,7 +2175,7 @@ fn import_brings_windows_into_the_module_from_the_creator() {
         ..Default::default()
     };
     let mut h = creator(app_with("nui_test", dialogs), [1300, 900]);
-    h.get_by_label("Import…").click();
+    nui_click(&mut h, "Import…");
     h.run_steps(3);
     let module = |h: &Harness<'_, Moonglow>| h.state().ws.as_ref().unwrap().module.clone();
     let m = module(&h);
@@ -1959,12 +2220,10 @@ fn import_brings_windows_into_the_module_from_the_creator() {
 #[test]
 fn the_event_function_is_chosen_under_client_delivery() {
     let mut h = harness();
-    h.get_by_label("Bindings").click();
-    h.run();
-    h.get_by_label("Client delivery").click();
-    h.run();
+    page(&mut h, "Bindings");
+    // (Under the Bindings panel's table, M4's U19.)
     assert!(!settings(&h).event_function);
-    h.get_by_label("Events go to the module's event script (a function to call)").click();
+    h.get_by_label("Events go to the module's event script").click();
     h.run();
     assert!(settings(&h).event_function);
     undo(&mut h);
@@ -2530,10 +2789,7 @@ fn the_layout_off_the_screen_is_the_canvas_s() {
     app.actions.push(Action::OpenTab(Tab::Nui(ResKey::parse("crier", ResType::JUI).unwrap())));
     let mut h = creator(app, [1300, 900]);
     h.run_steps(3);
-    h.get_by_value("Editor").click();
-    h.run();
-    h.get_by_label("Preview only").click();
-    h.run();
+    view_choose(&mut h, "Layout", "Preview only");
     h.get_by_label("100%").click();
     h.run_steps(3);
     let window = h.get_by_label("Canvas window").rect().min;
@@ -2607,19 +2863,16 @@ fn the_layout_says_what_does_not_fit() {
 fn a_window_drawn_off_the_screen_is_where_its_layout_says_in_any_state() {
     use mg_ui::nui_render::{Look, Options, layout, render};
     mg_testkit::gpu::hold();
-    let Some(gpu) = mg_render::Gpu::headless() else {
-        eprintln!("skipped: no GPU adapter");
-        return;
-    };
+    let Some(gpu) = shared_gpu() else { return };
     // With the game's skin and fonts when it is installed.
     let game = mg_testkit::nwn_root().and_then(|root| {
-        mg_resman::ResMan::for_game(&mg_resman::GameInstall::new(&root, None, "en")).ok()
+        mg_testkit::shared_resman(&mg_resman::GameInstall::new(&root, None, "en")).ok()
     });
     let m = crier();
     let window = mg_ui::nui_render::Window { resman: game.as_ref(), ..crier_window(&m) };
     for scale in [1.0, 2.0] {
         let options = Options { scale, ..Default::default() };
-        let picture = render(&gpu, &window, &options).unwrap();
+        let picture = render(gpu, &window, &options).unwrap();
         let laid = layout(&window, &options).unwrap();
         assert_eq!(picture.layout, laid);
         let size = ((420.0 * scale) as u32, (300.0 * scale) as u32);
@@ -2648,10 +2901,10 @@ fn a_window_drawn_off_the_screen_is_where_its_layout_says_in_any_state() {
         assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), picture.width);
     }
 
-    let plain = render(&gpu, &window, &Options::default()).unwrap();
+    let plain = render(gpu, &window, &Options::default()).unwrap();
     let o =
         Options { states: [(Some("cancel".to_owned()), Look::Hover)].into(), ..Default::default() };
-    let hovered = render(&gpu, &window, &o).unwrap();
+    let hovered = render(gpu, &window, &o).unwrap();
     assert_eq!(hovered.layout, layout(&window, &o).unwrap());
     let cancel =
         hovered.layout.elements.iter().find(|e| e.id.as_deref() == Some("cancel")).unwrap();
@@ -2677,7 +2930,7 @@ fn a_window_drawn_off_the_screen_is_where_its_layout_says_in_any_state() {
         states: [(Some("read".to_owned()), Look::Hover)].into(),
         ..Default::default()
     };
-    let picture = render(&gpu, &window, &o).unwrap();
+    let picture = render(gpu, &window, &o).unwrap();
     assert_eq!(picture.layout, layout(&window, &o).unwrap());
     let pixel = |x: f32, y: f32| {
         let i = ((y as u32 * picture.width + x as u32) * 4) as usize;
@@ -2697,7 +2950,7 @@ fn a_window_drawn_off_the_screen_is_where_its_layout_says_in_any_state() {
     }
     // The variant: drawn as laid out too.
     let o = Options { variants: vec!["details".into()], states: Default::default(), ..o };
-    let picture = render(&gpu, &window, &o).unwrap();
+    let picture = render(gpu, &window, &o).unwrap();
     assert_eq!(picture.layout, layout(&window, &o).unwrap());
 }
 
@@ -2898,10 +3151,7 @@ fn a_renamed_window_takes_its_settings_and_scripts_and_one_undo_brings_them_back
 #[test]
 fn a_renamed_window_is_built_under_its_new_name() {
     let root = mg_testkit::corpus!();
-    let app = Moonglow::new(
-        Some(mg_resman::GameInstall::new(root, None, "en")),
-        Box::new(NoDialogs::default()),
-    );
+    let app = game_app(mg_resman::GameInstall::new(root, None, "en"), NoDialogs::default());
     let mut app = shop(app);
     app.run(Action::GenerateNui { name: "shop".into(), export: false });
     let before = resources(&app);
@@ -2997,4 +3247,118 @@ fn a_window_rename_leaves_a_text_that_is_not_the_window_s_settings() {
     assert!(module.contains(&res("notes_e", ResType::NSS)));
     assert!(!module.contains(&res("pages", ResType::TXT)));
     assert_eq!(resources(&app).len(), before);
+}
+
+/// What the client does with a window's root and a column's fit, held to
+/// its screenshots (`client_nui`, 8193.37-17; the TDoD Design session's
+/// report): a group root's draw list isn't drawn, where a column root's
+/// is; a group root's border is 4 points out in the window's inset, its
+/// child where it would be without it; a column as wide as what it holds
+/// is said refused in a row, and not in a group.
+#[test]
+fn a_group_root_and_a_column_s_fit_are_as_the_client_has_them() {
+    use mg_ui::nui_render::{Options, layout, render};
+    let magenta = json!({"r":255,"g":0,"b":255,"a":255});
+    let rect = json!([{"type":7,"enabled":true,"color":magenta,"fill":true,"line_thickness":1.0,
+        "order":1,"render":0,"rect":{"x":0.0,"y":0.0,"w":120.0,"h":40.0}}]);
+    let window = |root: Value| {
+        let mut doc = mg_nui::window();
+        doc["geometry"] = json!({"x":-1.0,"y":-1.0,"w":400.0,"h":300.0});
+        doc["root"] = root;
+        let mut m = mg_module::Module::new();
+        m.set(ResKey::parse("w", ResType::JUI).unwrap(), serde_json::to_vec(&doc).unwrap());
+        m
+    };
+    let spacer = json!({"type":"spacer","width":120.0,"height":40.0,"draw_list_scissor":false,
+        "draw_list":rect});
+    let label = |w: f64| json!({"type":"label","value":"L","width":w,"height":30.0});
+    let col = |w: f64, child: Value| json!({"type":"col","width":w,"children":[child]});
+    // The fit, said or not.
+    let refused = |root: Value| {
+        let m = window(root);
+        let w = mg_ui::nui_render::Window { name: "w", ..crier_window(&m) };
+        let l = layout(&w, &Options::default()).unwrap();
+        l.issues.iter().any(|i| i.contains("NWN refuses this window"))
+    };
+    let row = json!({"type":"row","height":40.0,"children":[col(316.0, label(316.0))]});
+    let group = json!({"type":"group","height":40.0,"children":[col(316.0, label(316.0))]});
+    assert!(refused(json!({"type":"col","children":[row]})));
+    assert!(!refused(json!({"type":"col","children":[group]})));
+    // The group root's child, where the client has it.
+    let root = json!({"type":"group","draw_list_scissor":false,"draw_list":rect,
+        "children":[spacer]});
+    let m = window(root.clone());
+    let w = mg_ui::nui_render::Window { name: "w", ..crier_window(&m) };
+    let l = layout(&w, &Options::default()).unwrap();
+    let child = l.elements.iter().find(|e| e.path == "/root/children/0").unwrap();
+    assert_eq!((child.area.x, child.area.y), (12.0, 45.0), "{l:#?}");
+    mg_testkit::gpu::hold();
+    let Some(gpu) = shared_gpu() else { return };
+    let count = |root: Value| {
+        let m = window(root);
+        let w = mg_ui::nui_render::Window { name: "w", ..crier_window(&m) };
+        let p = render(gpu, &w, &Options::default()).unwrap();
+        p.rgba.chunks(4).filter(|c| c[..3] == [255, 0, 255]).count()
+    };
+    // The spacer's alone: the group root's own isn't drawn.
+    assert_eq!(count(root), 4_800);
+    let col_root = json!({"type":"col","draw_list_scissor":false,"draw_list":rect,
+        "children":[label(200.0)]});
+    assert_eq!(count(col_root), 4_800, "a column root's is");
+}
+
+/// "Not built" in the Status Bar until a build (M4's U19, the plan's): said
+/// in `warn` beside the designer docked in front, gone once Build has made
+/// its scripts, back as the window changes; "Build failed" where a Build
+/// fails (no game). Floating, the window's header says it (the Status Bar
+/// is the main window's).
+#[test]
+fn not_built_is_said_until_a_build() {
+    use mg_ui::nui_names::{BUILD_STATE, NUI_HEADER};
+    let root = mg_testkit::corpus!();
+    for tabs in [true, false] {
+        let what = if tabs { "As Tabs" } else { "floating" };
+        let mut app =
+            game_app(mg_resman::GameInstall::new(root.clone(), None, "en"), NoDialogs::default());
+        if tabs {
+            app.settings.open_editors = mg_ui::OpenEditors::Tabs;
+        }
+        let mut m = mg_module::Module::new();
+        m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
+        app.ws = Some(mg_edit::Workspace::new(m));
+        app.run(Action::NewNui("nui_test".into()));
+        let mut h = creator(app, [1500, 850]);
+        h.run();
+        let says = |h: &Harness<'_, Moonglow>, words: &str| match tabs {
+            true => h.state().status_said().iter().any(|s| s == words),
+            false => {
+                mg_uikit::header::records(&h.ctx, NUI_HEADER)
+                    .first()
+                    .is_some_and(|r| r.places.iter().any(|(n, _)| n == BUILD_STATE))
+                    && h.query_by_label(words).is_some()
+            }
+        };
+        assert!(says(&h, "Not built"), "{what}: not built yet");
+        h.state_mut().run(Action::GenerateNui { name: "nui_test".into(), export: false });
+        h.run();
+        assert!(!says(&h, "Not built") && !says(&h, "Build failed"), "{what}: built");
+        // The window changed: not built again.
+        let mut w = document(&h);
+        w["title"] = json!("Changed");
+        h.state_mut().ws.as_mut().unwrap().module.set(key(), serde_json::to_vec(&w).unwrap());
+        h.run();
+        assert!(says(&h, "Not built"), "{what}: changed since");
+    }
+    // A Build that fails (no game): said, As Tabs, in the Status Bar.
+    let mut app = app();
+    app.settings.open_editors = mg_ui::OpenEditors::Tabs;
+    app.run(Action::OpenTab(Tab::Nui(key())));
+    let mut h = creator(app, [1500, 850]);
+    h.state_mut().run(Action::GenerateNui { name: "nui_test".into(), export: false });
+    h.run();
+    assert!(
+        h.state().status_said().iter().any(|s| s == "Build failed"),
+        "{:?}",
+        h.state().status_said()
+    );
 }

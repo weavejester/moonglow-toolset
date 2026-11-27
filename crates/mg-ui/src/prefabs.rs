@@ -53,39 +53,74 @@ pub fn rename(dir: Option<&std::path::Path>, from: &str, to: &str) -> Result<(),
 /// What a prefab holds, in a line or two: how many objects of each kind,
 /// and their tags.
 pub fn summary(dir: Option<&std::path::Path>, name: &str) -> Result<String, String> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::SystemTime;
+
+    type Key = PathBuf;
+    type Entry = (u64, Option<SystemTime>, Result<String, String>);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Entry>>> = OnceLock::new();
+
     let path = file(dir, name)?;
-    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let g = from_json(&json, Codepage::default()).map_err(|e| e.to_string())?;
-    let mut counts = [0usize; ObjectKind::ALL.len()];
-    let mut tags: Vec<String> = Vec::new();
-    for item in g.root.list("Objects").unwrap_or(&[]) {
-        let kind = item.integer("Kind").and_then(|k| usize::try_from(k).ok());
-        if let Some(n) = kind.and_then(|k| counts.get_mut(k)) {
-            *n += 1;
+    let meta = std::fs::metadata(&path).ok();
+    let stamp = meta.as_ref().map(|m| (m.len(), m.modified().ok()));
+    if let Some((len, mtime)) = stamp
+        && let Ok(cache) = CACHE.get_or_init(Default::default).lock()
+        && let Some((clen, cmtime, res)) = cache.get(&path)
+        && *clen == len
+        && *cmtime == mtime
+    {
+        return res.clone();
+    }
+
+    let computed = (|| -> Result<String, String> {
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let g = from_json(&json, Codepage::default()).map_err(|e| e.to_string())?;
+        let mut counts = [0usize; ObjectKind::ALL.len()];
+        let mut tags: Vec<String> = Vec::new();
+        for item in g.root.list("Objects").unwrap_or(&[]) {
+            let kind = item.integer("Kind").and_then(|k| usize::try_from(k).ok());
+            if let Some(n) = kind.and_then(|k| counts.get_mut(k)) {
+                *n += 1;
+            }
+            if let Some(Value::Struct(s)) = item.get("Object")
+                && let Some(tag) = s.string("Tag").map(crate::text::decode)
+                && !tag.is_empty()
+                && !tags.contains(&tag)
+            {
+                tags.push(tag);
+            }
         }
-        if let Some(Value::Struct(s)) = item.get("Object")
-            && let Some(tag) = s.string("Tag").map(crate::text::decode)
-            && !tag.is_empty()
-            && !tags.contains(&tag)
-        {
-            tags.push(tag);
+        let kinds: Vec<String> = ObjectKind::ALL
+            .iter()
+            .zip(counts)
+            .filter(|(_, n)| *n > 0)
+            .map(|(k, n)| {
+                let noun = if n == 1 { k.name().to_string() } else { k.label().to_lowercase() };
+                format!("{n} {noun}")
+            })
+            .collect();
+        if kinds.is_empty() {
+            return Err("no objects".into());
         }
+        let mut line = kinds.join(", ");
+        if !tags.is_empty() {
+            line.push_str(&format!("\nTags: {}", crate::text::some_of(&tags, SUMMARY_TAGS)));
+        }
+        Ok(line)
+    })();
+
+    if let Some((len, mtime)) = stamp
+        && let Ok(mut cache) = CACHE.get_or_init(Default::default).lock()
+    {
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(path, (len, mtime, computed.clone()));
     }
-    let kinds: Vec<String> = ObjectKind::ALL
-        .iter()
-        .zip(counts)
-        .filter(|(_, n)| *n > 0)
-        .map(|(k, n)| format!("{n} {}", k.label().to_lowercase()))
-        .collect();
-    if kinds.is_empty() {
-        return Err("no objects".into());
-    }
-    let mut line = kinds.join(", ");
-    if !tags.is_empty() {
-        line.push_str(&format!("\nTags: {}", crate::text::some_of(&tags, SUMMARY_TAGS)));
-    }
-    Ok(line)
+    computed
 }
 
 /// How many tags a prefab's summary names.
@@ -154,6 +189,7 @@ impl Moonglow {
                 match self.palette.area.and_then(|a| self.area_views.get_mut(&a)) {
                     Some(view) => {
                         view.pasting = true;
+                        view.paste_turn = 0.0;
                         self.log.info(format!("Prefab {name}: click in the area to place it"));
                     }
                     None => {
@@ -170,18 +206,21 @@ impl Moonglow {
 pub(crate) fn save_window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some((mut name, clip)) = app.prefab_save.take() else { return };
     let mut open = true;
-    let (mut save, mut cancel) = (false, false);
-    crate::widgets::dialog(ctx, "Save as Prefab", &mut open)
+    // (The prefabs kept, read from their folder as the window opens.)
+    let names = crate::area_tools::kept_while_shown(ctx, egui::Id::new("prefab-names"), || {
+        std::sync::Arc::new(list(app.prefab_dir.as_deref()))
+    });
+    let footed = crate::widgets::dialog(ctx, "Save as Prefab", &mut open)
         .collapsible(false)
         .resizable(false)
-        .show(ctx, |ui| {
+        .show_foot(ctx, |ui| {
             ui.label(format!(
                 "{} object(s), placed again from Edit › Prefabs in any area.",
                 clip.objects.len()
             ));
             ui.horizontal(|ui| {
                 crate::widgets::field_label(ui, "Name");
-                let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(220.0));
+                let r = ui.add(mg_uikit::text_field(&mut name).desired_width(220.0));
                 crate::widgets::autofocus(ui, &r);
             });
             let ok = valid_name(&name);
@@ -191,15 +230,13 @@ pub(crate) fn save_window(app: &mut Moonglow, ctx: &egui::Context) {
                     "Letters, digits, spaces, - and _ only",
                 );
             }
-            if list(app.prefab_dir.as_deref()).iter().any(|n| n.eq_ignore_ascii_case(name.trim())) {
+            if names.iter().any(|n| n.eq_ignore_ascii_case(name.trim())) {
                 ui.weak("A prefab of that name will be replaced");
             }
-            ui.horizontal(|ui| {
-                save = ui.add_enabled(ok, egui::Button::new("Save")).clicked()
-                    || (ok && crate::widgets::enter(ui));
-                cancel = crate::widgets::cancel(ui);
-            });
+            ((), crate::widgets::Foot::new().main("Save", ok).cancel())
         });
+    let save = footed.as_ref().is_some_and(|f| f.pressed.main());
+    let cancel = footed.as_ref().is_some_and(|f| f.pressed.cancelled());
     if save {
         match app.save_prefab(&name, &clip) {
             Ok(path) => app.log.info(format!("Prefab saved: {}", path.display())),
@@ -207,5 +244,39 @@ pub(crate) fn save_window(app: &mut Moonglow, ctx: &egui::Context) {
         }
     } else if open && !cancel {
         app.prefab_save = Some((name, clip));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_uses_singular_for_one_and_plural_for_many() {
+        let dir = mg_testkit::scratch_dir("prefab-summary-plurals");
+        let item = |kind: ObjectKind, tag: &str| {
+            let mut obj = mg_gff::Struct::new(kind.struct_id());
+            obj.set("Tag", Value::String(tag.as_bytes().to_vec()));
+            let mut s = mg_gff::Struct::new(0);
+            s.set("Kind", Value::Byte(kind.index() as u8));
+            s.set("Object", Value::Struct(obj));
+            s
+        };
+        let mut g = Gff::new(*b"MGPF");
+        g.root.set(
+            "Objects",
+            Value::List(vec![
+                item(ObjectKind::Waypoint, "WP_1"),
+                item(ObjectKind::Creature, "CRE_1"),
+                item(ObjectKind::Creature, "CRE_2"),
+            ]),
+        );
+        let json = to_json(&g, Codepage::default()).unwrap();
+        std::fs::write(dir.join("Camp.prefab.json"), to_json_text(&json, TextStyle::default()))
+            .unwrap();
+        let text = summary(Some(&dir), "Camp").unwrap();
+        assert!(text.contains("2 creatures"), "{text}");
+        assert!(text.contains("1 waypoint"), "{text}");
+        assert!(!text.contains("1 waypoints"), "{text}");
     }
 }

@@ -8,7 +8,7 @@
 //! module as Verify read it, so a [`Guard`] holds each fix to the resources
 //! it touches being as they were then.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use mg_core::ResType;
@@ -16,15 +16,30 @@ use mg_gff::{Struct, Value};
 use mg_module::Module;
 use mg_module::doctor::Finding;
 use mg_module::tags::{TagIndex, Tagged};
-use mg_resman::ResKey;
+use mg_resman::{ResKey, ResMan};
 
 use crate::{Command, Edit, GffPath, Step, Workspace};
 
-/// A finding's fix: what its button says, and the edits it makes.
+/// A finding's fix: what its button says, and the edits it makes; or,
+/// for one that asks the user first, the plugin's command its button runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fix {
     pub label: String,
     pub edits: Vec<Edit>,
+    /// A fix that asks (a form, a choice) is a plugin's command, run on
+    /// what the finding is about when the button is clicked, its edits
+    /// one step of Undo as a command's are. None: its edits are the fix.
+    pub asks: Option<Asks>,
+}
+
+/// The command a fix that asks runs: the plugin's id, the command's, and
+/// what it runs on (each a resource and where in it, as a plugin's
+/// selection has it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asks {
+    pub plugin: String,
+    pub command: String,
+    pub on: Vec<(ResKey, GffPath)>,
 }
 
 impl Fix {
@@ -42,13 +57,6 @@ impl Fix {
             }
         }
         out
-    }
-
-    /// Whether it only sets and removes fields, and takes items out of
-    /// lists: then the paths of another fix of the same resources still
-    /// lead where they did, or are followed ([`Guard::check`]).
-    fn sets_fields_only(&self) -> bool {
-        self.edits.iter().all(|e| matches!(e, Edit::SetField { .. } | Edit::RemoveItem { .. }))
     }
 }
 
@@ -69,15 +77,40 @@ impl From<Finding> for Found {
 /// the finding, which their checks made), and the doctor's fixes where it
 /// has one ([`doctor_fix`]), worked out on `module` as the findings were.
 pub fn attach(module: &Module, findings: Vec<Finding>, plugins: &[Found]) -> Vec<Found> {
+    attach_on(module, None, findings, plugins)
+}
+
+/// [`attach`], the game's resources `rm` at hand for the fixes that read
+/// them (`transition-hidden` puts an outline back on the area's ground,
+/// its tiles' walkmeshes; without them, only in order).
+pub fn attach_on(
+    module: &Module,
+    rm: Option<&ResMan>,
+    findings: Vec<Finding>,
+    plugins: &[Found],
+) -> Vec<Found> {
+    let mut by_key: HashMap<(&str, ResKey, &str), Vec<usize>> = HashMap::new();
+    for (i, p) in plugins.iter().enumerate() {
+        if p.fix.is_some() {
+            by_key
+                .entry((p.finding.check.as_ref(), p.finding.resource, p.finding.at.as_str()))
+                .or_default()
+                .push(i);
+        }
+    }
     let mut used = vec![false; plugins.len()];
-    let mut seen = Seen::default();
+    let mut seen = Seen { rm, ..Seen::default() };
     findings
         .into_iter()
         .map(|finding| {
-            let theirs = plugins
-                .iter()
-                .enumerate()
-                .find(|(i, p)| !used[*i] && p.fix.is_some() && p.finding == finding);
+            let key = (finding.check.as_ref(), finding.resource, finding.at.as_str());
+            let theirs = by_key.get(&key).and_then(|indices| {
+                indices
+                    .iter()
+                    .copied()
+                    .find(|&i| !used[i] && plugins[i].finding == finding)
+                    .map(|i| (i, &plugins[i]))
+            });
             let fix = match theirs {
                 Some((i, p)) => {
                     used[i] = true;
@@ -106,12 +139,32 @@ pub fn doctor_fix(module: &Module, finding: &Finding) -> Option<Fix> {
 /// variables of one name in one `VarTable` are two findings of one
 /// place, each the fix of one of them).
 #[derive(Default)]
-struct Seen {
+struct Seen<'a> {
     tags: Option<TagIndex>,
     said: HashMap<(String, ResKey, String), usize>,
+    /// The game's resources, where the caller has them.
+    rm: Option<&'a ResMan>,
+    grounds: mg_module::ground::Grounds,
+    /// `transition-hidden`'s findings of the order made fixes of with no
+    /// ground, by place.
+    ordered: HashMap<(ResKey, String), usize>,
+    /// Parsed GFFs reused across findings on the same resource.
+    gffs: HashMap<ResKey, Option<mg_gff::Gff>>,
+    /// Duplicate tags indexed by `(first resource, described places)` for O(1) lookup.
+    dups_whole: Option<DupMap>,
+    dups_areas: Option<DupMap>,
 }
 
-fn doctor_fix_with(module: &Module, f: &Finding, seen: &mut Seen) -> Option<Fix> {
+/// Duplicate tags indexed by `(first resource, described places)` for O(1) lookup.
+type DupMap = HashMap<(ResKey, String), (Vec<u8>, Vec<Tagged>)>;
+
+impl Seen<'_> {
+    fn gff(&mut self, module: &Module, key: ResKey) -> Option<&mg_gff::Gff> {
+        self.gffs.entry(key).or_insert_with(|| module.gff(&key).and_then(Result::ok)).as_ref()
+    }
+}
+
+fn doctor_fix_with(module: &Module, f: &Finding, seen: &mut Seen<'_>) -> Option<Fix> {
     if f.source != "module" {
         return None;
     }
@@ -119,16 +172,17 @@ fn doctor_fix_with(module: &Module, f: &Finding, seen: &mut Seen) -> Option<Fix>
     let nth = *said;
     *said += 1;
     match f.check.as_ref() {
-        "tag-unique" => {
-            let index = seen.tags.get_or_insert_with(|| TagIndex::of_module(module));
-            retag_fix(index, f)
-        }
-        "area-variables" => move_variables_fix(module, f.resource),
-        "var-runtime" => remove_variable_fix(module, f, nth),
-        "static-transform" => untransform_fix(module, f, nth),
+        "tag-unique" => retag_fix(module, seen, f),
+        "area-variables" => move_variables_fix(module, seen, f.resource),
+        "var-runtime" => remove_variable_fix(module, seen, f, nth),
+        "static-transform" => untransform_fix(module, seen, f, nth),
+        "transition-hidden" => outline_fix(module, f, nth, seen),
         _ => None,
     }
 }
+
+/// The label of `transition-hidden`'s fix.
+pub const PUT_OUTLINE_RIGHT: &str = "Put the outline in order on the ground";
 
 /// The label of `var-runtime`'s fix.
 pub const REMOVE_VARIABLE: &str = "Remove the variable";
@@ -138,32 +192,37 @@ pub const TAKE_TRANSFORM_OFF: &str = "Take the transform off";
 
 /// `var-runtime`: the variable out of its `VarTable` (the `nth` of those
 /// the finding's place names, as the doctor found them).
-fn remove_variable_fix(module: &Module, f: &Finding, nth: usize) -> Option<Fix> {
-    let gff = module.gff(&f.resource)?.ok()?;
-    let found = mg_module::var_desc::variables_of(f.resource, &gff).into_iter().filter(|v| {
+fn remove_variable_fix(
+    module: &Module,
+    seen: &mut Seen<'_>,
+    f: &Finding,
+    nth: usize,
+) -> Option<Fix> {
+    let gff = seen.gff(module, f.resource)?;
+    let found = mg_module::var_desc::variables_of(f.resource, gff).into_iter().filter(|v| {
         let table = mg_module::var_desc::table_path(&v.path);
-        let place = mg_module::rename::describe(f.resource, Some(&gff), &table);
+        let place = mg_module::rename::describe(f.resource, Some(gff), &table);
         format!("{place} › {}", v.name) == f.at
     });
     let v = found.into_iter().nth(nth)?;
     let edits = vec![Edit::remove_item(f.resource, v.path, "VarTable", v.index)];
-    Some(Fix { label: REMOVE_VARIABLE.into(), edits })
+    Some(Fix { label: REMOVE_VARIABLE.into(), edits, asks: None })
 }
 
 /// `static-transform`: the static placeable's visual transform off, as
 /// ticking Static takes it off ([`mg_module::areas::static_fields`]): the
 /// `nth` of those the finding's place names (placeables of one tag are
 /// said alike).
-fn untransform_fix(module: &Module, f: &Finding, nth: usize) -> Option<Fix> {
+fn untransform_fix(module: &Module, seen: &mut Seen<'_>, f: &Finding, nth: usize) -> Option<Fix> {
     if f.resource.restype != ResType::GIT {
         return None;
     }
-    let gff = module.gff(&f.resource)?.ok()?;
+    let gff = seen.gff(module, f.resource)?;
     let list = gff.root.list("Placeable List")?;
     let at = (0..list.len())
         .filter(|i| {
             let path = GffPath::root().item("Placeable List", *i).field("Static");
-            mg_module::rename::describe(f.resource, Some(&gff), &path) == f.at
+            mg_module::rename::describe(f.resource, Some(gff), &path) == f.at
         })
         .nth(nth)?;
     let path = GffPath::root().item("Placeable List", at);
@@ -177,22 +236,90 @@ fn untransform_fix(module: &Module, f: &Finding, nth: usize) -> Option<Fix> {
             value,
         })
         .collect();
-    (!edits.is_empty()).then(|| Fix { label: TAKE_TRANSFORM_OFF.into(), edits })
+    (!edits.is_empty()).then(|| Fix { label: TAKE_TRANSFORM_OFF.into(), edits, asks: None })
+}
+
+/// `transition-hidden`: the area transition's outline in Aurora's order
+/// (counterclockwise from its point of smallest X) and on the area's
+/// ground (its tiles' walkmeshes, read from `seen.rm`) as Redraw Polygon
+/// draws it: the trigger at height 0, each point 0.025 above the ground
+/// under it ([`mg_module::ground::outline_put_right`]); its `ZPosition`
+/// and its `Geometry` set whole, in one step. The trigger is the `nth`
+/// of the transitions the finding's place names that the game hides (as
+/// Verify found them: transitions of one tag are said alike). Without
+/// the game's resources (or the area's tileset) only the order, and only
+/// for a finding of the order (the others' heights can't be judged so).
+/// None when it would change nothing.
+fn outline_fix(module: &Module, f: &Finding, nth: usize, seen: &mut Seen<'_>) -> Option<Fix> {
+    if f.resource.restype != ResType::GIT {
+        return None;
+    }
+    let ground = seen.rm.and_then(|rm| seen.grounds.of(rm, module, f.resource.resref));
+    // (Without the ground, the findings of the order alone are counted.)
+    let nth = match ground {
+        Some(_) => nth,
+        None if f.message.contains("its points run clockwise") => {
+            let counted = seen.ordered.entry((f.resource, f.at.clone())).or_default();
+            *counted += 1;
+            *counted - 1
+        }
+        None => return None,
+    };
+    let gff = seen.gff(module, f.resource)?;
+    let list = gff.root.list("TriggerList")?;
+    let at = (0..list.len())
+        .filter(|&i| {
+            let path = GffPath::root().item("TriggerList", i).field("Geometry");
+            mg_module::rename::describe(f.resource, Some(gff), &path) == f.at
+                && list[i].integer("Type") == Some(1)
+                && mg_module::doctor::hidden_transition(&list[i], ground.as_ref()).is_some()
+        })
+        .nth(nth)?;
+    let t = &list[at];
+    let (points, z) = mg_module::ground::outline_put_right(t, ground.as_ref());
+    let path = GffPath::root().item("TriggerList", at);
+    let mut edits = Vec::new();
+    if t.float("ZPosition").is_some_and(|was| was != z) {
+        let (key, path) = (f.resource, path.clone());
+        let value = Some(Value::Float(z));
+        edits.push(Edit::SetField { key, path, label: "ZPosition".into(), value });
+    }
+    if t.list("Geometry") != Some(&points[..]) {
+        let value = Some(Value::List(points));
+        edits.push(Edit::SetField { key: f.resource, path, label: "Geometry".into(), value });
+    }
+    (!edits.is_empty()).then(|| Fix { label: PUT_OUTLINE_RIGHT.into(), edits, asks: None })
+}
+
+fn index_duplicates<T: AsRef<[Tagged]>>(list: Vec<(&[u8], T)>) -> DupMap {
+    let mut map = HashMap::with_capacity(list.len());
+    for (tag, places) in list {
+        let places = places.as_ref();
+        let Some(first) = places.first() else { continue };
+        let at = places.iter().map(|p| p.describe()).collect::<Vec<_>>().join(", ");
+        map.entry((first.key(), at)).or_insert_with(|| (tag.to_vec(), places.to_vec()));
+    }
+    map
 }
 
 /// `tag-unique`: the places of the tag the finding is about (found as the
 /// doctor found them: its first place is the finding's resource, and `at`
 /// lists them all: the module's, or of one area where the project wants
 /// the tag unique in each), each but one given a tag of its own.
-fn retag_fix(index: &TagIndex, f: &Finding) -> Option<Fix> {
-    let said = |places: &[Tagged]| {
-        places[0].key() == f.resource
-            && places.iter().map(|p| p.describe()).collect::<Vec<_>>().join(", ") == f.at
-    };
-    let whole = index.duplicates().into_iter().find(|(_, places)| said(places));
+fn retag_fix(module: &Module, seen: &mut Seen<'_>, f: &Finding) -> Option<Fix> {
+    let index = seen.tags.get_or_insert_with(|| TagIndex::of_module(module));
+    let key = (f.resource, f.at.clone());
+    let whole =
+        seen.dups_whole.get_or_insert_with(|| index_duplicates(index.duplicates())).get(&key);
     let (tag, places): (&[u8], Vec<Tagged>) = match whole {
-        Some((tag, places)) => (tag, places.to_vec()),
-        None => index.duplicates_in_areas().into_iter().find(|(_, places)| said(places))?,
+        Some((tag, places)) => (tag, places.clone()),
+        None => {
+            let areas = seen
+                .dups_areas
+                .get_or_insert_with(|| index_duplicates(index.duplicates_in_areas()));
+            let (tag, places) = areas.get(&key)?;
+            (tag, places.clone())
+        }
     };
     // (Tags are written as bytes: one that is not plain text is left to
     // the builder.)
@@ -223,7 +350,7 @@ fn retag_fix(index: &TagIndex, f: &Finding) -> Option<Fix> {
         [one] => format!("Retag the other as {one}"),
         many => format!("Retag the other {} ({}…)", many.len(), many[0]),
     };
-    Some(Fix { label, edits })
+    Some(Fix { label, edits, asks: None })
 }
 
 /// An area's variables as they are once moved from its ARE to its GIT:
@@ -242,19 +369,18 @@ pub fn variables_moved(git: &[Struct], are: &[Struct]) -> Vec<Struct> {
 
 /// `area-variables`: the area's variables into its GIT, and none left in
 /// its ARE.
-fn move_variables_fix(module: &Module, are: ResKey) -> Option<Fix> {
+fn move_variables_fix(module: &Module, seen: &mut Seen<'_>, are: ResKey) -> Option<Fix> {
     if are.restype != ResType::ARE {
         return None;
     }
     let git = ResKey::new(are.resref, ResType::GIT);
-    let list = |key: &ResKey| -> Option<Vec<Struct>> {
-        let gff = module.gff(key)?.ok()?;
-        Some(gff.root.list("VarTable").map(<[_]>::to_vec).unwrap_or_default())
-    };
-    let (in_are, in_git) = (list(&are)?, list(&git)?);
+    let in_are =
+        seen.gff(module, are)?.root.list("VarTable").map(<[_]>::to_vec).unwrap_or_default();
     if in_are.is_empty() {
         return None;
     }
+    let in_git =
+        seen.gff(module, git)?.root.list("VarTable").map(<[_]>::to_vec).unwrap_or_default();
     let set = |key: ResKey, value: Option<Value>| Edit::SetField {
         key,
         path: GffPath::root(),
@@ -263,7 +389,7 @@ fn move_variables_fix(module: &Module, are: ResKey) -> Option<Fix> {
     };
     let edits =
         vec![set(git, Some(Value::List(variables_moved(&in_git, &in_are)))), set(are, None)];
-    Some(Fix { label: "Move the variables to the GIT".into(), edits })
+    Some(Fix { label: "Move the variables to the GIT".into(), edits, asks: None })
 }
 
 /// A resource's bytes as a number to compare (`None`: the module has no
@@ -274,6 +400,207 @@ fn digest(bytes: Option<&[u8]>) -> Option<u64> {
         b.hash(&mut h);
         h.finish()
     })
+}
+
+/// What making a fix changed of a [`Guard`], to take back when the fix is
+/// undone ([`Guard::unmade`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Made {
+    /// Each resource's digest before (none: not held).
+    seen: Vec<(ResKey, Option<Option<u64>>)>,
+    removed: Vec<((ResKey, GffPath, String), usize)>,
+    replaced: Vec<ListAt>,
+}
+
+/// A list: its resource, the path of its struct and its label, as Verify
+/// read them.
+type ListAt = (ResKey, GffPath, String);
+
+/// The items one fix took out so far, by their list: their places as
+/// Verify read them. A fix's edits run one after another, so an edit
+/// after a removal has its places as the removal left them: these turn
+/// them back.
+#[derive(Debug, Default)]
+struct Removed(HashMap<ListAt, Vec<usize>>);
+
+impl Removed {
+    /// The place Verify read of what is at `index` of the list now.
+    fn index_then(&self, at: &ListAt, index: usize) -> usize {
+        let mut earlier = self.0.get(at).cloned().unwrap_or_default();
+        earlier.sort_unstable();
+        earlier.into_iter().fold(index, |then, gone| then + usize::from(gone <= then))
+    }
+
+    /// The path Verify read of what is at `path` now.
+    fn path_then(&self, key: &ResKey, path: &GffPath) -> GffPath {
+        let mut then = GffPath::root();
+        for step in &path.0 {
+            let step = match step {
+                Step::Field(_) => step.clone(),
+                Step::Item(list, i) => {
+                    let at = (*key, then.clone(), list.clone());
+                    Step::Item(list.clone(), self.index_then(&at, *i))
+                }
+            };
+            then.0.push(step);
+        }
+        then
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OwnOp {
+    Remove { at_fix: usize, at_ws: usize },
+    Insert { at_fix: usize, at_ws: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Origin {
+    Verify(usize),
+    Inserted(usize, usize),
+}
+
+fn trace_origin(ops: &[OwnOp], mut index: usize) -> Origin {
+    for (op_idx, op) in ops.iter().enumerate().rev() {
+        match *op {
+            OwnOp::Insert { at_fix, at_ws } => {
+                if index == at_fix {
+                    return Origin::Inserted(op_idx, at_ws);
+                }
+                if index > at_fix {
+                    index -= 1;
+                }
+            }
+            OwnOp::Remove { at_fix, .. } => {
+                if index >= at_fix {
+                    index += 1;
+                }
+            }
+        }
+    }
+    Origin::Verify(index)
+}
+
+fn resolve_ws(
+    ops: &[OwnOp],
+    removed_before: Option<&Vec<usize>>,
+    origin: Origin,
+    for_insert: bool,
+) -> Option<usize> {
+    let below = |idx: usize| removed_before.map_or(0, |r| r.iter().filter(|x| **x < idx).count());
+    let (mut w, rest) = match origin {
+        Origin::Verify(v) => {
+            if !for_insert && removed_before.is_some_and(|r| r.contains(&v)) {
+                return None;
+            }
+            (v - below(v), ops)
+        }
+        Origin::Inserted(op_idx, ws_pos) => (ws_pos, &ops[op_idx + 1..]),
+    };
+    for &op in rest {
+        match op {
+            OwnOp::Insert { at_ws, .. } => {
+                if w >= at_ws {
+                    w += 1;
+                }
+            }
+            OwnOp::Remove { at_ws, .. } => {
+                if !for_insert && w == at_ws {
+                    return None;
+                }
+                if w > at_ws {
+                    w -= 1;
+                }
+            }
+        }
+    }
+    Some(w)
+}
+
+#[derive(Debug, Default)]
+struct OwnOps(HashMap<ListAt, Vec<OwnOp>>);
+
+impl OwnOps {
+    fn map_existing(
+        &self,
+        removed: Option<&HashMap<ListAt, Vec<usize>>>,
+        at: &ListAt,
+        fix_idx: usize,
+    ) -> Option<usize> {
+        let ops = self.0.get(at).map_or(&[][..], Vec::as_slice);
+        let origin = trace_origin(ops, fix_idx);
+        resolve_ws(ops, removed.and_then(|r| r.get(at)), origin, false)
+    }
+
+    fn map_insert(
+        &self,
+        removed: Option<&HashMap<ListAt, Vec<usize>>>,
+        at: &ListAt,
+        fix_idx: usize,
+    ) -> usize {
+        let ops = self.0.get(at).map_or(&[][..], Vec::as_slice);
+        let origin = trace_origin(ops, fix_idx);
+        resolve_ws(ops, removed.and_then(|r| r.get(at)), origin, true)
+            .expect("insert position resolves")
+    }
+
+    fn map_path(
+        &self,
+        removed: &HashMap<ListAt, Vec<usize>>,
+        replaced: &HashSet<ListAt>,
+        key: &ResKey,
+        path: &GffPath,
+    ) -> Option<GffPath> {
+        let (mut then, mut now) = (GffPath::root(), GffPath::root());
+        // (Past an item this fix inserted, nothing is another fix's: what
+        // they took out or replaced at that place was under the item that
+        // was there, which the fix-space path names too.)
+        let mut inside_new = false;
+        for step in &path.0 {
+            let step_now = match step {
+                Step::Field(_) => step.clone(),
+                Step::Item(list, i) => {
+                    let at = (*key, then.clone(), list.clone());
+                    if !inside_new && replaced.contains(&at) {
+                        return None;
+                    }
+                    let ops = self.0.get(&at).map_or(&[][..], Vec::as_slice);
+                    let origin = trace_origin(ops, *i);
+                    let others = if inside_new { None } else { removed.get(&at) };
+                    let ws_idx = resolve_ws(ops, others, origin, false)?;
+                    if let Origin::Verify(v) = origin {
+                        then.0.push(Step::Item(list.clone(), v));
+                    } else {
+                        inside_new = true;
+                        then.0.push(step.clone());
+                    }
+                    now.0.push(Step::Item(list.clone(), ws_idx));
+                    continue;
+                }
+            };
+            then.0.push(step.clone());
+            now.0.push(step_now);
+        }
+        Some(now)
+    }
+
+    fn then_path_for_list(&self, key: &ResKey, path: &GffPath) -> Option<GffPath> {
+        let mut then = GffPath::root();
+        for step in &path.0 {
+            match step {
+                Step::Field(_) => then.0.push(step.clone()),
+                Step::Item(list, i) => {
+                    let at = (*key, then.clone(), list.clone());
+                    let ops = self.0.get(&at).map_or(&[][..], Vec::as_slice);
+                    match trace_origin(ops, *i) {
+                        Origin::Verify(v) => then.0.push(Step::Item(list.clone(), v)),
+                        Origin::Inserted(_, _) => return None,
+                    }
+                }
+            }
+        }
+        Some(then)
+    }
 }
 
 /// What a Verify's fixes were worked out on: each resource one of them
@@ -294,6 +621,10 @@ pub struct Guard {
     /// its struct and its label, as Verify read them): their places, as
     /// Verify read them.
     removed: HashMap<(ResKey, GffPath, String), Vec<usize>>,
+    /// Fields whose removal via `SetField { value: None }` deletes a list.
+    list_fields: HashSet<(ResKey, GffPath, String)>,
+    /// Lists replaced or removed whole by fixes made so far.
+    replaced: HashSet<ListAt>,
 }
 
 impl Guard {
@@ -301,12 +632,36 @@ impl Guard {
     /// the findings were made on).
     pub fn new<'a>(module: &Module, fixes: impl IntoIterator<Item = &'a Fix>) -> Guard {
         let mut seen = HashMap::new();
+        let mut removals: HashMap<ResKey, Vec<(GffPath, String)>> = HashMap::new();
         for fix in fixes {
             for key in fix.resources() {
                 seen.entry(key).or_insert_with(|| digest(module.get(&key)));
             }
+            for edit in &fix.edits {
+                if let Edit::SetField { key, path, label, value: None } = edit {
+                    removals.entry(*key).or_default().push((path.clone(), label.clone()));
+                }
+            }
         }
-        Guard { seen, removed: HashMap::new() }
+        let mut list_fields = HashSet::new();
+        for (key, fields) in removals {
+            if let Some(Ok(gff)) = module.gff(&key) {
+                for (path, label) in fields {
+                    if path
+                        .get(&gff.root)
+                        .and_then(|s| s.get(&label))
+                        .is_some_and(|v| matches!(v, Value::List(_)))
+                    {
+                        list_fields.insert((key, path, label));
+                    }
+                }
+            }
+        }
+        Guard { seen, removed: HashMap::new(), list_fields, replaced: HashSet::new() }
+    }
+
+    fn preserves_indices(&self, fix: &Fix) -> bool {
+        fix.edits.iter().all(|e| matches!(e, Edit::SetField { .. } | Edit::RemoveItem { .. }))
     }
 
     /// Whether `fix` may be made on the module of `ws` now, and the fix
@@ -329,87 +684,139 @@ impl Guard {
             format!("{key}: another fix took out what this fixes: run Verify again for a fix")
         };
         let mut edits = Vec::new();
+        let mut own = OwnOps::default();
         for e in &fix.edits {
             let key = *e.key();
-            let path_now = |path: &GffPath| self.path_now(&key, path).ok_or_else(|| gone(&key));
-            let before = |path: &GffPath, list: &str, index: usize| {
-                let r = self.removed.get(&(key, path.clone(), list.to_string()));
-                r.map_or(0, |r| r.iter().filter(|i| **i < index).count())
-            };
             edits.push(match e {
                 Edit::SetField { path, label, value, .. } => {
-                    // (A list set whole, which held an item taken out:
-                    // set as it was, it would put the item back.)
-                    if self.removed.contains_key(&(key, path.clone(), label.clone())) {
-                        return Err(gone(&key));
+                    if let Some(then) = own.then_path_for_list(&key, path) {
+                        let at = (key, then, label.clone());
+                        if self.removed.contains_key(&at) || self.replaced.contains(&at) {
+                            return Err(gone(&key));
+                        }
                     }
-                    let path_then = path;
-                    let path = path_now(path_then)?;
+                    let path = own
+                        .map_path(&self.removed, &self.replaced, &key, path)
+                        .ok_or_else(|| gone(&key))?;
                     Edit::SetField { key, path, label: label.clone(), value: value.clone() }
                 }
                 Edit::RemoveItem { path, list, index, .. } => {
-                    let r = self.removed.get(&(key, path.clone(), list.clone()));
-                    if r.is_some_and(|r| r.contains(index)) {
-                        return Err(gone(&key));
-                    }
-                    let index = index - before(path, list, *index);
-                    Edit::remove_item(key, path_now(path)?, list.clone(), index)
+                    let ws_path = own
+                        .map_path(&self.removed, &self.replaced, &key, path)
+                        .ok_or_else(|| gone(&key))?;
+                    let (at, rem) = match own.then_path_for_list(&key, path) {
+                        Some(then_path) => {
+                            let at = (key, then_path, list.clone());
+                            if self.replaced.contains(&at) {
+                                return Err(gone(&key));
+                            }
+                            (at, Some(&self.removed))
+                        }
+                        None => ((key, ws_path.clone(), list.clone()), None),
+                    };
+                    let ws_idx = own.map_existing(rem, &at, *index).ok_or_else(|| gone(&key))?;
+                    own.0
+                        .entry(at)
+                        .or_default()
+                        .push(OwnOp::Remove { at_fix: *index, at_ws: ws_idx });
+                    Edit::remove_item(key, ws_path, list.clone(), ws_idx)
                 }
                 Edit::InsertItem { path, list, index, item, .. } => {
-                    let index = index - before(path, list, *index);
-                    Edit::insert_item(key, path_now(path)?, list.clone(), index, item.clone())
+                    let ws_path = own
+                        .map_path(&self.removed, &self.replaced, &key, path)
+                        .ok_or_else(|| gone(&key))?;
+                    let (at, rem) = match own.then_path_for_list(&key, path) {
+                        Some(then_path) => {
+                            let at = (key, then_path, list.clone());
+                            if self.replaced.contains(&at) {
+                                return Err(gone(&key));
+                            }
+                            (at, Some(&self.removed))
+                        }
+                        None => ((key, ws_path.clone(), list.clone()), None),
+                    };
+                    let ws_idx = own.map_insert(rem, &at, *index);
+                    own.0
+                        .entry(at)
+                        .or_default()
+                        .push(OwnOp::Insert { at_fix: *index, at_ws: ws_idx });
+                    Edit::insert_item(key, ws_path, list.clone(), ws_idx, item.clone())
                 }
                 Edit::SetResource { .. } => e.clone(),
             });
         }
-        Ok(Fix { label: fix.label.clone(), edits })
-    }
-
-    /// Where a path Verify read leads now that fixes took items out (none:
-    /// through one taken out).
-    fn path_now(&self, key: &ResKey, path: &GffPath) -> Option<GffPath> {
-        let (mut then, mut now) = (GffPath::root(), GffPath::root());
-        for step in &path.0 {
-            let step_now = match step {
-                Step::Field(_) => step.clone(),
-                Step::Item(list, i) => {
-                    match self.removed.get(&(*key, then.clone(), list.clone())) {
-                        Some(r) if r.contains(i) => return None,
-                        Some(r) => {
-                            Step::Item(list.clone(), i - r.iter().filter(|x| *x < i).count())
-                        }
-                        None => step.clone(),
-                    }
-                }
-            };
-            then.0.push(step.clone());
-            now.0.push(step_now);
-        }
-        Some(now)
+        Ok(Fix { label: fix.label.clone(), edits, asks: fix.asks.clone() })
     }
 
     /// Notes that `fix` (as Verify found it: the one given to
     /// [`Guard::check`]) was made on the module of `ws`: its resources as
     /// they are now are those the other fixes may find, if it only set
-    /// fields and took items out (which they follow); else they refuse
+    /// scalar fields and took items out (which they follow); else they refuse
     /// them.
-    pub fn made(&mut self, ws: &mut Workspace, fix: &Fix) {
+    pub fn made(&mut self, ws: &mut Workspace, fix: &Fix) -> Made {
         let flushed = ws.flush().is_ok();
-        let follows = flushed && fix.sets_fields_only();
+        let follows = flushed && self.preserves_indices(fix);
+        let mut made = Made::default();
         for key in fix.resources() {
-            if follows {
-                self.seen.insert(key, digest(ws.module.get(&key)));
+            let was = if follows {
+                self.seen.insert(key, digest(ws.module.get(&key)))
             } else {
-                self.seen.remove(&key);
-            }
+                self.seen.remove(&key)
+            };
+            made.seen.push((key, was));
         }
         if follows {
+            // (Each place as Verify read it, not as the edit has it: the
+            // second of a fix's two removals at one place took out the
+            // item after the first's.)
+            let mut own = Removed::default();
             for e in &fix.edits {
-                if let Edit::RemoveItem { key, path, list, index } = e {
-                    let r = self.removed.entry((*key, path.clone(), list.clone())).or_default();
-                    r.push(*index);
+                match e {
+                    Edit::RemoveItem { key, path, list, index } => {
+                        let at = (*key, own.path_then(key, path), list.clone());
+                        let then = own.index_then(&at, *index);
+                        own.0.entry(at.clone()).or_default().push(then);
+                        self.removed.entry(at.clone()).or_default().push(then);
+                        made.removed.push((at, then));
+                    }
+                    Edit::SetField { key, path, label, value } => {
+                        let at = (*key, own.path_then(key, path), label.clone());
+                        if (matches!(value, Some(Value::List(_)))
+                            || (value.is_none() && self.list_fields.contains(&at)))
+                            && self.replaced.insert(at.clone())
+                        {
+                            made.replaced.push(at);
+                        }
+                    }
+                    _ => {}
                 }
             }
+        }
+        made
+    }
+
+    /// Takes back what [`Guard::made`] noted of a fix, once the fix is
+    /// undone (its resources as Verify read them again): it may be made
+    /// again, and the other fixes there follow as before it.
+    pub fn unmade(&mut self, made: &Made) {
+        for (key, was) in made.seen.iter().rev() {
+            match was {
+                Some(d) => self.seen.insert(*key, *d),
+                None => self.seen.remove(key),
+            };
+        }
+        for (at, index) in &made.removed {
+            if let Some(r) = self.removed.get_mut(at) {
+                if let Some(i) = r.iter().rposition(|x| x == index) {
+                    r.remove(i);
+                }
+                if r.is_empty() {
+                    self.removed.remove(at);
+                }
+            }
+        }
+        for at in &made.replaced {
+            self.replaced.remove(at);
         }
     }
 }
@@ -524,6 +931,70 @@ mod tests {
         assert_eq!(ws.can_undo(), Some("Move the variables to the GIT"));
     }
 
+    /// A fix that takes two items out one after the other at one place (a
+    /// plugin's "remove 3, remove 3" for items 3 and 4): the places noted
+    /// are those Verify read, so a fix on the second of them is refused
+    /// and one on a later item follows to where that item is (it was let
+    /// through onto the object two places on).
+    #[test]
+    fn a_fix_s_removals_one_after_another_are_followed_by_the_others() {
+        let mut m = module();
+        let git = key("inn.git");
+        let mut g = m.gff(&git).unwrap().unwrap();
+        let tags = ["P0", "P1", "P2", "P3", "P4", "P5", "P6"];
+        g.root.set("Placeable List", Value::List(tags.iter().map(|t| tagged(t)).collect()));
+        m.set_gff(git, &g).unwrap();
+        let remove = |index| Edit::remove_item(git, GffPath::root(), "Placeable List", index);
+        let fix = |label: &str, edits| Fix { label: label.into(), edits, asks: None };
+        let retag = |index: usize| {
+            let path = GffPath::root().item("Placeable List", index);
+            let value = Some(Value::String(b"NEW".to_vec()));
+            fix("Retag", vec![Edit::SetField { key: git, path, label: "Tag".into(), value }])
+        };
+        let two = fix("Remove two", vec![remove(3), remove(3)]);
+        let (on_third, on_fourth, on_fifth) = (retag(3), retag(4), retag(5));
+        let (take_fourth, take_last) = (fix("Take", vec![remove(4)]), fix("Take", vec![remove(6)]));
+        // (One that takes item 1 out and then sets what was item 2.)
+        let own_path = {
+            let path = GffPath::root().item("Placeable List", 1);
+            let value = Some(Value::String(b"TWO".to_vec()));
+            let set = Edit::SetField { key: git, path, label: "Tag".into(), value };
+            fix("Take and set", vec![remove(1), set])
+        };
+        let all = [&two, &on_third, &on_fourth, &on_fifth, &take_fourth, &take_last, &own_path];
+        let mut guard = Guard::new(&m, all);
+        let mut ws = Workspace::new(m);
+        let now = guard.check(&mut ws, &two).unwrap();
+        assert_eq!(now, two, "its own places are as it has them");
+        ws.apply(now.command()).unwrap();
+        let made = guard.made(&mut ws, &two);
+        let tags_now = |ws: &mut Workspace| -> Vec<String> {
+            let list = ws.doc(&git).unwrap().root.list("Placeable List").unwrap();
+            list.iter().map(|p| String::from_utf8_lossy(p.string("Tag").unwrap()).into()).collect()
+        };
+        assert_eq!(tags_now(&mut ws), ["P0", "P1", "P2", "P5", "P6"]);
+        for gone in [&on_third, &on_fourth, &take_fourth] {
+            let err = guard.check(&mut ws, gone).unwrap_err();
+            assert!(err.contains("another fix took out"), "{err}");
+        }
+        // The fifth is two places up, and so is the last.
+        let now = guard.check(&mut ws, &on_fifth).unwrap();
+        assert_eq!(now, retag(3));
+        assert_eq!(guard.check(&mut ws, &take_last).unwrap().edits, [remove(4)]);
+        // A fix's own later edit keeps its place as the fix has it, less
+        // what the others took out before it.
+        let now = guard.check(&mut ws, &own_path).unwrap();
+        assert_eq!(now, own_path);
+        ws.apply(now.command()).unwrap();
+        guard.made(&mut ws, &own_path);
+        assert_eq!(tags_now(&mut ws), ["P0", "TWO", "P5", "P6"]);
+        assert_eq!(guard.check(&mut ws, &take_last).unwrap().edits, [remove(3)]);
+        assert!(guard.check(&mut ws, &retag(1)).is_err(), "item 1 is out");
+        // What the first noted is taken back by the places Verify read.
+        guard.unmade(&made);
+        assert_eq!(guard.removed.values().cloned().collect::<Vec<_>>(), [vec![1]]);
+    }
+
     #[test]
     fn a_fix_is_made_only_on_what_verify_saw() {
         let m = module();
@@ -535,11 +1006,13 @@ mod tests {
                 label: "Tag".into(),
                 value: Some(Value::String(tag.as_bytes().to_vec())),
             }],
+            asks: None,
         };
         let (a, b, c) = (set("inn", "A"), set("inn", "B"), set("mill", "C"));
         let removal = Fix {
             label: "Remove".into(),
             edits: vec![Edit::remove_item(key("mill.git"), GffPath::root(), "StoreList", 0)],
+            asks: None,
         };
         let inserted = Fix {
             label: "Insert".into(),
@@ -550,6 +1023,7 @@ mod tests {
                 0,
                 tagged("X"),
             )],
+            asks: None,
         };
         let mut guard = Guard::new(&m, [&a, &b, &c, &removal, &inserted]);
         let mut ws = Workspace::new(m);
@@ -658,6 +1132,105 @@ mod tests {
         );
     }
 
+    /// `transition-hidden`: a clockwise area transition 2 m below its
+    /// ground (a tile raised two 1 m steps; its `ZPosition` -1) is put in
+    /// Aurora's order on the ground in one step that undoes whole; with
+    /// no game resources at hand, only in order. A generic trigger has
+    /// no finding and no fix.
+    #[test]
+    fn a_hidden_transition_is_put_in_order_on_the_ground() {
+        use mg_resman::{LayerClass, MemContainer, priority};
+        let set = b"[GENERAL]\nName=TST\nTransition=1\n[TILES]\nCount=1\n[TILE0]\nModel=tst_a01\n\
+[GROUPS]\nCount=0\n";
+        let wok = b"beginwalkmeshgeom tst_a01\nnode aabb tst_a01_wg\nparent tst_a01\nverts 4\n\
+-5 -5 0\n5 -5 0\n5 5 0\n-5 5 0\nfaces 2\n0 1 2 1 0 0 0 1\n0 2 3 1 0 0 0 1\nendnode\n\
+endwalkmeshgeom tst_a01\n";
+        let mut hak = MemContainer::new();
+        hak.insert(key("tst.set"), set.to_vec());
+        hak.insert(key("tst_a01.wok"), wok.to_vec());
+        let mut rm = ResMan::new();
+        rm.add(priority::HAK_USER, "tst.hak", LayerClass::Erf, hak);
+        let mut are = Gff::new(*b"ARE ");
+        are.root.set("Tileset", Value::resref(mg_core::ResRef::from_str("tst").unwrap()));
+        are.root.set("Width", Value::Int(1));
+        are.root.set("Height", Value::Int(1));
+        let mut tile = Struct::new(1);
+        tile.set("Tile_ID", Value::Int(0));
+        tile.set("Tile_Height", Value::Int(2));
+        are.root.set("Tile_List", Value::List(vec![tile]));
+        let lift = mg_module::instances::OUTLINE_LIFT;
+        let trigger = |tag: &str, kind: i32| {
+            let mut t = tagged(tag);
+            t.set("Type", Value::Int(kind));
+            for (l, v) in [("XPosition", 2.0), ("YPosition", 2.0), ("ZPosition", -1.0)] {
+                t.set(l, Value::Float(v));
+            }
+            // Clockwise, at -1 + 1.025: 2 m below the ground.
+            let corners = [(0.0, 0.0), (0.0, 4.0), (4.0, 4.0), (4.0, 0.0)];
+            let points = corners
+                .iter()
+                .map(|&(x, y)| {
+                    let mut p = Struct::new(3);
+                    for (l, v) in [("PointX", x), ("PointY", y), ("PointZ", 1.0 + lift)] {
+                        p.set(l, Value::Float(v));
+                    }
+                    p
+                })
+                .collect();
+            t.set("Geometry", Value::List(points));
+            t
+        };
+        let mut git = Gff::new(*b"GIT ");
+        git.root.set("TriggerList", Value::List(vec![trigger("GENERIC", 0), trigger("GATE", 1)]));
+        let mut m = Module::new();
+        m.set_gff(key("yard.are"), &are).unwrap();
+        m.set_gff(key("yard.git"), &git).unwrap();
+        let findings =
+            mg_module::doctor::examine(&m, &rm, mg_module::doctor::TalkTables::default());
+        let ours: Vec<Finding> =
+            findings.into_iter().filter(|f| f.check == "transition-hidden").collect();
+        assert_eq!(ours.len(), 1, "{ours:#?}");
+        assert_eq!(ours[0].at, "yard › trigger GATE › Geometry");
+        assert!(ours[0].message.contains("clockwise"), "{}", ours[0].message);
+        assert!(ours[0].message.contains("1.98 m below"), "{}", ours[0].message);
+
+        let found = attach_on(&m, Some(&rm), ours.clone(), &[]);
+        let fix = found[0].fix.clone().expect("a fix");
+        // (Its ZPosition to 0 and its points, as Redraw Polygon puts them.)
+        assert_eq!((fix.label.as_str(), fix.edits.len()), (PUT_OUTLINE_RIGHT, 2));
+        let mut ws = Workspace::new(m.clone());
+        let before = ws.doc(&key("yard.git")).unwrap().root.clone();
+        ws.apply(fix.command()).unwrap();
+        let outline = |ws: &mut Workspace| -> Vec<[f32; 3]> {
+            let g = ws.doc(&key("yard.git")).unwrap();
+            let t = &g.root.list("TriggerList").unwrap()[1];
+            let z = t.float("ZPosition").unwrap();
+            let f = |p: &Struct, l: &str| p.float(l).unwrap();
+            let geometry = t.list("Geometry").unwrap();
+            geometry.iter().map(|p| [f(p, "PointX"), f(p, "PointY"), z + f(p, "PointZ")]).collect()
+        };
+        let after = outline(&mut ws);
+        let xy: Vec<[f32; 2]> = after.iter().map(|p| [p[0], p[1]]).collect();
+        assert_eq!(xy, [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], "counterclockwise");
+        assert!(after.iter().all(|p| (p[2] - 2.0 - lift).abs() < 1e-5), "{after:?}");
+        // Verify finds nothing more.
+        ws.flush().unwrap();
+        let again =
+            mg_module::doctor::examine(&ws.module, &rm, mg_module::doctor::TalkTables::default());
+        assert!(again.iter().all(|f| f.check != "transition-hidden"), "{again:#?}");
+        ws.undo().unwrap();
+        assert_eq!(ws.doc(&key("yard.git")).unwrap().root, before, "one step undone");
+        ws.redo().unwrap();
+        assert_eq!(outline(&mut ws), after);
+        // No game resources: in order, at the heights it had.
+        let fix = attach(&m, ours, &[])[0].fix.clone().expect("a fix");
+        let mut ws = Workspace::new(m);
+        ws.apply(fix.command()).unwrap();
+        let kept = outline(&mut ws);
+        assert_eq!(kept[1][..2], [4.0, 0.0]);
+        assert!(kept.iter().all(|p| (p[2] - lift).abs() < 1e-5), "{kept:?}");
+    }
+
     /// `static-transform`: the transform off, as ticking Static takes it
     /// off; the rest of the placeable kept (xtul's report, October 2026).
     #[test]
@@ -702,10 +1275,164 @@ mod tests {
     fn the_plugins_fixes_go_with_their_findings() {
         let m = module();
         let mine = finding("mine/rule", "inn.git", "here");
-        let fix = Fix { label: "Do it".into(), edits: Vec::new() };
+        let fix = Fix { label: "Do it".into(), edits: Vec::new(), asks: None };
         let plugins = [Found { finding: mine.clone(), fix: Some(fix.clone()) }];
         let found = attach(&m, vec![finding("other", "inn.git", ""), mine], &plugins);
         assert_eq!(found[0].fix, None);
         assert_eq!(found[1].fix, Some(fix));
+    }
+
+    /// A fix that inserts an item and edits inside it: another fix's
+    /// removals under the original item at that place are not the new
+    /// item's (the review's ccfb8cfe note 3: its edit went one place up).
+    #[test]
+    fn an_edit_inside_an_inserted_item_is_not_moved_by_another_s_removals() {
+        let with_sub = |tag: &str| {
+            let mut s = tagged(tag);
+            s.set("Sub", Value::List(vec![tagged("S0"), tagged("S1")]));
+            s
+        };
+        let mut g = Gff::new(*b"GIT ");
+        g.root.set("VarTable", Value::List(vec![with_sub("X0"), with_sub("X1")]));
+        let git = key("inn.git");
+        let mut m = Module::new();
+        m.set_gff(git, &g).unwrap();
+        let x1 = GffPath::root().item("VarTable", 1);
+        let take = Fix {
+            label: "Take X1's first".into(),
+            edits: vec![Edit::remove_item(git, x1.clone(), "Sub", 0)],
+            asks: None,
+        };
+        let set = Edit::SetField {
+            key: git,
+            path: x1.clone().item("Sub", 1),
+            label: "Tag".into(),
+            value: Some(Value::String(b"NEW_S1".to_vec())),
+        };
+        let insert = Fix {
+            label: "Insert and edit inside".into(),
+            edits: vec![
+                Edit::insert_item(git, GffPath::root(), "VarTable", 1, with_sub("NEW")),
+                set,
+            ],
+            asks: None,
+        };
+        let mut ws = Workspace::new(m.clone());
+        let mut guard = Guard::new(&ws.module, [&take, &insert]);
+        let checked = guard.check(&mut ws, &take).unwrap();
+        ws.apply(checked.command()).unwrap();
+        guard.made(&mut ws, &take);
+        let checked = guard.check(&mut ws, &insert).unwrap();
+        assert_eq!(checked, insert, "the new item's own places, as the fix has them");
+    }
+
+    #[test]
+    fn guard_rejects_whole_list_set_field_and_tracks_insert_item_shifts() {
+        let mut g = Gff::new(*b"GIT ");
+        g.root.set("VarTable", Value::List(vec![tagged("V0"), tagged("V1"), tagged("V2")]));
+        let git = key("inn.git");
+        let mut m = Module::new();
+        m.set_gff(git, &g).unwrap();
+
+        // Deleting or replacing a list blocks fixes touching or descending into that list
+        // while keeping unrelated sibling fields valid, and unmade() re-enables them.
+        let remove_list = Fix {
+            label: "Drop vars".into(),
+            edits: vec![Edit::SetField {
+                key: git,
+                path: GffPath::root(),
+                label: "VarTable".into(),
+                value: None,
+            }],
+            asks: None,
+        };
+        let replace_list = Fix {
+            label: "Replace vars".into(),
+            edits: vec![Edit::SetField {
+                key: git,
+                path: GffPath::root(),
+                label: "VarTable".into(),
+                value: Some(Value::List(vec![tagged("ONLY")])),
+            }],
+            asks: None,
+        };
+        let follow = Fix {
+            label: "Edit var 1".into(),
+            edits: vec![Edit::SetField {
+                key: git,
+                path: GffPath::root().item("VarTable", 1),
+                label: "Tag".into(),
+                value: Some(Value::String(b"X".to_vec())),
+            }],
+            asks: None,
+        };
+        let sibling = Fix {
+            label: "Set Extra".into(),
+            edits: vec![Edit::SetField {
+                key: git,
+                path: GffPath::root(),
+                label: "Extra".into(),
+                value: Some(Value::Int(7)),
+            }],
+            asks: None,
+        };
+        for whole in [&remove_list, &replace_list] {
+            let mut ws = Workspace::new(m.clone());
+            let mut guard = Guard::new(&ws.module, [whole, &follow, &sibling]);
+            let checked = guard.check(&mut ws, whole).unwrap();
+            ws.apply(checked.command()).unwrap();
+            let made = guard.made(&mut ws, whole);
+            assert!(guard.check(&mut ws, &follow).is_err(), "{}", whole.label);
+            assert!(guard.check(&mut ws, &sibling).is_ok(), "{}", whole.label);
+            ws.undo().unwrap();
+            guard.unmade(&made);
+            assert!(guard.check(&mut ws, &follow).is_ok(), "{}", whole.label);
+        }
+
+        // Removing item 0 first, then checking a combined fix that inserts at 1 and edits/removes shifted indices.
+        let mut ws = Workspace::new(m.clone());
+        let first_rm = Fix {
+            label: "Remove 0".into(),
+            edits: vec![Edit::remove_item(git, GffPath::root(), "VarTable", 0)],
+            asks: None,
+        };
+        let combined = Fix {
+            label: "Insert and shift".into(),
+            edits: vec![
+                Edit::insert_item(git, GffPath::root(), "VarTable", 1, tagged("INS")),
+                Edit::SetField {
+                    key: git,
+                    path: GffPath::root().item("VarTable", 2), // V1 shifted 1->2 in fix space, 0->1 in ws
+                    label: "Tag".into(),
+                    value: Some(Value::String(b"V1_NEW".to_vec())),
+                },
+                Edit::remove_item(git, GffPath::root(), "VarTable", 3), // V2 shifted 2->3 in fix space, 1->2 in ws
+            ],
+            asks: None,
+        };
+        let mut guard = Guard::new(&ws.module, [&first_rm, &combined]);
+        let f1 = guard.check(&mut ws, &first_rm).unwrap();
+        ws.apply(f1.command()).unwrap();
+        guard.made(&mut ws, &first_rm);
+        let checked = guard.check(&mut ws, &combined).unwrap();
+        assert_eq!(
+            checked.edits,
+            vec![
+                Edit::insert_item(git, GffPath::root(), "VarTable", 0, tagged("INS")),
+                Edit::SetField {
+                    key: git,
+                    path: GffPath::root().item("VarTable", 1),
+                    label: "Tag".into(),
+                    value: Some(Value::String(b"V1_NEW".to_vec())),
+                },
+                Edit::remove_item(git, GffPath::root(), "VarTable", 2),
+            ]
+        );
+        ws.apply(checked.command()).unwrap();
+        let vars = ws.doc(&git).unwrap().root.list("VarTable").unwrap();
+        assert_eq!(
+            vars.iter().map(|s| s.string("Tag").unwrap()).collect::<Vec<_>>(),
+            [b"INS".as_slice(), b"V1_NEW".as_slice()]
+        );
     }
 }

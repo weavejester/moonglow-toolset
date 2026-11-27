@@ -11,7 +11,9 @@
 //! pages, conversation lines). A blueprint's inventory names its items'
 //! blueprints rather than holding them, so an item blueprint that matches
 //! is also found where a creature, placeable, store or container
-//! blueprint carries it.
+//! blueprint carries it. Asked to, the blueprints of the module's haks
+//! and the game's own that the module has none of are searched too, as
+//! read-only hits naming the layer they are read from.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use mg_rules::{Choice, ChoiceColumns, GameData, ItemProperty, ObjectKind};
 use rayon::prelude::*;
 
 use crate::Module;
-use crate::query::like;
+use crate::query::Matcher;
 use crate::refs::{Location, RefKind, Reference, gff_references};
 pub use crate::vars::VarType;
 
@@ -165,8 +167,10 @@ pub enum Search {
     /// Creatures with a feat (feat.2da row).
     Feat(i64),
     /// Creatures that know or have memorized a spell, or have it as a
-    /// special ability (spells.2da row).
-    Spell(i64),
+    /// special ability (spells.2da row); with `class` (a classes.2da row),
+    /// those that know or have memorized it as that class (a cleric's
+    /// Heal, not a druid's; a special ability is no class's).
+    Spell { spell: i64, class: Option<i64> },
     /// Creatures with at least `min_rank` ranks in a skill (skills.2da
     /// row).
     Skill { skill: usize, min_rank: u8 },
@@ -187,7 +191,7 @@ impl Search {
         match self {
             Search::Class(_) | Search::ClassLevel { .. } => creature("Class"),
             Search::Feat(_) => creature("Feat"),
-            Search::Spell(_) => creature("Spell"),
+            Search::Spell { .. } => creature("Spell"),
             Search::Skill { .. } => list_table("UTC ", &[], "SkillList"),
             Search::Appearance { of, .. } => Some(of.table()),
             Search::ItemProperty { .. } => row_table("UTI ", &[], "PropertyName"),
@@ -198,7 +202,7 @@ impl Search {
     /// The row of a table it looks for.
     fn row(&self) -> Option<i64> {
         match self {
-            Search::Class(r) | Search::Feat(r) | Search::Spell(r) => Some(*r),
+            Search::Class(r) | Search::Feat(r) | Search::Spell { spell: r, .. } => Some(*r),
             Search::Appearance { row, .. } => Some(*row),
             _ => None,
         }
@@ -231,6 +235,11 @@ pub struct Query {
     /// name, a field's label and text) are regular expressions, found
     /// anywhere unless anchored (`^…$`), not `*` patterns.
     pub regex: bool,
+    /// The blueprints of the module's haks and the game's own (those the
+    /// game reads, where the module has none of the name) are searched
+    /// too: their hits name the layer they are read from
+    /// ([`Hit::layer`]), and are read-only.
+    pub haks_and_game: bool,
 }
 
 impl Query {
@@ -243,6 +252,7 @@ impl Query {
             types: Vec::new(),
             placed: None,
             regex: false,
+            haks_and_game: false,
         }
     }
 
@@ -297,6 +307,11 @@ pub struct Hit {
     /// blueprint's, or a placed encounter's), naming the creature
     /// blueprint found.
     pub spawned: Option<ResRef>,
+    /// Where it is read from when it is not the module: a hak's layer
+    /// (`hak:cep2_top_v28`) or the game's (`base`...), with
+    /// [`Query::haks_and_game`]. Such a hit is read-only: nothing changes
+    /// it, nor edits it together with others.
+    pub layer: Option<String>,
 }
 
 impl Hit {
@@ -387,6 +402,19 @@ impl Hit {
             _ => Vec::new(),
         }
     }
+
+    /// What conditions together are met on: the objects it is on
+    /// ([`objects`](Self::objects)), else, for what is on no object (a
+    /// conversation's lines, a journal's entries), the resource itself, so
+    /// that a conversation one condition finds on a line and another on
+    /// another line is kept.
+    fn joins(&self) -> Vec<Object> {
+        let objects = self.objects();
+        if !objects.is_empty() {
+            return objects;
+        }
+        vec![Object { key: self.key, path: GffPath::root(), kind: self.key.restype }]
+    }
 }
 
 /// An object something was found on: the resource, and the path of the
@@ -455,7 +483,7 @@ fn git_kind(list: &str) -> &'static str {
 /// The object a path is in, for people: `keep › creature GUARD › item
 /// SWORD` (a placed object and the items it holds), `sword.uti`, `keep
 /// (area)`, `Module`; a conversation's line as Find References names it.
-fn place(key: ResKey, gff: &Gff, path: &GffPath, cp: Codepage) -> String {
+pub(crate) fn place(key: ResKey, gff: &Gff, path: &GffPath, cp: Codepage) -> String {
     let name = key.resref.to_lowercase().to_string();
     let first = path.first().and_then(Step::item);
     let mut out = match key.restype {
@@ -559,12 +587,44 @@ fn in_range(v: &Value, min: Option<f64>, max: Option<f64>) -> bool {
     min.is_none_or(|m| n >= end(m)) && max.is_none_or(|m| n <= end(m))
 }
 
-/// Whether `text` contains `pattern`, ignoring case, `*` matching any run
-/// (with `regex`, a regular expression found anywhere in it).
-fn contains(pattern: &str, text: &str, regex: bool) -> bool {
-    match regex {
-        true => like(pattern, text, true),
-        false => like(&format!("*{pattern}*"), text, false),
+struct CompiledSearch<'a> {
+    search: &'a Search,
+    matchers: CompiledMatchers,
+}
+
+enum CompiledMatchers {
+    None,
+    Variable { name: Matcher, value: Option<Matcher> },
+    Script(Matcher),
+    Field { label: Option<Matcher>, value_text: Option<Matcher> },
+}
+
+impl<'a> CompiledSearch<'a> {
+    fn new(search: &'a Search, regex: bool) -> Self {
+        let matchers = match search {
+            Search::Variable { name, value, .. } => CompiledMatchers::Variable {
+                name: Matcher::exact(name, regex),
+                value: value.as_deref().map(|v| Matcher::exact(v, regex)),
+            },
+            Search::Script(pattern) => CompiledMatchers::Script(Matcher::exact(pattern, regex)),
+            Search::Field { label, value } => CompiledMatchers::Field {
+                label: label.as_deref().map(|l| Matcher::exact(l, regex)),
+                value_text: match value {
+                    Some(FieldValue::Text(t)) => Some(Matcher::contains(t, regex)),
+                    _ => None,
+                },
+            },
+            _ => CompiledMatchers::None,
+        };
+        Self { search, matchers }
+    }
+}
+
+fn any_text(v: &Value, cp: Codepage, mut predicate: impl FnMut(&str) -> bool) -> bool {
+    match v {
+        Value::String(b) | Value::ResRef(b) => predicate(&cp.decode(b)),
+        Value::LocString(ls) => ls.strings.iter().any(|(_, b)| predicate(&cp.decode(b))),
+        _ => false,
     }
 }
 
@@ -583,38 +643,46 @@ pub fn event(label: &str) -> String {
 /// What one field matches, if it does: the path of what matched and the
 /// text that says so.
 fn field_hit(
-    search: &Search,
+    compiled: &CompiledSearch<'_>,
     file_type: &str,
+    root: &Struct,
     f: &FieldAt<'_>,
     game: Option<&GameData>,
     cp: Codepage,
-    regex: bool,
 ) -> Option<(GffPath, String)> {
-    let glob = |p: &str, t: &str| like(p, t, regex);
     // The path of the struct the field is in.
     let owner = || f.path.parent();
     // The labels of the steps to it, the field's own last.
     let labels = || f.path.0.iter().map(Step::label).collect::<Vec<&str>>();
-    match search {
-        Search::Variable { name, kind, value } => {
+    match (compiled.search, &compiled.matchers) {
+        (
+            Search::Variable { kind, .. },
+            CompiledMatchers::Variable { name: name_matcher, value: value_matcher },
+        ) => {
             if f.list != Some("VarTable") || f.label != "Name" {
                 return None;
             }
             let var = f.owner;
-            let var_name = cp.decode(var.string("Name")?).into_owned();
             let t = VarType::of(var.integer("Type").unwrap_or(0));
+            if kind.is_some_and(|k| t != Some(k)) {
+                return None;
+            }
+            let var_name = cp.decode(var.string("Name")?);
+            if !name_matcher.is_match(&var_name) {
+                return None;
+            }
             let text = variable_value(var, cp);
-            let hit = glob(name, &var_name)
-                && kind.is_none_or(|k| t == Some(k))
-                && value.as_ref().is_none_or(|v| glob(v, &text));
+            if value_matcher.as_ref().is_some_and(|v| !v.is_match(&text)) {
+                return None;
+            }
             let type_name = t.map_or("?", VarType::name);
             let shown = match t {
                 Some(VarType::String) => format!("\"{text}\""),
                 _ => text,
             };
-            hit.then(|| (owner(), format!("{var_name} ({type_name}) = {shown}")))
+            Some((owner(), format!("{var_name} ({type_name}) = {shown}")))
         }
-        Search::ItemProperty { property, subtype, value, param } => {
+        (Search::ItemProperty { property, subtype, value, param }, _) => {
             if f.list != Some("PropertiesList") || f.label != "PropertyName" {
                 return None;
             }
@@ -623,6 +691,9 @@ fn field_hit(
                 && subtype.is_none_or(|s| p.subtype == s)
                 && value.is_none_or(|v| p.cost_value == v)
                 && param.is_none_or(|v| p.param1_value == v);
+            if !hit {
+                return None;
+            }
             let text = match game {
                 Some(g) => g.property_text(&p),
                 None => format!(
@@ -630,9 +701,15 @@ fn field_hit(
                     p.property, p.subtype, p.cost_value
                 ),
             };
-            hit.then(|| (owner(), text))
+            Some((owner(), text))
         }
-        Search::Class(_) | Search::Feat(_) | Search::Spell(_) | Search::Appearance { .. } => {
+        (
+            search @ (Search::Class(_)
+            | Search::Feat(_)
+            | Search::Spell { .. }
+            | Search::Appearance { .. }),
+            _,
+        ) => {
             let want = search.table()?;
             let n = f.value.as_integer()?;
             if Some(n) != search.row() {
@@ -643,8 +720,29 @@ fn field_hit(
             if table.table != want.table {
                 return None;
             }
-            let name = row_name(game, &table, n);
             let list = f.list.unwrap_or_default();
+            // A spell known or memorized as a class: its list is in the
+            // class's item of `ClassList` (`/ClassList[1]/KnownList3[0]/
+            // Spell`).
+            if let Search::Spell { class: Some(class), .. } = search {
+                let steps = &f.path.0;
+                let in_class = steps.len() >= 3
+                    && (list.starts_with("KnownList") || list.starts_with("MemorizedList"))
+                    && steps[steps.len() - 3].item().is_some_and(|(l, _)| l == "ClassList");
+                let of = in_class
+                    .then(|| GffPath(steps[..steps.len() - 2].to_vec()).get(root))
+                    .flatten()
+                    .and_then(|c| c.integer("Class"));
+                if of != Some(*class) {
+                    return None;
+                }
+                let classes = row_table("UTC ", &[], "Class")?;
+                let what = if list.starts_with("KnownList") { "Known" } else { "Memorized" };
+                let name = row_name(game, &table, n);
+                let class = row_name(game, &classes, *class);
+                return Some((f.path.clone(), format!("{what} spell: {name} ({class})")));
+            }
+            let name = row_name(game, &table, n);
             let what = match list {
                 "ClassList" => {
                     let level = f.owner.integer("ClassLevel").unwrap_or(0);
@@ -661,7 +759,7 @@ fn field_hit(
             };
             Some((f.path.clone(), format!("{what}: {name}")))
         }
-        Search::ClassLevel { class, min, max } => {
+        (Search::ClassLevel { class, min, max }, _) => {
             if f.list != Some("ClassList")
                 || f.label != "Class"
                 || f.value.as_integer() != Some(*class)
@@ -672,40 +770,53 @@ fn field_hit(
             if level < *min || level > *max {
                 return None;
             }
-            let name = row_name(game, &search.table()?, *class);
+            let name = row_name(game, &compiled.search.table()?, *class);
             Some((owner(), format!("Class: {name}, level {level}")))
         }
-        Search::Skill { skill, min_rank } => {
+        (Search::Skill { skill, min_rank }, _) => {
             if f.list != Some("SkillList") || f.label != "Rank" {
+                return None;
+            }
+            let (_, index) = f.path.0.iter().rev().nth(1)?.item()?;
+            if index != *skill {
+                return None;
+            }
+            let rank = f.value.as_integer()?;
+            if rank < i64::from((*min_rank).max(1)) {
                 return None;
             }
             let labels = labels();
             let at = labels.len().saturating_sub(2);
             let table = list_table(file_type, &labels[..at], "SkillList")?;
-            let (_, index) = f.path.0.iter().rev().nth(1)?.item()?;
-            let rank = f.value.as_integer()?;
-            let hit = index == *skill && rank >= i64::from((*min_rank).max(1));
             let name = row_name(game, &table, index as i64);
-            hit.then(|| (owner(), format!("Skill: {name}, {rank} rank(s)")))
+            Some((owner(), format!("Skill: {name}, {rank} rank(s)")))
         }
-        Search::Script(_) => None,
-        Search::Field { label, value } => {
-            if label.as_ref().is_some_and(|l| !glob(l, f.label)) {
+        (Search::Script(_), _) => None,
+        (
+            Search::Field { label, value },
+            CompiledMatchers::Field { label: label_matcher, value_text },
+        ) => {
+            if label.is_none() && value.is_none() {
+                return None;
+            }
+            if label_matcher.as_ref().is_some_and(|l| !l.is_match(f.label)) {
                 return None;
             }
             let hit = match value {
                 None => true,
                 Some(FieldValue::Number(n)) => f.value.as_integer() == Some(*n),
-                Some(FieldValue::Text(t)) => {
-                    texts(f.value, cp).iter().any(|s| contains(t, s, regex))
+                Some(FieldValue::Text(_)) => {
+                    let matcher = value_text.as_ref()?;
+                    any_text(f.value, cp, |s| matcher.is_match(s))
                 }
                 Some(FieldValue::Range { min, max }) => in_range(f.value, *min, *max),
             };
-            if !hit || (label.is_none() && value.is_none()) {
+            if !hit {
                 return None;
             }
             Some((f.path.clone(), format!("{} = {}", f.label, shown(f.value, cp))))
         }
+        _ => None,
     }
 }
 
@@ -714,28 +825,33 @@ fn field_hit(
 /// attached reads the resource's references.
 fn resource_hits(
     read: &Read<'_>,
-    searches: &[&Search],
+    searches: &[CompiledSearch<'_>],
     game: Option<&GameData>,
     cp: Codepage,
-    regex: bool,
 ) -> Vec<Vec<Hit>> {
-    let Read { key, gff, refs } = *read;
+    let Read { key, gff, refs, layer } = *read;
     let file_type = gff.file_type_str();
     let mut found: Vec<Vec<(GffPath, String)>> = vec![Vec::new(); searches.len()];
-    for (s, found) in searches.iter().zip(&mut found) {
-        let Search::Script(pattern) = s else { continue };
+    for (c, found) in searches.iter().zip(&mut found) {
+        let CompiledMatchers::Script(matcher) = &c.matchers else { continue };
         for r in refs {
             let Some(path) = r.path.gff() else { continue };
-            if r.kind == RefKind::Script && like(pattern, &r.target.to_string(), regex) {
-                let script = r.target.to_lowercase();
-                found.push((path.clone(), format!("{}: {script}", event(path.label()))));
+            if r.kind == RefKind::Script {
+                let target_lower = r.target.to_lowercase();
+                let s = target_lower
+                    .as_str()
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|| std::borrow::Cow::Owned(target_lower.to_string_lossy()));
+                if matcher.is_match(&s) {
+                    found.push((path.clone(), format!("{}: {target_lower}", event(path.label()))));
+                }
             }
         }
     }
-    if searches.iter().any(|s| !matches!(s, Search::Script(_))) {
+    if searches.iter().any(|c| !matches!(c.search, Search::Script(_))) {
         gff.root.walk_fields(&mut |f| {
-            for (s, found) in searches.iter().zip(&mut found) {
-                if let Some(hit) = field_hit(s, &file_type, f, game, cp, regex) {
+            for (c, found) in searches.iter().zip(&mut found) {
+                if let Some(hit) = field_hit(c, &file_type, &gff.root, f, game, cp) {
                     found.push(hit);
                 }
             }
@@ -757,6 +873,7 @@ fn resource_hits(
                 object,
                 carried: None,
                 spawned: None,
+                layer: layer.map(str::to_string),
             });
         }
         out
@@ -797,6 +914,8 @@ struct Read<'a> {
     key: ResKey,
     gff: &'a Gff,
     refs: &'a [Reference],
+    /// The layer it is read from, where it is not the module's.
+    layer: Option<&'a str>,
 }
 
 /// Everything in the module the query matches: resource by resource (in
@@ -827,15 +946,34 @@ pub struct Kept {
     searches: Vec<Search>,
     /// Whether they were asked as regular expressions.
     regex: bool,
+    /// The codepage the cached hits were decoded with.
+    cp: Option<Codepage>,
+    /// The game data identity and mutation revision the cached hits used.
+    game_gen: Option<(u64, u64)>,
     /// Each GFF resource, as read, and what they found in it (none: it
     /// doesn't read).
     found: HashMap<ResKey, KeptOne>,
+    /// The haks' and the game's blueprints ([`Query::haks_and_game`]), by
+    /// their layer and key: the layer's fingerprint as read, and what was
+    /// found (a layer changed, a hak built again, is read again).
+    outside: HashMap<(String, ResKey), KeptOutside>,
     /// How many resources the last search read.
     pub read: usize,
 }
 
+/// Whether a layer's blueprints are searched with the haks' and the
+/// game's: every layer the game reads but the module's own (the haks, the
+/// game's archives, its override folder).
+fn searched_layer(l: &mg_resman::Layer) -> bool {
+    l.label != mg_resman::MODULE_LABEL
+}
+
 /// A resource's bytes as read, and what the conditions found in it.
 type KeptOne = (Arc<[u8]>, Option<Found>);
+
+/// A layer's blueprint: the layer's fingerprint as it was read, and what
+/// the conditions found in it.
+type KeptOutside = (u64, Option<Found>);
 
 impl Kept {
     /// [`search`], reading only the resources new or changed since the
@@ -848,10 +986,18 @@ impl Kept {
         cp: Codepage,
     ) -> Vec<Hit> {
         let searches = q.searches();
-        if !self.searches.iter().eq(searches.iter().copied()) || self.regex != q.regex {
+        let game_gen = game.map(GameData::generation);
+        if !self.searches.iter().eq(searches.iter().copied())
+            || self.regex != q.regex
+            || self.cp != Some(cp)
+            || self.game_gen != game_gen
+        {
             self.searches = searches.iter().map(|s| (*s).clone()).collect();
             self.regex = q.regex;
+            self.cp = Some(cp);
+            self.game_gen = game_gen;
             self.found.clear();
+            self.outside.clear();
         }
         self.found.retain(|k, _| m.contains(k));
         let mut changed = Vec::new();
@@ -870,6 +1016,8 @@ impl Kept {
             changed.push((*key, data));
         }
         self.read = changed.len();
+        let compiled: Vec<CompiledSearch<'_>> =
+            searches.iter().map(|s| CompiledSearch::new(s, q.regex)).collect();
         // (Each tree let go once walked: what is kept is what was found.)
         let read: Vec<(ResKey, KeptOne)> = changed
             .into_par_iter()
@@ -879,16 +1027,85 @@ impl Kept {
                         true => gff_references(key, &gff),
                         false => Vec::new(),
                     };
-                    let read = Read { key, gff: &gff, refs: &refs };
-                    Found::of(&read, &searches, game, cp, q.regex)
+                    let read = Read { key, gff: &gff, refs: &refs, layer: None };
+                    Found::of(&read, &compiled, game, cp)
                 });
                 (key, (data.clone(), found))
             })
             .collect();
         self.found.extend(read);
+        // The haks' and the game's blueprints the module has none of: each
+        // as the game reads it (the highest layer's).
+        let mut ranks: HashMap<&str, usize> = HashMap::new();
+        if q.haks_and_game
+            && let Some(game) = game
+        {
+            let layers = game.resman.layers();
+            let mut taken: std::collections::HashSet<ResKey> = std::collections::HashSet::new();
+            let mut wanted: Vec<(usize, ResKey)> = Vec::new();
+            for (i, l) in layers.iter().enumerate() {
+                if !searched_layer(l) {
+                    continue;
+                }
+                ranks.insert(l.label.as_str(), i + 1);
+                let mut keys: Vec<ResKey> = (l.container.keys())
+                    .filter(|k| ObjectKind::from_restype(k.restype).is_some())
+                    .filter(|k| !m.contains(k))
+                    .collect();
+                keys.sort();
+                // (Highest first: a copy a higher layer hides is not the one
+                // the game reads.)
+                for k in keys {
+                    if taken.insert(k) {
+                        wanted.push((i, k));
+                    }
+                }
+            }
+            // (What is kept of a blueprint is kept while the layer the game
+            // reads it from is the one it was read from, as it was then:
+            // looked up by its key, each key wanted once, not found by
+            // walking the wanted ones for each one kept.)
+            let layer_of: HashMap<ResKey, usize> = wanted.iter().map(|(i, k)| (*k, *i)).collect();
+            self.outside.retain(|(label, key), (print, _)| {
+                layer_of
+                    .get(key)
+                    .is_some_and(|i| layers[*i].label == *label && layers[*i].fingerprint == *print)
+            });
+            let new: Vec<(usize, ResKey)> = (wanted.into_iter())
+                .filter(|(i, k)| !self.outside.contains_key(&(layers[*i].label.clone(), *k)))
+                .collect();
+            self.read += new.len();
+            let read: Vec<((String, ResKey), KeptOutside)> = new
+                .into_par_iter()
+                .map(|(i, key)| {
+                    let l = &layers[i];
+                    let found = l.container.read(&key).ok().and_then(|data| {
+                        let gff = Gff::read(&data).ok()?;
+                        let refs = match needs_refs(key, &searches) {
+                            true => gff_references(key, &gff),
+                            false => Vec::new(),
+                        };
+                        let read = Read { key, gff: &gff, refs: &refs, layer: Some(&l.label) };
+                        Some(Found::of(&read, &compiled, Some(game), cp))
+                    });
+                    ((l.label.clone(), key), (l.fingerprint, found))
+                })
+                .collect();
+            self.outside.extend(read);
+        }
         let mut found: Vec<(ResKey, &Found)> =
             (self.found.iter()).filter_map(|(k, (_, f))| Some((*k, f.as_ref()?))).collect();
-        found.sort_by_key(|(k, _)| *k);
+        if q.haks_and_game {
+            found.extend(
+                (self.outside.iter())
+                    .filter(|((label, _), _)| ranks.contains_key(label.as_str()))
+                    .filter_map(|((_, k), (_, f))| Some((*k, f.as_ref()?))),
+            );
+        }
+        // The module's first, then each layer's, highest first.
+        // (Each one's rank looked up once, not at each compare of the sort.)
+        let rank = |f: &Found| f.layer.as_deref().map_or(0, |l| ranks.get(l).copied().unwrap_or(0));
+        found.sort_by_cached_key(|(k, f)| (rank(f), *k));
         joined(&found, q)
     }
 }
@@ -962,7 +1179,7 @@ impl<'a> Near<'a> {
         let mut own: HashMap<Object, &str> = HashMap::new();
         let mut held: HashMap<Object, &str> = HashMap::new();
         for h in theirs {
-            let objects = h.objects();
+            let objects = h.joins();
             if let Some(o) = objects.first() {
                 own.entry(o.clone()).or_insert(&h.matched);
             }
@@ -976,7 +1193,7 @@ impl<'a> Near<'a> {
     /// What the condition found on the object `h` is on, on one it holds,
     /// or on one holding it.
     fn meets(&self, h: &Hit) -> Option<&'a str> {
-        let objects = h.objects();
+        let objects = h.joins();
         let first = objects.first().and_then(|o| self.held.get(o)).copied();
         first.or_else(|| objects.iter().find_map(|o| self.own.get(o).copied()))
     }
@@ -1001,20 +1218,21 @@ struct Found {
     carries: Vec<(GffPath, ResRef, String)>,
     /// (path, creature blueprint, place).
     spawns: Vec<(GffPath, ResRef, String)>,
+    /// The layer it was read from, where not the module.
+    layer: Option<String>,
 }
 
 impl Found {
     fn of(
         read: &Read<'_>,
-        searches: &[&Search],
+        searches: &[CompiledSearch<'_>],
         game: Option<&GameData>,
         cp: Codepage,
-        regex: bool,
     ) -> Found {
-        let hits = resource_hits(read, searches, game, cp, regex);
+        let hits = resource_hits(read, searches, game, cp);
         let key = read.key;
         let (mut carries, mut spawns) = (Vec::new(), Vec::new());
-        if searches.iter().any(|s| carrying(s)) {
+        if searches.iter().any(|c| carrying(c.search)) {
             let blueprint = ObjectKind::from_restype(key.restype).is_some();
             let encounters = matches!(key.restype, ResType::UTE | ResType::GIT);
             for r in read.refs {
@@ -1032,7 +1250,7 @@ impl Found {
                 }
             }
         }
-        Found { hits, carries, spawns }
+        Found { hits, carries, spawns, layer: read.layer.map(str::to_string) }
     }
 }
 
@@ -1070,6 +1288,7 @@ fn condition_hits(found: &[(ResKey, &Found)], c: usize, s: &Search) -> Vec<Hit> 
                             object: ResType::UTI,
                             carried: Some(item),
                             spawned: None,
+                            layer: f.layer.clone(),
                         });
                     }
                 }
@@ -1095,6 +1314,7 @@ fn condition_hits(found: &[(ResKey, &Found)], c: usize, s: &Search) -> Vec<Hit> 
                         object: ResType::UTC,
                         carried: None,
                         spawned: Some(*target),
+                        layer: f.layer.clone(),
                     });
                 }
             }
@@ -1190,7 +1410,7 @@ pub fn property_parts(game: &GameData, property: u16, subtype: Option<u16>) -> P
         .property_param_table(&t, subtype.unwrap_or(0))
         .map(|p| named(cell("iprp_paramtable", p as usize, "TableResRef")))
         .unwrap_or_default();
-    PropertyParts { subtypes: named(t.subtypes.clone()), values, params }
+    PropertyParts { subtypes: named(t.subtypes), values, params }
 }
 
 /// A row of a table, given as its number or its name (the game's name or
@@ -1468,16 +1688,186 @@ mod tests {
         assert!(find(&m, Search::Class(5)).is_empty());
         assert_eq!(find(&m, Search::Feat(0)).len(), 2);
         // A known spell and a special ability.
-        assert_eq!(find(&m, Search::Spell(107))[0].matched, "Known spell: row 107");
-        assert_eq!(find(&m, Search::Spell(58))[0].matched, "Special ability: row 58");
+        assert_eq!(
+            find(&m, Search::Spell { spell: 107, class: None })[0].matched,
+            "Known spell: row 107"
+        );
+        assert_eq!(
+            find(&m, Search::Spell { spell: 58, class: None })[0].matched,
+            "Special ability: row 58"
+        );
         // (Cast Spell's subtype 107 is an iprp_spells row, no spell.)
-        assert_eq!(find(&m, Search::Spell(107)).len(), 2);
+        assert_eq!(find(&m, Search::Spell { spell: 107, class: None }).len(), 2);
         let skill = |skill, min_rank| Search::Skill { skill, min_rank };
         assert_eq!(find(&m, skill(3, 1))[0].matched, "Skill: row 3, 6 rank(s)");
         assert_eq!(find(&m, skill(3, 6)).len(), 2);
         assert!(find(&m, skill(3, 7)).is_empty());
         // No ranks is no skill.
         assert!(find(&m, skill(0, 0)).is_empty());
+    }
+
+    /// A spell by the class that knows it: the fighter's known spell is
+    /// found as the fighter's (row 4), not as a cleric's; a memorized one
+    /// as its own class's; a special ability is no class's.
+    #[test]
+    fn a_spell_by_the_class_that_knows_it() {
+        let mut m = module();
+        let spell = |spell, class| Search::Spell { spell, class };
+        assert_eq!(
+            places(&find(&m, spell(107, Some(4)))),
+            [
+                ("guard.utc", "Known spell: row 107 (row 4)"),
+                ("keep › creature GUARD_01", "Known spell: row 107 (row 4)")
+            ]
+        );
+        assert!(find(&m, spell(107, Some(2))).is_empty());
+        assert!(find(&m, spell(58, Some(4))).is_empty(), "a special ability");
+        // A cleric who has memorized it, beside the fighter who knows it.
+        let mut utc = Gff::new(*b"UTC ");
+        utc.root = creature("PRIEST");
+        let mut cleric = Struct::new(2);
+        cleric.set("Class", Value::Int(2));
+        cleric.set("ClassLevel", Value::Short(3));
+        let mut memorized = Struct::new(3);
+        memorized.set("Spell", Value::Word(107));
+        cleric.set("MemorizedList1", Value::List(vec![memorized]));
+        utc.root.list_mut("ClassList").unwrap().push(cleric);
+        m.set_gff(ResKey::parse("priest", ResType::UTC).unwrap(), &utc).unwrap();
+        let clerics = find(&m, spell(107, Some(2)));
+        assert_eq!(places(&clerics), [("priest.utc", "Memorized spell: row 107 (row 2)")]);
+        assert_eq!(clerics[0].path.to_string(), "/ClassList[1]/MemorizedList1[0]/Spell");
+        assert_eq!(find(&m, spell(107, Some(4))).len(), 3);
+        // Any class's, as before: each list it is in.
+        assert_eq!(find(&m, spell(107, None)).len(), 4);
+    }
+
+    /// What is on no object (a conversation's lines) is kept by several
+    /// conditions together where the same resource meets them: a script
+    /// on one line and a text on another.
+    #[test]
+    fn a_conversation_meets_conditions_on_different_lines() {
+        let mut m = module();
+        let line = |text: &str, script: &str| {
+            let mut s = Struct::new(0);
+            let t = LocString::from_text(Language::ENGLISH, Gender::Male, text);
+            s.set("Text", Value::LocString(t));
+            s.set("Script", Value::resref(rr(script)));
+            s
+        };
+        for (name, lines) in [
+            ("elder", vec![line("Greetings.", "a_give_quest"), line("The well is dry.", "")]),
+            ("child", vec![line("Hello!", "a_give_candy"), line("Bye.", "")]),
+        ] {
+            let mut dlg = Gff::new(*b"DLG ");
+            dlg.root.set("EntryList", Value::List(lines));
+            m.set_gff(ResKey::parse(name, ResType::DLG).unwrap(), &dlg).unwrap();
+        }
+        let script = Search::Script("a_give_*".into());
+        let well = Search::Field { label: None, value: Some(FieldValue::Text("well".into())) };
+        let q = Query { and: vec![well.clone()], ..Query::new(script.clone()) };
+        let hits = search(&m, &q, None, Codepage::WINDOWS_1252);
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert_eq!(hits[0].key, ResKey::parse("elder", ResType::DLG).unwrap());
+        assert!(hits[0].matched.contains("a_give_quest") && hits[0].matched.contains("well"));
+        // Left out where it is not, the same way.
+        let q = Query { not: vec![well], ..Query::new(script) };
+        let hits = search(&m, &q, None, Codepage::WINDOWS_1252);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, ResKey::parse("child", ResType::DLG).unwrap());
+        // (A conversation is still no object to open or edit together.)
+        assert_eq!(hits[0].object(), None);
+    }
+
+    /// With the haks' and the game's blueprints: those the module has none
+    /// of are searched, each as the game reads it (a hak's over the
+    /// game's), its hits naming its layer, after the module's; the
+    /// module's blueprint carrying a game item found is the module's.
+    #[test]
+    fn the_haks_and_the_game_s_blueprints_are_searched_read_only() {
+        let gff = |kind: &[u8; 4], root: Struct| {
+            let mut g = Gff::new(*kind);
+            g.root = root;
+            g.to_bytes().unwrap()
+        };
+        let key = |name: &str, t| ResKey::parse(name, t).unwrap();
+        let bonus = |v| {
+            let from = vec![var(&format!("nFrom{v}"), Value::Int(1))];
+            item("BONUS", from, vec![property(52, 3, 25, v)])
+        };
+        let mut game_layer = MemContainer::new();
+        game_layer.insert(key("nw_gem", ResType::UTI), &gff(b"UTI ", bonus(1))[..]);
+        game_layer.insert(key("nw_ring", ResType::UTI), &gff(b"UTI ", bonus(1))[..]);
+        // (The module's own sword hides the game's.)
+        game_layer.insert(key("sword", ResType::UTI), &gff(b"UTI ", bonus(9))[..]);
+        let mut hak = MemContainer::new();
+        hak.insert(key("nw_ring", ResType::UTI), &gff(b"UTI ", bonus(2))[..]);
+        hak.insert(key("orc", ResType::UTC), &gff(b"UTC ", creature("ORC"))[..]);
+        let mut rm = ResMan::new();
+        rm.add(priority::KEY, "base", LayerClass::Key, game_layer);
+        rm.add(priority::HAK, "hak:monsters", LayerClass::Erf, hak);
+        let game = GameData::new(rm, Tlk::new(Language::ENGLISH));
+        let mut m = module();
+        let mut utp = Gff::new(*b"UTP ");
+        let mut held = Struct::new(0);
+        held.set("InventoryRes", Value::resref(rr("nw_gem")));
+        utp.root.set("ItemList", Value::List(vec![held]));
+        m.set_gff(key("crate", ResType::UTP), &utp).unwrap();
+        let p = Search::ItemProperty { property: 52, subtype: None, value: None, param: None };
+        let mut kept = Kept::default();
+        let q = Query { haks_and_game: true, ..Query::new(p.clone()) };
+        let hits = kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1252);
+        let layers: Vec<(&str, Option<&str>)> =
+            hits.iter().map(|h| (h.place.as_str(), h.layer.as_deref())).collect();
+        assert_eq!(
+            layers,
+            [
+                ("chest.utp › carries sword.uti", None),
+                ("crate.utp › carries nw_gem.uti", None),
+                ("keep › creature GUARD_01 › item OLD_SWORD", None),
+                ("sword.uti", None),
+                ("nw_ring.uti", Some("hak:monsters")),
+                ("nw_gem.uti", Some("base")),
+            ]
+        );
+        // (The hak's ring, not the game's it hides; nor the game's sword.)
+        let from = |v: &str| {
+            let s = Search::Variable { name: format!("nFrom{v}"), kind: None, value: None };
+            let q = Query { haks_and_game: true, ..Query::new(s) };
+            search(&m, &q, Some(&game), Codepage::WINDOWS_1252)
+        };
+        assert_eq!(places(&from("2"))[..1], [("nw_ring.uti", "nFrom2 (int) = 1")]);
+        assert_eq!(from("9").len(), 0);
+        assert_eq!(
+            from("1").iter().map(|h| h.place.as_str()).collect::<Vec<_>>(),
+            ["crate.utp › carries nw_gem.uti", "nw_gem.uti"]
+        );
+        // Asked again, nothing is read again; without them, the module's.
+        kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1252);
+        assert_eq!(kept.read, 0);
+        let only = Query::new(p.clone());
+        let module_only = kept.search(&m, &only, Some(&game), Codepage::WINDOWS_1252);
+        assert_eq!(module_only.len(), 3);
+        assert!(module_only.iter().all(|h| h.layer.is_none()));
+        // A hak's creature, by its class, with the module's.
+        let q = Query { haks_and_game: true, ..Query::new(Search::Class(4)) };
+        let hits = search(&m, &q, Some(&game), Codepage::WINDOWS_1252);
+        assert_eq!(hits.last().unwrap().place, "orc.utc");
+        assert_eq!(hits.last().unwrap().layer.as_deref(), Some("hak:monsters"));
+        // Placed objects only: none of theirs.
+        let q = Query { placed: Some(true), ..q };
+        let hits = search(&m, &q, Some(&game), Codepage::WINDOWS_1252);
+        assert!(hits.iter().all(|h| h.layer.is_none()));
+        // What is kept of their blueprints is kept by the layer the game
+        // reads each from: one the module now has is let go, the rest are
+        // not read again, and the answer is the one a search anew gives.
+        let q = Query { haks_and_game: true, ..Query::new(p.clone()) };
+        let mut kept = Kept::default();
+        kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1252);
+        m.set(key("nw_ring", ResType::UTI), gff(b"UTI ", bonus(3)));
+        let again = kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1252);
+        assert_eq!(kept.read, 1, "the module's new ring alone");
+        assert_eq!(again, search(&m, &q, Some(&game), Codepage::WINDOWS_1252));
+        assert!(again.iter().all(|h| h.layer.as_deref() != Some("hak:monsters")), "{again:?}");
     }
 
     #[test]
@@ -1900,5 +2290,41 @@ mod tests {
         m.set(ResKey::parse("broken", ResType::UTC).unwrap(), b"UTC V3.2 truncated".to_vec());
         let t = Search::Field { label: None, value: Some(FieldValue::Text("lag".into())) };
         assert_eq!(places(&find(&m, t)), [("camp.utw", "LocalizedName = \"Camp\"")]);
+    }
+
+    #[test]
+    fn kept_invalidates_on_codepage_and_game_data_changes() {
+        let mut m = Module::new();
+        let mut utp = Gff::new(*b"UTP ");
+        utp.root.set("Tag", Value::String(vec![b'K', 0xa3]));
+        m.set_gff(ResKey::parse("box", ResType::UTP).unwrap(), &utp).unwrap();
+
+        let tlk = mg_tlk::Tlk::new(Language::ENGLISH);
+        let rm = mg_resman::ResMan::new();
+        let mut game = GameData::new(rm, tlk);
+
+        let mut kept = Kept::default();
+        let q = Query::new(Search::Field { label: Some("Tag".into()), value: None });
+
+        let hits = kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1252);
+        assert!(kept.read > 0);
+        assert_eq!(hits[0].matched, "Tag = \"K\u{a3}\"");
+
+        let _ = kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1252);
+        assert_eq!(kept.read, 0);
+
+        let hits = kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1250);
+        assert!(kept.read > 0);
+        assert_eq!(hits[0].matched, "Tag = \"K\u{141}\"");
+
+        let mut custom = mg_tlk::Tlk::new(Language::ENGLISH);
+        custom.entries.push(mg_tlk::TlkEntry::text("Custom"));
+        assert!(game.update_custom_tlk(&custom));
+        let _ = kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1250);
+        assert!(kept.read > 0);
+
+        game.invalidate();
+        let _ = kept.search(&m, &q, Some(&game), Codepage::WINDOWS_1250);
+        assert!(kept.read > 0);
     }
 }

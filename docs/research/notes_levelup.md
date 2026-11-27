@@ -3,7 +3,7 @@ type: Research Note
 title: Levelling up by package, and the Creature Wizard (Aurora's)
 description: How Aurora's Levelup Wizard and Creature Wizard level a creature by its classes' packages, worked out from creatures made in Aurora 89.8193.37 and checked against them.
 tags: [creatures, levelup, packages, aurora, rules]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-01T06:01:42Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-10T07:02:37Z }
 ---
 
 # Levelling up by package, and the Creature Wizard (Aurora's)
@@ -56,13 +56,18 @@ In class slot order, one level at a time:
 
 - **Spells**: a class that prepares them (`MemorizesSpells`) gets each
   spell level's slots (`SpellGainTable`, plus a bonus slot per four points
-  of the casting ability's modifier from the spell level up) filled with a
+  of the casting ability's modifier from the spell level up, wherever the
+  table's cell is a number, 0 too, but none at level 0) filled with a
   domain spell (the first domain's for that level, else the second's) and
   the package's spells of that level (`SpellPref2DA`) in order, the first
   repeated in what is left (a cleric's five cantrips: Inflict Minor Wounds
-  five times). One that knows them gets the package's first spells of each
-  level up to its `SpellKnownTable` (not checked against Aurora). Entries
-  are Spell, SpellMetaMagic 0, SpellFlags 1.
+  five times; Paladin 4 at Wisdom 14, whose first level's cell is 0, one
+  first-level spell). One that knows them gets the package's first spells
+  of each level up to its `SpellKnownTable` (Sorcerer 1: four cantrips and
+  two first-level spells; Bard 1: four cantrips; captured 2026-11-10,
+  `levelup/spells-after.mod`). Entries are Spell, SpellMetaMagic 0,
+  SpellFlags 1. Aurora's Properties window, when OK'd, writes the feats
+  sorted by name.
 - **Equipment**: the package's `Equip2DA` items in order: each to the
   first slot of its base item's `EquipableSlots` if free and a weapon,
   shield, armour, helmet or ammunition (baseitems.2da `Category` 1–8; a

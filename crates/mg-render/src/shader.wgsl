@@ -12,25 +12,7 @@
 // model has tangents, else from screen-space derivatives (the tangents made
 // for a mesh without, for the game's shaders, are left alone).
 
-struct Frame {
-    view: mat4x4<f32>,
-    proj: mat4x4<f32>,
-    // Area (sun/moon) light, linear.
-    area_ambient: vec4<f32>,
-    area_diffuse: vec4<f32>,
-    // View-space direction towards the sun/moon.
-    area_dir: vec4<f32>,
-    // enabled, start, end, 1 / (end - start)
-    fog: vec4<f32>,
-    // Gamma space.
-    fog_color: vec4<f32>,
-    // 1 / max intensity, falloff factor, light count, target height (pixels)
-    light_params: vec4<f32>,
-    // Minimum light (the GUI "scene colour"), linear.
-    scene_color: vec4<f32>,
-    // x = seconds, for what moves by itself (water).
-    time: vec4<f32>,
-};
+// (`Frame`: `frame.wgsl`, put before this source.)
 
 struct Light {
     // View-space position.
@@ -66,6 +48,8 @@ struct Draw {
     // A rippling texture (the game's procedural water): x = how far its
     // picture is pushed about (a part of its width), y = how fast; 0: still.
     // z = 1 for water (`bumpmaptexture shinywater`): waves cross it.
+    // w = 1: multiplied by the shadows' mask (a see-through mesh's soft
+    // part that receives the shadows, drawn after they are laid).
     water: vec4<f32>,
     // A known custom shader's doings (the `vertexalpha` pair): x = which
     // (1 vertex colors, 2 an alpha mask on the second coordinates, 4 a
@@ -75,7 +59,7 @@ struct Draw {
     // The texture's turn (the game's `m_texture`: a tile's ground turned
     // with it): x = cos, y = sin.
     uv_turn: vec4<f32>,
-    // x = number of lights for this draw, y = 1 if skinned, z = first bone,
+    // x = number of lights for this draw, y = nothing, z = first bone,
     // w = 1 if the mesh's tangents were made (not the model's)
     light_count: vec4<u32>,
     // Up to 32 light indices.
@@ -95,6 +79,9 @@ const SOLID_ALPHA: f32 = 0.95;
 // instance's values are those `order` names for its number.
 @group(0) @binding(3) var<storage, read> draws: array<Draw>;
 @group(0) @binding(4) var<storage, read> order: array<u32>;
+// The shadows laid so far: what the picture was multiplied by (white
+// where none are).
+@group(0) @binding(5) var shadow_mask: texture_2d<f32>;
 var<private> this_draw: u32;
 @group(1) @binding(0) var tex0: texture_2d<f32>;
 @group(1) @binding(1) var tex_env: texture_2d<f32>;
@@ -212,6 +199,12 @@ fn unturn(t: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(turn.x * t.x + turn.y * t.y, -turn.y * t.x + turn.x * t.y);
 }
 
+// A direction in the texture turned as the texture was (`mat2(m_texture)`).
+fn turn(t: vec2<f32>) -> vec2<f32> {
+    let turn = draws[this_draw].uv_turn.xy;
+    return vec2<f32>(turn.x * t.x - turn.y * t.y, turn.y * t.x + turn.x * t.y);
+}
+
 // The environment map's 2D ("sphere") coordinates, view space.
 fn env_coords(n: vec3<f32>, pos_view: vec3<f32>) -> vec2<f32> {
     let e = n.xy / (1.0 + abs(n.z)) + 0.5 * pos_view.xy / (-pos_view.z + 0.2);
@@ -300,10 +293,13 @@ fn height_at(uv: vec2<f32>, duv1: vec2<f32>, duv2: vec2<f32>) -> f32 {
 }
 
 // Parallax: the game's iterative search (inc_displacement), height read as
-// depth 1 - h. `v` points towards the eye.
+// depth 1 - h. `v` points towards the eye. With the model's own tangents
+// (`own`), the direction is turned as the texture was (`mat2(m_texture)`,
+// as the normal map's is turned back): they turned with the tile.
 fn displace(
     uv0: vec2<f32>,
     tsb: mat3x3<f32>,
+    own: bool,
     v: vec3<f32>,
     surface_n: vec3<f32>,
     pos_view: vec3<f32>,
@@ -321,7 +317,10 @@ fn displace(
     if (iterations <= 0.5) {
         return uv0;
     }
-    let vd = transpose(tsb) * v;
+    var vd = transpose(tsb) * v;
+    if (own) {
+        vd = vec3<f32>(turn(vd.xy), vd.z);
+    }
     iterations = floor(iterations + 0.5);
     var segment = 1.0 / iterations;
     let h = 0.5 * vd.z + 0.5;
@@ -345,6 +344,17 @@ fn displace(
 
 @fragment
 fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    var c = shade(in, front);
+    // (A soft part drawn after the shadows, darkened where they are.)
+    if (draws[this_draw].water.w > 0.5) {
+        // (Within it: white is a texel alone, where none is laid.)
+        let at = min(vec2<u32>(in.clip.xy), textureDimensions(shadow_mask) - vec2<u32>(1u));
+        c = vec4<f32>(c.rgb * textureLoad(shadow_mask, at, 0).r, c.a);
+    }
+    return c;
+}
+
+fn shade(in: VertexOut, front: bool) -> vec4<f32> {
     this_draw = in.draw;
     // Derivatives first, while every fragment of the quad is running.
     let dp1 = dpdx(in.pos_view);
@@ -371,40 +381,20 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
         let handed = select(-1.0, 1.0, in.tangent_view.w >= 0.0);
         tsb = mat3x3<f32>(tn, cross(surface_n, tn) * handed, surface_n);
     }
-    // The environment map's coordinates' derivatives, here too: the game
-    // samples the map with the roughness as a bias over the level they
-    // give (`inc_envmap`'s `texture2D(texUnitEnv, uv, bias)`), so a
-    // magnified map stays sharp however rough. Taken from the normal the
-    // normal map makes (the game's coordinates are the fragment normal's),
-    // before anything is discarded.
-    var n_env = surface_n;
-    if (normal_mapped) {
-        let s = textureSampleGrad(tex_normal, samp0, in.uv, duv1, duv2).rg * 2.0 - 1.0;
-        let t = select(s, unturn(s), own);
-        n_env = normalize(tsb * vec3<f32>(t, sqrt(max(1.0 - dot(t, t), 0.0))));
-    }
-    let env_uv = env_coords(n_env, in.pos_view);
-    let denv1 = dpdx(env_uv);
-    let denv2 = dpdy(env_uv);
-    let view_to_world =
-        transpose(mat3x3<f32>(frame.view[0].xyz, frame.view[1].xyz, frame.view[2].xyz));
-    let env_dir = view_to_world * reflect(-v, n_env);
-    let ddir1 = dpdx(env_dir);
-    let ddir2 = dpdy(env_dir);
-
     // Tangent frame and parallax.
     var uv = in.uv;
-    // Water: the picture pushed about by two slow waves each way (an
-    // approximation of the game's procedure, which is its own).
+    // A rippling texture (`proceduretype arturo`) and water: the picture
+    // pushed about by two slow waves each way (an approximation of the
+    // game's procedure, which is its own), as far (x) and as fast (y, the
+    // clock's rate) as the renderer's `ripple_of` says.
     if (draws[this_draw].water.x > 0.0) {
-        let t = frame.time.x * draws[this_draw].water.y * 0.06;
+        let t = frame.time.x * draws[this_draw].water.y;
         let k = 6.2831853;
         let wave = vec2<f32>(
             sin(k * uv.y * 1.0 + t) + sin(k * uv.x * 0.7 + t * 0.63 + 1.3),
             cos(k * uv.x * 1.0 + t * 0.81) + cos(k * uv.y * 0.6 + t * 0.47 + 2.1),
         );
-        // (Under the waves of Enhanced Edition's water, half as far.)
-        uv = uv + wave * (draws[this_draw].water.x * select(0.25, 0.12, draws[this_draw].water.z > 0.5));
+        uv = uv + wave * draws[this_draw].water.x;
     }
     // A known custom shader's doings (see `Draw.effect`).
     let fx = u32(draws[this_draw].effect.x + 0.5);
@@ -423,8 +413,36 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
         uv = uv + way * (draws[this_draw].effect.y * frame.time.x);
     }
     if (height_mapped) {
-        uv = displace(uv, tsb, v, surface_n, in.pos_view, duv1, duv2);
+        uv = displace(uv, tsb, own, v, surface_n, in.pos_view, duv1, duv2);
     }
+
+    // The normal map: RG only, Z rebuilt.
+    var n = surface_n;
+    if (normal_mapped) {
+        let s = textureSampleGrad(tex_normal, samp0, uv, duv1, duv2).rg * 2.0 - 1.0;
+        let t = select(s, unturn(s), own);
+        n = normalize(tsb * vec3<f32>(t, sqrt(max(1.0 - dot(t, t), 0.0))));
+    }
+    // The environment map's coordinates' derivatives, here too: the game
+    // samples the map with the roughness as a bias over the level they
+    // give (`inc_envmap`'s `texture2D(texUnitEnv, uv, bias)`), so a
+    // magnified map stays sharp however rough. Taken from the normal it
+    // reflects by, as the game's are: the normal map's at the coordinates
+    // the parallax moved, a normal facing away bent towards the eye (as
+    // below); before anything is discarded.
+    var n_env = n;
+    let nv_env = dot(n_env, v);
+    if (nv_env < 0.0) {
+        n_env = normalize(n_env - nv_env * v);
+    }
+    let env_uv = env_coords(n_env, in.pos_view);
+    let denv1 = dpdx(env_uv);
+    let denv2 = dpdy(env_uv);
+    let view_to_world =
+        transpose(mat3x3<f32>(frame.view[0].xyz, frame.view[1].xyz, frame.view[2].xyz));
+    let env_dir = view_to_world * reflect(-v, n_env);
+    let ddir1 = dpdx(env_dir);
+    let ddir2 = dpdy(env_dir);
 
     // Every `discard` here is followed by a `return`: a discarded fragment
     // that went on running (as WGSL has it, and as Metal's
@@ -495,6 +513,11 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     if (draws[this_draw].extra.w > 3.5) {
         return vec4<f32>(0.0);
     }
+    // The alpha the light through it from behind is weighed by: a
+    // cut-out's own (the mesh's times the texel's) though it is drawn
+    // solid, as the game's lighting takes it (`batch6_cut_out_lighter`: a
+    // disc of mesh `alpha 0.5` a quarter lighter, lit from behind).
+    let light_alpha = color.a;
     if (draws[this_draw].extra.w > 2.5) {
         color.a = 1.0;
     } else if (draws[this_draw].extra.w > 1.5) {
@@ -516,14 +539,6 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     // Unlit (TXI decal).
     if (draws[this_draw].params.w > 0.5) {
         return vec4<f32>(color_clamp(gam(color.rgb)), color.a);
-    }
-
-    // The normal map: RG only, Z rebuilt.
-    var n = surface_n;
-    if (normal_mapped) {
-        let s = textureSampleGrad(tex_normal, samp0, uv, duv1, duv2).rg * 2.0 - 1.0;
-        let t = select(s, unturn(s), own);
-        n = normalize(tsb * vec3<f32>(t, sqrt(max(1.0 - dot(t, t), 0.0))));
     }
 
     // Water: small waves crossing it tip its surface this way and that, so
@@ -627,7 +642,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     let r2 = rough * rough;
     let k = rough;
     // Light through transparent surfaces from behind.
-    let translucence = 1.0 - color.a;
+    let translucence = 1.0 - light_alpha;
 
     var acc: Accum;
     acc.ambient = frame.area_ambient.rgb;
@@ -709,7 +724,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     specular = specular + (ambient + diffuse) * env_sample * ao * env_spec;
     ambient = ambient * ao;
     var total = draws[this_draw].emissive.rgb + (1.0 - env_spec) * (ambient + diffuse);
-    total = max(total, min(frame.scene_color.rgb * draws[this_draw].diffuse.rgb, vec3<f32>(1.0)));
+    total = max(total, vec3<f32>(0.0));
     var rgb = color.rgb * total;
     if (draws[this_draw].maps2.x > 0.5) {
         rgb = rgb + lin(textureSampleGrad(tex_illum, samp0, uv, duv1, duv2).rgb);

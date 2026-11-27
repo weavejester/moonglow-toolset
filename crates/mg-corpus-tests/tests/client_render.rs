@@ -27,10 +27,10 @@
 //! the image, and they are compared with what Moonglow uploads.
 //!
 //! Needs the game, a GPU and the off-screen display; run by hand:
-//! `DISPLAY=:1 cargo test -p mg-corpus-tests --test client_render -- --ignored --nocapture`.
+//! `DISPLAY=$D cargo test -p mg-corpus-tests --test client_render -- --ignored --nocapture`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,24 +60,50 @@ mod batch3;
 mod batch4;
 #[path = "client_render/batch5.rs"]
 mod batch5;
+#[path = "client_render/batch6.rs"]
+mod batch6;
+#[path = "client_render/batch7.rs"]
+mod batch7;
+#[path = "client_render/batch8d.rs"]
+mod batch8d;
+#[path = "client_render/chrome_reflection.rs"]
+mod chrome_reflection;
+#[path = "client_render/copies.rs"]
+mod copies;
+#[path = "client_render/custom_body.rs"]
+mod custom_body;
 #[path = "client_render/ee_visuals.rs"]
 mod ee_visuals;
 #[path = "client_render/heads.rs"]
 mod heads;
 #[path = "client_render/heed.rs"]
 mod heed;
+#[path = "client_render/icons.rs"]
+mod icons;
 #[path = "client_render/joined.rs"]
 mod joined;
+#[path = "client_render/local_z.rs"]
+mod local_z;
+#[path = "client_render/night_fog.rs"]
+mod night_fog;
 #[path = "client_render/nui.rs"]
 mod nui;
+#[path = "client_render/part_emitters.rs"]
+mod part_emitters;
+#[path = "client_render/part_textures.rs"]
+mod part_textures;
 #[path = "client_render/programs.rs"]
 mod programs;
 #[path = "client_render/readings.rs"]
 mod readings;
 #[path = "client_render/shadows.rs"]
 mod shadows;
+#[path = "client_render/soft.rs"]
+mod soft;
 #[path = "client_render/soft_particles.rs"]
 mod soft_particles;
+#[path = "client_render/transition_outlines.rs"]
+mod transition_outlines;
 #[path = "client_render/upright.rs"]
 mod upright;
 #[path = "client_render/uv_sets.rs"]
@@ -89,11 +115,12 @@ const FACING: f32 = 90.0;
 const AHEAD: f32 = 3.0;
 /// The view the client shows for `SetCameraFacing(90, 12, 45)`: field of
 /// view (degrees), focus height, distance, pitch (degrees from straight
-/// down).
-const FIT_FOV: f32 = 48.0;
-const FIT_FOCUS: f32 = 1.25;
-const FIT_DISTANCE: f32 = 19.0;
-const FIT_PITCH: f32 = 50.0;
+/// down): the client's own camera there, which does not take the command
+/// given at once ([`Camera::GAME_ENTRY`], where the fit is kept).
+const FIT_FOV: f32 = Camera::GAME_FOV;
+const FIT_FOCUS: f32 = Camera::GAME_FOCUS;
+const FIT_DISTANCE: f32 = Camera::GAME_ENTRY.0;
+const FIT_PITCH: f32 = Camera::GAME_ENTRY.1;
 
 const ENTER: &str = r#"
 void Log(string s) { WriteTimestampedLogEntry(s); }
@@ -310,23 +337,9 @@ fn fitted_camera(pc: Vec3, fov: f32, focus: f32, distance: f32, pitch: f32) -> C
 }
 
 /// [`fitted_camera`] looking along another facing (degrees anticlockwise
-/// from east).
+/// from east): the game's camera as mg-render has it ([`Camera::game`]).
 fn camera_facing(pc: Vec3, facing: f32, fov: f32, focus: f32, distance: f32, pitch: f32) -> Camera {
-    let elevation = (90.0 - pitch).to_radians();
-    let facing = facing.to_radians();
-    let focus = pc + Vec3::new(0.0, 0.0, focus);
-    let dir = Vec3::new(
-        -facing.cos() * elevation.cos(),
-        -facing.sin() * elevation.cos(),
-        elevation.sin(),
-    );
-    Camera {
-        eye: focus + dir * distance,
-        target: focus,
-        fov_y: fov.to_radians(),
-        near: 0.1,
-        far: 200.0,
-    }
+    Camera::game(pc, facing, distance, pitch, focus, fov)
 }
 
 /// How far a picture of Moonglow's is from the client's: the mean
@@ -438,8 +451,8 @@ fn off_and_on(
 /// second after the player enters (as [`save_area_module_facing`] turns
 /// it): field of view and focus as [`fitted_camera`]'s, this distance and
 /// pitch (fitted to its pictures: [`fit_turned_camera`]).
-const TURNED_DISTANCE: f32 = 11.0;
-const TURNED_PITCH: f32 = 44.0;
+const TURNED_DISTANCE: f32 = Camera::GAME_SCRIPTED_12_45.0;
+const TURNED_PITCH: f32 = Camera::GAME_SCRIPTED_12_45.1;
 
 /// [`camera_facing`] for the camera [`save_area_module_facing`] gives the
 /// client: [`fitted_camera`]'s looking north, else turned.
@@ -449,6 +462,14 @@ fn scripted_camera(pc: Vec3, facing: f32) -> Camera {
     } else {
         camera_facing(pc, facing, FIT_FOV, FIT_FOCUS, TURNED_DISTANCE, TURNED_PITCH)
     }
+}
+
+/// How far the client's camera of [`save_area_module_facing`] stands from
+/// the player, as the client keeps it (what its fog's start follows:
+/// `mg_area::View::camera`): its own as the player enters (20 m) looking
+/// north, the script's 12 m else.
+fn scripted_camera_distance(facing: f32) -> f32 {
+    if facing == FACING { mg_area::GAME_CAMERA } else { 12.0 }
 }
 
 /// Exploration (`MG_FIT=1`): the distance, pitch and focus of the camera
@@ -543,7 +564,7 @@ fn fit_camera(r: &mut Renderer, gpu: &Gpu, game: &GameData, scene: &Scene, clien
 fn reference_scenes_match_the_client() {
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -1067,7 +1088,10 @@ fn placeable_light_uniforms() {
 /// L5: the client's fog uniforms (read back through the debug shader) are
 /// Moonglow's fog: the end at the fog clip distance, the start the fog
 /// amount nearer than 30 m (at most 1 m before the end), with or without a
-/// skybox. `MG_FOG_CASES=amount:clip,...` measures others.
+/// skybox, by day (the sun's fog) and at night (the moon's), outdoors and
+/// in. `MG_FOG_CASES=amount:clip[:flags],...` measures others, the flags
+/// `n` for night and `i` for an interior (as `12:22:ni`, the Shard of
+/// The Domains of Dread).
 #[test]
 #[ignore]
 fn fog_uniforms_match_the_client() {
@@ -1075,27 +1099,59 @@ fn fog_uniforms_match_the_client() {
     let _ = oracle_tool!("nwn_script_comp");
     let game = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
     let shader = debug_shader(&game);
-    let cases: Vec<(u8, f32, u8)> = std::env::var("MG_FOG_CASES")
+    // (amount, clip, skybox, night, interior)
+    let cases: Vec<(u8, f32, u8, bool, bool)> = std::env::var("MG_FOG_CASES")
         .ok()
         .map(|v| {
             v.split(',')
                 .map(|c| {
-                    let (a, d) = c.split_once(':').unwrap();
-                    (a.parse().unwrap(), d.parse().unwrap(), 0)
+                    let mut parts = c.split(':');
+                    let a = parts.next().unwrap().parse().unwrap();
+                    let d = parts.next().unwrap().parse().unwrap();
+                    let flags = parts.next().unwrap_or("");
+                    (a, d, 0, flags.contains('n'), flags.contains('i'))
                 })
                 .collect()
         })
-        .unwrap_or_else(|| vec![(0, 45.0, 0), (10, 45.0, 0), (50, 100.0, 1), (0, 25.0, 0)]);
+        .unwrap_or_else(|| {
+            vec![
+                (0, 45.0, 0, false, false),
+                (10, 45.0, 0, false, false),
+                (50, 100.0, 1, false, false),
+                (0, 25.0, 0, false, false),
+                (12, 22.0, 0, true, true),
+                (12, 22.0, 0, false, false),
+            ]
+        });
     let mut failures = Vec::new();
-    for (amount, clip, sky) in cases {
-        let dir = scratch_dir(&format!("client_fog_{amount}_{clip}"));
+    for (amount, clip, sky, night, interior) in cases {
+        let what = format!(
+            "fog {amount} clip {clip} sky {sky}{}{}",
+            if night { " night" } else { "" },
+            if interior { " interior" } else { "" }
+        );
+        let dir = scratch_dir(&format!(
+            "client_fog_{amount}_{clip}{}{}",
+            if night { "_n" } else { "" },
+            if interior { "_i" } else { "" }
+        ));
         let light =
             Lighting { ambient: 0x404040, diffuse: 0xB0B0B0, main_light: 0, only_tile: None };
         let (mut m, mut are) = build_module(&game, &dir, light);
-        are.root.set("SunFogAmount", Value::Byte(amount));
-        are.root.set("SunFogColor", Value::Dword(0x806040));
+        // (The other one's fog another amount and colour, to tell which
+        // the client takes.)
+        let (this, other) = if night { ("Moon", "Sun") } else { ("Sun", "Moon") };
+        are.root.set(&format!("{this}FogAmount"), Value::Byte(amount));
+        are.root.set(&format!("{this}FogColor"), Value::Dword(0x806040));
+        are.root.set(&format!("{other}FogAmount"), Value::Byte(amount.wrapping_add(7)));
+        are.root.set(&format!("{other}FogColor"), Value::Dword(0x204080));
+        are.root.set("IsNight", Value::Byte(u8::from(night)));
         are.root.set("FogClipDist", Value::Float(clip));
         are.root.set("SkyBox", Value::Byte(sky));
+        if interior {
+            let flags = are.root.integer("Flags").unwrap_or(0) | 1;
+            are.root.set("Flags", Value::Dword(u32::try_from(flags).unwrap_or(1)));
+        }
         let area =
             m.info().unwrap().root.list("Mod_Area_list").unwrap()[0].resref("Area_Name").unwrap();
         m.set_gff(ResKey::new(area, ResType::ARE), &are).unwrap();
@@ -1104,31 +1160,31 @@ fn fog_uniforms_match_the_client() {
         std::fs::write(dir.join("user/override/inc_standard.shd"), &shader).unwrap();
         m.save_as(&ModuleLocation::Archive(dir.join("user/modules/MgScene.mod"))).unwrap();
         let Some(client) = client_screenshot(&dir, "MgScene") else {
-            panic!("fog {amount}: the client did not reach the scene (see {})", dir.display());
+            panic!("{what}: the client did not reach the scene (see {})", dir.display());
         };
         // The start from 1 / (end - start): the read-back clamps below 0.
         let end = debug_value(&client, 12, 1024.0);
         let start = end - 1.0 / debug_value(&client, 13, 1.0);
         let color = [14, 15, 16].map(|k| debug_value(&client, k, 1.0));
         let lighting = mg_area::Lighting::read(&are.root, None);
-        let ours = mg_area::fog(&lighting, false);
+        let ours = mg_area::fog(&lighting, night);
         eprintln!(
-            "fog {amount} clip {clip} sky {sky}: client {start:.2}..{end:.2}, \
-             moonglow {:.2}..{:.2}",
-            ours.start, ours.end
+            "{what}: client {start:.2}..{end:.2} colour {color:.3?}, \
+             moonglow {:.2}..{:.2} colour {:.3}",
+            ours.start, ours.end, ours.color
         );
         let close = |a: f32, b: f32, tolerance: f32| (a - b).abs() <= tolerance;
         if debug_value(&client, 10, 1.0) < 0.5 {
-            failures.push(format!("fog {amount}: the client has fog off"));
+            failures.push(format!("{what}: the client has fog off"));
         }
         if !close(start, ours.start, 0.3) || !close(end, ours.end, 0.1) {
             failures.push(format!(
-                "fog {amount} clip {clip}: client {start}..{end}, moonglow {}..{}",
+                "{what}: client {start}..{end}, moonglow {}..{}",
                 ours.start, ours.end
             ));
         }
         if (0..3).any(|c| !close(color[c], ours.color[c], 0.003)) {
-            failures.push(format!("fog {amount}: colour {color:?} vs {}", ours.color));
+            failures.push(format!("{what}: colour {color:?} vs {}", ours.color));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -1142,7 +1198,7 @@ fn fog_uniforms_match_the_client() {
 fn grass_and_sky_look() {
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -1183,6 +1239,191 @@ fn grass_and_sky_look() {
     eprintln!("{}: client {}", dir.display(), client.is_some());
 }
 
+/// The sky under the game's farthest camera (`SetCameraFacing`'s distance
+/// 25, its most) and under Moonglow's far beyond it, for a look (M3 T15's
+/// review): a rural field (ttr01, 4 by 4) with the Grass_Clear skybox and
+/// a magenta fog color (the horizon fade is drawn in it), the player at
+/// the field's west edge, the client's camera looking north straight down
+/// (`top`: pitch 1, the field's west edge at the picture's left) and 30°
+/// down from the horizon (`low`: pitch 60, the land past the field's west
+/// and north edges and the fade over it). Moonglow's camera is fitted to
+/// the field in each client picture (its distance and pitch, by the
+/// ground alone: the scripted ones do not map one to one onto the view),
+/// and the sky beside the field compared ([`sky_difference`]); then drawn
+/// from 150 m at the same pitch (`far`, and `far_wide` 2559 by 800), where
+/// no game camera goes. Pictures in `target/test-output/client_render_sky/`,
+/// Moonglow's named by `MG_SKY_LABEL` (default `now`); `MG_SKY_TOP` or
+/// `MG_SKY_LOW` ("distance,pitch") give Moonglow's camera instead of the
+/// fit, `MG_NO_CLIENT=1` draws Moonglow's alone.
+#[test]
+#[ignore]
+fn sky_under_the_game_s_farthest_camera_look() {
+    let root = corpus!();
+    let _ = oracle_tool!("nwn_script_comp");
+    crate::common::gpu_after_display();
+    let Some(gpu) = Gpu::headless() else {
+        eprintln!("skipped: no GPU");
+        return;
+    };
+    let game = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let light = Lighting { ambient: 0x404040, diffuse: 0xB0B0B0, main_light: 0, only_tile: None };
+    let label = std::env::var("MG_SKY_LABEL").unwrap_or_else(|_| "now".into());
+    let skip_client = std::env::var_os("MG_NO_CLIENT").is_some();
+    let entry = glam::Vec2::new(3.0, 20.0);
+    let out = scratch_dir("client_render_sky");
+    // (The case, the client's pitch, and the fit's search for Moonglow's
+    // pitch, degrees from straight down; the camera where no client ran.)
+    let cases =
+        [("top", "1.0", (0.0, 12.0), (23.0, 2.0)), ("low", "60.0", (52.0, 66.0), (23.0, 59.0))];
+    for (case, pitch, search, fallback) in cases {
+        let dir = scratch_dir(&format!("client_render_sky_{case}"));
+        let (mut m, mut are) = build_module_on(&game, &dir, light, "ttr01", 1);
+        let are_key = *m.keys_of(ResType::ARE).next().unwrap();
+        are.root.set("SunFogColor", Value::Dword(0x00C0_20C0));
+        m.set_gff(are_key, &are).unwrap();
+        // (Where the player stands, to the log: [`player_stood`].)
+        let ready = "DelayCommand(4.0, Log(\"MG_READY\"));";
+        let stood = "DelayCommand(3.5, Log(\"MG_PC \" + FloatToString(GetPosition(pc).x, 0, 3) \
+                     + \" \" + FloatToString(GetPosition(pc).y, 0, 3) + \" \" \
+                     + FloatToString(GetPosition(pc).z, 0, 3)));";
+        let enter = enter_with_camera("25.0", pitch)
+            .replace("CreateObject(", "if (FALSE) CreateObject(")
+            .replace(ready, &format!("{stood}\n    {ready}"));
+        assert!(enter.contains("MG_PC"));
+        let ncs = compile(&dir, "mg_enter", &enter);
+        m.set(ResKey::parse("mg_enter", ResType::NCS).unwrap(), ncs);
+        let mut info = m.info().unwrap();
+        info.root.write(&ifo::MOD_ENTRY_X, entry.x);
+        info.root.write(&ifo::MOD_ENTRY_Y, entry.y);
+        m.set_info(&info).unwrap();
+        std::fs::create_dir_all(dir.join("user")).unwrap();
+        std::fs::write(dir.join("user/settings.tml"), batch5::with_skybox(SETTINGS)).unwrap();
+        m.save_as(&ModuleLocation::Archive(dir.join("user/modules/MgScene.mod"))).unwrap();
+        let client = if skip_client { None } else { client_screenshot(&dir, "MgScene") };
+        let git_key = *m.keys_of(ResType::GIT).next().unwrap();
+        let git = m.gff(&git_key).unwrap().unwrap();
+        let tileset = mg_area::tileset(&game, ResRef::from_str("ttr01").unwrap()).ok();
+        let model = mg_area::AreaModel::read(&game, &are.root, &git.root, tileset.as_ref());
+        let pc = player_stood(&dir, &game, &model, entry);
+        let area_scene = mg_area::AreaScene::new(&gpu, &game, &model);
+        let scene =
+            area_scene.scene(&model, &mg_area::View { fog: false, ..mg_area::View::of(&model) });
+        let (w, h) = client.as_ref().map_or((1024, 768), |c| (c.width, c.height));
+        let camera = |distance: f32, pitch: f32| {
+            camera_facing(pc, FACING, FIT_FOV, FIT_FOCUS, distance, pitch)
+        };
+        if let Some(c) = &client {
+            save_png(c, &out.join(format!("{case}_client.png")));
+        }
+        let given = std::env::var(format!("MG_SKY_{}", case.to_uppercase())).ok().and_then(|v| {
+            let (d, p) = v.split_once(',')?;
+            Some((d.trim().parse().ok()?, p.trim().parse().ok()?))
+        });
+        let (distance, fitted) = match (&client, given) {
+            (_, Some(given)) => given,
+            (Some(c), None) => fit_to_the_ground(&gpu, &game, &scene, c, search, &camera),
+            (None, None) => fallback,
+        };
+        eprintln!("{case}: Moonglow's camera at distance {distance}, pitch {fitted}");
+        let near = camera(distance, fitted);
+        let (off, on) = off_and_on(&gpu, &game, &scene, &near, (w, h), client.as_ref(), &dir, "mg");
+        save_png(&off, &out.join(format!("{case}_moonglow_{label}.png")));
+        save_png(&on, &out.join(format!("{case}_moonglow_shaders_{label}.png")));
+        if let Some(c) = &client {
+            let (sky, n) = sky_difference(c, &off);
+            let (sky_on, _) = sky_difference(c, &on);
+            eprintln!(
+                "{case}: the sky beside the field ({n} pixels) {sky:.2} from the client's of 255, \
+                 the game's shaders {sky_on:.2}"
+            );
+        }
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+        let far = camera(150.0, fitted);
+        let far_img = r.render_image(&gpu, &game.resman, &scene, &far, w, h);
+        save_png(&far_img, &out.join(format!("{case}_far_{label}.png")));
+        let wide = r.render_image(&gpu, &game.resman, &scene, &far, 2559, 800);
+        save_png(&wide, &out.join(format!("{case}_far_wide_{label}.png")));
+    }
+    eprintln!("pictures in {}", out.display());
+}
+
+/// Whether a pixel of the client's picture shows the ground (grass,
+/// dirt, rock), not the sky's fade in [`sky_under_the_game_s_farthest_camera_look`]'s
+/// magenta fog, nor black.
+fn ground_pixel(p: &[u8]) -> bool {
+    let (r, g, b) = (i32::from(p[0]), i32::from(p[1]), i32::from(p[2]));
+    r + g + b > 30 && 2 * g > r.min(b)
+}
+
+/// The rows and columns of a picture compared, clear of the game's GUI.
+fn clear_of_the_gui(w: usize, h: usize) -> impl Iterator<Item = (usize, usize)> {
+    (h / 10..h * 7 / 10).flat_map(move |y| (w / 10..w * 9 / 10).map(move |x| (x, y)))
+}
+
+/// How far the sky in Moonglow's picture is from the client's: the mean
+/// difference per channel (of 255) over what is not the ground in the
+/// client's ([`ground_pixel`]), clear of its GUI; and how many pixels.
+fn sky_difference(client: &Rgba, ours: &Rgba) -> (f64, usize) {
+    let (w, h) = (client.width as usize, client.height as usize);
+    let (mut sum, mut n) = (0f64, 0usize);
+    for (x, y) in clear_of_the_gui(w, h) {
+        let i = (y * w + x) * 4;
+        if ground_pixel(&client.data[i..i + 3]) {
+            continue;
+        }
+        sum +=
+            (0..3).map(|c| f64::from(client.data[i + c].abs_diff(ours.data[i + c]))).sum::<f64>()
+                / 3.0;
+        n += 1;
+    }
+    (sum / n.max(1) as f64, n)
+}
+
+/// The distance (15 to 35 m, half a meter apart) and pitch (degrees from
+/// straight down, half a degree apart over `pitches`) of `camera`'s that
+/// match the client's picture best on the ground alone ([`ground_pixel`],
+/// gray levels, clear of its GUI): the sky is what is compared, not
+/// what is fitted.
+fn fit_to_the_ground(
+    gpu: &Gpu,
+    game: &GameData,
+    scene: &Scene,
+    client: &Rgba,
+    (low, high): (f32, f32),
+    camera: &dyn Fn(f32, f32) -> Camera,
+) -> (f32, f32) {
+    let mut r = Renderer::new(gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+    let (w, h) = (client.width as usize, client.height as usize);
+    let gray = |img: &Rgba, i: usize| {
+        (f32::from(img.data[i]) + f32::from(img.data[i + 1]) + f32::from(img.data[i + 2])) / 3.0
+    };
+    let ground: Vec<usize> = clear_of_the_gui(w, h)
+        .filter(|&(x, y)| x % 2 == 0 && y % 2 == 0)
+        .map(|(x, y)| (y * w + x) * 4)
+        .filter(|&i| ground_pixel(&client.data[i..i + 3]))
+        .collect();
+    let mut best = (f32::MAX, (0.0, 0.0));
+    let pitches = (0..).map(|k| low + k as f32 * 0.5).take_while(|&p| p <= high);
+    for pitch in pitches {
+        for distance in (30..=70).map(|d| d as f32 / 2.0) {
+            let cam = camera(distance, pitch);
+            let img = r.render_image(gpu, &game.resman, scene, &cam, client.width, client.height);
+            let err = ground.iter().map(|&i| (gray(&img, i) - gray(client, i)).abs()).sum::<f32>()
+                / ground.len().max(1) as f32;
+            if err < best.0 {
+                best = (err, (distance, pitch));
+            }
+        }
+    }
+    eprintln!(
+        "best fit on {} ground pixels: error {:.2}: distance, pitch {:?}",
+        ground.len(),
+        best.0,
+        best.1
+    );
+    best.1
+}
+
 /// One grass override for [`grass_overrides_look`], as Moonglow writes it.
 fn grass_override(
     material: u32,
@@ -1215,7 +1456,7 @@ fn grass_override(
 fn grass_overrides_look() {
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -1656,7 +1897,7 @@ fn particles_look() {
     m.set(ResKey::parse("mg_enter", ResType::NCS).unwrap(), ncs);
     m.save_as(&ModuleLocation::Archive(user.join("modules/MgScene.mod"))).unwrap();
     if std::env::var_os("MG_PREDICT").is_some() {
-        mg_testkit::gpu::hold();
+        crate::common::gpu_after_display();
         let gpu = Gpu::headless().unwrap();
         let (_, are) = build_module(&game, &dir, light);
         let (scene, _) = moonglow_scene(&gpu, &game, &are, light);
@@ -1706,7 +1947,7 @@ fn placeables_look() {
     use mg_module::instances::{Placement, Placing, instance};
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -1820,7 +2061,7 @@ fn visual_transforms_look() {
     use mg_module::instances::{Placement, Placing, instance};
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -1926,7 +2167,7 @@ fn items_look() {
     use mg_module::instances::{Placement, Placing, instance};
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -2004,7 +2245,7 @@ fn creatures_look() {
     use mg_rules::items::{ArmorChannel, set_armor_part_color};
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -2093,8 +2334,10 @@ fn creatures_look() {
         // (Part 7: the torso.)
         set_armor_part_color(&mut armor.root, 7, channel, Some(88));
     }
-    // `MG_PARTS`: armor part numbers, as `Torso=32,LThigh=3,RThigh=3`.
+    // `MG_PARTS`: armor part numbers, as `Torso=32,LThigh=3,RThigh=3`
+    // (`Robe=3` too: no robe unless named).
     if let Ok(parts) = std::env::var("MG_PARTS") {
+        armor.root.set("ArmorPart_Robe", Value::Byte(0));
         for (part, n) in parts.split(',').filter_map(|p| p.split_once('=')) {
             let n: u8 = n.trim().parse().unwrap();
             let label = format!("ArmorPart_{}", part.trim());
@@ -2104,7 +2347,6 @@ fn creatures_look() {
                 armor.root.set(&wide, Value::Word(u16::from(n)));
             }
         }
-        armor.root.set("ArmorPart_Robe", Value::Byte(0));
     }
     let mut cloak = first(ResType::UTI, &|s| s.integer("BaseItem") == Some(80));
     // (Nothing that could keep a creature from wearing it.)
@@ -2313,7 +2555,7 @@ fn cutouts_look() {
     use mg_module::instances::{Placement, Placing, instance};
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -2495,37 +2737,44 @@ fn cutouts_look() {
     eprintln!("{}: client {}", dir.display(), client.is_some());
 }
 
-/// The Domains of Dread's custom shaders in the client beside Moonglow's
-/// drawing (`docs/shaders-proposal.md`, M2): its fountain
-/// (`dd_tap_stron1030`, placeables.2da row 63754 of `tdod_top`; the
-/// falling water by `dd_tap_flow_vs`/`_fs`) north of the player in the
-/// reference room, with its haks (`MOONGLOW_HAKS`, linked into the scratch
-/// user folder's `hak`; `tdod_shaders`' `inc_lighting` with them). Moonglow
-/// draws it with the Shaders switch off and on; each is compared with the
-/// client over the fountain's pixels (where Moonglow's drawing with it
-/// differs from one without it) and over the floor regions: the mean
-/// difference per channel. Pictures in `target/test-output/client_tdod_shaders/`.
-#[test]
-#[ignore]
-fn tdod_custom_shaders_look() {
+/// The Domains of Dread's fountain scene ([`tdod_custom_shaders_look`]),
+/// saved in the scratch directory `name` with `overrides` in its user
+/// directory's `override`: the game with the haks, the area's ARE, its GIT
+/// with the fountain and without. `None` (said) without the haks.
+struct TdodFountain {
+    dir: PathBuf,
+    game: GameData,
+    are: Gff,
+    git: Gff,
+    empty: Gff,
+}
+
+fn tdod_fountain(name: &str, overrides: &[(&str, Vec<u8>)]) -> Option<TdodFountain> {
     use mg_module::instances::{Placement, Placing, instance};
-    let root = corpus!();
-    let _ = oracle_tool!("nwn_script_comp");
+    let (Some(root), Some(_)) = (mg_testkit::nwn_root(), mg_testkit::nwn_tool("nwn_script_comp"))
+    else {
+        eprintln!("skipped: no game (NWN_ROOT) or no nwn_script_comp (NWN_TOOLS_BIN)");
+        return None;
+    };
     let Some(haks) = mg_testkit::builder_hak_dirs()
         .into_iter()
         .find(|d| d.join("tdod_p_tap.hak").is_file() && d.join("tdod_top.hak").is_file())
     else {
         eprintln!("skipped: no tdod_p_tap.hak in MOONGLOW_HAKS");
-        return;
+        return None;
     };
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
-    let dir = scratch_dir("client_tdod_shaders");
+    let dir = scratch_dir(name);
     std::fs::create_dir_all(dir.join("user/hak")).unwrap();
+    std::fs::create_dir_all(dir.join("user/override")).unwrap();
     std::fs::write(dir.join("user/settings.tml"), SETTINGS).unwrap();
+    // (`MG_FOUNTAIN_OVERRIDE=<folder>`: its files in the `override` for
+    // the client and Moonglow alike, a patched `fswater.shd` painting what
+    // it computes; the client's picture kept under the folder's name.)
+    if let Some(extra) = std::env::var_os("MG_FOUNTAIN_OVERRIDE") {
+        for e in std::fs::read_dir(extra).expect("the override folder").flatten() {
+            std::fs::copy(e.path(), dir.join("user/override").join(e.file_name())).unwrap();
+        }
+    }
     // (Highest priority first, as the module lists them.)
     let names = ["tdod_shaders", "tdod_p_tap", "tdod_top"];
     for name in names {
@@ -2566,32 +2815,107 @@ fn tdod_custom_shaders_look() {
     empty.root.set("Placeable List", Value::List(Vec::new()));
     m.set_gff(git_key, &git).unwrap();
     m.save_as(&ModuleLocation::Archive(dir.join("user/modules/MgScene.mod"))).unwrap();
-    let client = client_capture(&dir, "MgScene", "tdod_fountain");
+    // (The overrides for the client alone: the game read for Moonglow was
+    // opened without them.)
+    for (file, data) in overrides {
+        std::fs::write(dir.join("user/override").join(file), data).unwrap();
+    }
+    Some(TdodFountain { dir, game, are, git, empty })
+}
+
+/// The Domains of Dread's custom shaders in the client beside Moonglow's
+/// drawing (`docs/shaders-proposal.md`, M2): its fountain
+/// (`dd_tap_stron1030`, placeables.2da row 63754 of `tdod_top`; the
+/// falling water by `dd_tap_flow_vs`/`_fs`) north of the player in the
+/// reference room, with its haks (`MOONGLOW_HAKS`, linked into the scratch
+/// user folder's `hak`; `tdod_shaders`' `inc_lighting` with them). Moonglow
+/// draws it with the Shaders switch off and on; each is compared with the
+/// client over the fountain's pixels (where Moonglow's drawing with it
+/// differs from one without it) and over the floor regions: the mean
+/// difference per channel. Pictures in `target/test-output/client_tdod_shaders/`.
+/// `MG_FOUNTAIN_OVERRIDE=<folder>` puts its files in the `override` of
+/// both (a patched `fswater.shd` painting what it computes; the pictures in
+/// `client_tdod_shaders_<folder>/`, the client's kept as
+/// `tdod_fountain_<folder>.png`), and `MG_FOUNTAIN_HIDE=<texture>,...`
+/// leaves the meshes of those textures out of Moonglow's pictures.
+///
+/// Read (2026-11-26) with a painting `fswater`: the client's basin water
+/// reads the texture's alpha at its smallest level as 0.73 and the basin's
+/// floor 0.2 to 0.5 m under it, its copy holding the floor and the
+/// column's foot. Moonglow's read alpha 1 (the rippling procedure's gray,
+/// fixed) and, its copy made before the fountain's body (a standard DXT5,
+/// see-through to both), the room's floor 0.9 m down (fixed: the copy is
+/// made after the see-through meshes' solid parts).
+#[test]
+#[ignore]
+fn tdod_custom_shaders_look() {
+    // (With `MG_FOUNTAIN_OVERRIDE`, the scratch folder and the client's
+    // kept picture are named by the override's folder.)
+    let patch = std::env::var_os("MG_FOUNTAIN_OVERRIDE")
+        .map(|d| format!("_{}", Path::new(&d).file_name().unwrap_or_default().to_string_lossy()));
+    let patch = patch.unwrap_or_default();
+    let Some(TdodFountain { dir, game, are, git, empty }) =
+        tdod_fountain(&format!("client_tdod_shaders{patch}"), &[])
+    else {
+        return;
+    };
+    let kept = format!("tdod_fountain{patch}");
+    let client = client_capture(&dir, "MgScene", &kept);
     if let Some(c) = &client {
         save_png(c, &dir.join("client.png"));
     }
 
     let tileset = mg_area::tileset(&game, ResRef::from_str("tic01").unwrap()).ok();
+    crate::common::gpu_after_display();
+    let Some(gpu) = Gpu::headless() else {
+        eprintln!("skipped: no GPU");
+        return;
+    };
     let camera =
         fitted_camera(Vec3::new(20.0, 20.0, 0.0), FIT_FOV, FIT_FOCUS, FIT_DISTANCE, FIT_PITCH);
     let (w, h) = client.as_ref().map_or((1280, 800), |c| (c.width, c.height));
-    let draw = |git: &Gff, on: bool, water: bool| {
+    let draw_fogged = |git: &Gff, on: bool, water: bool, fog: bool| {
         let model = mg_area::AreaModel::read(&game, &are.root, &git.root, tileset.as_ref());
         let area_scene = mg_area::AreaScene::new(&gpu, &game, &model);
-        let view = mg_area::View { fog: false, time: 4.0, ..mg_area::View::of(&model) };
-        let scene = area_scene.scene(&model, &view);
+        let view = mg_area::View { fog, time: 4.0, ..mg_area::View::of(&model) };
+        let mut scene = area_scene.scene(&model, &view);
+        // (`MG_FOUNTAIN_HIDE=<texture>,...`: meshes of those textures left
+        // out of Moonglow's pictures, to see what lies under them.)
+        if let Ok(hide) = std::env::var("MG_FOUNTAIN_HIDE") {
+            let hide: Vec<&str> = hide.split(',').collect();
+            for inst in &mut scene.instances {
+                let mut state = inst
+                    .state
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_else(|| mg_render::scene::MeshState::new(&inst.model));
+                for (m, o) in inst.model.meshes.iter().zip(&mut state.meshes) {
+                    if m.material.texture.as_deref().is_some_and(|t| hide.contains(&t)) {
+                        o.hidden = true;
+                    }
+                }
+                inst.state = Some(std::sync::Arc::new(state));
+            }
+        }
         let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
         r.game_shaders = on;
         r.game_water = water;
         let img = r.render_image(&gpu, &game.resman, &scene, &camera, w, h);
         (img, r.drawn, r.game_shader_failures().to_vec())
     };
+    let draw = |git: &Gff, on: bool, water: bool| draw_fogged(git, on, water, false);
     let (bare, _, _) = draw(&empty, false, false);
     let (off, _, _) = draw(&git, false, false);
     // (The basin's water by `fswater` with the framebuffer's copies, as the
     // client draws it, while `GAME_WATER`; and by Moonglow's own water.)
     let (on, drawn, failures) = draw(&git, true, mg_render::GAME_WATER);
     let (water, _, _) = draw(&git, true, false);
+    // (And with the area's fog, which the client lays over the far floor
+    // and water at a fog amount of 0 too: `reading_far_water_by_part`.)
+    let (fogged, _, _) = draw_fogged(&git, true, mg_render::GAME_WATER, true);
+    let (fogged_off, _, _) = draw_fogged(&git, false, false, true);
+    save_png(&fogged, &dir.join("moonglow_on_fog.png"));
+    save_png(&fogged_off, &dir.join("moonglow_off_fog.png"));
     save_png(&off, &dir.join("moonglow_off.png"));
     save_png(&on, &dir.join("moonglow_on.png"));
     save_png(&water, &dir.join("moonglow_ownwater.png"));
@@ -2617,9 +2941,12 @@ fn tdod_custom_shaders_look() {
     let (d_off, n) = over(&off);
     let (d_on, _) = over(&on);
     let (d_water, _) = over(&water);
+    let (d_fog, _) = over(&fogged);
+    let (d_fog_off, _) = over(&fogged_off);
     eprintln!(
         "fountain ({n} pixels): Moonglow's own shader differs from the client by {d_off:.1} of 255 \
-         on average, the game's shaders by {d_on:.1}, and with Moonglow's water by {d_water:.1}"
+         on average, the game's shaders by {d_on:.1}, and with Moonglow's water by {d_water:.1}; \
+         with the fog, the game's shaders by {d_fog:.1} and Moonglow's own by {d_fog_off:.1}"
     );
     for (name, r, _) in REGIONS.iter().filter(|(n, ..)| n.contains("floor")) {
         let c = mean(&client, *r);
@@ -2730,7 +3057,7 @@ fn tdod_custom_shaders_look() {
 fn area_lighting_look() {
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -3035,7 +3362,7 @@ fn model_light_uniforms() {
     use mg_module::instances::{Placement, Placing, instance};
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;
@@ -3232,7 +3559,7 @@ fn area_env_map_look() {
     use mg_module::instances::{Placement, Placing, instance};
     let root = corpus!();
     let _ = oracle_tool!("nwn_script_comp");
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU");
         return;

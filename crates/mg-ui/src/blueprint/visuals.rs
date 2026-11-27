@@ -17,6 +17,7 @@ use egui::Ui;
 use mg_edit::{Command, Edit, GffPath};
 use mg_gff::{Struct, Value};
 use mg_resman::ResKey;
+use mg_uikit::Controls as _;
 
 use super::Form;
 use crate::Action;
@@ -107,17 +108,17 @@ fn cursor_name(v: i64) -> String {
 /// The page: everything (`full`), or only `MiscVisuals` (triggers).
 pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, full: bool) {
     if full {
-        crate::widgets::section_heading(ui, "Texture replacements");
+        crate::widgets::section_heading(ui, "Texture Replacements");
         f.mixed_line(ui, "TextureReplace");
         ui.weak("A texture of the object's models drawn with another (not PLT textures).");
         super::replacements::textures(f, ui);
         ui.add_space(crate::widgets::SECTION_GAP);
-        crate::widgets::section_heading(ui, "Animation replacements");
+        crate::widgets::section_heading(ui, "Animation Replacements");
         f.mixed_line(ui, "AnimationReplace");
         ui.weak("An animation of the object's model played as another.");
         super::replacements::animations(f, ui);
         ui.add_space(crate::widgets::SECTION_GAP);
-        crate::widgets::section_heading(ui, "Shader parameters");
+        crate::widgets::section_heading(ui, "Shader Parameters");
         f.mixed_line(ui, "Material");
         ui.weak(
             "Values a material's shader reads (uniforms): only an MTR that names its own \
@@ -140,6 +141,24 @@ impl Form<'_> {
             .unwrap_or_default()
     }
 
+    /// Builds a command that sets the list inside a struct field, keeping
+    /// the struct's other fields; an empty list removes the field.
+    pub(super) fn nested_list_command(
+        &self,
+        what: &str,
+        field: &str,
+        id: u32,
+        list: &str,
+        items: Vec<Struct>,
+    ) -> Command {
+        let value = (!items.is_empty()).then(|| {
+            let mut s = self.root.child(field).cloned().unwrap_or_else(|| Struct::new(id));
+            s.set(list, Value::List(items));
+            Value::Struct(s)
+        });
+        self.setting(what, field, value)
+    }
+
     /// Sets the list inside a struct field, keeping the struct's other
     /// fields; an empty list removes the field.
     pub(super) fn set_nested_list(
@@ -150,18 +169,13 @@ impl Form<'_> {
         list: &str,
         items: Vec<Struct>,
     ) {
-        let value = (!items.is_empty()).then(|| {
-            let mut s = self.root.child(field).cloned().unwrap_or_else(|| Struct::new(id));
-            s.set(list, Value::List(items));
-            Value::Struct(s)
-        });
-        self.set_opt(what, field, value);
+        let cmd = self.nested_list_command(what, field, id, list, items);
+        self.app.actions.push(Action::Apply(cmd));
     }
 
-    /// Sets fields of `MiscVisuals`, keeping the others: each object's
-    /// own, where several are edited together (the first one's were set
-    /// on all of them).
-    fn set_misc(&mut self, what: &str, fields: &[(&str, Value)]) {
+    /// Builds a command setting fields of `MiscVisuals` on each target while
+    /// preserving each object's other fields.
+    fn misc_command(&mut self, what: &str, fields: &[(&str, Value)]) -> Command {
         let targets: Vec<(ResKey, GffPath)> = self.targets().map(|(k, p)| (k, p.clone())).collect();
         let mut edits = Vec::new();
         for (key, path) in targets {
@@ -179,20 +193,37 @@ impl Form<'_> {
             let value = Some(Value::Struct(s));
             edits.push(Edit::SetField { key, path, label: "MiscVisuals".into(), value });
         }
-        self.app.actions.push(Action::Apply(Command::new(what, edits)));
+        Command::new(what, edits)
+    }
+
+    /// Sets fields of `MiscVisuals`, keeping the others: each object's
+    /// own, where several are edited together (the first one's were set
+    /// on all of them).
+    fn set_misc(&mut self, what: &str, fields: &[(&str, Value)]) {
+        let cmd = self.misc_command(what, fields);
+        self.app.actions.push(Action::Apply(cmd));
     }
 
     /// [`mark_mixed`](Form::mark_mixed) for fields of the struct `field`
     /// (`MiscVisuals`' highlight color).
     fn mark_mixed_in(&mut self, ui: &Ui, field: &str, labels: &[&str]) {
-        let seen = |v: Option<&Value>| -> Vec<Option<Value>> {
-            let s = match v {
-                Some(Value::Struct(s)) => Some(s),
-                _ => None,
-            };
-            labels.iter().map(|l| s.and_then(|s| s.get(l)).cloned()).collect()
+        if self.also.is_empty() || self.also.len() > super::MIXED_LIMIT {
+            return;
+        }
+        let Some(ws) = self.app.ws.as_mut() else { return };
+        let mine = match self.root.get(field) {
+            Some(Value::Struct(s)) => Some(s),
+            _ => None,
         };
-        if self.differs_by(field, seen) {
+        let differs = self.also.iter().any(|(key, path)| {
+            let theirs =
+                match ws.doc(key).ok().and_then(|d| path.get(&d.root)).and_then(|s| s.get(field)) {
+                    Some(Value::Struct(s)) => Some(s),
+                    _ => None,
+                };
+            labels.iter().any(|l| theirs.and_then(|s| s.get(l)) != mine.and_then(|s| s.get(l)))
+        });
+        if differs {
             self.paint_mixed(ui, &format!("{field}#{}", labels.join("#")));
         }
     }
@@ -203,75 +234,116 @@ fn shader_params(f: &mut Form<'_>, ui: &mut Ui) {
     let items = f.nested_list("Material", "ShaderParams");
     let mut changed: Option<Vec<Struct>> = None;
     let text = |s: &Struct, l: &str| decode(s.string(l).unwrap_or_default());
-    egui::Grid::new(f.id("ShaderParams")).num_columns(5).spacing([12.0, 4.0]).show(ui, |ui| {
-        if !items.is_empty() {
-            for l in ["Material", "Parameter", "Type", "Value"] {
-                ui.strong(l);
-            }
-            ui.end_row();
-        }
-        for (i, e) in items.iter().enumerate() {
-            for label in ["Material", "Param"] {
-                let id = f.id(&format!("ShaderParams#{i}#{label}"));
-                if let Some(v) = commit_text(f.app, ui, id, &text(e, label), false, 120.0) {
-                    let mut all = items.clone();
-                    all[i].set(label, Value::String(encode(v.trim())));
-                    changed = Some(all);
-                }
-            }
-            let kind = e.integer("Type").unwrap_or(0);
-            let mut pick = kind;
-            let name = |k: &i64| match k {
-                1 => "Integer".to_string(),
-                2 => "Vector".to_string(),
-                k => format!("({k})"),
-            };
-            crate::widgets::dropdown(f.id(&format!("ShaderParams#{i}#Type")))
-                .selected_text(name(&kind))
-                .show(ui, &mut pick, &[1, 2], name);
-            if pick != kind {
-                let mut all = items.clone();
-                all[i].set("Type", Value::Byte(pick as u8));
-                changed = Some(all);
-            }
-            ui.horizontal(|ui| match kind {
-                1 => {
-                    let v = e.integer("Int").unwrap_or(0);
-                    if let Some(n) = commit_number(ui, v, i64::from(i32::MIN)..=i64::from(i32::MAX))
-                    {
-                        let mut all = items.clone();
-                        all[i].set("Int", Value::Int(n as i32));
-                        changed = Some(all);
+    // (In a narrow room, the Properties panel's: the material and the
+    // parameter on a line, their type and value on the line under.)
+    let narrow = super::narrow(ui);
+    let field = if narrow { 100.0 } else { 120.0 };
+    mg_uikit::with_table_rows(ui, |ui| {
+        egui::Grid::new(f.id("ShaderParams").with(narrow))
+            .num_columns(if narrow { 2 } else { 5 })
+            .spacing([12.0, mg_uikit::metrics::TABLE_RULE])
+            .show(ui, |ui| {
+                if !items.is_empty() && !narrow {
+                    for l in ["Material", "Parameter", "Type", "Value"] {
+                        ui.strong(l);
                     }
+                    ui.end_row();
                 }
-                2 => {
-                    for k in 1..=4 {
-                        let label = format!("Float{k}");
-                        let v = e.float(&label).unwrap_or(0.0);
-                        if let Some(n) =
-                            crate::widgets::drag_number(ui, v, |d| d.speed(0.01).max_decimals(3))
-                        {
+                for (i, e) in items.iter().enumerate() {
+                    for label in ["Material", "Param"] {
+                        let id = f.id(&format!("ShaderParams#{i}#{label}"));
+                        let current = text(e, label);
+                        if let Some(v) = commit_text(f.app, ui, id, &current, false, field) {
                             let mut all = items.clone();
-                            all[i].set(&label, Value::Float(n));
+                            all[i].set(label, Value::String(encode(v.trim())));
                             changed = Some(all);
                         }
+                        let cur_shown = crate::text::to_editor(&current).0;
+                        f.hold_command(ui, id, false, |form, buf| {
+                            if buf == cur_shown {
+                                return None;
+                            }
+                            let v = crate::text::with_line_ends(buf, &current);
+                            let mut all = items.clone();
+                            all[i].set(label, Value::String(encode(v.trim())));
+                            Some(form.nested_list_command(
+                                "Shader parameter",
+                                "Material",
+                                MATERIAL_ID,
+                                "ShaderParams",
+                                all,
+                            ))
+                        });
                     }
+                    if narrow {
+                        ui.end_row();
+                    }
+                    let kind = e.integer("Type").unwrap_or(0);
+                    let mut pick = kind;
+                    let name = |k: &i64| match k {
+                        1 => "Integer".to_string(),
+                        2 => "Vector".to_string(),
+                        k => format!("({k})"),
+                    };
+                    crate::widgets::dropdown(f.id(&format!("ShaderParams#{i}#Type")))
+                        .selected_text(name(&kind))
+                        .show(ui, &mut pick, &[1, 2], name);
+                    if pick != kind {
+                        let mut all = items.clone();
+                        all[i].set("Type", Value::Byte(pick as u8));
+                        changed = Some(all);
+                    }
+                    super::row(ui, |ui| match kind {
+                        1 => {
+                            let v = e.integer("Int").unwrap_or(0);
+                            if let Some(n) =
+                                commit_number(ui, v, i64::from(i32::MIN)..=i64::from(i32::MAX))
+                            {
+                                let mut all = items.clone();
+                                all[i].set("Int", Value::Int(n as i32));
+                                changed = Some(all);
+                            }
+                        }
+                        2 => {
+                            for k in 1..=4 {
+                                let label = format!("Float{k}");
+                                let v = e.float(&label).unwrap_or(0.0);
+                                if let Some(n) = crate::widgets::drag_number(ui, v, |d| {
+                                    d.speed(0.01).max_decimals(3)
+                                }) {
+                                    let mut all = items.clone();
+                                    all[i].set(&label, Value::Float(n));
+                                    changed = Some(all);
+                                }
+                            }
+                        }
+                        _ => {}
+                    });
+                    if ui.small_button("Remove").clicked() {
+                        let mut all = items.clone();
+                        all.remove(i);
+                        changed = Some(all);
+                    }
+                    ui.end_row();
                 }
-                _ => {}
-            });
-            if ui.small_button("Remove").clicked() {
-                let mut all = items.clone();
-                all.remove(i);
-                changed = Some(all);
-            }
-            ui.end_row();
-        }
+            })
     });
+    // (The Domains of Dread's tint is its locals', which its script sets
+    // over a stored one: `mg_rules::tint`, Verify's `tint-stored`.)
+    let tint = |e: &Struct| text(e, "Param").trim().eq_ignore_ascii_case(mg_rules::tint::PARAMETER);
+    if items.iter().any(tint) {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "tdodTint is The Domains of Dread's tint, which its scripts set from the tdod_tint \
+             variables (the Tint section) as the module loads, over what is stored here: set it \
+             there instead.",
+        );
+    }
     let ids = ["Material", "Param"].map(|l| f.id(&format!("ShaderParams#new#{l}")));
-    ui.horizontal(|ui| {
+    super::row(ui, |ui| {
         for (id, hint) in ids.iter().zip(["material", "parameter"]) {
             let buf = f.app.buffers.entry(*id).or_default();
-            ui.add(egui::TextEdit::singleline(buf).desired_width(120.0).hint_text(hint));
+            ui.add(mg_uikit::text_field(buf).desired_width(super::fit(ui, 120.0)).hint_text(hint));
         }
         let text = |id| f.app.buffers.get(&id).map(|s| s.trim().to_string()).unwrap_or_default();
         let (material, param) = (text(ids[0]), text(ids[1]));
@@ -302,14 +374,14 @@ fn misc(f: &mut Form<'_>, ui: &mut Ui) {
     let s = f.root.child("MiscVisuals").cloned().unwrap_or_default();
     let int = |l: &str, d: i64| s.integer(l).unwrap_or(d);
     let rgb = ["HiliteColorR", "HiliteColorG", "HiliteColorB"].map(|l| s.float(l).unwrap_or(-1.0));
-    egui::Grid::new(f.id("MiscVisuals")).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+    super::form_grid(ui, f.id("MiscVisuals")).spacing([12.0, 6.0]).show(ui, |ui| {
         // The highlight color: -1 each for the game's.
-        crate::widgets::field_label(ui, "Highlight Color");
+        crate::widgets::field_label(ui, "Highlight color");
         f.mark_mixed_in(ui, "MiscVisuals", &["HiliteColorR", "HiliteColorG", "HiliteColorB"]);
-        ui.horizontal(|ui| {
+        super::row(ui, |ui| {
             let custom = rgb.iter().all(|c| *c >= 0.0);
             let mut on = custom;
-            if ui.checkbox(&mut on, "Own color").changed() {
+            if ui.check_box(&mut on, "Own color").changed() {
                 let v = if on { [1.0, 1.0, 1.0] } else { [-1.0; 3] };
                 set_highlight(f, v);
             }
@@ -337,7 +409,7 @@ fn misc(f: &mut Form<'_>, ui: &mut Ui) {
         });
         ui.end_row();
 
-        crate::widgets::field_label(ui, "Mouse Cursor");
+        crate::widgets::field_label(ui, "Mouse cursor");
         f.mark_mixed_in(ui, "MiscVisuals", &["MouseCursor"]);
         let current = int("MouseCursor", -1);
         let mut pick = current;
@@ -361,9 +433,9 @@ fn misc(f: &mut Form<'_>, ui: &mut Ui) {
         }
         ui.end_row();
 
-        crate::widgets::field_label(ui, "Text Bubble");
+        crate::widgets::field_label(ui, "Text bubble");
         f.mark_mixed_in(ui, "MiscVisuals", &["TextBubbleType", "TextBubbleText"]);
-        ui.horizontal(|ui| {
+        super::row(ui, |ui| {
             let mode = int("TextBubbleType", 0);
             let mut pick = mode;
             let modes: Vec<i64> = (0..BUBBLE_MODES.len() as i64).collect();
@@ -375,11 +447,21 @@ fn misc(f: &mut Form<'_>, ui: &mut Ui) {
             }
             if mode != 0 {
                 let current = decode(s.string("TextBubbleText").unwrap_or_default());
-                if let Some(v) =
-                    commit_text(f.app, ui, f.id("TextBubbleText"), &current, false, 200.0)
-                {
+                let id = f.id("TextBubbleText");
+                if let Some(v) = commit_text(f.app, ui, id, &current, false, 200.0) {
                     f.set_misc("Text bubble", &[("TextBubbleText", Value::String(encode(&v)))]);
                 }
+                let cur_shown = crate::text::to_editor(&current).0;
+                f.hold_command(ui, id, false, |form, buf| {
+                    if buf == cur_shown {
+                        return None;
+                    }
+                    let v = crate::text::with_line_ends(buf, &current);
+                    Some(form.misc_command(
+                        "Text bubble",
+                        &[("TextBubbleText", Value::String(encode(&v)))],
+                    ))
+                });
             }
         });
         ui.end_row();
@@ -390,7 +472,7 @@ fn misc(f: &mut Form<'_>, ui: &mut Ui) {
         ui.vertical(|ui| {
             let mask = int("UiDiscoverMask", -1);
             let mut default = mask < 0;
-            if ui.checkbox(&mut default, "As the game decides").changed() {
+            if ui.check_box(&mut default, "As the game decides").changed() {
                 let v = if default { -1 } else { DEFAULT_DISCOVERY };
                 f.set_misc("Shown", &[("UiDiscoverMask", Value::Int(v as i32))]);
             }
@@ -398,7 +480,7 @@ fn misc(f: &mut Form<'_>, ui: &mut Ui) {
                 ui.horizontal_wrapped(|ui| {
                     for (bit, n) in DISCOVERY {
                         let mut on = mask & bit != 0;
-                        if ui.checkbox(&mut on, n).changed() {
+                        if ui.check_box(&mut on, n).changed() {
                             let v = if on { mask | bit } else { mask & !bit };
                             f.set_misc("Shown", &[("UiDiscoverMask", Value::Int(v as i32))]);
                         }
@@ -408,9 +490,9 @@ fn misc(f: &mut Form<'_>, ui: &mut Ui) {
         });
         ui.end_row();
 
-        crate::widgets::field_label(ui, "Visible Distance");
+        crate::widgets::field_label(ui, "Visible distance");
         f.mark_mixed_in(ui, "MiscVisuals", &["VisibleDistance"]);
-        ui.horizontal(|ui| {
+        super::row(ui, |ui| {
             let v = s.float("VisibleDistance").unwrap_or(DEFAULT_DISTANCE);
             if let Some(n) = crate::widgets::drag_number(ui, v, |d| {
                 d.range(0.0..=1000.0).speed(0.5).max_decimals(1).suffix(" m")

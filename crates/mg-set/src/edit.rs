@@ -69,6 +69,20 @@ impl SetFile {
         Ini::parse(&self.text())
     }
 
+    /// Its lines, without their ends.
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Puts `with` in place of `remove` lines from line `at` on (clamped
+    /// to the file), and gives back the lines taken out: for an editor's
+    /// undo to keep the lines a step changed, not a copy of the file.
+    pub fn splice_lines(&mut self, at: usize, remove: usize, with: Vec<String>) -> Vec<String> {
+        let at = at.min(self.lines.len());
+        let end = at.saturating_add(remove).min(self.lines.len());
+        self.lines.splice(at..end, with).collect()
+    }
+
     /// The line range of a section's body (after its header), if it is
     /// there.
     fn body(&self, section: &str) -> Option<(usize, usize)> {
@@ -135,20 +149,41 @@ impl SetFile {
     /// Sets a key's value: where it stands, else at the end of the section
     /// (the section is added if missing).
     pub fn set(&mut self, section: &str, key: &str, value: &str) {
+        let _ = self.set_in_place(section, key, value);
+    }
+
+    /// Sets `key` in `section` to `value` in place (adding `section` if
+    /// missing), returning `(at, now, old)` when the file changed: the `old`
+    /// lines replaced at `at..` by `now` lines afterward. Returns `None` when
+    /// `key` already had that exact written value.
+    pub fn set_in_place(
+        &mut self,
+        section: &str,
+        key: &str,
+        value: &str,
+    ) -> Option<(usize, usize, Vec<String>)> {
         if !self.has_section(section) {
-            self.add_section(section, &[]);
+            let at = self.add_section_index(section);
+            let before = self.lines.len();
+            self.insert_section(at, section, &[(key.to_string(), value.to_string())]);
+            return Some((at, self.lines.len() - before, Vec::new()));
         }
-        let (a, b) = self.body(section).expect("added");
-        for i in a..b {
-            if key_of(&self.lines[i]).is_some_and(|k| k.eq_ignore_ascii_case(key)) {
-                let written =
-                    self.lines[i].split_once('=').map(|(k, _)| k).unwrap_or(key).to_string();
-                self.lines[i] = format!("{written}={value}");
-                return;
+        let (a, b) = self.body(section).expect("section exists");
+        for (offset, line) in self.lines[a..b].iter().enumerate() {
+            if key_of(line).is_some_and(|k| k.eq_ignore_ascii_case(key)) {
+                let i = a + offset;
+                let written = line.split_once('=').map(|(k, _)| k).unwrap_or(key);
+                let next = format!("{written}={value}");
+                if *line == next {
+                    return None;
+                }
+                let old = std::mem::replace(&mut self.lines[i], next);
+                return Some((i, 1, vec![old]));
             }
         }
         let at = self.end_of(a, b);
         self.lines.insert(at, format!("{key}={value}"));
+        Some((at, 1, Vec::new()))
     }
 
     /// Takes a key out of a section.
@@ -161,24 +196,27 @@ impl SetFile {
         }
     }
 
-    /// Adds a section after the last of its family (`[TILE12]` after the
-    /// last `[TILEn]`), else at the end, with a blank line before it.
-    pub fn add_section(&mut self, name: &str, entries: &[(String, String)]) {
+    fn add_section_index(&self, name: &str) -> usize {
         let fam = family(name);
         let last = self
             .lines
             .iter()
-            .enumerate()
-            .filter(|(_, l)| header(l).is_some_and(|h| family(h) == fam))
-            .map(|(i, l)| (i, header(l).unwrap_or_default().to_string()))
-            .next_back();
-        let at = match last {
-            Some((_, h)) => {
+            .filter_map(|l| header(l).filter(|h| family(h) == fam))
+            .next_back()
+            .map(str::to_string);
+        match last {
+            Some(h) => {
                 let (a, b) = self.body(&h).expect("found");
                 self.end_of(a, b)
             }
             None => self.end_of(0, self.lines.len()),
-        };
+        }
+    }
+
+    /// Adds a section after the last of its family (`[TILE12]` after the
+    /// last `[TILEn]`), else at the end, with a blank line before it.
+    pub fn add_section(&mut self, name: &str, entries: &[(String, String)]) {
+        let at = self.add_section_index(name);
         self.insert_section(at, name, entries);
     }
 
@@ -217,13 +255,9 @@ impl SetFile {
     /// below its `Doors` count (which in custom tilesets may be no count
     /// at all), each door's number and section, by number.
     pub fn doors(&self, tile: usize) -> Vec<(usize, String)> {
-        let declared = self
-            .get(&format!("TILE{tile}"), "Doors")
-            .and_then(|d| d.trim().parse::<i64>().ok())
-            .unwrap_or(0)
-            .max(0);
+        let declared = self.number(&format!("TILE{tile}"), "Doors");
         let mut doors = self.door_sections(tile);
-        doors.retain(|(d, _)| (*d as i64) < declared);
+        doors.retain(|(d, _)| *d < declared);
         doors
     }
 
@@ -242,8 +276,42 @@ impl SetFile {
         }
     }
 
-    fn count(&self, section: &str) -> usize {
-        self.get(section, "Count").and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    /// How many items of a list the file really has, by its sections
+    /// `item<n>` (`TILE`): one past the last there is (below the reader's
+    /// bound, eight a section the file has and 4,096, so a stray
+    /// `[TILE2147483646]` is none), holes among them counted. An item
+    /// added or removed at the end is numbered by it, not by the list's
+    /// `Count=`, which may be anything (`1869573190`, or less than the
+    /// sections there are, where numbering by it would make a section
+    /// twice); the count is written back as the new number says.
+    fn listed(&self, item: &str) -> usize {
+        self.last_section(item, usize::MAX)
+    }
+
+    /// [`SetFile::listed`] of the sections below the list's `Count=`, as
+    /// the reader reads them: a section past the count is not an item
+    /// (painting rules, whose own edits reuse one there).
+    fn listed_by_count(&self, list: &str, item: &str) -> usize {
+        self.last_section(item, self.number(list, "Count"))
+    }
+
+    fn last_section(&self, item: &str, below: usize) -> usize {
+        let names: Vec<String> =
+            self.lines.iter().filter_map(|l| header(l)).map(str::to_ascii_uppercase).collect();
+        let most = names.len() * 8 + 4096;
+        let last = (names.iter())
+            .filter_map(|h| h.strip_prefix(item)?.parse::<usize>().ok())
+            .filter(|&i| i < below.min(most))
+            .max();
+        last.map_or(0, |i| i + 1)
+    }
+
+    /// A count as the reader reads it ([`Section::int`](crate::ini::Section::int),
+    /// the game's way: what follows the digits is ignored, so `Count=250;`
+    /// is 250 here too), none or a negative one as 0.
+    fn number(&self, section: &str, key: &str) -> usize {
+        let n = self.get(section, key).and_then(mg_core::num::parse_decimal);
+        n.unwrap_or(0).max(0) as usize
     }
 }
 
@@ -262,7 +330,7 @@ fn pairs(entries: &[(&str, String)]) -> Vec<(String, String)> {
 pub fn add_type(f: &mut SetFile, crosser: bool, name: &str, strref: Option<u32>) -> usize {
     let (list, each) =
         if crosser { ("CROSSER TYPES", "CROSSER") } else { ("TERRAIN TYPES", "TERRAIN") };
-    let n = f.count(list);
+    let n = f.listed(each);
     f.set(list, "Count", &(n + 1).to_string());
     let mut entries = vec![("Name", name.to_string())];
     if let Some(s) = strref {
@@ -337,7 +405,7 @@ pub fn rename_type(f: &mut SetFile, crosser: bool, index: usize, to: &str) -> Op
 /// one; returns its index. Tiles are numbered by place: areas store the
 /// numbers, so tiles are only added at the end.
 pub fn duplicate_tile(f: &mut SetFile, from: usize) -> Option<usize> {
-    let n = f.count("TILES");
+    let n = f.listed("TILE");
     let entries = f.entries(&format!("TILE{from}"));
     if entries.is_empty() {
         return None;
@@ -346,8 +414,7 @@ pub fn duplicate_tile(f: &mut SetFile, from: usize) -> Option<usize> {
     f.add_section(&format!("TILE{n}"), &entries);
     // The door sections that are there, up to the count (which in custom
     // tilesets may be no count at all).
-    let doors =
-        f.get(&format!("TILE{from}"), "Doors").and_then(|d| d.parse::<usize>().ok()).unwrap_or(0);
+    let doors = f.number(&format!("TILE{from}"), "Doors");
     for (d, name) in f.door_sections(from) {
         let door = f.entries(&name);
         if d < doors && !door.is_empty() {
@@ -360,7 +427,7 @@ pub fn duplicate_tile(f: &mut SetFile, from: usize) -> Option<usize> {
 /// Adds a tile at the end with a model and the same terrain at each
 /// corner; returns its index.
 pub fn add_tile(f: &mut SetFile, model: &str, terrain: &str) -> usize {
-    let n = f.count("TILES");
+    let n = f.listed("TILE");
     f.set("TILES", "Count", &(n + 1).to_string());
     let mut entries = vec![
         ("Model".to_string(), model.to_string()),
@@ -424,7 +491,7 @@ pub fn skeleton(name: &str) -> SetFile {
 
 /// Takes away the last tile (and its door sections).
 pub fn remove_last_tile(f: &mut SetFile) -> bool {
-    let n = f.count("TILES");
+    let n = f.listed("TILE");
     let Some(last) = n.checked_sub(1) else { return false };
     for (_, name) in f.door_sections(last) {
         f.remove_section(&name);
@@ -443,7 +510,7 @@ pub fn add_group(
     columns: usize,
     tiles: &[Option<u32>],
 ) -> usize {
-    let n = f.count("GROUPS");
+    let n = f.listed("GROUP");
     f.set("GROUPS", "Count", &(n + 1).to_string());
     let mut entries = vec![
         ("Name".to_string(), name.to_string()),
@@ -459,7 +526,7 @@ pub fn add_group(
 
 /// Takes away the last group.
 pub fn remove_last_group(f: &mut SetFile) -> bool {
-    let n = f.count("GROUPS");
+    let n = f.listed("GROUP");
     let Some(last) = n.checked_sub(1) else { return false };
     f.remove_section(&format!("GROUP{last}"));
     f.set("GROUPS", "Count", &last.to_string());
@@ -486,7 +553,7 @@ pub fn add_rule(
     changed: &str,
 ) -> usize {
     let (list, each) = rule_sections(secondary);
-    let n = f.count(list);
+    let n = f.listed_by_count(list, each);
     f.set(list, "Count", &(n + 1).to_string());
     let entries = pairs(&[
         ("Placed", placed.to_string()),
@@ -507,7 +574,7 @@ pub fn add_rule(
 /// Takes away the last painting rule (`secondary`: the last secondary).
 pub fn remove_last_rule(f: &mut SetFile, secondary: bool) -> bool {
     let (list, each) = rule_sections(secondary);
-    let n = f.count(list);
+    let n = f.listed_by_count(list, each);
     let Some(last) = n.checked_sub(1) else { return false };
     f.remove_section(&format!("{each}{last}"));
     f.set(list, "Count", &last.to_string());
@@ -558,6 +625,20 @@ pub fn remove_last_door(f: &mut SetFile, tile: usize) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn lines_are_spliced_and_given_back() {
+        let mut f = SetFile::parse("[A]\r\nx=1\r\ny=2\r\n[B]\r\n");
+        assert_eq!(f.lines(), ["[A]", "x=1", "y=2", "[B]"]);
+        let out = f.splice_lines(1, 2, vec!["z=3".into()]);
+        assert_eq!(out, ["x=1", "y=2"]);
+        assert_eq!(f.text(), "[A]\r\nz=3\r\n[B]\r\n");
+        // Put back; and past the end is the end.
+        assert_eq!(f.splice_lines(1, 1, out), ["z=3"]);
+        assert_eq!(f.text(), "[A]\r\nx=1\r\ny=2\r\n[B]\r\n");
+        assert!(f.splice_lines(9, 5, vec!["[C]".into()]).is_empty());
+        assert_eq!(f.lines().last().map(String::as_str), Some("[C]"));
+    }
+
     const SAMPLE: &str = "; made by hand\r\n[GENERAL]\r\nName=ZZZ01\r\nTransition=5\r\n\r\n[TERRAIN TYPES]\r\nCount=1\r\n\r\n[TERRAIN0]\r\nName=Grass\r\n\r\n[TILES]\r\nCount=1\r\n\r\n[TILE0]\r\nModel=zzz01_a01_01\r\nDoors=1\r\n\r\n[TILE0DOOR0]\r\nType=1\r\n\r\n[GROUPS]\r\nCount=0\r\n";
 
     #[test]
@@ -566,6 +647,95 @@ mod tests {
         let t = crate::Tileset::parse(f.text().as_bytes(), mg_core::Codepage::default()).unwrap();
         assert_eq!((t.general.name.as_str(), t.tiles.len()), ("ZZZ01", 0));
         assert!(f.text().starts_with("[GENERAL]\r\nName=ZZZ01\r\n"), "{}", f.text());
+    }
+
+    /// A list's `Count=` that lies (junk, or short of its sections, or past
+    /// them) numbers nothing: a tile, group or terrain added or removed at
+    /// the end goes by the sections the file has (the last one there is,
+    /// holes among them kept), never making a section twice, and the count
+    /// is written back as that says. A file not touched is as it was. (A
+    /// painting rule goes by the count: `rules_keep_their_counts_and_places`.)
+    #[test]
+    fn a_count_that_lies_numbers_nothing() {
+        let read = |f: &SetFile| {
+            crate::Tileset::parse(f.text().as_bytes(), mg_core::Codepage::default()).unwrap()
+        };
+        let junk = "[GENERAL]\nName=x\n[TERRAIN TYPES]\nCount=1869573190\n[TERRAIN0]\nName=G\n\
+[TILES]\nCount=1869573190\n[TILE0]\nModel=a\n[TILE1]\nModel=b\n\
+[GROUPS]\nCount=0\n[GROUP0]\nName=g\nRows=1\nColumns=1\nTile0=0\n";
+        let mut f = SetFile::parse(junk);
+        assert_eq!(f.text(), junk, "untouched, it is as it was");
+        assert_eq!(add_tile(&mut f, "c", "G"), 2);
+        assert_eq!(f.get("TILES", "Count"), Some("3"));
+        assert!(!f.has_section("TILE1869573190"));
+        assert_eq!(add_type(&mut f, false, "W", None), 1);
+        assert_eq!(f.get("TERRAIN TYPES", "Count"), Some("2"));
+        assert_eq!(add_group(&mut f, "h", 1, 1, &[Some(1)]), 1);
+        assert_eq!(f.get("GROUPS", "Count"), Some("2"));
+        assert_eq!(read(&f).tiles.len(), 3);
+        assert_eq!(duplicate_tile(&mut f, 0), Some(3));
+        assert!(remove_last_tile(&mut f) && !f.has_section("TILE3") && f.has_section("TILE2"));
+        assert_eq!(f.get("TILES", "Count"), Some("3"));
+        // Holes among the sections keep their numbers (areas store them):
+        // the tile goes after the last section, and a stray section far past the
+        // count is no list.
+        let holes = "[TILES]\nCount=1\n[TILE0]\nModel=a\n[TILE3]\nModel=d\n\
+[TILE2147483646]\nModel=far\n";
+        let mut f = SetFile::parse(holes);
+        assert_eq!(add_tile(&mut f, "e", "G"), 4);
+        assert_eq!(f.get("TILES", "Count"), Some("5"));
+        // A count short of its sections: the tile follows the last of them,
+        // and no section is made twice.
+        let short = "[TILES]\nCount=1\n[TILE0]\nModel=a\n[TILE1]\nModel=b\n[TILE2]\nModel=c\n\
+[GROUPS]\nCount=0\n[GROUP0]\nName=g\n[TERRAIN TYPES]\nCount=0\n[TERRAIN0]\nName=G\n";
+        let mut f = SetFile::parse(short);
+        assert_eq!(add_tile(&mut f, "d", "G"), 3);
+        assert_eq!(add_group(&mut f, "h", 1, 1, &[None]), 1);
+        assert_eq!(add_type(&mut f, false, "W", None), 1);
+        assert_eq!(duplicate_tile(&mut f, 0), Some(4));
+        let text = f.text();
+        let headers: Vec<&str> = text.lines().filter(|l| l.starts_with('[')).collect();
+        let mut once = headers.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(headers.len(), once.len(), "a section twice: {text}");
+        assert_eq!(f.get("TILES", "Count"), Some("5"));
+        assert!(remove_last_tile(&mut f) && f.get("TILES", "Count") == Some("4"));
+        // No sections, whatever the count says.
+        let mut f = SetFile::parse("[TILES]\nCount=7\n");
+        assert_eq!(add_tile(&mut f, "e", "G"), 0);
+        assert_eq!(f.get("TILES", "Count"), Some("1"));
+        let mut f = SetFile::parse("[TILES]\nCount=7\n");
+        assert!(!remove_last_tile(&mut f));
+        // None of it panics on what is no file.
+        for text in ["", "[", "[TILE99999999999999999999]\n", "[TILES]\nCount=-3\n[TILE-1]\n"] {
+            let mut f = SetFile::parse(text);
+            add_tile(&mut f, "e", "G");
+        }
+    }
+
+    /// A count with something after its number (`Count=2;`, `Doors=1x`)
+    /// is the number, as the reader and the game have it: a tile added is
+    /// the third, not a second `[TILE0]` under `Count=1`.
+    #[test]
+    fn counts_are_read_as_the_reader_reads_them() {
+        let text = "[GENERAL]\nName=x\n[TILES]\nCount=2;\n[TILE0]\nModel=a\nDoors=1x\n\
+[TILE0DOOR0]\nType=3\n[TILE1]\nModel=b\nDoors=-1\n";
+        let read = |f: &SetFile| {
+            crate::Tileset::parse(f.text().as_bytes(), mg_core::Codepage::default()).unwrap()
+        };
+        let mut f = SetFile::parse(text);
+        assert_eq!(read(&f).tiles.len(), 2);
+        assert_eq!(f.doors(0), [(0, "TILE0DOOR0".to_string())]);
+        assert!(f.doors(1).is_empty());
+        assert_eq!(add_tile(&mut f, "c", "Grass"), 2);
+        assert_eq!(f.get("TILES", "Count"), Some("3"));
+        assert!(f.has_section("TILE2"));
+        assert_eq!(duplicate_tile(&mut f, 0), Some(3));
+        assert!(f.has_section("TILE3DOOR0"), "the door is copied with its tile");
+        let t = read(&f);
+        assert_eq!((t.tiles.len(), t.tiles[3].doors.len()), (4, 1));
+        assert_eq!(t.tiles[2].model, "c");
     }
 
     #[test]
@@ -720,5 +890,36 @@ Type=1\r\n\r\n[TILE1]\r\nModel=b\r\nDoors=1869573190\r\n\r\n[TILE1DOOR0]\r\nType
             !f.has_section("TILE1") && !f.has_section("TILE1DOOR0") && !f.has_section("GROUP0")
         );
         assert_eq!(f.get("TILES", "Count"), Some("1"));
+    }
+
+    #[test]
+    fn set_in_place_matches_set_and_reports_exact_splice() {
+        let cases = [
+            // Existing key (case-preserving left-hand side)
+            ("GENERAL", "Name", "NEW01", false),
+            // Exact no-op
+            ("GENERAL", "Name", "ZZZ01", true),
+            // Missing key in existing section
+            ("TILE0", "PathNode", "pn0", false),
+            // Missing section inside existing family
+            ("TERRAIN1", "Name", "Water", false),
+            // Missing section in a brand-new family
+            ("BRANDNEW", "Key", "Value", false),
+        ];
+        for (section, key, value, noop) in cases {
+            let mut a = SetFile::parse(SAMPLE);
+            let mut b = a.clone();
+            let before = a.lines().to_vec();
+            a.set(section, key, value);
+            let patch = b.set_in_place(section, key, value);
+            assert_eq!(a.text(), b.text(), "[{section}] {key}={value}");
+            if noop {
+                assert!(patch.is_none(), "[{section}] {key} unchanged");
+                continue;
+            }
+            let (at, now, old) = patch.expect("changed");
+            b.splice_lines(at, now, old);
+            assert_eq!(b.lines(), before.as_slice(), "undo [{section}] {key}={value}");
+        }
     }
 }

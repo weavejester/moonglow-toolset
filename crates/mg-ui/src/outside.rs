@@ -1,8 +1,9 @@
 //! A nasher project's or a module folder's files changed outside Moonglow
 //! (an editor, `git checkout`, `git pull`) while it is open: every few seconds, with
-//! Options › General's reloading on, those the module has no unsaved
-//! change to are read again; where it has one, Moonglow's is kept and the
-//! Changed Outside Moonglow window asks which to keep.
+//! Tools › Options › Folders › Reload haks, override and development when
+//! they change on, those the module has no unsaved change to are read
+//! again; where it has one, Moonglow's is kept and the Changed Outside
+//! Moonglow window asks which to keep.
 //!
 //! None of the looking is done on the window's thread: a [`Watch`] sees
 //! that something changed (and waits for a burst of changes, a pull's, to
@@ -25,7 +26,7 @@ use mg_module::palette::BlueprintKind;
 use mg_module::watch::Watch;
 use mg_resman::ResKey;
 
-use crate::{Moonglow, Tab};
+use crate::Moonglow;
 
 /// What is known of the files changed outside.
 #[derive(Debug, Default)]
@@ -41,6 +42,12 @@ pub(crate) struct OutsideState {
     watch: Option<Watch>,
     /// And at the haks and folders the game data reads.
     content: Option<Watch>,
+    /// And at the files of the tilesets open in the tileset editor (M5's
+    /// W5).
+    tilesets: Option<Watch>,
+    /// What that watch heard, kept while a text field typed in sets its
+    /// text first: the files (`None`: all of them).
+    tileset_heard: Option<Option<Vec<PathBuf>>>,
     /// The files being read on a thread of their own, after the watch saw
     /// a change.
     looking: Option<Looking>,
@@ -56,9 +63,29 @@ pub(crate) struct OutsideState {
     /// The watches walk the files rather than be told by the system (a
     /// test of the walk).
     pub(crate) walk: bool,
+    /// The Status Bar's note as a test sets it ([`Moonglow::show_looking_note`]),
+    /// over what a look under way says.
+    shown_note: Option<&'static str>,
 }
 
 impl OutsideState {
+    /// What is known of the module's files let go of (it was closed, or
+    /// another opened). What is not the module's stays: the tileset
+    /// editor's watch (its tabs stay open), the frame a watch asks for and
+    /// a test's walk. (All of it let go of, the tileset watch was made
+    /// again before the window said how to ask for a frame, and changes
+    /// to those files woke the window no more.)
+    pub(crate) fn forget_module(&mut self) {
+        let kept = OutsideState {
+            tilesets: self.tilesets.take(),
+            tileset_heard: self.tileset_heard.take(),
+            repaint: self.repaint.take(),
+            walk: self.walk,
+            ..Default::default()
+        };
+        *self = kept;
+    }
+
     /// What a watch calls when it hears a change: a frame asked for.
     fn on_change(&self) -> Option<mg_module::watch::OnChange> {
         let (ctx, at_once) = self.repaint.clone()?;
@@ -76,6 +103,8 @@ struct Looking {
     /// What the thread found, kept while a text field typed in sets its
     /// text first ([`Moonglow::take_looked`]).
     found: Option<Looked>,
+    /// The files looked at; `None`: all of the module's.
+    files: Option<Vec<PathBuf>>,
     /// The keyboard was taken from such a field in the frame before.
     left_text: bool,
 }
@@ -152,7 +181,7 @@ impl Moonglow {
         // (And the builder's own project file, in a hidden folder the
         // walk passes over.)
         let paths = match archive {
-            true => vec![root.clone()],
+            true => vec![root],
             false => vec![root.clone(), mg_module::project_file::ProjectFile::user_path(&root)],
         };
         if self.outside.watch.as_ref().is_none_or(|w| w.paths() != paths.as_slice()) {
@@ -211,6 +240,8 @@ impl Moonglow {
             None => ws.module.outside_scan(),
         };
         let Some(scan) = scan else { return };
+        // (A module kept in one file is read whole whatever was named.)
+        let files = files.filter(|_| ws.module.project.is_some() || ws.module.folder.is_some());
         // (The areas as they are now, for their locks: only the project's
         // files leave them out. Those of the files named, where they are:
         // all of them were 1,400 a look.)
@@ -244,7 +275,7 @@ impl Moonglow {
             Ok(_) => {
                 let started = Instant::now();
                 self.outside.looking =
-                    Some(Looking { root, started, done, found: None, left_text: false });
+                    Some(Looking { root, started, done, found: None, files, left_text: false });
             }
             Err(_) => self.reload_project_files(),
         }
@@ -285,9 +316,24 @@ impl Moonglow {
         }
     }
 
+    /// Shows the Status Bar's note of a look under way (`Some("Reading
+    /// files changed outside Moonglow…")`) as if one took a while, or
+    /// leaves it to the looks again (`None`): for the window's tests and
+    /// pictures, a look's timing being the machine's.
+    #[doc(hidden)]
+    pub fn show_looking_note(&mut self, note: Option<&'static str>) {
+        self.outside.shown_note = note;
+    }
+
     /// What the status bar says of a look under way that takes a while,
     /// or of scripts read again being compiled.
     pub(crate) fn looking_note(&self) -> Option<&'static str> {
+        if let Some(note) = self.outside.shown_note {
+            return Some(note);
+        }
+        if self.game_waits.any() {
+            return Some("Waiting for the game data to be free…");
+        }
         if self.outside.compiling.as_ref().is_some_and(|c| c.queue.len() > 1) {
             return Some("Compiling scripts changed outside Moonglow…");
         }
@@ -345,7 +391,7 @@ impl Moonglow {
         crate::trace::changed("outside", || {
             format!("{} changed, looked at in {:.0?}", changes.len(), looking.started.elapsed())
         });
-        self.take_found(changes, problems, &looked.locks);
+        self.take_found(changes, problems, &looked.locks, looking.files.as_deref());
         false
     }
 
@@ -427,6 +473,8 @@ impl Moonglow {
         let had = ws.module.project_file.found;
         if ws.module.reread_project_file() {
             self.log_project_file(true, had);
+            // (The bake's rows file may have changed with it.)
+            self.sync_bake_rows();
         }
     }
 
@@ -440,19 +488,32 @@ impl Moonglow {
         self.reread_project_file();
         let Some(ws) = self.ws.as_mut() else { return };
         let Some((changes, problems)) = ws.module.outside() else { return };
-        self.take_found(changes, problems, &HashMap::new());
+        self.take_found(changes, problems, &HashMap::new(), None);
     }
 
     /// Takes the files found changed outside: those the module has no
     /// unsaved change to are read into it, the others wait for an answer.
     /// `locks`: the locks of areas, found off the window's thread, as the
-    /// module had them then.
+    /// module had them then. `only`: the files the look was of (those a
+    /// watch heard of), where it was not of all: the conflicts waiting on
+    /// other files are no business of such a look and stay, weighed again
+    /// with what it found (one whose change here was undone since is read
+    /// now). They were dropped with every look, and a file saved outside
+    /// while another's question was open closed the question for good.
     fn take_found(
         &mut self,
-        changes: Vec<Outside>,
+        mut changes: Vec<Outside>,
         problems: Vec<String>,
         locks: &HashMap<ResKey, (Arc<[u8]>, Vec<Lock>)>,
+        only: Option<&[PathBuf]>,
     ) {
+        if let Some(only) = only {
+            let waiting = std::mem::take(&mut self.outside.conflicts);
+            let kept: Vec<Outside> = (waiting.into_iter())
+                .filter(|c| !only.contains(&c.path) && !changes.iter().any(|n| n.key == c.key))
+                .collect();
+            changes.extend(kept);
+        }
         // (A file moved where the project's include doesn't look is said.)
         self.take_project_warnings();
         let Some(ws) = self.ws.as_mut() else { return };
@@ -503,9 +564,93 @@ impl Moonglow {
         }
     }
 
-    /// The files changed outside that wait for an answer (which to keep).
+    /// The files changed outside that wait for an answer (which to keep):
+    /// the module's, then the tilesets' open in the tileset editor.
     pub fn outside_conflicts(&self) -> Vec<PathBuf> {
-        self.outside.conflicts.iter().map(|c| c.path.clone()).collect()
+        let tilesets = crate::tileset_view::waiting_outside(self).map(PathBuf::from);
+        self.outside.conflicts.iter().map(|c| c.path.clone()).chain(tilesets).collect()
+    }
+
+    /// Has the tilesets' watch walk the files every few seconds rather than
+    /// be told by the system, as where it can't be (a test of the look at
+    /// every file: the watch's start, its walk), started again now.
+    #[doc(hidden)]
+    pub fn walk_tileset_files(&mut self) {
+        self.outside.walk = true;
+        self.outside.tilesets = None;
+    }
+
+    /// Changed Outside Moonglow asks again, though Later was its answer
+    /// (a tileset changed outside again, or its Save refused meanwhile).
+    pub(crate) fn ask_outside_again(&mut self) {
+        self.outside.later.clear();
+    }
+
+    /// The files of the tilesets open in the tileset editor, watched as
+    /// the module's files are (M5's W5, the owner's ruling of 2026-11-21:
+    /// "reread on change"), with Tools › Options › Folders › Reload haks,
+    /// override and development when they change on: told by
+    /// the system off the window's thread, a burst of writes heard once
+    /// it has been quiet a moment ([`Watch`]), nothing looked at while
+    /// nothing changes. What changed is read again
+    /// ([`crate::tileset_view::changed_on_disk`]) once a field typed in
+    /// has set its text. Not under the game data's gate: a tileset needs
+    /// none. (A tileset the game data reads, in a hak or a folder it
+    /// reads, is read again for the areas' views and the tiles palette by
+    /// the watch of those: [`Moonglow::reload_changed_content`].)
+    pub(crate) fn reload_changed_tilesets(&mut self, ctx: &egui::Context) {
+        if self.tilesets.is_empty() || self.settings.no_auto_reload {
+            self.outside.tilesets = None;
+            self.outside.tileset_heard = None;
+            return;
+        }
+        let watched = |w: &Watch| w.paths().iter().eq(self.tilesets.iter().map(|d| &d.path));
+        if !self.outside.tilesets.as_ref().is_some_and(watched) {
+            let paths = self.tilesets.iter().map(|d| d.path.clone()).collect();
+            let (every, walk, repaint) =
+                (Duration::from_secs(3), self.outside.walk, self.outside.on_change());
+            self.outside.tilesets = Some(Watch::start(paths, false, every, walk, repaint));
+        }
+        let watch = self.outside.tilesets.as_ref().expect("just made");
+        if let Some(heard) = watch.take() {
+            let files = heard.files();
+            self.outside.tileset_heard = Some(match (self.outside.tileset_heard.take(), files) {
+                (Some(Some(mut was)), Some(files)) => {
+                    was.extend(files);
+                    Some(was)
+                }
+                (None, files) => files,
+                _ => None,
+            });
+        }
+        let Some(heard) = self.outside.tileset_heard.take() else { return };
+        // (A field of that tileset's editor typed in sets its text as it is
+        // drawn next: read after. Another editor's field keeps the keyboard.)
+        if crate::tileset_view::typing_in(self, ctx, heard.as_deref())
+            && crate::widgets::leave_text(ctx)
+        {
+            self.outside.tileset_heard = Some(heard);
+            ctx.request_repaint();
+            return;
+        }
+        let paths: Vec<PathBuf> = match heard {
+            Some(mut files) => {
+                files.sort();
+                files.dedup();
+                files
+            }
+            // (Every file looked at, as at the watch's start: only those
+            // whose time or length moved are read, on the frame.)
+            None => self
+                .tilesets
+                .iter()
+                .map(|d| d.path.clone())
+                .filter(|p| crate::tileset_view::may_have_changed(self, p))
+                .collect(),
+        };
+        for path in paths {
+            crate::tileset_view::changed_on_disk(self, &path, false);
+        }
     }
 
     /// Reads `changes` into the module (their files' versions), and counts
@@ -545,6 +690,11 @@ impl Moonglow {
                 return;
             }
         };
+        // (The history gone: the talk-table lines typed with its steps
+        // stay as they are.)
+        if dropped {
+            self.typed.forget();
+        }
         for c in changes {
             ws.module.took(c);
         }
@@ -570,9 +720,20 @@ impl Moonglow {
         let added_area =
             changes.iter().any(|c| c.key.restype == ResType::ARE && c.resource.is_some());
         let mut keys: Vec<ResKey> = changes.iter().map(|c| c.key).collect();
-        if added_area && let Some(info) = ws.module.area_list_settled() {
+        // (Flushed first: `module.ifo` as its editors have it is what the
+        // list is settled on, and what stays to be saved.)
+        if added_area && let Err(e) = ws.flush() {
+            self.log.error(e.to_string());
+        } else if added_area && let Some(settled) = ws.module.area_list_settled() {
             let key = mg_module::Module::info_key();
-            if let Err(e) = ws.adopt(&[(key, Some(info))]) {
+            // (What the file stands for counts as saved; Module Properties'
+            // changes not yet saved stay the module's, to be written.)
+            let mine = (settled.module != settled.read).then_some(settled.module);
+            let taken = ws.adopt(&[(key, Some(settled.read))]).and_then(|_| match mine {
+                Some(mine) => ws.derive(|m| m.set(key, mine)),
+                None => Ok(()),
+            });
+            if let Err(e) = taken {
                 self.log.error(e.to_string());
             }
             keys.push(key);
@@ -585,16 +746,9 @@ impl Moonglow {
         // What is gone has no editor any more.
         let gone: Vec<_> = changes.iter().filter(|c| c.resource.is_none()).map(|c| c.key).collect();
         if !gone.is_empty() {
-            crate::tabs::close_tabs(&mut self.dock, |t| match t {
-                Tab::Script(k) | Tab::Gff(k) | Tab::Dialog(k) | Tab::Blueprint(k) => {
-                    !gone.contains(k)
-                }
-                Tab::Nui(k) => !gone.contains(k),
-                Tab::Area(r) | Tab::AreaProperties(r) => {
-                    !gone.iter().any(|k| k.restype == mg_core::ResType::ARE && k.resref == *r)
-                }
-                _ => true,
-            });
+            // (As Delete closes them: an area's objects' windows, and an
+            // Edit Together tab that holds one, were left open here.)
+            crate::tabs::close_tabs(&mut self.dock, |t| !t.shows_any(&gone));
         }
         // Names shown from the module are read again.
         self.area_names = Default::default();
@@ -774,7 +928,10 @@ impl Compiling {
 /// Changed Outside Moonglow: the files changed outside that Moonglow has
 /// unsaved changes to, and which to keep.
 pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
-    let paths: Vec<PathBuf> = app.outside.conflicts.iter().map(|c| c.path.clone()).collect();
+    // (The module's files, then the tilesets' open in the tileset editor:
+    // M5's W5.)
+    let paths = app.outside_conflicts();
+    let tilesets = paths.len() - app.outside.conflicts.len();
     if paths.is_empty() || paths == app.outside.later {
         return;
     }
@@ -784,62 +941,93 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         Later,
     }
     let mut answer = None;
-    crate::widgets::modal(ctx, "Changed Outside Moonglow").show(ctx, |ui| {
+    let footed = crate::widgets::modal(ctx, "Changed Outside Moonglow").show_foot(ctx, |ui| {
         ui.label(
-            "These files of the project were changed by another program, and Moonglow has \
-                 unsaved changes to them:",
+            "These files were changed by another program, and Moonglow has unsaved changes \
+                 to them:",
         );
         egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
             for c in &app.outside.conflicts {
                 let gone = if c.resource.is_none() { " (deleted)" } else { "" };
                 ui.monospace(format!("{}{gone}", c.path.display()));
             }
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui
-                .button("Keep Moonglow's")
-                .on_hover_text("Your changes stay; the next Save writes them over the files")
-                .clicked()
-            {
-                answer = Some(Answer::Ours);
-            }
-            if ui
-                .button("Take the Files'")
-                .on_hover_text("The files are read again; your unsaved changes to them are lost")
-                .clicked()
-            {
-                answer = Some(Answer::Theirs);
-            }
-            if ui
-                .button("Later")
-                .on_hover_text("Moonglow's stay for now, and Save won't write over these files")
-                .clicked()
-                || crate::widgets::escape_closes(ui.ctx(), "Changed Outside Moonglow")
-            {
-                answer = Some(Answer::Later);
+            for path in &paths[paths.len() - tilesets..] {
+                ui.monospace(path.display().to_string());
             }
         });
+        let foot = crate::widgets::Foot::new()
+            .main("Keep Moonglow's", true)
+            .no_enter()
+            .tip("Your changes stay, and the next Save writes them over the files")
+            .button("Take the Files'", true)
+            .tip("Read the files again. Your unsaved changes to them are lost.")
+            .leave("Later")
+            .tip("Moonglow's stay for now, and Save won't write over these files");
+        ((), foot)
     });
+    if let Some(f) = footed {
+        if f.pressed.main() {
+            answer = Some(Answer::Ours);
+        } else if f.pressed.clicked("Take the Files'") {
+            answer = Some(Answer::Theirs);
+        } else if f.pressed.cancelled() {
+            answer = Some(Answer::Later);
+        }
+    }
     let conflicts = std::mem::take(&mut app.outside.conflicts);
     match answer {
         Some(Answer::Ours) => {
-            if let Some(ws) = app.ws.as_mut() {
-                for c in &conflicts {
-                    ws.module.took(c);
+            if !conflicts.is_empty() {
+                if let Some(ws) = app.ws.as_mut() {
+                    for c in &conflicts {
+                        ws.module.took(c);
+                    }
                 }
+                // (No longer as saved: the files have something else.)
+                if let Some(ws) = app.ws.as_mut() {
+                    ws.mark_modified();
+                }
+                app.log.info(format!("Kept Moonglow's: {} (Save writes them)", named(&conflicts)));
             }
-            // (No longer as saved: the files have something else.)
-            if let Some(ws) = app.ws.as_mut() {
-                ws.mark_modified();
+            let sets = crate::tileset_view::answered_outside(app, true);
+            if !sets.is_empty() {
+                app.log.info(format!("Kept Moonglow's: {} (Save writes them)", sets.join(", ")));
             }
-            app.log.info(format!("Kept Moonglow's: {} (Save writes them)", named(&conflicts)));
         }
-        Some(Answer::Theirs) => app.take_outside(&conflicts, &HashMap::new()),
+        Some(Answer::Theirs) => {
+            if !conflicts.is_empty() {
+                app.take_outside(&conflicts, &HashMap::new());
+            }
+            crate::tileset_view::answered_outside(app, false);
+        }
         Some(Answer::Later) => {
             app.outside.later = paths;
             app.outside.conflicts = conflicts;
         }
         None => app.outside.conflicts = conflicts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A module closed or another opened lets go of what was known of its
+    /// files, not of how a watch asks for a frame (the tileset editor's
+    /// watch, made again on the next frame, was made without it) nor of a
+    /// test's walk.
+    #[test]
+    fn forgetting_the_module_keeps_the_frame_a_watch_asks_for() {
+        let mut state = OutsideState {
+            later: vec![PathBuf::from("a.nss")],
+            repaint: Some((egui::Context::default(), true)),
+            walk: true,
+            ..Default::default()
+        };
+        state.said.insert(7);
+        state.forget_module();
+        assert!(state.later.is_empty() && state.said.is_empty(), "the module's let go of");
+        assert!(state.on_change().is_some(), "a watch made next still wakes the window");
+        assert!(state.walk);
     }
 }

@@ -15,6 +15,8 @@ pub enum FileKind {
     ScriptSet,
     /// A variable set: `.vars.json`.
     VariableSet,
+    /// A conversation script's parameter set: `.params.json`.
+    ParameterSet,
     /// A class spell list: `.ini`.
     SpellList,
     /// A conversation as text, CSV, Twine (Twee) or Ink.
@@ -27,6 +29,9 @@ pub enum FileKind {
     Content,
     /// Files to add to a hak.
     HakFiles,
+    /// Loose files to import into the module: its resources, by name and
+    /// extension.
+    ResourceFiles,
     /// A picture: `.png`.
     Png,
     /// Pictures to add to a module or a hak: the types the game reads.
@@ -40,6 +45,8 @@ pub enum FileKind {
     NuiWindows,
     /// The log, as text: `.txt`.
     Log,
+    /// Problems' findings, as text: `.txt`.
+    Problems,
     /// A 2DA table: `.2da`.
     Table,
     /// A talk table: `.tlk`.
@@ -64,6 +71,8 @@ impl FileKind {
             (FileKind::ScriptSet, true) => "Save Script Set",
             (FileKind::VariableSet, false) => "Add Variable Set from File",
             (FileKind::VariableSet, true) => "Save Variable Set to File",
+            (FileKind::ParameterSet, false) => "Add Parameter Set from File",
+            (FileKind::ParameterSet, true) => "Save Parameter Set to File",
             (FileKind::SpellList, false) => "Load Class Spell List",
             (FileKind::SpellList, true) => "Save Class Spell List",
             (FileKind::Conversation(_), false) => "Import Lines",
@@ -73,6 +82,7 @@ impl FileKind {
             (FileKind::Hak, true) => "Save Hak As",
             (FileKind::Content, _) => "Add Haks and Talk Table",
             (FileKind::HakFiles, _) => "Add Files to the Hak",
+            (FileKind::ResourceFiles, _) => "Import Files",
             (FileKind::Png, _) => "Save Picture",
             (FileKind::Images, _) => "Add Images",
             (FileKind::Tileset, false) => "Open Tileset",
@@ -80,6 +90,7 @@ impl FileKind {
             (FileKind::Plugin, _) => "Install Plugin from File",
             (FileKind::NuiWindows, _) => "Import NUI Windows",
             (FileKind::Log, _) => "Save Log",
+            (FileKind::Problems, _) => "Save Problems As",
             (FileKind::Table, false) => "Open 2DA",
             (FileKind::Table, true) => "Save 2DA As",
             (FileKind::TalkTable, false) => "Open Talk Table",
@@ -101,6 +112,7 @@ impl FileKind {
             (FileKind::ScriptSet, _) => Some(("Script sets", &["ini"])),
             // (A filter matches the last extension: .vars.json ends in json.)
             (FileKind::VariableSet, _) => Some(("Variable sets", &["json"])),
+            (FileKind::ParameterSet, _) => Some(("Parameter sets", &["json"])),
             (FileKind::SpellList, _) => Some(("Spell lists", &["ini"])),
             (FileKind::Conversation(f), _) => Some((f.name(), f.extensions())),
             (FileKind::Story, _) => Some(("Twine or Ink stories", &["twee", "tw", "ink"])),
@@ -110,7 +122,7 @@ impl FileKind {
                 "Haks, talk tables and archives of them",
                 &["hak", "tlk", "zip", "7z", "rar"],
             )),
-            (FileKind::HakFiles, _) => None,
+            (FileKind::HakFiles | FileKind::ResourceFiles, _) => None,
             (FileKind::Png, _) => Some(("PNG picture", &["png"])),
             (FileKind::Images, _) => Some(("Pictures", &["png", "tga", "dds", "jpg", "bmp"])),
             (FileKind::Tileset, _) => Some(("Tileset", &["set"])),
@@ -120,6 +132,7 @@ impl FileKind {
                 &["jui", "erf", "hak", "mod", "nwm", "zip"],
             )),
             (FileKind::Log, _) => Some(("Text", &["txt", "log"])),
+            (FileKind::Problems, _) => Some(("Text", &["txt"])),
             (FileKind::Table, _) => Some(("2DA tables", &["2da"])),
             (FileKind::TalkTable, _) => Some(("Talk tables", &["tlk"])),
             (FileKind::TalkLines { json: false }, _) => Some(("CSV", &["csv"])),
@@ -145,6 +158,17 @@ pub trait Dialogs {
     /// Asks for files to open (none: cancelled).
     fn open_files(&mut self, kind: FileKind, start: Option<&Path>) -> Vec<PathBuf> {
         self.open_file(kind, start).into_iter().collect()
+    }
+    /// Asks where to save a file of `extension` (empty: any), under
+    /// `title`: where a plugin's exporter writes. `suggested` is the
+    /// proposed file.
+    fn save_file_of(
+        &mut self,
+        _title: &str,
+        _extension: &str,
+        suggested: Option<&Path>,
+    ) -> Option<PathBuf> {
+        self.save_file(FileKind::Any, suggested)
     }
 }
 

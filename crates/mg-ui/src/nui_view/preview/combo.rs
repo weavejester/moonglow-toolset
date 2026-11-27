@@ -2,7 +2,7 @@
 use super::*;
 
 impl Renderer<'_> {
-    pub(super) fn combo(&mut self, ui: &mut Ui, c: &mut Control<'_>) {
+    pub(super) fn combo(&mut self, c: &mut Control<'_>) {
         let Control { s, a, scale, node, row, body, tint, fg, font, interactive, .. } = *c;
         let p = &c.p;
         c.frame("combo", body);
@@ -52,43 +52,63 @@ impl Renderer<'_> {
             true,
         );
         if interactive {
-            self.combo_popup(ui, c);
+            self.combo_popup(c);
         }
     }
 
-    fn combo_popup(&mut self, ui: &mut Ui, c: &mut Control<'_>) {
+    fn combo_popup(&mut self, c: &mut Control<'_>) {
         let Control { s, a, scale, node, row, body, tint, fg, font, .. } = *c;
         let response = &c.response;
-        // The client's popup (NWN EE 8193.37, np_combo): as wide as
-        // its widest entry plus 67, 23 a row plus 5, the bevel of a
-        // group, its top on the combo's bottom bevel and always a
-        // vertical bar; no mark on the selected entry.
-        let entries: Vec<String> = val(&node["elements"], s, row)
-            .as_array()
-            .map(|e| e.iter().map(|e| localized_string(&e[0], s, row, a)).collect())
-            .unwrap_or_default();
-        let (font_id, spacing) = a.font(ui.ctx(), font, scale);
-        let widest = entries
-            .iter()
-            .map(|e| native_advances(ui.ctx(), e, &font_id, spacing).iter().sum::<f32>())
-            .fold(0.0, f32::max);
-        // At most 297 high; the rest scrolls (np_combo3: 30 entries).
-        let full = (23.0 * entries.len() as f32 + 5.0) * scale;
-        let size = vec2(widest + 67.0 * scale, full.min(297.0 * scale));
         egui::Popup::menu(response)
             .frame(egui::Frame::NONE)
             .at_position(pos2(body.left(), body.bottom() - 5.0 * scale))
             .gap(0.0)
+            // (Open while its bar is clicked or dragged: an entry closes
+            // it, and a click outside.)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
+                // The client's popup (NWN EE 8193.37, np_combo): as wide as
+                // its widest entry plus 67, 23 a row plus 5, the bevel of a
+                // group, its top on the combo's bottom bevel and always a
+                // vertical bar; no mark on the selected entry. (Its entries
+                // are read and measured here, while it is open: done for
+                // every combo of the window in every frame of Interact, a
+                // combo of an appearance.2da's 7,000 names took most of a
+                // frame with its list closed.)
+                let entries: Vec<String> = val(&node["elements"], s, row)
+                    .as_array()
+                    .map(|e| e.iter().map(|e| localized_string(&e[0], s, row, a)).collect())
+                    .unwrap_or_default();
+                let (font_id, spacing) = a.font(ui.ctx(), font, scale);
+                let widest = entries
+                    .iter()
+                    .map(|e| native_advances(ui.ctx(), e, &font_id, spacing).iter().sum::<f32>())
+                    .fold(0.0, f32::max);
+                // At most 297 high; the rest scrolls (np_combo3: 30 entries).
+                let full = (23.0 * entries.len() as f32 + 5.0) * scale;
+                let size = vec2(widest + 67.0 * scale, full.min(297.0 * scale));
                 let (rect, area) = ui.allocate_exact_size(size, Sense::hover());
+                // Scrolled as a group, a list and a text are (`scroll_by`):
+                // the wheel taken, so that what is under the popup does not
+                // scroll with it, and its bar clicked or dragged. Kept in
+                // points, as theirs: the same entries at another scale.
                 let scroll_id = ui.id().with("combo-scroll");
-                let max = full - size.y;
-                let mut offset = ui.data(|d| d.get_temp::<f32>(scroll_id)).unwrap_or(0.0);
-                if ui.rect_contains_pointer(area.rect) {
-                    offset -= ui.input(|i| i.smooth_scroll_delta.y);
-                }
-                let offset = offset.clamp(0.0, max);
-                ui.data_mut(|d| d.insert_temp(scroll_id, offset));
+                let max = (full - size.y).max(0.0);
+                let kept = ui.data(|d| d.get_temp::<f32>(scroll_id)).unwrap_or(0.0);
+                let width = a.number("window.scrollbar_size_x", 18.0) * scale;
+                let inset = 2.0 * scale;
+                let strip = Rect::from_min_max(
+                    pos2(rect.right() - width - inset, rect.top() + inset),
+                    rect.right_bottom() - vec2(inset, inset),
+                );
+                let bar_response =
+                    ui.interact(strip, ui.id().with("combo-bar"), Sense::click_and_drag());
+                bar_response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, "Scroll the list")
+                });
+                let bar = Bar { strip, axis: 1, button: width, max };
+                let offset = scroll_by(ui, &bar_response, area.rect, &bar, kept * scale);
+                ui.data_mut(|d| d.insert_temp(scroll_id, offset / scale));
                 let p = ui.painter();
                 p.rect_filled(rect, 0, a.color("window.background", Color32::BLACK));
                 a.paint(p, "window.border_image", rect, scale, true, tint);

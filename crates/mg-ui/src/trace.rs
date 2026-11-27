@@ -11,16 +11,19 @@
 //! set aside before) and a new one begun, so a session takes two files'
 //! room at most.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static ON: AtomicBool = AtomicBool::new(false);
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static GEN: AtomicU64 = AtomicU64::new(1);
 
 /// How large the debug log's file grows before it is set aside, in bytes.
 pub const LIMIT: u64 = 4 << 20;
@@ -140,6 +143,7 @@ pub fn set(on: bool) {
         }
     }
     ON.store(on, Ordering::Relaxed);
+    GEN.fetch_add(1, Ordering::Relaxed);
     if on {
         note(format!(
             "Moonscar Toolset {} on {} {}, {} UTC",
@@ -151,13 +155,44 @@ pub fn set(on: bool) {
     }
 }
 
+/// The most characters of a value a line says.
+const LONGEST: usize = 1200;
+
+/// `text` cut to [`LONGEST`] characters, with a mark where it was cut.
+fn cut(text: &str) -> String {
+    match text.char_indices().nth(LONGEST) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_string(),
+    }
+}
+
+/// A value as its `Debug` says it, cut as a line is: formatted only as
+/// far as is said (an action holding an import's files or a compiled
+/// script was written out whole, hundreds of megabytes of digits, before
+/// it was cut, and whether or not the log was on).
+pub fn brief(value: &impl std::fmt::Debug) -> String {
+    struct Short(String, usize);
+    impl std::fmt::Write for Short {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for c in s.chars() {
+                if self.1 == 0 {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push(c);
+                self.1 -= 1;
+            }
+            Ok(())
+        }
+    }
+    let mut out = Short(String::new(), LONGEST + 1);
+    let _ = std::fmt::write(&mut out, format_args!("{value:?}"));
+    out.0
+}
+
 fn write(state: &mut State, text: &str) {
     let t = state.started.elapsed().as_secs_f64();
     // (Long values, a resource's bytes in an action, are cut.)
-    let mut text: String = text.chars().take(1200).collect();
-    if text.len() == 1200 {
-        text.push('…');
-    }
+    let text = cut(text);
     let clock = utc(SystemTime::now()).1;
     let indent = "\n".to_string() + &" ".repeat(26);
     let line = format!("[{clock} {t:9.3}] {}\n", text.replace('\n', &indent));
@@ -208,6 +243,74 @@ pub fn changed(topic: &str, text: impl FnOnce() -> String) {
     write(state, &format!("{topic}: {text}"));
 }
 
+fn hash_of<H: Hash + ?Sized>(value: &H) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut h);
+    h.finish()
+}
+
+fn changed_hashed(
+    id_hash: (u64, u64),
+    key_hash: u64,
+    make_topic: impl FnOnce() -> String,
+    make_text: impl FnOnce() -> String,
+) {
+    let trace_gen = GEN.load(Ordering::Relaxed);
+    type TraceKeys = (u64, HashMap<(u64, u64), u64>);
+    thread_local! {
+        static KEYS: RefCell<TraceKeys> = RefCell::new((0, HashMap::new()));
+    }
+    let unchanged = KEYS.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.0 != trace_gen {
+            guard.0 = trace_gen;
+            guard.1.clear();
+        }
+        guard.1.get(&id_hash) == Some(&key_hash)
+    });
+    if unchanged {
+        return;
+    }
+    let topic = make_topic();
+    let text = make_text();
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = state.as_mut() else { return };
+    if state.last.get(&topic).is_none_or(|last| *last != text) {
+        state.last.insert(topic.clone(), text.clone());
+        write(state, &format!("{topic}: {text}"));
+    }
+    KEYS.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.0 == trace_gen {
+            guard.1.insert(id_hash, key_hash);
+        }
+    });
+}
+
+/// Fast path for [`changed`] when a cheap scalar/hash key identifies all inputs to `text`.
+pub fn changed_key<K: Hash>(topic: &str, key: &K, text: impl FnOnce() -> String) {
+    if !on() {
+        return;
+    }
+    let id = (hash_of(topic), topic.len() as u64);
+    changed_hashed(id, hash_of(key), || topic.to_string(), text);
+}
+
+/// Fast path for [`changed`] when both the topic label and value derive from cheap keys.
+pub fn changed_for<I: Hash, K: Hash>(
+    tag: &str,
+    id: &I,
+    key: &K,
+    topic: impl FnOnce() -> String,
+    text: impl FnOnce() -> String,
+) {
+    if !on() {
+        return;
+    }
+    let id_hash = (hash_of(tag), hash_of(id));
+    changed_hashed(id_hash, hash_of(key), topic, text);
+}
+
 /// The graphics libraries' messages (wgpu, eframe): warnings and errors,
 /// and what they say of the adapter chosen.
 struct Libraries;
@@ -234,9 +337,31 @@ impl log::Log for Libraries {
 mod tests {
     use super::*;
 
+    /// A long value is cut by its characters, and formatted only as far
+    /// as it is said (the review of November 2026, S18 and S27).
+    #[test]
+    fn a_long_value_is_cut_before_it_is_written_out() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert_eq!(cut(&"é".repeat(1200)), "é".repeat(1200), "as long as it may be");
+        assert_eq!(cut(&"é".repeat(1300)), "é".repeat(1200) + "…");
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        struct Byte;
+        impl std::fmt::Debug for Byte {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                ASKED.fetch_add(1, Ordering::Relaxed);
+                f.write_str("255")
+            }
+        }
+        let big: Vec<Byte> = (0..1_000_000).map(|_| Byte).collect();
+        let said = brief(&big);
+        assert_eq!(said.chars().count(), 1201);
+        assert!(ASKED.load(Ordering::Relaxed) < 1000, "not every byte formatted");
+        assert_eq!(brief(&"short"), "\"short\"");
+    }
+
     #[test]
     fn a_full_log_is_set_aside_and_a_new_one_begun() {
-        let dir = std::env::temp_dir().join(format!("mg-trace-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-trace");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("debug-log.txt");
@@ -273,7 +398,7 @@ mod tests {
         assert_eq!(at(1_709_164_800).0, "2024-02-29");
         // The last sessions' logs stay, with what was set aside of them;
         // older ones and nothing else go.
-        let dir = std::env::temp_dir().join(format!("mg-trace-keep-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-trace-keep");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for name in [

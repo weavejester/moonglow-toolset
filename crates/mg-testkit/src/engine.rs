@@ -23,6 +23,10 @@ pub struct ServerRun {
     pub log: String,
     /// Whether the done marker appeared before the timeout.
     pub finished: bool,
+    /// Where it did not: how long it ran, whether and how the server
+    /// ended, and the ends of the engine's and the error log (also
+    /// printed on the test's output).
+    pub why: Option<String>,
 }
 
 impl ServerRun {
@@ -73,7 +77,7 @@ pub fn run_server(
     let _turn = SERVERS.take(1, SERVERS_AT_ONCE);
     // Never listed publicly, and locked against anyone who finds the port
     // anyway: what `mg_serve` does unless asked otherwise.
-    let server = mg_serve::Server::start(&mg_serve::Options {
+    let mut server = mg_serve::Server::start(&mg_serve::Options {
         server,
         user_dir: user_dir.to_path_buf(),
         module: module.to_string(),
@@ -85,14 +89,50 @@ pub fn run_server(
     loop {
         let log = server.log();
         if log.contains(done_marker) {
-            return Ok(ServerRun { log, finished: true });
+            return Ok(ServerRun { log, finished: true, why: None });
         }
         // It quit (a module it can't load): nothing more will come.
         if start.elapsed() > timeout || log.contains("Server shutting down") {
-            return Ok(ServerRun { log, finished: false });
+            // Said on the test's output, which a failing test shows: why
+            // the server stopped, where its own log doesn't say.
+            let why = why_unfinished(&mut server, start.elapsed());
+            eprintln!("{why}");
+            return Ok(ServerRun { log, finished: false, why: Some(why) });
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// What a run that did not finish leaves to say why: how long it ran,
+/// whether and how the server ended, and the ends of the engine's log
+/// and the error log (a server that stops right after "Loading Module"
+/// says nothing more in its own log).
+fn why_unfinished(server: &mut mg_serve::Server, ran: Duration) -> String {
+    // (A server shutting down by itself may need a moment to end.)
+    let mut status = server.exited();
+    for _ in 0..20 {
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        status = server.exited();
+    }
+    let tail = |path: std::path::PathBuf| {
+        let text = std::fs::read(&path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|e| format!("(not read: {e})"));
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(40)..].join("\n")
+    };
+    let logs = server.log_path().with_file_name("nwserverError1.txt");
+    format!(
+        "the server did not finish after {:.1} s; it {}\n\
+         nwengineLog.txt ends:\n{}\nnwserverError1.txt ends:\n{}",
+        ran.as_secs_f64(),
+        status.map_or("was still running".to_string(), |s| format!("ended: {s}")),
+        tail(server.engine_log_path()),
+        tail(logs),
+    )
 }
 
 /// Runs `<user_dir>/modules/<module>.mod` in the headless server until a
@@ -147,17 +187,31 @@ pub fn save_game(
     }
     // (A command typed while the module is still being set up is not
     // taken: typed again until the server says it is saving.)
+    // Done when the server says so, or, once it is saving, when the
+    // save's file is there and has kept its size for a second: its
+    // "Save complete" can stay in its output's buffer (seen when the
+    // master server's advisory was printed into the "Saving" line).
+    let sav = saves.join("000002 - mgsave").join(format!("{module}.sav"));
     let mut complete = false;
     let mut saving = false;
     let mut asked = None::<Instant>;
+    let mut held = None::<(u64, Instant)>;
     while start.elapsed() < timeout && !complete {
         if !saving && asked.is_none_or(|at| at.elapsed() > Duration::from_secs(3)) {
             server.say("save 2 mgsave")?;
             asked = Some(Instant::now());
         }
+        if saving && let Ok(meta) = std::fs::metadata(&sav) {
+            match held {
+                Some((len, since)) if len == meta.len() && meta.len() > 0 => {
+                    complete = since.elapsed() > Duration::from_secs(1);
+                }
+                _ => held = Some((meta.len(), Instant::now())),
+            }
+        }
         let Ok(line) = lines.recv_timeout(Duration::from_millis(200)) else { continue };
         saving |= line.contains("Saving");
-        complete = line.contains("Save complete");
+        complete |= line.contains("Save complete");
         printed.push(line);
     }
     let log = server.log();
@@ -165,5 +219,5 @@ pub fn save_game(
     if !complete {
         return Err(failed(&printed, log, "the save did not complete"));
     }
-    Ok(saves.join("000002 - mgsave").join(format!("{module}.sav")))
+    Ok(sav)
 }

@@ -18,6 +18,9 @@ use crate::Module;
 /// The five factions every module has; they cannot be removed.
 pub const STANDARD: [&str; 5] = ["PC", "Hostile", "Commoner", "Merchant", "Defender"];
 
+/// The standard faction that fights no one, in [`STANDARD`].
+const COMMONER: u32 = 2;
+
 /// A reputation looked up where the file has none (Aurora's value, which it
 /// also writes into the file when it looks one up).
 pub const DEFAULT_REPUTATION: u32 = 100;
@@ -90,9 +93,14 @@ impl Factions {
 
     /// The module's factions (the standard ones if it has no `repute.fac`).
     pub fn of_module(m: &Module) -> Factions {
+        Factions::of_module_in(m, Codepage::WINDOWS_1252)
+    }
+
+    /// [`of_module`](Self::of_module) decoding faction names in `codepage`.
+    pub fn of_module_in(m: &Module, codepage: Codepage) -> Factions {
         let key = ResKey::new(ResRef::from_str("repute").expect("valid"), ResType::FAC);
         let g = m.gff(&key).and_then(Result::ok).unwrap_or_else(crate::new::default_factions);
-        Factions::read(&g)
+        Factions::read_in(&g, codepage)
     }
 
     /// The file, as Aurora writes it: factions and reputations in id order,
@@ -138,12 +146,6 @@ impl Factions {
         self.reputations.get(&(target, perceiver)).copied()
     }
 
-    /// How much `perceiver` likes `target`; a missing entry is written with
-    /// the default first, as Aurora does.
-    fn lookup(&mut self, perceiver: u32, target: u32) -> u32 {
-        *self.reputations.entry((target, perceiver)).or_insert(DEFAULT_REPUTATION)
-    }
-
     pub fn set_reputation(&mut self, perceiver: u32, target: u32, rep: u32) {
         self.reputations.insert((target, perceiver), rep.min(100));
     }
@@ -155,34 +157,49 @@ impl Factions {
         let new = self.factions.len() as u32;
         self.factions.push(Faction {
             name: name.to_string(),
-            parent: Some(parent),
+            parent: (parent < new).then_some(parent),
             global,
             original: Struct::new(new),
         });
+        // A parent's missing entries are written with the default as they
+        // are looked up, as Aurora does (`aurora_factions` holds it to its
+        // capture). A parent that is no faction has no entries to write.
+        let valid = parent < new;
         for f in 0..=new {
-            let rep = self.lookup(parent, f);
+            let rep = if valid { self.lookup(parent, f) } else { DEFAULT_REPUTATION };
             self.reputations.insert((f, new), rep);
         }
         for f in 0..=new {
-            let rep = self.lookup(f, parent);
+            let rep = if valid { self.lookup(f, parent) } else { DEFAULT_REPUTATION };
             self.reputations.insert((new, f), rep);
         }
         new
     }
 
+    /// How much `perceiver` likes `target`; a missing entry is written with
+    /// the default first, as Aurora does.
+    fn lookup(&mut self, perceiver: u32, target: u32) -> u32 {
+        *self.reputations.entry((target, perceiver)).or_insert(DEFAULT_REPUTATION)
+    }
+
     /// Removes a faction (not a standard one): its reputations go, and the
     /// factions after it move down one id. Returns the old-to-new id map
-    /// for objects that refer to factions ([`renumber_faction_users`]).
+    /// for objects that refer to factions ([`renumber_faction_users`]). An
+    /// object still of the removed faction (the caller asks
+    /// [`faction_users`] first, and removes none in use) goes to the
+    /// faction it started from, its parent, or to Commoner where it has
+    /// none: never left with its number, which is now another faction's.
     pub fn remove(&mut self, id: u32) -> Option<impl Fn(u32) -> Option<u32> + use<>> {
         if (id as usize) < STANDARD.len() || id as usize >= self.factions.len() {
             return None;
         }
-        self.factions.remove(id as usize);
+        let removed = self.factions.remove(id as usize);
         let map = move |old: u32| match old.cmp(&id) {
             std::cmp::Ordering::Less => Some(old),
             std::cmp::Ordering::Equal => None,
             std::cmp::Ordering::Greater => Some(old - 1),
         };
+        let heir = removed.parent.and_then(map).unwrap_or(COMMONER);
         for f in &mut self.factions {
             f.parent = f.parent.and_then(map);
         }
@@ -190,12 +207,11 @@ impl Factions {
             .into_iter()
             .filter_map(|((t, p), r)| Some(((map(t)?, map(p)?), r)))
             .collect();
-        Some(map)
+        Some(move |old: u32| map(old).or(Some(heir)))
     }
 }
 
-/// Labels of the faction fields of objects and their instances.
-const FACTION_FIELDS: [&str; 2] = ["FactionID", "Faction"];
+/// Resource types of objects and instances that hold a faction id.
 const FACTION_USERS: [ResType; 6] =
     [ResType::UTC, ResType::UTD, ResType::UTP, ResType::UTT, ResType::UTE, ResType::GIT];
 
@@ -204,7 +220,7 @@ fn walk(s: &mut Struct, f: &mut dyn FnMut(&mut Value)) {
         match &mut field.value {
             Value::Struct(c) => walk(c, f),
             Value::List(items) => items.iter_mut().for_each(|i| walk(i, f)),
-            v if FACTION_FIELDS.contains(&field.label.to_string_lossy().as_str()) => f(v),
+            v if matches!(field.label.as_bytes(), b"FactionID" | b"Faction") => f(v),
             _ => {}
         }
     }
@@ -221,9 +237,9 @@ fn faction_of(v: &Value) -> Option<u32> {
 
 /// The module's objects (blueprints and placed instances) in a faction.
 pub fn faction_users(m: &Module, id: u32) -> Vec<ResKey> {
-    let keys: Vec<ResKey> =
-        m.keys().filter(|k| FACTION_USERS.contains(&k.restype)).copied().collect();
-    keys.into_iter()
+    m.keys()
+        .filter(|k| FACTION_USERS.contains(&k.restype))
+        .copied()
         .filter(|k| {
             let Some(Ok(mut g)) = m.gff(k) else { return false };
             let mut used = false;
@@ -233,7 +249,8 @@ pub fn faction_users(m: &Module, id: u32) -> Vec<ResKey> {
         .collect()
 }
 
-/// Rewrites the faction ids of the module's objects after a removal;
+/// Rewrites the faction ids of the module's objects after a removal
+/// (`map`: [`Factions::remove`]'s; an id it gives none for is left);
 /// returns the resources changed.
 pub fn renumber_faction_users(m: &mut Module, map: impl Fn(u32) -> Option<u32>) -> Vec<ResKey> {
     let keys: Vec<ResKey> =
@@ -284,5 +301,67 @@ mod tests {
         assert_eq!(id, 5);
         assert!(f.remove(id).is_some());
         assert_eq!(f.factions, standard.factions);
+    }
+
+    /// The objects of the factions after a removed one follow them down,
+    /// and one still of the removed faction goes to the faction it started
+    /// from: it is not left with the number, which is the next faction's
+    /// now (the review's V19).
+    #[test]
+    fn an_object_of_a_removed_faction_is_not_left_with_its_number() {
+        let mut f = Factions::read(&crate::new::default_factions());
+        let (a, b) = (f.add("A", true, 4), f.add("B", true, 3));
+        let c = f.add("C", true, b);
+        let mut m = Module::new();
+        let key = |n: &str| ResKey::parse(n, ResType::UTC).unwrap();
+        let of = |m: &Module, n: &str| m.gff(&key(n)).unwrap().unwrap().root.integer("FactionID");
+        for (name, faction) in [("in_a", a), ("in_b", b), ("in_c", c), ("hostile", 1)] {
+            let mut g = Gff::new(*b"UTC ");
+            g.root.set("FactionID", Value::Word(faction as u16));
+            m.set_gff(key(name), &g).unwrap();
+        }
+        assert_eq!(faction_users(&m, b), [key("in_b")]);
+        let map = f.remove(b).unwrap();
+        assert_eq!(f.factions[b as usize].name, "C", "C has B's number now");
+        assert_eq!(f.factions[b as usize].parent, None, "and no parent: its was B");
+        let changed = renumber_faction_users(&mut m, map);
+        assert_eq!(changed, [key("in_b"), key("in_c")]);
+        assert_eq!(of(&m, "in_a"), Some(i64::from(a)));
+        assert_eq!(of(&m, "in_b"), Some(3), "to Merchant, which B started from");
+        assert_eq!(of(&m, "in_c"), Some(i64::from(b)), "C's new number");
+        assert_eq!(of(&m, "hostile"), Some(1));
+        // One with no parent: its objects are Commoners.
+        let map = f.remove(b).unwrap();
+        assert_eq!(map(b), Some(COMMONER));
+    }
+
+    #[test]
+    fn of_module_in_decodes_codepage_and_add_writes_parent_entries_as_aurora() {
+        let mut g = crate::new::default_factions();
+        let cp = Codepage::WINDOWS_1250;
+        let list = g.root.list_mut(fac::FACTION_LIST.label).unwrap();
+        // Byte 0xA3 is 'Ł' in Windows-1250.
+        list[4].set("FactionName", Value::String(vec![b'G', b'u', b'a', b'r', b'd', 0xa3]));
+        let mut m = Module::new();
+        m.set_gff(ResKey::new(ResRef::from_str("repute").unwrap(), ResType::FAC), &g).unwrap();
+
+        let mut fac = Factions::of_module_in(&m, cp);
+        assert_eq!(fac.factions[4].name, "Guard\u{141}");
+
+        fac.reputations.remove(&(4, 4));
+        let added = fac.add("New", false, 4);
+        assert_eq!(added, 5);
+        // Aurora writes the parent's missing entries with the default as it
+        // looks them up (its capture `added-guards-bandits-edit.fac`).
+        assert_eq!(fac.reputation(4, 4), Some(DEFAULT_REPUTATION), "parent's own entry written");
+        assert_eq!(fac.reputation(added, added), Some(DEFAULT_REPUTATION));
+        assert_eq!(fac.reputation(4, added), Some(DEFAULT_REPUTATION));
+        assert_eq!(fac.reputation(added, 4), Some(DEFAULT_REPUTATION));
+        // Out-of-range parent yields `parent: None` instead of a dangling
+        // index, and writes no entries for the faction that is not there.
+        let bad = fac.add("Orphan", false, 99);
+        assert_eq!(fac.factions[bad as usize].parent, None);
+        assert!(fac.reputations.keys().all(|&(t, p)| t != 99 && p != 99));
+        assert_eq!(fac.reputation(bad, bad), Some(DEFAULT_REPUTATION));
     }
 }

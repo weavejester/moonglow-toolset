@@ -92,6 +92,48 @@ fn a_rename_says_which_strings_still_spell_the_old_name() {
     assert!(said("A string still spelled “hello” in scripts (caller.nss line 1)"), "{:?}", app.log);
 }
 
+/// A rename takes the compiled code of the scripts it rewrote and
+/// compiles them again. Whether a failure was one of theirs was told by
+/// the script's name being somewhere in the error's message: a script
+/// whose compile failed in another include (the message names that file)
+/// lost its compiled code without a word, and an unrelated script whose
+/// name holds a rewritten one's was said to be the rename's (the review
+/// of November 2026, D9). The failures are told by the script compiled.
+#[test]
+fn a_rename_says_which_of_its_scripts_no_longer_compile() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-rename-recompile");
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let script = |name: &str| ResKey::parse(name, ResType::NSS).unwrap();
+    m.set(script("inc_old"), b"void Old() {}\n".to_vec());
+    m.set(script("inc_utils"), b"void Utils() { int x = ; }\n".to_vec());
+    let main = b"#include \"inc_old\"\n#include \"inc_utils\"\nvoid main() { Old(); }\n";
+    m.set(script("quest"), main.to_vec());
+    // (Compiled once, before inc_utils was broken: the rename takes it.)
+    m.set(ResKey::parse("quest", ResType::NCS).unwrap(), b"NCS V1.0B".to_vec());
+    // Another script that never compiled, its name holding the first's.
+    m.set(script("quest_other"), b"void main() { nothing here }\n".to_vec());
+    m.save().unwrap();
+    let mut app = game_app(&root, None);
+    app.open_module(&path);
+    app.rename_resource(script("inc_old"), ResRef::from_str("inc_new").unwrap(), false);
+    let module = &app.ws.as_ref().unwrap().module;
+    assert!(module.contains(&script("inc_new")), "{:?}", app.log.entries);
+    assert!(!module.contains(&ResKey::parse("quest", ResType::NCS).unwrap()));
+    let errors: Vec<&str> = (app.log.entries.iter())
+        .filter(|(level, _)| matches!(level, mg_ui::Level::Error))
+        .map(|(_, m)| m.as_str())
+        .collect();
+    assert!(
+        errors.iter().any(|m| m.contains("quest.nss") && m.contains("inc_utils")),
+        "{errors:?}"
+    );
+    assert!(!errors.iter().any(|m| m.contains("quest_other")), "not the rename's: {errors:?}");
+    let said = |s: &str| app.log.entries.iter().any(|e| e.1.contains(s));
+    assert!(said("Some scripts the rename changed aren't compiled"));
+}
+
 /// The first Find References in a module reads its references on a
 /// thread of its own, as the desktop app runs (the window draws, and says
 /// it is reading); the next ones read only what changed, at once; the
@@ -208,6 +250,49 @@ fn find_references_finds_a_line_in_scripts_and_the_haks_2das() {
     assert!(h.state().dock.find_tab(&Tab::Script(key)).is_some(), "the script opens");
 }
 
+/// A script's rename follows into the module's own `spells.2da`, and the
+/// log says which cell of a hak's table still names the old script: that
+/// table is not the module's to rewrite (the review's V4).
+#[test]
+fn a_script_s_rename_rewrites_the_module_s_tables_and_warns_of_the_haks() {
+    use mg_schema::{StructExt, ifo};
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-rename-script-tables");
+    let user = user_folder(&dir, &["hak"]);
+    let table = b"2DA V2.0\n\n   Label ImpactScript\n0  Mine  hello\n1  Other x_other\n".to_vec();
+    let mut hak = mg_erf::ErfWriter::new(*b"HAK ");
+    hak.add(ResRef::from_str("spells").unwrap(), ResType::TWODA, table.clone()).unwrap();
+    std::fs::write(user.join("hak/kz_spells.hak"), hak.to_bytes().unwrap()).unwrap();
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let mut info = m.info().unwrap();
+    let mut item = ifo::MOD_HAK_LIST.new_item();
+    item.write(&ifo::mod_hak_list::MOD_HAK, mg_schema::ExoString::from("kz_spells"));
+    info.root.items_mut(&ifo::MOD_HAK_LIST).push(item);
+    m.set_info(&info).unwrap();
+    let spells = ResKey::parse("spells", ResType::TWODA).unwrap();
+    m.set(spells, table);
+    m.save().unwrap();
+    let mut app = game_app(&root, Some(user));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let hello = ResKey::parse("hello", ResType::NSS).unwrap();
+    app.rename_resource(hello, ResRef::from_str("greet").unwrap(), false);
+    let module = &app.ws.as_ref().unwrap().module;
+    let text = String::from_utf8_lossy(module.get(&spells).unwrap()).into_owned();
+    assert!(text.contains("0  Mine  greet\n"), "{text}");
+    let said = |s: &str| app.log.entries.iter().any(|e| e.1.contains(s));
+    assert!(said("1 in the module's 2DAs"), "{:?}", app.log);
+    assert!(
+        said(
+            "A cell of the haks' tables still names hello (kz_spells › spells.2da › row 0, \
+             ImpactScript)"
+        ),
+        "{:?}",
+        app.log
+    );
+}
+
 #[test]
 fn find_and_replace_text_across_the_module() {
     use mg_edit::{Command, Edit};
@@ -241,10 +326,20 @@ fn find_and_replace_text_across_the_module() {
     h.run();
     h.get_by_label("Find").click();
     h.run();
-    h.get_by_label("2 string(s), 2 time(s)");
-    // The second unticked: one replaced.
-    h.state_mut().text_replace.as_mut().unwrap().hits[1].1 = false;
+    h.get_by_label("2 strings, 2 times");
+    dock_high(&mut h, 360);
+    settle(&mut h);
+    // The second unticked (by its tick, M4's U28: a row of Search
+    // Results'): one replaced.
+    h.get_all_by(|n| {
+        n.role() == egui::accesskit::Role::CheckBox
+            && n.label().is_some_and(|l| l.starts_with("Replace in camp_b.utw"))
+    })
+    .next()
+    .expect("camp_b's tick")
+    .click();
     h.run();
+    assert!(!h.state().text_replace.as_ref().unwrap().hits[1].1, "camp_b's unticked");
     h.get_by_label("Replace in 1").click();
     h.run();
     let name = |h: &mut Harness<'_, Moonglow>, k: &ResKey| {
@@ -255,11 +350,32 @@ fn find_and_replace_text_across_the_module() {
     };
     assert_eq!(name(&mut h, &keys[0]), "Goblin camp");
     assert_eq!(name(&mut h, &keys[1]), "Orc camp");
+    // (The log counts one time, not "1 times".)
+    let replaced = |h: &Harness<'_, Moonglow>| -> Vec<String> {
+        let log = &h.state().log.entries;
+        log.iter().map(|(_, m)| m.clone()).filter(|m| m.starts_with("Replaced ")).collect()
+    };
+    assert!(
+        replaced(&h).last().is_some_and(|m| m.ends_with("\"orc\" 1 time")),
+        "{:?}",
+        replaced(&h)
+    );
     // Found again: what's left.
-    h.get_by_label("1 string(s), 1 time(s)");
+    h.get_by_label("1 string, 1 time");
     h.state_mut().actions.push(mg_ui::Action::Undo);
     h.run();
     assert_eq!(name(&mut h, &keys[0]), "Orc camp");
+    // Both replaced: two times.
+    h.get_by_label("Find").click();
+    h.run();
+    h.get_by_label("2 strings, 2 times");
+    h.get_by_label("Replace in 2").click();
+    h.run();
+    assert!(
+        replaced(&h).last().is_some_and(|m| m.ends_with("\"orc\" 2 times")),
+        "{:?}",
+        replaced(&h)
+    );
 }
 
 /// Find and Replace in the tags, by a regular expression: ticked beside
@@ -303,7 +419,7 @@ fn find_and_replace_in_tags_by_a_regular_expression() {
     h.run();
     h.get_by_label("Find").click();
     h.run();
-    h.get_by_label("2 string(s), 2 time(s)");
+    h.get_by_label("2 strings, 2 times");
     h.get_by_label("Replace in 2").click();
     h.run();
     let tags = |h: &mut Harness<'_, Moonglow>| -> Vec<String> {
@@ -373,7 +489,9 @@ fn advanced_search_changes_what_it_found_and_takes_conditions_together() {
     let start = ResKey::parse("start", ResType::GIT).unwrap();
     let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
     app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
-    let mut h = window_harness(app);
+    // (The window at the size it opens at, its form and the list of what
+    // it found under it: a screen of 1280 by 900 has room for the form.)
+    let mut h = harness(app, 1280.0, 900.0);
     h.run();
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AdvancedSearch));
     h.run_steps(2);
@@ -418,7 +536,7 @@ fn advanced_search_changes_what_it_found_and_takes_conditions_together() {
     // A variable set on the ticked one, in one step.
     h.state_mut().advanced_search.ticked[1] = false;
     h.run();
-    h.get_by_label("Change the 1 ticked").click();
+    h.get_by_label("Change the 1 checked").click();
     h.run();
     type_into_hint(&mut h, "its name, e.g. nQuestState", "nTest");
     type_into_hint(&mut h, "the value", "5");
@@ -431,6 +549,9 @@ fn advanced_search_changes_what_it_found_and_takes_conditions_together() {
     h.state_mut().actions.push(mg_ui::Action::Undo);
     h.run_steps(2);
     assert_eq!(var(&creature(&mut h, 0)), None, "undone as one");
+    // (The module changed under what was found: found again first.)
+    h.get_by_label("Find").click();
+    h.run();
     // An event's script, on both.
     {
         let a = &mut h.state_mut().advanced_search.act;
@@ -451,24 +572,555 @@ fn advanced_search_changes_what_it_found_and_takes_conditions_together() {
     }
 
     // Edit Together, and their area chosen in Edit Areas Together.
-    h.get_by_label("Edit the 2 ticked together").click();
+    h.get_by_label("Edit the 2 checked together").click();
     h.run();
-    h.get_by_label("Edit 2 creature(s) in start Together").click();
+    h.get_by_label("Edit 2 creatures in start Together").click();
     h.run_steps(2);
     let paths = vec![
         mg_edit::GffPath::root().item("Creature List", 0),
         mg_edit::GffPath::root().item("Creature List", 1),
     ];
     let area = ResRef::from_str("start").unwrap();
-    let both = Tab::Instances { area, paths };
+    let both = Tab::instances(area, paths);
     assert!(h.state().dock.find_tab(&both).is_some());
     // (Closed: in this small screen it lies over the search's.)
     h.state_mut().actions.push(mg_ui::Action::CloseTab(both));
     h.run_steps(2);
-    h.get_by_label("Choose 1 Area(s)…").click();
+    h.get_by_label("Choose 1 Area…").click();
     h.run_steps(2);
-    // (The chooser's button: one area ticked.)
-    h.get_by_label("Edit 1 Together");
+    // (Edit Areas Together's section, in front in the Right Dock: one area
+    // checked.)
+    h.get_by_label("1 area checked");
+}
+
+/// Objects of one kind found in several areas open in one Edit Together
+/// (the deferred entry "Advanced Search, what it doesn't do"): a field set
+/// in it is set in each area, at each object's own place (another object
+/// stands at the same place in the first area, and is left), as one undo
+/// step, which Cancel takes back too. The items those objects hold open
+/// together the same way, apart from the objects.
+#[test]
+fn advanced_search_edits_objects_of_several_areas_and_the_items_they_hold_together() {
+    use mg_edit::{Command, Edit, GffPath};
+    use mg_gff::{Struct, Value};
+    use mg_ui::search::{Condition, Kind};
+    let dir = mg_testkit::scratch_dir("ui-advanced-search-areas-together");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let text = |s: &str| Value::String(s.as_bytes().to_vec());
+    let gem = || {
+        let mut i = Struct::new(0);
+        i.set("Tag", text("GEM"));
+        i.set("BaseItem", Value::Int(77));
+        i.set("Plot", Value::Byte(0));
+        i
+    };
+    let placeable = |tag: &str, holds: bool| {
+        let mut p = Struct::new(9);
+        p.set("Tag", text(tag));
+        p.set("Plot", Value::Byte(0));
+        p.set("HasInventory", Value::Byte(u8::from(holds)));
+        p.set("ItemList", Value::List(if holds { vec![gem()] } else { Vec::new() }));
+        p
+    };
+    let start = ResKey::parse("start", ResType::GIT).unwrap();
+    let field = ResKey::parse("field", ResType::GIT).unwrap();
+    let mut edits = Vec::new();
+    // In start, OTHER stands where the chest of field stands (the first).
+    for (key, list) in [
+        (start, vec![placeable("OTHER", true), placeable("CHEST", true)]),
+        (field, vec![placeable("CHEST", true)]),
+    ] {
+        let mut git = Gff::new(*b"GIT ");
+        git.root.set("Placeable List", Value::List(list));
+        edits.push(Edit::SetResource { key, data: Some(git.to_bytes().unwrap()) });
+    }
+    let are = Gff::new(*b"ARE ").to_bytes().unwrap();
+    let field_are = ResKey::parse("field", ResType::ARE).unwrap();
+    edits.push(Edit::SetResource { key: field_are, data: Some(are) });
+    app.ws.as_mut().unwrap().apply(Command::new("setup", edits)).unwrap();
+    let mut h = harness(app, 1280.0, 900.0);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AdvancedSearch));
+    h.run_steps(2);
+    // Each placeable's Plot, and its gem's, in start then field.
+    let plots = |h: &mut Harness<'_, Moonglow>| -> Vec<(Option<i64>, Option<i64>)> {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.flush().unwrap();
+        [start, field]
+            .iter()
+            .flat_map(|k| {
+                let g = ws.module.gff(k).unwrap().unwrap();
+                g.root.list("Placeable List").unwrap().to_vec()
+            })
+            .map(|p| (p.integer("Plot"), p.list("ItemList").unwrap()[0].integer("Plot")))
+            .collect()
+    };
+    let none = vec![(Some(0), Some(0)); 3];
+    let find = |h: &mut Harness<'_, Moonglow>, tag: &str, n: usize| {
+        h.state_mut().advanced_search.first = Condition {
+            kind: Kind::Field,
+            name: "Tag".into(),
+            value: tag.into(),
+            ..Default::default()
+        };
+        h.run();
+        h.get_by_label("Find").click();
+        h.run();
+        h.get_by_label(&format!("{n} found:"));
+    };
+
+    // The two chests, in two areas: one button.
+    find(&mut h, "CHEST", 2);
+    h.get_by_label("Edit the 2 checked together").click();
+    h.run();
+    h.get_by_label("Edit 2 placeables in 2 areas Together").click();
+    h.run_steps(3);
+    // (The objects of the tab of several open, in any order.)
+    let together = |h: &Harness<'_, Moonglow>| -> Option<Vec<(ResRef, GffPath)>> {
+        h.state().dock.iter_all_tabs().find_map(|(_, t)| match t {
+            Tab::Instances { objects } => {
+                let mut o = objects.to_vec();
+                o.sort();
+                Some(o)
+            }
+            _ => None,
+        })
+    };
+    let mut chests = vec![
+        (start.resref, GffPath::root().item("Placeable List", 1)),
+        (field.resref, GffPath::root().item("Placeable List", 0)),
+    ];
+    chests.sort();
+    assert_eq!(together(&h), Some(chests));
+    h.get_by_label("Plot").click();
+    settle(&mut h);
+    let both = vec![(Some(0), Some(0)), (Some(1), Some(0)), (Some(1), Some(0))];
+    assert_eq!(plots(&mut h), both, "each chest, OTHER left");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    assert_eq!(plots(&mut h), none, "undone as one");
+    // A list edited on each, the Variables page's: a variable added in
+    // both areas, OTHER left, in one step.
+    let vars = |h: &mut Harness<'_, Moonglow>| -> Vec<usize> {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.flush().unwrap();
+        [start, field]
+            .iter()
+            .flat_map(|k| {
+                let g = ws.module.gff(k).unwrap().unwrap();
+                g.root.list("Placeable List").unwrap().to_vec()
+            })
+            .map(|p| p.list("VarTable").map_or(0, <[_]>::len))
+            .collect()
+    };
+    page(&mut h, "Variables");
+    in_page(&h, "Variables").get_by_label("Add").click();
+    settle(&mut h);
+    type_into_hint(&mut h, "Name", "nMark");
+    h.key_press(egui::Key::Tab);
+    settle(&mut h);
+    assert_eq!(vars(&mut h), [0, 1, 1], "each chest's, OTHER left");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    assert_eq!(vars(&mut h), [0, 0, 0], "undone as one");
+    page(&mut h, "Basic");
+    h.get_by_label("Plot").click();
+    settle(&mut h);
+    assert_eq!(plots(&mut h), both);
+    h.get_by_label("Placeable properties header").get_by_label("Cancel").click();
+    settle(&mut h);
+    assert_eq!(plots(&mut h), none, "Cancel takes both back");
+    assert_eq!(together(&h), None, "closed");
+
+    // The gems the three hold: three held items, in two areas.
+    find(&mut h, "GEM", 3);
+    h.get_by_label("Edit 3 held items in 2 areas Together").click();
+    h.run_steps(3);
+    let mut gems = vec![
+        (start.resref, GffPath::root().item("Placeable List", 0).item("ItemList", 0)),
+        (start.resref, GffPath::root().item("Placeable List", 1).item("ItemList", 0)),
+        (field.resref, GffPath::root().item("Placeable List", 0).item("ItemList", 0)),
+    ];
+    gems.sort();
+    assert_eq!(together(&h), Some(gems));
+    h.get_by_label("Plot item").click();
+    settle(&mut h);
+    let held = vec![(Some(0), Some(1)); 3];
+    assert_eq!(plots(&mut h), held, "each gem, its holder left");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    assert_eq!(plots(&mut h), none, "undone as one");
+    // OTHER deleted: the window follows the gem of start's chest up its
+    // list and lets OTHER's go; the delete undone, back down.
+    let gem = |area: ResKey, i: usize| {
+        (area.resref, GffPath::root().item("Placeable List", i).item("ItemList", 0))
+    };
+    let remove = Edit::remove_item(start, GffPath::root(), "Placeable List", 0);
+    h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("Delete", vec![remove])));
+    settle(&mut h);
+    let mut now = vec![gem(start, 0), gem(field, 0)];
+    now.sort();
+    assert_eq!(together(&h), Some(now));
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    settle(&mut h);
+    let mut now = vec![gem(start, 1), gem(field, 0)];
+    now.sort();
+    assert_eq!(together(&h), Some(now));
+    h.get_by_label("Plot item").click();
+    settle(&mut h);
+    let after = vec![(Some(0), Some(0)), (Some(0), Some(1)), (Some(0), Some(1))];
+    assert_eq!(plots(&mut h), after, "the gems of the chests, not OTHER's");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+
+    // A field the chests lack is set only with Add where missing ticked:
+    // then each has it, of the type the game's files give it.
+    let useable = |h: &mut Harness<'_, Moonglow>| -> Vec<Option<Value>> {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.flush().unwrap();
+        [start, field]
+            .iter()
+            .flat_map(|k| {
+                let g = ws.module.gff(k).unwrap().unwrap();
+                g.root.list("Placeable List").unwrap().to_vec()
+            })
+            .map(|p| p.get("Useable").cloned())
+            .collect()
+    };
+    let open = h.state().dock.iter_all_tabs().find_map(|(_, t)| match t {
+        Tab::Instances { .. } => Some(t.clone()),
+        _ => None,
+    });
+    h.state_mut().actions.push(mg_ui::Action::CloseTab(open.expect("the gems' tab")));
+    h.run_steps(2);
+    find(&mut h, "CHEST", 2);
+    h.state_mut().advanced_search.act.act = mg_ui::search::Act::SetField;
+    h.run();
+    h.get_by_label("Change the 2 checked").click();
+    h.run();
+    type_into_hint(&mut h, "its label, e.g. Appearance_Type", "useable");
+    type_into_hint(&mut h, "the value", "1");
+    h.get_by_label("Change 2 Found").click();
+    h.run();
+    assert_eq!(useable(&mut h), [None, None, None], "none added unasked");
+    h.get_by_label("Add where missing").click();
+    h.run();
+    h.get_by_label("Change 2 Found").click();
+    h.run();
+    let one = Some(Value::Byte(1));
+    assert_eq!(useable(&mut h), [None, one.clone(), one], "added to the chests, spelled so");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    assert_eq!(useable(&mut h), [None, None, None], "undone as one");
+}
+
+/// What Advanced Search found is a list of places (`start.git /Creature
+/// List[1]`). With an object before one deleted since, Change wrote to
+/// whatever stood at the place by then, another creature (the review of
+/// November 2026, D2): in a module changed since they were found, the
+/// hits are found again and nothing is changed, opened or edited together
+/// until the builder has seen the new list.
+#[test]
+fn advanced_search_finds_again_before_it_acts_in_a_changed_module() {
+    use mg_edit::{Command, Edit, GffPath};
+    use mg_gff::{Struct, Value};
+    use mg_ui::search::{Act, Condition, Kind};
+    let dir = mg_testkit::scratch_dir("ui-advanced-search-stale");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let creature = |tag: &str, quest: bool| {
+        let mut c = Struct::new(4);
+        c.set("Tag", Value::String(tag.as_bytes().to_vec()));
+        let mut v = Struct::new(0);
+        v.set("Name", Value::String(b"nQuest".to_vec()));
+        v.set("Type", Value::Dword(1));
+        v.set("Value", Value::Int(1));
+        c.set("VarTable", Value::List(if quest { vec![v] } else { Vec::new() }));
+        c
+    };
+    let mut git = Gff::new(*b"GIT ");
+    let creatures =
+        vec![creature("FIRST", false), creature("ASKS", true), creature("PLAIN", false)];
+    git.root.set("Creature List", Value::List(creatures));
+    let start = ResKey::parse("start", ResType::GIT).unwrap();
+    let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
+    let tags = |app: &mut Moonglow| -> Vec<(String, bool)> {
+        let ws = app.ws.as_mut().unwrap();
+        ws.flush().unwrap();
+        let g = ws.module.gff(&start).unwrap().unwrap();
+        (g.root.list("Creature List").unwrap().iter())
+            .map(|c| {
+                let tag = String::from_utf8_lossy(c.string("Tag").unwrap()).into_owned();
+                let marked = c.list("VarTable").is_some_and(|v| {
+                    v.iter().any(|v| v.string("Name") == Some(b"nMarked".as_slice()))
+                });
+                (tag, marked)
+            })
+            .collect()
+    };
+    let mut d = mg_ui::search::AdvancedSearch {
+        first: Condition { kind: Kind::Variable, name: "nQuest".into(), ..Default::default() },
+        ..Default::default()
+    };
+    app.advanced_search(&mut d);
+    assert_eq!(d.hits.len(), 1, "{:?}", d.hits);
+    let object = |h: &mg_module::search::Hit| GffPath(h.path.0.iter().take(1).cloned().collect());
+    assert_eq!(object(&d.hits[0]), GffPath::root().item("Creature List", 1));
+    d.act.act = Act::SetVariable;
+    d.act.name = "nMarked".into();
+    d.act.value = "1".into();
+    // The first creature goes: at the place of the one found is PLAIN, which
+    // was never found.
+    let remove = Edit::remove_item(start, GffPath::root(), "Creature List", 0);
+    app.ws.as_mut().unwrap().apply(Command::new("Delete", vec![remove])).unwrap();
+    app.change_found(&mut d);
+    assert_eq!(tags(&mut app), [("ASKS".to_string(), false), ("PLAIN".to_string(), false)]);
+    assert!(d.note.as_deref().is_some_and(|n| n.contains("Found again")), "{:?}", d.note);
+    assert_eq!(object(&d.hits[0]), GffPath::root().item("Creature List", 0), "found where it is");
+    // Asked again, with the list as it is now: the creature that was found.
+    app.change_found(&mut d);
+    assert_eq!(tags(&mut app), [("ASKS".to_string(), true), ("PLAIN".to_string(), false)]);
+    assert!(d.note.is_none());
+
+    // In the window: a hit clicked after an Undo is found again, not
+    // opened where it was.
+    app.advanced_search = d;
+    let mut h = window_harness(app);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AdvancedSearch));
+    h.run_steps(2);
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    let was = h.state().dock.iter_all_tabs().count();
+    h.get_by_label_contains("creature ASKS").click();
+    h.run_steps(2);
+    assert_eq!(h.state().dock.iter_all_tabs().count(), was, "nothing opened");
+    h.get_by_label_contains("The module changed since this was found");
+    assert_eq!(
+        object(&h.state().advanced_search.hits[0]),
+        GffPath::root().item("Creature List", 1),
+        "found again, where Undo put it back"
+    );
+}
+
+/// Advanced Search's list lays out the rows in sight, the others taking
+/// a row's room each (every hit was laid out every frame: 8,785 rows of
+/// widgets for a world's variables; the review of November 2026, D23):
+/// the first rows are there, the last is not until the list is scrolled
+/// to it, and a row scrolled to is ticked and clicked as any other.
+#[test]
+fn advanced_search_lays_out_the_rows_in_sight() {
+    use mg_edit::{Command, Edit};
+    use mg_gff::{Struct, Value};
+    use mg_ui::search::{Condition, Kind};
+    let dir = mg_testkit::scratch_dir("ui-advanced-search-rows");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let creatures: Vec<Struct> = (0..400)
+        .map(|i| {
+            let mut c = Struct::new(4);
+            c.set("Tag", Value::String(format!("T{i:03}").into_bytes()));
+            let mut v = Struct::new(0);
+            v.set("Name", Value::String(b"nQuest".to_vec()));
+            v.set("Type", Value::Dword(1));
+            v.set("Value", Value::Int(1));
+            c.set("VarTable", Value::List(vec![v]));
+            c
+        })
+        .collect();
+    let mut git = Gff::new(*b"GIT ");
+    git.root.set("Creature List", Value::List(creatures));
+    let start = ResKey::parse("start", ResType::GIT).unwrap();
+    let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
+    // (The window at the size it opens at, its form and the list of what
+    // it found under it: a screen of 1280 by 900 has room for the form.)
+    let mut h = harness(app, 1280.0, 900.0);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AdvancedSearch));
+    h.run_steps(2);
+    h.state_mut().advanced_search.first =
+        Condition { kind: Kind::Variable, name: "nQuest".into(), ..Default::default() };
+    h.run();
+    h.get_by_label("Find").click();
+    h.run();
+    h.get_by_label("400 found:");
+    h.get_by_label_contains("creature T000");
+    assert!(h.query_by_label_contains("creature T399").is_none(), "out of sight: not laid out");
+    let laid_out = h.query_all_by_label_contains("creature T").count();
+    assert!((5..200).contains(&laid_out), "{laid_out} rows laid out");
+    // Scrolled to its end: the last rows, where the first were.
+    let over = h.get_by_label_contains("creature T003").rect().center();
+    h.hover_at(over);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -1_000_000.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    let deadline = std::time::Instant::now() + SETTLE_TIME;
+    while h.query_by_label_contains("creature T399").is_none() {
+        assert!(std::time::Instant::now() < deadline, "the list scrolls to its end");
+        h.step();
+    }
+    assert!(h.query_by_label_contains("creature T000").is_none());
+    h.get_by_label_contains("creature T399").click();
+    let area = ResRef::from_str("start").unwrap();
+    while h.state().dock.find_tab(&Tab::Area(area)).is_none() {
+        assert!(std::time::Instant::now() < deadline, "its place opens");
+        h.step();
+    }
+}
+
+/// Every search wrote the field looked for over the change's name, which
+/// is a variable's too: after a search of appearances, a variable typed
+/// as nBoss read Appearance_Type once the change had run (it ends with a
+/// search), and the next change set a variable of that name on everything
+/// found (the review of November 2026, D10). The field is offered where
+/// a field is what is set, and when another thing is looked for.
+#[test]
+fn advanced_search_keeps_the_name_typed_for_a_change() {
+    use mg_edit::{Command, Edit};
+    use mg_gff::{Struct, Value};
+    use mg_ui::search::{Act, AdvancedSearch, Condition, Kind};
+    let dir = mg_testkit::scratch_dir("ui-advanced-search-name");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut c = Struct::new(4);
+    c.set("Tag", Value::String(b"OGRE".to_vec()));
+    c.set("Appearance_Type", Value::Word(6));
+    let mut git = Gff::new(*b"GIT ");
+    git.root.set("Creature List", Value::List(vec![c]));
+    let start = ResKey::parse("start", ResType::GIT).unwrap();
+    let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
+    let mut d = AdvancedSearch {
+        first: Condition { kind: Kind::Appearance, row: Some(6), ..Default::default() },
+        ..Default::default()
+    };
+    d.act.act = Act::SetVariable;
+    d.act.name = "nBoss".into();
+    d.act.value = "1".into();
+    app.advanced_search(&mut d);
+    assert_eq!(d.hits.len(), 1, "{:?}", d.hits);
+    assert_eq!(d.act.name, "nBoss", "after the search");
+    app.change_found(&mut d);
+    assert_eq!(d.act.name, "nBoss", "after the change, which searches again");
+    let ws = app.ws.as_mut().unwrap();
+    ws.flush().unwrap();
+    let g = ws.module.gff(&start).unwrap().unwrap();
+    let vars = g.root.list("Creature List").unwrap()[0].list("VarTable").unwrap().to_vec();
+    assert_eq!(vars.len(), 1);
+    assert_eq!(vars[0].string("Name"), Some(b"nBoss".as_slice()));
+    // A field to set is the one looked for, once another thing is asked.
+    d.act.act = Act::SetField;
+    d.first.row = Some(7);
+    app.advanced_search(&mut d);
+    assert_eq!(d.act.name, "Appearance_Type");
+    // (And what is typed over it stays through the same question.)
+    d.act.name = "Tag".into();
+    app.advanced_search(&mut d);
+    assert_eq!(d.act.name, "Tag");
+}
+
+/// Advanced Search's changes to lists, through Edit Together's rules
+/// (`docs/lists-together-proposal.md`): a feat added to the fighters
+/// found (where they lack it), taken from them, a class added at a level,
+/// and their only class kept, said; each one step.
+#[test]
+fn advanced_search_adds_and_removes_list_entries_on_what_it_found() {
+    use mg_edit::{Command, Edit};
+    use mg_gff::{Struct, Value};
+    use mg_ui::search::{Act, Condition, Kind};
+    let dir = mg_testkit::scratch_dir("ui-advanced-search-lists");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let fighter = |tag: &str, feat: bool| {
+        let mut class = Struct::new(2);
+        class.set("Class", Value::Int(4));
+        class.set("ClassLevel", Value::Short(5));
+        let mut c = Struct::new(4);
+        c.set("Tag", Value::String(tag.as_bytes().to_vec()));
+        c.set("ClassList", Value::List(vec![class]));
+        let mut f = Struct::new(1);
+        f.set("Feat", Value::Word(0));
+        c.set("FeatList", Value::List(if feat { vec![f] } else { Vec::new() }));
+        c
+    };
+    let mut git = Gff::new(*b"GIT ");
+    let creatures = vec![fighter("GUARD", true), fighter("CAPTAIN", false)];
+    git.root.set("Creature List", Value::List(creatures));
+    let start = ResKey::parse("start", ResType::GIT).unwrap();
+    let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
+    // (The window at the size it opens at, its form and the list of what
+    // it found under it: a screen of 1280 by 900 has room for the form.)
+    let mut h = harness(app, 1280.0, 900.0);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AdvancedSearch));
+    h.run_steps(2);
+    let list = |h: &mut Harness<'_, Moonglow>, label: &str, field: &str| -> Vec<Vec<i64>> {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.flush().unwrap();
+        let g = ws.module.gff(&start).unwrap().unwrap();
+        let all = g.root.list("Creature List").unwrap().to_vec();
+        all.iter()
+            .map(|c| c.list(label).unwrap_or(&[]).iter().filter_map(|e| e.integer(field)).collect())
+            .collect()
+    };
+    h.state_mut().advanced_search.first =
+        Condition { kind: Kind::Class, row: Some(4), ..Default::default() };
+    h.run();
+    h.get_by_label("Find").click();
+    h.run();
+    h.get_by_label("2 found:");
+    h.get_by_label("Change the 2 checked").click();
+    h.run();
+    let act = |h: &mut Harness<'_, Moonglow>, act: Act, row: usize| {
+        // (The kind of row chosen first: a new kind starts with none.)
+        h.state_mut().advanced_search.act.act = act;
+        h.run();
+        h.state_mut().advanced_search.act.entry.row = Some(row);
+        h.run();
+        h.get_by_label("Change 2 Found").click();
+        h.run_steps(3);
+    };
+    // Feat 0: added to the captain, who lacks it; the guard has it.
+    act(&mut h, Act::AddFeat, 0);
+    assert_eq!(list(&mut h, "FeatList", "Feat"), [vec![0], vec![0]]);
+    assert!(h.query_by_label_contains("has it already").is_some());
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    // (Found again in the module as Undo left it.)
+    h.get_by_label("Find").click();
+    h.run();
+    assert_eq!(list(&mut h, "FeatList", "Feat"), [vec![0], vec![]], "one step");
+    act(&mut h, Act::RemoveFeat, 0);
+    assert_eq!(list(&mut h, "FeatList", "Feat"), [Vec::<i64>::new(), vec![]]);
+    // A rogue at level 3 for both; the fighter class, their only one, kept.
+    h.state_mut().advanced_search.act.entry.levels.0 = 3;
+    act(&mut h, Act::AddClass, 8);
+    assert_eq!(list(&mut h, "ClassList", "Class"), [vec![4, 8], vec![4, 8]]);
+    assert_eq!(list(&mut h, "ClassList", "ClassLevel"), [vec![5, 3], vec![5, 3]]);
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    // (Found again in the module as Undo left it.)
+    h.get_by_label("Find").click();
+    h.run();
+    act(&mut h, Act::RemoveClass, 4);
+    assert_eq!(list(&mut h, "ClassList", "Class"), [vec![4], vec![4]]);
+    assert!(h.query_by_label_contains("its only class").is_some());
 }
 
 /// Advanced Search with a condition ticked Not (fighters without a feat),
@@ -504,7 +1156,9 @@ fn advanced_search_leaves_out_a_condition_and_finds_any_of_them() {
     let start = ResKey::parse("start", ResType::GIT).unwrap();
     let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
     app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
-    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    // (The window at the size it opens at, its form and the list of what
+    // it found under it: a screen of 1280 by 900 has room for the form.)
+    let mut h = harness(app, 1280.0, 900.0);
     h.run();
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AdvancedSearch));
     h.run_steps(2);
@@ -615,7 +1269,7 @@ fn advanced_search_finds_objects_by_what_they_hold() {
     app.game = Some(std::sync::Arc::new(mg_rules::GameData::new(rm, tlk)));
     let mut h = window_harness(app);
     settle(&mut h);
-    h.get_by_label("Edit").click();
+    menu(&h, "Edit").click();
     h.run_steps(2);
     h.get_by_label("Advanced Search…").click();
     h.run_steps(2);
@@ -661,6 +1315,97 @@ fn advanced_search_finds_objects_by_what_they_hold() {
     h.get_by_label("Choose a class");
 }
 
+/// A spell by the class that knows it (As class), and the game's own
+/// blueprints searched with the module's: listed after them, said to be
+/// read-only, never ticked (so neither changed nor edited together), and
+/// opened as their copy to look at.
+#[test]
+fn advanced_search_finds_a_spell_by_its_class_and_the_game_s_blueprints() {
+    use mg_edit::{Command, Edit};
+    use mg_gff::{Struct, Value};
+    use mg_ui::search::{Condition, Kind};
+    let dir = mg_testkit::scratch_dir("ui-advanced-search-spell-class");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    // A fighter (4) who knows spell 107, as a blueprint of the module's and
+    // of the game's.
+    let fighter = |tag: &str| {
+        let mut known = Struct::new(3);
+        known.set("Spell", Value::Word(107));
+        let mut class = Struct::new(2);
+        class.set("Class", Value::Int(4));
+        class.set("ClassLevel", Value::Short(5));
+        class.set("KnownList1", Value::List(vec![known]));
+        let mut utc = Gff::new(*b"UTC ");
+        utc.root.set("Tag", Value::String(tag.as_bytes().to_vec()));
+        utc.root.set("ClassList", Value::List(vec![class]));
+        utc
+    };
+    let guard = ResKey::parse("guard", ResType::UTC).unwrap();
+    let set = Edit::SetResource { key: guard, data: Some(fighter("GUARD").to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
+    let mut mem = mg_resman::MemContainer::new();
+    mem.insert(
+        ResKey::parse("classes", ResType::TWODA).unwrap(),
+        &b"2DA V2.0\n\n Label Name\n0 Barbarian ****\n1 Bard ****\n2 Cleric ****\n3 Druid ****\n4 Fighter 1\n"[..],
+    );
+    let bandit = ResKey::parse("nw_bandit", ResType::UTC).unwrap();
+    mem.insert(bandit, &fighter("BANDIT").to_bytes().unwrap()[..]);
+    let mut rm = mg_resman::ResMan::new();
+    rm.add(mg_resman::priority::KEY, "base", mg_resman::LayerClass::Key, mem);
+    let mut tlk = mg_tlk::Tlk::new(Language::ENGLISH);
+    tlk.entries.push(mg_tlk::TlkEntry::text("Bad Strref"));
+    tlk.entries.push(mg_tlk::TlkEntry::text("Fighter"));
+    app.game = Some(std::sync::Arc::new(mg_rules::GameData::new(rm, tlk)));
+    let mut h = Harness::new_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AdvancedSearch));
+    h.run_steps(2);
+    h.state_mut().advanced_search.first =
+        Condition { kind: Kind::Spell, row: Some(107), ..Default::default() };
+    h.run();
+    // The class it is known as, chosen from the game's classes.
+    h.get_by_label("As class");
+    h.state_mut().advanced_search.first.class = Some(4);
+    h.run();
+    h.get_by_label("Find").click();
+    h.run();
+    h.get_by_label("1 found:");
+    h.get_by_label("Known spell: row 107 (Fighter)");
+    h.state_mut().advanced_search.first.class = Some(2);
+    h.run();
+    h.get_by_label("Find").click();
+    h.run();
+    h.get_by_label("Nothing in the module holds it.");
+
+    // The game's blueprints too: the bandit, after the guard, read-only.
+    h.state_mut().advanced_search.first.class = Some(4);
+    h.get_by_label("The haks' and the game's blueprints too").click();
+    h.run();
+    assert!(h.state().advanced_search.haks_and_game);
+    h.get_by_label("Find").click();
+    h.run();
+    h.get_by_label("2 found:");
+    h.get_by_label("(1 of them the haks' or the game's, read-only)");
+    h.get_by_label("(base)");
+    let d = &h.state().advanced_search;
+    assert_eq!(d.hits[1].layer.as_deref(), Some("base"));
+    assert_eq!(d.ticked, [true, false], "the game's is not ticked");
+    assert_eq!(d.chosen().len(), 1);
+    h.get_by_label("Change the 1 checked");
+    // Tick All leaves it out; a tick set by hand is not taken.
+    h.state_mut().advanced_search.ticked = vec![true, true];
+    h.run();
+    assert_eq!(h.state().advanced_search.chosen().len(), 1);
+    // A click opens its copy, to look at.
+    h.get_by_label("nw_bandit.utc").click();
+    h.run_steps(3);
+    let copy = Tab::ResourceCopy { key: bandit, layer: "base".into() };
+    assert!(h.state().dock.find_tab(&copy).is_some());
+}
+
 /// Advanced Search's Value list of an item property keeps the cost
 /// table's order, as the item editor's Cost Parameter does (+2 before
 /// +10), where it went by name past 12 rows.
@@ -693,7 +1438,7 @@ fn advanced_search_lists_a_property_s_values_in_the_cost_table_s_order() {
 /// by its name where areas are shown by name.
 #[test]
 fn references_name_areas_as_the_window_does() {
-    let Some((mut h, area)) = area_harness("refs-area-names") else { return };
+    let Some((mut h, area)) = area_ui_harness("refs-area-names") else { return };
     let waypoint = ResKey::parse("nw_waypoint001", ResType::UTW).unwrap();
     h.state_mut().settings.area_names = false;
     h.state_mut().actions.push(mg_ui::Action::FindReferences(waypoint));
@@ -827,4 +1572,184 @@ fn the_references_window_says_where_things_are() {
     assert_eq!(order, by_text);
     assert_eq!(order[1], "start.git /Creature List[0]/ScriptHeartbeat");
     assert_eq!(order[2], "start.git /Creature List[10]/ScriptHeartbeat");
+}
+
+/// Advanced Search's results (5.2's W4): a row's menu (a right click on
+/// its place or its row) has Copy (its place and what matched) and Copy
+/// All (every result, ticked or not, in the list's order).
+#[test]
+fn advanced_search_s_results_copy_from_their_menus() {
+    use mg_edit::{Command, Edit};
+    use mg_gff::{Struct, Value};
+    use mg_ui::row_copy::{COPY, COPY_ALL};
+    use mg_ui::search::{Condition, Kind};
+    let dir = mg_testkit::scratch_dir("w4-advanced-search-copy");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let creatures: Vec<Struct> = (0..3)
+        .map(|i| {
+            let mut c = Struct::new(4);
+            c.set("Tag", Value::String(format!("T{i:03}").into_bytes()));
+            let mut v = Struct::new(0);
+            v.set("Name", Value::String(b"nQuest".to_vec()));
+            v.set("Type", Value::Dword(1));
+            v.set("Value", Value::Int(i));
+            c.set("VarTable", Value::List(vec![v]));
+            c
+        })
+        .collect();
+    let mut git = Gff::new(*b"GIT ");
+    git.root.set("Creature List", Value::List(creatures));
+    let start = ResKey::parse("start", ResType::GIT).unwrap();
+    let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
+    let mut h = harness(app, 1280.0, 900.0);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::AdvancedSearch));
+    h.run_steps(2);
+    h.state_mut().advanced_search.first =
+        Condition { kind: Kind::Variable, name: "nQuest".into(), ..Default::default() };
+    h.run();
+    h.get_by_label("Find").click();
+    h.run();
+    h.get_by_label("3 found:");
+    let copied = |h: &mut Harness<'_, Moonglow>, item: &str| -> Vec<String> {
+        h.get_all_by_label(item).last().unwrap_or_else(|| panic!("{item} in the menu")).click();
+        h.step();
+        let out = (h.output().platform_output.commands.iter())
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        h.run();
+        out
+    };
+    let place = |h: &Harness<'_, Moonglow>, tag: &str| {
+        h.get_by_label_contains(&format!("creature {tag}")).accesskit_node().label().unwrap()
+    };
+    let first = place(&h, "T000");
+    h.get_by_label_contains("creature T000").click_secondary();
+    h.run();
+    let one = copied(&mut h, COPY);
+    assert_eq!(one.len(), 1);
+    assert!(one[0].starts_with(&format!("{first}: ")), "its place first: {one:?}");
+    // (A right click on the row past its words opens the menu too.)
+    let r = h.get_by_label_contains("creature T001").rect();
+    let at = egui::pos2(r.right() + 3.0, r.center().y);
+    h.hover_at(at);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run();
+    let all = copied(&mut h, COPY_ALL);
+    let lines: Vec<&str> = all[0].lines().collect();
+    assert_eq!(lines.len(), 3, "every result: {lines:?}");
+    assert_eq!(lines[0], one[0], "in the list's order");
+    assert!(lines[2].starts_with(&format!("{}: ", place(&h, "T002"))), "{lines:?}");
+    // The keyboard on a result's link (its row's Tab stop): Ctrl+C copies
+    // the row, Shift+F10 opens its menu.
+    h.get_by_label_contains("creature T001").focus();
+    h.run();
+    assert!(h.get_by_label_contains("creature T001").accesskit_node().is_focused());
+    assert_eq!(copy_now(&mut h), [lines[1]], "Ctrl+C: the row the keyboard is on");
+    menu_by_keys(&mut h, &|h| {
+        h.get_by_label_contains("creature T001").accesskit_node().is_focused()
+    });
+}
+
+/// Ctrl+C (the backend's Copy): what it copied to the clipboard.
+fn copy_now(h: &mut Harness<'_, Moonglow>) -> Vec<String> {
+    h.event(egui::Event::Copy);
+    h.step();
+    let out = (h.output().platform_output.commands.iter())
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    h.run();
+    out
+}
+
+/// The open menu's `item` clicked: what it copied to the clipboard.
+fn menu_copies(h: &mut Harness<'_, Moonglow>, item: &str) -> Vec<String> {
+    h.get_all_by_label(item).last().unwrap_or_else(|| panic!("{item} in the menu")).click();
+    h.step();
+    let out = (h.output().platform_output.commands.iter())
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    h.run();
+    out
+}
+
+/// Shift+F10 with the keyboard on a row: its menu open, Copy taking the
+/// keyboard; Escape closes it and gives the keyboard back (`back` says
+/// whether it has it).
+fn menu_by_keys(h: &mut Harness<'_, Moonglow>, back: &dyn Fn(&Harness<'_, Moonglow>) -> bool) {
+    use mg_ui::row_copy::{COPY, COPY_ALL};
+    press_now(h, egui::Modifiers::SHIFT, egui::Key::F10);
+    h.run();
+    let copy = h.get_all_by_label(COPY).last().expect("Shift+F10 opens its menu");
+    assert!(copy.accesskit_node().is_focused(), "Copy has the keyboard");
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert!(h.query_by_label(COPY_ALL).is_none(), "Escape closes it");
+    assert!(back(h), "Escape gives the keyboard back to the row");
+}
+
+/// References' places ("Used in N places"): a place's menu has Copy (the
+/// place, then the resource and field that name it) and Copy All (every
+/// place, in the list's order), after the plugins' commands; with the
+/// keyboard on its link, Ctrl+C copies it and Shift+F10 opens its menu.
+#[test]
+fn references_places_copy_from_their_menus_and_keys() {
+    use mg_ui::row_copy::{COPY, COPY_ALL};
+    let dir = mg_testkit::scratch_dir("w4-references-copy");
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let mut git = Gff::new(*b"GIT ");
+    for tag in ["GREETER", "PORTER"] {
+        let mut c = mg_schema::git::CREATURE_LIST.new_item();
+        c.write(&mg_schema::git::creature_list::SCRIPT_SPAWN, ResRef::from_str("hello").unwrap());
+        c.set("Tag", mg_gff::Value::String(tag.as_bytes().to_vec()));
+        git.root.items_mut(&mg_schema::git::CREATURE_LIST).push(c);
+    }
+    m.set_gff(ResKey::parse("start", ResType::GIT).unwrap(), &git).unwrap();
+    m.save().unwrap();
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = harness(app, 1280.0, 800.0);
+    h.run();
+    let hello = ResKey::parse("hello", ResType::NSS).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::FindReferences(hello));
+    h.run_steps(3);
+    h.get_by_label("Used in 2 places:");
+    let line = |tag: &str, i: usize| {
+        format!("start › creature {tag} › OnSpawn: start.git /Creature List[{i}]/ScriptSpawn")
+    };
+    let greeter = "start › creature GREETER › OnSpawn";
+    h.get_by_label(greeter).click_secondary();
+    h.run();
+    assert_eq!(menu_copies(&mut h, COPY), [line("GREETER", 0)], "Copy: the place and field");
+    h.get_by_label(greeter).click_secondary();
+    h.run();
+    let all = format!("{}\n{}", line("GREETER", 0), line("PORTER", 1));
+    assert_eq!(menu_copies(&mut h, COPY_ALL), [all], "Copy All: every place");
+    let porter = "start › creature PORTER › OnSpawn";
+    h.get_by_label(porter).focus();
+    h.run();
+    assert!(h.get_by_label(porter).accesskit_node().is_focused(), "its link has the keyboard");
+    assert_eq!(copy_now(&mut h), [line("PORTER", 1)], "Ctrl+C: the place the keyboard is on");
+    menu_by_keys(&mut h, &|h| h.get_by_label(porter).accesskit_node().is_focused());
 }

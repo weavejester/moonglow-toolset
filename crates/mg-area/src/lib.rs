@@ -2,9 +2,16 @@
 //! animation loops, the objects placed in it (the GIT's lists) with their
 //! models and outlines, and the area's sun, moon, fog and sky.
 //!
-//! [`AreaModel`] reads an area (its ARE and GIT) without the GPU;
-//! [`AreaScene`] loads the models and builds the renderer's scene from it at
-//! a moment of the day.
+//! [`AreaModel`] reads an area (its ARE and GIT) without the GPU, or is
+//! built from plain values ([`values`]: what a game client has of an area,
+//! with no files); [`AreaScene`] loads the models and builds the renderer's
+//! scene from it at a moment of the day, and follows its objects as they
+//! are added, moved and taken out ([`AreaScene::update_objects`]).
+//!
+//! The editing half (undoable edits, painting, Resize, Change Tileset,
+//! the tileset's palette) is the default feature `edit`, with the editor's
+//! workspace (mg-edit) and the module's (mg-module); without it, the scene
+//! alone.
 //!
 //! Conventions (checked in the engine, `tests/engine_facings.rs`): tile
 //! (x, y) is `Tile_List[y * Width + x]`, 10 m square, its centre at
@@ -18,7 +25,7 @@ use std::f32::consts::FRAC_PI_2;
 
 use glam::{Mat4, Quat, Vec3};
 use mg_core::{ResRef, ResType};
-use mg_gff::{Gff, Struct};
+use mg_gff::Struct;
 use mg_preview::Preview;
 use mg_resman::ResKey;
 use mg_rules::GameData;
@@ -26,23 +33,25 @@ use mg_set::Tileset;
 
 pub mod arrange;
 pub mod border;
+#[cfg(feature = "edit")]
 pub mod edit;
 pub mod grass;
 mod grass_view;
 pub mod marker;
 pub mod pick;
+#[cfg(feature = "edit")]
 pub mod reshape;
+#[cfg(feature = "edit")]
+pub mod retile;
 mod scene;
+#[cfg(feature = "edit")]
 pub mod terrain;
+pub mod values;
 pub mod walk;
 
 pub use grass_view::{CHUNK, GrassDraw, Grown, chunk_of, grass_chosen};
-pub use mg_rules::rows::{replacement_row, replacement_value};
-pub use scene::{AreaScene, BareLight, Sight, Usage, View, fog, overview};
-
-/// The texture a tile model's mesh is drawn with where the tile's
-/// `Tile_ReplaceTex` replaces it ([`replacement_row`]).
-pub const REPLACE_TEX: &str = "replace_tex";
+pub use mg_rules::rows::{REPLACE_TEX, replacement_row, replacement_value};
+pub use scene::{AreaScene, BareLight, GAME_CAMERA, Sight, Usage, View, fog, fog_from, overview};
 
 /// A tile's edge, metres.
 pub const TILE_SIZE: f32 = 10.0;
@@ -135,19 +144,11 @@ impl TileFeatures {
     /// are the same in the game's tilesets), case aside.
     pub fn of(model: &mg_mdl::Model, resref: &str) -> TileFeatures {
         // (A main light is a light node; a source light's place any node.)
-        let has = |suffix: &str, light: bool| {
-            model.nodes.iter().any(|n| {
-                let named = [model.name.as_str(), resref].iter().any(|base| {
-                    n.name.len() == base.len() + suffix.len()
-                        && n.name.get(..base.len()).is_some_and(|b| b.eq_ignore_ascii_case(base))
-                        && n.name.get(base.len()..).is_some_and(|s| s.eq_ignore_ascii_case(suffix))
-                });
-                named && (!light || matches!(n.kind, mg_mdl::NodeKind::Light(_)))
-            })
-        };
+        let has = |suffix: &str, light: bool| named_node(model, resref, suffix, light).is_some();
+        let source = |slot: usize| source_light_node(model, resref, slot).is_some();
         TileFeatures {
             main: [has("ml1", true), has("ml2", true)],
-            source: [has("sl1", false), has("sl2", false)],
+            source: [source(1), source(2)],
             loops: ["animloop01", "animloop02", "animloop03"].map(|a| model.animation(a).is_some()),
             replace: model.draws_texture(REPLACE_TEX),
         }
@@ -211,9 +212,9 @@ impl Default for VisualTransform {
 
 impl VisualTransform {
     /// A placed object's, as its model is drawn with it (`None` without
-    /// one): [`mg_module::placement::visual_transform`].
+    /// one): [`mg_rules::placement::visual_transform`].
     pub fn read(s: &Struct) -> Option<VisualTransform> {
-        let t = mg_module::placement::visual_transform(s)?;
+        let t = mg_rules::placement::visual_transform(s)?;
         Some(VisualTransform {
             scale: Vec3::from(t.scale),
             rotate: Vec3::from(t.rotate),
@@ -267,7 +268,7 @@ pub struct AreaObject {
     /// with its animation speed and lerps in progress, and a creature's
     /// head, tail, wings and cloak (drawn on those parts:
     /// `mg_preview::scope_matrix`). What Adjust Location shows of them.
-    pub scopes: Vec<mg_module::placement::Scoped>,
+    pub scopes: Vec<mg_rules::placement::Scoped>,
     /// A placeable's `Static`: part of the scenery. The game gives a
     /// static placeable no visual transform (Aurora resets it).
     pub is_static: bool,
@@ -282,6 +283,9 @@ pub struct AreaObject {
     pub spawn_facings: Vec<f32>,
     /// Locked in the area editor ([`LOCKED`]): not picked by clicks or boxes.
     pub locked: bool,
+    /// Its outline's own color, red, green and blue ([`OUTLINE_COLOR`],
+    /// an encounter's); `None`, its kind's.
+    pub outline_color: Option<[u8; 3]>,
     /// A door's or placeable's `AnimationState` (a door: 0 closed, 1 and 2
     /// open one way or the other).
     pub state: u8,
@@ -292,88 +296,70 @@ pub struct AreaObject {
 
 /// The field Moonglow marks a locked object with: a byte the game and
 /// Aurora don't read (Aurora drops it when it saves). A nasher project
-/// keeps it out of its files ([`mg_module::locks`]).
-pub use mg_module::locks::LOCKED;
+/// keeps it out of its files (`mg_module::locks`).
+pub use mg_rules::placement::LOCKED;
+
+/// The field Moonglow keeps a placed encounter's own outline color in
+/// (a DWORD 0x00BBGGRR the game and Aurora don't read).
+pub use mg_rules::placement::OUTLINE_COLOR;
 
 impl AreaObject {
-    /// Reads the object `index` of the GIT list of `kind`.
+    /// Reads the object `index` of the GIT list of `kind`: its values
+    /// ([`values::Object::read`]) made an object ([`AreaObject::from_values`]).
     pub fn read(game: &GameData, kind: ObjectKind, index: usize, s: &Struct) -> AreaObject {
-        let items = |r: ResRef| -> Option<Gff> {
-            let data = game.resman.get(&ResKey::new(r, ResType::UTI)).ok()?;
-            Gff::read(&data).ok()
-        };
-        let preview = mg_preview::of_object(game, kind, s, &items, mg_preview::Shown::Placed);
-        // A waypoint without a flag (no appearance) is drawn as a marker:
-        // nothing is wrong with it; a store or a sound without the game's
-        // marker model, drawn as one.
-        let preview = match kind {
-            ObjectKind::Waypoint | ObjectKind::Store | ObjectKind::Sound => {
-                preview.and_then(Result::ok).map(Ok)
-            }
-            _ => preview,
-        };
-        let (preview, problem) = match preview {
-            Some(Ok(p)) => (Some(p), None),
-            Some(Err(e)) => (None, Some(e.to_string())),
-            None => (None, None),
-        };
-        let laid = if kind == ObjectKind::Item { mg_preview::ground_turn(game, s) } else { 0 };
-        AreaObject { preview, problem, laid, ..AreaObject::placed(kind, index, s) }
+        AreaObject::from_values(index, values::Object::read(game, kind, s))
+    }
+
+    /// The object `o`, the `index`th of its kind in its area (its place in
+    /// its GIT list: what its particles are kept by between updates of the
+    /// scene, and [`AreaModel::object`] finds it by).
+    pub fn from_values(index: usize, o: values::Object) -> AreaObject {
+        let (preview, problem) = o.look.split();
+        let (spawn_points, spawn_facings) = o.spawn_points.into_iter().unzip();
+        AreaObject {
+            kind: o.kind,
+            index,
+            position: o.position,
+            rotation: o.rotation,
+            tag: o.tag,
+            template: o.template,
+            preview,
+            problem,
+            outline: o.outline.into_iter().map(|p| o.position + p).collect(),
+            visual: o.visual,
+            scopes: o.scopes,
+            is_static: o.is_static,
+            trigger_type: o.trigger_type,
+            conversation: o.conversation,
+            spawn_points,
+            spawn_facings,
+            locked: o.locked,
+            outline_color: o.outline_color,
+            state: o.state,
+            laid: o.laid,
+        }
+    }
+
+    /// Moves it to `position`, its model turned `rotation` (its facing less
+    /// a quarter turn, as [`AreaObject::rotation`]): its outline goes with
+    /// it (an encounter's spawn points, which the file keeps where they are
+    /// in the area, stay). What a game client does each frame an object
+    /// walks; the scene takes it as it is drawn next, with no update
+    /// ([`AreaScene::update_objects`] says what does need one).
+    pub fn move_to(&mut self, position: Vec3, rotation: f32) {
+        let by = position - self.position;
+        for p in &mut self.outline {
+            *p += by;
+        }
+        self.position = position;
+        self.rotation = rotation;
     }
 
     /// The object `index` of the GIT list of `kind` as it is placed (where
     /// it stands, how it turns, its outline and fields), without the game:
     /// no preview, and an item not turned as it lies.
     pub fn placed(kind: ObjectKind, index: usize, s: &Struct) -> AreaObject {
-        let at = mg_module::placement::Placement::read(kind, s);
-        let (position, rotation) = (Vec3::from(at.position), at.rotation);
-        let points = mg_module::placement::outline(kind, s);
-        let outline = points.into_iter().map(|p| position + Vec3::from(p)).collect();
-        let template_field = kind.resref_field();
-        AreaObject {
-            laid: 0,
-            kind,
-            index,
-            position,
-            rotation,
-            tag: s
-                .string("Tag")
-                .map(|t| String::from_utf8_lossy(t).into_owned())
-                .unwrap_or_default(),
-            template: s.resref(template_field).filter(|r| !r.is_empty()),
-            preview: None,
-            problem: None,
-            outline,
-            visual: VisualTransform::read(s),
-            scopes: mg_module::placement::visual_scopes(s),
-            is_static: kind == ObjectKind::Placeable && s.integer("Static").unwrap_or(0) != 0,
-            trigger_type: if kind == ObjectKind::Trigger {
-                s.integer("Type").unwrap_or(0)
-            } else {
-                0
-            },
-            conversation: s.resref("Conversation").filter(|r| !r.is_empty()),
-            locked: s.integer(LOCKED).is_some_and(|v| v != 0),
-            state: s.integer("AnimationState").and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
-            spawn_points: if kind == ObjectKind::Encounter {
-                s.list("SpawnPointList")
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|p| {
-                        let f = |l: &str| p.float(l).unwrap_or(0.0);
-                        Vec3::new(f("X"), f("Y"), f("Z"))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            spawn_facings: if kind == ObjectKind::Encounter {
-                let points = s.list("SpawnPointList").unwrap_or(&[]);
-                points.iter().map(|p| p.float("Orientation").unwrap_or(0.0)).collect()
-            } else {
-                Vec::new()
-            },
-        }
+        AreaObject::from_values(index, values::Object::placed(kind, s))
     }
 
     /// Where its model stands and how it turns.
@@ -416,7 +402,47 @@ impl AreaObject {
     }
 }
 
-/// The door hooks of `tiles` (with the tileset they are from).
+/// The index of the tile under the point (`x`, `y`) of an area of `tiles`
+/// tiles laid `width` to a row from the south-west; `None` outside it
+/// (west or south of it, past its width or its last tile, or for a
+/// coordinate that is no number). The one place a point becomes a tile:
+/// a point far off wraps onto no row.
+pub fn tile_at(width: u32, tiles: usize, x: f32, y: f32) -> Option<usize> {
+    if !(x >= 0.0 && y >= 0.0) {
+        return None;
+    }
+    // (A float past a `u32` becomes the largest one.)
+    let (column, row) = ((x / TILE_SIZE) as u32, (y / TILE_SIZE) as u32);
+    let i = (row as usize).checked_mul(width as usize)?.checked_add(column as usize)?;
+    (column < width && i < tiles).then_some(i)
+}
+
+/// The node of tile model `model` (read from resource `resref`) where
+/// source light `slot` (1 or 2) has its flame: the one named
+/// `<model>sl1` or `<model>sl2`, after the model's own name or the
+/// resource's (the same in the game's tilesets), case aside. What Tile
+/// Properties enables a source light by and where the area's view puts
+/// its flame are this one node: one that only ends in `sl1` (`torchesl1`)
+/// is not it.
+pub fn source_light_node(model: &mg_mdl::Model, resref: &str, slot: usize) -> Option<usize> {
+    named_node(model, resref, &format!("sl{slot}"), false)
+}
+
+/// The node of `model` named `<model><suffix>` (by its own name or by
+/// `resref`), a light node if `light`.
+fn named_node(model: &mg_mdl::Model, resref: &str, suffix: &str, light: bool) -> Option<usize> {
+    model.nodes.iter().position(|n| {
+        let named = [model.name.as_str(), resref].iter().any(|base| {
+            n.name.len() == base.len() + suffix.len()
+                && n.name.get(..base.len()).is_some_and(|b| b.eq_ignore_ascii_case(base))
+                && n.name.get(base.len()..).is_some_and(|s| s.eq_ignore_ascii_case(suffix))
+        });
+        named && (!light || matches!(n.kind, mg_mdl::NodeKind::Light(_)))
+    })
+}
+
+/// The door hooks of `tiles` (with the tileset they are from), each
+/// where [`mg_tiles::door_hooks`] puts it.
 fn tiles_hooks(tiles: &[AreaTile], tileset: Option<&Tileset>) -> Vec<DoorHook> {
     let Some(set) = tileset else { return Vec::new() };
     let mut out = Vec::new();
@@ -424,18 +450,13 @@ fn tiles_hooks(tiles: &[AreaTile], tileset: Option<&Tileset>) -> Vec<DoorHook> {
         let Some(tile) = usize::try_from(t.id).ok().and_then(|i| set.tiles.get(i)) else {
             continue;
         };
-        let to = t.transform();
-        for d in &tile.doors {
-            let turn = f32::from(t.orientation) * 90.0;
-            let degrees = (d.orientation + turn).rem_euclid(360.0);
-            let degrees = if degrees > 180.0 { degrees - 360.0 } else { degrees };
-            out.push(DoorHook {
-                tile: t.index,
-                door_type: d.door_type,
-                position: to.transform_point3(Vec3::from_array(d.position)),
-                bearing: degrees.to_radians(),
-            });
-        }
+        let hooks = mg_tiles::door_hooks(tile, t.position, t.orientation);
+        out.extend(hooks.map(|(door_type, position, bearing)| DoorHook {
+            tile: t.index,
+            door_type,
+            position,
+            bearing,
+        }));
     }
     out
 }
@@ -493,12 +514,23 @@ pub struct Lighting {
     /// game's own.
     pub sun_direction: Option<Vec3>,
     pub moon_direction: Option<Vec3>,
+    /// The wallpaper's color its GIT's `tdod_wallpaper` local gives (The
+    /// Domains of Dread's colorways, [`mg_rules::tint`]): what the
+    /// module's script sets as `scriptableVec1` for a player who enters.
+    pub wallpaper: Option<[f32; 3]>,
 }
 
 impl Lighting {
     /// [`Lighting::read`], with the directions of the sun and moon the
     /// GIT whose root is `git` gives.
     pub fn read_with(are: &Struct, git: &Struct, tileset: Option<&Tileset>) -> Lighting {
+        Lighting::fields(are, git).settled(tileset)
+    }
+
+    /// The ARE's and GIT's fields as they are (what is missing a default;
+    /// no direction normalized, no range settled, no environment map):
+    /// [`values::Area::read`]'s.
+    pub(crate) fn fields(are: &Struct, git: &Struct) -> Lighting {
         let props = match git.get("AreaProperties") {
             Some(mg_gff::Value::Struct(p)) => Some(p),
             _ => None,
@@ -506,13 +538,43 @@ impl Lighting {
         let direction = |prefix: &str| {
             let props = props?;
             let c = |axis: &str| props.float(&format!("{prefix}Direction{axis}"));
-            let d = Vec3::new(c("X")?, c("Y")?, c("Z")?);
-            (d.is_finite() && d.length_squared() > 1e-12).then(|| d.normalize())
+            Some(Vec3::new(c("X")?, c("Y")?, c("Z")?))
         };
+        let to_u32 = |v: i64| v.clamp(0, i64::from(u32::MAX)) as u32;
         Lighting {
+            sun: Sky::read(are, "Sun"),
+            moon: Sky::read(are, "Moon"),
+            is_night: are.integer("IsNight").unwrap_or(0) != 0,
+            day_night_cycle: are.integer("DayNightCycle").unwrap_or(0) != 0,
+            fog_clip: are.float("FogClipDist").unwrap_or(45.0),
+            sky_box: to_u32(are.integer("SkyBox").unwrap_or(0)),
+            env_map: None,
+            shadow_opacity: are.integer("ShadowOpacity").unwrap_or(0).clamp(0, 255) as u8,
+            flags: to_u32(are.integer("Flags").unwrap_or(0)),
+            wind_power: are.integer("WindPower").unwrap_or(0),
             sun_direction: direction("Sun"),
             moon_direction: direction("Moon"),
-            ..Lighting::read(are, tileset)
+            wallpaper: mg_rules::tint::wallpaper(git),
+        }
+    }
+
+    /// Settled as the model holds it (from fields or a client's values):
+    /// the directions to the sun and moon of unit length (none for one of
+    /// no length or not a number), the shadows' opacity at most 100, and
+    /// the tileset's environment map.
+    pub(crate) fn settled(self, tileset: Option<&Tileset>) -> Lighting {
+        let direction = |d: Option<Vec3>| {
+            d.filter(|d| d.is_finite() && d.length_squared() > 1e-12).map(Vec3::normalize)
+        };
+        Lighting {
+            sun_direction: direction(self.sun_direction),
+            moon_direction: direction(self.moon_direction),
+            shadow_opacity: self.shadow_opacity.min(100),
+            env_map: tileset
+                .and_then(|t| t.general.env_map.clone())
+                .map(|e| e.to_ascii_lowercase())
+                .filter(|e| !e.is_empty()),
+            ..self
         }
     }
 
@@ -522,24 +584,10 @@ impl Lighting {
         if night { self.moon_direction } else { self.sun_direction }
     }
 
+    /// The ARE's lighting alone (no direction to the sun or moon, no
+    /// wallpaper: the GIT's).
     pub fn read(are: &Struct, tileset: Option<&Tileset>) -> Lighting {
-        Lighting {
-            sun: Sky::read(are, "Sun"),
-            moon: Sky::read(are, "Moon"),
-            is_night: are.integer("IsNight").unwrap_or(0) != 0,
-            day_night_cycle: are.integer("DayNightCycle").unwrap_or(0) != 0,
-            fog_clip: are.float("FogClipDist").unwrap_or(45.0),
-            sky_box: are.integer("SkyBox").unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32,
-            env_map: tileset
-                .and_then(|t| t.general.env_map.clone())
-                .map(|e| e.to_ascii_lowercase())
-                .filter(|e| !e.is_empty()),
-            shadow_opacity: are.integer("ShadowOpacity").unwrap_or(0).clamp(0, 100) as u8,
-            flags: are.integer("Flags").unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32,
-            wind_power: are.integer("WindPower").unwrap_or(0),
-            sun_direction: None,
-            moon_direction: None,
-        }
+        Lighting::fields(are, &Struct::new(0)).settled(tileset)
     }
 
     /// Whether the area is shown at night by default: at night always
@@ -565,8 +613,26 @@ impl Lighting {
     }
 }
 
+/// The fields of a placed object that change nothing of what it looks
+/// like (what the game draws it with): where it stands and how it turns,
+/// its tag, the area editor's lock and an outline's own color (drawn over
+/// the scene, not in it). [`AreaModel::touched_objects`]
+/// tells edits of these alone.
+pub const PLACED_ONLY: &[&str] = &[
+    "XPosition",
+    "YPosition",
+    "ZPosition",
+    "XOrientation",
+    "YOrientation",
+    "ZOrientation",
+    "Bearing",
+    "Tag",
+    LOCKED,
+    OUTLINE_COLOR,
+];
+
 /// An area as the editor shows it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AreaModel {
     pub tileset: Option<ResRef>,
     /// Tiles along X (east) and Y (north).
@@ -591,28 +657,45 @@ pub struct AreaModel {
 
 impl AreaModel {
     /// Reads an area from its ARE and GIT (their root structs) with its
-    /// tileset (`None` when it is missing: the tiles have no models).
+    /// tileset (`None` when it is missing: the tiles have no models): its
+    /// fields made values ([`values::Area::read`]) and the values a model
+    /// ([`AreaModel::from_values`]), the one way an area's model is made.
     pub fn read(game: &GameData, are: &Struct, git: &Struct, tileset: Option<&Tileset>) -> Self {
+        AreaModel::from_values(game, values::Area::read(game, are, git), tileset)
+    }
+
+    /// Builds an area's model from values (`area`: what a game client has
+    /// of it, or what [`values::Area::read`] read of its files) with its
+    /// tileset (`None` when it is missing: the tiles have no models).
+    /// Settles what is out of range (a size past 1024 tiles either way, a
+    /// turn past three quarters, a height past 1024 steps, a direction of
+    /// no length, a tile list of another length than the size says: see
+    /// [`values`]) and finds what follows from the tileset and the game's
+    /// tables: each tile's model, where it lies, its replacement texture
+    /// and door hooks, the tile border, the grass that grows, the
+    /// environment map. What could not be found is in
+    /// [`AreaModel::problems`].
+    pub fn from_values(game: &GameData, area: values::Area, tileset: Option<&Tileset>) -> Self {
         let mut problems = Vec::new();
-        let width = are.integer("Width").unwrap_or(0).clamp(0, 1024) as u32;
-        let height = are.integer("Height").unwrap_or(0).clamp(0, 1024) as u32;
+        let (width, height) = (area.width.min(1024), area.height.min(1024));
         let step = tileset.map_or(0.0, |t| t.general.transition);
-        let list = are.list("Tile_List").unwrap_or(&[]);
-        if list.len() != (width * height) as usize {
-            problems
-                .push(format!("Tile_List has {} tiles for a {width} by {height} area", list.len()));
+        let count = (width * height) as usize;
+        if area.tiles.len() != count {
+            problems.push(format!(
+                "Tile_List has {} tiles for a {width} by {height} area",
+                area.tiles.len()
+            ));
         }
         let mut unknown = 0;
         let mut holes = Vec::new();
         let replacements = game.table("replacetexture").ok();
-        let tiles: Vec<AreaTile> = list
+        let tiles: Vec<AreaTile> = area
+            .tiles
             .iter()
+            .take(count)
             .enumerate()
-            .take((width * height) as usize)
             .map(|(index, t)| {
-                let int = |label: &str| t.integer(label).unwrap_or(0);
-                let byte = |label: &str| int(label).clamp(0, 255) as u8;
-                let id = int("Tile_ID");
+                let id = t.id;
                 let model = tileset.and_then(|s| {
                     let tile = usize::try_from(id).ok().and_then(|i| s.tiles.get(i));
                     if tile.is_none() {
@@ -625,7 +708,7 @@ impl AreaModel {
                     tile.filter(|t| !t.is_hole()).map(|t| t.model.to_ascii_lowercase())
                 });
                 let (column, row) = (index as u32 % width.max(1), index as u32 / width.max(1));
-                let tile_height = int("Tile_Height").clamp(-1024, 1024) as i32;
+                let tile_height = t.height.clamp(-1024, 1024);
                 AreaTile {
                     index,
                     column,
@@ -633,12 +716,12 @@ impl AreaModel {
                     id,
                     model,
                     height: tile_height,
-                    orientation: int("Tile_Orientation").rem_euclid(4) as u8,
-                    main_lights: [byte("Tile_MainLight1"), byte("Tile_MainLight2")],
-                    source_lights: [byte("Tile_SrcLight1"), byte("Tile_SrcLight2")],
-                    anim_loops: [1, 2, 3].map(|n| int(&format!("Tile_AnimLoop{n}")) != 0),
+                    orientation: t.orientation % 4,
+                    main_lights: t.main_lights,
+                    source_lights: t.source_lights.map(|s| s.map_or(0, std::num::NonZeroU8::get)),
+                    anim_loops: t.anim_loops,
                     replace_texture: replacements.as_ref().and_then(|table| {
-                        let row = replacement_row(t.integer("Tile_ReplaceTex"), table.len())?;
+                        let row = usize::try_from(t.replace_texture?).ok()?;
                         Some(table.get(row, "TEXTURENAME")?.to_ascii_lowercase())
                     }),
                     position: Vec3::new(
@@ -660,7 +743,7 @@ impl AreaModel {
                 named.join(", ")
             ));
         }
-        let tileset_ref = are.resref("Tileset").filter(|r| !r.is_empty());
+        let tileset_ref = area.tileset.filter(|r| !r.is_empty());
         if tileset.is_none() {
             problems.push(match tileset_ref {
                 Some(r) => format!("tileset {r} not found"),
@@ -669,17 +752,19 @@ impl AreaModel {
         }
         let hooks = tiles_hooks(&tiles, tileset);
         let border = match (tileset, tileset_ref) {
-            (Some(set), Some(name)) => (game.table(&format!("{name}_edge")))
+            (Some(set), Some(name)) => (game.table(&border::edge_table(&name.to_string())))
                 .map(|t| border::border(set, &border::edge_rows(&t), &tiles, (width, height), step))
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        let mut objects = Vec::new();
-        for kind in ObjectKind::ALL {
-            for (i, s) in git.list(kind.list()).unwrap_or(&[]).iter().enumerate() {
-                objects.push(AreaObject::read(game, kind, i, s));
-            }
-        }
+        let mut counts = [0usize; ObjectKind::ALL.len()];
+        let objects = (area.objects.into_iter())
+            .map(|o| {
+                let count = &mut counts[o.kind.index()];
+                *count += 1;
+                AreaObject::from_values(*count - 1, o)
+            })
+            .collect();
         AreaModel {
             tileset: tileset_ref,
             width,
@@ -688,8 +773,8 @@ impl AreaModel {
             tiles,
             objects,
             hooks,
-            lighting: Lighting::read_with(are, git, tileset),
-            grass: grass::AreaGrass::read(git).growing(tileset),
+            lighting: area.lighting.settled(tileset),
+            grass: area.grass.growing(tileset),
             border,
             problems,
         }
@@ -700,11 +785,8 @@ impl AreaModel {
     /// has a hook in each, facing opposite ways: Aurora takes the one of
     /// the tile under the pointer).
     pub fn hook_near(&self, p: Vec3, reach: f32) -> Option<&DoorHook> {
-        let tile = (p.x >= 0.0 && p.y >= 0.0).then(|| {
-            let (x, y) = ((p.x / TILE_SIZE) as u32, (p.y / TILE_SIZE) as u32);
-            (x < self.width).then_some((y * self.width + x) as usize)
-        });
-        let on_tile = |h: &DoorHook| tile.flatten() == Some(h.tile);
+        let tile = tile_at(self.width, self.tiles.len(), p.x, p.y);
+        let on_tile = |h: &DoorHook| tile == Some(h.tile);
         self.hooks
             .iter()
             .map(|h| (h, (h.position - p).truncate().length()))
@@ -716,6 +798,146 @@ impl AreaModel {
     /// The door hooks at `p` (within 5 cm).
     pub fn hooks_at(&self, p: Vec3) -> impl Iterator<Item = &DoorHook> {
         self.hooks.iter().filter(move |h| (h.position - p).length() < 0.05)
+    }
+
+    /// The objects of a GIT (its root struct) that differ from `was`, by
+    /// kind and place in its list, where nothing else of the area that
+    /// the model reads from it differs: no list longer or shorter (an
+    /// object added, taken out or moved in its list), no other field (the
+    /// area's sounds and music, its grass). `None` where something else
+    /// differs: the area is to be read whole ([`AreaModel::read`]).
+    pub fn changed_objects(was: &Struct, now: &Struct) -> Option<Vec<(ObjectKind, usize)>> {
+        // (Its fields but the objects' lists.)
+        fn others(g: &Struct) -> Vec<&mg_gff::Field> {
+            let list = |f: &&mg_gff::Field| {
+                ObjectKind::ALL.iter().any(|k| f.label.as_bytes() == k.list().as_bytes())
+            };
+            g.fields.iter().filter(|f| !list(f)).collect()
+        }
+        if was.id != now.id || others(was) != others(now) {
+            return None;
+        }
+        let mut changed = Vec::new();
+        for kind in ObjectKind::ALL {
+            let (a, b) = (was.list(kind.list()), now.list(kind.list()));
+            // (A list there in one and not the other, even empty: whole.)
+            if a.is_some() != b.is_some() {
+                return None;
+            }
+            let (a, b) = (a.unwrap_or(&[]), b.unwrap_or(&[]));
+            if a.len() != b.len() {
+                return None;
+            }
+            changed.extend(
+                a.iter().zip(b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| (kind, i)),
+            );
+        }
+        Some(changed)
+    }
+
+    /// The objects of the area whose GIT is `git` that the edits
+    /// `touched` changed (a field of one, at any depth: an item of its
+    /// inventory, a variable, where it stands), as
+    /// `mg_edit::Workspace::touched_since` tells them; none for edits
+    /// of other resources. `None` where anything else of the area was
+    /// touched (its ARE `are`, an object put in or taken out, the GIT's
+    /// own fields, the GIT set whole): the area is to be read whole.
+    ///
+    /// Each with whether only where it stands, its turn, its tag or its
+    /// lock changed ([`PLACED_ONLY`]): what [`AreaModel::place_objects`]
+    /// reads again, its look kept (a creature's took up to 2 ms to put
+    /// together again).
+    #[cfg(feature = "edit")]
+    pub fn touched_objects(
+        touched: &[mg_edit::Touched],
+        are: &ResKey,
+        git: &ResKey,
+    ) -> Option<Vec<((ObjectKind, usize), bool)>> {
+        let mut changed: Vec<((ObjectKind, usize), bool)> = Vec::new();
+        for t in touched {
+            if t.key == *are {
+                return None;
+            }
+            if t.key != *git {
+                continue;
+            }
+            // (An object's own struct, or one inside it.)
+            let Some(mg_edit::Step::Item(list, index)) = t.path.0.first() else { return None };
+            let kind = ObjectKind::ALL.into_iter().find(|k| k.list() == list.as_str())?;
+            if t.whole {
+                return None;
+            }
+            let placed = t.path.0.len() == 1 && PLACED_ONLY.contains(&t.label.as_str());
+            match changed.iter_mut().find(|(o, _)| *o == (kind, *index)) {
+                Some((_, only)) => *only &= placed,
+                None => changed.push(((kind, *index), placed)),
+            }
+        }
+        Some(changed)
+    }
+
+    /// Reads again where the objects `moved` of the GIT `git` stand, how
+    /// they turn, their tags and locks, as [`AreaModel::read`] would; what
+    /// they look like is kept (none of these fields changes it).
+    /// Returns their places in [`AreaModel::objects`].
+    pub fn place_objects(&mut self, git: &Struct, moved: &[(ObjectKind, usize)]) -> Vec<usize> {
+        let mut at = Vec::with_capacity(moved.len());
+        for &(kind, index) in moved {
+            let Some(s) = git.list(kind.list()).and_then(|l| l.get(index)) else { continue };
+            let Some(i) = self.objects.iter().position(|o| o.kind == kind && o.index == index)
+            else {
+                continue;
+            };
+            let o = &mut self.objects[i];
+            let (preview, problem, laid) = (o.preview.take(), o.problem.take(), o.laid);
+            *o = AreaObject { preview, problem, laid, ..AreaObject::placed(kind, index, s) };
+            at.push(i);
+        }
+        at
+    }
+
+    /// Reads again the objects `changed` of the GIT `git` (as
+    /// [`AreaModel::changed_objects`] finds them): the model is then as
+    /// [`AreaModel::read`] would read it, the rest kept as it was. An area
+    /// of thousands of objects reads one moved in well under a millisecond,
+    /// where read whole it took tens.
+    /// Returns their places in [`AreaModel::objects`].
+    pub fn read_objects(
+        &mut self,
+        game: &GameData,
+        git: &Struct,
+        changed: &[(ObjectKind, usize)],
+    ) -> Vec<usize> {
+        let mut at = Vec::with_capacity(changed.len());
+        for &(kind, index) in changed {
+            let Some(s) = git.list(kind.list()).and_then(|l| l.get(index)) else { continue };
+            at.push(self.read_object(game, kind, index, s));
+        }
+        at
+    }
+
+    /// Reads the object `index` of the GIT list of `kind` again from `s`
+    /// (its struct, or another made of it: one with the variables a color
+    /// being picked gives it), as [`AreaModel::read`] would; its place in
+    /// [`AreaModel::objects`].
+    pub fn read_object(
+        &mut self,
+        game: &GameData,
+        kind: ObjectKind,
+        index: usize,
+        s: &Struct,
+    ) -> usize {
+        let read = AreaObject::read(game, kind, index, s);
+        match self.objects.iter().position(|o| o.kind == kind && o.index == index) {
+            Some(i) => {
+                self.objects[i] = read;
+                i
+            }
+            None => {
+                self.objects.push(read);
+                self.objects.len() - 1
+            }
+        }
     }
 
     /// The object `index` of the GIT list of `kind`.
@@ -733,6 +955,33 @@ impl AreaModel {
 mod tests {
     use super::*;
     use mg_gff::Value;
+
+    /// An encounter's outline color is read into its object (none without
+    /// the field), and an edit of it alone is one of where an object
+    /// stands and how it is marked: its look kept, not read again.
+    #[cfg(feature = "edit")]
+    #[test]
+    fn an_outline_color_is_read_and_its_edit_keeps_the_look() {
+        use mg_core::{ResRef, ResType};
+        let mut s = Struct::new(7);
+        let o = AreaObject::placed(ObjectKind::Encounter, 0, &s);
+        assert_eq!(o.outline_color, None);
+        s.set(OUTLINE_COLOR, Value::Dword(0x0030_80F0));
+        let o = AreaObject::placed(ObjectKind::Encounter, 0, &s);
+        assert_eq!(o.outline_color, Some([0xF0, 0x80, 0x30]));
+        let area = ResRef::from_str("a1").unwrap();
+        let (are, git) = (ResKey::new(area, ResType::ARE), ResKey::new(area, ResType::GIT));
+        let touched = |label: &str| mg_edit::Touched {
+            key: git,
+            path: mg_edit::GffPath::root().item(ObjectKind::Encounter.list(), 1),
+            label: label.into(),
+            whole: false,
+        };
+        let changed = AreaModel::touched_objects(&[touched(OUTLINE_COLOR)], &are, &git);
+        assert_eq!(changed, Some(vec![((ObjectKind::Encounter, 1), true)]));
+        let changed = AreaModel::touched_objects(&[touched("Faction")], &are, &git);
+        assert_eq!(changed, Some(vec![((ObjectKind::Encounter, 1), false)]), "another field");
+    }
 
     /// A tile model with main light 1, source light 2's place (named in
     /// another case) and animation loop 2; a light named ml2 of another
@@ -761,6 +1010,50 @@ doneanim animloop02 tst01_a01_01\ndonemodel tst01_a01_01\n";
         let other = TileFeatures { loops: [true, false, false], ..none };
         assert_eq!(TileFeatures::union([has, other]).loops, [true, true, false]);
         assert!(!has.replace, "no mesh drawn with replace_tex");
+        // Where the flame goes is the node Tile Properties enables the
+        // light by: the tile's own `sl2`, not the first node that ends so.
+        let name = |i: usize| model.nodes[i].name.to_ascii_lowercase();
+        assert_eq!(
+            source_light_node(&model, "tst01_a01_01", 2).map(name),
+            Some("tst01_a01_01sl2".into())
+        );
+        assert_eq!(source_light_node(&model, "tst01_a01_01", 1), None);
+        let with_torches = text.replace(
+            "node dummy TST01_A01_01SL2\n",
+            "node dummy torchesl2\n  parent tst01_a01_01\nendnode\nnode dummy xsl1\n  \
+             parent tst01_a01_01\nendnode\nnode dummy TST01_A01_01SL2\n",
+        );
+        let model = mg_mdl::Model::read(with_torches.as_bytes()).unwrap();
+        let name = |i: usize| model.nodes[i].name.to_ascii_lowercase();
+        assert!(model.nodes.iter().any(|n| n.name.eq_ignore_ascii_case("torchesl2")));
+        assert_eq!(
+            source_light_node(&model, "tst01_a01_01", 2).map(name),
+            Some("tst01_a01_01sl2".into())
+        );
+        assert_eq!(source_light_node(&model, "tst01_a01_01", 1), None, "`xsl1` is not its `sl1`");
+        assert_eq!(TileFeatures::of(&model, "tst01_a01_01").source, [false, true]);
+    }
+
+    /// The tile under a point, of an area 4 wide and 3 high: none past
+    /// any edge, nor for a point so far north that its row times the
+    /// width is past what a `u32` holds (it came out as a tile of row 0).
+    #[test]
+    fn the_tile_under_a_point_is_inside_the_area() {
+        let at = |x: f32, y: f32| tile_at(4, 12, x, y);
+        assert_eq!(at(0.0, 0.0), Some(0));
+        assert_eq!(at(39.9, 29.9), Some(11));
+        assert_eq!(at(15.0, 25.0), Some(9));
+        for (x, y) in [(-0.1, 5.0), (5.0, -0.1), (40.0, 5.0), (5.0, 30.0), (1e12, 5.0)] {
+            assert_eq!(at(x, y), None, "({x}, {y})");
+        }
+        assert_eq!(at(5.0, 1.3e10), None, "far north");
+        assert_eq!(at(5.0, 4.294_967_3e10), None);
+        assert_eq!(at(f32::NAN, 5.0), None);
+        assert_eq!(at(5.0, f32::INFINITY), None);
+        assert_eq!(tile_at(0, 0, 5.0, 5.0), None);
+        assert_eq!(tile_at(u32::MAX, usize::MAX, 5.0e10, 5.0e10), None);
+        // (A list shorter than the size says: no tile past its last.)
+        assert_eq!(tile_at(4, 6, 5.0, 25.0), None);
     }
 
     /// A tile model has a replacement texture where a mesh's bitmap is
@@ -905,6 +1198,23 @@ donemodel tst01_a01_01\n"
         assert_eq!(l.direction(true), None, "a zero direction is none");
         let l = Lighting::read_with(&Struct::new(0), &Struct::new(0xFFFF_FFFF), None);
         assert_eq!((l.direction(false), l.direction(true)), (None, None));
+    }
+
+    /// The GIT's `tdod_wallpaper` is the scene's `scriptableVec1` at full
+    /// strength, as the module's script sets it; without it, zero.
+    #[test]
+    fn the_git_s_wallpaper_local_is_scriptable_vec1() {
+        let mut var = Struct::new(0);
+        var.set("Name", Value::String(b"tdod_wallpaper".to_vec()));
+        var.set("Type", Value::Dword(3));
+        var.set("Value", Value::String(b"#ff0000".to_vec()));
+        let mut git = Struct::new(0xFFFF_FFFF);
+        git.set("VarTable", Value::List(vec![var]));
+        let l = Lighting::read_with(&Struct::new(0), &git, None);
+        assert_eq!(l.wallpaper, Some([1.0, 0.0, 0.0]));
+        assert_eq!(scene::environment(&l).scriptable[0], [1.0, 0.0, 0.0, 1.0]);
+        let l = Lighting::read_with(&Struct::new(0), &Struct::new(0xFFFF_FFFF), None);
+        assert_eq!(scene::environment(&l).scriptable[0], [0.0; 4]);
     }
 
     #[test]

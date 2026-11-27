@@ -45,7 +45,10 @@ impl RefKind {
             RefKind::Conversation => &[ResType::DLG],
             RefKind::Blueprint(t) => ObjectKind::from_restype(t).map_or(&[], ObjectKind::restypes),
             RefKind::Area => &[ResType::ARE],
-            RefKind::Sound => &[ResType::WAV],
+            // (What the game looks for a placed sound's, a sound
+            // blueprint's and a conversation line's sound under: `mg_audio`'s
+            // role table says, the one place it is kept.)
+            RefKind::Sound => mg_audio::Role::Placed.looked_for(),
             RefKind::Tileset => &[ResType::SET],
             RefKind::Portrait => &[ResType::TGA, ResType::DDS],
             // Movies live in `movies/` and `data/mov/`, outside the resource
@@ -56,21 +59,29 @@ impl RefKind {
         }
     }
 
-    /// The resource names that satisfy the reference: portraits name a
-    /// family (`po_x` stands for `po_xh`, `po_xm`, ...), so their medium
-    /// size is what must exist.
-    pub fn candidates(self, target: ResRef) -> Vec<ResKey> {
+    pub fn each_candidate(self, target: ResRef, mut f: impl FnMut(ResKey)) {
         let name = match self {
             RefKind::Portrait => {
                 let s = format!("{}m", target.to_string_lossy());
                 match ResRef::from_str(&s) {
                     Ok(r) => r,
-                    Err(_) => return Vec::new(),
+                    Err(_) => return,
                 }
             }
             _ => target,
         };
-        self.types().iter().map(|&t| ResKey::new(name, t)).collect()
+        for &t in self.types() {
+            f(ResKey::new(name, t));
+        }
+    }
+
+    /// The resource names that satisfy the reference: portraits name a
+    /// family (`po_x` stands for `po_xh`, `po_xm`, ...), so their medium
+    /// size is what must exist.
+    pub fn candidates(self, target: ResRef) -> Vec<ResKey> {
+        let mut out = Vec::with_capacity(self.types().len());
+        self.each_candidate(target, |k| out.push(k));
+        out
     }
 }
 
@@ -140,6 +151,10 @@ pub struct Reference {
 }
 
 impl Reference {
+    pub fn each_candidate(&self, f: impl FnMut(ResKey)) {
+        self.kind.each_candidate(self.target, f);
+    }
+
     pub fn candidates(&self) -> Vec<ResKey> {
         self.kind.candidates(self.target)
     }
@@ -264,7 +279,7 @@ pub fn script_includes(from: ResKey, source: &[u8]) -> Vec<Reference> {
     let mut counted = 0;
     for at in mg_script::lex::includes(source) {
         let quoted = String::from_utf8_lossy(&source[at.name]);
-        line += source[counted..at.directive.start].iter().filter(|&&b| b == b'\n').count();
+        line += mg_core::text::line_ends(&source[counted..at.directive.start]);
         counted = at.directive.start;
         if let Ok(target) = ResRef::from_str(&quoted)
             && !target.is_empty()

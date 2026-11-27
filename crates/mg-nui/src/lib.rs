@@ -39,7 +39,7 @@ pub use actions::{
     merge_events, rename_in_code, string_expr, variant_function, window_id_function,
 };
 pub use error::NuiError;
-pub use rename::{Renamed, build_renamed, can_rename, rename};
+pub use rename::{Renamed, build_renamed, can_rename, rename, rename_calls, script_calls_function};
 pub use schema::{controls, jui_schema, settings_schema};
 pub use script::{Build, Generated, generate, is_current, opener_source, rebuild_events};
 pub use validate::{Diagnostic, Severity, plain_name, validate};
@@ -420,14 +420,25 @@ pub fn template(ty: &str) -> Value {
     v
 }
 
-/// Calls `f` with `v` and everything in it, objects and arrays alike:
-/// names are found wherever a document has them, in fields this version
-/// knows or not.
+/// Calls `f` with every JSON object in `v` (skipping primitives so huge numeric
+/// arrays are not walked recursively when searching for object properties).
 fn walk<'a>(v: &'a Value, f: &mut impl FnMut(&'a Value)) {
-    f(v);
     match v {
-        Value::Object(o) => o.values().for_each(|v| walk(v, f)),
-        Value::Array(a) => a.iter().for_each(|v| walk(v, f)),
+        Value::Object(o) => {
+            f(v);
+            for child in o.values() {
+                if matches!(child, Value::Object(_) | Value::Array(_)) {
+                    walk(child, f);
+                }
+            }
+        }
+        Value::Array(a) => {
+            for child in a {
+                if matches!(child, Value::Object(_) | Value::Array(_)) {
+                    walk(child, f);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -496,49 +507,77 @@ pub fn group_ids(v: &Value) -> BTreeSet<String> {
 /// The pictures a window shows, lower case: those named in its layout and
 /// its swap layout variants, and those its binds name at first.
 pub fn image_names(window: &Value, settings: &Settings) -> BTreeSet<String> {
-    fn add(v: &Value, s: &Settings, out: &mut BTreeSet<String>) {
-        let v = v["bind"].as_str().and_then(|n| s.bindings.get(n)).map_or(v, |b| &b.value);
+    let mut out = BTreeSet::new();
+    image_names_in(window, settings, &mut out);
+    for view in settings.variants.values() {
+        image_names_in(view, settings, &mut out);
+    }
+    out
+}
+
+/// [`image_names`] of one layout alone (`layout`: the window's, or one of
+/// its swap layout variants), added to `out`: an image's `value`, an
+/// image button's `label` and any `image` key, each a name, a list of
+/// names (a list's rows) or a bind, whose first value is read.
+///
+/// A bind is read once, where the layout names it: inside a bind's value
+/// a `{"bind": …}` object is data, as it is to the game, so a bind whose
+/// value names itself (or two that name each other) end there. (They
+/// were followed without end: settings written so crashed `mg nui
+/// preview` and the Creator's Export with a stack overflow.)
+pub fn image_names_in(layout: &Value, settings: &Settings, out: &mut BTreeSet<String>) {
+    /// A name, or a list of them (as deep as the JSON read is).
+    fn add(v: &Value, out: &mut BTreeSet<String>) {
         match v {
             Value::String(n) if !n.is_empty() => {
                 out.insert(n.to_lowercase());
             }
-            Value::Array(a) => {
-                for v in a {
-                    add(v, s, out)
-                }
-            }
+            Value::Array(a) => a.iter().for_each(|v| add(v, out)),
             _ => {}
         }
     }
-    fn visit(v: &Value, s: &Settings, out: &mut BTreeSet<String>) {
-        match v["type"].as_str() {
-            Some("image") => add(&v["value"], s, out),
-            Some("button_image") => add(&v["label"], s, out),
-            _ => {}
-        }
-        if v.get("image").is_some() {
-            add(&v["image"], s, out);
-        }
-        match v {
-            Value::Object(o) => {
-                for v in o.values() {
-                    visit(v, s, out)
+    let named = |v: &Value, out: &mut BTreeSet<String>| {
+        let bound = v.get("bind").and_then(Value::as_str).and_then(|n| settings.bindings.get(n));
+        add(bound.map_or(v, |b| &b.value), out);
+    };
+    match layout {
+        Value::Object(o) => {
+            let ty = o.get("type").and_then(Value::as_str);
+            match ty {
+                Some("image") => {
+                    if let Some(v) = o.get("value") {
+                        named(v, out);
+                    }
+                }
+                Some("button_image") => {
+                    if let Some(v) = o.get("label") {
+                        named(v, out);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(image) = o.get("image") {
+                named(image, out);
+            }
+            let skip_chart_value = ty == Some("chart");
+            for (k, v) in o {
+                if skip_chart_value && k == "value" {
+                    continue;
+                }
+                if matches!(v, Value::Object(_) | Value::Array(_)) {
+                    image_names_in(v, settings, out);
                 }
             }
-            Value::Array(a) => {
-                for v in a {
-                    visit(v, s, out)
+        }
+        Value::Array(a) => {
+            for v in a {
+                if matches!(v, Value::Object(_) | Value::Array(_)) {
+                    image_names_in(v, settings, out);
                 }
             }
-            _ => {}
         }
+        _ => {}
     }
-    let mut out = BTreeSet::new();
-    visit(window, settings, &mut out);
-    for view in settings.variants.values() {
-        visit(view, settings, &mut out);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -784,5 +823,36 @@ mod tests {
         s.variants.insert("v".into(), json!({"type": "image", "value": "other"}));
         let names: Vec<String> = image_names(&w, &s).into_iter().collect();
         assert_eq!(names, ["frame", "ir_attack", "other", "portrait"]);
+        // (One layout's alone, as the canvas asks: not the variants'.)
+        let mut own = BTreeSet::new();
+        image_names_in(&w, &s, &mut own);
+        assert!(!own.contains("other") && own.contains("ir_attack"));
+    }
+
+    /// A bind is read once, where the layout names it: one whose value
+    /// names itself, two that name each other, or a list's rows of binds
+    /// end there (they were followed until the stack ran out, which
+    /// aborts the process: a downloaded window's settings crashed `mg nui
+    /// preview` and the Creator's Export).
+    #[test]
+    fn a_bind_that_names_a_bind_ends_the_walk() {
+        let mut w = window();
+        w["root"]["children"] = json!([
+            {"type": "image", "value": {"bind": "a"}},
+            {"type": "button_image", "label": {"bind": "b"}},
+            {"type": "list", "image": {"bind": "rows"}},
+        ]);
+        let mut s = Settings::default();
+        let mut bind = |name: &str, value: Value| {
+            s.bindings.insert(name.into(), Binding { value, ..Default::default() });
+        };
+        bind("a", json!([{"bind": "a"}]));
+        bind("b", json!({"bind": "c"}));
+        bind("c", json!([{"bind": "b"}, "seen_never"]));
+        bind("rows", json!(["ir_one", ["IR_Two", {"bind": "a"}], ""]));
+        s.variants.insert("v".into(), json!({"image": {"bind": "c"}}));
+        let names: Vec<String> = image_names(&w, &s).into_iter().collect();
+        // (Bind `c`, read where the variant names it, gives its own name.)
+        assert_eq!(names, ["ir_one", "ir_two", "seen_never"]);
     }
 }

@@ -21,13 +21,25 @@ use mg_rules::GameData;
 use mg_set::Tileset;
 use mg_testkit::corpus;
 
-use crate::area_common::each_module;
+use crate::area_common::{each_module, shared_game};
+
+fn gpu() -> Option<Gpu> {
+    mg_testkit::gpu::hold();
+    static BASE: std::sync::OnceLock<Option<Gpu>> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        let g = Gpu::headless();
+        if g.is_none() {
+            eprintln!("skipped: no GPU adapter");
+        }
+        g
+    });
+    base.as_ref().map(|g| Gpu::new(g.device.clone(), g.queue.clone()))
+}
 
 #[test]
 fn every_shipped_area_opens_and_renders() {
     let root = corpus!();
-    mg_testkit::gpu::hold();
-    let gpu = Gpu::headless();
+    let gpu = gpu();
     if gpu.is_none() {
         eprintln!("no GPU: models and rendering not checked");
     }
@@ -157,6 +169,120 @@ fn shows_nothing(game: &GameData, placeable: &Struct) -> bool {
     }
 }
 
+/// An area read again after an edit of some of its objects alone reads
+/// just those (`AreaModel::changed_objects`, `read_objects`; where they
+/// were only moved or locked, `place_objects`, their looks kept), and is then
+/// what reading it whole gives: an object moved, given another
+/// appearance, a variable, its lock; an edit of anything else of the GIT
+/// (an object added, the area's music) asks for it to be read whole, and
+/// a GIT as it was changes nothing. Held on the most crowded area of the
+/// first shipped module.
+#[test]
+fn an_area_reads_again_only_the_objects_an_edit_changed() {
+    use mg_gff::Value;
+    let root = corpus!();
+    let mut done = false;
+    each_module(&root, |opened| {
+        if done {
+            return;
+        }
+        done = true;
+        let game = &opened.game;
+        let gff = |a: ResRef, t: ResType| -> Option<Gff> {
+            Gff::read(&game.resman.get(&ResKey::new(a, t)).ok()?).ok()
+        };
+        let count = |g: &Gff| -> usize {
+            ObjectKind::ALL.iter().map(|k| g.root.list(k.list()).map_or(0, <[Struct]>::len)).sum()
+        };
+        let (area, are, git) = opened
+            .module
+            .areas()
+            .unwrap()
+            .into_iter()
+            .filter_map(|a| Some((a, gff(a, ResType::ARE)?, gff(a, ResType::GIT)?)))
+            .max_by_key(|(_, _, git)| count(git))
+            .expect("an area");
+        let set = are.root.resref("Tileset").and_then(|r| mg_area::tileset(game, r).ok());
+        let was = AreaModel::read(game, &are.root, &git.root, set.as_ref());
+        let kinds: Vec<ObjectKind> =
+            [ObjectKind::Placeable, ObjectKind::Creature, ObjectKind::Door]
+                .into_iter()
+                .filter(|k| git.root.list(k.list()).is_some_and(|l| l.len() > 1))
+                .collect();
+        assert!(!kinds.is_empty(), "{area}: objects to edit");
+        eprintln!("{}/{area}: {} objects, editing {kinds:?}", opened.name, count(&git));
+        // An edit of the GIT: the object `i` of `kind` changed by `change`.
+        let edited = |kind: ObjectKind, i: usize, change: &dyn Fn(&mut Struct)| -> Gff {
+            let mut g = git.clone();
+            change(&mut g.root.list_mut(kind.list()).unwrap()[i]);
+            g
+        };
+        // (Named, each an edit of an object's struct.)
+        type Change<'a> = (&'a str, &'a dyn Fn(&mut Struct));
+        let edits: [Change; 4] = [
+            ("moved", &|s: &mut Struct| {
+                let x = s.float("X").or(s.float("XPosition")).unwrap_or(0.0);
+                s.set(if s.contains("X") { "X" } else { "XPosition" }, Value::Float(x + 1.5));
+            }),
+            ("another appearance", &|s: &mut Struct| {
+                let a = s.integer("Appearance").unwrap_or(0);
+                s.set("Appearance", Value::Dword(u32::try_from(a + 1).unwrap_or(1)));
+            }),
+            ("a variable", &|s: &mut Struct| {
+                let mut v = Struct::new(0);
+                v.set("Name", Value::String(b"mg_test".to_vec()));
+                v.set("Type", Value::Dword(1));
+                v.set("Value", Value::Int(7));
+                let mut list = s.list("VarTable").map(<[Struct]>::to_vec).unwrap_or_default();
+                list.push(v);
+                s.set("VarTable", Value::List(list));
+            }),
+            ("locked", &|s: &mut Struct| s.set(mg_area::LOCKED, Value::Byte(1))),
+        ];
+        for kind in &kinds {
+            let last = git.root.list(kind.list()).unwrap().len() - 1;
+            for (what, change) in &edits {
+                for i in [0, last] {
+                    let now = edited(*kind, i, *change);
+                    let changed = AreaModel::changed_objects(&git.root, &now.root);
+                    assert_eq!(changed, Some(vec![(*kind, i)]), "{kind:?} {i} {what}");
+                    let mut read = was.clone();
+                    read.read_objects(game, &now.root, &changed.unwrap());
+                    let whole = AreaModel::read(game, &are.root, &now.root, set.as_ref());
+                    assert!(read.objects == whole.objects, "{kind:?} {i} {what}: as read whole");
+                    // Moved or locked: its look kept, the rest read again.
+                    if matches!(*what, "moved" | "locked") {
+                        let mut placed = was.clone();
+                        placed.place_objects(&now.root, &[(*kind, i)]);
+                        assert!(placed.objects == whole.objects, "{kind:?} {i} {what}: placed");
+                    }
+                }
+            }
+        }
+        // Several at once.
+        let kind = kinds[0];
+        let mut now = edited(kind, 0, edits[0].1);
+        now.root.list_mut(kind.list()).unwrap()[1].set(mg_area::LOCKED, Value::Byte(1));
+        let changed = AreaModel::changed_objects(&git.root, &now.root).unwrap();
+        assert_eq!(changed, [(kind, 0), (kind, 1)]);
+        let mut read = was.clone();
+        read.read_objects(game, &now.root, &changed);
+        let whole = AreaModel::read(game, &are.root, &now.root, set.as_ref());
+        assert!(read.objects == whole.objects, "two at once");
+        // The rest: read whole.
+        let mut added = git.clone();
+        let copy = added.root.list(kind.list()).unwrap()[0].clone();
+        added.root.list_mut(kind.list()).unwrap().push(copy);
+        assert_eq!(AreaModel::changed_objects(&git.root, &added.root), None, "an object added");
+        let mut music = git.clone();
+        let mut props = Struct::new(100);
+        props.set("MusicDay", Value::Int(3));
+        music.root.set("AreaProperties", Value::Struct(props));
+        assert_eq!(AreaModel::changed_objects(&git.root, &music.root), None, "the area's music");
+        assert_eq!(AreaModel::changed_objects(&git.root, &git.root), Some(Vec::new()));
+    });
+}
+
 /// A waypoint is drawn as the flag of its appearance (waypoint.2da: blue,
 /// red, green, yellow); one without an appearance has none, and no problem.
 #[test]
@@ -219,12 +345,8 @@ fn placed_objects_hold_still_when_not_animated() {
     use mg_module::instances::{Placement, Placing, instance};
     use mg_module::new::{AreaSpec, add_area, new_module};
     let root = corpus!();
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU adapter");
-        return;
-    };
-    let game = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let Some(gpu) = gpu() else { return };
+    let game = shared_game(&root);
     let mut rng = fastrand::Rng::with_seed(3);
     let mut m = new_module(&game, "Still", &mut rng).unwrap();
     let tileset = ResRef::from_str("ttr01").unwrap();
@@ -269,12 +391,13 @@ fn a_model_that_fails_is_left_out_and_the_area_still_drawn() {
     use mg_module::instances::{Placement, Placing, instance};
     use mg_module::new::{AreaSpec, add_area, new_module};
     let root = corpus!();
-    mg_testkit::gpu::hold();
+    // Alone across this test because mg_render::guard::fail_on is process-global.
+    mg_testkit::gpu::alone();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped: no GPU adapter");
         return;
     };
-    let game = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let game = shared_game(&root);
     let mut rng = fastrand::Rng::with_seed(3);
     let mut m = new_module(&game, "Fails", &mut rng).unwrap();
     let tileset = ResRef::from_str("ttr01").unwrap();
@@ -314,8 +437,7 @@ fn a_model_that_fails_is_left_out_and_the_area_still_drawn() {
             mg_render::guard::fail_on(None);
         }
     }
-    // (No other test renders while a model fails on purpose.)
-    mg_testkit::gpu::alone();
+    // (gpu::alone() was acquired at the start of this test before creating Gpu.)
     let _reset = Reset;
     mg_render::guard::fail_on(Some(&name));
     let broken = AreaScene::new(&gpu, &game, &model);
@@ -325,6 +447,63 @@ fn a_model_that_fails_is_left_out_and_the_area_still_drawn() {
     let failures = mg_render::guard::take_failures();
     assert_eq!(failures, [format!("{name}: made to fail")]);
     assert!(mg_render::guard::take_failures().is_empty(), "told once");
+}
+
+/// A tile whose model fails is left out with its grass: the tufts that
+/// grow on its walkmesh would stand over ground not drawn (the renderer
+/// watch counts what they draw as the area's ground).
+#[test]
+fn a_tile_that_fails_is_left_out_with_its_grass() {
+    use mg_module::new::{AreaSpec, add_area, new_module};
+    let root = corpus!();
+    // Alone across this test because mg_render::guard::fail_on is process-global.
+    mg_testkit::gpu::alone();
+    let Some(gpu) = Gpu::headless() else {
+        eprintln!("skipped: no GPU adapter");
+        return;
+    };
+    let game = shared_game(&root);
+    let mut rng = fastrand::Rng::with_seed(3);
+    let mut m = new_module(&game, "Fails", &mut rng).unwrap();
+    let tileset = ResRef::from_str("ttr01").unwrap();
+    let spec = AreaSpec { name: "Field".into(), tileset, width: 2, height: 2 };
+    let area = add_area(&mut m, &game, &spec, &mut rng).unwrap();
+    let set = mg_area::tileset(&game, tileset).unwrap();
+    let (id, tile) = set.tiles.iter().enumerate().find(|(_, t)| !t.model.is_empty()).unwrap();
+    let name = tile.model.to_ascii_lowercase();
+    let mut are = m.gff(&ResKey::new(area, ResType::ARE)).unwrap().unwrap();
+    for t in are.root.list_mut("Tile_List").unwrap() {
+        t.set("Tile_ID", mg_gff::Value::Int(id as i32));
+    }
+    let git = m.gff(&ResKey::new(area, ResType::GIT)).unwrap().unwrap();
+    let model = AreaModel::read(&game, &are.root, &git.root, Some(&set));
+    let camera = mg_render::Camera {
+        eye: glam::Vec3::new(10.0, -10.0, 25.0),
+        target: glam::Vec3::new(10.0, 10.0, 0.0),
+        fov_y: 0.8,
+        near: 0.1,
+        far: 200.0,
+    };
+    let grass = |scene: &AreaScene| {
+        let sight = mg_area::Sight::of(&camera, 4.0 / 3.0);
+        let view = View { fog: false, grass: Some(sight), ..View::of(&model) };
+        let frame = scene.scene(&model, &view);
+        frame.instances.iter().filter(|i| i.grass).count()
+    };
+    let sound = AreaScene::new(&gpu, &game, &model);
+    assert!(grass(&sound) > 0, "grass grows on {name}");
+    let _ = mg_render::guard::take_failures();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            mg_render::guard::fail_on(None);
+        }
+    }
+    let _reset = Reset;
+    mg_render::guard::fail_on(Some(&name));
+    let broken = AreaScene::new(&gpu, &game, &model);
+    assert_eq!(broken.failed_tiles(&model, &[]).len(), 4, "the tiles failed");
+    assert_eq!(grass(&broken), 0, "no grass over the tiles left out");
 }
 
 /// The Tile Border: with it on, the scene holds the tileset's edge tiles
@@ -339,12 +518,8 @@ fn a_model_that_fails_is_left_out_and_the_area_still_drawn() {
 fn the_tile_border_is_drawn_past_the_edge_when_asked_for() {
     use mg_module::new::{AreaSpec, add_area, new_module};
     let root = corpus!();
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU adapter");
-        return;
-    };
-    let game = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let Some(gpu) = gpu() else { return };
+    let game = shared_game(&root);
     let mut rng = fastrand::Rng::with_seed(3);
     let mut m = new_module(&game, "Border", &mut rng).unwrap();
     // (Three by three: three tiles a side, five deep, and four corners'
@@ -396,12 +571,8 @@ fn the_tile_border_is_drawn_past_the_edge_when_asked_for() {
 fn fade_geometry_leaves_out_the_fading_meshes() {
     use mg_module::new::{AreaSpec, add_area, new_module};
     let root = corpus!();
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU adapter");
-        return;
-    };
-    let game = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let Some(gpu) = gpu() else { return };
+    let game = shared_game(&root);
     let mut rng = fastrand::Rng::with_seed(3);
     let mut m = new_module(&game, "Fade", &mut rng).unwrap();
     let tileset = ResRef::from_str("tin01").unwrap();
@@ -422,7 +593,7 @@ fn fade_geometry_leaves_out_the_fading_meshes() {
         let view = View { fade, ..View::of(&model) };
         let scene = loaded.scene(&model, &view);
         let gone = |i: &mg_render::scene::Instance| {
-            i.state.as_ref().map_or(0, |s| s.meshes.iter().filter(|m| m.alpha == Some(0.0)).count())
+            i.state.as_ref().map_or(0, |s| s.meshes.iter().filter(|m| m.hidden).count())
         };
         (
             scene.instances.iter().map(gone).sum(),
@@ -446,7 +617,7 @@ fn fade_geometry_leaves_out_the_fading_meshes() {
     let walled = scene
         .instances
         .iter()
-        .find(|i| i.state.as_ref().is_some_and(|s| s.meshes.iter().any(|m| m.alpha == Some(0.0))));
+        .find(|i| i.state.as_ref().is_some_and(|s| s.meshes.iter().any(|m| m.hidden)));
     let walled = walled.expect("the walled tile");
     let state = walled.state.as_ref().unwrap();
     let mut by_fade: Vec<(u32, bool)> = walled
@@ -454,7 +625,7 @@ fn fade_geometry_leaves_out_the_fading_meshes() {
         .meshes
         .iter()
         .zip(&state.meshes)
-        .map(|(m, s)| (tilefade(m.node), s.alpha == Some(0.0)))
+        .map(|(m, s)| (tilefade(m.node), s.hidden))
         .collect();
     by_fade.sort();
     by_fade.dedup();
@@ -469,12 +640,8 @@ fn fade_geometry_leaves_out_the_fading_meshes() {
 fn a_tile_s_emitters_follow_its_animation_loops() {
     use mg_module::new::{AreaSpec, add_area, new_module};
     let root = corpus!();
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU adapter");
-        return;
-    };
-    let game = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let Some(gpu) = gpu() else { return };
+    let game = shared_game(&root);
     let mut rng = fastrand::Rng::with_seed(3);
     let mut m = new_module(&game, "Smoke", &mut rng).unwrap();
     let tileset = ResRef::from_str("tcn01").unwrap();
@@ -514,12 +681,8 @@ fn a_tile_s_emitters_follow_its_animation_loops() {
 fn water_ripples_with_time() {
     use mg_module::new::{AreaSpec, add_area, new_module};
     let root = corpus!();
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU adapter");
-        return;
-    };
-    let game = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let Some(gpu) = gpu() else { return };
+    let game = shared_game(&root);
     let mut rng = fastrand::Rng::with_seed(3);
     let mut m = new_module(&game, "Water", &mut rng).unwrap();
     let tileset = ResRef::from_str("ttr01").unwrap();

@@ -9,8 +9,7 @@
 //! without a word).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,7 +50,8 @@ pub fn folder_files(dir: &Path) -> Vec<PathBuf> {
             }
             match e.file_type() {
                 Ok(t) if t.is_dir() => dirs.push(e.path()),
-                Ok(t) if t.is_file() => files.push(e.path()),
+                // (A link to a file too, as the game reads one.)
+                Ok(_) if mg_resman::is_file_or_link_to_one(&e) => files.push(e.path()),
                 _ => {}
             }
         }
@@ -85,20 +85,25 @@ struct Change {
     description: Option<(String, String)>,
 }
 
-/// Renamed resources' bytes, kept in scratch files until the hak is saved;
-/// the files go when the last copy of the hak does.
 #[derive(Debug, Default)]
-struct Stash(std::sync::Mutex<Vec<PathBuf>>);
+struct StashInner {
+    dir: Option<PathBuf>,
+    files: Vec<PathBuf>,
+}
+
+/// Renamed resources' bytes, kept in scratch files until the hak (or a
+/// view, extraction, or save taken from it) is dropped.
+#[derive(Debug, Default)]
+struct Stash(std::sync::Mutex<StashInner>);
 
 impl Drop for Stash {
     fn drop(&mut self) {
-        let files = std::mem::take(self.0.get_mut().unwrap_or_else(|e| e.into_inner()));
-        for f in &files {
+        let inner = std::mem::take(self.0.get_mut().unwrap_or_else(|e| e.into_inner()));
+        for f in &inner.files {
             let _ = std::fs::remove_file(f);
         }
-        // (The folder is the process's: gone once no hak keeps a file in it.)
-        if let Some(dir) = files.first().and_then(|f| f.parent()) {
-            let _ = std::fs::remove_dir(dir);
+        if let Some(dir) = inner.dir {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -119,11 +124,15 @@ pub struct Hak {
     redo: Vec<(String, Change)>,
     saved: Option<usize>,
     stash: Arc<Stash>,
+    /// How many times its resources or description changed (a change, an
+    /// undo, a redo, a save taken): what is made from them is kept while
+    /// this stays ([`Hak::changes`]).
+    changes: u64,
 }
 
 /// What the folders of renamed resources' bytes are named, before the
 /// process's number ([`Hak::rename`]).
-const STASH: &str = "moonglow-hak-";
+pub const STASH: &str = "moonglow-hak-";
 
 /// Takes away the folders of renamed bytes in `temp` that a Moonglow no
 /// longer running left there (one that crashed: a process's own goes with
@@ -131,13 +140,21 @@ const STASH: &str = "moonglow-hak-";
 /// (Linux's `/proc`); elsewhere a folder untouched for a week is taken as
 /// left. How many went.
 pub fn sweep_stashes(temp: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(temp) else { return 0 };
+    sweep_left(temp, STASH)
+}
+
+/// Takes away the folders in `dir` named `prefix` and a process's number
+/// that a Moonglow no longer running left there, as [`sweep_stashes`]
+/// does (a plugin's copies of the haks it wrote, kept for Undo, use it
+/// too). How many went.
+pub fn sweep_left(dir: &Path, prefix: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     let ours = std::process::id();
     let week = std::time::Duration::from_secs(7 * 24 * 3600);
     let mut gone = 0;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(pid) = name.strip_prefix(STASH).and_then(|p| p.parse::<u32>().ok()) else {
+        let Some(pid) = name.strip_prefix(prefix).and_then(|p| p.parse::<u32>().ok()) else {
             continue;
         };
         if pid == ours || !e.file_type().is_ok_and(|t| t.is_dir()) {
@@ -199,11 +216,15 @@ impl Hak {
             redo: Vec::new(),
             saved: None,
             stash: Arc::default(),
+            changes: 0,
         }
     }
 
     /// Opens an archive.
     pub fn open(path: &Path) -> Result<Hak, String> {
+        // (What a save that a crash cut short left beside it, once old.)
+        crate::left_writing(&crate::sibling(path, crate::WRITING));
+        crate::left_writing(&crate::sibling(&crate::sibling(path, ".bak"), crate::WRITING));
         let archive = ErfContainer::open(path).map_err(|e| e.to_string())?;
         let items = archive
             .index()
@@ -257,18 +278,31 @@ impl Hak {
         self.redo.clear();
     }
 
+    /// How many times its resources or description changed, by any way
+    /// (an editor's view made of them is made again when this moves).
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
     /// Does a change: what it replaces, then what it removes, then what it
     /// adds at the end.
     fn apply(&mut self, c: &Change) {
+        self.changes += 1;
         for (at, _, after) in &c.replaced {
             self.places.remove(&self.items[*at].key);
             self.items[*at] = after.clone();
             self.places.insert(after.key, *at);
         }
         if !c.removed.is_empty() {
-            for (at, _) in c.removed.iter().rev() {
-                self.items.remove(*at);
-            }
+            let (mut r, mut i) = (0usize, 0usize);
+            self.items.retain(|_| {
+                let drop = c.removed.get(r).is_some_and(|(at, _)| *at == i);
+                if drop {
+                    r += 1;
+                }
+                i += 1;
+                !drop
+            });
             self.index();
         }
         for item in &c.appended {
@@ -282,14 +316,28 @@ impl Hak {
 
     /// Takes a change back, in the reverse order.
     fn revert(&mut self, c: &Change) {
+        self.changes += 1;
         for item in &c.appended {
             self.places.remove(&item.key);
         }
         self.items.truncate(self.items.len() - c.appended.len());
         if !c.removed.is_empty() {
-            for (at, item) in &c.removed {
-                self.items.insert(*at, item.clone());
+            let total = self.items.len() + c.removed.len();
+            let mut merged = Vec::with_capacity(total);
+            let mut current = std::mem::take(&mut self.items).into_iter();
+            let mut removed = c.removed.iter();
+            let mut next_removed = removed.next();
+            for pos in 0..total {
+                if let Some((at, item)) = next_removed
+                    && *at == pos
+                {
+                    merged.push(item.clone());
+                    next_removed = removed.next();
+                } else if let Some(item) = current.next() {
+                    merged.push(item);
+                }
             }
+            self.items = merged;
             self.index();
         }
         for (at, before, _) in &c.replaced {
@@ -526,29 +574,31 @@ impl Hak {
         Ok(to)
     }
 
-    /// Keeps renamed bytes in a scratch file until the hak is saved (and
-    /// removed when the hak is closed).
+    /// Keeps renamed bytes in a private scratch file until the hak is saved
+    /// (and removed once neither the hak nor any view/save/extraction holds it).
     fn stash(&self, key: ResKey, bytes: &[u8]) -> Result<PathBuf, String> {
-        let temp = std::env::temp_dir();
-        // (Once a process: the folders a Moonglow that crashed left.)
-        static SWEPT: std::sync::Once = std::sync::Once::new();
-        SWEPT.call_once(|| _ = sweep_stashes(&temp));
-        let dir = temp.join(format!("{STASH}{}", std::process::id()));
+        // (Once a process: the legacy folders a Moonglow that crashed left.
+        // Not by this crate's tests, which leave the system's folder be.)
+        #[cfg(not(test))]
+        {
+            static SWEPT: std::sync::Once = std::sync::Once::new();
+            SWEPT.call_once(|| _ = sweep_stashes(&std::env::temp_dir()));
+        }
+        let mut inner = self.stash.0.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = match inner.dir.as_ref().filter(|d| d.is_dir()) {
+            Some(dir) => dir.clone(),
+            None => {
+                let base = crate::build::own_scratch_dir().map_err(|e| e.to_string())?;
+                let made = crate::build::new_private_dir(&base).map_err(|e| e.to_string())?;
+                inner.dir = Some(made.clone());
+                made
+            }
+        };
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = dir.join(format!("{n}-{key}"));
-        // (Another hak closed meanwhile takes the folder away when it is
-        // empty, between its making and the write: made again.)
-        let mut tries = 0;
-        loop {
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            match std::fs::write(&path, bytes) {
-                Ok(()) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && tries < 3 => tries += 1,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        self.stash.0.lock().unwrap_or_else(|e| e.into_inner()).push(path.clone());
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        inner.files.push(path.clone());
         Ok(path)
     }
 
@@ -560,6 +610,7 @@ impl Hak {
         Contents {
             archive: self.archive.clone(),
             items: self.items.iter().map(|i| (i.key, i.source.clone())).collect(),
+            _stash: self.stash.clone(),
         }
     }
 
@@ -570,31 +621,28 @@ impl Hak {
     }
 
     fn read(&self, item: &Item) -> Result<Vec<u8>, String> {
-        match &item.source {
-            Source::Archive => {
-                let a = self.archive.as_ref().ok_or("no archive")?;
-                a.read(&item.key).map(Cow::into_owned).map_err(|e| e.to_string())
-            }
-            Source::File(p) => std::fs::read(p).map_err(|e| format!("{}: {e}", p.display())),
-            Source::Bytes(b) => Ok(b.to_vec()),
-        }
+        read_item(self.archive.as_deref(), item)
     }
 
-    /// Writes resources as files into a folder; returns how many.
+    /// Writes resources as files into a folder (over those there);
+    /// returns how many.
     pub fn extract(&self, keys: &[ResKey], dir: &Path) -> Result<usize, String> {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let mut n = 0;
+        self.extraction(keys).write(dir, &HashSet::new(), &mut |_| true)
+    }
+
+    /// The resources `keys` as they are now, to be written as files away
+    /// from the hak ([`Extraction::write`]): a hak of gigabytes is
+    /// extracted off the window's thread, which draws meanwhile.
+    pub fn extraction(&self, keys: &[ResKey]) -> Extraction {
         let mut places: Vec<usize> =
             keys.iter().filter_map(|k| self.places.get(k)).copied().collect();
         places.sort_unstable();
         places.dedup();
-        for item in places.into_iter().map(|at| &self.items[at]) {
-            let path = item.key.path_in(dir).map_err(|e| e.to_string())?;
-            std::fs::write(&path, self.read(item)?)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            n += 1;
+        Extraction {
+            archive: self.archive.clone(),
+            items: places.into_iter().map(|at| self.items[at].clone()).collect(),
+            _stash: self.stash.clone(),
         }
-        Ok(n)
     }
 
     /// The resources that would start past 2 GiB, which the game can't read.
@@ -609,9 +657,21 @@ impl Hak {
 
     /// Saves to `path` (its own when `None`), then reads the archive back.
     pub fn save(&mut self, path: Option<&Path>) -> Result<(), String> {
+        let saving = self.saving(path)?;
+        match saving.write(&mut |_| true)? {
+            Some(saved) => self.saved(saved),
+            None => Err("the save was stopped".into()),
+        }
+    }
+
+    /// A save to `path` (the hak's own when `None`), ready to be written
+    /// away from the hak ([`Saving::write`], then [`Hak::saved`]): a hak
+    /// of gigabytes is written off the window's thread.
+    pub fn saving(&self, path: Option<&Path>) -> Result<Saving, String> {
         let path = path.or(self.path.as_deref()).ok_or("no file to save to")?.to_path_buf();
         // Sizes now: an added file may have changed since.
-        for item in &mut self.items {
+        let mut items = self.items.clone();
+        for item in &mut items {
             if let Source::File(p) = &item.source {
                 item.size =
                     std::fs::metadata(p).map_err(|e| format!("{}: {e}", p.display()))?.len();
@@ -630,39 +690,184 @@ impl Hak {
         let (year, day) = crate::build_date();
         header.build_year = year;
         header.build_day = day;
-        let entries: Vec<_> =
-            self.items.iter().map(|i| (i.key.resref, i.key.restype, i.size)).collect();
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        Ok(Saving {
+            path,
+            header,
+            items,
+            archive: self.archive.clone(),
+            _stash: self.stash.clone(),
+        })
+    }
+
+    /// Takes a save written ([`Saving::write`]) as the hak's own: its
+    /// resources are the archive's from now on. An error where the hak's
+    /// resources are no longer those that were written (it was changed
+    /// meanwhile): the file is as written, the hak as it is.
+    pub fn saved(&mut self, saved: Saved) -> Result<(), String> {
+        let same = self.items.len() == saved.sizes.len()
+            && self.items.iter().zip(&saved.sizes).all(|(i, (key, _))| i.key == *key);
+        if !same {
+            return Err(format!(
+                "the hak was changed while it was saved: {} has it as it was",
+                saved.path.display()
+            ));
         }
-        let part = path.with_extension("part");
-        let write = || -> Result<(), String> {
-            let file =
-                std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
-            let mut w = std::io::BufWriter::new(file);
-            mg_erf::write_streamed(&mut w, &header, &entries, |i| {
-                self.read(&self.items[i]).map(Cow::Owned).map_err(std::io::Error::other)
-            })
-            .map_err(|e| e.to_string())?;
-            w.flush().map_err(|e| e.to_string())
-        };
-        if let Err(e) = write() {
-            let _ = std::fs::remove_file(&part);
-            return Err(e);
-        }
-        std::fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let archive = ErfContainer::open(&path).map_err(|e| e.to_string())?;
-        for item in &mut self.items {
+        for (item, (_, size)) in self.items.iter_mut().zip(&saved.sizes) {
             item.source = Source::Archive;
+            item.size = *size;
         }
-        self.header = archive.header.clone();
-        self.archive = Some(Arc::new(archive));
-        self.path = Some(path);
-        // Undo now would point at sources that may be gone: start afresh.
+        self.header = saved.archive.header.clone();
+        self.archive = Some(Arc::new(saved.archive));
+        self.path = Some(saved.path);
+        // Undo now would point at sources that may be gone: start afresh,
+        // releasing unused rename stash files once existing handles drop.
+        self.stash = Arc::new(Stash::default());
         self.undo.clear();
         self.redo.clear();
         self.saved = Some(0);
+        self.changes += 1;
         Ok(())
+    }
+}
+
+/// A resource's bytes, wherever they are: in `archive` (the hak's, as it
+/// was opened or last saved), a file, or bytes given.
+fn read_item(archive: Option<&ErfContainer>, item: &Item) -> Result<Vec<u8>, String> {
+    match &item.source {
+        Source::Archive => {
+            let a = archive.ok_or("no archive")?;
+            // (Wherever it lies in the file: a hak past 2 GiB is split by
+            // taking out what the game cannot reach.)
+            a.read_anywhere(&item.key).map(Cow::into_owned).map_err(|e| e.to_string())
+        }
+        Source::File(p) => std::fs::read(p).map_err(|e| format!("{}: {e}", p.display())),
+        Source::Bytes(b) => Ok(b.to_vec()),
+    }
+}
+
+/// Resources of a hak as they were when taken ([`Hak::extraction`]), to
+/// be written as files.
+#[derive(Debug, Clone)]
+pub struct Extraction {
+    archive: Option<Arc<ErfContainer>>,
+    items: Vec<Item>,
+    _stash: Arc<Stash>,
+}
+
+impl Extraction {
+    /// How many resources, and their bytes in all.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn size(&self) -> u64 {
+        self.items.iter().map(|i| i.size).sum()
+    }
+
+    /// Those of them that `dir` has a file of already (which a write puts
+    /// its own over, unless told to skip them).
+    pub fn there(&self, dir: &Path) -> Vec<ResKey> {
+        (self.items.iter())
+            .filter(|i| i.key.path_in(dir).is_ok_and(|p| p.exists()))
+            .map(|i| i.key)
+            .collect()
+    }
+
+    /// Writes them as files into `dir`, but for `skip` (left as the
+    /// folder has them): each beside its place and moved there, so that
+    /// one stopped or failed leaves no file cut short. `step` is told the
+    /// bytes written so far before each file, and stops the work by
+    /// saying `false` (the files written stay). Returns how many were
+    /// written.
+    pub fn write(
+        &self,
+        dir: &Path,
+        skip: &HashSet<ResKey>,
+        step: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<usize, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let (mut n, mut done) = (0, 0u64);
+        for item in self.items.iter().filter(|i| !skip.contains(&i.key)) {
+            if !step(done) {
+                break;
+            }
+            let path = item.key.path_in(dir).map_err(|e| e.to_string())?;
+            let data = read_item(self.archive.as_deref(), item)?;
+            crate::write_replacing_one_of_many(&path, &data)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            done += data.len() as u64;
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+/// A save of a hak ready to be written ([`Hak::saving`]).
+#[derive(Debug)]
+pub struct Saving {
+    path: PathBuf,
+    header: Header,
+    items: Vec<Item>,
+    archive: Option<Arc<ErfContainer>>,
+    _stash: Arc<Stash>,
+}
+
+/// A hak's save, written: what [`Hak::saved`] takes.
+#[derive(Debug)]
+pub struct Saved {
+    path: PathBuf,
+    archive: ErfContainer,
+    /// Each resource written, and its size as written.
+    sizes: Vec<(ResKey, u64)>,
+}
+
+impl Saving {
+    /// The bytes of the resources it writes.
+    pub fn size(&self) -> u64 {
+        self.items.iter().map(|i| i.size).sum()
+    }
+
+    /// Where it writes.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Writes the hak (beside its place, then moved over it) and reads
+    /// the archive back. `step` is told the bytes of resources written so
+    /// far before each resource, and stops the save by saying `false`:
+    /// then nothing is left of it, the file is as it was, and `None` is
+    /// returned.
+    pub fn write(self, step: &mut dyn FnMut(u64) -> bool) -> Result<Option<Saved>, String> {
+        let Saving { path, header, items, archive, _stash } = self;
+        let entries: Vec<_> = items.iter().map(|i| (i.key.resref, i.key.restype, i.size)).collect();
+        let (mut done, mut stopped) = (0u64, false);
+        // (Beside it under the one name Moonglow writes files by, a
+        // resource at a time, then moved over it: `x.hak` and `x.erf` no
+        // longer share `x.part`.)
+        let written = crate::write_replacing_with(&path, |w| {
+            mg_erf::write_streamed(w, &header, &entries, |i| {
+                if !step(done) {
+                    stopped = true;
+                    return Err(std::io::Error::other("stopped"));
+                }
+                done += items[i].size;
+                read_item(archive.as_deref(), &items[i])
+                    .map(Cow::Owned)
+                    .map_err(std::io::Error::other)
+            })
+            .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+        if stopped {
+            return Ok(None);
+        }
+        written.map_err(|e| format!("{}: {e}", path.display()))?;
+        let archive = ErfContainer::open(&path).map_err(|e| e.to_string())?;
+        let sizes = items.iter().map(|i| (i.key, i.size)).collect();
+        Ok(Some(Saved { path, archive, sizes }))
     }
 }
 
@@ -684,11 +889,28 @@ pub fn write_into(path: &Path, resources: Vec<(ResKey, Source)>) -> Result<Added
     Ok(added)
 }
 
+/// Takes `keys` out of the hak at `path` (kept beside itself as `.bak`
+/// first, as [`write_into`] keeps it): how many it had. A hak that has
+/// none of them isn't written.
+pub fn remove_from(path: &Path, keys: &[ResKey]) -> Result<usize, String> {
+    let mut hak = Hak::open(path)?;
+    let had = keys.iter().filter(|k| hak.places.contains_key(k)).count();
+    if had == 0 {
+        return Ok(0);
+    }
+    let bak = crate::sibling(path, ".bak");
+    crate::keep_previous(path).map_err(|e| format!("{}: {e}", bak.display()))?;
+    hak.remove(keys);
+    hak.save(Some(path))?;
+    Ok(had)
+}
+
 /// A hak's resources as they were when taken ([`Hak::contents`]).
 #[derive(Debug, Clone)]
 pub struct Contents {
     archive: Option<Arc<ErfContainer>>,
     items: HashMap<ResKey, Source>,
+    _stash: Arc<Stash>,
 }
 
 impl Container for Contents {
@@ -732,9 +954,73 @@ impl Default for Hak {
 mod tests {
     use super::*;
 
+    /// `changes` moves at each change, undo, redo and save taken, and not
+    /// for what changes nothing (a description as it is): an editor's views
+    /// made of a hak are made again by it, whatever way the hak changed.
+    #[test]
+    fn changes_move_at_every_change_and_no_other_time() {
+        let mut hak = Hak::new();
+        assert_eq!(hak.changes(), 0);
+        let key = ResKey::parse("mg_one", mg_core::ResType::TXT).unwrap();
+        hak.add_sources(vec![(key, Source::Bytes(b"one".to_vec().into()))]).unwrap();
+        assert_eq!(hak.changes(), 1, "an add");
+        hak.set_description("");
+        assert_eq!(hak.changes(), 1, "the description as it is: nothing");
+        hak.set_description("Ours");
+        assert_eq!(hak.changes(), 2, "the description");
+        hak.undo();
+        assert_eq!((hak.changes(), hak.description.as_str()), (3, ""), "an undo");
+        hak.redo();
+        assert_eq!(hak.changes(), 4, "a redo");
+        let _ = hak.data(key).unwrap();
+        let _ = hak.items().len();
+        assert_eq!(hak.changes(), 4, "read: nothing");
+        let dir = std::env::temp_dir().join(format!("mg-hak-changes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        hak.save(Some(&dir.join("ours.hak"))).unwrap();
+        assert_eq!(hak.changes(), 5, "a save taken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hak opened and saved unchanged is the same bytes; the steps the
+    /// hak editor takes (add a file, remove one, set the description) save
+    /// as the same steps written straight to a new hak do: the editor's
+    /// views change none of what is written (M4's U21 review).
+    #[test]
+    fn saves_are_the_bytes_of_the_steps_taken() {
+        let dir = std::env::temp_dir().join(format!("mg-hak-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = |n: &str| ResKey::parse(n, mg_core::ResType::TXT).unwrap();
+        let mut hak = Hak::new();
+        let src = |b: &[u8]| Source::Bytes(b.to_vec().into());
+        hak.add_sources(vec![(key("mg_one"), src(b"one")), (key("mg_two"), src(b"two"))]).unwrap();
+        let first = dir.join("first.hak");
+        hak.save(Some(&first)).unwrap();
+        let mut opened = Hak::open(&first).unwrap();
+        let again = dir.join("again.hak");
+        opened.save(Some(&again)).unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), std::fs::read(&again).unwrap(), "unchanged");
+        let file = dir.join("mg_three.txt");
+        std::fs::write(&file, "three").unwrap();
+        opened.add_files(std::slice::from_ref(&file));
+        opened.remove(&[key("mg_one")]);
+        opened.set_description("Ours");
+        let edited = dir.join("edited.hak");
+        opened.save(Some(&edited)).unwrap();
+        let mut straight = Hak::new();
+        straight
+            .add_sources(vec![(key("mg_two"), src(b"two")), (key("mg_three"), src(b"three"))])
+            .unwrap();
+        straight.set_description("Ours");
+        let made = dir.join("made.hak");
+        straight.save(Some(&made)).unwrap();
+        assert_eq!(std::fs::read(&edited).unwrap(), std::fs::read(&made).unwrap(), "the steps");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn bytes_go_into_a_new_hak_and_into_one_that_is_there() {
-        let dir = std::env::temp_dir().join(format!("mg-hak-bytes-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-hak-bytes");
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("made.hak");
         let key = |n: &str| ResKey::parse(n, ResType::TXT).unwrap();
@@ -772,7 +1058,7 @@ mod tests {
 
     #[test]
     fn built_from_a_folder_edited_and_saved() {
-        let dir = std::env::temp_dir().join(format!("mg-hak-edit-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-hak-edit");
         let _ = std::fs::remove_dir_all(&dir);
         let src = dir.join("content");
         write(&src, "plc_chair.mdl", b"model");
@@ -840,7 +1126,7 @@ mod tests {
         let out = dir.join("out");
         assert_eq!(back.extract(&[mdl], &out).unwrap(), 1);
         assert_eq!(std::fs::read(out.join("plc_chair.mdl")).unwrap(), b"model 2");
-        assert!(!dir.join("mine.part").exists());
+        assert!(!dir.join("mine.hak.moonglow-tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -948,6 +1234,77 @@ mod tests {
         assert_eq!(names(&hak), ["a.txt", "c.txt"]);
     }
 
+    /// A save and an extraction are written away from the hak (as a job
+    /// of the window, the review of November 2026, D19), told how far
+    /// they are and stopped when asked: a save stopped leaves the file as
+    /// it was and nothing beside it, an extraction the files it wrote and
+    /// none cut short; files told to be skipped stay as the folder has
+    /// them. Written to their end, they give what `save` and `extract`
+    /// give.
+    #[test]
+    fn a_save_and_an_extraction_are_told_of_and_stopped() {
+        let dir = mg_testkit::scratch_dir("mg-hak-jobs");
+        let src = dir.join("src");
+        for (name, data) in [("a.txt", &b"aaaa"[..]), ("b.txt", b"bb"), ("c.txt", b"c")] {
+            write(&src, name, data);
+        }
+        let mut hak = Hak::new();
+        hak.add_folder(&src);
+        let path = dir.join("made.hak");
+        std::fs::write(&path, b"as it was").unwrap();
+        // Stopped before its second resource: the file as it was.
+        let saving = hak.saving(Some(&path)).unwrap();
+        assert_eq!(saving.size(), 7);
+        let mut told = Vec::new();
+        let stopped = saving.write(&mut |done| {
+            told.push(done);
+            told.len() < 2
+        });
+        assert!(matches!(stopped, Ok(None)), "{stopped:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"as it was");
+        let left: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 2, "the folder and the file, nothing beside them: {left:?}");
+        assert!(hak.is_dirty() && hak.path.is_none(), "the hak as it was");
+        // Written whole: as `save`.
+        let saving = hak.saving(Some(&path)).unwrap();
+        let mut told = Vec::new();
+        let saved = saving.write(&mut |done| {
+            told.push(done);
+            true
+        });
+        hak.saved(saved.unwrap().expect("written")).unwrap();
+        assert_eq!(told.len(), 3);
+        assert_eq!((told[0], *told.last().unwrap() < 7), (0, true));
+        assert!(!hak.is_dirty());
+        let back = Hak::open(&path).unwrap();
+        assert_eq!(back.data(key("a")).unwrap(), b"aaaa");
+        assert_eq!(back.items().len(), 3);
+
+        // Extracted: one there already is skipped, and one stop is heeded.
+        let out = dir.join("out");
+        write(&out, "b.txt", b"mine");
+        let all: Vec<ResKey> = hak.items().iter().map(|i| i.key).collect();
+        let plan = hak.extraction(&all);
+        assert_eq!((plan.len(), plan.size()), (3, 7));
+        assert_eq!(plan.there(&out), [key("b")]);
+        let skip: HashSet<ResKey> = [key("b")].into();
+        assert_eq!(plan.write(&out, &skip, &mut |_| true), Ok(2));
+        assert_eq!(std::fs::read(out.join("b.txt")).unwrap(), b"mine", "skipped");
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"aaaa");
+        let again = dir.join("again");
+        let mut calls = 0;
+        let wrote = plan.write(&again, &HashSet::new(), &mut |_| {
+            calls += 1;
+            calls < 2
+        });
+        assert_eq!(wrote, Ok(1), "stopped before the second");
+        assert_eq!(std::fs::read_dir(&again).unwrap().count(), 1);
+        // (And `extract`, over what is there.)
+        assert_eq!(hak.extract(&all, &out), Ok(3));
+        assert_eq!(std::fs::read(out.join("b.txt")).unwrap(), b"bb");
+    }
+
     /// A folder of renamed bytes that a Moonglow no longer running left in
     /// the temporary folder goes; this process's own, and a running one's,
     /// stay.
@@ -985,9 +1342,125 @@ mod tests {
         assert_eq!(Hak::open(&path).unwrap().items().len(), 2);
     }
 
+    /// A hak past 2 GiB, which the game cannot read the end of, is split
+    /// by taking out what lies past the mark: the editor reads it there
+    /// (a load order does not, as the game). The file is sparse: its
+    /// header by hand, 2 GiB of nothing, then the second resource.
+    #[cfg(unix)]
+    #[test]
+    fn a_resource_past_2_gib_is_read_extracted_and_saved() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = mg_testkit::scratch_dir("mg-hak-past-limit");
+        let path = dir.join("big.hak");
+        let far: u32 = (1 << 31) + 16;
+        let mut head = Vec::new();
+        head.extend_from_slice(b"HAK V1.0");
+        // (No description; two entries; keys at 160, the list at 208.)
+        for n in [0u32, 0, 2, 160, 160, 208, 126, 1, 0xffff_ffff] {
+            head.extend_from_slice(&n.to_le_bytes());
+        }
+        head.resize(160, 0);
+        for (id, name) in [b"near", b"away"].into_iter().enumerate() {
+            let mut resref = [0u8; 16];
+            resref[..4].copy_from_slice(name);
+            head.extend_from_slice(&resref);
+            head.extend_from_slice(&(id as u32).to_le_bytes());
+            head.extend_from_slice(&ResType::TXT.0.to_le_bytes());
+            head.extend_from_slice(&[0, 0]);
+        }
+        for (offset, size) in [(224u32, 4u32), (far, 3)] {
+            head.extend_from_slice(&offset.to_le_bytes());
+            head.extend_from_slice(&size.to_le_bytes());
+        }
+        head.extend_from_slice(b"near");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&head).unwrap();
+        file.seek(SeekFrom::Start(u64::from(far))).unwrap();
+        file.write_all(b"far").unwrap();
+        drop(file);
+
+        let (near, away) = (key_for("near.txt").unwrap(), key_for("away.txt").unwrap());
+        let mut hak = Hak::open(&path).unwrap();
+        assert_eq!(hak.data(away).unwrap(), b"far");
+        let out = dir.join("out");
+        assert_eq!(hak.extract(&[away], &out), Ok(1));
+        assert_eq!(std::fs::read(out.join("away.txt")).unwrap(), b"far");
+        // A load order reads as the game does: not past the mark.
+        assert!(hak.contents().read(&away).is_err());
+        // The first half taken out, the rest is saved: within reach now.
+        hak.remove(&[near]);
+        let small = dir.join("small.hak");
+        hak.save(Some(&small)).unwrap();
+        assert!(std::fs::metadata(&small).unwrap().len() < 1024);
+        let hak = Hak::open(&small).unwrap();
+        assert!(hak.past_read_limit().is_empty());
+        assert_eq!(hak.contents().read(&away).unwrap().as_ref(), b"far");
+    }
+
     #[test]
     fn build_dates() {
         let (year, day) = crate::build_date();
         assert!(year >= 125 && day < 366);
+    }
+
+    #[test]
+    fn stash_outlives_hak_for_contents_extraction_saving_and_cleans_up_on_save() {
+        let dir = mg_testkit::scratch_dir("mg-hak-stash-lifetime");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("orig.hak");
+        let out_path = dir.join("saved.hak");
+        let ext_dir = dir.join("ext");
+
+        let mut writer = mg_erf::ErfWriter::new(*b"HAK ");
+        writer.add(ResRef::from_str("one").unwrap(), ResType::TXT, b"payload".to_vec()).unwrap();
+        std::fs::write(&src_path, writer.to_bytes().unwrap()).unwrap();
+
+        let one = key_for("one.txt").unwrap();
+        let two = key_for("two.txt").unwrap();
+
+        let mut hak = Hak::open(&src_path).unwrap();
+        hak.rename(one, "two").unwrap();
+        let stash_path = match &hak.items()[0].source {
+            Source::File(p) => p.clone(),
+            other => panic!("expected stashed file, got {other:?}"),
+        };
+        let stash_dir = stash_path.parent().unwrap().to_path_buf();
+        assert!(stash_path.is_file());
+        // (Under the tests' own folder, not the user's cache.)
+        assert!(stash_dir.starts_with(mg_testkit::test_output()), "{}", stash_dir.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&stash_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+
+        let contents = hak.contents();
+        let extraction = hak.extraction(&[two]);
+        let saving = hak.saving(Some(&out_path)).unwrap();
+        drop(hak);
+
+        // Handles keep stash alive after Hak is dropped.
+        assert!(stash_path.is_file());
+        assert_eq!(contents.read(&two).unwrap().as_ref(), b"payload");
+        assert_eq!(extraction.write(&ext_dir, &HashSet::new(), &mut |_| true).unwrap(), 1);
+        assert_eq!(std::fs::read(ext_dir.join("two.txt")).unwrap(), b"payload");
+        drop(contents);
+        drop(extraction);
+        assert!(saving.write(&mut |_| true).unwrap().is_some());
+        assert!(!stash_path.exists());
+        assert!(!stash_dir.exists());
+
+        // Saving releases old stash when no external handles remain.
+        let mut hak2 = Hak::open(&out_path).unwrap();
+        hak2.rename(two, "one").unwrap();
+        let stash2 = match &hak2.items()[0].source {
+            Source::File(p) => p.clone(),
+            other => panic!("expected stashed file, got {other:?}"),
+        };
+        assert!(stash2.is_file());
+        hak2.save(None).unwrap();
+        assert!(!stash2.exists());
+        assert_eq!(hak2.data(one).unwrap(), b"payload");
     }
 }

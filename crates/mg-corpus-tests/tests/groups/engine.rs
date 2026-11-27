@@ -47,6 +47,8 @@ mod engine_git_runtime;
 mod engine_grass;
 #[path = "../engine_hak_names.rs"]
 mod engine_hak_names;
+#[path = "../engine_include_entry.rs"]
+mod engine_include_entry;
 #[path = "../engine_item_cost.rs"]
 mod engine_item_cost;
 #[path = "../engine_item_flags.rs"]
@@ -55,6 +57,8 @@ mod engine_item_flags;
 mod engine_journal;
 #[path = "../engine_light_state.rs"]
 mod engine_light_state;
+#[path = "../engine_linked_files.rs"]
+mod engine_linked_files;
 #[path = "../engine_local_variables.rs"]
 mod engine_local_variables;
 #[path = "../engine_locked.rs"]
@@ -77,6 +81,8 @@ mod engine_resource_names;
 mod engine_return_types;
 #[path = "../engine_rules.rs"]
 mod engine_rules;
+#[path = "../engine_runner.rs"]
+mod engine_runner;
 #[path = "../engine_saves.rs"]
 mod engine_saves;
 #[path = "../engine_special_abilities.rs"]

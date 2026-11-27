@@ -27,9 +27,13 @@ pub fn resref(name: &str, taken: impl Fn(&ResRef) -> bool) -> ResRef {
     resref_named(name, &Naming::default(), taken)
 }
 
-/// [`resref`] by a project's naming: the builder's code in the team's
-/// pattern around the name (`ab_wizardsword`), the name cut to fit.
-pub fn resref_named(name: &str, naming: &Naming, taken: impl Fn(&ResRef) -> bool) -> ResRef {
+/// Non-panicking [`resref_named`]; returns `None` when the naming pattern
+/// cannot form a valid ResRef or all numbered slots `1..10_000` are taken.
+pub fn try_resref_named(
+    name: &str,
+    naming: &Naming,
+    taken: impl Fn(&ResRef) -> bool,
+) -> Option<ResRef> {
     let plain = name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_');
     let compact: String = if plain {
         name.chars().filter(|c| *c != ' ').map(|c| c.to_ascii_lowercase()).collect()
@@ -37,21 +41,61 @@ pub fn resref_named(name: &str, naming: &Naming, taken: impl Fn(&ResRef) -> bool
         String::new()
     };
     let compact = naming.strip(&compact).to_string();
-    let make = |s: &str, n: &str| naming.resref(s, n).expect("letters and digits");
     if !compact.is_empty() {
         // A trailing number stays whole.
         let digits = compact.len() - compact.trim_end_matches(|c: char| c.is_ascii_digit()).len();
         let (stem, number) = compact.split_at(compact.len() - digits.min(compact.len()));
-        let candidate = make(stem, number);
-        if !taken(&candidate) {
-            return candidate;
+        if let Some(candidate) = naming.resref(stem, number)
+            && !taken(&candidate)
+        {
+            return Some(candidate);
         }
     }
     let stem = if compact.is_empty() { "blueprint".to_string() } else { compact };
     let in_use = |s: &str| ResRef::from_str(s).is_ok_and(|r| taken(&r));
-    naming
-        .numbered(stem.trim_end_matches(|c: char| c.is_ascii_digit()), 1, &in_use)
-        .expect("a free resref")
+    naming.numbered(stem.trim_end_matches(|c: char| c.is_ascii_digit()), 1, &in_use)
+}
+
+/// [`resref`] by a project's naming: the builder's code in the team's
+/// pattern around the name (`ab_wizardsword`), the name cut to fit.
+pub fn resref_named(name: &str, naming: &Naming, taken: impl Fn(&ResRef) -> bool) -> ResRef {
+    if let Some(r) = try_resref_named(name, naming, &taken) {
+        return r;
+    }
+    let plain = name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_');
+    let compact: String = if plain {
+        name.chars().filter(|c| *c != ' ').map(|c| c.to_ascii_lowercase()).collect()
+    } else {
+        String::new()
+    };
+    let fallback_stem = naming.strip(&compact);
+    let stem = if fallback_stem.is_empty() { "blueprint" } else { fallback_stem };
+    naming.resref(stem, "").unwrap_or_else(|| ResRef::from_str("blueprint").expect("valid"))
+}
+
+/// The name the blueprint wizards suggest for a blueprint in `category`:
+/// "Category 001", "Category 002"…, the first whose resref is free. Where
+/// the name's resref doesn't follow its number (a category named with
+/// other characters than letters, digits and spaces makes `blueprint001`,
+/// as Aurora's wizards do; or every number's taken), the first: its
+/// resref is numbered to a free one as the blueprint is made. (It looked
+/// on for a free one for ever: Northwind's report, the Placeable Wizard
+/// frozen at Assign Palette Category once `blueprint001` was taken.)
+pub fn suggested_name(category: &str, naming: &Naming, taken: impl Fn(&ResRef) -> bool) -> String {
+    let mut last = None;
+    for n in 1..=999 {
+        let name = default_name(category, n);
+        let resref = resref_named(&name, naming, |_| false);
+        if !taken(&resref) {
+            return name;
+        }
+        // (The number doesn't reach the resref: no other will be free.)
+        if last == Some(resref) {
+            break;
+        }
+        last = Some(resref);
+    }
+    default_name(category, 1)
 }
 
 /// A blueprint's tag for a name: its letters, digits and underscores.
@@ -415,7 +459,9 @@ pub fn door(resref: ResRef, display: &str, category: u8) -> Gff {
     gff(b"UTD ", fields)
 }
 
-const COLORS: [&str; 6] =
+/// An item's color fields: its layers' (a new item's, and what a placed
+/// item is given where its blueprint has none).
+pub(crate) const COLORS: [&str; 6] =
     ["Leather1Color", "Leather2Color", "Cloth1Color", "Cloth2Color", "Metal1Color", "Metal2Color"];
 
 /// An item of a base item: its model fields by the base item's model type
@@ -499,6 +545,24 @@ pub fn make_magical(game: &GameData, g: &mut Gff, magic: Magical) {
 mod tests {
     use super::*;
 
+    /// The name suggested for a blueprint in a category: the first whose
+    /// resref is free; where the name's resref doesn't follow its number
+    /// (a category named with an `&`: `blueprint001`, as
+    /// Aurora's), the first, at once (Northwind's report: with that resref
+    /// taken, the Placeable Wizard froze at Assign Palette Category).
+    #[test]
+    fn a_suggested_name_is_found_whatever_the_category() {
+        let naming = Naming::default();
+        let r = |s: &str| ResRef::from_str(s).unwrap();
+        assert_eq!(suggested_name("Chairs", &naming, |x| *x == r("chairs001")), "Chairs 002");
+        assert_eq!(suggested_name("Chairs", &naming, |_| false), "Chairs 001");
+        let blueprint001 = |x: &ResRef| *x == r("blueprint001");
+        assert_eq!(resref_named("Doors & Gates 007", &naming, |_| false), r("blueprint001"));
+        assert_eq!(suggested_name("Doors & Gates", &naming, blueprint001), "Doors & Gates 001");
+        // Every number's resref taken: the first still, at once.
+        assert_eq!(suggested_name("Chairs", &naming, |_| true), "Chairs 001");
+    }
+
     fn r(s: &str) -> ResRef {
         ResRef::from_str(s).unwrap()
     }
@@ -533,6 +597,22 @@ mod tests {
         assert_eq!(tag("Containers & Switches 001"), "ContainersSwitches001");
         assert_eq!(tag("1. Average 001"), "1Average001");
         assert_eq!(default_name("Civilization", 1), "Civilization 001");
+    }
+
+    #[test]
+    fn saturated_or_oversized_naming_never_panics_in_resref_named() {
+        let full = Naming::default();
+        assert_eq!(try_resref_named("Sword", &full, |_| true), None);
+        assert_eq!(resref_named("Sword", &full, |_| true), r("sword"));
+
+        let oversized = Naming::new(&"x".repeat(16), "{code}_{name}");
+        let taken = |res: &ResRef| res.as_str() == Some("xxxxxxxxxxxxxxxx");
+        assert_eq!(try_resref_named("Sword", &oversized, taken), None);
+        assert_eq!(resref_named("Sword", &oversized, taken), r("xxxxxxxxxxxxxxxx"));
+
+        let bad_chars = Naming::new("a\0b", "{code}_{name}");
+        assert_eq!(try_resref_named("Sword", &bad_chars, |_| false), None);
+        assert_eq!(resref_named("Sword", &bad_chars, |_| false), r("blueprint"));
     }
 }
 

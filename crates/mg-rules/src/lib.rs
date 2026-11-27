@@ -8,7 +8,10 @@
 //! [`GameData::table`] and [`GameData::choices`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+static NEXT_GAME_DATA_ID: AtomicU64 = AtomicU64::new(1);
 
 use mg_2da::TwoDa;
 use mg_core::{Codepage, Gender, Language, LocString, ResRef, ResType, StrRef};
@@ -19,20 +22,51 @@ use thiserror::Error;
 pub mod appearance;
 pub mod challenge;
 pub mod creatures;
+pub mod grass;
 pub mod item_wizard;
 pub mod items;
 pub mod levelup;
+pub mod lights;
 pub mod models;
 pub mod names;
 pub mod objects;
 pub mod placeables;
+pub mod placement;
 pub mod rows;
 pub mod spell_warnings;
+pub mod tint;
 pub use challenge::Challenge;
 pub use creatures::{ClassSpells, CreatureSheet, CreatureStats};
 pub use items::{ItemProperty, ItemValue};
 pub use objects::ObjectKind;
 pub use spell_warnings::{SpellSlots, SpellWarning};
+
+// Numbers a file gives (a GFF field of any integer type, a 2DA's cell),
+// brought into what holds them here without `as`: one that does not fit
+// is the nearest that does, never the number its low bits spell, which is
+// another row's.
+
+/// A row of a table (or a count): 0 for a negative number, the largest
+/// for one past a `u32`.
+pub(crate) fn row(v: i64) -> u32 {
+    u32::try_from(v.max(0)).unwrap_or(u32::MAX)
+}
+
+/// A WORD's worth: the largest (a row no table has) for a number outside
+/// it.
+pub(crate) fn word(v: i64) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
+/// A BYTE's worth: the largest for a number outside it.
+pub(crate) fn byte(v: i64) -> u8 {
+    u8::try_from(v).unwrap_or(u8::MAX)
+}
+
+/// A number held to `lo..=hi`, a field's range.
+pub(crate) fn held(v: i64, lo: i32, hi: i32) -> i32 {
+    v.clamp(i64::from(lo), i64::from(hi)) as i32
+}
 
 #[derive(Debug, Error)]
 pub enum RulesError {
@@ -111,8 +145,92 @@ pub struct ChoiceColumns<'a> {
 
 type ChoiceKey = (ResRef, Option<usize>, Option<usize>);
 
-/// An appearance list's kind of object, its length and first row's name.
-type MarkedKey = (ObjectKind, usize, Option<String>);
+/// The custom talk-table lines a kept list read as it was made, sorted:
+/// what [`GameData::update_custom_tlk`] keeps it by.
+pub(crate) type Lines = Box<[u32]>;
+
+/// A kept list and the custom talk-table lines it read.
+type Kept<T> = (Arc<Vec<T>>, Lines);
+
+thread_local! {
+    /// The custom talk-table lines read so far while a kept list is made
+    /// ([`reading_lines`]), none while none is.
+    static LINES_READ: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Notes custom talk-table lines as read, for the list being made, if one is.
+pub(crate) fn note_lines(lines: &[u32]) {
+    if lines.is_empty() {
+        return;
+    }
+    LINES_READ.with(|read| {
+        if let Some(read) = read.borrow_mut().as_mut() {
+            read.extend_from_slice(lines);
+        }
+    });
+}
+
+/// Makes a list to keep, with the custom talk-table lines it read (a
+/// line read and not there counts too: added, it names the row). Those
+/// are noted for a list being made around it as well (the list by name
+/// is made from the one in the table's order).
+pub(crate) fn reading_lines<T>(make: impl FnOnce() -> T) -> (T, Lines) {
+    let outer = LINES_READ.with(|read| read.borrow_mut().replace(Vec::new()));
+    let made = make();
+    let mut lines = LINES_READ
+        .with(|read| std::mem::replace(&mut *read.borrow_mut(), outer))
+        .unwrap_or_default();
+    lines.sort_unstable();
+    lines.dedup();
+    note_lines(&lines);
+    (made, lines.into_boxed_slice())
+}
+
+/// The lines of `mine` that differ from `theirs`'s, as far as both go:
+/// looked through on several threads where there are many (a world's
+/// table of 50,000 lines took 4.8 ms on one, its lines' texts each read
+/// from memory).
+fn differing(mine: &[mg_tlk::TlkEntry], theirs: &[mg_tlk::TlkEntry]) -> Vec<u32> {
+    const ALONE: usize = 4_096;
+    let len = mine.len().min(theirs.len());
+    let of = |from: usize, to: usize| -> Vec<u32> {
+        (from..to).filter(|&l| mine[l] != theirs[l]).map(|l| l as u32).collect()
+    };
+    if len < 2 * ALONE {
+        return of(0, len);
+    }
+    // (Asked only then: it reads the system's files.)
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if threads < 2 {
+        return of(0, len);
+    }
+    let step = len.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..len)
+            .step_by(step)
+            .map(|from| scope.spawn(move || of(from, (from + step).min(len))))
+            .collect();
+        parts.into_iter().flat_map(|p| p.join().expect("a comparison panicked")).collect()
+    })
+}
+
+/// The custom talk-table lines that changed: those listed, and every one
+/// from `from` on (where the table grew or shrank).
+struct Changed {
+    lines: Vec<u32>,
+    from: u32,
+}
+
+impl Changed {
+    fn names_any(&self, lines: &[u32]) -> bool {
+        lines.last().is_some_and(|&last| last >= self.from)
+            || lines.iter().any(|l| self.lines.binary_search(l).is_ok())
+    }
+}
+
+/// An appearance list's kind of object, its length and a hash of its rows
+/// (each row's number and name: `appearance::rows_hash`).
+type MarkedKey = (ObjectKind, usize, u64);
 
 /// What looking up a 2DA found, kept until [`GameData::invalidate`]. (A
 /// read that failed on I/O is not kept: it may succeed next time.)
@@ -129,14 +247,14 @@ enum Looked {
 pub struct GameData {
     pub resman: ResMan,
     pub language: Language,
-    tlk: Tlk,
+    tlk: Arc<Tlk>,
     custom_tlk: Option<Tlk>,
     /// Tables looked up so far, found or not: a missing table is asked for
     /// again and again (per candidate feat in a level-up).
     tables: RwLock<HashMap<ResRef, Looked>>,
     /// The choice lists made so far ([`choice_list`](Self::choice_list)),
     /// by table and the two columns' places in it.
-    choices: RwLock<HashMap<ChoiceKey, Arc<Vec<Choice>>>>,
+    choices: RwLock<HashMap<ChoiceKey, Kept<Choice>>>,
     /// Appearance lists with their rows of no model marked
     /// ([`appearance_choices`](Self::appearance_choices)), by the kind of
     /// object and the list they were made from.
@@ -144,10 +262,17 @@ pub struct GameData {
     /// Objects' appearances judged so far
     /// ([`appearance_problems`](Self::appearance_problems)), by the kind
     /// of object and the fields that bear on it.
-    judged: RwLock<HashMap<appearance::JudgedKey, Arc<Vec<appearance::ModelProblem>>>>,
+    judged: RwLock<appearance::JudgedCache>,
+    /// The item property lists made so far (`items.rs`): a table's named
+    /// rows, by the table and by which of them and in what order; and the
+    /// property types of each itemprops.2da column.
+    named: RwLock<HashMap<String, Vec<items::NamedList>>>,
+    property_types: RwLock<HashMap<i32, Kept<items::PropertyType>>>,
     /// The codepage of the game's text, once worked out (see
     /// [`codepage`](Self::codepage)).
     codepage: RwLock<Option<Codepage>>,
+    id: u64,
+    revision: AtomicU64,
 }
 
 /// The codepage of an `encoding.2da`: its `Codepoint` column is the
@@ -226,20 +351,30 @@ impl GameData {
     /// Opens the base stack of an install and its `dialog.tlk`.
     pub fn open(install: &GameInstall) -> Result<GameData, RulesError> {
         let resman = ResMan::for_game(install)?;
+        let tlk = Self::open_tlk(install)?;
+        Ok(GameData::new(resman, tlk))
+    }
+
+    /// Reads an install's `dialog.tlk`.
+    pub fn open_tlk(install: &GameInstall) -> Result<Tlk, RulesError> {
         let path = install.talk_table();
         let bytes = std::fs::read(&path).map_err(|e| RulesError::Tlk {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
-        let tlk = Tlk::read(&bytes).map_err(|e| RulesError::Tlk {
+        Tlk::read(&bytes).map_err(|e| RulesError::Tlk {
             path: path.display().to_string(),
             message: e.to_string(),
-        })?;
-        Ok(GameData::new(resman, tlk))
+        })
     }
 
     /// Wraps an existing resource stack and talk table.
     pub fn new(resman: ResMan, tlk: Tlk) -> GameData {
+        Self::with_shared_tlk(resman, Arc::new(tlk))
+    }
+
+    /// Wraps an existing resource stack and a shared read-only `dialog.tlk`.
+    pub fn with_shared_tlk(resman: ResMan, tlk: Arc<Tlk>) -> GameData {
         GameData {
             resman,
             language: tlk.language,
@@ -248,9 +383,18 @@ impl GameData {
             tables: RwLock::new(HashMap::new()),
             choices: RwLock::new(HashMap::new()),
             marked: RwLock::new(HashMap::new()),
-            judged: RwLock::new(HashMap::new()),
+            judged: RwLock::default(),
+            named: RwLock::new(HashMap::new()),
+            property_types: RwLock::new(HashMap::new()),
             codepage: RwLock::new(None),
+            id: NEXT_GAME_DATA_ID.fetch_add(1, Ordering::Relaxed),
+            revision: AtomicU64::new(0),
         }
+    }
+
+    /// Unique instance identity and mutation counter for external cache invalidation.
+    pub fn generation(&self) -> (u64, u64) {
+        (self.id, self.revision.load(Ordering::Relaxed))
     }
 
     /// Sets (or clears) the module's custom talk table.
@@ -259,6 +403,53 @@ impl GameData {
         // (The lists name rows by its strings.)
         self.choices.get_mut().expect("choice cache poisoned").clear();
         self.marked.get_mut().expect("marked cache poisoned").clear();
+        self.named.get_mut().expect("named cache poisoned").clear();
+        self.property_types.get_mut().expect("property type cache poisoned").clear();
+        self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Brings the module's custom talk table up to `tlk`, the table as
+    /// its editor holds it now, a few lines of it changed: only the lines
+    /// that differ are copied (and those past its end added, those past
+    /// `tlk`'s taken off), where setting it anew copied every line's text
+    /// and sound for each text typed, 50,000 of them to change one. What
+    /// is made from its strings is forgotten where it read a line that
+    /// differed (one typed text made the Creature editor's pages name
+    /// every list again, 11 ms), as [`set_custom_tlk`](Self::set_custom_tlk)
+    /// forgets all of it. With no custom
+    /// table yet, or one of another language, `tlk` is copied whole.
+    /// Whether anything changed.
+    pub fn update_custom_tlk(&mut self, tlk: &Tlk) -> bool {
+        let Some(own) = self.custom_tlk.as_mut().filter(|own| own.language == tlk.language) else {
+            self.set_custom_tlk(Some(tlk.clone()));
+            return true;
+        };
+        let (old, new) = (own.entries.len(), tlk.entries.len());
+        let from = if old == new { u32::MAX } else { old.min(new) as u32 };
+        own.entries.truncate(new);
+        let lines = differing(&own.entries, &tlk.entries);
+        for &line in &lines {
+            own.entries[line as usize].clone_from(&tlk.entries[line as usize]);
+        }
+        own.entries.extend_from_slice(&tlk.entries[old.min(new)..]);
+        let changed = Changed { lines, from };
+        if changed.lines.is_empty() && old == new {
+            return false;
+        }
+        // (The lists name rows by its strings: those that read a line that
+        // changed are made again. A list marked by appearance is kept by
+        // its texts, so a list made again is another's.)
+        let kept = |lines: &Lines| !changed.names_any(lines);
+        self.choices.get_mut().expect("choice cache poisoned").retain(|_, (_, l)| kept(l));
+        self.property_types
+            .get_mut()
+            .expect("property type cache poisoned")
+            .retain(|_, (_, l)| kept(l));
+        for lists in self.named.get_mut().expect("named cache poisoned").values_mut() {
+            lists.retain(|(_, _, l)| kept(l));
+        }
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     pub fn custom_tlk(&self) -> Option<&Tlk> {
@@ -269,13 +460,19 @@ impl GameData {
     /// test brings its own), the language its own.
     pub fn set_tlk(&mut self, tlk: Tlk) {
         self.language = tlk.language;
-        self.tlk = tlk;
+        self.tlk = Arc::new(tlk);
         self.invalidate();
     }
 
     /// `dialog.tlk`.
     pub fn tlk(&self) -> &Tlk {
         &self.tlk
+    }
+
+    /// Shared handle to `dialog.tlk` so tests can build fresh [`GameData`]
+    /// instances without re-parsing all 112k talk-table entries.
+    pub fn tlk_arc(&self) -> Arc<Tlk> {
+        Arc::clone(&self.tlk)
     }
 
     /// Forgets cached tables (call after the resource stack changes, e.g.
@@ -285,7 +482,10 @@ impl GameData {
         self.choices.write().expect("choice cache poisoned").clear();
         self.marked.write().expect("marked cache poisoned").clear();
         self.judged.write().expect("judged cache poisoned").clear();
+        self.named.write().expect("named cache poisoned").clear();
+        self.property_types.write().expect("property type cache poisoned").clear();
         *self.codepage.write().expect("codepage poisoned") = None;
+        self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The codepage of the game's text: the language's, or the table of a
@@ -352,7 +552,12 @@ impl GameData {
         if strref.is_none() {
             return None;
         }
-        let tlk = if strref.is_custom() { self.custom_tlk.as_ref()? } else { &self.tlk };
+        let tlk = if strref.is_custom() {
+            note_lines(&[strref.index()]);
+            self.custom_tlk.as_ref()?
+        } else {
+            &self.tlk
+        };
         tlk.text_in(strref, self.codepage())
     }
 
@@ -426,22 +631,39 @@ impl GameData {
         let label_col = cols.label.and_then(|c| t.column(c));
         let resref = ResRef::from_str(table).map_err(|_| RulesError::BadName(table.into()))?;
         let key = (resref, name_col, label_col);
-        if let Some(made) = self.choices.read().expect("choice cache poisoned").get(&key) {
+        if let Some((made, lines)) = self.choices.read().expect("choice cache poisoned").get(&key) {
+            note_lines(lines);
             return Ok(made.clone());
         }
         // A name written out in the table, for a row without a talk-table
         // string (ambientmusic.2da's `DisplayName`, for custom music).
         let display_col = t.column(DISPLAY_NAME);
-        let out: Vec<Choice> = (0..t.len())
-            .filter_map(|row| {
-                let text = self.named_row(&t, row, name_col, display_col, label_col)?;
-                Some(Choice { row, text })
-            })
-            .collect();
+        let (out, lines) = reading_lines(|| {
+            (0..t.len())
+                .filter_map(|row| {
+                    let text = self.named_row(&t, row, name_col, display_col, label_col)?;
+                    Some(Choice { row, text })
+                })
+                .collect::<Vec<Choice>>()
+        });
         let out = Arc::new(out);
-        self.choices.write().expect("choice cache poisoned").insert(key, out.clone());
+        self.choices.write().expect("choice cache poisoned").insert(key, (out.clone(), lines));
         Ok(out)
     }
+}
+
+/// The game's data with only `tables` (each a name and what follows a
+/// 2DA's header), for the tests of what is worked out of them.
+#[cfg(test)]
+pub(crate) fn test_game(tables: &[(&str, &str)]) -> GameData {
+    let mut mem = mg_resman::MemContainer::new();
+    for (name, body) in tables {
+        let text = format!("2DA V2.0\n\n{body}");
+        mem.insert(ResKey::parse(name, ResType::TWODA).unwrap(), text.as_bytes());
+    }
+    let mut rm = ResMan::new();
+    rm.add(mg_resman::priority::KEY, "mem", mg_resman::LayerClass::Key, mem);
+    GameData::new(rm, Tlk::new(Language::ENGLISH))
 }
 
 #[cfg(test)]
@@ -702,5 +924,122 @@ mod tests {
         assert_eq!(texts(&gd, cols), ["Longsword", "Axe", "From another"], "until forgotten");
         gd.invalidate();
         assert_eq!(texts(&gd, cols), ["Mace"]);
+    }
+
+    /// The custom talk table brought up to its editor's
+    /// ([`GameData::update_custom_tlk`]) is that table, line for line: a
+    /// line changed, lines added and lines taken off; the lines that are
+    /// as they were are not copied (their text stays where it was), the
+    /// lists made from its strings are made again only when a line
+    /// differed, and the 2DAs read are kept.
+    #[test]
+    fn the_custom_talk_table_is_brought_up_to_date_line_by_line() {
+        let mut gd = data();
+        let cols = ChoiceColumns { name: Some("name"), label: Some("label") };
+        let texts = |gd: &GameData| -> Vec<String> {
+            gd.choice_list("things", cols).unwrap().iter().map(|c| c.text.clone()).collect()
+        };
+        let table = gd.table("things").unwrap();
+        // The editor's table: the game data's, and 2,000 lines more.
+        let mut theirs = gd.custom_tlk().unwrap().clone();
+        for n in 1..2_000 {
+            theirs.entries.push(TlkEntry::text(format!("Line {n}")));
+        }
+        assert!(gd.update_custom_tlk(&theirs));
+        assert_eq!(gd.custom_tlk(), Some(&theirs));
+        let list = gd.choice_list("things", cols).unwrap();
+        let at = |gd: &GameData, row: usize| gd.custom_tlk().unwrap().entries[row].text.as_ptr();
+        let (first, last) = (at(&gd, 0), at(&gd, 1_999));
+        // Nothing changed: nothing forgotten, nothing copied.
+        assert!(!gd.update_custom_tlk(&theirs));
+        assert!(Arc::ptr_eq(&list, &gd.choice_list("things", cols).unwrap()));
+        // One line typed over: that line alone, and the lists made again.
+        theirs.entries[0] = TlkEntry::text("Typed since");
+        assert!(gd.update_custom_tlk(&theirs));
+        assert_eq!(gd.custom_tlk(), Some(&theirs));
+        assert_eq!(gd.string(StrRef(0x0100_0000)).as_deref(), Some("Typed since"));
+        assert_eq!(texts(&gd), ["Longsword", "Axe", "Typed since"]);
+        assert_eq!(at(&gd, 1_999), last, "a line as it was is not copied");
+        assert_ne!(at(&gd, 0), first);
+        // Lines taken back off the end.
+        theirs.entries.truncate(1);
+        assert!(gd.update_custom_tlk(&theirs));
+        assert_eq!(gd.custom_tlk(), Some(&theirs));
+        assert_eq!(gd.string(StrRef(0x0100_0001)), None);
+        // (The 2DAs read have none of its strings: kept.)
+        assert!(Arc::ptr_eq(&table, &gd.table("things").unwrap()));
+        // Another language's, or none before: the table whole.
+        let mut other = Tlk::new(Language::GERMAN);
+        other.entries.push(TlkEntry::text("Aus dem Modul"));
+        assert!(gd.update_custom_tlk(&other));
+        assert_eq!(gd.custom_tlk(), Some(&other));
+        gd.set_custom_tlk(None);
+        assert!(gd.update_custom_tlk(&theirs));
+        assert_eq!(texts(&gd), ["Longsword", "Axe", "Typed since"]);
+    }
+
+    /// A line of the custom talk table changed, added or taken off makes
+    /// again only the lists that read it (or asked for it and found
+    /// nothing): a list of none of its lines is kept, as is one of other
+    /// lines, and a list made inside another counts for that one too.
+    #[test]
+    fn only_the_lists_that_read_a_changed_line_are_made_again() {
+        let mut gd = data();
+        let named = ChoiceColumns { name: Some("name"), label: Some("label") };
+        let labels = ChoiceColumns { name: None, label: Some("label") };
+        let mut theirs = gd.custom_tlk().unwrap().clone();
+        let (by_name, by_label) =
+            (gd.choice_list("things", named).unwrap(), gd.choice_list("things", labels).unwrap());
+        // A line added after the one the list reads: both kept.
+        theirs.entries.push(TlkEntry::text("Added"));
+        assert!(gd.update_custom_tlk(&theirs));
+        assert!(Arc::ptr_eq(&by_name, &gd.choice_list("things", named).unwrap()));
+        assert!(Arc::ptr_eq(&by_label, &gd.choice_list("things", labels).unwrap()));
+        // The line it reads typed over: that list made again, with it.
+        theirs.entries[0] = TlkEntry::text("Typed");
+        assert!(gd.update_custom_tlk(&theirs));
+        let again = gd.choice_list("things", named).unwrap();
+        assert!(!Arc::ptr_eq(&by_name, &again));
+        assert_eq!(again[2].text, "Typed");
+        assert!(Arc::ptr_eq(&by_label, &gd.choice_list("things", labels).unwrap()));
+        // A list made inside another: its lines are the outer one's too,
+        // kept or made.
+        let line = |n: u32| StrRef::custom(n);
+        let ((_, inner), outer) = reading_lines(|| {
+            gd.string(line(1));
+            reading_lines(|| gd.choice_list("things", named).unwrap())
+        });
+        assert_eq!(*inner, [0]);
+        assert_eq!(*outer, [0, 1]);
+        // A line asked for and not there yet, then added: made again.
+        let ((), asked) = reading_lines(|| assert_eq!(gd.string(line(5)), None));
+        assert_eq!(*asked, [5]);
+        let changed = Changed { lines: vec![], from: 2 };
+        assert!(changed.names_any(&asked));
+        assert!(!changed.names_any(&[0, 1]));
+        // Lines taken off the end: a list of the lines left is kept.
+        theirs.entries.truncate(1);
+        assert!(gd.update_custom_tlk(&theirs));
+        assert!(Arc::ptr_eq(&again, &gd.choice_list("things", named).unwrap()));
+    }
+
+    /// The lines that differ, of a table looked through on several threads
+    /// as of one on one: every one, in order, the first and the last too.
+    #[test]
+    fn the_lines_that_differ_are_found_in_a_long_table_as_in_a_short_one() {
+        for len in [10, 50_001] {
+            let mine: Vec<TlkEntry> =
+                (0..len).map(|n| TlkEntry::text(format!("Line {n}"))).collect();
+            let mut theirs = mine.clone();
+            let changed = [0, 1, len / 3, len / 2 + 1, len - 1];
+            for &n in &changed {
+                theirs[n].text.push(b'!');
+            }
+            theirs.push(TlkEntry::text("Past the end"));
+            let found = differing(&mine, &theirs);
+            let mut want: Vec<u32> = changed.iter().map(|&n| n as u32).collect();
+            want.dedup();
+            assert_eq!(found, want, "{len} lines");
+        }
     }
 }

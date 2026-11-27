@@ -52,6 +52,7 @@ fn plugins_are_listed_and_checked() {
         json!({
             "id": "fix-tags", "title": "Fix Creature Tags",
             "hint": "Upper-case every creature's tag", "key": null, "for": [],
+            "menu": [],
         })
     );
     assert_eq!(tags["checks"][0]["severity"], "warning");
@@ -66,6 +67,27 @@ fn plugins_are_listed_and_checked() {
     let (ok, checked) = mg(&["plugin", "check", broken.to_str().unwrap()]);
     assert!(!ok);
     assert_eq!(checked["plugins"][0]["faults"].as_array().unwrap().len(), 4, "{checked}");
+}
+
+/// `mg plugin check` runs a plugin's top-level code, an archive's from
+/// anywhere too: code that never returns is stopped, and said to have run
+/// out of time.
+#[test]
+fn a_plugin_whose_code_never_loads_is_stopped() {
+    let dir = mg_testkit::scratch_dir("mg-plugin-endless");
+    std::fs::write(
+        dir.join("plugin.cfg"),
+        "[plugin]\nid = \"test.endless\"\nname = \"Endless\"\nversion = \"1\"\napi = \"0.1\"\n\
+         license = \"MIT\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("main.luau"), "while true do end\n").unwrap();
+    let started = std::time::Instant::now();
+    let (ok, checked) = mg(&["plugin", "check", dir.to_str().unwrap()]);
+    assert!(!ok, "{checked}");
+    let fault = checked["plugins"][0]["faults"][0].as_str().unwrap_or_default();
+    assert!(fault.contains("ran out of time: its code may take 5 seconds to load"), "{checked}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
 }
 
 #[test]
@@ -125,6 +147,9 @@ fn a_plugin_s_command_runs_on_a_module() {
     };
     assert!(fails(&["--answer", "prefx=A_"]).contains("no form asked for it"));
     assert!(fails(&["--answer", "count=many"]).contains("is not a number"));
+    // (They parse as numbers, and are none.)
+    assert!(fails(&["--answer", "count=nan"]).contains("\"nan\" is not a number"));
+    assert!(fails(&["--answer", "count=inf"]).contains("is not a number"));
     assert!(fails(&["--answer", "count=500"]).contains("outside what the field takes"));
     assert!(fails(&["--answer", "kind=dragons"]).contains("is not one of creatures, doors"));
     assert_eq!(tag(&path), "SGT_GATE_GUARD");
@@ -239,6 +264,45 @@ fn a_plugin_is_packed_and_installed() {
     assert!(!ok);
     assert_eq!(checked["plugins"][0]["faults"], json!(["it is not a zip archive"]));
 
+    // An archive of several plugins: each checked, and each installed in
+    // its own folder, or none (one installed already, without --replace).
+    let bundle = dir.join("bundle.zip");
+    {
+        use std::io::Write;
+        let manifest = std::fs::read_to_string(source.join("plugin.cfg")).unwrap();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for id in ["example.tag-conventions", "example.other"] {
+            let m = manifest.replace("example.tag-conventions", id);
+            zip.start_file(format!("{id}/plugin.cfg"), options).unwrap();
+            zip.write_all(m.as_bytes()).unwrap();
+            for file in ["main.luau", "rules.luau"] {
+                zip.start_file(format!("{id}/{file}"), options).unwrap();
+                zip.write_all(&std::fs::read(source.join(file)).unwrap()).unwrap();
+            }
+        }
+        std::fs::write(&bundle, zip.finish().unwrap().into_inner()).unwrap();
+    }
+    let both = bundle.to_str().unwrap();
+    let (ok, checked) = mg(&["plugin", "check", both]);
+    assert!(ok, "{checked}");
+    assert_eq!(checked["plugins"].as_array().unwrap().len(), 2);
+    let (ok, refused) = mg(&["plugin", "install", both, to]);
+    assert!(!ok);
+    assert!(refused["error"].as_str().unwrap().contains("is installed already"), "{refused}");
+    assert!(!plugins.join("example.other").exists(), "none of them installed");
+    let (ok, installed) = mg(&["plugin", "install", both, to, "--replace"]);
+    assert!(ok, "{installed}");
+    let ids: Vec<&str> = installed["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["example.other", "example.tag-conventions"]);
+    assert_eq!(installed["plugins"][1]["replaced"], "1.0.0");
+    assert!(plugins.join("example.other/main.luau").is_file());
+
     // Removed by its id: what was installed, not what was copied in.
     let copied = plugins.join("by-hand");
     std::fs::create_dir_all(&copied).unwrap();
@@ -264,10 +328,7 @@ fn a_plugin_is_packed_and_installed() {
 /// verify against).
 #[test]
 fn a_plugin_s_checks_count_in_verify() {
-    let Some(root) = mg_testkit::nwn_root() else {
-        eprintln!("skipped: no game install");
-        return;
-    };
+    let root = mg_testkit::corpus!();
     let dir = mg_testkit::scratch_dir("mg-plugin-verify");
     let path = module(&dir);
     let plugins = fixtures().join("tag-conventions");
@@ -353,6 +414,31 @@ fn a_plugin_s_own_tests_run_as_in_a_pipeline() {
         .unwrap();
     assert!(!none.status.success());
     assert!(String::from_utf8_lossy(&none.stderr).contains("has no tests"));
+
+    // A folder of plugins: each one's tests, its lines under its id.
+    let examples = example.parent().unwrap();
+    let (ok, json) = mg(&["plugin", "test", examples.to_str().unwrap()]);
+    assert!(ok, "{json}");
+    let ids: Vec<&str> =
+        json["plugins"].as_array().unwrap().iter().map(|p| p["plugin"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"example.tag-conventions") && ids.len() >= 2, "{ids:?}");
+
+    // `mg plugin check` reads the test files too (not running them).
+    let work = dir.join("checked");
+    std::fs::create_dir_all(work.join("tests")).unwrap();
+    for f in ["plugin.cfg", "main.luau", "rules.luau"] {
+        std::fs::copy(example.join(f), work.join(f)).unwrap();
+    }
+    std::fs::write(
+        work.join("tests/bad.toml"),
+        "module = \"nowhere\"\n[[test]]\nname = \"x\"\ncommand = \"no-such\"\n",
+    )
+    .unwrap();
+    let (ok, checked) = mg(&["plugin", "check", work.to_str().unwrap()]);
+    assert!(!ok);
+    let faults = checked["plugins"][0]["faults"].to_string();
+    assert!(faults.contains("the manifest declares no command \\\"no-such\\\""), "{faults}");
+    assert!(faults.contains("its fixture nowhere is not there"), "{faults}");
 }
 
 /// `mg plugin test` with no game: a test whose game data is its own (a
@@ -406,6 +492,11 @@ fn a_plugin_s_tests_run_on_their_own_game_data() {
              game = \"bare\"\n[[test.finding]]\nresource = \"guard.utc\"\nmessage = \"AnimalEmpathy\"\n",
             root.display().to_string()
         ));
+    } else {
+        assert!(
+            !mg_testkit::corpus_required(),
+            "MOONGLOW_REQUIRE_CORPUS is set but no game install was found"
+        );
     }
     std::fs::write(source.join("tests/game.toml"), tests).unwrap();
     let out = crate::mg_on(dir.join("no-game"), None)
@@ -547,15 +638,49 @@ fn a_project_s_plugins_are_listed_as_allowed() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("the project has no plugin nobody.else"));
 }
 
+/// `mg plugin allow --prune`: answers kept for a project no longer on disk
+/// (a removed worktree) are taken out and listed; those of a project still
+/// there stay. Only when asked: listing and allowing take none out.
+#[test]
+fn answers_for_projects_gone_are_pruned_when_asked() {
+    let kept = project_with_plugins("mg-project-plugins-prune-kept");
+    let gone = project_with_plugins("mg-project-plugins-prune-gone");
+    let home = mg_testkit::scratch_dir("mg-project-plugins-prune-home");
+    let gone_path = gone.canonicalize().unwrap();
+    mg_at(&home, &["plugin", "allow", kept.to_str().unwrap()]);
+    mg_at(&home, &["plugin", "allow", gone.to_str().unwrap(), "--deny"]);
+    std::fs::remove_dir_all(&gone).unwrap();
+    // (Another command leaves the answer alone.)
+    mg_at(&home, &["plugin", "allow", kept.to_str().unwrap()]);
+    let answers = mg_plugin::project::Answers::read(&answers_in(&home)).unwrap();
+    assert_eq!(answers.answers.len(), 2);
+    let (ok, pruned) = mg_at(&home, &["plugin", "allow", "--prune"]);
+    assert!(ok, "{pruned}");
+    assert_eq!(pruned["pruned"].as_array().unwrap().len(), 1, "{pruned}");
+    assert_eq!(pruned["pruned"][0]["project"], gone_path.display().to_string());
+    assert_eq!(pruned["pruned"][0]["allow"], false);
+    let answers = mg_plugin::project::Answers::read(&answers_in(&home)).unwrap();
+    assert_eq!(answers.answers.len(), 1);
+    assert_eq!(answers.answers[0].project, kept.canonicalize().unwrap());
+    let (_, listed) = mg_at(&home, &["plugin", "list", "--project", kept.to_str().unwrap()]);
+    assert_eq!(listed["plugins"][0]["project"]["trust"], "allowed");
+    // Again: nothing to take out, and said.
+    let out = mg_in(&home).args(["plugin", "allow", "--prune"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing taken out"));
+    // --prune takes no project, and a project is needed without it.
+    let out = mg_in(&home).args(["plugin", "allow", "--prune", "x"]).output().unwrap();
+    assert!(!out.status.success());
+    let out = mg_in(&home).args(["plugin", "allow"]).output().unwrap();
+    assert!(!out.status.success());
+}
+
 /// `mg verify` runs a project's plugins only as the builder allowed them
 /// in Moonglow's own folder, or every one with `--allow-project-plugins`
 /// (a build pipeline); answers the project carries itself allow nothing.
 #[test]
 fn verify_runs_a_project_s_plugins_as_allowed() {
-    let Some(root) = mg_testkit::nwn_root() else {
-        eprintln!("skipped: no game install");
-        return;
-    };
+    let root = mg_testkit::corpus!();
     let dir = project_with_plugins("mg-project-plugins-verify");
     let home = mg_testkit::scratch_dir("mg-project-plugins-verify-home");
     let args = ["--root", root.to_str().unwrap(), "verify", dir.to_str().unwrap()];
@@ -669,6 +794,151 @@ fn a_plugin_s_settings_are_read_and_kept_on_the_command_line() {
     assert!(std::fs::read_to_string(dir.join(".moonglow/user.toml")).unwrap().contains("\"zz\""));
 }
 
+/// A setting of scope `user` is kept where the window keeps it (the file
+/// in Moonglow's data folder it shares with `mg`), and read from there by
+/// the next run, by `mg plugin list` and by the window alike.
+#[test]
+fn a_plugin_s_own_settings_are_kept_with_moonglow_s() {
+    let dir = mg_testkit::scratch_dir("mg-plugin-user-settings");
+    let home = dir.join("home");
+    let path = module(&dir);
+    let plugin = dir.join("counter");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.cfg"),
+        "[plugin]\nid = \"test.counter\"\nname = \"Counter\"\nversion = \"1\"\napi = \"0.5\"\nlicense = \"MIT\"\n\
+         \n[command]\nid = \"count\"\ntitle = \"Count\"\n\n[setting]\nid = \"runs\"\ntype = \
+         \"int\"\n\n[setting]\nid = \"scale\"\ntype = \"float\"\ndefault = 0.5\n",
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("main.luau"),
+        "local mg = require(\"@moonglow\")\nmg.command(\"count\", function(ctx)\n  \
+         print(ctx.settings.runs, ctx.settings.scale)\n  ctx.settings:set(\"runs\", \
+         ctx.settings.runs + 1)\n  ctx.settings:set(\"scale\", ctx.settings.scale * 3)\nend)\n",
+    )
+    .unwrap();
+    let run = || {
+        let (m, p) = (path.to_str().unwrap(), plugin.to_str().unwrap());
+        mg_at(&home, &["plugin", "run", m, p, "count"])
+    };
+    let (ok, out) = run();
+    assert!(ok, "{out}");
+    assert_eq!(
+        out["settings"][0],
+        json!({ "id": "runs", "scope": "user", "value": 1, "kept": true })
+    );
+    let kept = home.join("data/moonglow/plugin-settings.json");
+    let values: Json = serde_json::from_str(&std::fs::read_to_string(&kept).unwrap()).unwrap();
+    assert_eq!(values, json!({ "test.counter": { "runs": 1, "scale": 1.5 } }));
+    let (ok, out) = run();
+    assert!(ok, "{out}");
+    assert!(out["log"].to_string().contains("1\\t1.5"), "the values kept, read: {out}");
+    let (_, listed) = mg_at(&home, &["plugin", "list", plugin.to_str().unwrap()]);
+    assert_eq!(listed["plugins"][0]["settings"][0]["value"], 2, "{listed}");
+    assert_eq!(listed["plugins"][0]["settings"][1]["type"], "float");
+}
+
+/// `mg plugin tidy`: what is kept wrong of the project's plugins'
+/// settings taken out or moved, said first with `--dry-run`; another
+/// plugin's table left alone, and said.
+#[test]
+fn a_project_s_plugin_settings_are_tidied() {
+    let dir = project_with_plugins("mg-plugin-tidy");
+    let home = dir.join("home");
+    let team = dir.join("moonglow.toml");
+    std::fs::write(
+        &team,
+        "[plugins.\"example.builder-tags\"]\nprefix = \"KRZ_\"\nmax_length = 40\nlost = 1\ncode = \
+         \"ab\"\n\n[plugins.\"other.plugin\"]\nx = 1\n",
+    )
+    .unwrap();
+    let project = dir.to_str().unwrap();
+    let (ok, out) = mg_at(&home, &["plugin", "tidy", project, "--dry-run"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["plugins"][0]["done"].as_array().unwrap().len(), 3, "{out}");
+    assert!(std::fs::read_to_string(&team).unwrap().contains("max_length = 40"));
+    let (ok, out) = mg_at(&home, &["plugin", "tidy", project]);
+    assert!(ok, "{out}");
+    assert!(out["notes"].to_string().contains("there is no plugin other.plugin"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&team).unwrap(),
+        "[plugins.\"example.builder-tags\"]\nprefix = \"KRZ_\"\n\n[plugins.\"other.plugin\"]\nx = 1\n"
+    );
+    let own = std::fs::read_to_string(dir.join(".moonglow/user.toml")).unwrap();
+    assert!(own.contains("code = \"ab\""), "moved where its scope keeps it: {own}");
+}
+
+/// A plugin that refuses every save, written into `dir`.
+pub(crate) fn refuser(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.cfg"),
+        "[plugin]\nid = \"test.refuser\"\nname = \"Refuser\"\nversion = \"1\"\napi = \"0.4\"\n\
+         license = \"MIT\"\n\n[event]\nid = \"no\"\non = \"resource-saving\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.luau"),
+        "local mg = require(\"@moonglow\")\n\
+         mg.on(\"no\", function(ctx) ctx.event:refuse(\"not today\") end)\n",
+    )
+    .unwrap();
+}
+
+/// A value `mg plugin tidy` moves out of the project's file into the
+/// user's own is written there before anything else is tidied: a plugin
+/// further on whose tidy fails (here, the builder's own project file
+/// can't be written) left it in neither place.
+#[cfg(unix)]
+#[test]
+fn a_setting_moved_by_tidy_is_kept_when_a_later_tidy_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = project_with_plugins("mg-plugin-tidy-fails");
+    let home = dir.join("home");
+    let plugin = |id: &str, setting: &str| {
+        let at = dir.join("named").join(id);
+        std::fs::create_dir_all(&at).unwrap();
+        let cfg = format!(
+            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\napi = \"0.4\"\n\
+             license = \"MIT\"\n\n{setting}"
+        );
+        std::fs::write(at.join("plugin.cfg"), cfg).unwrap();
+        std::fs::write(at.join("main.luau"), "local mg = require(\"@moonglow\")\n").unwrap();
+        at
+    };
+    let one = plugin("a.one", "[setting]\nid = \"name\"\nlabel = \"Name\"\nscope = \"user\"\n");
+    let two = plugin("b.two", "");
+    std::fs::write(dir.join("moonglow.toml"), "[plugins.\"a.one\"]\nname = \"mine\"\n").unwrap();
+    let own = dir.join(".moonglow");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("user.toml"), "[plugins.\"b.two\"]\nlost = 1\n").unwrap();
+    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // (Who may write anywhere, the administrator, is not held by it.)
+    let held = std::fs::write(own.join("probe"), b"").is_err();
+    let project = dir.to_str().unwrap();
+    let (ok, out) =
+        mg_at(&home, &["plugin", "tidy", project, one.to_str().unwrap(), two.to_str().unwrap()]);
+    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !held {
+        return;
+    }
+    assert!(!ok && out["error"].as_str().unwrap().starts_with("b.two: "), "{out}");
+    // Out of the project's file, and in the user's own.
+    assert!(!std::fs::read_to_string(dir.join("moonglow.toml")).unwrap().contains("mine"));
+    let mut kept = Vec::new();
+    let mut folders = vec![home.clone()];
+    while let Some(folder) = folders.pop() {
+        for e in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            match e.path().is_dir() {
+                true => folders.push(e.path()),
+                false => kept.push(std::fs::read_to_string(e.path()).unwrap_or_default()),
+            }
+        }
+    }
+    assert!(kept.iter().any(|text| text.contains("a.one") && text.contains("mine")), "{kept:?}");
+}
+
 /// The House rules example (a resource's own events, API 0.4).
 fn house_rules() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plugins/examples/house-rules")
@@ -713,14 +983,14 @@ fn a_plugin_refuses_or_warns_of_what_mg_saves() {
     let out = set("INN", true);
     assert!(!out.status.success());
     // (With --json, the error is in the JSON.)
-    let stderr = String::from_utf8_lossy(&out.stdout);
-    assert!(stderr.contains("not saved: a plugin refuses it"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("not saved: a plugin refuses it"), "{stdout}");
     assert!(
-        stderr.contains(
+        stdout.contains(
             "House rules: tavern.are: its tag was TAVERN, now INN: players' places are kept by it \
              (fix: Put back TAVERN)"
         ),
-        "{stderr}"
+        "{stdout}"
     );
     assert_eq!(area_tag(&dir), "TAVERN", "nothing written");
     // --dry-run says the same, and writes nothing either.
@@ -759,6 +1029,113 @@ fn a_plugin_refuses_or_warns_of_what_mg_saves() {
         notes.contains("warning: House rules: tavern.are: its tag was TAVERN, now Inn"),
         "{out}"
     );
+    // --strict: a warning stops the save too.
+    let (ok, out) = mg(&[
+        "set",
+        dir.to_str().unwrap(),
+        "tavern.are",
+        "Tag=Hall",
+        "--strict",
+        "--plugins",
+        rules.to_str().unwrap(),
+    ]);
+    assert!(!ok);
+    assert!(out["error"].as_str().unwrap().contains("not saved (--strict): a plugin warns"));
+    assert_eq!(area_tag(&dir), "Inn", "nothing written");
+
+    // The project's own plugin, allowed, is asked by mg's other saving
+    // commands too (mg replace here): its refusal writes nothing.
+    let dir = tavern("mg-plugin-save-replace", "");
+    let home = dir.join("home");
+    let into = dir.join("plugins/house-rules");
+    std::fs::create_dir_all(&into).unwrap();
+    for f in std::fs::read_dir(&rules).unwrap().flatten() {
+        if f.file_type().unwrap().is_file() {
+            std::fs::copy(f.path(), into.join(f.file_name())).unwrap();
+        }
+    }
+    let (ok, out) = mg_at(&home, &["plugin", "allow", dir.to_str().unwrap()]);
+    assert!(ok, "{out}");
+    let (ok, out) = mg_at(
+        &home,
+        &["replace", dir.to_str().unwrap(), "TAVERN", "INN", "--only", "tags", "--match-case"],
+    );
+    assert!(!ok, "{out}");
+    assert!(out["error"].as_str().unwrap().contains("not saved: a plugin refuses it"), "{out}");
+    assert_eq!(area_tag(&dir), "TAVERN", "nothing written");
+}
+
+/// Every command of `mg` that changes a module's resources asks the
+/// project's plugins before it saves, as `mg set` does: with a plugin of
+/// the project's that refuses every save, each fails saying so and the
+/// module's files are as they were (`mg compile`, `mg dialog-import`, `mg
+/// attach`, `mg nui new`, `generate` and `import` and `mg rename` of a
+/// window saved without asking; `mg attach` copies nothing either).
+#[test]
+fn every_saving_command_asks_the_project_s_plugins() {
+    use mg_module::dialog::{Kind, Parent, add_node, new_dialog};
+    let root = mg_testkit::corpus!();
+    let scratch = mg_testkit::scratch_dir("mg-plugin-save-asked");
+    let (dir, home, user) = (scratch.join("keep"), scratch.join("home"), scratch.join("user"));
+    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let mut m = Module::new();
+    m.set_info(&Gff::new(*b"IFO ")).unwrap();
+    m.set(key("hello.nss"), b"void main() { }".to_vec());
+    let mut greet = new_dialog();
+    let hello = add_node(&mut greet, Parent::Root, "Hello.");
+    add_node(&mut greet, Parent::Node(Kind::Entry, hello), "Bye.");
+    m.set_gff(key("greet.dlg"), &greet).unwrap();
+    m.save_as(&ModuleLocation::Folder(dir.clone())).unwrap();
+    let p = dir.to_str().unwrap();
+    let mg = |args: &[&str]| -> (bool, Json) {
+        let mut c = crate::mg_on(&root, Some(&user));
+        c.env("MOONGLOW_DATA_DIR", home.join("data/moonglow")).arg("--json").args(args);
+        crate::json_out(&mut c)
+    };
+    // What the commands work on, made while nothing refuses: a window, a
+    // conversation's lines to read back, a hak to attach, a window's files.
+    let (ok, made) = mg(&["nui", "new", p, "shop"]);
+    assert!(ok, "{made}");
+    let csv = scratch.join("greet.csv");
+    let (ok, made) = mg(&["dialog-export", p, "greet.dlg", csv.to_str().unwrap()]);
+    assert!(ok, "{made}");
+    let lines = std::fs::read_to_string(&csv).unwrap().replace("Hello.", "Hello there.");
+    std::fs::write(&csv, lines).unwrap();
+    let hak = scratch.join("mg_asked.hak");
+    std::fs::write(&hak, mg_erf::ErfWriter::new(*b"HAK ").to_bytes().unwrap()).unwrap();
+    let crier = crate::nui::crier_files("mg-plugin-save-asked-crier");
+
+    refuser(&dir.join("plugins/refuser"));
+    let (ok, allowed) = mg(&["plugin", "allow", p]);
+    assert!(ok, "{allowed}");
+    let files = || {
+        let mut all: Vec<(PathBuf, Vec<u8>)> = (std::fs::read_dir(&dir).unwrap().flatten())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+            .collect();
+        all.sort();
+        all
+    };
+    let before = files();
+    let (c, h, j) = (csv.to_str().unwrap(), hak.to_str().unwrap(), crier.to_str().unwrap());
+    let commands: [&[&str]; 8] = [
+        &["compile", p],
+        &["dialog-import", p, c],
+        &["attach", p, h],
+        &["nui", "new", p, "crier2"],
+        &["nui", "generate", p, "shop"],
+        &["nui", "import", p, j],
+        &["rename", p, "shop.jui", "store"],
+        &["set", p, "greet.dlg", "EndConversation=mg_other"],
+    ];
+    for command in commands {
+        let (ok, out) = mg(command);
+        let why = out["error"].as_str().unwrap_or_default();
+        assert!(!ok && why.contains("not saved: a plugin refuses it"), "{command:?}: {out}");
+        assert!(why.contains("Refuser: ") && why.contains("not today"), "{command:?}: {out}");
+        assert!(files() == before, "{command:?} wrote to the module");
+    }
+    assert_eq!(std::fs::read_dir(user.join("hak")).unwrap().count(), 0, "mg attach copied");
 }
 
 /// `mg plugin run --event` runs the new events' handlers by hand: a save's
@@ -811,4 +1188,93 @@ fn a_plugin_s_new_events_run_by_hand() {
     assert_eq!(events[0]["types"], json!(["are"]));
     assert_eq!(events[1]["for"], json!(["waypoint"]));
     assert!(events[2]["says"].as_str().unwrap().starts_with("when a wizard, Add to Palette"));
+}
+
+fn example(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plugins/examples").join(name)
+}
+
+/// API 0.6 from the command line: `mg plugin export` writes the file an
+/// exporter makes and changes nothing (`--dry-run` writes none either);
+/// `mg plugin import` reads a file into the module and saves; `mg plugin
+/// list` says what each adds.
+#[test]
+fn exporters_and_importers_run_from_the_command_line() {
+    let dir = mg_testkit::scratch_dir("mg-plugin-export");
+    let m = module(&dir);
+    let sheet = example("creature-sheet");
+    let (m, sheet) = (m.to_str().unwrap(), sheet.to_str().unwrap());
+    let out = dir.join("creatures.csv");
+    let dry = dir.join("dry.csv");
+    let (ok, said) =
+        mg(&["plugin", "export", m, sheet, "creatures-csv", dry.to_str().unwrap(), "--dry-run"]);
+    assert!(ok && !dry.exists(), "{said}");
+    let (ok, said) = mg(&["plugin", "export", m, sheet, "creatures-csv", out.to_str().unwrap()]);
+    assert!(ok, "{said}");
+    assert_eq!(said["files"], json!([out.display().to_string()]));
+    assert!(said["log"][0]["text"].as_str().unwrap().contains("1 creatures written"), "{said}");
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("guard,gate_guard,,0"), "{text}");
+    assert_eq!(tag(Path::new(m)), "gate_guard", "an export changes nothing");
+    // What it has not.
+    let (ok, said) = mg(&["plugin", "export", m, sheet, "pdf", out.to_str().unwrap()]);
+    assert!(!ok && said.to_string().contains("no exporter \\\"pdf\\\""), "{said}");
+
+    let input = dir.join("night.csv");
+    std::fs::write(&input, "resref,tag,name\nguard,NIGHT_GUARD,Night\n").unwrap();
+    let (ok, said) = mg(&["plugin", "import", m, sheet, "creatures-csv", input.to_str().unwrap()]);
+    assert!(ok, "{said}");
+    assert_eq!(said["label"], "Import 1 creatures", "{said}");
+    assert_eq!(tag(Path::new(m)), "NIGHT_GUARD");
+    // A file of another kind is not read.
+    let (ok, said) = mg(&["plugin", "import", m, sheet, "creatures-csv", m]);
+    assert!(!ok && said.to_string().contains("reads .csv"), "{said}");
+
+    let (ok, listed) = mg(&["plugin", "list", sheet]);
+    assert!(ok);
+    let p = &listed["plugins"][0];
+    assert_eq!(p["exporters"][0]["extension"], "csv");
+    assert_eq!(p["exporters"][1]["for"], json!(["creature blueprint"]));
+    assert_eq!(p["importers"][0]["extensions"], json!(["csv"]));
+}
+
+/// `mg plugin wizard`: each page answered from `--answers` (a JSON file)
+/// and `--answer`, over the defaults; its Finish's edits saved. A page's
+/// check that objects is an error, and nothing is saved.
+#[test]
+fn a_wizard_is_answered_from_the_command_line() {
+    let dir = mg_testkit::scratch_dir("mg-plugin-wizard");
+    let m = module(&dir);
+    let wizard = example("store-wizard");
+    let (m, wizard) = (m.to_str().unwrap(), wizard.to_str().unwrap());
+    let answers = dir.join("answers.json");
+    std::fs::write(&answers, r#"{ "name": "Iron Hand", "kind": "Smith", "markup": 170 }"#).unwrap();
+    let (ok, said) = mg(&[
+        "plugin",
+        "wizard",
+        m,
+        wizard,
+        "new-store",
+        "--answers",
+        answers.to_str().unwrap(),
+        "--answer",
+        "markup=160",
+    ]);
+    assert!(ok, "{said}");
+    assert_eq!(said["label"], "New store Iron Hand");
+    let store = Module::open(Path::new(m)).unwrap().gff(&key("ironhand.utm")).unwrap().unwrap();
+    assert_eq!(store.root.get("MarkUp"), Some(&Value::Int(160)), "--answer over --answers");
+    let log: Vec<&str> =
+        said["log"].as_array().unwrap().iter().filter_map(|l| l["text"].as_str()).collect();
+    assert!(log.contains(&"page 3 of 3 (What it buys)"), "{log:?}");
+
+    let (ok, said) =
+        mg(&["plugin", "wizard", m, wizard, "new-store", "--answer", "name= ", "--dry-run"]);
+    assert!(!ok && said.to_string().contains("A store needs a name."), "{said}");
+    let (ok, listed) = mg(&["plugin", "list", wizard]);
+    assert!(ok);
+    assert_eq!(listed["plugins"][0]["wizards"][0]["title"], "Shop Wizard…");
+    let (ok, listed) = mg(&["plugin", "list", example("module-overview").to_str().unwrap()]);
+    assert!(ok);
+    assert_eq!(listed["plugins"][0]["panels"][0]["refresh"], json!(["edits", "selection"]));
 }

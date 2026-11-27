@@ -6,15 +6,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use mg_edit::Workspace;
-use mg_module::Module;
 use mg_nui::import::{Found, command, gather, incoming};
-use mg_resman::ResKey;
 use serde_json::json;
 
 use crate::{Output, path_text};
 
 /// `mg nui import`.
 pub(crate) fn import(
+    cli: &crate::Cli,
     module: &Path,
     sources: &[std::path::PathBuf],
     replace: bool,
@@ -24,7 +23,7 @@ pub(crate) fn import(
     for source in sources {
         gather(source, &mut found).with_context(|| path_text(source))?;
     }
-    let mut ws = Workspace::new(Module::open(module)?);
+    let mut ws = Workspace::new(crate::open_module(module)?);
     let windows = incoming(&ws.module, &found)
         .with_context(|| sources.iter().map(|s| path_text(s)).collect::<Vec<_>>().join(", "))?;
     let mut out = Output::default();
@@ -52,14 +51,14 @@ pub(crate) fn import(
         );
     }
     let made = command(&windows);
-    let resources: Vec<ResKey> = made.edits.iter().map(|e| *e.key()).collect();
+    let resources = crate::edits::unique_keys(&made.edits);
     let left = super::left_out(&ws.module, &resources);
     let saved = !dry_run && !resources.is_empty();
     if !resources.is_empty() {
         ws.apply(made)?;
     }
     if saved {
-        ws.save()?;
+        crate::save_workspace_asked(cli, &mut ws, &mut out)?;
     }
     out.json = json!({
         "module": path_text(module),

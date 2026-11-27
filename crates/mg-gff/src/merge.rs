@@ -48,7 +48,9 @@ pub enum ListRule {
     /// same `TemplateResRef`, `Tag` and position (`XPosition`/`YPosition`/
     /// `ZPosition`, or `X`/`Y`/`Z`, to 4 decimal places); the only one of
     /// its `TemplateResRef` and `Tag` left (an object moved); the only one
-    /// of its `TemplateResRef` and position left (an object retagged).
+    /// of its `TemplateResRef` and position left (an object retagged). (A
+    /// placed store names its blueprint in `ResRef`, which stands for
+    /// `TemplateResRef` where an object has none.)
     /// Anything else is a removed object and an added one. Objects both
     /// sides added are all kept (one, where both added the same object).
     Placed,
@@ -75,15 +77,23 @@ pub struct Merged {
 
 /// Merges `ours` and `theirs`, both made from `base`. `rules` says what an
 /// item of a list is, by the file's type (`"GIT"`, without the trailing
-/// space) and the list's label.
+/// space), the label of the list whose item the list is in (`None` for a
+/// list that is in no item of another: a placed store's `StoreList` is in
+/// an item of the area's `StoreList`) and the list's label.
 pub fn merge(
     base: &Gff,
     ours: &Gff,
     theirs: &Gff,
     prefer: Prefer,
-    rules: &dyn Fn(&str, &str) -> ListRule,
+    rules: &dyn Fn(&str, Option<&str>, &str) -> ListRule,
 ) -> Merged {
-    let mut m = Merger { file_type: ours.file_type_str(), rules, prefer, conflicts: Vec::new() };
+    let mut m = Merger {
+        file_type: ours.file_type_str(),
+        rules,
+        inside: Vec::new(),
+        prefer,
+        conflicts: Vec::new(),
+    };
     let header = |g: &Gff| Value::String([g.file_type, g.version].concat());
     let (hb, ho, ht) = (header(base), header(ours), header(theirs));
     let top = match m.scalar("(file type)", Some(&hb), Some(&ho), Some(&ht)) {
@@ -101,7 +111,9 @@ pub fn merge(
 
 struct Merger<'a> {
     file_type: String,
-    rules: &'a dyn Fn(&str, &str) -> ListRule,
+    rules: &'a dyn Fn(&str, Option<&str>, &str) -> ListRule,
+    /// The lists the merge is inside of, outermost first.
+    inside: Vec<String>,
     prefer: Prefer,
     conflicts: Vec<Conflict>,
 }
@@ -276,10 +288,14 @@ impl Merger<'_> {
         if let Some(l) = settled(&b, &o, &t) {
             return l.to_vec();
         }
-        match (self.rules)(&self.file_type, label) {
+        let rule = (self.rules)(&self.file_type, self.inside.last().map(String::as_str), label);
+        self.inside.push(label.to_string());
+        let out = match rule {
             ListRule::ByIndex => self.by_index(path, b, o, t),
             rule => self.by_identity(path, rule, b, o, t),
-        }
+        };
+        self.inside.pop();
+        out
     }
 
     fn by_index(&mut self, path: &str, b: &[Struct], o: &[Struct], t: &[Struct]) -> Vec<Struct> {
@@ -377,7 +393,10 @@ impl Merger<'_> {
                     of_side[*j] = Some(i);
                 }
             }
-            let used: Vec<bool> = (0..side.len()).map(|j| m.contains(&Some(j))).collect();
+            let mut used = vec![false; side.len()];
+            for &j in m.iter().flatten() {
+                used[j] = true;
+            }
             let mut after = None;
             let mut out = Vec::new();
             for j in 0..side.len() {
@@ -391,19 +410,29 @@ impl Merger<'_> {
         };
         let mut ours_added: Vec<(Option<usize>, Struct)> =
             added(o, &om).into_iter().map(|(a, j)| (a, o[j].clone())).collect();
+        // (Ours by what they hold and by their key, each looked up, not
+        // every one of theirs held against every one of ours.)
+        let mut ours_same: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut ours_keyed: HashMap<Vec<u8>, usize> = HashMap::new();
+        for (n, (_, s)) in ours_added.iter().enumerate() {
+            ours_same.entry(fingerprint(s)).or_default().push(n);
+            if rule != ListRule::Placed
+                && let Some(k) = key(rule, s)
+            {
+                ours_keyed.entry(k).or_insert(n);
+            }
+        }
         let mut theirs_added: Vec<(Option<usize>, Struct)> = Vec::new();
         for (after, j) in added(t, &tm) {
             let ti = &t[j];
             // The same item added by both is one.
-            if ours_added.iter().any(|(_, s)| s == ti) {
+            let same = ours_same.get(&fingerprint(ti));
+            if same.is_some_and(|ns| ns.iter().any(|&n| ours_added[n].1 == *ti)) {
                 continue;
             }
             let same_key = match rule {
                 ListRule::Placed => None,
-                _ => {
-                    let k = key(rule, ti);
-                    ours_added.iter().position(|(_, s)| k.is_some() && key(rule, s) == k)
-                }
+                _ => key(rule, ti).and_then(|k| ours_keyed.get(&k).copied()),
             };
             match same_key {
                 Some(n) => {
@@ -412,6 +441,7 @@ impl Merger<'_> {
                     if let Some(Value::Struct(s)) =
                         self.conflict(&p, None, Some(&ours), Some(&as_value(ti)))
                     {
+                        ours_same.entry(fingerprint(&s)).or_default().push(n);
                         ours_added[n].1 = s;
                     }
                 }
@@ -419,11 +449,18 @@ impl Merger<'_> {
             }
         }
         let mut out = Vec::with_capacity(order.len() + ours_added.len() + theirs_added.len());
+        // (Each side's new items by the item they follow, in their order.)
+        let by_place = |list: Vec<(Option<usize>, Struct)>| {
+            let mut by: HashMap<Option<usize>, Vec<Struct>> = HashMap::new();
+            for (after, s) in list {
+                by.entry(after).or_default().push(s);
+            }
+            by
+        };
+        let (mut ours_at, mut theirs_at) = (by_place(ours_added), by_place(theirs_added));
         let mut place = |out: &mut Vec<Struct>, at: Option<usize>| {
-            for list in [&mut ours_added, &mut theirs_added] {
-                let (here, rest): (Vec<_>, Vec<_>) = list.drain(..).partition(|(a, _)| *a == at);
-                out.extend(here.into_iter().map(|(_, s)| s));
-                *list = rest;
+            for by in [&mut ours_at, &mut theirs_at] {
+                out.extend(by.remove(&at).into_iter().flatten());
             }
         };
         place(&mut out, None);
@@ -536,12 +573,25 @@ fn placed_steps() -> [(KeyOf, bool); 4] {
     fn join(a: Option<Vec<u8>>, b: Option<Vec<u8>>) -> Option<Vec<u8>> {
         Some([a?, b?].concat())
     }
+    fn tagged(s: &Struct) -> Option<Vec<u8>> {
+        join(blueprint_key(s), fields_key(s, &["Tag"]))
+    }
     [
         (|s| fields_key(s, &["ObjectId"]), false),
-        (|s| join(fields_key(s, &["TemplateResRef", "Tag"]), position_key(s)), false),
-        (|s| fields_key(s, &["TemplateResRef", "Tag"]), true),
-        (|s| join(fields_key(s, &["TemplateResRef"]), position_key(s)), true),
+        (|s| join(tagged(s), position_key(s)), false),
+        (|s| tagged(s), true),
+        (|s| join(blueprint_key(s), position_key(s)), true),
     ]
+}
+
+/// The field a placed object names its blueprint in: `TemplateResRef`,
+/// and a placed store's `ResRef` (it has no `TemplateResRef`).
+fn blueprint_label(s: &Struct) -> &'static str {
+    if s.contains("TemplateResRef") { "TemplateResRef" } else { "ResRef" }
+}
+
+fn blueprint_key(s: &Struct) -> Option<Vec<u8>> {
+    fields_key(s, &[blueprint_label(s)])
 }
 
 /// An item's identity under `rule` (`None`: it has none, and pairs only
@@ -554,16 +604,71 @@ fn key(rule: ListRule, s: &Struct) -> Option<Vec<u8>> {
     }
 }
 
+/// A number two structs the same in every field share (and others
+/// nearly never do): what equal items are looked up by.
+fn fingerprint(s: &Struct) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn of_struct(s: &Struct, h: &mut impl Hasher) {
+        s.id.hash(h);
+        s.fields.len().hash(h);
+        for f in &s.fields {
+            f.label.as_bytes().hash(h);
+            of_value(&f.value, h);
+        }
+    }
+    fn of_value(v: &Value, h: &mut impl Hasher) {
+        std::mem::discriminant(v).hash(h);
+        match v {
+            Value::Byte(n) => n.hash(h),
+            Value::Char(n) => n.hash(h),
+            Value::Word(n) => n.hash(h),
+            Value::Short(n) => n.hash(h),
+            Value::Dword(n) => n.hash(h),
+            Value::Int(n) => n.hash(h),
+            Value::Dword64(n) => n.hash(h),
+            Value::Int64(n) => n.hash(h),
+            // (By their bits, as they are compared.)
+            Value::Float(f) => f.to_bits().hash(h),
+            Value::Double(f) => f.to_bits().hash(h),
+            Value::String(b) | Value::ResRef(b) | Value::Void(b) => b.hash(h),
+            Value::LocString(ls) => {
+                ls.strref.0.hash(h);
+                for (k, text) in &ls.strings {
+                    (k.0, text).hash(h);
+                }
+            }
+            Value::Struct(s) => of_struct(s, h),
+            Value::List(items) => {
+                items.len().hash(h);
+                items.iter().for_each(|s| of_struct(s, h));
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    of_struct(s, &mut h);
+    h.finish()
+}
+
 /// For each item of `base`, the item of `side` that is it.
 fn matching(rule: ListRule, base: &[Struct], side: &[Struct]) -> Vec<Option<usize>> {
     let mut of_base: Vec<Option<usize>> = vec![None; base.len()];
     let mut used = vec![false; side.len()];
     // The same in every field, in order (mostly at the same place, so
     // looked for there first).
+    // (Each side item's fingerprint taken once and looked up: an item
+    // that has no equal, one a side changed, was held against the whole
+    // list, 25 million structs for an area of 5,000 objects all moved.)
+    let mut same: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (j, s) in side.iter().enumerate() {
+        same.entry(fingerprint(s)).or_default().push(j);
+    }
     let mut next = 0;
     for (i, b) in base.iter().enumerate() {
-        let at =
-            (next..side.len()).chain(0..next.min(side.len())).find(|&j| !used[j] && side[j] == *b);
+        let Some(same) = same.get(&fingerprint(b)) else { continue };
+        // The first from `next` on, else the first before it.
+        let from = same.partition_point(|&j| j < next);
+        let at = (same[from..].iter().chain(&same[..from]).copied())
+            .find(|&j| !used[j] && side[j] == *b);
         if let Some(j) = at {
             (of_base[i], used[j], next) = (Some(j), true, j + 1);
         }
@@ -624,7 +729,7 @@ fn describe(rule: ListRule, s: &Struct) -> String {
         ListRule::Placed => {
             let at = if s.contains("XPosition") { POSITION } else { POINT };
             let (x, y) = (text(s.get(at[0])), text(s.get(at[1])));
-            format!("{} \"{}\" at {x}, {y}", text(s.get("TemplateResRef")), text(s.get("Tag")))
+            format!("{} \"{}\" at {x}, {y}", text(s.get(blueprint_label(s))), text(s.get("Tag")))
         }
     }
 }
@@ -652,7 +757,7 @@ mod tests {
         s
     }
 
-    fn rules(_: &str, label: &str) -> ListRule {
+    fn rules(_: &str, _: Option<&str>, label: &str) -> ListRule {
         match label {
             "VarTable" => ListRule::ByKey(&["Name", "Type"]),
             "Mod_Area_list" => ListRule::ByKey(&["Area_Name"]),
@@ -680,6 +785,38 @@ mod tests {
 
     fn labels(s: &Struct) -> Vec<String> {
         s.fields.iter().map(|f| f.label.to_string()).collect()
+    }
+
+    /// An area of 5,000 objects, every one moved on one side and a
+    /// thousand added on each: merged as a small one is, in well under a
+    /// second (each unmatched item was held against the whole other
+    /// list: 25 million struct comparisons).
+    #[test]
+    fn a_long_list_changed_throughout_merges_at_once() {
+        let n = 5000;
+        let item = |i: usize, x: f32| placed("plc", &format!("t{i}"), x, i as f32);
+        let list = |items: Vec<Struct>| root(&[("Placeable List", Value::List(items))]);
+        let b: Vec<Struct> = (0..n).map(|i| item(i, 1.0)).collect();
+        let mut o: Vec<Struct> = (0..n).map(|i| item(i, 2.5)).collect();
+        o.extend((0..1000).map(|i| placed("ours", &format!("o{i}"), 0.0, 0.0)));
+        let mut t = b.clone();
+        t.remove(7);
+        t.extend((0..1000).map(|i| placed("theirs", &format!("n{i}"), 0.0, 0.0)));
+        // (One added by both, the same.)
+        t.push(o[n + 3].clone());
+        let started = std::time::Instant::now();
+        let m = run(&list(b.clone()), &list(o.clone()), &list(t), Prefer::Ours);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        let merged = m.gff.root.list("Placeable List").unwrap();
+        // Ours' moves, theirs' removal (changed by ours: a conflict, ours
+        // kept), and both sides' new items, the shared one once.
+        assert_eq!(m.conflicts.len(), 1, "{:?}", m.conflicts);
+        assert_eq!(merged.len(), n + 2000);
+        assert_eq!(merged[..n], o[..n]);
+        assert_eq!(merged[n..n + 1000], o[n..]);
+        assert!(merged[n + 1000..].iter().all(|s| s.resref("TemplateResRef").is_some()));
+        assert_eq!(merged[n + 1000].string("Tag"), Some(&b"n0"[..]));
     }
 
     #[test]

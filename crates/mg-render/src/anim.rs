@@ -67,8 +67,56 @@ impl Local {
     }
 }
 
+/// Samples `c` at `t` (clamped to its keys) into `out` and returns the column count.
+/// Callers needing more than 4 columns should use [`sample`].
+pub fn sample_into(c: &Controller, t: f32, out: &mut [f32; 4]) -> usize {
+    let n = c.times.len();
+    let cols = c.columns.min(4);
+    if n == 0 || cols == 0 {
+        return 0;
+    }
+    let i = c.times.partition_point(|&k| k <= t);
+    if i == 0 {
+        let row = c.row(0);
+        let len = row.len().min(cols);
+        out[..len].copy_from_slice(&row[..len]);
+        return len;
+    }
+    if i >= n {
+        let row = c.row(n - 1);
+        let len = row.len().min(cols);
+        out[..len].copy_from_slice(&row[..len]);
+        return len;
+    }
+    let (t0, t1) = (c.times[i - 1], c.times[i]);
+    let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+    let (a, b) = (c.row(i - 1), c.row(i));
+    if c.name == "orientation" && a.len() == 4 && b.len() == 4 {
+        let qa = Quat::from_slice(a).normalize();
+        let qb = Quat::from_slice(b).normalize();
+        *out = qa.slerp(qb, f).to_array();
+        return 4;
+    }
+    let len = a.len().min(b.len()).min(cols);
+    for k in 0..len {
+        out[k] = a[k] + (b[k] - a[k]) * f;
+    }
+    len
+}
+
+/// Samples a scalar controller (`columns >= 1`) at `t` without heap allocation.
+pub fn sample_one(c: &Controller, t: f32) -> Option<f32> {
+    let mut out = [0.0; 4];
+    (sample_into(c, t, &mut out) >= 1).then_some(out[0])
+}
+
 /// A controller's value at `t` (clamped to its keys).
 pub fn sample(c: &Controller, t: f32) -> Vec<f32> {
+    if c.columns <= 4 {
+        let mut out = [0.0; 4];
+        let len = sample_into(c, t, &mut out);
+        return out[..len].to_vec();
+    }
     let n = c.times.len();
     if n == 0 || c.columns == 0 {
         return Vec::new();
@@ -83,17 +131,12 @@ pub fn sample(c: &Controller, t: f32) -> Vec<f32> {
     let (t0, t1) = (c.times[i - 1], c.times[i]);
     let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
     let (a, b) = (c.row(i - 1), c.row(i));
-    if c.name == "orientation" && a.len() == 4 && b.len() == 4 {
-        let qa = Quat::from_slice(a).normalize();
-        let qb = Quat::from_slice(b).normalize();
-        return qa.slerp(qb, f).to_array().to_vec();
-    }
     a.iter().zip(b).map(|(x, y)| x + (y - x) * f).collect()
 }
 
 // (Which animations a model plays: mg-mdl's, as blueprint previews read
 // them without a renderer.)
-pub use mg_mdl::animations;
+pub use mg_mdl::{animations, animations_scaled};
 
 /// The model-space transform of every node of `model` playing `anim` at
 /// time `t` (seconds; see [`time_in`]).
@@ -121,15 +164,16 @@ pub struct Binding {
 }
 
 impl Binding {
-    /// `anim`, played by `model`.
-    pub fn new(model: &Model, anim: &Animation) -> Binding {
-        Nodes::of(model, None).bind(model, anim)
-    }
-
-    /// Each of `anims`, played by `model` (its nodes looked up once).
-    pub fn all<'a>(model: &Model, anims: impl IntoIterator<Item = &'a Animation>) -> Vec<Binding> {
+    /// Each of `anims`, played by `model` (its nodes looked up once), with
+    /// the scale it plays at through the model's chain of supermodels
+    /// ([`mg_mdl::animations_scaled`]: the product of each link's but the
+    /// owner's).
+    pub fn all_scaled<'a>(
+        model: &Model,
+        anims: impl IntoIterator<Item = (&'a Animation, f32)>,
+    ) -> Vec<Binding> {
         let nodes = Nodes::of(model, None);
-        anims.into_iter().map(|a| nodes.bind(model, a)).collect()
+        anims.into_iter().map(|(a, scale)| nodes.bind(model, a, Some(scale))).collect()
     }
 }
 
@@ -162,9 +206,11 @@ impl Nodes {
         Nodes { numbered, by_part, by_name, worn }
     }
 
-    fn bind(&self, model: &Model, anim: &Animation) -> Binding {
+    /// `chain`: the scale another model's animation plays at through the
+    /// chain of supermodels ([`Binding::all_scaled`]), else the model's.
+    fn bind(&self, model: &Model, anim: &Animation, chain: Option<f32>) -> Binding {
         let own = model.animations.iter().any(|own| std::ptr::eq(own, anim));
-        let scale = match self.worn.unwrap_or(model.animation_scale) {
+        let scale = match self.worn.or(chain).unwrap_or(model.animation_scale) {
             s if !own && s.is_finite() && s > 0.0 => s,
             _ => 1.0,
         };
@@ -217,9 +263,17 @@ impl<'a> Playing<'a> {
 
     /// [`Playing::new`] of animations not bound before (bound here, by
     /// name where they go by name). `worn`: see [`pose_worn`].
-    fn unbound(model: &Model, layers: &[&'a Animation], t: f32, worn: Option<f32>) -> Playing<'a> {
+    /// `chain`: the scale through the chain of supermodels of each layer
+    /// that is another model's ([`pose_scaled`]).
+    fn unbound(
+        model: &Model,
+        layers: &[&'a Animation],
+        t: f32,
+        worn: Option<f32>,
+        chain: Option<f32>,
+    ) -> Playing<'a> {
         let nodes = Nodes::of(model, worn);
-        let bound: Vec<Binding> = layers.iter().map(|a| nodes.bind(model, a)).collect();
+        let bound: Vec<Binding> = layers.iter().map(|a| nodes.bind(model, a, chain)).collect();
         let layers: Vec<(&'a Animation, &Binding)> = layers.iter().copied().zip(&bound).collect();
         Playing::new(model, &layers, t)
     }
@@ -243,11 +297,12 @@ impl<'a> Playing<'a> {
             .map(|(i, n)| {
                 let (mut pos, mut orient, mut scale) = (n.position, n.orientation, n.scale);
                 if let Some(nodes) = self.of(i) {
+                    let mut v = [0.0; 4];
                     for (c, t, by) in controllers(nodes) {
-                        let v = sample(c, t);
-                        match (c.name.as_str(), v.len()) {
+                        let len = sample_into(c, t, &mut v);
+                        match (c.name.as_str(), len) {
                             ("position", 3) => pos = [v[0] * by, v[1] * by, v[2] * by],
-                            ("orientation", 4) => orient = [v[0], v[1], v[2], v[3]],
+                            ("orientation", 4) => orient = v,
                             ("scale", 1) => scale = v[0],
                             _ => {}
                         }
@@ -278,7 +333,7 @@ fn controllers<'a, 'b>(
 /// `day` and animation loops): each controller follows the last layer that
 /// keys it.
 pub fn pose_layers(model: &Model, layers: &[&Animation], t: f32) -> Vec<Mat4> {
-    Playing::unbound(model, layers, t, None).pose(model)
+    Playing::unbound(model, layers, t, None, None).pose(model)
 }
 
 /// Every node's transform relative to its parent playing `anim` at `t`.
@@ -289,7 +344,7 @@ pub fn locals(model: &Model, anim: &Animation, t: f32) -> Vec<Local> {
 /// [`locals`] for several animations played together (see
 /// [`pose_layers`]).
 pub fn locals_layers(model: &Model, layers: &[&Animation], t: f32) -> Vec<Local> {
-    Playing::unbound(model, layers, t, None).locals(model)
+    Playing::unbound(model, layers, t, None, None).locals(model)
 }
 
 /// [`pose`] for a model worn by another (a cloak, a robe), playing the
@@ -299,7 +354,36 @@ pub fn locals_layers(model: &Model, layers: &[&Animation], t: f32) -> Vec<Local>
 /// model has no scale of its own, sits on an elf's shoulders, not at a
 /// human's height.
 pub fn pose_worn(model: &Model, anim: &Animation, t: f32, scale: f32) -> Vec<Mat4> {
-    Playing::unbound(model, &[anim], t, Some(scale)).pose(model)
+    Playing::unbound(model, &[anim], t, Some(scale), None).pose(model)
+}
+
+/// [`pose`] of an animation found through the model's chain of
+/// supermodels, at the scale it plays at there (`scale`, of
+/// [`mg_mdl::animations_scaled`]: the product of the scales of the model
+/// and of each supermodel before the animation's owner), where [`pose`]
+/// takes the model's own scale alone. The model's own animation is played
+/// as keyed, whatever `scale` says.
+pub fn pose_scaled(model: &Model, anim: &Animation, t: f32, scale: f32) -> Vec<Mat4> {
+    Playing::unbound(model, &[anim], t, None, Some(scale)).pose(model)
+}
+
+/// [`pose_scaled`] of several animations played together (see
+/// [`pose_layers`]: a creature's idle and an overlay played over it, its
+/// arm raised for a torch), each at its own scale through the chain of
+/// supermodels.
+pub fn pose_layers_scaled(model: &Model, layers: &[(&Animation, f32)], t: f32) -> Vec<Mat4> {
+    let bound = Binding::all_scaled(model, layers.iter().copied());
+    let layers: Vec<(&Animation, &Binding)> = layers.iter().map(|(a, _)| *a).zip(&bound).collect();
+    Playing::new(model, &layers, t).pose(model)
+}
+
+/// [`pose_worn`] of several animations played together (see
+/// [`pose_layers`]), each at its own scale (the wearer's for it).
+pub fn pose_worn_layers(model: &Model, layers: &[(&Animation, f32)], t: f32) -> Vec<Mat4> {
+    let bound: Vec<Binding> =
+        layers.iter().map(|(a, s)| Nodes::of(model, Some(*s)).bind(model, a, None)).collect();
+    let layers: Vec<(&Animation, &Binding)> = layers.iter().map(|(a, _)| *a).zip(&bound).collect();
+    Playing::new(model, &layers, t).pose(model)
 }
 
 /// The rest pose's transforms relative to their parents.
@@ -425,7 +509,7 @@ pub fn lamps_layers(model: &Model, layers: &[&Animation], t: f32, pose: &[Mat4])
     if !model.nodes.iter().any(|n| matches!(n.kind, mg_mdl::NodeKind::Light(_))) {
         return Vec::new();
     }
-    Playing::unbound(model, layers, t, None).lamps(model, pose)
+    Playing::unbound(model, layers, t, None, None).lamps(model, pose)
 }
 
 /// What `anim` at `t` changes in `model`'s meshes: animated alpha and
@@ -439,7 +523,7 @@ pub fn mesh_state(model: &GpuModel, anim: &Animation, t: f32) -> MeshState {
 /// [`mesh_state`] for several animations played together (see
 /// [`pose_layers`]).
 pub fn mesh_state_layers(model: &GpuModel, layers: &[&Animation], t: f32) -> MeshState {
-    Playing::unbound(&model.model, layers, t, None).mesh_state(model)
+    Playing::unbound(&model.model, layers, t, None, None).mesh_state(model)
 }
 
 impl Playing<'_> {
@@ -454,12 +538,28 @@ impl Playing<'_> {
     }
 
     fn lamp(&self, i: usize, n: &mg_mdl::Node, l: &mg_mdl::Light, pose: &[Mat4]) -> Lamp {
-        let keyed = |name: &str| -> Option<Vec<f32>> {
-            let nodes = self.of(i)?;
-            let (c, t, _) = controllers(nodes).filter(|(c, ..)| c.name == name).last()?;
-            Some(sample(c, t))
+        let nodes = self.of(i);
+        let value = |name: &str, buf: &mut [f32; 4]| -> usize {
+            if let Some(nodes) = nodes
+                && let Some((c, t, _)) = controllers(nodes).filter(|(c, ..)| c.name == name).last()
+            {
+                return sample_into(c, t, buf);
+            }
+            if let Some(v) = n.value(name) {
+                let len = v.len().min(4);
+                buf[..len].copy_from_slice(&v[..len]);
+                return len;
+            }
+            0
         };
-        let value = |name: &str| keyed(name).or_else(|| n.value(name).map(<[f32]>::to_vec));
+        let mut color_buf = [0.0; 4];
+        let color_len = value("color", &mut color_buf);
+        let mut radius_buf = [0.0; 4];
+        let radius_len = value("radius", &mut radius_buf);
+        let mut mult_buf = [0.0; 4];
+        let mult_len = value("multiplier", &mut mult_buf);
+        let mut lift_buf = [0.0; 4];
+        let lift_len = value("verticaldisplacement", &mut lift_buf);
         let lower = n.name.to_ascii_lowercase();
         let main = if lower.ends_with("ml1") {
             Some(0)
@@ -471,16 +571,17 @@ impl Playing<'_> {
         Lamp {
             at: node_position(pose, i),
             main,
-            color: match value("color").as_deref() {
-                Some([r, g, b, ..]) => Vec3::new(*r, *g, *b),
-                _ => Vec3::ONE,
+            color: if color_len >= 3 {
+                Vec3::new(color_buf[0], color_buf[1], color_buf[2])
+            } else {
+                Vec3::ONE
             },
-            radius: value("radius").and_then(|v| v.first().copied()).unwrap_or(5.0),
-            multiplier: value("multiplier").and_then(|v| v.first().copied()).unwrap_or(1.0),
+            radius: if radius_len >= 1 { radius_buf[0] } else { 5.0 },
+            multiplier: if mult_len >= 1 { mult_buf[0] } else { 1.0 },
             ambient_only: l.ambient_only,
             priority: l.priority.clamp(1, 5),
             shadow: l.shadow,
-            lift: value("verticaldisplacement").and_then(|v| v.first().copied()).unwrap_or(0.0),
+            lift: if lift_len >= 1 { lift_buf[0] } else { 0.0 },
         }
     }
 
@@ -492,26 +593,65 @@ impl Playing<'_> {
             let Some(nodes) = self.of(mesh.node) else { continue };
             let out = &mut state.meshes[i];
             for (c, t, _) in controllers(nodes) {
-                let v = sample(c, t);
-                match (c.name.as_str(), v.as_slice()) {
-                    ("alpha", [a, ..]) => out.alpha = Some(*a),
-                    ("selfillumcolor", [r, g, b, ..]) => {
-                        out.selfillum = Some(Vec3::new(*r, *g, *b))
+                match c.name.as_str() {
+                    "alpha" => {
+                        if let Some(a) = sample_one(c, t) {
+                            out.alpha = Some(a);
+                        }
+                    }
+                    "selfillumcolor" => {
+                        let mut v = [0.0; 4];
+                        if sample_into(c, t, &mut v) >= 3 {
+                            out.selfillum = Some(Vec3::new(v[0], v[1], v[2]));
+                        }
                     }
                     _ => {}
                 }
             }
             let sets = nodes.iter().rev().find_map(|(n, t, _)| Some((n.anim_mesh.as_ref()?, *t)));
             if let (Some((sets, t)), Some(data)) = (sets, model.mesh_data(i)) {
-                out.vertices = animated_vertices(data, sets, t);
+                let cache = mesh.anim_cache.get_or_init(|| AnimMeshCache::new(data));
+                out.vertices = animated_vertices(data, sets, t, cache);
             }
         }
         state
     }
 }
 
+/// Cached rest upload and normal smoothing equivalence classes for a [`GpuMesh`]
+/// so animated vertex updates avoid rebuilding topology each frame.
+#[derive(Debug)]
+pub struct AnimMeshCache {
+    uploaded: crate::model::Uploaded,
+    classes: Vec<usize>,
+    class_count: usize,
+}
+
+impl AnimMeshCache {
+    fn new(m: &Mesh) -> Self {
+        let uploaded = crate::model::uploaded(m);
+        let mut class: HashMap<([u32; 3], [u32; 3]), usize> = HashMap::new();
+        let classes: Vec<usize> = uploaded
+            .originals
+            .iter()
+            .map(|&o| {
+                let p = m.vertices.get(o as usize).copied().unwrap_or_default().map(f32::to_bits);
+                let n = m.normals.get(o as usize).copied().unwrap_or_default().map(f32::to_bits);
+                let next = class.len();
+                *class.entry((p, n)).or_insert(next)
+            })
+            .collect();
+        AnimMeshCache { uploaded, classes, class_count: class.len() }
+    }
+}
+
 /// An animated mesh's vertices at `t`.
-fn animated_vertices(m: &Mesh, sets: &AnimMeshSets, t: f32) -> Option<Vec<Vertex>> {
+fn animated_vertices(
+    m: &Mesh,
+    sets: &AnimMeshSets,
+    t: f32,
+    cache: &AnimMeshCache,
+) -> Option<Vec<Vertex>> {
     if sets.vertex_sets.is_empty() && sets.uv_sets.is_empty() {
         return None;
     }
@@ -522,23 +662,29 @@ fn animated_vertices(m: &Mesh, sets: &AnimMeshSets, t: f32) -> Option<Vec<Vertex
         let k = (f.floor().max(0.0) as usize).min(last);
         (k, (k + 1).min(last), (f - k as f32).clamp(0.0, 1.0))
     };
-    let mut out = crate::model::mesh_vertices(m);
+    // (A vertex on a mirrored seam is uploaded twice: the copy moves with
+    // its original.)
+    let originals = &cache.uploaded.originals;
+    let triangles = &cache.uploaded.triangles;
+    let mut out = cache.uploaded.vertices.clone();
     if !sets.vertex_sets.is_empty() {
         let (a, b, f) = at(sets.vertex_sets.len());
         let (a, b) = (&sets.vertex_sets[a], &sets.vertex_sets[b]);
-        for (v, &s) in out.iter_mut().zip(&m.source) {
+        for (v, &o) in out.iter_mut().zip(originals) {
+            let Some(&s) = m.source.get(o as usize) else { continue };
             let s = s as usize;
             if let (Some(p), Some(q)) = (a.get(s), b.get(s)) {
                 v.pos = Vec3::from(*p).lerp(Vec3::from(*q), f).to_array();
             }
         }
-        smooth_normals(m, &mut out);
+        smooth_normals(triangles, &cache.classes, cache.class_count, &mut out);
     }
     if !sets.uv_sets.is_empty() {
         let (a, b, f) = at(sets.uv_sets.len());
         let (a, b) = (&sets.uv_sets[a], &sets.uv_sets[b]);
-        let source = if m.source_uv.len() == out.len() { &m.source_uv } else { &m.source };
-        for (v, &s) in out.iter_mut().zip(source) {
+        let source = if m.source_uv.len() == m.vertices.len() { &m.source_uv } else { &m.source };
+        for (v, &o) in out.iter_mut().zip(originals) {
+            let Some(&s) = source.get(o as usize) else { continue };
             let s = s as usize;
             if let (Some(p), Some(q)) = (a.get(s), b.get(s)) {
                 v.uv = glam::Vec2::from(*p).lerp(glam::Vec2::from(*q), f).to_array();
@@ -548,21 +694,18 @@ fn animated_vertices(m: &Mesh, sets: &AnimMeshSets, t: f32) -> Option<Vec<Vertex
     Some(out)
 }
 
-/// Normals from the faces around each vertex. Vertices that had the same
-/// position and normal at rest (split only by UV seams) share one, so hard
-/// edges stay hard.
-fn smooth_normals(m: &Mesh, out: &mut [Vertex]) {
-    let mut class: HashMap<([u32; 3], [u32; 3]), usize> = HashMap::new();
-    let classes: Vec<usize> = (0..out.len())
-        .map(|i| {
-            let p = m.vertices[i].map(f32::to_bits);
-            let n = m.normals.get(i).copied().unwrap_or_default().map(f32::to_bits);
-            let next = class.len();
-            *class.entry((p, n)).or_insert(next)
-        })
-        .collect();
-    let mut sum = vec![Vec3::ZERO; class.len()];
-    for t in m.triangles() {
+/// Normals from the faces around each vertex (`triangles`, of the vertices
+/// as uploaded; `classes`: precomputed rest position/normal equivalence
+/// class per vertex). Vertices that had the same position and normal at
+/// rest (split only by UV seams) share one, so hard edges stay hard.
+fn smooth_normals(
+    triangles: &[[u32; 3]],
+    classes: &[usize],
+    class_count: usize,
+    out: &mut [Vertex],
+) {
+    let mut sum = vec![Vec3::ZERO; class_count];
+    for t in triangles {
         let [a, b, c] = t.map(|v| v as usize);
         if a.max(b).max(c) >= out.len() {
             continue;
@@ -573,7 +716,7 @@ fn smooth_normals(m: &Mesh, out: &mut [Vertex]) {
             sum[classes[v]] += n;
         }
     }
-    for (v, &k) in out.iter_mut().zip(&classes) {
+    for (v, &k) in out.iter_mut().zip(classes) {
         if let Some(n) = sum[k].try_normalize() {
             v.normal = n.to_array();
         }
@@ -704,6 +847,15 @@ mod tests {
         let at = |a: &Animation| pose(&model, a, 0.0)[0].to_scale_rotation_translation().2;
         assert_eq!(at(&borrowed), Vec3::new(1.5, 0.0, 3.0), "another model's: scaled");
         assert_eq!(at(&model.animations[0]), Vec3::new(2.0, 0.0, 4.0), "its own: as keyed");
+        // Through a chain of supermodels, at the chain's scale (the
+        // client's, `batch6_supermodel_chain`), bound or not.
+        let at_chain = |p: Vec<Mat4>| p[0].to_scale_rotation_translation().2;
+        assert_eq!(at_chain(pose_scaled(&model, &borrowed, 0.0, 6.0)), Vec3::new(12.0, 0.0, 24.0));
+        let own = pose_scaled(&model, &model.animations[0], 0.0, 6.0);
+        assert_eq!(at_chain(own), Vec3::new(2.0, 0.0, 4.0));
+        let bound = Binding::all_scaled(&model, [(&borrowed, 6.0)]);
+        let playing = Playing::new(&model, &[(&borrowed, &bound[0])], 0.0).pose(&model);
+        assert_eq!(at_chain(playing), Vec3::new(12.0, 0.0, 24.0));
     }
 
     #[test]
@@ -887,7 +1039,9 @@ mod tests {
         };
         for model in [model([Some(0), Some(1), Some(2)]), model([None; 3])] {
             let layers = [&model.animations[0], &borrowed];
-            let bound = Binding::all(&model, layers);
+            // (Each at the model's own scale, as `pose_layers` plays it.)
+            let nodes = Nodes::of(&model, None);
+            let bound: Vec<Binding> = layers.iter().map(|a| nodes.bind(&model, a, None)).collect();
             let pairs: Vec<(&Animation, &Binding)> = layers.into_iter().zip(&bound).collect();
             for t in [0.0, 0.25, 1.0, 1.5] {
                 let playing = Playing::new(&model, &pairs, t);
@@ -901,5 +1055,60 @@ mod tests {
             let lamp = Playing::new(&model, &pairs, 0.0).lamps(&model, &played);
             assert_eq!(lamp[0].color, Vec3::new(0.25, 0.5, 0.75));
         }
+    }
+
+    /// Vertex animation on a mesh with a mirrored texture seam (its middle
+    /// vertices uploaded twice, for the tangents the renderer makes): the
+    /// copies move with their originals, and take their normals from the
+    /// faces as uploaded. (It read past the mesh's vertices for the copies,
+    /// and ended the model viewer.)
+    #[test]
+    fn vertex_animation_moves_a_mirrored_seam_s_copies() {
+        let card = Mesh {
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [0.6, 0.0, 0.0],
+                [1.2, 0.0, 0.0],
+                [0.0, 0.0, 1.2],
+                [0.6, 0.0, 1.2],
+                [1.2, 0.0, 1.2],
+            ],
+            normals: vec![[0.0, -1.0, 0.0]; 6],
+            uvs: [
+                vec![[0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 1.0]],
+                vec![],
+                vec![],
+                vec![],
+            ],
+            faces: [[0, 1, 4], [0, 4, 3], [1, 2, 5], [1, 5, 4]]
+                .map(|vertices| mg_mdl::Face { vertices, material: 0 })
+                .to_vec(),
+            source: (0..6).collect(),
+            source_uv: (0..6).collect(),
+            ..Default::default()
+        };
+        let rest = card.vertices.clone();
+        // The second set: every vertex a meter up, the card turned to face
+        // along X.
+        let moved: Vec<[f32; 3]> = rest.iter().map(|p| [0.0, p[0], p[2] + 1.0]).collect();
+        let sets = AnimMeshSets {
+            sample_period: 1.0,
+            vertex_sets: vec![rest, moved.clone()],
+            uv_sets: vec![card.uvs[0].clone(), card.uvs[0].iter().map(|u| [u[0], 2.0]).collect()],
+        };
+        let cache = AnimMeshCache::new(&card);
+        let out = animated_vertices(&card, &sets, 1.0, &cache).expect("animated");
+        assert_eq!(out.len(), 8, "the middle's two copied");
+        for (at, o) in (0..6).chain([1, 4]).enumerate() {
+            assert_eq!(out[at].pos, moved[o], "vertex {at}, of {o}");
+            assert_eq!(out[at].uv[1], 2.0, "vertex {at}");
+            let n = Vec3::from(out[at].normal);
+            assert!(n.abs().abs_diff_eq(Vec3::X, 1e-5), "vertex {at}: {n}");
+        }
+        assert_eq!((out[6].normal, out[7].normal), (out[1].normal, out[4].normal));
+        // Halfway, a copy is where its original is.
+        let half = animated_vertices(&card, &sets, 0.5, &cache).expect("animated");
+        assert_eq!((half[6].pos, half[7].pos), (half[1].pos, half[4].pos));
+        assert_eq!(half[1].pos, [0.3, 0.3, 0.5]);
     }
 }

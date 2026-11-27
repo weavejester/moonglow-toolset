@@ -14,13 +14,13 @@ cargo test -p mg-corpus-tests --release --tests                         # corpus
 MOONGLOW_FULL_CORPUS=1 cargo test -p mg-corpus-tests --release --tests    # the same over the whole install: before a release
 cargo clippy --workspace --all-targets          # must be warning-free
 cargo clippy -p mg-ui --test screens --test frame_perf --test world_perf --test campaign_perf --test editor_perf --test nui_perf   # the tests run by hand, which --all-targets leaves out
-cargo clippy -p mg-corpus-tests --test client_render --test client_minimap --test client_nui
+cargo clippy -p mg-corpus-tests --test client_render --test client_minimap --test client_nui --test client_audio
 cargo fmt                                       # rustfmt.toml: width 100, "Max" heuristics
 ```
 
 The first two test commands are the whole suite, each test once: a plain
 `cargo test --workspace` also runs the corpus tests a second time,
-unoptimized, and links the 22 examples (documentation tests, as CI runs
+unoptimized, and links the 24 examples (documentation tests, as CI runs
 them: `cargo test --workspace --doc`).
 The corpus tests' sweeps (every area, model, script, sound, texture and
 module of the install) take a sample on an everyday run (under a minute)
@@ -28,11 +28,13 @@ and everything with `MOONGLOW_FULL_CORPUS=1` (four minutes), which a
 release is tested with: `mg_testkit::sweep` picks, `at_least` scales the
 counts a sweep must reach. A new sweep over the install goes through
 them. Test files are grouped into a few binaries (`tests/groups/` in
-`mg-corpus-tests` and `apps/mg`): a new test file is named in its group,
-and one group runs with `--test engine` (a file's tests: `--test engine
-engine_tlk`). mg-ui's UI tests are one binary, `--test app`, a file a
+`mg-corpus-tests`, `mg-plugin` and `apps/mg`): a new test file is named
+in its group, and one group runs with `--test engine` (a file's tests:
+`--test engine engine_tlk`; mg-plugin's seven are `--test plugins`). mg-ui's UI tests are one binary, `--test app`, a file a
 subject in `crates/mg-ui/tests/app/` (a new file is named in its
-`main.rs`), with the shared set-ups in `app/common.rs`. A UI test waits
+`main.rs`), with the shared set-ups in `app/common.rs` (an area's
+window with its 3D view, `area_harness`, which takes the GPU; without
+it, its panels, docks and forms alone, `area_ui_harness`). A UI test waits
 for the window's own work (`Moonglow::under_way`) with `settle`, or for
 what it looks for with a deadline, not for a count of frames: on a busy
 machine (CI's) the same work takes more of them. To try the tests on a
@@ -58,19 +60,22 @@ before it in `docs/PLAN.md` §4): `crates/mg-core` (ResRef, ResType, languages,
 LocString, binary helpers), `mg-gff`, `mg-erf`, `mg-key`, `mg-2da`, `mg-tlk`,
 ... `mg-shader` (the game's `.shd` programs assembled, compiled by glslang
 and read into naga modules; Verify's `shader-compile`), ... `mg-edit`
-(undoable workspace), `mg-nui` (NUI windows: the JUI document,
+(undoable workspace), `mg-uikit` (the suite's look on egui alone: theme
+tokens, metrics, fonts, the drawn icons; `docs/ui-redesign-proposal.md`),
+`mg-nui` (NUI windows: the JUI document,
 its checks and the generated scripts), `mg-plugin` (the plugin host: manifests
 and the sandboxed Luau runtime; the API is documented in
 `docs/manual/16-writing-plugins.md` and `17-plugin-api.md`, and
-`crates/mg-plugin/tests/examples.rs` holds those and the examples in
-`docs/plugins/` to the code), `mg-render` (wgpu renderer), `mg-preview`
+`crates/mg-plugin/tests/examples.rs`, in its `plugins` test binary,
+holds those and the examples in `docs/plugins/` to the code), `mg-render` (wgpu renderer), `mg-preview`
 (blueprint previews: what a creature, item, placeable or door looks like),
 `mg-serve` (runs the game's headless server on a module: `mg serve`,
 `mg test`, the engine tests), `mg-ui` (egui app; UI tests with
 `egui_kittest` in `crates/mg-ui/tests`; to look at a window's layout,
 render it with `tests/screens.rs`: `cargo test -p mg-ui --test screens --
 --ignored` writes PNGs to `target/test-output/screens/`), `mg-testkit` (corpus locator, oracle
-tools, engine runner) and `mg-corpus-tests` (tests only). Binaries:
+tools, engine runner; it re-exports `mg-testkit-gpu`, the GPU hold alone, which a
+client of the crates takes by itself) and `mg-corpus-tests` (tests only). Binaries:
 `apps/mg` (CLI) and `apps/moonglow` (the GUI). `packaging/` builds the release packages
 (AppImage, Flatpak, Windows installer, macOS app; `packaging/README.md`) and
 `docs/manual/` is the user manual, also built into the app (Help › User
@@ -91,6 +96,24 @@ It starts a scratch module with `+TestNewModule` and screenshots the client's
 window. To read what the client actually computes, put a patched copy of the
 game's own shader include in the scratch user directory's `override` (as
 `light_uniforms_match_the_client` does): no tracing tools needed.
+To hear what the client plays (which music and sound files it takes),
+`client_audio.rs` runs it with `MG_CLIENT_AUDIO_OUT` set, which has
+`run-client.sh` give it OpenAL Soft's `wave` backend: what it plays is
+written to a WAV file in the scratch folder, still with no audio device.
+Every run that puts a window on the off-screen display (the client, Aurora,
+a restart of the display) holds the machine's display lock first
+(`docs/locks.md`; `tools/locks.sh`, which the scripts source): by hand,
+`tools/locks.sh hold display -- CMD...` around anything you drive, and
+a holder exports `MOONGLOW_LOCKS_HELD=display` so what it starts does not
+wait for it. A wait is on stderr (`MOONGLOW_LOCK_WAIT=SECONDS`, 0 refuses).
+Take the lock first, then start or check the display inside the hold
+(`headless.sh start` there gives `DISPLAY`): never read `DISPLAY` before
+the hold, since the holder before you may restart the display.
+Reading the client's own code (`nm`, `objdump` on the unstripped
+`nwmain-linux`) is a last resort, by the owner's word: only once its
+pictures, patched includes, scripts, shims and runs made to tell the
+causes apart have all failed to settle a question, and what it shows is
+then confirmed by running the client.
 
 ## Documents
 
@@ -126,7 +149,9 @@ installed game; `crates/mg-corpus-tests/examples/observed_schema.rs`).
   SCRATCH`**, on the off-screen display: a bubblewrap sandbox with a
   read-only system, Steam hidden (no Steam API, presence or cloud sync), no
   network, D-Bus or audio, and only SCRATCH writable (its user directory is
-  SCRATCH/user). It refuses the desktop display :0.
+  SCRATCH/user). It refuses any display but the running off-screen
+  session's (`tools/aurora/headless.sh check`; the desktop holds :0 and :1),
+  as `run-aurora.sh` does.
 - **Test servers stay private.** Run `nwserver` only through
   `mg_serve::Server::start` with its defaults (which
   `mg_testkit::engine::run_server`, `mg serve` and `mg test` do): it passes
@@ -140,7 +165,12 @@ installed game; `crates/mg-corpus-tests/examples/observed_schema.rs`).
   untouched file round-trips.
 - **Tests that open a GPU device call `mg_testkit::gpu::hold()` first**, so a
   test binary has a few devices open at a time (4; `MG_TEST_GPUS` sets how
-  many, 1 for one at a time): a test suite with dozens at once coincided
+  many, 1 for one at a time), and the machine too: each test also takes one
+  of that many slot files (`docs/locks.md`), so test runs at once keep to the
+  same few. A test that runs the client or uses the display takes the display
+  lock first (`mg_testkit::display::hold()`; the client tests'
+  `common::gpu_after_display()` is both in order): display, then GPU, never
+  the reverse (it panics otherwise). The cap is there because a test suite with dozens at once coincided
   with a kernel panic on the development machine. A test that changes what
   every render does (`mg_render::guard::fail_on`) takes the GPU alone
   (`gpu::alone()`), and process-wide state a window reads is the window's
@@ -170,6 +200,10 @@ installed game; `crates/mg-corpus-tests/examples/observed_schema.rs`).
   type and defined with another, which Aurora compiles (Moonglow patches its
   vendored compiler and warns): `--test scripts` allows exactly the scripts
   that warn of it.
+- **Interface text follows [the style guide](docs/style-guide.md)**:
+  title case for titles, headings, tabs, menus and buttons, sentence case
+  for labels, tooltips and messages; a tooltip one short sentence, no
+  semicolons; American English.
 - Moonglow is GPL-3.0: GPL code (the official NWScript compiler, GPL crates)
   may be built in. Game assets, including Beamdog's shaders, are only ever
   loaded from the user's install.
@@ -181,3 +215,5 @@ installed game; `crates/mg-corpus-tests/examples/observed_schema.rs`).
   (`docs/framebuffer-proposal.md`; the shaders proposal's M5 had kept it
   Moonglow's). Every view and preview draws as the area view does, and
   both paths are validated against client screenshots.
+
+Sessions working by a charter follow `~/Projects/moonglow-toolset/.claude/pipelines/` (untracked, private).

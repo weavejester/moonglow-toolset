@@ -313,3 +313,88 @@ fn where_things_are_said_as_they_were() {
         );
     }
 }
+
+/// A new name with characters a resref doesn't take (Aurora's: letters,
+/// digits and `_`) is refused, the module left as it was; capitals are
+/// lowered.
+#[test]
+fn a_rename_to_a_name_with_other_characters_is_refused() {
+    let dir = mg_testkit::scratch_dir("mg-rename-chars");
+    let path = module(&dir);
+    let p = path.to_str().unwrap();
+    let nowhere = dir.join("no-game");
+    let before = std::fs::read(&path).unwrap();
+    for to in ["my-guard", "guard<2>", "g!@#$%^&*"] {
+        let out =
+            crate::mg_on(&nowhere, None).args(["rename", p, "guard.utc", to]).output().unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && said.contains("letters, digits and _"), "{to}: {said}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{to}: unchanged");
+    }
+    let out =
+        crate::mg_on(&nowhere, None).args(["rename", p, "guard.utc", "Sentry"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let m = Module::open(&path).unwrap();
+    assert!(m.contains(&ResKey::parse("sentry", ResType::UTC).unwrap()));
+    let names: Vec<String> =
+        m.keys_of(ResType::UTC).map(|k| k.resref.as_str().unwrap().to_string()).collect();
+    assert!(names.contains(&"sentry".to_string()), "lowered: {names:?}");
+}
+
+/// A tag with a letter outside ASCII is found as the files have it: an
+/// object's in the module's codepage, a script's string in the scripts'
+/// (`Se\xF1or` in Windows-1252). Asked as the command line's UTF-8 it was
+/// found nowhere, as in the window before the review's D17.
+#[test]
+fn a_tag_with_a_letter_outside_ascii_is_found() {
+    let dir = mg_testkit::scratch_dir("mg-refs-tag");
+    let mut m = Module::new();
+    m.set_info(&Gff::new(*b"IFO ")).unwrap();
+    let guard = gff(b"UTC ", vec![("Tag", Value::String(b"Se\xf1or".to_vec()))]);
+    m.set_gff(ResKey::parse("guard", ResType::UTC).unwrap(), &guard).unwrap();
+    let script = b"void main() { GetObjectByTag(\"Se\xf1or\"); }\n";
+    m.set(ResKey::parse("find", ResType::NSS).unwrap(), script.to_vec());
+    let path = dir.join("tags.mod");
+    m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let out = crate::mg_on(dir.join("no-game"), None)
+        .args(["--json", "refs", path.to_str().unwrap(), "--tag", "Se\u{f1}or"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let found: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(found["uses"].as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found["uses"][0]["from"], "guard.utc", "{found}");
+    assert_eq!(found["script_strings"].as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found["script_strings"][0]["script"], "find.nss", "{found}");
+}
+
+/// A script's rename follows into the module's own `spells.2da`: the cell
+/// that named it names the new one, and the command says so (the review's
+/// V4: the cell kept the name of a script that was gone).
+#[test]
+fn a_script_s_rename_follows_into_the_module_s_tables() {
+    let dir = mg_testkit::scratch_dir("mg-rename-tables");
+    let path = dir.join("spells.mod");
+    let key = |name: &str, t| ResKey::parse(name, t).unwrap();
+    let mut m = Module::new();
+    m.set_info(&Gff::new(*b"IFO ")).unwrap();
+    m.set(key("x_s0_mine", ResType::NSS), b"void main() {}\n".to_vec());
+    m.set(key("x_s0_mine", ResType::NCS), b"NCS V1.0".to_vec());
+    let table = "2DA V2.0\n\n   Label ImpactScript\n0  Mine  X_S0_Mine\n1  Other x_s0_other\n";
+    m.set(key("spells", ResType::TWODA), table.as_bytes().to_vec());
+    m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let nowhere = dir.join("no-game");
+    let out = crate::mg_on(&nowhere, None)
+        .args(["--json", "rename", path.to_str().unwrap(), "x_s0_mine.nss", "x_s0_mine2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(said["in_tables"], 1, "{said}");
+    assert!(said["changed"].as_array().unwrap().contains(&"spells.2da".into()), "{said}");
+    let notes = said["notes"].to_string();
+    assert!(notes.contains("1 in the module's 2DAs"), "{said}");
+    let m = Module::open(&path).unwrap();
+    let saved = String::from_utf8(m.get(&key("spells", ResType::TWODA)).unwrap().to_vec()).unwrap();
+    assert_eq!(saved, table.replace("X_S0_Mine", "x_s0_mine2"));
+}

@@ -15,7 +15,17 @@ pub(super) struct Session {
     pub last_event: String,
     pub closed: bool,
     pub row_values: std::collections::BTreeMap<(String, usize), Value>,
+    /// The window's generation it was last found to be of
+    /// (`State::window_gen`), so that a frame of the same one compares
+    /// nothing; and a stamp its window or settings take again each time
+    /// they change, which no other session shares (what is kept of the
+    /// window it draws is kept under it).
+    proven: u64,
+    pub revision: u64,
 }
+
+/// The next session's or change's stamp ([`Session::revision`]).
+static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(super) struct Change {
     pub path: String,
@@ -51,6 +61,16 @@ pub(super) fn set(value: &mut Value, key: &str, new: Value) {
     }
 }
 
+/// Whether the simulation has where to write a value of control `node`
+/// (in list row `row`): the control's own `value`, or its bind's first
+/// value, and that row of it for a list's. [`Session::apply`] writes
+/// nowhere else, and says what is missing.
+pub(super) fn has_place(node: &Value, s: &Settings, row: Option<usize>) -> bool {
+    let Some(bind) = node["value"]["bind"].as_str() else { return true };
+    let Some(binding) = s.bindings.get(bind) else { return false };
+    row.is_none_or(|row| binding.value.as_array().is_some_and(|rows| row < rows.len()))
+}
+
 impl WindowMove {
     pub(super) fn update(&mut self, pointer: Pos2) {
         self.position =
@@ -65,7 +85,9 @@ impl WindowMove {
 }
 
 impl Session {
-    pub(super) fn new(doc: &Value, settings: &Settings) -> Self {
+    /// A session of `doc` and `settings`, the window of the generation
+    /// `generation` where that is known (`trusted`).
+    pub(super) fn new(doc: &Value, settings: &Settings, generation: Option<u64>) -> Self {
         let mut session = Self {
             source: doc.clone(),
             initial: settings.clone(),
@@ -74,13 +96,37 @@ impl Session {
             last_event: String::new(),
             closed: false,
             row_values: Default::default(),
+            proven: generation.unwrap_or(u64::MAX),
+            revision: 0,
         };
         session.dispatch("open", "", None, 0);
+        session.touch();
         session
     }
 
-    pub(super) fn matches(&self, doc: &Value, settings: &Settings) -> bool {
-        &self.source == doc && &self.initial == settings
+    /// Whether it is a session of `doc` and `settings`, the window of the
+    /// generation `generation` where that is known: compared only once a
+    /// generation (a combo of 10,000 entries was compared twice a frame).
+    pub(super) fn matches(
+        &mut self,
+        generation: Option<u64>,
+        doc: &Value,
+        settings: &Settings,
+    ) -> bool {
+        if generation.is_some_and(|g| g == self.proven) {
+            debug_assert!(&self.source == doc && &self.initial == settings, "a window changed");
+            return true;
+        }
+        let same = &self.source == doc && &self.initial == settings;
+        if let Some(generation) = generation.filter(|_| same) {
+            self.proven = generation;
+        }
+        same
+    }
+
+    /// Its window or settings changed.
+    fn touch(&mut self) {
+        self.revision = STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The client writes the constrained dimensions back to a geometry bind.
@@ -92,13 +138,17 @@ impl Session {
         let size = preview::window_size(&self.doc, &self.settings);
         let Some(bind) = self.doc["geometry"]["bind"].as_str() else { return };
         let Some(binding) = self.settings.bindings.get_mut(bind) else { return };
-        if binding.value.is_object() {
+        if binding.value.is_object()
+            && (binding.value["w"] != json!(size.x) || binding.value["h"] != json!(size.y))
+        {
             set(&mut binding.value, "w", json!(size.x));
             set(&mut binding.value, "h", json!(size.y));
+            self.touch();
         }
     }
 
     pub(super) fn collapse(&mut self, collapsed: bool) {
+        self.touch();
         if let Some(bind) = self.doc["collapsed"]["bind"].as_str().map(str::to_owned) {
             if let Some(binding) = self.settings.bindings.get_mut(&bind) {
                 binding.value = json!(collapsed);
@@ -110,6 +160,7 @@ impl Session {
     }
 
     pub(super) fn apply(&mut self, change: Change) {
+        self.touch();
         let Some(node) = self.doc.pointer_mut(&change.path) else { return };
         let id = node["id"].as_str().map_or_else(|| design::node_name(node), str::to_owned);
         let clicked = !change.normalization
@@ -164,6 +215,7 @@ impl Session {
         row: Option<usize>,
         depth: usize,
     ) {
+        self.touch();
         if depth >= 32 {
             self.last_event = "Action recursion stopped; look at the watch handlers".into();
             return;
@@ -290,7 +342,7 @@ pub(super) fn resize_handles(
         ui.painter().rect_stroke(
             hit.shrink(2.0),
             1,
-            egui::Stroke::new(1.0, egui::Color32::WHITE),
+            egui::Stroke::new(1.0, mg_uikit::tokens(ui.ctx()).on_fill),
             egui::StrokeKind::Inside,
         );
         if response.drag_started()
@@ -308,9 +360,7 @@ pub(super) fn resize_handles(
                 vertical: y,
             });
         }
-        response.on_hover_text(
-            "Drag to resize. Release to apply; Esc cancels. One Undo restores the previous size.",
-        );
+        response.on_hover_text("Drag to resize, Esc to cancel. One Undo restores the size.");
     }
 }
 
@@ -359,14 +409,30 @@ impl Resize {
         let delta = (pointer - self.origin) / self.scale.max(0.001);
         let minimum = if self.path.is_empty() { 80.0 } else { 8.0 };
         let room = cross_room(&self.source, &self.path).max(Vec2::splat(minimum));
+        // An axis the pointer has not moved a point along keeps the size
+        // it had. (The size drawn is seldom whole: three labels sharing a
+        // row are 126.67 each, and any size is a fraction under Zoom Fit.
+        // Rounded as soon as a handle was pressed, a click on one wrote a
+        // width, and the label no longer shared its row.)
+        let sized = |initial: f32, moved: f32, room: f32| match moved.round() == 0.0 {
+            true => initial,
+            false => (initial + moved).round().clamp(minimum, room),
+        };
         if self.horizontal {
-            self.size.x = (self.initial.x + delta.x).round().clamp(minimum, room.x);
+            self.size.x = sized(self.initial.x, delta.x, room.x);
         }
         if self.vertical {
-            self.size.y = (self.initial.y + delta.y).round().clamp(minimum, room.y);
+            self.size.y = sized(self.initial.y, delta.y, room.y);
         }
     }
 
+    /// The gesture made the control (or the window) another size.
+    pub(super) fn changed(&self) -> bool {
+        self.size != self.initial
+    }
+
+    /// The size as the gesture has it, on the axes it changed: the other
+    /// keeps what the window says of it (none, or a bind).
     pub(super) fn apply(&self, doc: &mut Value) {
         let Some(node) = doc.pointer_mut(&self.path) else { return };
         let (node, width, height) = if self.path.is_empty() {
@@ -375,11 +441,57 @@ impl Resize {
             (Some(node), "width", "height")
         };
         let Some(node) = node else { return };
-        if self.horizontal {
+        if self.horizontal && self.size.x != self.initial.x {
             set(node, width, json!(self.size.x));
         }
-        if self.vertical {
+        if self.vertical && self.size.y != self.initial.y {
             set(node, height, json!(self.size.y));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{pos2, vec2};
+
+    /// A handle pressed and let go where it was writes nothing, whatever
+    /// size the control was drawn at; moved along one axis, it sizes that
+    /// axis alone. (Three labels sharing a row are 126.67 wide each: a
+    /// click on one's handle wrote "width": 127.0.)
+    #[test]
+    fn a_handle_not_moved_leaves_the_size_alone() {
+        let doc = json!({"root": {"type": "row", "children": [
+            {"type": "label"}, {"type": "label"}, {"type": "label"}]}});
+        let resize = |scale: f32, initial: Vec2| Resize {
+            path: "/root/children/1".into(),
+            source: doc.clone(),
+            origin: pos2(300.0, 200.0),
+            scale,
+            anchor: vec2(20.0, 20.0),
+            initial,
+            size: initial,
+            horizontal: true,
+            vertical: true,
+        };
+        for (scale, initial) in [(1.0, vec2(126.67, 30.0)), (0.73, vec2(173.972_6, 41.095_9))] {
+            let mut r = resize(scale, initial);
+            // (And a hair off, as a press that trembles.)
+            for at in [pos2(300.0, 200.0), pos2(300.3, 199.7)] {
+                r.move_to(at);
+                assert!(!r.changed(), "{scale} {initial:?} {at:?}: {:?}", r.size);
+                let mut after = doc.clone();
+                r.apply(&mut after);
+                assert_eq!(after, doc);
+            }
+            // Along the row only: a width, whole, and no height.
+            r.move_to(pos2(300.0 + 10.0 * scale, 200.0));
+            assert!(r.changed());
+            let mut after = doc.clone();
+            r.apply(&mut after);
+            let label = &after["root"]["children"][1];
+            assert_eq!(label["width"], json!((initial.x + 10.0).round()));
+            assert!(label.get("height").is_none(), "{label}");
         }
     }
 }

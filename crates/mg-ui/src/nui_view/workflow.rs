@@ -65,19 +65,30 @@ impl BindDraft {
         &self,
         bindings: &std::collections::BTreeMap<String, Binding>,
     ) -> Option<&'static str> {
-        let name = self.name.trim();
-        if name.is_empty() {
-            Some("Enter a bind name.")
-        } else if !mg_nui::plain_name(name) {
-            Some(
-                "The name can't hold a line break, a tab or another control character: the \
-                 event script couldn't name it.",
-            )
-        } else if bindings.contains_key(name) {
-            Some("This bind already exists. Choose it above or use another name.")
-        } else {
-            None
-        }
+        new_bind_name(&self.name, bindings).err()
+    }
+}
+
+/// The name a new bind is made under, from what was typed (the spaces at
+/// its ends aside), or why it can't be one: nothing, a line break, a tab
+/// or another control character (the event script's section lines could
+/// not carry it: `mg_nui::plain_name`), or a name a bind has. The one rule
+/// of New Bind, New Bind for a Property and a bind's Rename, which had
+/// drifted (a name pasted with a tab in it was made by one of them).
+pub(super) fn new_bind_name<'a>(
+    typed: &'a str,
+    bindings: &std::collections::BTreeMap<String, Binding>,
+) -> Result<&'a str, &'static str> {
+    let name = typed.trim();
+    if name.is_empty() {
+        Err("Enter a bind name.")
+    } else if !mg_nui::plain_name(name) {
+        Err("The name can't hold a line break, a tab or another control character: the event \
+             script couldn't name it.")
+    } else if bindings.contains_key(name) {
+        Err("This bind already exists. Choose it above or use another name.")
+    } else {
+        Ok(name)
     }
 }
 
@@ -86,12 +97,16 @@ impl BindDraft {
 pub(super) fn create_bind(
     ui: &mut Ui,
     bindings: &mut std::collections::BTreeMap<String, Binding>,
+    button: bool,
+    asked: bool,
 ) -> Option<String> {
     let mut created = None;
     ui.push_id("create-bind", |ui| {
         let id = ui.make_persistent_id("create-bind-draft");
         let mut draft = ui.ctx().data_mut(|d| d.get_temp::<BindDraft>(id));
-        if ui.button("+ Create bind").clicked() && draft.is_none() {
+        // (Its button, or the Bindings panel's header's plus: M4's U19.)
+        let pressed = button && ui.add(form::plus("Create Bind")).clicked();
+        if (pressed || asked) && draft.is_none() {
             draft = Some(BindDraft::new());
         }
         let mut finish = false;
@@ -100,10 +115,10 @@ pub(super) fn create_bind(
             let window = widgets::dialog(ui.ctx(), "New Bind", &mut open)
                 .collapsible(false)
                 .resizable(false);
-            window.show(ui.ctx(), |ui| {
+            let footed = window.show_foot(ui.ctx(), |ui| {
                 let name = widgets::field_label(ui, "Bind name");
                 let name_edit = ui
-                    .add(egui::TextEdit::singleline(&mut draft.name).hint_text("e.g. is_open"))
+                    .add(mg_uikit::text_field(&mut draft.name).hint_text("e.g. is_open"))
                     .labelled_by(name.id);
                 widgets::autofocus(ui, &name_edit);
                 let before = draft.kind;
@@ -117,33 +132,27 @@ pub(super) fn create_bind(
                 }
                 widgets::field_label(ui, "Initial value");
                 fields::value(ui, &mut draft.value, 0);
-                ui.checkbox(&mut draft.rows, "List row array").on_hover_text(
-                    "A value for each row of a list, starting with one row. Bindings and Row \
-                     data edit the rows.",
-                );
+                ui.check_box(&mut draft.rows, "List row array")
+                    .on_hover_text("A value for each row of a list, starting with one row");
                 if let Some(error) = draft.error(bindings) {
                     ui.weak(error);
                 }
-                ui.horizontal(|ui| {
-                    let ok = draft.error(bindings).is_none();
-                    if ui.add_enabled(ok, egui::Button::new("Create")).clicked()
-                        || (ok && widgets::enter(ui))
-                    {
-                        let name = draft.name.trim().to_owned();
-                        let value = if draft.rows {
-                            json!([draft.value.clone()])
-                        } else {
-                            draft.value.clone()
-                        };
-                        bindings.insert(name.clone(), Binding { value, ..Default::default() });
-                        created = Some(name);
-                        finish = true;
-                    }
-                    if widgets::cancel(ui) {
-                        finish = true;
-                    }
-                });
+                let ok = draft.error(bindings).is_none();
+                ((), widgets::Foot::new().main("Create", ok).cancel())
             });
+            if let Some(footed) = footed {
+                if footed.pressed.main() {
+                    let name = draft.name.trim().to_owned();
+                    let value =
+                        if draft.rows { json!([draft.value.clone()]) } else { draft.value.clone() };
+                    bindings.insert(name.clone(), Binding { value, ..Default::default() });
+                    created = Some(name);
+                    finish = true;
+                }
+                if footed.pressed.cancelled() {
+                    finish = true;
+                }
+            }
             finish |= !open;
         }
         ui.ctx().data_mut(|d| {
@@ -166,10 +175,10 @@ pub(super) fn ui(
     script: Option<&str>,
 ) {
     egui::ScrollArea::vertical().id_salt("nui-workflow").show(ui, |ui| {
-        widgets::section_heading(ui, "Swap layout variants");
+        widgets::section_heading(ui, "Swap Layout Variants");
         ui.label(
-            "A Swap layout is added in Design; its variants are made and edited in Properties \
-             or Layers.",
+            "A Swap Layout is added in Design; its variants are made and edited in Properties \
+             or the Outliner.",
         );
         let (mut remove, mut rename) = (None, None);
         for name in s.variants.keys() {
@@ -181,17 +190,17 @@ pub(super) fn ui(
                     Some(id) => format!("Swap layout · {id}"),
                     None => "No target assigned".into(),
                 });
-                if ui.button("Edit variant").clicked() {
+                if ui.button("Edit Variant").clicked() {
                     state.layout_target = target.unwrap_or_default();
                     layouts::edit(state, Some(name.clone()));
                 }
                 // The handlers showing it, and its function's calls, follow.
-                ui.menu_button("Rename…", |ui| {
+                mg_uikit::form_menu_button(ui, "Rename…", |ui| {
                     let id = ui.make_persistent_id(("rename-variant", name));
                     let mut to: String =
                         ui.ctx().data_mut(|d| d.get_temp(id)).unwrap_or_else(|| name.clone());
                     let label = widgets::field_label(ui, "Name");
-                    ui.text_edit_singleline(&mut to).labelled_by(label.id);
+                    ui.add(mg_uikit::text_field(&mut to)).labelled_by(label.id);
                     let taken = to != *name && s.variants.contains_key(&to);
                     let ok = to != *name && !to.is_empty() && mg_nui::plain_name(&to) && !taken;
                     if ui
@@ -209,13 +218,11 @@ pub(super) fn ui(
                     ui.ctx().data_mut(|d| d.insert_temp(id, to));
                 });
                 // A handler that shows it calls its function: removing it would break the build.
-                let call = format!("{}(", mg_nui::variant_function(window, name));
-                let shown = script.is_some_and(|t| {
-                    t.lines().any(|l| !l.trim_start().starts_with("//") && l.contains(&call))
-                }) || s
-                    .handlers
-                    .iter()
-                    .any(|r| matches!(&r.action, mg_nui::Action::Variant { variant: view, .. } if view==name));
+                let func = mg_nui::variant_function(window, name);
+                let shown = script.is_some_and(|t| mg_nui::script_calls_function(t, &func))
+                    || s.handlers
+                        .iter()
+                        .any(|r| matches!(&r.action, mg_nui::Action::Variant { variant: view, .. } if view==name));
                 if ui
                     .add_enabled(!shown, egui::Button::new("Remove"))
                     .on_disabled_hover_text(
@@ -283,9 +290,7 @@ pub(super) fn images(
             .hint("Find a picture…")
             .width(width)
             .show(ui);
-        let query = mg_core::text::Needle::new(&state.asset_search);
-        let names: Vec<_> =
-            assets.catalog.iter().filter(|n| query.finds(n)).take(24).cloned().collect();
+        let names = assets.found(&state.asset_search, 24).to_vec();
         assets.request_images(ui.ctx(), names.iter().cloned().collect());
         ui.small("First 24 matches from the current module and content stack");
         let row_array = node[field]["bind"]
@@ -293,9 +298,9 @@ pub(super) fn images(
             .and_then(|n| s.bindings.get(n))
             .is_some_and(|b| b.value.is_array());
         if row_array {
-            ui.weak("Choose individual row images in the list's Row data.");
+            ui.weak("Choose individual row images in the list's Row Data.");
         }
-        if !node["image_region"].is_object() && ui.button("Add crop region").clicked() {
+        if !node["image_region"].is_object() && ui.button("Add Crop Region").clicked() {
             let name = preview::string(&node[field], s, None);
             let size = assets.picture(&name).map_or(egui::vec2(64.0, 64.0), |p| p.size);
             node["image_region"] = json!({"x":0.0,"y":0.0,"w":size.x,"h":size.y});
@@ -343,6 +348,15 @@ mod tests {
         assert!(draft.error(&bindings).is_some());
         draft.name = "fresh".into();
         assert!(draft.error(&bindings).is_none());
+        // The one rule, for every window that names a bind.
+        let name = |typed| new_bind_name(typed, &bindings);
+        assert_eq!(name(" x "), Ok("x"));
+        assert_eq!(name("with a space"), Ok("with a space"));
+        assert_eq!(name(""), Err("Enter a bind name."));
+        assert_eq!(name("  \t "), Err("Enter a bind name."));
+        assert!(name("a\tb").is_err_and(|e| e.contains("a tab")));
+        assert!(name("a\nb").is_err() && name("a\0b").is_err());
+        assert!(name(" taken ").is_err_and(|e| e.contains("already exists")));
     }
 
     #[test]

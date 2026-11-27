@@ -21,7 +21,7 @@ fn verify_fails_on_errors_and_names_them_in_json() {
     let git = ResKey::new(ResRef::from_str("chess").unwrap(), ResType::GIT);
     let mut g = m.gff(&git).unwrap().unwrap();
     let mut p = Struct::new(9);
-    p.set("Appearance", Value::Dword(99_999));
+    p.set("Appearance", Value::Dword(60_000));
     p.set("Tag", Value::String(b"BROKEN".to_vec()));
     g.root.set("Placeable List", Value::List(vec![p]));
     m.set_gff(git, &g).unwrap();
@@ -231,6 +231,15 @@ fn verify_warns_of_a_unique_tag_on_two_objects() {
     assert!(!json["findings"].as_array().unwrap().iter().any(|f| f["check"] == "tag-unique"));
     let said = json["notes"].to_string();
     assert!(said.contains("--fix tag-unique: no finding of that check has a fix"), "{said}");
+    // A check there is none of (mistyped): it fails, for a pipeline.
+    let out = crate::mg_on(&root, None)
+        .args(["--json", "verify", "--fix", "tag-uniq"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("--fix tag-uniq: there is no such check"));
     // Only with a check named.
     let none = crate::mg().args(["verify", "--dry-run"]).arg(&dir).output().unwrap();
     assert!(!none.status.success());
@@ -381,4 +390,85 @@ fn verify_unused_says_a_script_once_and_counts_what_runs_it() {
     };
     assert!(at.iter().any(spell), "{json}");
     assert_eq!(refs("mg_ai_fight.nss")["marked"], "mg_ai_*");
+}
+
+/// `mg verify` says what `mg_module::verify::run` finds: Verify is put
+/// together there, once, for the command line and the window's Verify
+/// Module alike (the review's V20: each had its own copy, and they had
+/// drifted). A module with a reference to nothing and an object's row
+/// that isn't there: the same missing references and findings, in the
+/// same order.
+#[test]
+fn verify_says_what_verify_run_finds() {
+    use mg_module::doctor::{Skip, TalkTables, Timings};
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("mg-verify-run");
+    let mut m = Module::open(&root.join("data/mod/Neverwinter Chess.mod")).unwrap();
+    let area = ResKey::new(ResRef::from_str("chess").unwrap(), ResType::GIT);
+    let mut g = m.gff(&area).unwrap().unwrap();
+    let mut p = Struct::new(9);
+    p.set("Appearance", Value::Dword(60_000));
+    p.set("Tag", Value::String(b"BROKEN".to_vec()));
+    p.set("OnUsed", Value::resref(ResRef::from_str("mg_nowhere").unwrap()));
+    g.root.set("Placeable List", Value::List(vec![p]));
+    m.set_gff(area, &g).unwrap();
+    let broken = dir.join("broken.mod");
+    m.save_as(&ModuleLocation::Archive(broken.clone())).unwrap();
+
+    let out = crate::mg_on(&root, None).args(["verify", "--json"]).arg(&broken).output().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let text = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let said_missing: Vec<[String; 3]> = (json["missing"].as_array().unwrap().iter())
+        .map(|x| [text(x, "from"), text(x, "path"), text(x, "target")])
+        .collect();
+    let said_findings: Vec<[String; 5]> = (json["findings"].as_array().unwrap().iter())
+        .map(|x| ["check", "source", "resource", "at", "message"].map(|k| text(x, k)))
+        .collect();
+
+    let m = Module::open(&broken).unwrap();
+    let gi = mg_resman::GameInstall::new(&root, None, "en");
+    let mut rm = mg_testkit::shared_resman(&gi).unwrap();
+    m.stack_onto(&mut rm, &gi);
+    let base = mg_tlk::Tlk::read(&std::fs::read(gi.talk_table()).unwrap()).unwrap().entries.len();
+    let (nothing, unnamed) = (Skip::NONE, |_: &mg_module::palette::PaletteName| String::new());
+    let asked = |tlk| mg_module::verify::Verify {
+        module: &m,
+        compiled: None,
+        resman: &rm,
+        tlk,
+        custom_tlk: None,
+        codepage: mg_rules::text_codepage(&rm, mg_core::Language::ENGLISH),
+        palette_name: &unnamed,
+        skip: &nothing,
+        cache: None,
+        references: None,
+    };
+    let mut parts = Vec::new();
+    let tlk = TalkTables { base, custom: None };
+    let (missing, findings) =
+        mg_module::verify::run(asked(tlk), &mut Timings::default(), &mut |part| {
+            parts.push(part.to_string());
+            true
+        })
+        .unwrap();
+    assert_eq!(parts, ["Looking for what is missing", "Checking the custom content"]);
+    let missing: Vec<[String; 3]> = (missing.iter())
+        .map(|x| {
+            let r = &x.reference;
+            [r.from.to_string(), r.path.to_string(), r.target.to_string()]
+        })
+        .collect();
+    let findings: Vec<[String; 5]> = (findings.iter())
+        .map(|f| {
+            let (check, source) = (f.check.to_string(), f.source.clone());
+            [check, source, f.resource.to_string(), f.at.clone(), f.message.clone()]
+        })
+        .collect();
+    assert!(missing.iter().any(|x| x[2] == "mg_nowhere"), "{missing:?}");
+    assert!(findings.iter().any(|x| x[0] == "object-row"), "{findings:?}");
+    assert_eq!(said_missing, missing);
+    assert_eq!(said_findings, findings);
+    // Stopped at a part, it finds nothing.
+    let stopped = mg_module::verify::run(asked(tlk), &mut Timings::default(), &mut |_| false);
+    assert!(stopped.is_none());
 }

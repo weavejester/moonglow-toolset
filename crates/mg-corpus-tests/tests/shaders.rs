@@ -40,8 +40,8 @@ fn programs(rm: &ResMan, keys: impl IntoIterator<Item = ResKey>) -> Vec<(String,
 
 /// Compiles each program and splits its uniforms as a renderer does (M3:
 /// the draw's, the frame's, the bones'; here by a rough rule of names, as
-/// what is split is the program, not the rule); the failures, one line
-/// each. (And how many read the engine's lights by their places in the
+/// what is split is the program, not the rule, and by mg-render's own);
+/// the failures, one line each. (And how many read the engine's lights by their places in the
 /// frame's, `mg_shader::LIGHT_INDEX`, in `INDEXED`; how many read the
 /// lights' arrays as they are, in `UNINDEXED`.)
 fn compile_all(rm: &ResMan, list: &[(String, Stage)]) -> Vec<String> {
@@ -58,14 +58,25 @@ fn compile_all(rm: &ResMan, list: &[(String, Stage)]) -> Vec<String> {
             let split = compile(name, *stage, &pre, rm).and_then(|mut p| {
                 let had = !p.reflection.uniforms.is_empty();
                 let direct = mg_shader::LIGHT_ARRAYS.iter().any(|a| p.reads_uniform(a));
-                // (A program that reads the framebuffer's copies counts
-                // `gl_FragCoord.y` from the bottom, as the renderer has it:
-                // `fswater`, `fsparticle`, the post-processing ones.)
+                // (A fragment program counts `gl_FragCoord.y` from the
+                // bottom, as the renderer has it: by the framebuffer's
+                // copies' height where it reads them (`fswater`,
+                // `fsparticle`, the post-processing ones), else by
+                // `screenParams'`.)
                 let fb = p.reflection.textures.iter().any(|t| t.name.starts_with("texFB"));
+                if *stage == Stage::Fragment {
+                    p.frag_coord_from_bottom(fb)?;
+                }
                 if fb && *stage == Stage::Fragment {
-                    p.frag_coord_from_bottom()?;
                     FRAMEBUFFER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // (And as the renderer splits it: the parts as OpenGL lays
+                // them out, which `split_uniforms` refuses otherwise, and
+                // the program written in GLSL as wgpu's OpenGL back end has
+                // naga write it.)
+                let mut gl = p.clone();
+                gl.split_uniforms(mg_render::uniform_part)?;
+                glsl(&gl).map_err(|e| mg_shader::ShaderError::Naga(format!("GLSL: {e}")))?;
                 let split = p.split_uniforms(part)?;
                 if p.reflection.uniform(mg_shader::LIGHT_INDEX).is_some() {
                     INDEXED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -86,6 +97,33 @@ fn compile_all(rm: &ResMan, list: &[(String, Stage)]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// `p` written in GLSL as wgpu's OpenGL back end has naga write it
+/// (GLSL 4.30, its flags, a binding for each resource).
+fn glsl(p: &mg_shader::Program) -> Result<String, naga::back::glsl::Error> {
+    use naga::back::glsl;
+    let mut binding_map = glsl::BindingMap::default();
+    for (k, b) in p.module.global_variables.iter().filter_map(|(_, g)| g.binding).enumerate() {
+        binding_map.insert(b, k as u8);
+    }
+    let options = glsl::Options {
+        version: glsl::Version::Desktop(430),
+        writer_flags: glsl::WriterFlags::ADJUST_COORDINATE_SPACE
+            | glsl::WriterFlags::FORCE_POINT_SIZE,
+        binding_map,
+        ..Default::default()
+    };
+    let ep = &p.module.entry_points[0];
+    let pipeline = glsl::PipelineOptions {
+        shader_stage: ep.stage,
+        entry_point: ep.name.clone(),
+        multiview: None,
+    };
+    let mut text = String::new();
+    glsl::Writer::new(&mut text, &p.module, &p.info, &options, &pipeline, Default::default())?
+        .write()?;
+    Ok(text)
 }
 
 /// The programs [`compile_all`] found reading the lights by index.

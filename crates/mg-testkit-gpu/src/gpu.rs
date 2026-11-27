@@ -1,0 +1,107 @@
+//! A few GPU devices at a time in a test binary.
+//!
+//! libtest runs a binary's tests on many threads; tests that each open a
+//! wgpu device (the area viewer, the renderer, previews) would otherwise
+//! have a dozen or more Vulkan devices open at once, a load that once
+//! brought a developer's machine down (a kernel panic during the test
+//! suite, cause unlogged). A test calls [`hold`] before it opens a device
+//! and keeps its place until it ends; past [`places`] at once, the other
+//! GPU tests wait their turn. Tests that do not use the GPU run in
+//! parallel as before.
+//!
+//! One device at a time made the UI tests one long queue (each opens and
+//! draws in about a fifth of a second: 42 s of the UI tests' 42), so a few
+//! share the GPU now: `MG_TEST_GPUS` sets how many (1 for one at a time).
+//!
+//! Test binaries run at once (several worktrees, several suites) would add
+//! those counts up, so each test also takes a slot of the machine, a lock on
+//! one of `MG_TEST_GPUS` files ([`crate::slots`]): at most that many devices
+//! are open machine-wide by tests. [`alone`] is alone in its process only
+//! (it is about process-wide render state): it takes one slot.
+
+use std::cell::RefCell;
+use std::sync::OnceLock;
+
+use crate::places::{Places, Taken};
+use crate::slots::{self, Slot};
+
+static GPU: Places = Places::new();
+
+/// How many tests may hold the GPU at once: `MG_TEST_GPUS`, else 4.
+pub fn places() -> usize {
+    static PLACES: OnceLock<usize> = OnceLock::new();
+    *PLACES.get_or_init(|| {
+        let set = std::env::var("MG_TEST_GPUS").ok().and_then(|v| v.parse().ok());
+        set.filter(|&n| n > 0).unwrap_or(4)
+    })
+}
+
+thread_local! {
+    /// This thread's places, while its test holds them; given back when
+    /// the test's thread ends (libtest runs each test on its own thread),
+    /// also when it fails.
+    static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+}
+
+/// A test's places and its machine slot, given back together (the slot
+/// first: it is the one another process waits for).
+struct Held {
+    _slot: Option<Slot>,
+    taken: Taken,
+}
+
+/// Whether the calling thread's test holds a place on the GPU now. The
+/// display lock (`mg_testkit::display`) is never taken while it does: the
+/// order of the machine's locks is the display, then the GPU.
+pub fn holding() -> bool {
+    HELD.with(|held| held.borrow().is_some())
+}
+
+/// Takes a place on the GPU for the rest of the calling test, waiting while
+/// [`places`] others have one. Calling it again in the same test does
+/// nothing.
+pub fn hold() {
+    take(1);
+}
+
+/// [`hold`], then the device `open` makes (`mg_render::Gpu::headless`,
+/// say); `None`, and the test said to be skipped, where there is no
+/// GPU adapter to make one on.
+pub fn open<T>(open: impl FnOnce() -> Option<T>) -> Option<T> {
+    hold();
+    let device = open();
+    if device.is_none() {
+        eprintln!("skipped: no GPU adapter");
+    }
+    device
+}
+
+/// Takes the GPU alone for the rest of the calling test, waiting for every
+/// other GPU test to end: for a test that changes what every render does
+/// (`mg_render::guard::fail_on`). Called after [`hold`], it waits for the
+/// others too.
+pub fn alone() {
+    take(places());
+}
+
+fn take(wanted: usize) {
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.as_ref().is_some_and(|h| h.taken.count >= wanted) {
+            return;
+        }
+        // (What it held is given back while it waits for more, so that two
+        // tests waiting to be alone do not wait for each other.)
+        *held = None;
+        let taken = GPU.take(wanted, places());
+        // (After the places: a test of this process never waits for a slot
+        // of the machine while others of it wait for its place.)
+        *held = Some(Held { _slot: slots::take(places()), taken });
+    });
+}
+
+/// Gives the places back before the test ends (for a test whose GPU part
+/// is over); [`hold`] takes one again.
+pub fn release() {
+    HELD.with(|held| held.borrow_mut().take());
+}

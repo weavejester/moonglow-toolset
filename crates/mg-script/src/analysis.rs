@@ -15,7 +15,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::lex::{Token, TokenKind, tokenize};
-use crate::outline::{Outline, outline};
+use crate::outline::Outline;
 
 /// The engine's implicit include.
 pub const NWSCRIPT: &str = "nwscript";
@@ -177,17 +177,13 @@ impl File {
             };
             members.push(MemberUse { span: t.span.clone(), of });
         }
-        let outline = outline(text.as_bytes());
+        let outline = crate::outline::outline_with_tokens(&text, &toks);
         let mut locals = Vec::new();
         for f in &outline.functions {
             let Some(body) = f.body.clone() else { continue };
             // Parameters: in the declaration before the body, each a name
             // after a type.
-            let head: Vec<&Token> = sig
-                .iter()
-                .copied()
-                .filter(|t| t.span.start >= f.name_span.end && t.span.end <= body.start)
-                .collect();
+            let head = within(&sig, f.name_span.end..body.start);
             for (k, t) in head.iter().enumerate() {
                 if t.kind != TokenKind::Ident || k == 0 {
                     continue;
@@ -211,11 +207,40 @@ impl File {
         File { text, outline, idents, locals, members, toks }
     }
 
-    /// A local's documentation: the comments above its statement.
+    /// A local's documentation: the comments above its statement, then the
+    /// one that trails the statement's `;` on its line.
     fn local_doc(&self, l: &Local) -> (String, String) {
         let Some(at) = l.statement else { return Default::default() };
         let raw = self.toks.partition_point(|t| t.span.start < at);
-        crate::outline::doc_before(&self.text, &self.toks, raw)
+        let above = crate::outline::doc_before(&self.text, &self.toks, raw);
+        // The statement's `;`: the first after the name outside brackets
+        // (a `for` header's `;` is inside its parentheses, a block's `{`
+        // ends the search).
+        let mut depth = 0i32;
+        let mut semi = None;
+        for (k, t) in self
+            .toks
+            .iter()
+            .enumerate()
+            .skip(self.toks.partition_point(|t| t.span.start < l.decl.start))
+        {
+            match &self.text[t.span.clone()] {
+                "(" | "[" => depth += 1,
+                ")" | "]" => depth -= 1,
+                "{" | "}" => break,
+                ";" if depth <= 0 => {
+                    semi = Some(k);
+                    break;
+                }
+                _ => {}
+            }
+            if depth < 0 {
+                break;
+            }
+        }
+        let trailing =
+            semi.and_then(|k| crate::outline::trailing_comment(&self.text, &self.toks, k));
+        crate::outline::doc_with_trailing(&self.text, &self.toks, above, trailing)
     }
 
     /// The member name after `.` at (or just before) a byte offset.
@@ -229,35 +254,46 @@ impl File {
 
     /// The identifier at (or just before) a byte offset.
     fn ident_at(&self, offset: usize) -> Option<Range<usize>> {
-        self.idents.iter().find(|r| r.start <= offset && offset <= r.end).cloned()
+        let i = self.idents.partition_point(|r| r.start <= offset);
+        i.checked_sub(1).and_then(|k| self.idents.get(k)).filter(|r| offset <= r.end).cloned()
     }
 
     /// The local or parameter a name at `at` refers to.
     fn local(&self, name: &str, at: usize) -> Option<&Local> {
         self.locals
             .iter()
-            .filter(|l| l.name == name && l.decl.start <= at && l.scope.contains(&at))
+            .filter(|l| {
+                l.name == name
+                    && (l.decl.contains(&at) || (l.decl.start <= at && l.scope.contains(&at)))
+            })
             .max_by_key(|l| l.decl.start)
     }
 
     /// A name's span inside a declaration's span (after its type).
     fn name_in(&self, span: &Range<usize>, name: &str) -> Range<usize> {
-        self.idents
+        let start = self.idents.partition_point(|r| r.start < span.start);
+        self.idents[start..]
             .iter()
-            .filter(|r| r.start >= span.start && r.end <= span.end)
-            .find(|r| self.word(r) == name)
+            .take_while(|r| r.start < span.end)
+            .find(|r| r.end <= span.end && self.word(r) == name)
             .cloned()
-            .unwrap_or(span.clone())
+            .unwrap_or_else(|| span.clone())
     }
+}
+
+/// The tokens of `sig` (a file's, in order) that lie within `range`:
+/// found by where the range begins and ends, not by a pass over the file
+/// for every function of it (a script of 14,000 lines and 400 functions
+/// was 90 million steps an index).
+fn within<'a, 'b>(sig: &'a [&'b Token], range: Range<usize>) -> &'a [&'b Token] {
+    let from = sig.partition_point(|t| t.span.start < range.start);
+    let to = sig.partition_point(|t| t.span.end <= range.end);
+    &sig[from..to.max(from)]
 }
 
 /// Locals declared in a function body, each scoped to its block.
 fn body_locals(text: &str, sig: &[&Token], body: Range<usize>) -> Vec<Local> {
-    let toks: Vec<&Token> = sig
-        .iter()
-        .copied()
-        .filter(|t| t.span.start >= body.start && t.span.end <= body.end)
-        .collect();
+    let toks = within(sig, body.clone());
     let s = |i: usize| toks.get(i).map_or("", |t| &text[t.span.clone()]);
     // Each `{`'s matching `}` end.
     let mut block_end = HashMap::new();
@@ -349,6 +385,63 @@ fn body_locals(text: &str, sig: &[&Token], body: Range<usize>) -> Vec<Local> {
     out
 }
 
+/// A function's declaration in `file`, as [`Index::top_level`] gives it.
+fn function_declaration(file: &str, func: &crate::outline::FunctionDecl) -> Declaration {
+    let params: Vec<String> = func
+        .params
+        .iter()
+        .map(|p| match &p.default {
+            Some(d) => format!("{} {} = {d}", p.ty, p.name),
+            None => format!("{} {}", p.ty, p.name),
+        })
+        .collect();
+    Declaration {
+        name: func.name.clone(),
+        kind: DeclKind::Function,
+        at: Location { file: file.to_string(), span: func.name_span.clone() },
+        signature: format!("{} {}({})", func.return_type, func.name, params.join(", ")),
+        doc: func.doc.clone(),
+        doc_source: func.doc_source.clone(),
+    }
+}
+
+/// A function's definition `d`, with the documentation of the prototype
+/// declared before it where it has none of its own.
+fn defined(d: Declaration, prototype: Option<Declaration>) -> Declaration {
+    match prototype {
+        Some(Declaration { doc, doc_source, .. }) if d.doc.is_empty() => {
+            Declaration { doc, doc_source, ..d }
+        }
+        _ => d,
+    }
+}
+
+/// A global's declaration in `file` (indexed as `idx`).
+fn global_declaration(idx: &File, file: &str, g: &crate::outline::Global) -> Declaration {
+    let name = &g.name;
+    let value = g.value.as_ref().map(|v| format!(" = {v}")).unwrap_or_default();
+    Declaration {
+        name: name.clone(),
+        kind: if g.is_const { DeclKind::Constant } else { DeclKind::Variable },
+        at: Location { file: file.to_string(), span: idx.name_in(&g.span, name) },
+        signature: format!("{}{} {name}{value}", if g.is_const { "const " } else { "" }, g.ty),
+        doc: g.doc.clone(),
+        doc_source: g.doc_source.clone(),
+    }
+}
+
+/// A struct's declaration in `file` (indexed as `idx`).
+fn struct_declaration(idx: &File, file: &str, st: &crate::outline::StructDecl) -> Declaration {
+    Declaration {
+        name: st.name.clone(),
+        kind: DeclKind::Struct,
+        at: Location { file: file.to_string(), span: idx.name_in(&st.span, &st.name) },
+        signature: format!("struct {}", st.name),
+        doc: String::new(),
+        doc_source: String::new(),
+    }
+}
+
 /// Scripts, indexed as they're needed.
 #[derive(Debug, Default)]
 pub struct Index {
@@ -368,6 +461,11 @@ impl Index {
     /// Forgets a file (it is read again from the sources when needed).
     pub fn forget(&mut self, name: &str) {
         self.files.remove(&name.to_ascii_lowercase());
+    }
+
+    /// The indexed source text for `name`, if cached and readable.
+    pub fn text(&self, name: &str) -> Option<&Arc<str>> {
+        self.files.get(&name.to_ascii_lowercase())?.as_ref().map(|f| &f.text)
     }
 
     fn file(&mut self, name: &str, sources: &mut dyn Sources) -> Option<&File> {
@@ -419,35 +517,23 @@ impl Index {
         sources: &mut dyn Sources,
     ) -> Option<Declaration> {
         let unit = self.unit(file, sources);
+        self.top_level_in(&unit, name, sources)
+    }
+
+    fn top_level_in(
+        &mut self,
+        unit: &[String],
+        name: &str,
+        sources: &mut dyn Sources,
+    ) -> Option<Declaration> {
         let mut prototype = None;
-        for f in &unit {
+        for f in unit {
             let Some(idx) = self.file(f, sources) else { continue };
             let o = &idx.outline;
             for func in o.functions.iter().filter(|x| x.name == name) {
-                let params: Vec<String> = func
-                    .params
-                    .iter()
-                    .map(|p| match &p.default {
-                        Some(d) => format!("{} {} = {d}", p.ty, p.name),
-                        None => format!("{} {}", p.ty, p.name),
-                    })
-                    .collect();
-                let d = Declaration {
-                    name: name.to_string(),
-                    kind: DeclKind::Function,
-                    at: Location { file: f.clone(), span: func.name_span.clone() },
-                    signature: format!("{} {}({})", func.return_type, func.name, params.join(", ")),
-                    doc: func.doc.clone(),
-                    doc_source: func.doc_source.clone(),
-                };
+                let d = function_declaration(f, func);
                 if func.body.is_some() {
-                    // The documentation may be on the prototype.
-                    return Some(match prototype {
-                        Some(Declaration { doc, doc_source, .. }) if d.doc.is_empty() => {
-                            Declaration { doc, doc_source, ..d }
-                        }
-                        _ => d,
-                    });
+                    return Some(defined(d, prototype));
                 }
                 prototype.get_or_insert(d);
             }
@@ -455,29 +541,10 @@ impl Index {
                 continue;
             }
             if let Some(g) = o.globals.iter().find(|g| g.name == name) {
-                let value = g.value.as_ref().map(|v| format!(" = {v}")).unwrap_or_default();
-                return Some(Declaration {
-                    name: name.to_string(),
-                    kind: if g.is_const { DeclKind::Constant } else { DeclKind::Variable },
-                    at: Location { file: f.clone(), span: idx.name_in(&g.span, name) },
-                    signature: format!(
-                        "{}{} {name}{value}",
-                        if g.is_const { "const " } else { "" },
-                        g.ty
-                    ),
-                    doc: g.doc.clone(),
-                    doc_source: g.doc_source.clone(),
-                });
+                return Some(global_declaration(idx, f, g));
             }
             if let Some(st) = o.structs.iter().find(|s| s.name == name) {
-                return Some(Declaration {
-                    name: name.to_string(),
-                    kind: DeclKind::Struct,
-                    at: Location { file: f.clone(), span: idx.name_in(&st.span, name) },
-                    signature: format!("struct {name}"),
-                    doc: String::new(),
-                    doc_source: String::new(),
-                });
+                return Some(struct_declaration(idx, f, st));
             }
         }
         prototype
@@ -745,18 +812,27 @@ impl Index {
         if new == decl.name {
             return Err("the new name is the old one".into());
         }
-        let places = self.references(decl, files, sources);
+        // The declaration was taken a while ago (a Rename window stays up
+        // while its script is edited): where it is no longer the name at
+        // its place, there is nothing to rename.
+        let changed = || format!("{} changed since it was chosen: choose it again", decl.name);
+        let Some(f) = self.file(&decl.at.file, sources) else { return Err(changed()) };
+        if f.text.get(decl.at.span.clone()) != Some(decl.name.as_str()) {
+            return Err(changed());
+        }
         if decl.kind == DeclKind::Member {
             // (Taken where the struct has a member of that name.)
-            let f = self.file(&decl.at.file, sources).expect("indexed");
-            let st = (f.outline.structs.iter())
+            let Some(st) = (f.outline.structs.iter())
                 .find(|s| s.members.iter().any(|m| m.span == decl.at.span))
-                .expect("the member's struct");
+            else {
+                return Err(changed());
+            };
             if st.members.iter().any(|m| m.name == new) {
                 return Err(format!("{new} is already a member of struct {}", st.name));
             }
-            return Ok(places);
+            return Ok(self.references(decl, files, sources));
         }
+        let places = self.references(decl, files, sources);
         let mut checked = HashSet::new();
         for p in &places {
             let taken = match decl.kind {
@@ -842,23 +918,57 @@ impl Index {
                 }
             }
         }
+        // Each top-level name where the unit first has it, with the
+        // declaration [`top_level`](Self::top_level) finds for it, made
+        // in one pass over the unit: asked of `top_level` name by name,
+        // the engine's 7,500 were each a search of the whole unit.
+        enum Found {
+            /// Declared without a body so far (the first such), at `out`'s
+            /// place.
+            Prototype(usize),
+            Done,
+        }
+        let mut found: HashMap<String, Found> = HashMap::new();
         for f in self.unit(&name, sources) {
-            let names: Vec<String> = match self.file(&f, sources) {
-                Some(idx) => idx
-                    .outline
-                    .functions
-                    .iter()
-                    .map(|x| x.name.clone())
-                    .chain(idx.outline.globals.iter().map(|g| g.name.clone()))
-                    .chain(idx.outline.structs.iter().map(|s| s.name.clone()))
-                    .collect(),
-                None => continue,
-            };
-            for n in names {
-                if seen.insert(n.clone())
-                    && let Some(d) = self.top_level(&name, &n, sources)
-                {
-                    out.push(d);
+            let Some(idx) = self.file(&f, sources) else { continue };
+            let o = &idx.outline;
+            for func in &o.functions {
+                if seen.contains(&func.name) && !found.contains_key(&func.name) {
+                    continue; // a local's name
+                }
+                let prototype = match found.get(&func.name) {
+                    Some(Found::Done) => continue,
+                    Some(Found::Prototype(at)) => Some(*at),
+                    None => None,
+                };
+                match (prototype, func.body.is_some()) {
+                    (Some(_), false) => {}
+                    (Some(at), true) => {
+                        let d = function_declaration(&f, func);
+                        let prototype = std::mem::replace(&mut out[at], d.clone());
+                        out[at] = defined(d, Some(prototype));
+                        found.insert(func.name.clone(), Found::Done);
+                    }
+                    (None, body) => {
+                        seen.insert(func.name.clone());
+                        let state = if body { Found::Done } else { Found::Prototype(out.len()) };
+                        found.insert(func.name.clone(), state);
+                        out.push(function_declaration(&f, func));
+                    }
+                }
+            }
+            // (A name declared as a function so far is that function, as
+            // `top_level` has it: globals and structs are the names left.)
+            for g in &o.globals {
+                if !found.contains_key(&g.name) && seen.insert(g.name.clone()) {
+                    found.insert(g.name.clone(), Found::Done);
+                    out.push(global_declaration(idx, &f, g));
+                }
+            }
+            for st in &o.structs {
+                if !found.contains_key(&st.name) && seen.insert(st.name.clone()) {
+                    found.insert(st.name.clone(), Found::Done);
+                    out.push(struct_declaration(idx, &f, st));
                 }
             }
         }
@@ -879,8 +989,9 @@ impl Index {
             .chain(f.outline.globals.iter().map(|g| g.name.clone()))
             .chain(f.outline.structs.iter().map(|s| s.name.clone()))
             .collect();
+        let unit = self.unit(&name, sources);
         for n in names {
-            if let Some(d) = self.top_level(&name, &n, sources).filter(|d| d.at.file == name)
+            if let Some(d) = self.top_level_in(&unit, &n, sources).filter(|d| d.at.file == name)
                 && !out.iter().any(|o: &Declaration| o.at == d.at)
             {
                 out.push(d);
@@ -981,7 +1092,7 @@ mod tests {
         let inner = member(&mut idx, &mut src, "mKept.inner", 0, 1).unwrap();
         assert_eq!(
             (inner.signature.as_str(), inner.doc.as_str()),
-            ("struct Inner inner (struct Mark)", "")
+            ("struct Inner inner (struct Mark)", "after inner")
         );
         for (needle, nth) in [("GetMark().vPos", 0), ("gMark.vPos", 0), ("mArg.vPos", 0)] {
             let pos = member(&mut idx, &mut src, needle, nth, 1).unwrap();
@@ -1004,6 +1115,122 @@ mod tests {
         assert_eq!((refs.len(), in_uses), (4, 3), "{refs:?}");
         assert_eq!(idx.rename(&declared, "vWhere", &files, &mut src).unwrap().len(), 4);
         assert!(idx.rename(&declared, "inner", &files, &mut src).is_err(), "taken in the struct");
+    }
+
+    /// A declaration taken before its script changed (the Rename window
+    /// stays up while the editor is typed in) is refused, not a panic: a
+    /// line added above a member's struct, the struct gone with the name
+    /// still at the place, the declaring file gone.
+    #[test]
+    fn rename_refuses_a_declaration_that_changed() {
+        const S: &str = "struct S { int a; };\nvoid main() { struct S s; s.a = 1; }\n";
+        let mut src = |name: &str| (name == "nwscript").then(|| Arc::from(NWS));
+        let mut idx = Index::new();
+        idx.set("s", Arc::from(S));
+        let files = vec!["s".to_string()];
+        let member = idx.declaration_at("s", at(S, "s.a", 0) + 2, &mut src).unwrap();
+        assert_eq!((member.kind, member.at.span.clone()), (DeclKind::Member, 15..16));
+        assert_eq!(idx.rename(&member, "b", &files, &mut src).unwrap().len(), 2);
+        let local = idx.declaration_at("s", at(S, "s;", 0), &mut src).unwrap();
+        assert_eq!(local.kind, DeclKind::Local);
+        idx.set("s", Arc::from(format!("// A line above.\n{S}")));
+        for d in [&member, &local] {
+            let e = idx.rename(d, "b", &files, &mut src).unwrap_err();
+            assert!(e.contains("changed since it was chosen"), "{e}");
+        }
+        // (The member's place still reads `a`, in no struct.)
+        idx.set("s", Arc::from("int aaaaaaaaaaaaaaaaaaaa;\n"));
+        let e = idx.rename(&member, "b", &files, &mut src).unwrap_err();
+        assert!(e.contains("changed since it was chosen"), "{e}");
+        idx.forget("s");
+        assert!(idx.rename(&member, "b", &files, &mut src).is_err());
+    }
+
+    /// A long script of many functions is indexed in the time its length
+    /// takes, with every function's parameters and locals found.
+    #[test]
+    fn a_script_of_many_functions_is_indexed_at_once() {
+        let mut text = String::new();
+        for f in 0..400 {
+            text.push_str(&format!(
+                "int F{f}(int nA{f}, object oB)\n{{\n    int nSum{f} = nA{f};\n"
+            ));
+            for line in 0..30 {
+                text.push_str(&format!(
+                    "    nSum{f} = nSum{f} + {line} * GetLocalInt(oB, \"x\");\n"
+                ));
+            }
+            text.push_str(&format!("    {{ float fIn{f}; }}\n    return nSum{f};\n}}\n"));
+        }
+        let text: Arc<str> = Arc::from(text);
+        let started = std::time::Instant::now();
+        let file = File::new(text.clone());
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+        assert_eq!(file.locals.len(), 400 * 4);
+        for f in [0, 199, 399] {
+            let of = |name: String| file.locals.iter().find(|l| l.name == name).unwrap();
+            let (a, sum, inner) =
+                (of(format!("nA{f}")), of(format!("nSum{f}")), of(format!("fIn{f}")));
+            assert_eq!((a.kind, a.ty.as_str()), (DeclKind::Parameter, "int"));
+            assert_eq!((sum.kind, sum.ty.as_str()), (DeclKind::Local, "int"));
+            assert!(a.scope.contains(&sum.decl.start) && sum.scope.contains(&inner.decl.start));
+            assert!(inner.scope.end < sum.scope.end, "the inner block's own scope");
+            assert!(text[a.scope.clone()].starts_with('{') && text[a.scope.clone()].ends_with('}'));
+        }
+    }
+
+    /// Completions are what `top_level` finds for each of the unit's
+    /// names, in the order the unit first has them: a prototype in one
+    /// file and its definition in another, a name that is a function
+    /// here and a constant there, a local over a global; and the engine's
+    /// thousands of names take no time.
+    #[test]
+    fn completions_are_the_unit_s_declarations_in_one_pass() {
+        const A: &str = "// Documented here.\nint Later(int n);\nint Only(int n);\nint Both = 1;\n\
+            struct Both { int a; };\nstruct Shape { int a; };\nint Shadowed = 2;\n\
+            int Twice();\n// Second.\nint Twice();\n";
+        const B: &str = "int Later(int n) { return n; }\nint Only = 3;\nvoid Both() {}\n\
+            int Shape = 4;\nint Twice() { return 2; }\nint TRUE = 0;\n";
+        const M: &str =
+            "#include \"a\"\n#include \"b\"\nvoid main()\n{\n    int Shadowed = 1;\n    \n}\n";
+        let mut engine = String::from(NWS);
+        for n in 0..7000 {
+            engine.push_str(&format!("int CONSTANT_{n} = {n};\n"));
+        }
+        let engine: Arc<str> = Arc::from(engine);
+        let mut src = |name: &str| match name {
+            "a" => Some(Arc::from(A)),
+            "b" => Some(Arc::from(B)),
+            "m" => Some(Arc::from(M)),
+            "nwscript" => Some(engine.clone()),
+            _ => None,
+        };
+        let mut idx = Index::new();
+        let at = at(M, "    \n}", 0) + 4;
+        idx.completions("m", at, &mut src);
+        let started = std::time::Instant::now();
+        let all = idx.completions("m", at, &mut src);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+        assert_eq!(all.len(), 9 + 7000, "each name once");
+        assert_eq!((all[0].name.as_str(), all[0].kind), ("Shadowed", DeclKind::Local));
+        let names: Vec<&str> = all[1..9].iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["main", "Later", "Only", "Twice", "Both", "Shape", "TRUE", "GetSelf"]);
+        // Each is what `top_level` finds.
+        for d in &all[1..] {
+            let found = idx.top_level("m", &d.name, &mut src).unwrap();
+            assert_eq!(*d, found, "{}", d.name);
+        }
+        let of = |name: &str| all.iter().find(|d| d.name == name).unwrap();
+        assert_eq!(
+            (of("Later").at.file.as_str(), of("Later").doc.as_str()),
+            ("b", "Documented here.")
+        );
+        assert_eq!((of("Only").kind, of("Only").at.file.as_str()), (DeclKind::Function, "a"));
+        assert_eq!((of("Both").kind, of("Both").at.file.as_str()), (DeclKind::Variable, "a"));
+        assert_eq!((of("Twice").at.file.as_str(), of("Twice").doc.as_str()), ("b", ""));
+        assert_eq!(of("TRUE").at.file, "b");
     }
 
     #[test]
@@ -1041,5 +1268,39 @@ mod tests {
         for n in ["Twice", "LIMIT", "Pair", "GetSelf", "TRUE"] {
             assert!(names.contains(&n.to_string()), "{n}");
         }
+    }
+
+    /// A local's trailing comment documents it, and the next local takes
+    /// none of it.
+    #[test]
+    fn a_locals_trailing_comment_documents_it() {
+        const TEXT: &str = "void main()\n{\n    int nCount = 0; // How many.\n    int nOther;\n}\n";
+        const FILES: &[(&str, &str)] = &[("main", TEXT)];
+        let mut src = sources(FILES);
+        let mut idx = Index::new();
+        let d = idx.declaration_at("main", at(TEXT, "nCount", 0), &mut src).unwrap();
+        assert_eq!((d.kind, d.doc.as_str()), (DeclKind::Local, "How many."));
+        let d = idx.declaration_at("main", at(TEXT, "nOther", 0), &mut src).unwrap();
+        assert_eq!(d.doc, "");
+    }
+
+    #[test]
+    fn parameter_declaration_resolves_references_and_renames() {
+        const PARAM_SRC: &str = "void Foo(int nBar)\n{\n    int x = nBar + 1;\n}\n";
+        const FILES: &[(&str, &str)] = &[("p", PARAM_SRC)];
+        let mut src = sources(FILES);
+        let mut idx = Index::new();
+        let all = vec!["p".to_string()];
+        let decl_at = at(PARAM_SRC, "nBar)", 0);
+        let decl = idx.declaration_at("p", decl_at, &mut src).expect("param decl");
+        assert_eq!(decl.kind, DeclKind::Parameter);
+        assert_eq!(decl.at.span.start, decl_at);
+        let refs = idx.references(&decl, &all, &mut src);
+        assert_eq!(refs.len(), 2, "{refs:?}");
+        assert_eq!(refs[0].span.start, decl_at);
+        assert_eq!(refs[1].span.start, at(PARAM_SRC, "nBar + 1", 0));
+        let renamed = idx.rename(&decl, "nBaz", &all, &mut src).unwrap();
+        assert_eq!(renamed.len(), 2);
+        assert_eq!(idx.text("p").map(|t| t.as_ref()), Some(PARAM_SRC));
     }
 }

@@ -26,6 +26,22 @@
 //!
 //! [pack]                              # a nasher project's Pack
 //! compile_models = true               # models kept as text go in compiled
+//!
+//! [talk]                              # text typed into the custom talk table
+//! typed = true                        # on for everyone (off unless said: each builder's Options)
+//! lines = "100000-149999"             # the lines it takes (0 is StrRef 16777216)
+//! map = "tlk/strings.strrefs.json"    # mg tlk-alloc's map: its lines are never taken
+//! [talk.builders]                     # a builder's own part, by their code
+//! ab = "100000-109999"
+//!
+//! [palette.kind]                      # a grouping of the palettes: Group by's "Kind"
+//! types = ["utp"]                     # the palettes it is offered in (left out: all)
+//! words_of = '^.*?:\s*(.*?)\s*(\(|$)' # the part of a name its words come from
+//! from = "palette_kinds.toml"         # lists a tool writes ("Tables" = ["dd_tbl01"])
+//! [[palette.kind.group]]
+//! name = "Tables"
+//! names = ["table", "desk"]           # whole words of a name, case and accents ignored
+//! resrefs = ["dd_*_tbl*"]             # or ResRef patterns
 //! ```
 //!
 //! And in `.moonglow/user.toml`, the builder's own:
@@ -181,6 +197,11 @@ pub struct StaticRules {
     /// placeable whose tag a script names stays dynamic
     /// ([`StaticRules::with_scripts`]; none until it is called).
     pub scripts: crate::areas::ScriptStrings,
+    /// Not of the file: placeables.2da's rows of flickering lights
+    /// (`crate::lights::flickering_rows`), which stay dynamic, as the game
+    /// plays no static placeable's flicker
+    /// ([`StaticRules::with_flickering_rows`]; none until it is called).
+    pub flickering_rows: std::collections::BTreeSet<u32>,
 }
 
 impl StaticRules {
@@ -188,6 +209,13 @@ impl StaticRules {
     /// ([`crate::areas::ScriptStrings::of`]).
     pub fn with_scripts(mut self, module: &crate::Module) -> StaticRules {
         self.scripts = crate::areas::ScriptStrings::of(module);
+        self
+    }
+
+    /// These rules, with the rows of placeables.2da `table` (the copy the
+    /// game reads) that are flickering lights.
+    pub fn with_flickering_rows(mut self, table: &mg_2da::TwoDa) -> StaticRules {
+        self.flickering_rows = crate::lights::flickering_rows(table);
         self
     }
 }
@@ -199,6 +227,7 @@ impl Default for StaticRules {
             keep_tags: Patterns::default(),
             keep_resrefs: Patterns::default(),
             scripts: Default::default(),
+            flickering_rows: Default::default(),
         }
     }
 }
@@ -413,7 +442,7 @@ pub struct UploadCommand {
 
 /// A command's name in the menu, from its name in the file:
 /// `run_tests` is Run Tests.
-fn label_of(name: &str) -> String {
+pub(crate) fn label_of(name: &str) -> String {
     let words = name.replace(['_', '-'], " ");
     let mut c = words.chars();
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
@@ -630,10 +659,24 @@ pub struct ProjectFile {
     pub store: Option<StoreRules>,
     /// `[used]`: what the Unused report counts as used.
     pub used: UsedRules,
+    /// `[tilesets] hidden`: the tilesets (resrefs, globs) the Area Wizard
+    /// and Change Tileset leave out of their lists, unless the builder
+    /// shows them; they stay in the game's load order, and an area on one
+    /// opens as any other.
+    pub hidden_tilesets: Patterns,
     /// `[pack]`: what Pack does on the way in.
     pub pack: PackRules,
     /// `[lights]`: lights made as content.
     pub lights: LightRules,
+    /// `[talk]`: the custom talk table's lines text typed takes
+    /// ([`crate::talk_range`]).
+    pub talk: crate::talk_range::TalkRules,
+    /// `[bake]`: where Bake Walkmesh to Transform puts its models and rows
+    /// ([`crate::bake`]).
+    pub bake: crate::bake::BakeRules,
+    /// The bake's rows file as read (none without `[bake]`; empty where
+    /// the file isn't there yet), or why it can't be read.
+    pub baked: Option<Result<crate::bake::RowsFile, String>>,
     /// `[resrefs] pattern`: how a new ResRef is made by the builder's
     /// code, or the team's prefix (none: [`DEFAULT_PATTERN`]).
     pub resref_pattern: Option<String>,
@@ -660,6 +703,9 @@ pub struct ProjectFile {
     /// plugins, their settings' values and what the builder allowed
     /// ([`crate::project_plugins`]).
     pub plugins: crate::project_plugins::PluginRules,
+    /// `[palette.*]`: the palettes' groupings of Moonglow's own, with
+    /// their `from` files' lists ([`crate::palette_groups`]).
+    pub palette: std::sync::Arc<crate::palette_groups::Groupings>,
     /// What was not understood, which leaves the rest as it reads:
     /// `moonglow.toml:12: "colour" is not a key of [store]`.
     pub warnings: Vec<String>,
@@ -667,24 +713,56 @@ pub struct ProjectFile {
     pub errors: Vec<String>,
     /// The files' times and sizes when read, to see a change.
     stamps: Vec<Option<(SystemTime, u64, u64)>>,
+    /// When [`ProjectFile::read_at`] started reading these files (none for
+    /// defaults / in-memory reads).
+    read_at: Option<SystemTime>,
     /// Where they were read from.
     place: Option<Place>,
 }
 
-fn stamp(path: &Path) -> Option<(SystemTime, u64, u64)> {
+fn hash_file(path: &Path) -> Option<u64> {
     use std::hash::{Hash, Hasher};
-    let m = std::fs::metadata(path).ok()?;
-    // These files are small: their bytes' hash too, as a rewrite of the
-    // same length within a timestamp's tick (coarse on some systems) would
-    // otherwise go unseen.
     let mut h = std::collections::hash_map::DefaultHasher::new();
     std::fs::read(path).ok()?.hash(&mut h);
-    Some((m.modified().ok()?, m.len(), h.finish()))
+    Some(h.finish())
+}
+
+fn stamp(path: &Path) -> Option<(SystemTime, u64, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len(), hash_file(path)?))
+}
+
+/// Checks `path` against a recorded stamp without reading file contents once its
+/// modification time is comfortably past the coarse filesystem tick window at `read_at`.
+fn stamp_unchanged(
+    path: &Path,
+    was: Option<(SystemTime, u64, u64)>,
+    read_at: Option<SystemTime>,
+) -> bool {
+    let Ok(m) = std::fs::metadata(path) else {
+        return was.is_none();
+    };
+    let Some((old_mtime, old_len, old_hash)) = was else {
+        return false;
+    };
+    let Ok(mtime) = m.modified() else {
+        return false;
+    };
+    if mtime != old_mtime || m.len() != old_len {
+        return false;
+    }
+    if read_at
+        .and_then(|t| t.duration_since(old_mtime).ok())
+        .is_some_and(|d| d >= std::time::Duration::from_secs(2))
+    {
+        return true;
+    }
+    hash_file(path) == Some(old_hash)
 }
 
 /// The line (from 1) a byte of `source` is on.
 pub(crate) fn line_of(source: &str, at: usize) -> usize {
-    source.as_bytes()[..at.min(source.len())].iter().filter(|b| **b == b'\n').count() + 1
+    mg_core::text::line_of(source.as_bytes(), at)
 }
 
 /// What reads one file: its name, as messages give it, and its text.
@@ -738,6 +816,26 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A file a section names by its path from the project file's folder
+    /// (trimmed; it may be empty). One that leaves the project (an
+    /// absolute path, a `..`) is a warning and is not taken: the file
+    /// comes with a checkout, and could otherwise have Moonglow read, or
+    /// make (the claims table), a file anywhere the builder can write.
+    pub(crate) fn file_inside(&mut self, entry: Entry) -> Option<String> {
+        let text = self.text(entry)?.trim().to_string();
+        if text.is_empty() {
+            return Some(text);
+        }
+        match crate::project_plugins::inside_problem(&text, "file") {
+            Some(problem) => {
+                let message = format!("{} \"{text}\": {problem}", entry.0.get_ref());
+                self.warn(entry.1.span().start, message);
+                None
+            }
+            None => Some(text),
+        }
+    }
+
     fn resref(&mut self, entry: Entry) -> Option<ResRef> {
         let text = self.text(entry)?;
         match ResRef::from_str(text.trim()) {
@@ -753,7 +851,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn patterns(&mut self, (key, value): Entry) -> Option<Patterns> {
+    pub(crate) fn patterns(&mut self, (key, value): Entry) -> Option<Patterns> {
         let DeValue::Array(items) = value.get_ref() else {
             let message = format!("{} is to be a list of names: [\"A_*\", \"B\"]", key.get_ref());
             self.warn(value.span().start, message);
@@ -773,6 +871,31 @@ impl<'a> Reader<'a> {
         Some(Patterns::new(&globs).expect("each read"))
     }
 
+    /// A command's table: its `run` for this system (`windows` or `unix`
+    /// before `run`), `input` set from its key, and each other key given
+    /// to `other`, in the file's order.
+    fn run_table<'i>(
+        &mut self,
+        t: &'i DeTable<'i>,
+        input: &mut bool,
+        mut other: impl FnMut(&mut Self, Entry<'i>),
+    ) -> Option<String> {
+        let (mut run, mut windows, mut unix) = (None, None, None);
+        for e in in_order(t) {
+            match e.0.get_ref().as_ref() {
+                "run" => run = self.text(e),
+                "windows" => windows = self.text(e),
+                "unix" => unix = self.text(e),
+                "input" => match e.1.get_ref() {
+                    DeValue::Boolean(b) => *input = *b,
+                    _ => self.warn(e.1.span().start, "input is true or false"),
+                },
+                _ => other(self, e),
+            }
+        }
+        if cfg!(windows) { windows.or(run) } else { unix.or(run) }
+    }
+
     /// A command of `[commands]`: its text, or a table of `run` (or
     /// `windows` and `unix`, each for its systems) and `label`.
     fn command(&mut self, (key, value): Entry) -> Option<ProjectCommand> {
@@ -789,30 +912,20 @@ impl<'a> Reader<'a> {
         match value.get_ref() {
             DeValue::String(s) => c.run = Some(s.to_string()),
             DeValue::Table(t) => {
-                let (mut run, mut windows, mut unix) = (None, None, None);
-                for e in in_order(t) {
-                    match e.0.get_ref().as_ref() {
-                        "run" => run = self.text(e),
-                        "windows" => windows = self.text(e),
-                        "unix" => unix = self.text(e),
-                        "label" => {
-                            if let Some(l) = self.text(e).filter(|l| !l.trim().is_empty()) {
-                                c.label = l.trim().to_string();
-                            }
+                let (label, writes, key, name) = (&mut c.label, &mut c.writes, &mut c.key, &c.name);
+                c.run = self.run_table(t, &mut c.input, |r, e| match e.0.get_ref().as_ref() {
+                    "label" => {
+                        if let Some(l) = r.text(e).filter(|l| !l.trim().is_empty()) {
+                            *label = l.trim().to_string();
                         }
-                        "writes" => match e.1.get_ref() {
-                            DeValue::Boolean(b) => c.writes = *b,
-                            _ => self.warn(e.1.span().start, "writes is true or false"),
-                        },
-                        "key" => c.key = self.text(e).filter(|k| !k.trim().is_empty()),
-                        "input" => match e.1.get_ref() {
-                            DeValue::Boolean(b) => c.input = *b,
-                            _ => self.warn(e.1.span().start, "input is true or false"),
-                        },
-                        _ => self.unknown(&format!("commands.{}", c.name), e),
                     }
-                }
-                c.run = if cfg!(windows) { windows.or(run) } else { unix.or(run) };
+                    "writes" => match e.1.get_ref() {
+                        DeValue::Boolean(b) => *writes = *b,
+                        _ => r.warn(e.1.span().start, "writes is true or false"),
+                    },
+                    "key" => *key = r.text(e).filter(|k| !k.trim().is_empty()),
+                    _ => r.unknown(&format!("commands.{name}"), e),
+                });
             }
             _ => {
                 let message = format!(
@@ -834,20 +947,7 @@ impl<'a> Reader<'a> {
         match value.get_ref() {
             DeValue::String(s) => c.run = Some(s.to_string()),
             DeValue::Table(t) => {
-                let (mut run, mut windows, mut unix) = (None, None, None);
-                for e in in_order(t) {
-                    match e.0.get_ref().as_ref() {
-                        "run" => run = self.text(e),
-                        "windows" => windows = self.text(e),
-                        "unix" => unix = self.text(e),
-                        "input" => match e.1.get_ref() {
-                            DeValue::Boolean(b) => c.input = *b,
-                            _ => self.warn(e.1.span().start, "input is true or false"),
-                        },
-                        _ => self.unknown("nwsync.upload", e),
-                    }
-                }
-                c.run = if cfg!(windows) { windows.or(run) } else { unix.or(run) };
+                c.run = self.run_table(t, &mut c.input, |r, e| r.unknown("nwsync.upload", e));
             }
             _ => {
                 let message = "upload is to be its command, in quotes, or a table: { run = \"…\", \
@@ -923,21 +1023,33 @@ impl ProjectFile {
             path: Some(path.clone()),
             // (The claims table's last, once the team's file says where.)
             stamps: vec![stamp(&path), user.as_deref().and_then(stamp), stamp(&described), None],
+            read_at: Some(SystemTime::now()),
             place: Some(place.clone()),
             ..Default::default()
         };
         let files = std::iter::once((path.clone(), false)).chain(user.map(|u| (u, true)));
         for (file, own) in files {
             let file = &file;
+            let name = if own { format!("{USER_DIR}/{USER_FILE}") } else { place.team_name() };
             let source = match std::fs::read(file) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Ok(bytes) => {
+                    // (Read all the same; what changes the file would put
+                    // U+FFFD there for good, and refuses to: said now.)
+                    if let Some(line) = not_utf8_at(&bytes) {
+                        p.warnings.push(format!(
+                            "{name}:{line}: the file is not UTF-8 text here (a character typed \
+                             in another encoding): it is read without it, and Moonglow does not \
+                             change the file until it is saved as UTF-8"
+                        ));
+                    }
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     p.errors.push(format!("{}: {e}", file.display()));
                     continue;
                 }
             };
-            let name = if own { format!("{USER_DIR}/{USER_FILE}") } else { place.team_name() };
             // (One made by hand: its folder would be committed for all.)
             if own && !root.join(USER_DIR).join(".gitignore").exists() {
                 p.warnings.push(format!(
@@ -952,6 +1064,16 @@ impl ProjectFile {
         if let Some(table) = p.claims.path_in(root) {
             p.stamps[3] = stamp(&table);
             p.read_claims(root, &table);
+        }
+        // The palettes' groupings' lists, each a file of its own beside
+        // the team's (their stamps after the others').
+        let dir = path.parent().unwrap_or(root).to_path_buf();
+        p.stamps.extend(p.palette.from_paths(&dir).iter().map(|f| stamp(f)));
+        std::sync::Arc::make_mut(&mut p.palette).read_lists(&dir, &mut p.warnings);
+        // The bake's rows file, beside the team's (its stamp last).
+        if let Some(rows) = p.bake.rows_path(&dir) {
+            p.stamps.push(stamp(&rows));
+            p.baked = Some(crate::bake::RowsFile::read(&rows).map(Option::unwrap_or_default));
         }
         // The team's described variables, a file of their own.
         match std::fs::read(&described) {
@@ -1180,14 +1302,32 @@ impl ProjectFile {
                             },
                             "hak" => {
                                 if let Some(t) = r.text(e) {
-                                    self.lights.hak =
-                                        Some(t.trim().trim_end_matches(".hak").into());
+                                    self.lights.hak = Some(
+                                        mg_core::text::strip_suffix_ascii_ci(t.trim(), ".hak")
+                                            .into(),
+                                    );
                                 }
                             }
                             "first_row" => match e.1.get_ref() {
                                 DeValue::Integer(i) if i.radix() == 10 => {
                                     match i.as_str().parse::<usize>() {
-                                        Ok(n) => self.lights.first_row = Some(n),
+                                        Ok(n) => {
+                                            // (Kept, so that Make Light
+                                            // refuses rather than take
+                                            // another row.)
+                                            self.lights.first_row = Some(n);
+                                            let last = crate::bake::LAST_ROW;
+                                            if n > last as usize {
+                                                r.warn(
+                                                    e.1.span().start,
+                                                    format!(
+                                                        "first_row {n} is past row {last}, the \
+                                                         last the game can use: no light can be \
+                                                         made"
+                                                    ),
+                                                );
+                                            }
+                                        }
                                         Err(_) => r.warn(
                                             e.1.span().start,
                                             "first_row is a row: 0 or more",
@@ -1239,7 +1379,24 @@ impl ProjectFile {
                         }
                     }
                 }
+                ("tilesets", false) => {
+                    for e in r.section(entry) {
+                        match e.0.get_ref().as_ref() {
+                            "hidden" => {
+                                if let Some(p) = r.patterns(e) {
+                                    self.hidden_tilesets = p;
+                                }
+                            }
+                            _ => r.unknown(section, e),
+                        }
+                    }
+                }
                 ("claims", false) => self.read_claim_rules(&mut r, entry),
+                ("talk", false) => self.read_talk_rules(&mut r, entry),
+                ("bake", false) => self.read_bake_rules(&mut r, entry),
+                ("palette", false) => {
+                    std::sync::Arc::make_mut(&mut self.palette).read(&mut r, entry)
+                }
                 ("commands", false) => {
                     for e in r.section(entry) {
                         if let Some(c) = r.command(e) {
@@ -1303,7 +1460,7 @@ impl ProjectFile {
                 }
                 (
                     "make_static" | "tags" | "store" | "resrefs" | "used" | "claims" | "commands"
-                    | "pack",
+                    | "pack" | "talk" | "palette" | "bake" | "tilesets",
                     true,
                 ) => r.warn(
                     key.span().start,
@@ -1317,15 +1474,151 @@ impl ProjectFile {
         self.warnings.append(&mut r.warnings);
     }
 
+    /// Reads `[talk]`: `lines`, `map` and `[talk.builders]`.
+    fn read_talk_rules(&mut self, r: &mut Reader, entry: Entry) {
+        use crate::talk_range::{Lines, TalkRules};
+        let mut rules = TalkRules::default();
+        let lines = |r: &mut Reader, e: Entry| -> Option<Lines> {
+            let text = match e.1.get_ref() {
+                DeValue::String(s) => s.to_string(),
+                DeValue::Integer(i) => i.as_str().to_string(),
+                DeValue::Array(a) if a.len() == 2 => {
+                    let n: Vec<String> = a
+                        .iter()
+                        .map(|v| match v.get_ref() {
+                            DeValue::Integer(i) => i.as_str().to_string(),
+                            _ => "?".into(),
+                        })
+                        .collect();
+                    format!("{}-{}", n[0], n[1])
+                }
+                _ => {
+                    let message =
+                        format!("{} is to be lines in quotes: \"100000-149999\"", e.0.get_ref());
+                    r.warn(e.1.span().start, message);
+                    return None;
+                }
+            };
+            match Lines::parse(&text) {
+                Ok(l) => Some(l),
+                Err(problem) => {
+                    r.warn(e.1.span().start, format!("{}: {problem}", e.0.get_ref()));
+                    None
+                }
+            }
+        };
+        for e in r.section(entry) {
+            match e.0.get_ref().as_ref() {
+                "lines" => rules.lines = lines(r, e),
+                "typed" => match e.1.get_ref() {
+                    DeValue::Boolean(b) => rules.typed = Some(*b),
+                    _ => r.warn(e.1.span().start, "typed is true or false"),
+                },
+                "map" => rules.map = r.file_inside(e).filter(|m| !m.is_empty()),
+                "builders" => {
+                    for b in r.section(e) {
+                        let code = b.0.get_ref().trim().to_ascii_lowercase();
+                        if let Some(problem) = code_problem(&code) {
+                            r.warn(b.0.span().start, format!("builder \"{code}\": {problem}"));
+                        } else if let Some(l) = lines(r, b) {
+                            rules.builders.insert(code, l);
+                        }
+                    }
+                }
+                _ => r.unknown("talk", e),
+            }
+        }
+        for problem in rules.problems() {
+            r.warn(entry.0.span().start, format!("[talk]: {problem}"));
+        }
+        self.talk = rules;
+    }
+
+    /// Reads `[bake]`: `rows`, `hak`, `names` and `rows_file`. What is
+    /// wrong is a warning and one of the rules' problems, which keep the
+    /// command from being offered.
+    fn read_bake_rules(&mut self, r: &mut Reader, entry: Entry) {
+        use crate::bake::{BakeRules, Rows};
+        let mut rules = BakeRules { given: true, ..Default::default() };
+        // (Every warning said of the section is a problem of the rules.)
+        let before = r.warnings.len();
+        let mut seen = Vec::new();
+        for e in r.section(entry) {
+            let at = e.1.span().start;
+            seen.push(e.0.get_ref().to_string());
+            match e.0.get_ref().as_ref() {
+                "rows" => {
+                    let text = match e.1.get_ref() {
+                        DeValue::String(s) => Some(s.to_string()),
+                        DeValue::Integer(i) => Some(i.as_str().to_string()),
+                        _ => None,
+                    };
+                    match text.map(|t| Rows::parse(&t)) {
+                        Some(Ok(rows)) => rules.rows = Some(rows),
+                        Some(Err(problem)) => r.warn(at, format!("rows: {problem}")),
+                        None => r.warn(at, "rows is to be rows in quotes: \"16500-16999\""),
+                    }
+                }
+                "hak" => match r
+                    .text(e)
+                    .map(|t| mg_core::text::strip_suffix_ascii_ci(t.trim(), ".hak").to_string())
+                {
+                    Some(h) if !h.is_empty() && h.len() <= 16 => rules.hak = Some(h),
+                    Some(h) => {
+                        r.warn(at, format!("hak \"{h}\": a hak's name is 1 to 16 characters"))
+                    }
+                    None => {}
+                },
+                "names" => {
+                    if let Some(n) = r.text(e).map(|t| t.trim().to_ascii_lowercase()) {
+                        match BakeRules::names_problem(&n) {
+                            Some(problem) => r.warn(at, problem),
+                            None => rules.names = Some(n),
+                        }
+                    }
+                }
+                "rows_file" => match r.file_inside(e) {
+                    Some(f) if !f.is_empty() => rules.rows_file = Some(f),
+                    Some(_) => r.warn(at, "rows_file is empty"),
+                    None => {}
+                },
+                _ => r.unknown("bake", e),
+            }
+        }
+        // (A key given but not right is said once, as it is.)
+        for missing in rules.missing() {
+            if !seen.iter().any(|k| missing.starts_with(&format!("[bake] has no {k}:"))) {
+                r.warn(entry.0.span().start, &missing);
+            }
+        }
+        rules.problems = r.warnings[before..].to_vec();
+        self.bake = rules;
+    }
+
+    /// The bake's rows file, where the project has `[bake]`: beside the
+    /// team's file.
+    pub fn bake_rows_path(&self) -> Option<PathBuf> {
+        let dir = self.path.as_deref()?.parent()?;
+        self.bake.rows_path(dir)
+    }
+
+    /// The bake's rows file as read: empty where it isn't there yet (or
+    /// the project has no `[bake]`), the error where it can't be read.
+    pub fn baked_rows(&self) -> Result<crate::bake::RowsFile, String> {
+        match &self.baked {
+            Some(Ok(rows)) => Ok(rows.clone()),
+            Some(Err(e)) => Err(e.clone()),
+            None => Ok(Default::default()),
+        }
+    }
+
     /// Reads `[claims]`.
     fn read_claim_rules(&mut self, r: &mut Reader, entry: Entry) {
         use crate::claims::{ClaimRules, Others, Unclaimed};
         let mut rules = ClaimRules::default();
         for e in r.section(entry) {
             match e.0.get_ref().as_ref() {
-                "file" => {
-                    rules.file = r.text(e).map(|f| f.trim().to_string()).filter(|f| !f.is_empty())
-                }
+                "file" => rules.file = r.file_inside(e).filter(|f| !f.is_empty()),
                 "others" => match r.text(e).as_deref() {
                     Some("warn") => rules.others = Others::Warn,
                     Some("read-only") => rules.others = Others::ReadOnly,
@@ -1411,11 +1704,16 @@ impl ProjectFile {
         use crate::claims::{Listed, Standing, Whose};
         let table = self.claim_table.clone().unwrap_or_default();
         let mut areas: Vec<ResRef> = table.rows.iter().map(|c| c.area).collect();
+        // (Looked up, not looked through: a world has 1,400 areas, and
+        // each was sought in both lists.)
+        let mut listed: std::collections::HashSet<ResRef> = areas.iter().copied().collect();
         for a in module.unwrap_or_default() {
-            if !areas.contains(a) {
+            if listed.insert(*a) {
                 areas.push(*a);
             }
         }
+        let in_module: Option<std::collections::HashSet<ResRef>> =
+            module.map(|m| m.iter().copied().collect());
         areas
             .into_iter()
             .map(|area| {
@@ -1429,7 +1727,7 @@ impl ProjectFile {
                     },
                     claim: standing.claim().cloned(),
                     protected: self.protected(area).is_some(),
-                    in_module: module.is_none_or(|m| m.contains(&area)),
+                    in_module: in_module.as_ref().is_none_or(|m| m.contains(&area)),
                 }
             })
             .collect()
@@ -1470,18 +1768,63 @@ impl ProjectFile {
     /// were read.
     pub fn changed(&self) -> bool {
         let Some(place) = &self.place else { return false };
-        let now = vec![
-            stamp(&place.team()),
-            place.user().as_deref().and_then(stamp),
-            stamp(&place.variables()),
-            self.claims.path_in(&place.root).and_then(|t| stamp(&t)),
-        ];
-        now != self.stamps
+        let team = place.team();
+        let dir = team.parent().unwrap_or(&place.root);
+        let from_paths = self.palette.from_paths(dir);
+        let bake_rows = self.bake.rows_path(dir);
+        let mut idx = 0usize;
+        let mut differs = |path: Option<&Path>| -> bool {
+            let Some(&was) = self.stamps.get(idx) else { return true };
+            idx += 1;
+            match path {
+                None => was.is_some(),
+                Some(p) => !stamp_unchanged(p, was, self.read_at),
+            }
+        };
+        let user = place.user();
+        let vars = place.variables();
+        let claims = self.claims.path_in(&place.root);
+        if differs(Some(&team))
+            || differs(user.as_deref())
+            || differs(Some(&vars))
+            || differs(claims.as_deref())
+            || from_paths.iter().any(|p| differs(Some(p)))
+            || bake_rows.as_deref().is_some_and(|p| differs(Some(p)))
+        {
+            return true;
+        }
+        idx != self.stamps.len()
     }
 
     /// Where its files were read from.
     pub fn place(&self) -> Option<&Place> {
         self.place.as_ref()
+    }
+
+    /// Where `[talk] map` is read from, beside the team's file (none
+    /// where `[talk]` names none): for a caller that keeps what
+    /// [`ProjectFile::talk_map`] reads while the file is as it was.
+    pub fn talk_map_path(&self) -> Option<PathBuf> {
+        let dir = self.path.as_deref().and_then(Path::parent)?;
+        self.talk.map_path(dir)
+    }
+
+    /// `[talk] map`: `mg tlk-alloc`'s map, read from beside the team's
+    /// file (none where `[talk]` names none, or the file isn't there yet).
+    pub fn talk_map(&self) -> Result<Option<crate::tlk_alloc::Map>, String> {
+        let Some(path) = self.talk_map_path() else { return Ok(None) };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => crate::tlk_alloc::Map::read(&text)
+                .map(Some)
+                .map_err(|e| format!("[talk] map {}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("[talk] map {}: {e}", path.display())),
+        }
+    }
+
+    /// The lines the text this builder types takes ([`crate::talk_range`]).
+    pub fn talk_allowed(&self) -> crate::talk_range::Allowed {
+        self.talk.allowed(self.user.builder_code.as_deref())
     }
 
     /// Writes the builder's own file (making its folder, which keeps
@@ -1507,11 +1850,7 @@ impl ProjectFile {
             return Err(invalid(format!("the code \"{}\": {problem}", code.unwrap_or(""))));
         }
         let path = Self::user_path(root);
-        let text = match std::fs::read(&path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e),
-        };
+        let text = text_to_rewrite(&path, &format!("{USER_DIR}/{USER_FILE}"))?;
         let code = code.map(str::to_ascii_lowercase);
         let text = with_code(&text, code.as_deref()).map_err(invalid)?;
         Self::write_user(root, &text)
@@ -1582,6 +1921,52 @@ impl ProjectFile {
     }
 }
 
+impl ProjectFile {
+    /// Sets (or, `None`, takes out) `[talk] lines` in the team's file
+    /// where it is (making the file where it isn't: beside a `.mod`,
+    /// `NAME.moonglow.toml`), the rest kept as written.
+    pub fn set_talk_lines(
+        place: &Place,
+        lines: Option<crate::talk_range::Lines>,
+    ) -> std::io::Result<()> {
+        let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+        let path = place.team();
+        let text = text_to_rewrite(&path, &place.team_name())?;
+        let value = lines.map(|l| format!("\"{l}\""));
+        let text = with_value_in(&place.team_name(), &text, "talk", "lines", value.as_deref())
+            .map_err(invalid)?;
+        crate::write_replacing(&path, text.as_bytes())
+    }
+}
+
+/// The line of the first byte of `bytes` that is not UTF-8 text (a
+/// character typed in Windows-1252, say); `None` for text that is.
+pub(crate) fn not_utf8_at(bytes: &[u8]) -> Option<usize> {
+    let e = std::str::from_utf8(bytes).err()?;
+    Some(mg_core::text::line_of(bytes, e.valid_up_to()))
+}
+
+/// The text of a project's file (`name`, as messages name it) that a
+/// command is to change and write back (none there: empty). An error for
+/// one that is not UTF-8 throughout: it can be read with U+FFFD in place
+/// of what is not, but written back so, every such byte (the `é` of a
+/// comment typed in Windows-1252) would be U+FFFD for good.
+pub(crate) fn text_to_rewrite(path: &Path, name: &str) -> std::io::Result<String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
+    String::from_utf8(bytes).map_err(|e| {
+        let line = not_utf8_at(e.as_bytes()).unwrap_or(1);
+        let said = format!(
+            "{name}:{line}: the file is not UTF-8 text here, and is not changed (save it as \
+             UTF-8 first)"
+        );
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, said)
+    })
+}
+
 /// A builder's file with its `[builder] code` set to `code` (or taken
 /// out), the rest kept as written; an error where the text is no TOML.
 fn with_code(text: &str, code: Option<&str>) -> Result<String, String> {
@@ -1593,8 +1978,18 @@ fn with_code(text: &str, code: Option<&str>) -> Result<String, String> {
 /// value, written as it is given) or taken out, the rest kept as written;
 /// an error where the text is no TOML.
 fn with_value(text: &str, section: &str, key: &str, value: Option<&str>) -> Result<String, String> {
+    with_value_in(&format!("{USER_DIR}/{USER_FILE}"), text, section, key, value)
+}
+
+/// [`with_value`] in the file `name` (as its messages name it).
+fn with_value_in(
+    name: &str,
+    text: &str,
+    section: &str,
+    key: &str,
+    value: Option<&str>,
+) -> Result<String, String> {
     let code = value;
-    let name = format!("{USER_DIR}/{USER_FILE}");
     let table = DeTable::parse(text).map_err(|e| {
         let line = e.span().map_or(1, |s| line_of(text, s.start));
         format!("{name}:{line}: {} (mend it first)", e.message().trim())
@@ -1604,22 +1999,37 @@ fn with_value(text: &str, section: &str, key: &str, value: Option<&str>) -> Resu
     let mut out = text.to_string();
     let entries = in_order(table.get_ref());
     let builder = entries.iter().find(|(k, _)| k.get_ref() == section);
-    match builder.map(|(k, v)| (k, v.get_ref())) {
-        Some((header, DeValue::Table(t))) => {
+    match builder.map(|(_, v)| (v.span(), v.get_ref())) {
+        Some((whole, DeValue::Table(t))) => {
+            // (Written in one line, `talk = { … }`: its keys are parts of
+            // that line, not lines.)
+            let inline = text[whole.clone()].starts_with('{').then_some(whole);
             let entry = in_order(t).into_iter().find(|(k, _)| k.get_ref() == key);
             match (entry, code) {
                 (Some((_, v)), Some(code)) => out.replace_range(v.span(), code),
+                (Some((k, v)), None) if inline.is_some() => {
+                    // (With the comma after it, else the one before.)
+                    let (mut from, mut to) = (k.span().start, v.span().end);
+                    let after = text[to..].trim_start();
+                    if after.starts_with(',') {
+                        to = text.len() - after.len() + 1;
+                    } else if let Some(before) = text[..from].trim_end().strip_suffix(',') {
+                        from = before.len();
+                    }
+                    out.replace_range(from..to, "");
+                }
                 (Some((k, v)), None) => {
                     out.replace_range(line_start(k.span().start)..line_end(v.span().end), "")
                 }
                 (None, Some(code)) => {
-                    // (The line after its header.)
-                    let mut at = line_end(header.span().start);
-                    if at == out.len() && !out.ends_with('\n') {
-                        out.push('\n');
-                        at = out.len();
-                    }
-                    out.insert_str(at, &format!("{key} = {code}\n"));
+                    let first = in_order(t).first().map(|(k, _)| line_end(k.span().start));
+                    out =
+                        with_new_key(text, section, key, code, inline, first).ok_or_else(|| {
+                            format!(
+                                "{name}: {key} cannot be added to \"{section}\" as it is \
+                                 written there (add it by hand)"
+                            )
+                        })?;
                 }
                 (None, None) => {}
             }
@@ -1638,6 +2048,89 @@ fn with_value(text: &str, section: &str, key: &str, value: Option<&str>) -> Resu
         }
     }
     Ok(out)
+}
+
+/// `text` (TOML that has a table `section` without `key`) with `key =
+/// value` added to that table, the rest as written: on the line after the
+/// table's own header, `[section]`; else, for a table written in one line
+/// (`inline`, its place), in it; else, for one made of dotted keys
+/// (`section.other = …`; `after_first`, the end of its first key's line),
+/// as another such line; else under a header of its own at the end,
+/// which TOML takes after a sub-table's (`[section.sub]`, the only header
+/// that names the section in a team's file with `[talk.builders]` alone:
+/// the key was put under that one, into the sub-table). Each is kept
+/// only if the text then reads with the key in the section; `None` where
+/// none does.
+fn with_new_key(
+    text: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+    inline: Option<std::ops::Range<usize>>,
+    after_first: Option<usize>,
+) -> Option<String> {
+    let reads = |candidate: &str| {
+        DeTable::parse(candidate).ok().is_some_and(|table| {
+            in_order(table.get_ref()).iter().any(|(k, v)| match v.get_ref() {
+                DeValue::Table(t) => {
+                    k.get_ref() == section && in_order(t).iter().any(|(k, _)| k.get_ref() == key)
+                }
+                _ => false,
+            })
+        })
+    };
+    // (A line put in at `at`, a line's start or the text's end.)
+    let line_at = |at: usize, line: &str| {
+        let mut out = text.to_string();
+        let mut at = at;
+        if at == out.len() && !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+            at = out.len();
+        }
+        out.insert_str(at, &format!("{line}\n"));
+        out
+    };
+    let header = |line: &str| {
+        let Some(rest) = line.trim().strip_prefix('[').filter(|r| !r.starts_with('[')) else {
+            return false;
+        };
+        let Some((name, after)) = rest.split_once(']') else { return false };
+        let name = name.trim();
+        let bare = name
+            .strip_prefix('"')
+            .and_then(|n| n.strip_suffix('"'))
+            .or_else(|| name.strip_prefix('\'').and_then(|n| n.strip_suffix('\'')))
+            .unwrap_or(name);
+        bare == section && (after.trim().is_empty() || after.trim_start().starts_with('#'))
+    };
+    let mut candidates = Vec::new();
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        at += line.len();
+        if header(line) {
+            candidates.push(line_at(at, &format!("{key} = {value}")));
+        }
+    }
+    if let Some(inline) = inline {
+        let empty = text[inline.clone()].trim_matches(['{', '}']).trim().is_empty();
+        let mut out = text.to_string();
+        let added = if empty { format!(" {key} = {value} ") } else { format!(" {key} = {value},") };
+        out.insert_str(inline.start + 1, &added);
+        candidates.push(out);
+    }
+    if let Some(at) = after_first {
+        candidates.push(line_at(at, &format!("{section}.{key} = {value}")));
+    }
+    let mut own = text.to_string();
+    if !own.is_empty() && !own.ends_with('\n') {
+        own.push('\n');
+    }
+    if !own.is_empty() {
+        own.push('\n');
+    }
+    own.push_str(&format!("[{section}]\n{key} = {value}\n"));
+    candidates.push(own);
+    candidates.into_iter().find(|c| reads(c))
 }
 
 /// What is wrong with a store tag's pattern: a `{…}` that is neither
@@ -1710,6 +2203,77 @@ keeper_variable = "tdod_store"
                 "moonglow.toml:4: \"colour\" is not a key of [lights]",
             ]
         );
+        // A row the game can't carry (16 bits) is said where it is written.
+        let past = read("[lights]\nfirst_row = 70000\n");
+        assert_eq!(
+            past.warnings,
+            ["moonglow.toml:2: first_row 70000 is past row 65535, the last the game can use: no \
+              light can be made"]
+        );
+    }
+
+    /// `[bake]`: its keys read; what is wrong (a range past row 65535,
+    /// which the game can't carry) a warning and a problem of the rules,
+    /// which keep the bake from being offered.
+    #[test]
+    fn bake_rules_are_read_and_their_problems_kept() {
+        use crate::bake::Rows;
+        let p = read(
+            "[bake]\nrows = \"50000-50999\"\nhak = \"mybaked.hak\"\nnames = \"Bk_\"\n\
+             rows_file = \"tables/baked.toml\"\n",
+        );
+        assert_eq!(p.warnings, Vec::<String>::new());
+        assert_eq!(p.bake.rows, Some(Rows { from: 50000, to: 50999 }));
+        assert_eq!(p.bake.hak.as_deref(), Some("mybaked"));
+        assert_eq!(p.bake.names.as_deref(), Some("bk_"));
+        assert_eq!(p.bake.rows_file.as_deref(), Some("tables/baked.toml"));
+        assert!(p.bake.ready().is_ok());
+        assert!(!read("").bake.given && read("").bake.ready().is_err());
+        let past = read("[bake]\nrows = \"65500-65600\"\nhak = \"b\"\n");
+        assert_eq!(past.warnings.len(), 1, "{:?}", past.warnings);
+        assert!(
+            past.warnings[0].starts_with("moonglow.toml:2: rows: \"65500-65600\" reaches past")
+        );
+        assert_eq!(past.bake.problems, past.warnings);
+        assert!(past.bake.ready().unwrap_err().contains("65535"));
+        let bad = read("[bake]\nrows = 5\nnames = \"a-b\"\ncolour = 1\nrows_file = \"\"\n");
+        assert_eq!(
+            bad.warnings,
+            [
+                "moonglow.toml:3: names \"a-b\": \"-\": a model's name is letters, digits and _",
+                "moonglow.toml:4: \"colour\" is not a key of [bake]",
+                "moonglow.toml:5: rows_file is empty",
+                "moonglow.toml:1: [bake] has no hak: the hak baked models go in",
+            ]
+        );
+        assert_eq!(bad.bake.rows, Some(Rows { from: 5, to: 5 }));
+        assert_eq!(bad.bake.problems.len(), 4);
+        let mut own = ProjectFile::default();
+        own.apply("user.toml", "[bake]\nhak = \"x\"\n", true);
+        assert_eq!(own.warnings, ["user.toml:1: [bake] is the team's: it goes in moonglow.toml"]);
+    }
+
+    /// The rows file is read beside the team's file, and read again when
+    /// it changes, as the claims table is.
+    #[test]
+    fn the_bake_rows_file_is_read_and_its_changes_seen() {
+        let dir = mg_testkit::scratch_dir("project-bake-rows");
+        std::fs::write(dir.join(FILE_NAME), "[bake]\nrows = \"100-199\"\nhak = \"b\"\n").unwrap();
+        let p = ProjectFile::read(&dir);
+        assert_eq!(p.bake_rows_path(), Some(dir.join("baked_rows.toml")));
+        assert_eq!(p.baked_rows(), Ok(Default::default()), "not there yet");
+        assert!(!p.changed());
+        let rows = "[[row]]\nrow = 100\ncopy_of = 3\nmodel = \"mgbk_0001\"\nlabel = \"x\"\n";
+        std::fs::write(dir.join("baked_rows.toml"), rows).unwrap();
+        assert!(p.changed());
+        let p = ProjectFile::read(&dir);
+        assert_eq!(p.baked_rows().unwrap().row(100).map(|r| r.copy_of), Some(3));
+        std::fs::write(dir.join("baked_rows.toml"), "[[row]]\nrow = 100\n").unwrap();
+        assert!(p.changed());
+        let p = ProjectFile::read(&dir);
+        assert!(p.baked_rows().unwrap_err().contains("baked_rows.toml: row 1: no copy_of"));
+        let none = ProjectFile::read(&mg_testkit::scratch_dir("project-bake-none"));
+        assert_eq!((none.bake_rows_path(), none.baked.is_none()), (None, true));
     }
 
     #[test]
@@ -1967,6 +2531,44 @@ keeper_variable = "tdod_store"
         assert_eq!(p.naming(), Naming::default());
     }
 
+    /// A new key goes under its section's own header: a file with a
+    /// sub-table's header alone (`[talk.builders]`), a dotted key or an
+    /// inline table has no `[talk]` line to put it after, and the key was
+    /// put into the sub-table (a builder named `lines`).
+    #[test]
+    fn a_new_key_goes_into_its_section_not_a_sub_table() {
+        let read = |text: &str| {
+            let mut p = ProjectFile::default();
+            p.apply(FILE_NAME, text, false);
+            assert!(p.warnings.is_empty() && p.errors.is_empty(), "{text}\n{:?}", p.warnings);
+            let lines = p.talk.lines.map(|l| l.to_string());
+            (lines, p.talk.builders.keys().cloned().collect::<Vec<_>>(), p.talk.typed)
+        };
+        let set = |text: &str| with_value_in("f", text, "talk", "lines", Some("\"1-9\"")).unwrap();
+        let lines = Some("1-9".to_string());
+        // A sub-table's header alone.
+        let out = set("[talk.builders]\nab = \"1-2\"\n");
+        assert_eq!(read(&out), (lines.clone(), vec!["ab".to_string()], None), "{out}");
+        assert!(out.starts_with("[talk.builders]\nab = \"1-2\"\n"), "{out}");
+        // The section's own header after its sub-table's.
+        let out = set("[talk.builders]\nab = \"1-2\"\n\n[talk]\ntyped = true\n");
+        assert_eq!(read(&out), (lines.clone(), vec!["ab".to_string()], Some(true)), "{out}");
+        // The header written with spaces, and a comment after it.
+        let out = set("[ talk ]  # typed text\ntyped = true\n[talk.builders]\nab = \"1-2\"\n");
+        assert_eq!(read(&out), (lines.clone(), vec!["ab".to_string()], Some(true)), "{out}");
+        assert!(out.starts_with("[ talk ]  # typed text\nlines = \"1-9\"\n"), "{out}");
+        // A dotted key, and an inline table: no header to go under.
+        let out = set("talk.typed = true\n\n[tags]\nunique = [\"A_*\"]\n");
+        assert_eq!(read(&out), (lines.clone(), Vec::new(), Some(true)), "{out}");
+        let out = set("talk = { typed = true }\n");
+        assert_eq!(read(&out), (lines, Vec::new(), Some(true)), "{out}");
+        // Taken out again, wherever it was put.
+        for text in ["[talk.builders]\nab = \"1-2\"\n", "talk.typed = true\n"] {
+            let out = with_value_in("f", &set(text), "talk", "lines", None).unwrap();
+            assert_eq!(read(&out).0, None, "{out}");
+        }
+    }
+
     #[test]
     fn setting_the_code_keeps_the_rest_of_the_builder_s_file() {
         // None yet: made, with its folder's ignore file.
@@ -2112,7 +2714,7 @@ keeper_variable = "tdod_store"
 
     #[test]
     fn the_builder_s_own_file_is_read_beside_the_team_s_and_kept_out_of_git() {
-        let dir = std::env::temp_dir().join(format!("mg-project-file-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-project-file");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let none = ProjectFile::read(&dir);
@@ -2345,7 +2947,7 @@ keeper_variable = "tdod_store"
         let c = p.nwsync_upload.unwrap();
         assert_eq!((c.run.as_deref(), c.own), (Some("mine {part}"), true));
         // Beside a .mod: not read.
-        let dir = std::env::temp_dir().join(format!("mg-pf-nwsync-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-pf-nwsync");
         std::fs::create_dir_all(&dir).unwrap();
         let module = dir.join("krezk.mod");
         std::fs::write(dir.join("krezk.moonglow.toml"), "[nwsync]\nupload = \"x\"\n").unwrap();
@@ -2353,6 +2955,25 @@ keeper_variable = "tdod_store"
         assert!(p.nwsync_upload.is_none());
         assert!(p.warnings[0].contains("[nwsync] is not read beside a module"), "{:?}", p.warnings);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `[tilesets] hidden` names tilesets by resref or glob, whatever
+    /// their case; the team's alone.
+    #[test]
+    fn hidden_tilesets_are_named_by_resref_or_glob() {
+        let p = read("[tilesets]\nhidden = [\"zcn01\", \"TTF01\", \"z*\"]\nshown = []\n");
+        assert_eq!(p.warnings, ["moonglow.toml:3: \"shown\" is not a key of [tilesets]"]);
+        let h = &p.hidden_tilesets;
+        assert!(h.matches("zcn01") && h.matches("ttf01") && h.matches("zdg01"));
+        assert!(!h.matches("tcn01") && !h.matches("ttr01"));
+        assert!(read("[tilesets]\n").hidden_tilesets.is_empty());
+        let mut p = ProjectFile::default();
+        p.apply(".moonglow/user.toml", "[tilesets]\nhidden = [\"x\"]\n", true);
+        assert!(p.hidden_tilesets.is_empty());
+        assert_eq!(
+            p.warnings,
+            [".moonglow/user.toml:1: [tilesets] is the team's: it goes in moonglow.toml"]
+        );
     }
 
     /// `[used]` reads scripts, conversations and blueprints by name or
@@ -2430,5 +3051,142 @@ keeper_variable = "tdod_store"
         m.save().unwrap();
         let m = crate::Module::open(&path).unwrap();
         assert_eq!(m.project_file.used.conversations.globs, ["chat_*"]);
+    }
+
+    /// The files the project's file names (the claims table, the talk
+    /// table's map, a grouping's lists, the bake's rows) are the
+    /// project's: one named outside it (a checkout's file could name any
+    /// the builder can write) is a warning by its line, and not taken.
+    #[test]
+    fn a_file_named_outside_the_project_is_not_taken() {
+        let mut p = ProjectFile::default();
+        p.apply(
+            FILE_NAME,
+            "[claims]\nfile = \"../x.2da\"\n[talk]\nmap = \"/etc/map.json\"\n[bake]\nrows_file = \
+             \"C:\\\\rows.toml\"\n[palette.kind]\nfrom = \"a/../../lists.toml\"\n",
+            false,
+        );
+        assert_eq!((p.claims.file.as_deref(), p.talk.map.as_deref()), (None, None));
+        assert_eq!(p.bake.rows_file, None);
+        assert!(p.palette.from_paths(Path::new("/p")).is_empty());
+        let said = p.warnings.join("\n");
+        for line in [
+            format!("{FILE_NAME}:2: file \"../x.2da\": it is to be inside the project (no ..)"),
+            format!("{FILE_NAME}:4: map \"/etc/map.json\": it is to be a file of the project"),
+            format!("{FILE_NAME}:6: rows_file \"C:\\rows.toml\": it is to be a file of the"),
+            format!("{FILE_NAME}:8: from \"a/../../lists.toml\": it is to be inside the project"),
+        ] {
+            assert!(said.contains(&line), "{line}\n{said}");
+        }
+        // Those inside it are taken as written.
+        let mut p = ProjectFile::default();
+        p.apply(
+            FILE_NAME,
+            "[claims]\nfile = \" builders/claims.2da \"\n[talk]\nmap = \"tlk\\\\map.json\"\n\
+             [palette.kind]\nfrom = \"lists.toml\"\n",
+            false,
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(p.claims.file.as_deref(), Some("builders/claims.2da"));
+        assert_eq!(p.talk.map.as_deref(), Some("tlk\\map.json"));
+        assert_eq!(p.palette.from_paths(Path::new("/p")), [Path::new("/p/lists.toml")]);
+    }
+
+    /// A project's file that is not UTF-8 throughout (a comment typed in
+    /// Windows-1252) is read, with a warning; nothing that changes a file
+    /// writes it, which would put U+FFFD for every such byte for good.
+    #[test]
+    fn a_file_that_is_not_utf_8_is_read_and_never_rewritten() {
+        let dir = mg_testkit::scratch_dir("project-file-not-utf8");
+        let team = b"[tags]\n# Jos\xe9's\nunique = [\"A_*\"]\n";
+        let own = b"# caf\xe9\n[builder]\ncode = \"ab\"\n";
+        std::fs::write(dir.join(FILE_NAME), team).unwrap();
+        std::fs::create_dir_all(dir.join(USER_DIR)).unwrap();
+        std::fs::write(dir.join(USER_DIR).join(".gitignore"), "*\n").unwrap();
+        std::fs::write(ProjectFile::user_path(&dir), own).unwrap();
+        let p = ProjectFile::read(&dir);
+        assert!(p.tags.unique.matches("A_1") && p.user.builder_code.as_deref() == Some("ab"));
+        let said = p.warnings.join("\n");
+        assert!(said.contains(&format!("{FILE_NAME}:2: the file is not UTF-8")), "{said}");
+        assert!(said.contains(&format!("{USER_DIR}/{USER_FILE}:1: ")), "{said}");
+        let place = Place::folder(&dir);
+        let lines = crate::talk_range::Lines::parse("100-200").ok();
+        let refused = [
+            ProjectFile::set_used(&place, "scripts", "ai_*", true),
+            ProjectFile::set_talk_lines(&place, lines),
+            ProjectFile::set_builder_code(&dir, Some("cd")),
+            crate::project_plugins::set_setting(&dir, false, "t.r", "max", None),
+            crate::project_plugins::set_setting(&dir, true, "t.r", "max", None),
+        ];
+        for r in refused {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("is not UTF-8 text") && e.contains("is not changed"), "{e}");
+        }
+        assert_eq!(std::fs::read(dir.join(FILE_NAME)).unwrap(), team);
+        assert_eq!(std::fs::read(ProjectFile::user_path(&dir)).unwrap(), own);
+    }
+
+    /// `[talk]`: the lines typed text takes, the map and each builder's
+    /// part; what can't be read is said with its line, and the range is
+    /// written into the team's file (beside a `.mod` too).
+    #[test]
+    fn talk_lines_are_read_and_written() {
+        use crate::talk_range::Lines;
+        let p = read(
+            "[talk]\ntyped = true\nlines = \"100000-149999\"\nmap = \"tlk/s.strrefs.json\"\n\
+             [talk.builders]\nAB = [100000, 109999]\ncd = \"110000-119999\"\n",
+        );
+        assert_eq!(p.warnings, Vec::<String>::new());
+        assert_eq!(p.talk.typed, Some(true));
+        assert!(p.talk.typed_or(false), "on for everyone");
+        assert_eq!(read("[talk]\ntyped = false\n").talk.typed, Some(false));
+        let wrong = read("[talk]\ntyped = \"yes\"\n");
+        assert_eq!((wrong.talk.typed, wrong.warnings.len()), (None, 1), "{:?}", wrong.warnings);
+        assert_eq!(p.talk.lines, Some(Lines { from: 100_000, to: 149_999 }));
+        assert_eq!(p.talk.map.as_deref(), Some("tlk/s.strrefs.json"));
+        assert_eq!(p.talk.builders["ab"], Lines { from: 100_000, to: 109_999 });
+        assert_eq!(p.talk.builders.len(), 2);
+        let bad =
+            read("[talk]\nlines = \"9-3\"\ncolor = 1\n[talk.builders]\na = \"1-5\"\nb = \"4-8\"\n");
+        assert_eq!(bad.talk.lines, None);
+        assert_eq!(bad.warnings.len(), 3, "{:?}", bad.warnings);
+        assert!(bad.warnings[0].contains(":2: lines:"), "{:?}", bad.warnings);
+        assert!(bad.warnings[2].contains("share lines"), "{:?}", bad.warnings);
+        let mut own = ProjectFile::default();
+        own.apply(USER_FILE, "[talk]\nlines = \"1-2\"\n", true);
+        assert!(own.warnings[0].contains("is the team's"), "{:?}", own.warnings);
+
+        let dir = mg_testkit::scratch_dir("project-file-talk");
+        let mut m = crate::Module::new();
+        m.save_as(&ModuleLocation::Folder(dir.clone())).unwrap();
+        std::fs::write(dir.join(FILE_NAME), "# the team's\n[talk]\nmap = \"m.json\" # kept\n")
+            .unwrap();
+        let place = ProjectFile::place_to_write(m.location.as_ref().unwrap()).unwrap();
+        ProjectFile::set_talk_lines(&place, Some(Lines { from: 5, to: 99 })).unwrap();
+        let text = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        assert!(text.starts_with("# the team's\n[talk]\nlines = \"5-99\"\nmap"), "{text}");
+        assert!(m.reread_project_file());
+        assert_eq!(m.project_file.talk.lines, Some(Lines { from: 5, to: 99 }));
+        ProjectFile::set_talk_lines(&place, None).unwrap();
+        assert!(m.reread_project_file());
+        assert_eq!(m.project_file.talk.lines, None);
+        assert_eq!(m.project_file.talk.map.as_deref(), Some("m.json"));
+
+        let path = mg_testkit::scratch_dir("project-file-talk-mod").join("krezk.mod");
+        let mut m = crate::Module::new();
+        m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+        let place = ProjectFile::place_to_write(m.location.as_ref().unwrap()).unwrap();
+        ProjectFile::set_talk_lines(&place, Some(Lines { from: 7, to: 7 })).unwrap();
+        assert!(m.reread_project_file());
+        assert_eq!(m.project_file.talk.lines, Some(Lines { from: 7, to: 7 }));
+        assert!(m.project_file.warnings.is_empty(), "read beside a .mod");
+    }
+
+    #[test]
+    fn uppercase_hak_extensions_strip_case_insensitively() {
+        let p = read("[lights]\nhak = \"TDOD.HAK\"\n[bake]\nrows = \"1-2\"\nhak = \"BAKE.HAK\"\n");
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(p.lights.hak.as_deref(), Some("TDOD"));
+        assert_eq!(p.bake.hak.as_deref(), Some("BAKE"));
     }
 }

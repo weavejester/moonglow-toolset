@@ -137,6 +137,53 @@ pub(crate) fn doc_before(text: &str, toks: &[Token], raw: usize) -> (String, Str
     (doc.join("\n"), lines.join("\n").replace('\r', ""))
 }
 
+/// The comment that trails the statement whose `;` is token `semi` of
+/// `toks`: on the same line, after the `;`, with nothing but spaces and
+/// that comment from there to the line's end (`int a; // about a`, or
+/// `/* about a */`; a block comment with more code after it on the line is
+/// no trailing comment). Its token's index.
+pub(crate) fn trailing_comment(text: &str, toks: &[Token], semi: usize) -> Option<usize> {
+    if toks.get(semi).is_none_or(|t| &text[t.span.clone()] != ";") {
+        return None;
+    }
+    let mut i = semi + 1;
+    let mut comment = None;
+    while let Some(t) = toks.get(i) {
+        match t.kind {
+            TokenKind::Whitespace if text[t.span.clone()].contains('\n') => break,
+            TokenKind::Whitespace => {}
+            TokenKind::LineComment | TokenKind::BlockComment { .. } if comment.is_none() => {
+                comment = Some(i);
+            }
+            // Code (or a second comment) on the line.
+            _ => return None,
+        }
+        i += 1;
+    }
+    comment
+}
+
+/// A declaration's documentation: the comments directly above it, then
+/// the one trailing it on its own line (`above` from [`doc_before`], the
+/// comment's token from [`trailing_comment`]); both, the one above first,
+/// when it has both.
+pub(crate) fn doc_with_trailing(
+    text: &str,
+    toks: &[Token],
+    above: (String, String),
+    trailing: Option<usize>,
+) -> (String, String) {
+    let Some(t) = trailing else { return above };
+    let written = comment_as_written(text, &toks[t].span).replace('\r', "");
+    let plain = comment_text(&written);
+    let join = |a: String, b: String| match (a.is_empty(), b.is_empty()) {
+        (true, _) => b,
+        (_, true) => a,
+        _ => format!("{a}\n{b}"),
+    };
+    (join(above.0, plain), join(above.1, written))
+}
+
 /// A source's top-level declarations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outline {
@@ -149,7 +196,7 @@ pub struct Outline {
 
 struct Parser<'a> {
     text: &'a str,
-    toks: Vec<Token>,
+    toks: &'a [Token],
     /// Indices of significant tokens.
     sig: Vec<usize>,
     pos: usize,
@@ -187,7 +234,12 @@ impl<'a> Parser<'a> {
     /// [`doc_before`] significant token `k`.
     fn doc_before(&self, k: usize) -> (String, String) {
         let Some(&raw) = self.sig.get(k) else { return Default::default() };
-        doc_before(self.text, &self.toks, raw)
+        doc_before(self.text, self.toks, raw)
+    }
+
+    /// [`trailing_comment`] of the `;` that is significant token `k`.
+    fn trailing(&self, k: usize) -> Option<usize> {
+        trailing_comment(self.text, self.toks, *self.sig.get(k)?)
     }
 
     /// Skips to just after the next `;` at bracket depth 0, or to (and
@@ -330,19 +382,20 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         let mut members = Vec::new();
         while !self.at_end() && self.peek() != "}" {
-            let (doc, doc_source) = self.doc_before(self.pos);
+            let above = self.doc_before(self.pos);
             let Some(ty) = self.parse_type() else {
                 self.recover();
                 continue;
             };
+            let first = members.len();
             loop {
                 if self.kind(self.pos) == Some(TokenKind::Ident) {
                     members.push(Member {
                         ty: ty.clone(),
                         name: self.peek().to_string(),
                         span: self.tok(self.pos).map(|t| t.span.clone()).unwrap_or_default(),
-                        doc: doc.clone(),
-                        doc_source: doc_source.clone(),
+                        doc: above.0.clone(),
+                        doc_source: above.1.clone(),
                     });
                     self.pos += 1;
                 }
@@ -353,6 +406,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             if self.peek() == ";" {
+                let trailing = self.trailing(self.pos);
+                for m in &mut members[first..] {
+                    (m.doc, m.doc_source) =
+                        doc_with_trailing(self.text, self.toks, above.clone(), trailing);
+                }
                 self.pos += 1;
             } else if self.peek() != "}" {
                 self.recover();
@@ -446,9 +504,11 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             if self.peek() == "(" {
                 let params = self.parse_params();
+                let mut trailing = None;
                 let body = match self.peek() {
                     "{" => Some(self.skip_block()),
                     ";" => {
+                        trailing = self.trailing(self.pos);
                         self.pos += 1;
                         None
                     }
@@ -458,6 +518,8 @@ impl<'a> Parser<'a> {
                     }
                 };
                 let name_span = self.tok(name_k).map(|t| t.span.clone()).unwrap_or_default();
+                let (doc, doc_source) =
+                    doc_with_trailing(self.text, self.toks, (doc, doc_source), trailing);
                 out.functions.push(FunctionDecl {
                     return_type: ty,
                     name,
@@ -471,6 +533,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             // Globals: `type a [= x], b [= y];`
+            let first = out.globals.len();
             let mut name = Some(name);
             while let Some(n) = name.take() {
                 let value = if self.peek() == "=" {
@@ -494,6 +557,12 @@ impl<'a> Parser<'a> {
                 }
             }
             if self.peek() == ";" {
+                let trailing = self.trailing(self.pos);
+                for g in &mut out.globals[first..] {
+                    let above = (std::mem::take(&mut g.doc), std::mem::take(&mut g.doc_source));
+                    (g.doc, g.doc_source) =
+                        doc_with_trailing(self.text, self.toks, above, trailing);
+                }
                 self.pos += 1;
             } else {
                 self.recover();
@@ -513,23 +582,24 @@ impl<'a> Parser<'a> {
 /// error is the compiler's to report, as Aurora reports it.
 pub fn has_entry_point(src: &[u8]) -> bool {
     let entry = |name: &str| matches!(name, "main" | "StartingConditional");
-    if outline(src).functions.iter().any(|f| f.body.is_some() && entry(&f.name)) {
-        return true;
-    }
-    let text = String::from_utf8_lossy(src);
-    let toks: Vec<&str> = (tokenize(text.as_bytes()).into_iter())
-        .filter(|t| t.kind.is_significant())
-        .map(|t| &text[t.span])
-        .collect();
-    toks.windows(4).any(|w| entry(w[0]) && w[1] == "(" && w[2] == ")" && w[3] == "{")
-}
-
-/// Parses the top-level declarations of a source.
-pub fn outline(src: &[u8]) -> Outline {
     let text = String::from_utf8_lossy(src);
     let toks = tokenize(text.as_bytes());
+    if outline_with_tokens(&text, &toks)
+        .functions
+        .iter()
+        .any(|f| f.body.is_some() && entry(&f.name))
+    {
+        return true;
+    }
+    let sig: Vec<&str> =
+        toks.iter().filter(|t| t.kind.is_significant()).map(|t| &text[t.span.clone()]).collect();
+    sig.windows(4).any(|w| entry(w[0]) && w[1] == "(" && w[2] == ")" && w[3] == "{")
+}
+
+/// Parses the top-level declarations from already-tokenized source text.
+pub fn outline_with_tokens(text: &str, toks: &[Token]) -> Outline {
     // (Read as the other script tools read them.)
-    let includes = (includes_in(text.as_bytes(), &toks).into_iter())
+    let includes = (includes_in(text.as_bytes(), toks).into_iter())
         .map(|at| Include {
             name: text[at.name.clone()].to_string(),
             span: at.directive.start..at.name.end + 1,
@@ -537,7 +607,14 @@ pub fn outline(src: &[u8]) -> Outline {
         .collect();
     let sig =
         toks.iter().enumerate().filter(|(_, t)| t.kind.is_significant()).map(|(i, _)| i).collect();
-    Outline { includes, ..Parser { text: &text, toks, sig, pos: 0 }.parse() }
+    Outline { includes, ..Parser { text, toks, sig, pos: 0 }.parse() }
+}
+
+/// Parses the top-level declarations of a source.
+pub fn outline(src: &[u8]) -> Outline {
+    let text = String::from_utf8_lossy(src);
+    let toks = tokenize(text.as_bytes());
+    outline_with_tokens(&text, &toks)
 }
 
 #[cfg(test)]
@@ -650,7 +727,8 @@ void main()
         let o =
             outline(b"struct S {\n    // The count.\n    int n; // after n\n    string s;\n};\n");
         let docs: Vec<&str> = o.structs[0].members.iter().map(|m| m.doc.as_str()).collect();
-        assert_eq!(docs, ["The count.", ""]);
+        // (`int n; // after n` is about `n`, and `s` takes none of it.)
+        assert_eq!(docs, ["The count.\nafter n", ""]);
     }
 
     /// A `/* … */` comment directly above a declaration is its
@@ -712,5 +790,26 @@ void main()
         assert!(!has_entry_point(b"/*\nvoid main() {}\n*/\nint NotMain() { return 1; }\n"));
         assert!(!has_entry_point(b"// void main() {}\nstring s = \"void main() {}\";"));
         assert!(has_entry_point(b"/* outer /* inner */ still outer? */\nvoid main() {}\n"));
+    }
+
+    /// A comment trailing a global, a prototype or a struct member on its
+    /// line documents it (after the comment above, if both); a definition's
+    /// body and the next declaration take none of it.
+    #[test]
+    fn a_trailing_comment_documents_the_declaration() {
+        let src = "// Above.\nconst int LIMIT = 10; // Beside.\nint nA, nB; /* Both. */\n\
+void Proto(int n); // Does it.\nvoid Def() { // inside\n}\nint Next;\n\
+struct S {\n    int a; // First.\n    // Above b.\n    int b; // And b.\n    int c;\n};\n";
+        let o = outline(src.as_bytes());
+        let g = |n: &str| o.globals.iter().find(|g| g.name == n).unwrap();
+        assert_eq!(g("LIMIT").doc, "Above.\nBeside.");
+        assert_eq!(g("LIMIT").doc_source, "// Above.\n// Beside.");
+        assert_eq!((g("nA").doc.as_str(), g("nB").doc.as_str()), ("Both.", "Both."));
+        let f = |n: &str| o.functions.iter().find(|f| f.name == n).unwrap();
+        assert_eq!(f("Proto").doc, "Does it.");
+        assert_eq!(f("Def").doc, "");
+        assert_eq!(g("Next").doc, "");
+        let m: Vec<&str> = o.structs[0].members.iter().map(|m| m.doc.as_str()).collect();
+        assert_eq!(m, ["First.", "Above b.\nAnd b.", ""]);
     }
 }

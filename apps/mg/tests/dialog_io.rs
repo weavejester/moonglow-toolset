@@ -79,3 +79,159 @@ fn a_csv_export_is_translated_and_read_back() {
     let out = run(&["dialog-export", p, "greet.dlg", c, "--language", "xx"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"xx\" isn't a language"));
 }
+
+/// A conversation written as Ink and read back over itself ends as it
+/// did: its own end script, and none where it has none (the review's V7:
+/// both became Aurora's `nw_walk_wp`). A story that says nothing of them,
+/// as one written in Inky, leaves the conversation's as they are.
+#[test]
+fn a_story_read_back_keeps_the_conversation_s_end_scripts() {
+    use mg_module::dialog::{Kind, Parent, add_node, new_dialog};
+    let dir = mg_testkit::scratch_dir("mg-dialog-end-scripts");
+    let path = dir.join("town.mod");
+    let mut m = Module::new();
+    m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
+    let mut g = new_dialog();
+    let hello = add_node(&mut g, Parent::Root, "Hello.");
+    add_node(&mut g, Parent::Node(Kind::Entry, hello), "Bye.");
+    let script = |name: &str| mg_gff::Value::resref(mg_core::ResRef::from_str(name).unwrap());
+    g.root.set("EndConversation", script("gate_done"));
+    g.root.set("EndConverAbort", script(""));
+    let key = ResKey::parse("gate", ResType::DLG).unwrap();
+    m.set_gff(key, &g).unwrap();
+    m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let ink = dir.join("gate.ink");
+    let (p, i) = (path.to_str().unwrap(), ink.to_str().unwrap());
+    let run = |args: &[&str]| {
+        let out = crate::mg_alone().args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    let ends = || {
+        let g = Module::open(&path).unwrap().gff(&key).unwrap().unwrap();
+        let name = |label: &str| g.root.resref(label).unwrap().to_string();
+        (name("EndConversation"), name("EndConverAbort"))
+    };
+    run(&["dialog-export", p, "gate.dlg", i]);
+    let story = std::fs::read_to_string(&ink).unwrap();
+    assert!(story.starts_with("# end:gate_done\n# abort:\n"), "{story}");
+    // As a new conversation, and over the one it came from: only with
+    // --force (without it nothing is written, and the command says so).
+    run(&["dialog-import", p, i, "--name", "gate_copy"]);
+    let before = std::fs::read(&path).unwrap();
+    let refused = crate::mg_alone().args(["dialog-import", p, i]).output().unwrap();
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{said}");
+    assert!(said.contains("gate.dlg is in the module") && said.contains("--force"), "{said}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    run(&["dialog-import", p, i, "--force"]);
+    assert_eq!(ends(), ("gate_done".to_string(), String::new()));
+    let copy = ResKey::parse("gate_copy", ResType::DLG).unwrap();
+    let copy = Module::open(&path).unwrap().gff(&copy).unwrap().unwrap();
+    assert_eq!(copy.root.get("EndConversation"), g.root.get("EndConversation"));
+    assert_eq!(copy.root.get("EndConverAbort"), g.root.get("EndConverAbort"));
+    // Edited in Inky, its tags gone: the conversation's own stay.
+    std::fs::write(&ink, "-> a\n=== a ===\nHello again.\n+ [Bye.] -> END\n").unwrap();
+    run(&["dialog-import", p, i, "--force"]);
+    assert_eq!(ends(), ("gate_done".to_string(), String::new()));
+}
+
+/// Several conversations into a folder (`--to`, `--format`), each as
+/// NAME.ink after its name, as the one-file form writes it; `--all` for
+/// every one; files there already only with `--force`; a name the module
+/// hasn't is said, the rest are written, and the command fails; `--json`
+/// lists what was written.
+#[test]
+fn several_conversations_go_into_a_folder() {
+    use mg_module::dialog::{Parent, add_node, new_dialog};
+    let dir = mg_testkit::scratch_dir("mg-dialog-export-several");
+    let path = dir.join("town.mod");
+    let mut m = Module::new();
+    m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
+    for (name, line) in [("gate", "Halt!"), ("inn", "A room?"), ("well", "Splash.")] {
+        let mut g = new_dialog();
+        add_node(&mut g, Parent::Root, line);
+        m.set_gff(ResKey::parse(name, ResType::DLG).unwrap(), &g).unwrap();
+    }
+    m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
+    let p = path.to_str().unwrap();
+    let run = |args: &[&str]| crate::mg_alone().args(args).output().unwrap();
+    let ok = |out: &std::process::Output| {
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    // The one-file form, as it was.
+    let single = dir.join("inn.ink");
+    ok(&run(&["dialog-export", p, "inn.dlg", single.to_str().unwrap()]));
+    let stories = dir.join("stories");
+    let _ = std::fs::remove_dir_all(&stories);
+    let s = stories.to_str().unwrap();
+    let (done, json) = crate::json_out(crate::mg_alone().args([
+        "--json",
+        "dialog-export",
+        p,
+        "gate.dlg",
+        "inn.dlg",
+        "--to",
+        s,
+        "--format",
+        "ink",
+    ]));
+    assert!(done, "{json}");
+    let written: Vec<&str> = json["written"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["conversation"].as_str().unwrap())
+        .collect();
+    assert_eq!(written, ["gate.dlg", "inn.dlg"]);
+    assert_eq!(json["format"], "Ink");
+    assert!(json["failed"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read(stories.join("inn.ink")).unwrap(), std::fs::read(&single).unwrap());
+    assert!(!stories.join("well.ink").exists());
+    // There already: refused, naming them, without --force.
+    let out = run(&["dialog-export", p, "--all", "--to", s, "--format", "ink"]);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("gate.ink, inn.ink") && said.contains("--force"), "{said}");
+    assert!(!stories.join("well.ink").exists(), "nothing written");
+    ok(&run(&["dialog-export", p, "--all", "--to", s, "--format", "ink", "--force"]));
+    assert!(stories.join("well.ink").exists());
+    // Each format by its extension; one named the module hasn't.
+    for (format, ext) in [("twine", "twee"), ("text", "txt"), ("csv", "csv")] {
+        let out =
+            run(&["dialog-export", p, "inn.dlg", "nobody.dlg", "--to", s, "--format", format]);
+        assert!(!out.status.success(), "{format}: nobody.dlg isn't in the module");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(said.contains("nobody.dlg is not in the module"), "{said}");
+        let one = dir.join(format!("inn.{ext}"));
+        ok(&run(&["dialog-export", p, "inn.dlg", one.to_str().unwrap()]));
+        let several = stories.join(format!("inn.{ext}"));
+        assert_eq!(std::fs::read(several).unwrap(), std::fs::read(&one).unwrap(), "{format}");
+    }
+    // What is asked for wrongly.
+    let out = run(&["dialog-export", p, "inn.dlg", "--to", s]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--to needs --format"));
+    let out = run(&["dialog-export", p, "gate.dlg", "inn.dlg", "x.ink"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--to FOLDER"));
+    let out = run(&["dialog-export", p, "--to", s, "--format", "ink"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--all for every one"));
+}
+
+#[test]
+fn dialog_export_rejects_non_dialog_resource() {
+    let dir = mg_testkit::scratch_dir("mg-dialog-export-non-dlg");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mod_path = dir.join("keep.mod");
+    let mut m = Module::new();
+    m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
+    m.set_gff(ResKey::parse("guard", ResType::UTC).unwrap(), &mg_gff::Gff::new(*b"UTC ")).unwrap();
+    m.save_as(&ModuleLocation::Archive(mod_path.clone())).unwrap();
+    let ink = dir.join("out.ink");
+    let out = crate::mg_alone()
+        .args(["dialog-export", mod_path.to_str().unwrap(), "guard.utc", ink.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a conversation (.dlg)"), "{stderr}");
+}

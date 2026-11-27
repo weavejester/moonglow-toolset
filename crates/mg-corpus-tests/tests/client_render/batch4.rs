@@ -7,7 +7,7 @@
 //!
 //! Needs the game and the off-screen display; run by hand, one client at a
 //! time:
-//! `DISPLAY=:2 cargo test -p mg-corpus-tests --release --test client_render batch4 -- --ignored --nocapture --test-threads 1`.
+//! `DISPLAY=$D cargo test -p mg-corpus-tests --release --test client_render batch4 -- --ignored --nocapture --test-threads 1`.
 
 use super::readings::{INVISIBLE, Reading, enter, placeables_with, print_log};
 use super::*;
@@ -47,7 +47,7 @@ pub(super) fn shoot_close(
     .unwrap();
     let (dir, client) =
         r.shoot(&enter(&super::readings::logged(body), (facing, distance, pitch)), settings);
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         return (dir, client);
     };
@@ -61,7 +61,10 @@ pub(super) fn shoot_close(
     let mut scene = area_scene.scene(&model, &v);
     if v.animate {
         let mut sims = HashMap::new();
-        scene.particles = area_scene.particles(&model, &v, &mut sims, 1.0 / 60.0, camera.view());
+        let (particles, chunks) =
+            area_scene.particles_and_chunks(&model, &v, &mut sims, 1.0 / 60.0, camera.view());
+        scene.particles = particles;
+        scene.instances.extend(chunks);
     }
     off_and_on(
         &gpu,
@@ -457,6 +460,221 @@ fn reading_particle_spin_and_order() {
     print_log(&dir);
 }
 
+/// A box trimesh `name` of [`chunk_model`] from `lo` to `hi`, textured
+/// `bitmap`.
+fn chunk_box(name: &str, parent: &str, lo: [f32; 3], hi: [f32; 3], bitmap: &str) -> String {
+    let [x0, y0, z0] = lo;
+    let [x1, y1, z1] = hi;
+    let verts: String = [
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ]
+    .iter()
+    .map(|[x, y, z]| format!("    {x} {y} {z}\n"))
+    .collect();
+    // (Each face's corners anticlockwise seen from outside.)
+    let faces: String = [
+        [0, 2, 1],
+        [0, 3, 2],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+        [1, 2, 6],
+        [1, 6, 5],
+    ]
+    .iter()
+    .map(|[a, b, c]| format!("    {a} {b} {c} 1 0 0 0 0\n"))
+    .collect();
+    format!(
+        "node trimesh {name}\n  parent {parent}\n  position 0 0 0\n  orientation 0 0 0 0\n  \
+         ambient 1 1 1\n  diffuse 1 1 1\n  specular 0 0 0\n  shininess 1\n  \
+         selfillumcolor 1 1 1\n  bitmap {bitmap}\n  render 1\n  shadow 0\n  verts 8\n{verts}  \
+         tverts 1\n    0.5 0.5 0\n  faces 12\n{faces}endnode\n"
+    )
+}
+
+/// A chunk's model whose turn can be read from any side: three sticks a
+/// metre long from its origin, red along +x, green along +y and blue
+/// along +z.
+fn chunk_model(name: &str) -> String {
+    let t = 0.07;
+    probe_model(
+        name,
+        &[
+            chunk_box("stick_x", name, [0.0, -t, -t], [1.0, t, t], "mgred"),
+            chunk_box("stick_y", name, [-t, 0.0, -t], [t, 1.0, t], "mggreen"),
+            chunk_box("stick_z", name, [-t, -t, 0.0], [t, t, 1.0], "mgblue"),
+        ],
+    )
+}
+
+/// An 8×8 TGA of one color.
+fn colored_tga(rgb: [u8; 3]) -> Vec<u8> {
+    mg_image::write_tga(&Rgba {
+        width: 8,
+        height: 8,
+        data: [rgb[0], rgb[1], rgb[2], 255].repeat(64),
+    })
+}
+
+/// How fast a chunk emitter's models turn (the review's R18: the quads'
+/// `particleRot` was read as radians a second,
+/// [`reading_particle_spin_and_order`]; a chunk's was taken as turns): in
+/// a lit tic01 room, north of the player, west to east, chunk emitters of
+/// [`chunk_model`] (red +x, green +y, blue +z sticks) at `particleRot`
+/// 0.25: a Single one standing still in the air (its one chunk never
+/// dies), and a Fountain one throwing a chunk up a second at 0.25 m/s
+/// (each chunk's age its height); and at `particleRot` 1 a Fountain one
+/// at velocity 0, a chunk a second living 3 s (three in one place, a
+/// second apart in age). Four pictures a second apart (`client_<i>.png`),
+/// and Moonglow's area view beside them (`moonglow.png`).
+///
+/// What tells radians from turns: at 0.25, a quarter radian (14°) a
+/// second or a quarter turn (90°); at 1, the three chunks of the still
+/// Fountain a radian (57°) apart, or as one (a whole turn apart).
+///
+/// Seen (2026-11-10): radians, about the emitter's z (each chunk's blue
+/// stick stays upright), anticlockwise seen from above, every chunk born
+/// facing as the emitter does (the newest of the rising column's red
+/// stick points east): the rising column a stair of chunks whose steps
+/// turn about 14° (a quarter radian a second of age); the Single chunk
+/// turned about 15° between pictures a second apart, its green stick
+/// pointing west a little south at about 7 s old (1.75 radians); the
+/// still Fountain's three chunks about a radian apart. Moonglow's area
+/// view drew no chunks (only the model view did) until 2026-11-10; it
+/// draws them since (`AreaScene::particles_and_chunks`), at the size
+/// [`reading_chunk_size`] read.
+#[test]
+#[ignore]
+fn reading_chunk_spin() {
+    let root = mg_testkit::nwn_root().expect("the game");
+    let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let m = "mg_chunks";
+    let chunk = "chunkName mgchunk\n  sizeStart 0.5\n  sizeEnd 0.5";
+    let model = probe_model(
+        m,
+        &[
+            emitter(
+                m,
+                "single",
+                [-2.0, 0.0, 1.0],
+                &format!("{chunk}\n  update Single\n  velocity 0\n  particleRot 0.25"),
+            ),
+            emitter(
+                m,
+                "rising",
+                [0.0, 0.0, 0.3],
+                &format!(
+                    "{chunk}\n  birthrate 1\n  velocity 0.25\n  lifeExp 10\n  particleRot 0.25\n  \
+                     sizeStart 0.3\n  sizeEnd 0.3"
+                ),
+            ),
+            emitter(
+                m,
+                "still",
+                [2.0, 0.0, 1.0],
+                &format!("{chunk}\n  birthrate 1\n  velocity 0\n  lifeExp 3\n  particleRot 1"),
+            ),
+        ],
+    );
+    let (table, first) = placeables_with(&base, &[(m, 0)]);
+    let overrides = [
+        ("mg_chunks.mdl", model.into_bytes()),
+        ("mgchunk.mdl", chunk_model("mgchunk").into_bytes()),
+        ("mgred.tga", colored_tga([255, 0, 0])),
+        ("mggreen.tga", colored_tga([0, 255, 0])),
+        ("mgblue.tga", colored_tga([0, 0, 255])),
+        ("mgwhite.tga", white_tga()),
+        ("placeables.2da", table.into_bytes()),
+    ];
+    let light = Lighting { ambient: 0xA0A0A0, diffuse: 0x808080, main_light: 0, only_tile: None };
+    let mut r = Reading::new("chunk_spin", "tic01", light, &overrides);
+    r.place(first, [20.0, 24.0, 0.0], 0.0, &[]);
+    let (are, git) = (r.are.clone(), r.git.clone());
+    r.save(&enter(INVISIBLE, (90.0, 12.0, 45.0)), SETTINGS);
+    let shots = common::client_screenshots(&r.dir, "MgScene", 4, Duration::from_secs(1))
+        .expect("the client's pictures");
+    for (t, _) in &shots {
+        eprintln!("picture at {t:.2} s");
+    }
+    print_log(&r.dir);
+    if let Some((_, client)) = shots.first() {
+        let game =
+            GameData::open(&GameInstall::new(&root, Some(r.dir.join("user")), "en")).unwrap();
+        super::readings::moonglow_beside_as(
+            &r.dir,
+            &game,
+            &are,
+            &git,
+            client,
+            &|v| v.animate = true,
+            "moonglow",
+        );
+    }
+    eprintln!("{}", r.dir.display());
+}
+
+/// How big the client draws a chunk emitter's models (seen beside
+/// [`reading_chunk_spin`]: Moonglow's, at their size, were about half the
+/// client's): in the lit tic01 room, north of the player, west to east,
+/// still Single chunk emitters of [`chunk_model`] (1 m sticks) 1 m up, at
+/// `sizeStart` 0.25, 0.5 and 1, not turning; Moonglow's area view beside
+/// them (`moonglow.png`).
+///
+/// Seen (2026-11-10, 89.8193.37): the three alike, each stick a meter
+/// long: the client draws a chunk at its model's own size, whatever the
+/// emitter's `sizeStart` and `sizeEnd`. Moonglow drew them at that size
+/// (a quarter, a half and the whole) until then; at the model's own since.
+#[test]
+#[ignore]
+fn reading_chunk_size() {
+    let root = mg_testkit::nwn_root().expect("the game");
+    let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let m = "mg_chunksz";
+    let nodes: Vec<String> = [0.25f32, 0.5, 1.0]
+        .iter()
+        .enumerate()
+        .map(|(i, size)| {
+            emitter(
+                m,
+                &format!("single{i}"),
+                [-2.0 + 2.0 * i as f32, 0.0, 1.0],
+                &format!(
+                    "chunkName mgchunk\n  sizeStart {size}\n  sizeEnd {size}\n  update Single\n  \
+                     velocity 0\n  particleRot 0"
+                ),
+            )
+        })
+        .collect();
+    let model = probe_model(m, &nodes);
+    let (table, first) = placeables_with(&base, &[(m, 0)]);
+    let overrides = [
+        ("mg_chunksz.mdl", model.into_bytes()),
+        ("mgchunk.mdl", chunk_model("mgchunk").into_bytes()),
+        ("mgred.tga", colored_tga([255, 0, 0])),
+        ("mggreen.tga", colored_tga([0, 255, 0])),
+        ("mgblue.tga", colored_tga([0, 0, 255])),
+        ("mgwhite.tga", white_tga()),
+        ("placeables.2da", table.into_bytes()),
+    ];
+    let light = Lighting { ambient: 0xA0A0A0, diffuse: 0x808080, main_light: 0, only_tile: None };
+    let mut r = Reading::new("chunk_size", "tic01", light, &overrides);
+    r.place(first, [20.0, 24.0, 0.0], 0.0, &[]);
+    let (dir, _) = r.shoot_beside(INVISIBLE, SETTINGS, &|v| v.animate = true);
+    print_log(&dir);
+}
+
 /// What the client gives a lightning and a `Linked` emitter of
 /// `particleSoftness` (the M5 item "Soft particles"), read as
 /// `soft_particles_in_the_client` reads the others: the game's
@@ -523,7 +741,12 @@ fn reading_soft_particles_of_lightning_and_linked() {
 /// A `VisTransformList` entry of `scope`: scaled by `scale`, turned by
 /// `rotate` (degrees about x, y, z) and moved by `translate` (metres), as
 /// Aurora's Adjust Location writes one.
-fn transform(scope: i32, scale: f32, rotate: [f32; 3], translate: [f32; 3]) -> mg_gff::Struct {
+pub(super) fn transform(
+    scope: i32,
+    scale: f32,
+    rotate: [f32; 3],
+    translate: [f32; 3],
+) -> mg_gff::Struct {
     let mut e = super::batch2::transform_entry(scope, scale, 0.0);
     for (prefix, v) in [("Rotate", rotate), ("Translate", translate)] {
         for (i, a) in ["X", "Y", "Z"].iter().enumerate() {
@@ -541,7 +764,7 @@ fn transform(scope: i32, scale: f32, rotate: [f32; 3], translate: [f32; 3]) -> m
 /// (degrees), standing still (no scripts), with `fields` set and wearing,
 /// over what its blueprint gives it, the items `equip` (slot bit, item
 /// blueprint).
-fn put_creature(
+pub(super) fn put_creature(
     r: &mut Reading,
     resref: &str,
     at: [f32; 3],
@@ -688,7 +911,7 @@ fn reading_item_part_scopes() {
 
 /// The Domains of Dread's haks (read only): `MOONGLOW_TDOD_HAKS`, else
 /// `~/Projects/tdod-module/build/hak`.
-fn tdod_haks() -> Option<PathBuf> {
+pub(super) fn tdod_haks() -> Option<PathBuf> {
     let dir = std::env::var_os("MOONGLOW_TDOD_HAKS").map(PathBuf::from).or_else(|| {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Projects/tdod-module/build/hak"))
     })?;
@@ -696,7 +919,7 @@ fn tdod_haks() -> Option<PathBuf> {
 }
 
 /// The files `names` (`name.ext`) out of the hak `hak` of [`tdod_haks`].
-fn from_hak(hak: &str, names: &[&str]) -> Vec<(String, Vec<u8>)> {
+pub(super) fn from_hak(hak: &str, names: &[&str]) -> Vec<(String, Vec<u8>)> {
     let data = std::fs::read(tdod_haks().expect("the Domains of Dread's haks").join(hak)).unwrap();
     let erf = mg_erf::Erf::read(&data).unwrap();
     names
@@ -849,9 +1072,73 @@ fn reading_static_placeable_default_animation() {
     print_log(&dir);
 }
 
+/// Whether a Custom Light's flicker plays in the client (the flicker
+/// of `mg_module::lights`, the model and the placeables.2da rows it
+/// makes): a dark tic01 room, the light of a Torch flicker, red 255 0 0,
+/// radius 4, its generated binary model, placed twice 5 m apart, west a
+/// static instance (its row `Static` 1) and east a dynamic one (its row
+/// `Static` 0, as the light's own row is). Eight pictures 0.4 s apart
+/// (the torch's cycle is 1.5 s): the floor's red under each.
+///
+/// Seen (2026-11-25, 89.8193.37; the floor's red, 0 to 255, in the two
+/// 6% by 5% rectangles at the light spots, the pictures 0.4 s apart asked,
+/// 0.5 to 0.7 s apart taken): the static one's 43.26, 43.22, 43.26,
+/// 43.23, 43.25, 43.24, 43.30, 43.25 (spread 0.08); the dynamic one's
+/// 39.71, 35.38, 39.70, 36.13, 38.10, 37.52, 42.90, 38.20 (spread 7.52,
+/// from 83% to 99% of the static one's, the key's table being 70% to
+/// 100% of the color: the client's light shows the keyed color). Green
+/// and blue never move. The test asserts a dynamic spread of 4 or more
+/// and a static one of 1.5 or less. See `docs/findings.md`, "A Custom
+/// Light's flicker plays on a dynamic placeable".
+#[test]
+#[ignore]
+fn reading_custom_light_flicker() {
+    use mg_module::lights::{Flicker, LightSpec};
+    let root = mg_testkit::nwn_root().expect("the game");
+    let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let spec = LightSpec {
+        color: [255, 0, 0],
+        radius: 4.0,
+        flicker: Flicker::Torch,
+        ..LightSpec::default()
+    };
+    let name = spec.model_name().to_string();
+    let binary = spec.model_binary().expect("the light's model compiles");
+    let (table, first) = placeables_with(&base, &[(&name, 1), (&name, 0)]);
+    let file = format!("{name}.mdl");
+    let overrides = [(file.as_str(), binary), ("placeables.2da", table.into_bytes())];
+    let light = Lighting { ambient: 0x202020, diffuse: 0, main_light: 0, only_tile: None };
+    let mut r = Reading::new("custom_light_flicker", "tic01", light, &overrides);
+    r.place(first, [17.5, 23.0, 0.0], 0.0, &[("Static", Value::Byte(1))]);
+    r.place(first + 1, [22.5, 23.0, 0.0], 0.0, &[("Static", Value::Byte(0))]);
+    let (dir, _) = r.shoot_beside(INVISIBLE, SETTINGS, &|v| {
+        v.animate = true;
+        v.time = 0.0;
+    });
+    let shots = common::client_screenshots(&dir, "MgScene", 8, Duration::from_millis(400))
+        .expect("the client's pictures");
+    let (mut west, mut east) = (Vec::new(), Vec::new());
+    for (i, (t, img)) in shots.iter().enumerate() {
+        let w = mean(img, [0.37, 0.43, 0.43, 0.48]);
+        let e = mean(img, [0.57, 0.43, 0.63, 0.48]);
+        eprintln!("picture {i} at {t:.2} s: floor west (static) {w:?}, east (dynamic) {e:?}");
+        west.push(w[0]);
+        east.push(e[0]);
+    }
+    print_log(&dir);
+    let spread = |v: &[f32]| {
+        v.iter().copied().fold(f32::MIN, f32::max) - v.iter().copied().fold(f32::MAX, f32::min)
+    };
+    let (sw, se) = (spread(&west), spread(&east));
+    eprintln!("red spread: static {sw:.2}, dynamic {se:.2}");
+    assert!(west.iter().all(|&r| r > 40.0), "the static light lights the floor: {west:?}");
+    assert!(se >= 4.0, "the dynamic light flickers: spread {se} of {east:?}");
+    assert!(sw <= 1.5, "the static light stays steady: spread {sw} of {west:?}");
+}
+
 /// A sphere a metre across, 1.2 m up, of `texture`, as an ASCII model
 /// `name` of `classification` (its texture's alpha 0: reflecting wholly).
-fn sphere_model(name: &str, classification: &str, texture: &str, centre: f32) -> String {
+pub(super) fn sphere_model(name: &str, classification: &str, texture: &str, centre: f32) -> String {
     let (rings, segments) = (16usize, 24usize);
     let (mut verts, mut tverts, mut faces) = (String::new(), String::new(), String::new());
     for i in 0..=rings {
@@ -886,7 +1173,7 @@ fn sphere_model(name: &str, classification: &str, texture: &str, centre: f32) ->
 }
 
 /// A 16×16 gray TGA of alpha `alpha`.
-fn gray_alpha_tga(alpha: u8) -> Vec<u8> {
+pub(super) fn gray_alpha_tga(alpha: u8) -> Vec<u8> {
     let mut t = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 16, 0, 32, 8];
     for _ in 0..256 {
         t.extend([128, 128, 128, alpha]);
@@ -897,7 +1184,7 @@ fn gray_alpha_tga(alpha: u8) -> Vec<u8> {
 /// The game's `inc_standard.shd` painting every environment-mapped
 /// fragment with the map bound to it (`texUnitEnv`), laid out by its
 /// texture coordinates, as `area_env_map_look`'s `MG_ENV_PAINT` does.
-fn env_paint_shader(game: &GameData) -> String {
+pub(super) fn env_paint_shader(game: &GameData) -> String {
     let src = game.resman.get_named("inc_standard", ResType::SHD).unwrap();
     let from = "\tApplyDebugModeOutput(FragmentColor);\n}";
     let src = String::from_utf8_lossy(&src).replace("\r\n", "\n");

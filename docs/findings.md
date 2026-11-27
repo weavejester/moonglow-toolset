@@ -3,7 +3,7 @@ type: Finding
 title: Findings
 description: What Moonglow's authors learned about NWN:EE that is undocumented or documented wrongly - item costs, creatures, areas and tiles, talk tables and 2DAs, haks, GFF fields, what Aurora writes - each saying how it was checked, where Moonglow implements it and what nwn.wiki says.
 tags: [findings, engine, aurora, gff, 2da, nwn-wiki]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-30T03:45:00Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-26T12:35:56Z }
 sources:
   - id: engine
     resource: The game itself (NWN:EE 89.8193.37) - a private nwserver, and the game client read back by screenshot; tests engine_* and client_* in crates/mg-corpus-tests/tests
@@ -298,6 +298,28 @@ asked for has them, and so the modifiers and the saves.
   `great_constitution_s_hit_points_are_the_engine_s_to_add`).
 - **Wiki:** missing.
 
+### The feats whose saves the engine hard-codes
+
+The game adds to a creature's saves for these feats, by feat.2da row,
+whatever the feat's own cells say: Great Fortitude (14), Lightning
+Reflexes (24) and Iron Will (22) 2 to their save; Epic Fortitude (583),
+Epic Reflexes (585) and Epic Will (695) 4 to theirs; Lucky (248) and Luck
+of Heroes (382) 1 to all three; Bullheaded (380) 1 to Will; Snake Blood
+(386) 1 to Reflex; Strong Soul (388) 1 to Fortitude and Will; Divine
+Grace (217) and Dark Blessing (473) the Charisma modifier to all three,
+each its own (a creature with both gets it twice).
+
+- **Checked:** in the game's server, `engine_saves.rs`
+  `save_feats_match_the_engine`: a fighter 10 of Charisma 18 with none
+  of them, with each, with Divine Grace and Dark Blessing together and
+  with the three epic ones, each save equal to the Statistics page's.
+  Through 3.18.1 the page left out the epic three, Dark Blessing,
+  Bullheaded, Snake Blood and Strong Soul (the code review of November
+  2026, G3).
+- **Moonglow:** `crates/mg-rules/src/creatures.rs` (`SAVE_FEATS`,
+  `creature_stats`).
+- **Wiki:** not looked for.
+
 ### Aurora's Levelup Wizard
 
 Levels are applied one at a time, in class-slot order:
@@ -456,7 +478,27 @@ floor is at `Tile_Height` × `Transition`.
   `a_tile_s_own_height_stands_where_the_engine_puts_it`). The game's own
   areas reach 19; below 0 is not in them but loads. Tile Properties'
   Height (issue #29) sets it.
-- **Moonglow:** `crates/mg-area/src/lib.rs`, `crates/mg-tiles`.
+- **Seams the game ships:** of the install's 1,462 areas (102,182
+  tiles), 75 pairs of neighbors disagree (69 cells). 66 are a group's
+  own: ttu01's two-tile group (Tile0=299, Tile1=300) has Floor on its
+  left and Rock on its right in both tiles, so they disagree with each
+  other where they meet, and whatever the tile beside that corner has
+  disagrees with one of them (Kingmaker, Hordes' chapter 1, Infinite
+  Dungeons); tid01's and tni01's groups disagree inside about a
+  crosser; trs02's `path` is on one tile only, 582 of group 12, and
+  declared as no crosser, so nothing outside the group can meet it.
+  Nine are an area's own, where the tileset has tiles that fit:
+  Tyrants of the Moonsea's `moonseablockade` and `moonseabattle` (tss13)
+  put the plain deck, tile 0, beside a group's gangplank, where tiles
+  392 to 403 are that same deck model with a gangplank edge; Darkness
+  over Daggerford's `c1ar2000_northco` (tno01) ends a sandbank at a
+  cliff tile (2, 5) that has none, where 42 free tiles carry one. The
+  game takes them as they are: they ship in the modules it plays (game
+  data, `tiles.rs` `shipped_tile_grids_are_consistent`; not run in the
+  engine here). Verify's `tile-seam` says the nine and not the 66
+  (`mg verify` on those modules).
+- **Moonglow:** `crates/mg-area/src/lib.rs`, `crates/mg-tiles`
+  (`seams`, Verify's `tile-seam`).
 - **Wiki:** missing (no page documents the ARE `Tile_*` fields).
 
 ### Door hooks, and the doors Aurora places itself
@@ -537,7 +579,15 @@ What lines ending each way in one file do was not measured.
   re-picks the tiles.
 - **Crossers:** each cell is split by its diagonals into four quarters, one
   per edge; the crosser goes on the edge of every quarter the drag passes
-  through, the first included. A click without moving re-picks the cell.
+  through, the first included. A click without moving puts it on the
+  edge of the quarter clicked (refused, it changes nothing; Aurora's
+  cursor, the quarter, is red there). It is laid edge by edge as the
+  drag goes, each on what came before: an edge no tile fits is held and
+  tried again with the next (a stream across a road fits only both
+  sides at once, a bridge), one that fits neither with it nor alone is
+  passed over, and the rest of the drag is laid (a road dragged into a
+  wall stops at it; a corridor dragged through a room goes on beyond).
+  A drag is refused only when none of it fits.
 - **Eraser:** acts on the tile, not a corner, and does not paint the
   Default terrain: it clears the tile's crossers and re-picks it and its
   neighbours across the cleared edges; a tile that then fits nothing loses
@@ -548,8 +598,10 @@ What lines ending each way in one file do was not measured.
   Tile0 (its lowest corner), overwriting the terrain and re-picking the
   tiles around.
 
-- **Checked:** Aurora, `aurora_terrain.rs` `painting_matches_aurora` (54
-  scripted steps in four tilesets, and eight group placements); game data
+- **Checked:** Aurora, `aurora_terrain.rs` `painting_matches_aurora` (73
+  scripted steps in four tilesets, five of them crosser clicks and six
+  drags partly refused, and eight
+  group placements); game data
   (770 group placements).
 - **Moonglow:** `crates/mg-tiles/src/paint.rs`.
 - **Wiki:** the Tilesets page says only that the toolset "will perform a
@@ -641,8 +693,8 @@ the Area Wizard writes from the row (above), and more:
 - **Checked:** Aurora, `aurora_lighting_scheme.rs` (Interior Evil, row 16,
   on a 4×4 Rural area whose tiles were lit 31).
 - **Moonglow:** `Scheme::applied_fields` and `tile_fields` in
-  `crates/mg-module/src/new.rs`; Area Properties, Give Every Area This
-  Page's Settings and `mg areas --lighting-scheme` use them.
+  `crates/mg-module/src/new.rs`; Area Properties, Copy This Page to
+  Every Area and `mg areas --lighting-scheme` use them.
 - **Wiki:** not described.
 
 ### ARE colors and tile lights, stored and read
@@ -661,15 +713,26 @@ return `0xRRGGBB`. `Tile_SrcLight1/2` stores the
 
 ### Fog
 
-`fogEnd` = `FogClipDist`; `fogStart` = min(30 − `Sun/MoonFogAmount`,
-`fogEnd` − 1), in meters. Fog is always on, even at amount 0; amounts above
-30 start it behind the camera. A skybox changes neither value. The fog
-color is the stored color, in gamma space.
+`fogEnd` = `FogClipDist`; `fogStart` = min(30 − `Sun/MoonFogAmount` −
+(20 − the camera's distance), `fogEnd` − 1), in meters, where the
+camera's distance is how far the client's camera stands from the player
+(as `SetCameraFacing` gives it; 20 as a player enters, where the
+formula reads min(30 − amount, end − 1)). Zoomed in, the fog starts
+nearer: with an amount of 12 and the camera at 5.5 m it starts 3.5 m off,
+not 18. The pitch changes nothing, nor day or night (the moon's amount
+and color at night, the sun's by day). Fog is always on, even at amount
+0; amounts above 30 start it behind the camera. A skybox changes neither
+value. The fog color is the stored color, in gamma space.
 
 - **Checked:** game client, `client_render.rs` `fog_uniforms_match_the_client`
-  (the shader's uniforms read back by a debug copy of the game's own shader
-  include in a scratch `override`).
-- **Moonglow:** `crates/mg-area/src/scene.rs` (`fog`).
+  (the camera as a player enters) and `night_fog.rs`
+  `fog_start_follows_the_camera` (cameras from 5.5 to 25 m, the start moving
+  back past 20 m as before it, pitch 45 and
+  84, amounts 0 to 30, day and night), the shader's uniforms read back by
+  a debug copy of the game's own shader include in a scratch `override`;
+  `night_fog_matches_the_client` compares the pictures (The Domains of
+  Dread's Shard at night with a clip distance of 22, and a rural area).
+- **Moonglow:** `crates/mg-area/src/scene.rs` (`fog_from`, `View::camera`).
 - **Wiki:** no formula. "Area Lighting" and "Render Distance with Fog and
   Skyboxes" say a skybox extends the fog clip distance; the fog end stays
   at `FogClipDist` (the draw distance was not measured).
@@ -816,11 +879,30 @@ the picture's bottom, also in a TGA that declares a top-left origin
 (descriptor bit 5): the game ignores it, so a picture saved top row
 first, as Krita saves it, shows upside down.
 
+Map notes (read 2026-11-05 for a builder's ask): the map marks a
+waypoint's note only where both `HasMapNote` and `MapNoteEnabled` are
+set; a disabled note and a waypoint without one show nothing. The mark
+is the GUI model `ctl_map_pin`: a 0.1205-unit square (12 pixels) showing
+the 12 by 12 texels of `gui_map_pieces` its UVs name, its mesh 0.01 right
+and 0.01 down of the waypoint, drawn unscaled over a map whose tiles are
+16 pixels (the game's minimap pictures are 16 by 16). The map draws no
+text of the note (a pointer resting on a pin showed none either in the
+picture taken; what the pointer shows there wasn't settled). The client puts the pin
+at whole pixels and spreads the area's meters over the map less two
+pixels: on a 4 by 3 area (64 by 48 pixels) and an 8 by 6 one (128 by 96)
+with fourteen notes each, every pin is the client's pixel for pixel at
+left `floor(s·x) − 3`, top `floor(s·(height − y)) − 4`, with `s` =
+(16 × width − 2) / (10 × width) pixels a meter, x and y in meters; a
+tall area (3 by 5) was not settled (its map is drawn in two grays).
+Moonglow marks the waypoint's own place (16 pixels a tile), within two
+pixels of the client's.
+
 - **Checked:** game client, `client_minimap.rs`
-  `minimaps_are_laid_out_as_the_client_draws_them`.
+  `minimaps_are_laid_out_as_the_client_draws_them` and
+  `map_notes_are_marked_as_the_client_marks_them`.
 - **Moonglow:** `crates/mg-module/src/minimap.rs`.
 - **Wiki:** the layout and rotation are missing (flipping DDS is
-  documented).
+  documented); map notes' marking is missing.
 
 ### Particles
 
@@ -872,16 +954,244 @@ All checked by screenshots of the game client beside Moonglow's picture,
 by eye (`client_render.rs`, the test named in each; exploration, no
 assertions).
 
-### A body part is drawn in its own texture
+### A body part is drawn in its own PLT
 
-A creature's part (`p<g><r><pheno>_<part>NNN`) is drawn with the texture
-of its own name, whatever texture its mesh names: the game's thigh 3
-names thigh 2's texture and chest 32 chest 13's (598 such meshes in the
-base game). A mesh that names something that is no part's texture keeps
-it.
+A creature's part (`p<g><r><pheno>_<part>NNN`) that has a PLT of its own
+name is drawn with that name on every mesh, whatever each mesh names:
+another part's texture (the game's thigh 3 names thigh 2's, chest 32
+chest 13's: 598 such meshes in the base game), a TGA or a PLT of no
+part's name, no texture at all (`bitmap NULL`, as several of CEP's
+heads), or one mesh of two whose other names the part's own (a head's
+hair, a gem). Without a PLT of its own name, the first of its
+fallbacks that has one counts the same: phenotype 0, the human of its
+gender, the human man; a head's stop at its race's phenotype 0 (an elf's
+or a woman's head with only the human man's PLT of its name keeps what
+its mesh names, and a mesh naming its own missing texture is drawn
+untextured, light gray). A DDS or TGA of the part's name alone replaces
+nothing: the mesh keeps its texture. Of a PLT and a DDS or true-color
+TGA of one name, the client draws the DDS or TGA, wherever each is in
+the load order (both in the override or in a hak, the TGA in a hak and
+the PLT in the override, or the other way about), on a part or on an
+item (a helmet); it draws the PLT over a gray TGA of 8 bits (type 3,
+with or without alpha bits declared), as the game's own `pmd0_head001`
+and `pmh0_handl003` are beside their PLTs, the only PLTs of the base game
+with a plain texture of their name; and over a DDS of one luminance
+channel, where a DXT1 of gray texels wins as any DDS. Such a luminance
+DDS alone the client draws in colors of no rule (60 blue, 128 dark red,
+0 and 255 black); Moonglow draws it gray.
 
-- **Checked:** `creatures_look` with `MG_PARTS`.
-- **Moonglow:** `crates/mg-preview`.
+Materials: a mesh whose `bitmap` or `materialname` names a material
+(MTR) with a `texture0` keeps the material, its own PLT or not; one
+naming a material with no `texture0` (a normal map alone) takes the PLT.
+The name a mesh is given in place of its own is drawn without that
+name's material: with an MTR of the part's own name whose `texture0`
+names another texture beside the part's PLT, a mesh naming something
+else is drawn in the PLT, a mesh naming the part's own name in the
+material. Robes (`p<g><r><pheno>_robeNNN`) are parts as any: an elf's
+takes the human man's PLT.
+
+Helmets are drawn the same way: a helmet (`helm_NNN`, worn or as an
+item) with a PLT of its own name is drawn in it on every mesh, whatever
+the mesh names (a texture that is nowhere, another helmet's PLT, a TGA
+of no part's name, no texture); a mesh naming a material with a
+`texture0` keeps it, and a TGA of the helmet's name alone replaces
+nothing. The game's hood, `helm_033`, names `helm`, which is nowhere
+(as `helm_035` does), and nine of the game's helmets name another
+helmet's PLT (`helm_006` names `helm_003`'s); Moonglow drew the hood
+untextured and shiny, the others in the other helmet's PLT (GitHub
+issue 45, a builder's report on 4.0: "the hoods are still missing their
+texture"). Of the game's and The Domains of Dread's models, only
+helmets, body parts and the game's `gi_cloak01` (the cloak dropped,
+whose mesh names its own name) have a PLT of their own name: no shield
+or weapon has one. A mesh keeps the material (its normal and specular
+maps) of the name it gives, not of the name it is drawn in, on helmets
+and body parts alike: a helmet whose mesh names `helm_003` beside the
+helmet's own `helm_006.mtr` is drawn with `helm_003`'s normal map. A
+mesh whose texture is nowhere is drawn close to a white texture of
+alpha 0: wholly reflecting its object's environment map.
+
+The earlier finding said a mesh naming something that is no part's
+texture keeps it (a head's hair, a gem): that half had never been read in
+the client (no stock body part names such a texture: only the cloaks do,
+whose textures come from `cloakmodel.2da`) and was wrong (a builder's
+report on 4.0: a part drawn in the texture its mesh names).
+
+- **Checked:** `creatures_look` with `MG_PARTS` (the stock thighs and
+  chests, 2026-10-07); `part_textures_look` (2026-11-10): 32 rows of
+  authored parts, flat-colored textures and palettes, in the override and
+  a hak, beside Moonglow's area view (pictures in
+  `target/test-output/part_textures/`); the base game's PLTs with a plain
+  texture of their name, `the_game_s_plts_with_a_plain_texture_of_their_name_have_a_gray_tga`;
+  the materials, robes and gray DDS rows G to V (2026-11-10). Over the
+  owner's module (The Domains of Dread's 150 haks and the base game,
+  56,664 part models): the rule draws 2,556 meshes of 2,520 parts
+  otherwise than Moonglow drew them before it, all in the haks, nothing
+  in the base game: 2,489 meshes naming a PLT, TGA or DDS of no part's
+  name (mostly TDoD's `cmh0_`, `cfh0_`, `qmh0_`, `qfh0_` textures on its
+  cloth parts, bandages, a snowshoe's wood), 28 naming a material, 29
+  newly given the human man's PLT, 10 another name's; none a PLT losing
+  to a color texture. Nine of them read in the client beside Moonglow
+  before and after (`part_textures_tdod_look`): eight the client draws
+  as the rule does (Moonglow before did not), and a head of 146 (its
+  mesh naming a material) neither draws. Helmets (2026-11-13,
+  `part_textures_look` rows W to Z and 0 to 2, authored, and 3 and 6,
+  the game's `helm_033` and `helm_006`): as above. Over the game and
+  TDoD's haks the rule draws 11 of the game's helmets and 78 of TDoD's
+  otherwise (`models_with_a_plt_of_their_own_name` in mg-preview's
+  `tests/previews.rs`, run by hand, lists them); six of TDoD's read in
+  the client beside Moonglow before
+  and after (`part_textures_tdod_look`, `MG_TDOD_SET=3`: `helm_017`,
+  `036`, `071`, `076`, `096`, `033`): the client draws them as the rule
+  does (a kettle hat whose mesh names a texture that is nowhere textured
+  and dark, where Moonglow drew it shiny gray; horns whose meshes name
+  TGAs of other names in the helmet's PLT, where Moonglow drew them
+  blue). The same day: two meshes of a helmet ($), a TGA beside its PLT
+  (&), the normal maps of materials with striped normal maps on helmets
+  and parts (4, 5, 7, 8 and %, +, #, =, seen from above in a darker
+  light), and meshes whose texture is nowhere beside white TGAs (Z, 9,
+  @, ^, ~).
+- **Moonglow:** `crates/mg-preview` (`creature::plt_fallbacks`,
+  `creature::helmet_textures`; tests
+  `a_helmet_with_a_plt_of_its_name_is_drawn_in_it_whatever_its_meshes_name`,
+  `a_part_with_a_plt_of_its_name_is_drawn_in_it_whatever_its_meshes_name`,
+  `a_part_s_own_plt_is_used_whatever_its_mesh_names`) and
+  `mg_render::Assets::texture_kept` (`only_a_plt_takes_an_instance_s_colors`;
+  `mg_image::tga::is_gray`, `mg_image::dds::is_gray`). Not as the
+  client: the material of the part's own name is drawn on a mesh given
+  that name (row J), and a luminance DDS alone is drawn gray (rows R to
+  U); both on [the deferred list](deferred.md).
+- **Not read:** a DDS in the game's own files beside a PLT (the game has
+  none), a BC4 (one-channel compressed) DDS beside a PLT.
+- **Wiki:** missing.
+
+### A creature's parts' emitters: tails, wings, helmets, held items
+
+The emitters of a creature's parts run in the client as its own do:
+an effect worn as a tail or wings (CEP's `tailmodel.2da` rows 616 and
+up and `wingmodel.2da` 109 and up, `@VFX: ...`, name the game's effect
+models, emitters and lights and no mesh; its "Balor: Flame" wings,
+`c_wingsbalr`, are wings full of fire emitters), a helmet's, a held
+torch's flame. What keys them:
+
+| The part | Its emitters keyed by |
+| --- | --- |
+| Tail, wings | its own animation of the name the creature plays (`pause1` keyed over 0 at rest: emits); else its own `default` (CEP's 620, `fx_lavaspurt`, 0 at rest, spurts); else as the model has them at rest (619 `wwhip_fxfire` burns; 753 `vdr_smoke`, keyed only in `duration`, smokes) |
+| Helmet | as the model has them at rest: its `equip` plays no part (0 at rest, 8 at `equip`'s end: none) |
+| Held item (a torch in the left hand) | its `equip`, as it ends: the game's torch (0 at rest, 9 and 12 at `equip`'s end) burns; ours keyed from 8 at rest to 0 at its end throws nothing |
+
+CEP's 629 (`vco_mehanfire01`, keyed only in `conjure01` and `fade`)
+shows no particle on a creature standing: its emitters are trails
+(`spawntype 1`, made as they move); its three lights light the
+creature and the floor. 668 (`vpm_circfire`) shows its flares at
+rest, 4 m off, one in sight. Wings a cloak hides (`cloakmodel.2da`
+`HIDEWING`) show nothing.
+
+A part's scale sizes its particles and not their speed: a tail at
+`WING_TAIL_SCALE` 3 throws squares three times as big that rise as far
+in their life as at 1; the tail's visual transform (scope 253) scaled 2
+doubles them, moved 0.5 m up starts them 0.5 m up. So does any
+object's: a placeable scaled 2 by its visual transform (scope 0) throws
+squares twice as big, as fast.
+
+- **Checked:** `part_emitters_look` (`client_render/part_emitters.rs`,
+  2026-11-10, EE 89.8193.37): commoners with authored `tailmodel.2da`
+  and `wingmodel.2da` rows naming the game's effect models and an
+  emitter of ours (12 cm white squares rising 1 m/s), helmets and a
+  torch whose models were the override's, beside Moonglow's area view
+  (`target/test-output/client_reading_part_emitters_<group>/`).
+- **Moonglow:** `mg_preview::compose::Composed::emitting` (each model
+  of a preview that emits, keyed as above: tests
+  `a_part_s_emitters_hang_where_the_part_does`,
+  `a_tail_s_emitters_play_its_own_animation_or_its_default`), drawn by
+  the area view (`AreaScene::particles_and_chunks`), the model view and
+  the pictures (`mg-ui`'s `model_view.rs`; UI test
+  `an_effect_worn_as_a_tail_shows_its_particles`); the size,
+  `mg_render::particles` (`a_scaled_emitter_throws_bigger_particles_as_fast`).
+  Until 2026-11-10 only a preview's base model was simulated.
+- **Not read:** a body part's or a shield's emitters, a held item's
+  `default`, a tail's own `cpause1` on a creature standing in `pause1`,
+  whether a scaled object scales the models a chunk emitter throws.
+- **Wiki:** missing.
+
+### A torch-bearer's raised arm, and an item's light on its wearer
+
+A creature holding a torch (base item 15) in its left hand plays
+`torchl` over whatever it plays: the overlay of `a_ba_non_combat`, which
+keys only the left arm (`lshould_g`, `lbicep_g`, `lforearm_g`,
+`lforearm`, `lhand_g`, `lhand` and a shoulder pad's bone), raises the
+arm and holds the torch up. It plays over the base's animation, not at
+rest, and over the bones of animated parts (a robe's, a cloak's). No
+other base item has an overlay (the wiki's Item page names only the
+torch's).
+
+An item's Light property lights its wearer, not its own model. Property
+44's `CostValue` (iprp_lightcost: 1 dim 5 m to 4 bright 20 m) and
+`Param1Value` (iprp_color: 0 blue, 1 yellow, 2 purple, 3 red, 4 green,
+5 orange, 6 white) pick a fixed `visualeffects.2da` row: 153, 157, 161,
+165, 177, 169 or 173 by the color, plus the brightness less 1 (the
+`VFX_DUR_LIGHT_*` rows; green is 177, which `nwscript.nss` calls grey).
+That row's `ProgFX_Duration` names a `progfx.2da` row of type 4:
+`Param1` the animation (`Yello_20m`), `Param3` the shadows,
+`Param7` the model, `fx_light_clr`, whose `AuroraLight01` is read at
+the animation's end (the bright yellow: color 1.75, 1.5, 1, radius 13.3).
+
+The light is the creature's effect, the same for a torch, a cloak, a
+ring and `EffectVisualEffect(160)` on the creature: it stands at the
+creature model's `headconjure` node plus (0, 0.75, 0.6) in the model's
+frame (0.75 m ahead, 0.6 m up), turns with the creature, and follows
+the model (a human, a badger, an ogre). `appearance.2da`'s `HEIGHT`,
+`PERSPACE` and `CREPERSPACE` change nothing. Of two items' lights the
+brightest is taken.
+
+Light added to the floor (linear red, client / Moonglow) by the torch
+of a commoner facing south, boxes along his east-west row (m from him)
+and his north-south line:
+
+| −7 | −5.5 | −4.5 | −3.5 | −2.5 | −1.5 | +1 | +2 | +3 | +4 | +5 | +6 | +8 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.071 / 0.073 | 0.127 / 0.131 | 0.197 / 0.201 | 0.320 / 0.323 | 0.524 / 0.522 | 0.806 / 0.794 | 0.952 / 0.924 | 0.655 / 0.649 | 0.407 / 0.411 | 0.249 / 0.254 | 0.158 / 0.161 | 0.103 / 0.107 | 0.050 / 0.052 |
+
+North 2 and 4 m: 0.481 / 0.500, 0.191 / 0.195; south 2, 4, 6, 8 m:
+0.887 / 0.872, 0.344 / 0.345, 0.134 / 0.137, 0.062 / 0.064. Green over
+red 0.71 on both sides. The root mean square of the log ratio is 0.024
+(the torch turned east 0.024, the cloak 0.022, the ring 0.022, the
+ogre's torch 0.018, a dim green torch 0.027, green over red about 4.5
+on both). Before, Moonglow drew no light; a light at the hand, tried
+first, gave about 0.65 of the client's far off.
+
+- **Checked:** `part_emitters_torch_light` (`client_render/part_emitters.rs`,
+  2026-11-25, EE 89.8193.37): fifteen runs, each beside Moonglow's view
+  of the same scene (`light_<run>_moonglow_on.png`); the arm in
+  `part_emitters_look`'s group h.
+- **Moonglow:** `mg_preview::creature` (`Preview::overlay` for the
+  torch, `Preview::effect_lights` from `item_light` over
+  `DressedLook::brightest_light`, the undrawn slots' lights in
+  `DressedLook::light`), drawn by `mg_preview::compose::Composed` for
+  the area view, the previews and the gallery (`anim::pose_layers_scaled`,
+  `anim::pose_worn_layers`). Tests: `a_torch_in_the_left_hand_raises_the_arm`,
+  `an_item_s_light_is_its_color_s_and_brightness_s_effect`,
+  `a_creature_s_light_is_its_brightest_item_s`,
+  `a_torch_bearer_raises_his_arm_and_lights_around_him`,
+  `the_game_s_torch_raises_the_arm_and_lights` (the install's torch).
+- **Not read:** which of two equally bright lights is taken; the light
+  of an item lying on the ground or of an item's own preview; colors
+  other than yellow and green (they go by the tables); a light on a
+  model without `headconjure` (Moonglow puts it at the origin plus the
+  offset).
+- **Wiki:** the Item page names the torch's overlay; the light's place
+  is missing.
+
+### A chunk emitter's models are drawn at their own size
+
+A chunk emitter (`chunkName`) throws its models at their own size,
+whatever its `sizeStart` and `sizeEnd`: chunks of sizes 0.25, 0.5 and 1
+were alike in the client. Moonglow drew them at that size (half the
+client's in `reading_chunk_spin`), and the area view drew none.
+
+- **Checked:** `reading_chunk_size` (`client_render/batch4.rs`,
+  2026-11-10, EE 89.8193.37).
+- **Moonglow:** `mg_render::particles::Particles::chunks`; the area view
+  draws them since 2026-11-10 (`AreaScene::particles_and_chunks`).
 - **Wiki:** missing.
 
 ### A skin mesh in a body part or a held item
@@ -929,6 +1239,57 @@ its own part is not drawn at all (`mg_preview::compose::without_skins`).
   and different from the stock parts'; in Moonglow,
   `a_body_part_bound_to_the_skeleton_follows_its_bones` (a part made so
   by hand).
+
+### A builder's FFXIV body
+
+A builder's FFXIV-style races (Q, a human, `pmq0`; V, a Miqo'te,
+`pmv0`; 2026-11-04) are skeletons of 195 bones with FFXIV's names, their
+animations in a chain of supermodels (`pause1` in the second link;
+`pmv0`'s chain is 25 models long), capart.2da hanging the body parts from
+those bones (the chest from `j_sebo_a`, the neck from `j_kubi`, the head,
+in the right foot's place, from `j_kao`), every part a skin compiled
+against the skeleton, and the materials custom shaders that tint from
+tint maps and a palette atlas in `texture7` to `texture10` by palette
+rows that the MTR (or the builder's scripts) give as parameters. In the
+client, a male of each, bare, phenotype 0, stands in his idle, skin, hair
+and swimwear tinted, no feature mesh showing (each feature's material has
+`fAlphaClipRef 1.1`, every texel cut, until a script lowers it). Where
+`pmq0`'s chain ends at a supermodel the files lack (`pmq0_ba3_f1`), the
+client still draws him, with the animations the chain has.
+
+Moonglow 3.7.0 drew neither: it took a part for a held item unless the
+node it hangs from is named `*_g`, and hid its skins. With the body parts
+told apart from held items by what they are, the skin follows the
+skeleton as the HD bodies' do. (An item on a `*_g` node, a helmet on
+`head_g`, is taken as before: the client's way with a helmet's skin has
+not been read.) Two more causes showed: the renderer bound
+an MTR's textures up to `texture7` (the game binds `texture0` to
+`texture10`), so the tinting shader read white tint maps and a white
+palette and drew the bodies white; and a chain of supermodels was
+followed for 17 models (and a creature's files for 9), so the animations
+past them were not offered. The game's shaders also take a uniform
+declared with a value (`uniform float rowHair = 0.172363;`,
+`uniform vec4 illumColor = vec4(1.0, …)`) to hold it until it is set, as
+OpenGL keeps it; Moonglow set such a uniform to zero where the MTR gave
+none, and now gives it the declared value (`mg_shader::uniform_defaults`).
+Where the game's shaders are off, Moonglow's own shader cannot run the
+tinting, and draws the bodies untinted (`texture0`, `xiv_white`, is not
+among the files): light gray.
+
+- **Checked:** in the client's pictures beside Moonglow's area view
+  (`reading_custom_skeleton_body` in `client_render.rs`, 2026-11-04, the
+  builder's files in a scratch override): pose, tint and where the
+  bodies stand alike. The builder's appearance.2da gives the elf's and the
+  human's rows races V and Q, and the files are the males' alone: the
+  client's default character, an elf woman (`pfv0`), could not be loaded
+  and the client stayed on its loading screen, so the reading's scratch
+  copy gives those two rows the game's races. In Moonglow,
+  `a_body_part_bound_to_a_skeleton_of_its_own_names_follows_its_idle`
+  (mg-preview, an authored skeleton), `a_long_chain_of_supermodels_is_followed_to_its_end`
+  (mg-mdl), `a_long_chain_of_supermodels_brings_every_link` (mg-preview's
+  files), `a_uniform_declared_with_a_value_holds_it` (mg-render), and on
+  the builder's own files, where they are,
+  `a_builder_s_custom_skeleton_body_draws_as_the_client_does`.
 
 ### `setfillumcolor` is not self-illumination
 
@@ -1080,6 +1441,83 @@ is `default` too, the area's, not `chrome1`.
   (`Instance::env_map_default`).
 - **Wiki:** missing.
 
+### The eighth client batch's smaller readings
+
+- **An item that names no model stops the area from loading.** A
+  creature holding one (an empty `ItemClass` and `DefaultModel`, a
+  class of no model, or a part number past the class's models) leaves
+  the client on the loading screen: its log says "CreateItem: Model …
+  nor the default model could be loaded", then "Message type mismatch".
+  Moonglow draws the creature without the item. Verify warns of it
+  (`item-model`, `mg_rules::appearance::item_without_model`).
+- **A two-digit phenotype's part** (phenotype 15, `pmh15`) takes its
+  textures as a phenotype 0 part does: its own PLT on every mesh, else
+  phenotype 0's by the fallback, else what its mesh names.
+- **Two static placeables of one texture** keep each model's
+  `NO_DISCARD` and opacity: the client's buckets do not reach across
+  models.
+- **A particle's size** is right: beside a card of its width at the
+  same depth it is as wide in both (1.00); the fitted camera of
+  `surfaces_in_the_client` draws the whole picture 3 to 5 percent
+  smaller.
+- **The sandboxed client's CD key copy goes with its run:** a joined DM
+  run with `MG_CLIENT_CDKEY` set joined its server (the character
+  list), and no `cdkey.ini` was left in its scratch folder afterwards
+  (`joined_dm_creator_palette`, 2026-11-25).
+- **Checked:** `batch8d.rs` in `client_render` (2026-11-25).
+- **Wiki:** missing (the item without a model).
+
+### A texture replacement's new name: its material, or the old texture kept
+
+`ReplaceObjectTexture` (and the `TextureReplace` field it saves) draws
+the new name through its material: an MTR of the name with a
+`texture0` is drawn with that texture over a TGA or PLT of the name.
+Where the new name has nothing to draw (an MTR with no `texture0`, even
+beside a TGA of the name, or no resource at all) the client keeps the
+old texture. A body part's own name, put on the part's meshes that name
+another texture, is drawn the other way: without its material, its PLT
+(`part_textures_look`, row J). Creatures and placeables are alike.
+
+- **Checked:** `part_textures_renamed_look` (2026-11-25; six chests
+  and six placeable boxes renamed by the script call, beside Moonglow's
+  field), and `part_textures_look`'s row J again (group `GHIJKL`).
+- **Moonglow:** `crates/mg-preview/src/lib.rs` (`replaced`,
+  `Lookup::renames_to_a_picture`); a part's own name marked
+  `mg_image::plt::plain_name` in `creature.rs` (`every_mesh_in`), which
+  the renderer's `image_of` draws without its MTR.
+- **Wiki:** missing.
+
+### A creature's worn and held items reflect the area's map
+
+A helmet, a shield and a weapon a creature wears or holds reflect the
+area's environment map (its tileset's `EnvMap`, `tic01__ref01` in
+`tic01`), as the creature does, not `chrome1`. A mesh whose texture is
+nowhere, drawn as a white texture of alpha 0, reflects wholly, so the map
+shows over all of it: a helmet's tops were gray in the client and bluish
+in Moonglow until its map was the area's. A placeable's `chrome1` is the
+placeable's alone. And on a placeable whose `Reflection` is `default`, a
+texture's TXI `envmaptexture` naming a map is not taken: the client
+keeps `chrome1` (the TXI's gradient did not show), where Moonglow
+reflected the named one. A held item's top still differs in brightness
+either way, from 30 below the client's to 46 above it (a shield's top:
+95 82 73 in the client, 142 125 112 in Moonglow). The pictures put this
+down to the pose, not the shading: each man holds his box at another
+angle in the client, at his own phase of the idle animation, so the tops
+face other parts of the map. The sides match to a level or two, and the
+Shaders switch changes nothing.
+
+- **Checked:** `chrome1_helmet_reflection_look` (2026-11-25; a worn
+  `helm_241` box, a held shield and a held long sword, with
+  `MG_CHROME_HELD`; the variants `chrome1` and `ref01-gradient`, a
+  gradient over `tic01__ref01.tga`, which shows on the client's items
+  and, since the fix, on Moonglow's), and `chrome1_reflection_look`
+  (boxes over placeables 428 and 447, and a TXI naming a gradient).
+- **Moonglow:** `crates/mg-preview/src/creature.rs` and `item.rs`
+  (a worn or held part's `env_map` is `default`); the TXI case in
+  `crates/mg-render/src/renderer.rs`
+  (`a_texture_s_default_map_is_the_area_s_unless_the_object_names_one`).
+- **Wiki:** missing.
+
 ### The game's shaders and Moonglow's own in stock interiors
 
 With the game's stock shaders, the area view draws an interior the same
@@ -1143,6 +1581,16 @@ computes the view vector wrong is not known. The check now draws the
 game's own copies (`Assets::game_shader`, the keys' copy) and names any
 copy the load order puts over them in its debug-log line, with the
 colors each shader drew.
+
+A second builder's card settled which (November 2026): Philos's Radeon
+RX 480 through AMD's Windows Vulkan driver, on a release that draws the
+game's own copies (the notice's "in the wrong colors" came with them,
+50a13f63), drew the same [212, 133, 133] at the same pixel, on every
+start. Both cards are Polaris; the stock programs give that pink there
+and nowhere else seen, so it is the driver's, not a builder's include.
+Moonglow's own shader draws right on both, so the views are drawn by it
+there; the notice can be hidden on that GPU, driver and backend (**Don't
+Show Again**).
 
 - **Checked:** `the_lit_check_draws_with_the_game_s_programs` and
   `a_builder_s_include_leaves_the_lit_check_to_the_game_s_own`
@@ -1389,6 +1837,24 @@ placeable's emitters run (a brazier's fire and smoke, either way).
 - **Moonglow:** `crates/mg-area/src/scene.rs` (`object_time`).
 - **Wiki:** missing.
 
+### A Custom Light's flicker plays on a dynamic placeable
+
+The generated model of a Custom Light with a Torch flicker (a light node
+whose `colorkey` is keyed in `default`, compiled to binary by
+`mg_module::lights`; red 255 0 0, radius 4) flickers in the client placed
+dynamic and stays steady placed static. Eight pictures 0.5 to 0.7 s apart,
+the floor's red under each light (0 to 255): static 43.26, 43.22, 43.26,
+43.23, 43.25, 43.24, 43.30, 43.25 (spread 0.08); dynamic 39.71, 35.38,
+39.70, 36.13, 38.10, 37.52, 42.90, 38.20 (spread 7.52, 83% to 99% of the
+static one's against the key table's 70% to 100%). Green and blue do not
+move.
+
+- **Checked:** game client, `batch4.rs`'s `reading_custom_light_flicker`
+  (2026-11-25, 89.8193.37).
+- **Moonglow:** `crates/mg-module/src/lights.rs` (`Flicker`,
+  `flicker_animation`); the area view plays it as it plays any `default`.
+- **Wiki:** missing.
+
 ### A helmet without its model, and bare skin over nothing
 
 A helmet whose `helm_NNN` model isn't there is drawn as its base item's
@@ -1407,6 +1873,544 @@ number is its EE twin `xModelPart1` first, as other part numbers.)
   `a_helmet_without_its_model_is_the_bag` and
   `a_creature_s_own_parts_show_where_its_armor_is_bare`.
 - **Wiki:** missing.
+
+### A PLT is replaced by name; a creature's items are not
+
+An object's texture replacement (`TextureReplace`, which
+`ReplaceObjectTexture` sets) replaces a PLT texture by its name as it
+does a DDS or TGA: a human's head `pmh0_head001` replaced by a red TGA is
+drawn plain red, without the object's colors, by the field and by the
+script call alike. A creature's replacements don't reach the items it
+wears: its helmet's `helm_001` and its cloak's `cloak_003` (both PLTs)
+stay as they are, by the field or the script call.
+
+- **Checked:** game client, `batch6.rs`'s `batch6_replaced_textures`
+  (2026-11-01, 89.8193.37), beside Moonglow's area view.
+- **Moonglow:** `crates/mg-preview/src/lib.rs` (`replaced`,
+  `Part::item`); the Visuals page offers Select Texture for PLTs; tests
+  `a_creature_s_replacements_leave_its_items_alone` and
+  `visuals_page_lists_a_creature_s_plt_textures_with_a_gallery`.
+- **Wiki:** the Lexicon's `ReplaceObjectTexture` asks for a "simple"
+  new texture; that the old one may be a PLT, and that a creature's
+  items are not reached, is missing.
+
+### An animated part plays only the animation asked
+
+Wings or a tail whose model lacks the animation the creature plays play
+none of their own: the game's `c_wings2` (all of whose animations are a
+creature's) on a human standing in `pause1` is spread as at rest, not in
+its `creadyl`.
+
+- **Checked:** game client, `batch2.rs`'s `reading_wings_without_bones`
+  from the side and from behind (2026-11-01), beside Moonglow's area
+  view before and after the change.
+- **Moonglow:** `crates/mg-preview/src/compose.rs`; test
+  `an_animated_part_without_the_animation_plays_none_of_its_own`.
+- **Wiki:** missing.
+
+### An item on the ground reflects the area's map
+
+An item lying in an area as its own model (a small shield, base item
+14, whose `Part1EnvMap` is 1) reflects the area's environment map (the
+tileset's `EnvMap`: `tin01__ref01`, copper), not `chrome1`.
+
+- **Checked:** game client, `batch6.rs`'s
+  `batch6_item_env_map_own_model` (2026-11-01: the shield's model made a
+  sphere of a texture of alpha 0, `inc_standard` painting each
+  environment-mapped fragment with its map).
+- **Moonglow:** `crates/mg-preview/src/item.rs` (`item_placed`); test
+  `what_is_only_worn_lies_in_an_area_as_aurora_shows_it`.
+- **Wiki:** missing.
+
+### 15- and 16-bit TGAs
+
+A 16-bit TGA is opaque wherever it is drawn: its top bit is no alpha,
+even where the descriptor declares an alpha bit. Its five-bit levels are
+`(c << 3) | (c >> 2)` as a model's texture (4 is 33, 30 is 247) and
+`c × 255 / 31` rounded down as a NUI image (4 is 32, 30 is 246). Seen
+once: a 16-bit TGA named only by a material's `texture0` drew as
+uninitialized texture memory, and drew right in the next run, where a
+mesh named it as its `bitmap` too.
+
+- **Checked:** game client, `batch6.rs`'s `batch6_tga16_texture`
+  (2026-11-01: custom programs painting the texture as sampled, its
+  lowest bit and its alpha) and `nui.rs`'s `nui_readings_in_the_client`
+  (2026-10-29).
+- **Moonglow:** `crates/mg-image/src/tga.rs` (`color`, `read_picture`);
+  test `a_16_bit_tga_is_opaque_and_its_levels_are_the_client_s`.
+- **Wiki:** missing.
+
+### A shader's includes: indented, missing, deep
+
+The engine splices an `#include` indented by spaces or a tab, as it
+splices one at the line's start. A program that includes a file that is
+nowhere fails, and the client draws its meshes magenta. Includes nest at
+least 1,000 deep (a chain of 1,000 files, each including the next,
+compiled and drew).
+
+- **Checked:** game client, `batch6.rs`'s `batch6_include_splicing`
+  (2026-11-01, with `MG_DEPTHS` 15 to 18, 24 to 250 and 1,000).
+- **Moonglow:** `crates/mg-shader/src/assemble.rs`: indentation, a
+  missing include and the depth as the engine (since 2026-11-02 no
+  limit: only an include of a file being spliced, a loop that would
+  never end, is refused; `includes_nest_as_deep_as_the_engine_takes_them`
+  splices chains of 17, 1,000 and 20,000).
+- **Wiki:** missing.
+
+### An animation played through a chain of supermodels is scaled by each link
+
+A model playing an animation one of its supermodels owns moves the
+animation's positions by its own `setanimationscale` times that of each
+supermodel between it and the owner: a model of scale 2 on one of 3 on
+the owner plays it at 6, and one of 1 on one of 3 at 3. The owner's own
+scale doesn't count (an owner of 0.5 or of 1, alike), nor does a model's
+own animation take its scale.
+
+- **Checked:** game client, `batch6.rs`'s `batch6_supermodel_chain`
+  (2026-11-01, with `MG_CHAIN_OWNER` 1 and 0.5: dynamic placeables whose
+  green card the owner's `default` holds 0.4 m up).
+- **Moonglow:** as the client since 2026-11-02 (`mg_mdl::animations_scaled`
+  gives each animation its chain's scale; the area view, the previews,
+  a part worn on them and the model viewer play it so:
+  `a_chain_of_scaled_supermodels_plays_at_each_link_s_scale`).
+- **Wiki:** missing.
+
+### A DDS with a rippling procedure loses its picture
+
+A texture with a TXI `proceduretype arturo` whose file is a DDS is
+drawn as a flat light gray (about 89, 82, 78 over the reference room,
+the same for a DDS of glowing coals and one of floor stones), its
+picture lost; the same TXI on a TGA ripples the picture. The DDS itself
+is not at fault: BioWare's DXT1 and DXT5, under BioWare's header or the
+standard one, draw whole without the procedure. This is The Domains of
+Dread's burning zombie's pallor: its glow `dd_ce3_txhotcoal` is an
+additive DDS with the ripple, drawn as a gray wash over the body when
+the hak's TGA of it isn't there.
+
+- **Checked:** game client, `batch6.rs`'s `batch6_bioware_dxt1` and
+  `batch6_procedure_on_dds` (2026-11-01).
+- **Moonglow:** as the client since 2026-11-02: a texture with the
+  procedure whose picture is a DDS (compressed) is drawn flat gray
+  (`renderer.rs`'s `procedure_picture`, its gray fitted so that the
+  reading's cards draw 86 and 96 of 255 where the client's are 83 and
+  92). Shiny water (`bumpmaptexture shinywater` in the TXI) keeps its
+  picture since 2026-11-26: the client draws The Domains of Dread's
+  fountain and ttr01's pools with their DDS whole, where the gray had
+  smoothed the basin's floor out of the water and made its clarity
+  (the smallest mip's alpha, which `fswater` reads) opaque, so a
+  shallow pool hid its shadowed floor (`client_render.rs`'s
+  `tdod_custom_shaders_look` with `MG_FOUNTAIN_OVERRIDE`, `shadows.rs`
+  with `MG_SEE_THROUGH_OVERRIDE`: the client's water painted by
+  patched `fswater` programs). That is the game's `fswater`'s picture
+  (the Shaders switch on): Moonglow's own water, which draws the water
+  opaque and sees no floor under it, keeps the gray (`TextureEntry`'s
+  `lost`; test `moonglow_s_own_water_draws_a_lost_ripple_in_its_gray`),
+  its pictures the same as before pixel for pixel.
+- **Wiki:** missing.
+
+### A DXT1's one-bit texels are opaque black
+
+A DXT1 block whose first color is not above its second (the three-color
+mode) holds a "transparent" index 3. The game draws those texels black,
+with alpha 1 to everything that reads it. That holds under BioWare's
+header (3 channels) and under the standard `DDS ` one. A TXI
+`alphamean 0.5` or `blending punchthrough` leaves them opaque and black.
+A mesh of `alpha 0.5` draws them evenly half there, as it draws any
+black texel. An environment map does not show through them. Four of the
+game's 6,737 DDS files hold such texels. In `tdt01_wood04` and
+`tdt01_wood05` every block is in that mode, and about a quarter of their
+texels are index 3. The game draws them as their texels made black, not
+holed. `tts02_gate03` and `tts02_tree01` have a few, in their smaller
+levels only. The same texels in a BioWare DXT5 or a 32-bit TGA are
+see-through. This was read on lit meshes with the stock lit and
+environment-mapped programs. Decals, additive meshes, an MTR's
+`transparency`, particles, static buckets and icons were not read.
+
+- **Checked:** game client, `batch6.rs`'s `batch6_bioware_dxt1_one_bit`
+  (2026-11-10: standing cards before a yellow board, each card's mean
+  read beside Moonglow's area view).
+- **Moonglow:** as the client since 2026-11-10. The texture readers give
+  such a DXT1 no alpha (`mg_image::dds`, `Texture::to_rgba`), and
+  `mg texture convert` and `mg texture info` take a BioWare DXT1 as
+  opaque. The renderer uploads a DXT1 with such texels decoded and
+  opaque, a cube map's face too (`mg_render::texture`'s
+  `one_bit_texels`): the GPU's BC1 gave
+  them alpha 0, and with Shaders on Moonglow cut them under a TXI
+  `alphamean` or a mesh alpha and reflected through them.
+- **Wiki:** missing.
+
+### How far and how fast a texture ripples
+
+With `distort 1`, a rippling texture's picture is pushed about by about
+0.82 × `distortionamplitude` texels of the texture itself (RMS over the
+picture; its 95th percentile 1.25 ×), whatever its size (64 and 128
+texels alike) and whatever `defaultwidth` says (16, 64 or none, alike).
+The ripple changes by about 12 texels a second at `speed` 16 and 4.5 at
+4, and a picture of it is unlike itself after about 4.5 seconds. With
+`distort 0` the channels are `c × channelscale + channeltranslate`: the
+zombie's scale 0 and translation 1 draw white.
+
+- **Checked:** game client, `batch6.rs`'s `batch6_ripple` (2026-11-01:
+  cards of a texture whose red is its u and green its v, painted as
+  sampled, the client's clock along their feet, 60 to 80 pictures over
+  20 s; the texel each pixel samples less its mean over the pictures).
+- **Moonglow:** as far and as fast since 2026-11-02 (`renderer.rs`'s
+  `ripple_of`, `shader.wgsl`'s waves: an RMS of 8.6 texels and 95th
+  percentile 12.6 at amplitude 10, 11.9 texels a second at speed 16 and
+  4.6 at 4, measured as the client's pictures were by
+  `a_texture_ripples_as_far_and_as_fast_as_the_client_s`); `distort 0`'s
+  channels baked into the texture. Its waves are its own: they come
+  apart from themselves in about a second, where the client's take 4.5.
+- **Wiki:** says the amplitude is in texels; that `defaultwidth`
+  changes nothing is missing.
+
+### A light's shadow takes the light's share
+
+A creature's shadow from a lamp darkens the floor by the lamp's share of
+the light falling there, at most about 0.53: an ogre's shadow from a
+lamp post (radius 10) darkens the floor by 0.50, 0.52, 0.53, 0.47, 0.38,
+0.29, 0.21, 0.13, 0.11 and 0.08 at 1.5, 2, 3 … 10 m and nothing at 11
+and 12, where the lamp's share of the floor's light (its brightness less
+the room's without the lamp, over its brightness) is 0.58, 0.54, 0.48,
+0.40, 0.33, 0.27, 0.20, 0.15, 0.11 and 0.07. Every creature in a lamp's
+reach casts at once (eight ogres in a row, each its shadow), and a
+player's own light casts the shadows of the creatures about the player.
+
+- **Checked:** game client, `batch3.rs`'s `reading_light_shadows` (the
+  distances between added 2026-11-01), `batch6.rs`'s
+  `batch6_light_shadow_casters` and `batch6_player_light_at_night`.
+- **Moonglow:** since 2026-11-02 `crates/mg-render/src/shadow.rs`
+  darkens by the light's share as Moonglow's shader lights the floor
+  (the receiver's normal from its depth's slope), no more than the
+  opacity times the plane's fade: 0.53, 0.53, 0.48, 0.39, 0.31, 0.24,
+  0.19, 0.15, 0.12 and 0.10 at 1.5, 2, 3 … 10 m (`moonglow_light_shadows`),
+  near the client's shares; it was 0.53 to 0.60 at every distance. Past
+  10 m (0.08 at 11 and 12 m) Moonglow's lamp still lights the floor a
+  little, where the client's shows no shadow.
+- **Wiki:** missing.
+
+### The grass's material: linear colors, and a fade by distance
+
+The engine gives the grass's draws the `.set`'s [GRASS] ambient and
+diffuse colors made linear (ttr01's 0.5, 0.6, 0.3 as 0.218, 0.325,
+0.071), no emissive, and a diffuse alpha that falls with the tufts'
+distance from the camera, batch by batch: about 0.94 at 17 m, 0.87 at
+18, 0.79 at 19, 0.71 at 20, 0.56 at 22.5 and 0.49 at 24 (about
+`(32 − d) / 16`), which `inc_standard` multiplies into the tufts' alpha.
+
+- **Checked:** game client, `batch6.rs`'s `batch6_grass_material`
+  (2026-11-01, `fsgrass` patched to paint each; `fade` paints the alpha
+  beside the distances from the camera and from the player, which it
+  doesn't follow).
+- **Moonglow:** the colors as the engine's; the alpha 1, by decision:
+  the area view draws grass to the far edge of the view, its camera
+  farther off than the game's (the deferred list's M5).
+- **Wiki:** missing.
+
+### A see-through cut-out is lit through from behind
+
+A mesh of `alpha 0.5` with a cut-out texture is drawn opaque, but lit
+as see-through: the game's lighting passes `1 − alpha` of the light
+falling on its back through it (`inc_lighting`'s
+`LIGHT_TRANSLUCENCE_VALUE`, the fragment's alpha the mesh's times the
+texel's), so a disc lit from behind is a quarter lighter than the same
+disc of alpha 1 (its lighting 156 against 126 of 255; its color before
+lighting the same; no blending). Moonglow's game path draws it so; its
+own shader doesn't.
+
+- **Checked:** game client, `batch6.rs`'s `batch6_cut_out_lighter`
+  (2026-11-01, `fslit` patched to paint the color before lighting, the
+  lighting, the alpha, and black with the fragment's alpha).
+- **Moonglow:** both paths since 2026-11-02 (`shader.wgsl` weighs the
+  light from behind by the alpha before a cut-out is made solid: 156,
+  98, 39 of 255 beside the client's 156, 99, 40).
+- **Wiki:** missing.
+
+### A `Linked` ribbon's cell runs half a particle past the next
+
+A ribbon's piece starts its texture's cell at its older particle and
+reaches the next particle at `gap / (gap + size / 2)` of the cell: at a
+metre's gap within 0.01 at particle sizes 0.15, 0.3, 0.45, 0.6, 0.9 and
+1.2 m (0.93 to 0.63); at half a metre's gap less far (0.85 at 0.3 m and
+0.67 at 0.6, where the rule says 0.77 and 0.63). A see-through mesh of
+another model in front of a ribbon hides it, as one of its own model
+does.
+
+- **Checked:** game client, `batch5.rs`'s
+  `reading_ribbon_pieces_and_order` (2026-10-30) and `batch6.rs`'s
+  `batch6_ribbon_sizes` (2026-11-01).
+- **Moonglow:** the cell's run as the client's since 2026-11-02
+  (`particles.rs`'s `reach`); a mesh of `alpha` under 1 hides a ribbon
+  behind it since 2026-11-02 (it writes its depth: "A model's meshes of
+  `alpha` under 1 are drawn in its order").
+- **Wiki:** missing.
+
+### A model's meshes of `alpha` under 1 are drawn in its order
+
+The client draws a model's meshes of mesh `alpha` under 1 in the
+model's order, each blended and writing its depth: a card listed after
+another and behind it is hidden where they overlap, the one listed
+first, nearer, showing alone; listed the other way (the far card
+first), both show. What is drawn after them (a ribbon of the model or of
+another) is hidden behind them. A texture of alpha 128 on a mesh of
+`alpha` 1 (no TXI) is opaque.
+
+- **Checked:** game client, `batch5.rs`'s `reading_see_through_crossing`
+  and `reading_ribbon_pieces_and_order` (2026-10-30), `batch6.rs`'s
+  `batch6_ribbon_sizes` (2026-11-01: a card of another model).
+- **Moonglow:** as the client since 2026-11-02: drawn in one part,
+  blended, writing its depth, by its instance's place and then the
+  model's order (`mg-render`'s `renderer.rs`, `GamePass::Ordered`;
+  `meshes_of_alpha_under_one_are_drawn_in_model_order_writing_depth`,
+  `a_mesh_of_alpha_under_one_hides_a_particle_behind_it`). Two models'
+  such meshes, as the client orders them, aren't read.
+- **Wiki:** missing.
+
+### The client's clock starts from the machine's
+
+The shaders' `worldtimerTimeOfDay` is the client's own world timer's
+time of day: the server's time never reaches it, and the module's
+start hour, day and dawn don't move it. The timer is made as the game's
+services start (`CClientExoAppInternal::StartServices`, a second or so
+before the player enters the area) with a day of 5 minutes an hour
+(7,200,000 ms) set to 23:59:56 (10,496,000 ms, past that day's end)
+against the machine's `CLOCK_MONOTONIC` (`CExoTimers::GetMicrosecondTimer`:
+the time since it booted, not the wall clock, the time zone or daylight
+saving); loading the module sets its minutes an hour
+(`CWorldTimer::SetMinutesPerHour` from `CNWCModule::LoadModule`), which
+changes the day's length but not the offset taken. So the timer is
+`(10,496,000 + 7,200,000 × ⌊b / 7,200,000⌋ + t) mod (minutes an hour ×
+1,440,000)`, `b` the boot clock's milliseconds as the timer was made and
+`t` the milliseconds since; it follows the wall clock within a run, and
+its start moves in steps of two hours of the machine's uptime. At 60
+minutes an hour, the boot clock at 66,083 s: 75,304,169 eight seconds
+in; the wall clock moved two hours, the same; the boot clock moved two
+hours, 82,504,381, and four, 3,304,388 (past the day).
+
+- **Checked:** the client's code (89.8193.37: `CWorldTimer::CWorldTimer`,
+  `GetWorldTime`, `SetWorldTime`; `GLRender::CheckAndUpdateUniformDirtyDataForFrame`
+  reads the client's timer for the uniform) and game client runs,
+  `batch7.rs`'s `batch7_timer_origin` (2026-11-02; the clocks moved for
+  the client alone by `tools/nwclient/timeshift.c`).
+- **Moonglow:** its clock starts at 0 (`mg-render`'s `time_values`): a
+  player's machine decides the client's.
+- **Wiki:** missing.
+
+### Static geometry is drawn in buckets
+
+A tile's meshes, and a static placeable's, that share a texture are
+drawn as one bucket, with the first one's (in the model's order)
+`NO_DISCARD` and opacity: an opaque mesh first, a mesh of `alpha 0.5`
+after it is drawn solid and not alpha-tested; a mesh of `alpha 0.5`
+first, an opaque one after it is drawn half see-through and
+alpha-tested. Each keeps its own program (a decal's `vsvt`/`fst`, an
+environment map's `vslit_sm`/`fslit_sm`). A dynamic placeable's
+meshes are each their own.
+
+- **Checked:** game client, `batch7.rs`'s `batch7_bucket_order`
+  (2026-11-02: every stock program marked, three pairs of cards in each
+  order, in two static placeables and a tile's model; `MG_UNMARKED=1`
+  for the opacity); `programs.rs`'s `program_choice_in_the_client` with
+  and without `MG_STATIC=1` (2026-10-29), which first showed it.
+- **Moonglow:** as the client since 2026-11-02, in a tile and a static
+  placeable: a mesh takes the alpha of the first of its model's meshes
+  naming the same textures, case not counted (`mg-render`'s
+  `GpuMesh::bucket`; `static_geometry_s_meshes_of_one_texture_take_the_first_one_s_alpha`).
+  A bucket of several models' meshes isn't read: each model's are kept
+  apart.
+- **Wiki:** missing.
+
+### A face casts the sun's shadow from its front only
+
+The client casts the sun's and moon's shadows from the faces whose
+front faces the light: a single face with its back to the sun casts
+nothing (of two single white walls under a sun low in the west, the
+one facing west casts, the one facing east doesn't). Buildings built of
+single faces cast only from the sides they turn to the sun: the city's
+edge tiles that face into the area (`tcn01_c02_07`, `c02_08`), their
+backs to a western sun, leave the street lit; turned the other way,
+they cast their long shadows. A cliff's rock face turned from the sun
+leaves the ground at its foot lit. A caster out of sight still casts,
+and a placeable's shadow at a cliff's top reaches the ground below it.
+
+- **Checked:** game client, `batch7.rs`'s `batch7_wall_sides` and
+  `batch7_low_sun_city_tiles` (2026-11-02), `shadows.rs`'s
+  `high_shadows_beside_the_client` case `cliff` (the tileset's own
+  cliff tiles). Its case `finhead` (run again 2026-11-02, Fast and High
+  agreeing with the client 0.49 and 0.57) doesn't tell: the fins'
+  shadows overlap in one shape, alike in both at that camera, the two
+  fins turned from that sun lying 17 and 28 degrees off its light.
+- **Moonglow:** as the client since 2026-11-02: the shadow map culls the
+  faces turned from the sun, and High's volumes make no prism of them
+  (`crates/mg-render/src/shadow.rs`, `volume.rs`;
+  `a_face_casts_the_sun_s_shadow_from_its_front_only`). The city's
+  street lit as the client's (`batch7_low_sun_city_tiles` drawn again
+  beside its pictures: the street's brightness 55.9 against the
+  client's 56.7), the wall turned from the sun casting nothing, the
+  cliff's shadows agreeing 0.80 with the client's (0.62 before). A
+  light's volumes of an open mesh are still cast from both sides (not
+  read).
+- **Wiki:** "Model Shadows" says the volumes come of a mesh's faces;
+  not that a face casts from its front only.
+
+### Grass and a tile's see-through meshes take the shadows
+
+The client darkens grass and the see-through meshes of tiles by the
+sun's shadows as it darkens the ground: their solid texels and their
+soft, blended ones alike. Under a white wall's shadow on ttr01, at
+Shadow Opacity 100 and the reference camera, a field of grass darkens
+by 0.42 where the bare floor does by 0.45; a road decal (transparency
+hint 1, most of its texels soft) by 0.39, as its ground by 0.39; a
+tree's alpha-blended crown by 0.07 where its ground does by 0.16 (the
+crown higher up the screen, where the plane fades). The grass also
+covers a creature's feet in the client's pictures. Water takes none of its own: deep water darkens by
+0.002 where its ground does by 0.37; a shallow pool darkens by 0.26,
+its shadowed floor seen through it. How much of a see-through texture
+is soft decides how much must be: ttr01's grass texture has 3% of its
+texels solid (alpha 0.95 and over) and 10% soft (0.2 to 0.95), its
+road 69% and 16%, its splotch 3% and 33%, its tree leaves 39% and 2%.
+
+- **Checked:** game client, `client_render/shadows.rs`'s
+  `shadows_look` (`MG_SHADOW_GRASS=1`) and `shadows_on_see_through`
+  (ttr01's `ttr01_h01_01` beside a deep pool, a shallow one with
+  `MG_SEE_THROUGH_WATER=53`, and a tall wall shading the tree with
+  `MG_SEE_THROUGH_WALLS=11,31.5`), 2026-11-25.
+- **Moonglow:** since 2026-11-25 (`crates/mg-render/src/renderer.rs`,
+  `shadow.rs`; `mg_shader::Program::darken_by_mask`): the solid part of
+  grass and of a receiver's see-through mesh is drawn before the
+  shadows are laid, and the soft part after them, multiplied by a mask
+  the darkening writes beside the picture ([the research
+  note](research/notes_shaders.md) §G.2). Beside the client's: grass
+  0.40 (0.34 to 0.36 before), the road 0.42 as its ground 0.42 (0.01
+  before), the crown 0.07 as the client's (0.01 before), the road under
+  the tall wall 0.45 as its ground (0.00 before); Fast and High, either
+  Shaders switch. Water as the client's, the shallow pool darkening by
+  0.264 with the Shaders switch on since 2026-11-26 (0.002 before, its
+  floor hidden by the rippling procedure's gray: [A DDS with a
+  rippling procedure loses its picture](#a-dds-with-a-rippling-procedure-loses-its-picture));
+  Moonglow's own water, with it off, hides its floor as before. Test
+  `grass_and_see_through_receivers_are_darkened_in_the_shadow`.
+- **Wiki:** "Model Shadows" says what casts; not what receives.
+
+### What the framebuffer's copies hold
+
+The client copies its picture and depth for the programs that read
+them (`texFBColor`, `texFBDepth`) once a frame, after the see-through
+meshes (alpha-blended cards, `transparencyhint 1`, a DXT5 with no
+`alphamean`) and before shiny water and `sample_framebuffer` meshes:
+the water shows those cards behind it, in color and in depth (a card
+standing in a pool shortens the depth the water reads to it). A soft
+see-through mesh (a DXT5 of alpha 0.5 texels with `transparencyhint
+1`) standing in front of a pool hides the water behind it: the client
+draws no water there, as though the mesh wrote its depth. (A 32-bit
+TGA of alpha 0.5 texels on a placeable's mesh, with or without the
+hint, is drawn opaque.) Which
+copy a mesh reads depends on how it is drawn, not on its program:
+
+- shiny water and a material's `sample_framebuffer` mesh read this
+  frame's copy;
+- a solid or `transparency 1` mesh whose program reads `texFBColor`
+  reads the frame before's finished picture, its additive meshes in it
+  (a card painting half its copy over red grows redder frame by frame
+  and shows the green of an additive card drawn after it);
+- particles read a depth copy without the water.
+
+- **Checked:** game client, `client_render/copies.rs`'s
+  `reading_copy_order` (`MG_COPY_ORDER=color`, `depth`, `particles`,
+  `front`), 2026-11-26.
+- **Moonglow:** shiny water and `sample_framebuffer` meshes read a
+  copy holding the see-through meshes' solid parts since 2026-11-26
+  (`renderer.rs`: their draws sort after them, and the copy is made at
+  the first of them; test
+  `the_water_s_copy_holds_the_see_through_meshes_behind_it`); particles
+  as the client. A see-through mesh's soft part is drawn after the
+  water, without writing depth: not in the copy, and laid over water
+  behind it, where the client draws no water (`MG_COPY_ORDER=front`;
+  [deferred list](deferred.md), "A see-through mesh's soft part and
+  shiny water"). A solid or `transparency 1` mesh reading the copy gets
+  this frame's copy, not the frame before's: no program the game or
+  The Domains of Dread draws reads it so ([deferred list](deferred.md),
+  Settled).
+- **Wiki:** missing.
+
+### When the client shows an area transition
+
+The client draws an area transition trigger (`Type` 1) only with the
+pointer over it, as a translucent blue fill of its outline: nothing shows
+with nothing held, and holding Tab shows no transition at all (not even
+Aurora's own). A click on a shown one takes the player to its
+destination; a stock transition fires on the click, not on walking
+across it, even a shown one. It is shown, and can be clicked, only when
+both hold:
+
+1. its `Geometry` points run counterclockwise seen from above (a
+   positive signed area in X and Y). The same trigger with only its
+   points' order reversed is never shown nor clickable (five runs);
+2. each point is on the ground: the height the client takes is the
+   trigger's `ZPosition` plus the point's `PointZ` (a trigger at
+   `ZPosition` −1 with `PointZ` 1.025 is shown; at `ZPosition` 1 with
+   `PointZ` 0.025 it is not).
+
+| Points above the ground (on flat ground) | Shown |
+|---|---|
+| 0, 0.025 (Aurora's), 0.03 | yes |
+| 0.05 | at some spots, in streaks, or not at all: unreliable |
+| 0.1, 0.3, 3; −0.1, −1, −5 | no |
+
+That table is of flat authored ground (`ttr01`). Elsewhere how far off
+the client still shows a transition depends on the place, and what
+decides it was not found: on a slope of Darkness over Daggerford's
+`c1ar1900_lizard` a whole outline is still shown 0.6 m above its
+walkmesh, not 1.0 m above nor 0.6 m below; at `c1ar0900_wildhil`'s
+`AR0900_AR0700_EXIT` it is shown 0.2 m below and hidden 0.3 m below; in
+XP1-Interlude's `area007` a disc was still drawn 1.0 m up (a scene with a
+fight and its spells' light in it: no click there was taken, not even
+on the shipped trigger). The game's own transitions there, 0.23 to
+0.31 m off the walkmesh (flat outlines over sloping ground, one 0.225 m
+above flat ground), are shown, and two of them took a click (the third
+could not be seen from the camera). The drawn tile surface lies within
+0.04 m of the walkmesh under every point of those three: it is not
+what makes the difference. An outline at the walkmesh + 0.025 is shown
+on every ground measured (flat `ttr01`, Aurora's captures, the three
+shipped tiles). A corner alone off the ground (one of four at +0.3,
+−0.3 or +0.05; two of four at +0.3) leaves the outline shown in part,
+the fill missing near the corner, and clickable at its middle.
+
+A hidden one can't be clicked either: the player walks to the ground
+clicked and stands inside it. `Cursor` (0 or 1) and `HighlightHeight`
+(0 or 3) make no difference to any of it. Aurora's own painted and
+linked trigger, moved onto flat ground with its points left 5 m up (as
+painted on its tileset's ground 5 m up), is not shown; with its points
+brought to 0.025 it is.
+
+- **Checked:** game client, `client_render/transition_outlines.rs`'s six
+  ignored tests (2026-11-12; a pointer moved down a column through a
+  row of triggers each differing from the first in one field, shots
+  every 20 px, Tab held, clicks), with Aurora's `TT_A1`
+  (`transition-triggers/07-s2-both.mod`) as the control. Rounds three
+  and four (2026-11-12), in the same file: `transition_outlines_before_and_after_the_fix`
+  (Moonglow's fixed build's three triggers of `after-fix.mod` shown and
+  taken through; the south-east rectangle in the order 4.1.0 saved it,
+  authored by the test, not),
+  `transition_outlines_with_a_lone_corner`,
+  `shipped_transitions_off_the_walkmesh_are_shown`,
+  `shipped_transitions_on_the_walkmesh`,
+  `shipped_transitions_far_off_the_walkmesh`,
+  `transition_outlines_fix_clicked_and_raised_by_position`,
+  `transition_outlines_by_size_off_the_ground` (on flat ground 0.3 m up
+  hidden, 2 m and 6 m across, by `ZPosition` or `PointZ` alike), and
+  `shipped_transitions_against_the_drawn_tiles` (the drawn surface, no
+  client).
+- **Moonglow:** draws and saves outlines counterclockwise and on the
+  ground, and Verify's `transition-hidden` finds a transition saved
+  clockwise and, as a possibility, one left at another level, every
+  point more than 1 m off the walkable ground: nearer, the client's
+  answer depends on the place
+  ([below](#a-triggers-outline-its-points-order-its-heights-and-trigger-type);
+  `crates/mg-module/src/doctor.rs`, `TRANSITION_OFF_GROUND`). It says
+  nothing of the game's own modules.
+- **Wiki:** missing (nothing on triggers' fields or when a transition is
+  drawn).
 
 ## Talk tables and 2DAs
 
@@ -1436,6 +2440,26 @@ sound-only entry (`0x2`) and a row past the end. Custom StrRefs are
 - **Checked:** engine, `engine_tlk.rs`.
 - **Moonglow:** `crates/mg-tlk/src/lib.rs`.
 - **Wiki:** missing (the TLK page also calls TLK "a GFF file").
+
+### A localized string's own text goes before its StrRef, in any language
+
+A localized string (CExoLocString) with a StrRef and text of its own
+shows its own text, not the talk table's line: an item named by custom
+StrRef 16777219 with its own English text reads as that text in an
+English game. Its own text in another language does too: with only a
+French text beside the StrRef, an English game names the item by the
+French text. Only a string with no text of its own, in any language,
+reads its line. Moonglow's text typed into the talk table therefore
+takes the string's own text out, and keeps a string with another
+language's text in the file.
+
+- **Checked:** engine, `engine_tlk.rs`
+  `a_typed_name_is_read_from_the_custom_talk_table` (an item blueprint's
+  `LocalizedName`, by `GetName` on the item created).
+- **Moonglow:** `crates/mg-module/src/talk_range.rs` (`in_line`,
+  `other_languages`), `crates/mg-ui/src/talk_typed.rs`.
+- **Wiki:** missing: the GFF page says a CExoLocString holds a StringRef
+  and strings, not which is shown.
 
 ### Line ends: plain in talk tables and localized text, CRLF in comments
 
@@ -1537,6 +2561,28 @@ even when listed later in `Mod_HakList`. `ResManGetAliasFor` returns
   its hak-order section says only that the first listed wins. The alias
   strings are not documented.
 
+### The body parts the creation screen offers
+
+Character creation's Appearance offers the same body parts to every
+race and gender, from no table: part 1 of every part but the belt, the
+shoulders and the robe (0), and, by its Tattoo choice (16 patterns),
+part 2 of the chest (the pattern's first bit), the biceps (its second),
+the shins (its third) and the forearms (its fourth); the thighs have no
+tattoo. Its Body offers the phenotypes of ruleset.2da's
+`CHARGEN_ENABLED_PHENOTYPES` (a bit each; 5, phenotypes 0 and 2, in the
+game's). parts_*.2da is not read. The game's pregenerated characters
+are made so (parts 1 and 2 on those parts alone, 0 on the belt and
+shoulders).
+
+- **Checked:** the client's code (89.8193.37:
+  `CCharacterAppearancePanel::PostAttachmentInitialize`,
+  `HandleTattooNextButton`, `HandleBodyNextButton`) and the install's
+  pregenerated characters (`data/lcv/*.bic`); the screen not driven.
+- **Moonglow:** What the Module Uses (`mg_preview::usage`'s
+  `players_choose`).
+- **Wiki:** "Character Generation and Levelup" names Head, Tattoo, Body
+  and Clothing, not what each offers.
+
 ### A woman's inventory icons: armor's, not cloaks'
 
 The base game has a woman's inventory icon of every armor part a man's
@@ -1553,6 +2599,177 @@ icon is the man's whoever wears it.
 - **Wiki:** "cloakmodel.2da" names the icon `icloak_m_NNN` and says
   nothing of a woman's; the armor parts' `ipf_` and `ipm_` icons are not
   named in the mirror.
+
+### What the game plays as music and as sounds
+
+The game decides what a sound is from its bytes, but which names it looks
+under, and which forms it plays there, differ between music, ambient
+sounds and `PlaySound`. Every row below is firm: a working track or sound
+played after it in the same launch. Files were in a hak; the `music` user
+folder and an area's own `MusicDay` and `MusicNight` (in place of the
+script) behaved the same where tried. "MP3" is the MP3 data of a track
+of the game's, read from the install by the test; "BMU" is the 8-byte
+header `BMU V1.0`.
+
+**Music** (an `ambientmusic.2da` row; only a `.bmu` is looked for):
+
+| Played | Silent |
+| --- | --- |
+| BMU + MP3 (as shipped); bare MP3 | PCM WAVE of every kind tried (s16 stereo 44100, s16 mono 22050, u8, float32; s24 gave faint noise, never the tone) |
+| bare MP3 behind a small ID3v2 tag, a 2 MiB ID3v2 tag, 1 KiB of zeros, 1 KiB of junk starting with a false sync; the same after BMU | IMA ADPCM WAVE; BMU + PCM WAVE; PCM WAVEs with wrong sizes; RF64 |
+| MP3 in a RIFF WAVE (`fmt ` tag 0x55), also by the area's own fields and loose in `music` | anything that exists only under the name `.wav` (PCM, BMU + MP3, bare MP3): a music row never finds a `.wav` |
+
+**Ambient sound** (an `ambientsound.2da` row; `.wav`, else `.bmu`):
+
+| Played | Silent |
+| --- | --- |
+| PCM s16 WAVE; IMA ADPCM WAVE | BMU + MP3 under `.wav`, the game's own `as_an_piranha.wav` (BMU + mono MP3) by its own name included; bare MP3 under `.wav`; MP3 in a RIFF WAVE under `.wav` |
+| PCM WAVE with RIFF size 0, and with RIFF size too small (36) | a PCM WAVE whose `data` size runs 1 MB past the file's end |
+| BMU + MP3 that exists only as `.bmu` | a PCM WAVE that exists only as `.bmu` (noise in three runs, near silence in two, never its tone) |
+
+**`PlaySound`** (on the player; `.wav` only):
+
+| Played | Silent |
+| --- | --- |
+| PCM s16 mono WAVE | that sound's MP3 without the header, under `.wav` |
+| the shipped `as_an_piranha.wav` (BMU + mono MP3) by its own name, and copied under another | anything that exists only as `.bmu` |
+| | stereo files (stereo PCM and stereo MP3 both silent: stereo is the likely cause, not settled) |
+
+**Placed sound objects** (a looping `SoundList` entry of the area's GIT,
+present from the start, switched by `SoundObjectPlay` and
+`SoundObjectStop`; positional twice, area-wide once; `.wav` only):
+
+| Played | Silent |
+| --- | --- |
+| PCM s16 mono WAVE; IMA ADPCM mono WAVE | that MP3 without the header, under `.wav`; that MP3 in a RIFF WAVE (tag 0x55) under `.wav` |
+| BMU + mono MP3 under `.wav`: the shipped `as_an_piranha.wav` by its own name, and copied under another | anything that exists only as `.bmu` (PCM, BMU + MP3) |
+| a PCM s16 stereo WAVE from an area-wide object (`Positional` 0) | the same stereo WAVE from a positional object |
+| a stereo IMA ADPCM WAVE from an area-wide object, both channels heard | the same from a positional object, at the stock blueprints' distances (min 1, max 10) and at 50 and 100: flat in both channels (`MG_AUDIO_FORMS=stereo`) |
+
+**Battle music** (`MusicBattleChange` to a custom `ambientmusic.2da` row,
+then `MusicBattlePlay`: started by script; only a `.bmu` is looked for),
+exactly as music by day and night:
+
+| Played | Silent |
+| --- | --- |
+| the game's track (BMU + MP3); MP3 in a RIFF WAVE as `.bmu` | a PCM WAVE as `.bmu`; anything that exists only as `.wav` (PCM, BMU + MP3) |
+
+So a builder's "WAV renamed to `.bmu`" plays as music only if the WAVE
+holds MP3 (a RIFF WAVE whose format tag is 0x55, which some tools write);
+a WAVE of PCM does not, which is what the wiki says. The game finds an
+MP3's first frame itself: after an ID3v2 tag of any size tried, after
+zeros or junk, with or without the header. A WAVE's RIFF size is not
+believed: 0 or too small plays as an ambient sound.
+
+Two of the game's own, read the same way (`MG_AUDIO_FORMS=stock`):
+`ambientsound.2da` row 200, `al_mus_throne2` ("Music, Throne Room"), is
+silent: its file is BMU + stereo MP3 under `.wav`, and the stock row by its
+number with nothing overridden, a new row naming the game's file and its
+bytes copied under a test name were all silent in two runs each (-99.3
+dBFS, the PCM control playing before and after); every other stock
+`ambientsound.2da` row names a WAVE. And a music row whose `Resource` is
+longer than 16 characters is silent: Wyvern Crown of Cormyr's row 83,
+`mus_wc_ruralguitar` (18), with the file of that name in `data/mus`, in
+two runs, while a row naming `mus_wc_ruralg`, the same bytes, played.
+Whether the game cuts the name or refuses it is not known (the cut name,
+`mus_wc_ruralguit`, exists nowhere either). And the game's own positional
+blueprints `lavalakeloop.uts` and `sludgelake.uts` (stereo IMA ADPCM
+`al_na_lavalake1.wav` and `al_na_sludglake1.wav`), every field copied into
+a placed object (Positional 1, Looping 1, Volume 127, MinDistance 1,
+MaxDistance 10), are silent as shipped and play made area-wide (-27.4 and
+-35.4 dBFS; `MG_AUDIO_FORMS=stereo`).
+
+So `PlaySound` and placed sound objects agree on what they tried: a
+`.wav` holding a WAVE, or MP3 behind the `BMU V1.0` header (nwn.wiki says
+the same of MP3 under `.wav`); a positional object plays no stereo WAVE.
+
+Not determined: stereo MP3 by `PlaySound` or from a placed sound (the
+game ships no stereo BMU + MP3 `.wav` to use as a control), stereo IMA
+ADPCM from a positional sound in an area as shipped (XP2_Chapter2's
+`q3_area_sanctum`, read only through its blueprint's fields), battle music
+in real combat, a conversation line's sound, and the Windows and macOS
+clients.
+
+- **Checked:** the game client, Linux build 26c6e573
+  (`bin/linux-x86/build.txt`, Oct 6, 2025; the engine above is 89.8193.37),
+  on the off-screen display, by `client_audio.rs`
+  (`client_audio`, by hand). `tools/nwclient/run-client.sh` has an opt-in,
+  `MG_CLIENT_AUDIO_OUT=<file under SCRATCH>`, which gives the sandboxed
+  client OpenAL Soft's `wave` backend (still no audio device), so all the
+  client plays is written to a WAV file. The test's module steps through
+  the forms by script (music and ambient rows added in a hak, `PlaySound`
+  on the player; placed sound objects and battle music with
+  `MG_AUDIO_FORMS=placed,battle`, the area-wide object with
+  `MG_AUDIO_AREAWIDE=1`); each authored WAVE is a tone of its own frequency, found
+  with a Goertzel filter, and the MP3 forms are judged by level against a
+  silent control (silence -99.3 dBFS; the game's track -36.6; the ambient
+  tone -17.1). The test asserts the controls, PCM as music silent, bare,
+  in-WAVE and ID3-tagged MP3 as music played, and PCM and IMA ADPCM as
+  ambient played; the rest it prints as observations.
+- **Moonglow:** `mg_audio::container` tells a sound's format from its
+  bytes and returns the range that is audio (`crates/mg-audio/src/lib.rs`,
+  so every reader has it: the area view's Music, Ambient and Sounds, the
+  Play buttons of the sound editor, conversations and sound sets, the hak
+  editor's View). An MP3's first frame is found (`find_mp3`: ID3v2 tags
+  skipped, then the first frame header that a second one confirms, looked
+  for up to a mebibyte on), behind `BMU V1.0` or not; a WAVE holding MP3 is
+  read from its `data` chunk; a WAVE's RIFF size is not believed. What it
+  still refuses says what it is (`an RF64 WAVE, which the game does not
+  play`; `a WAVE of a format Moonglow does not play (format 0x0050, MPEG
+  layer 1 or 2)`; Windows Media Audio, AAC and Ogg Vorbis named likewise).
+  Moonglow still plays the forms the game is silent on and says so in
+  the log, once per file and role (the owner's ruling of 2026-11-11): a
+  WAVE under `.bmu` as music, a music track that exists only as `.wav`, an
+  MP3 under `.wav` as an ambient sound, a WAVE under `.bmu` as an ambient
+  sound, a sound that exists only as `.bmu` (a Play button, a placed
+  sound); the hak editor's View marks a WAVE under `.bmu`. Music looks for
+  the `.bmu` first, as the game does. A WAVE cut short in its data is
+  played without a word. Verify holds an area's music and ambient rows to
+  the same rules (`sound-silent`, a warning: the `MusicDay`, `MusicNight`
+  and `MusicBattle` rows of `ambientmusic.2da`, the `AmbientSndDay` and
+  `AmbientSndNight` rows of `ambientsound.2da`, each file judged once a
+  run from its first bytes, `mg_audio::container_by_start`), and says a
+  placed sound or sound blueprint kept only as `.bmu` is missing, there
+  only as the `.bmu`; the rules are kept once, in `mg_audio::role`, for the
+  log and Verify alike, battle music and placed sounds by their own
+  readings. Verify holds placed sound objects and sound blueprints to them
+  too: MP3 under `.wav` without the header, and a stereo WAVE (its `fmt `
+  chunk's channels, `mg_audio::wave_channels`) where the object is
+  positional; the log, which doesn't know whether a sound is positional,
+  says the first only. A row's `Resource` longer than 16 characters is
+  said too (read for music; an ambient row's by the same limit on names).
+  Stereo MP3 is not judged, nor are stingers. The game's own content
+  draws findings by these readings: read in the client and right,
+  `ambientsound.2da` row 200, `al_mus_throne2.wav`, which
+  `the_game_s_own_music_and_ambient_rows_are_heard` (every row, every
+  day) holds to be the one finding, and Wyvern Crown of Cormyr's six
+  areas on its row 83, `mus_wc_ruralguitar`, known findings of
+  `shipped_modules_have_only_known_findings`; and the positional
+  blueprints `lavalakeloop.uts` and `sludgelake.uts`, of the stereo IMA
+  ADPCM `al_na_lavalake1.wav` and `al_na_sludglake1.wav`, silent as shipped
+  by the client's reading, the two findings
+  `the_game_s_own_sound_blueprints_name_only_two_sounds_it_does_not_play`
+  holds to (every one of the 301 blueprints, 876 sounds, every day), with
+  XP2_Chapter2's `q3_area_sanctum`, a positional LavaLakeLoop placed, a
+  known finding of `shipped_modules_have_only_known_findings` (its
+  blueprint's fields read; the area's own instance not loaded). No
+  blueprint of the game's names MP3 without the header. Unit tests in
+  `mg-audio`, among them `mp3_in_the_forms_the_game_plays_decodes`,
+  `mp3_inside_a_wave_decodes_from_its_data_chunk`,
+  `a_wave_with_wrong_sizes_decodes`, `finds_where_the_mp3_starts`,
+  `what_moonglow_does_not_play_is_refused_by_name` and
+  `cut_or_garbled_mp3_forms_are_answers_not_panics`; the area view's
+  `custom_music_kept_as_mp3_in_a_wave_named_bmu_plays`; the app's
+  `audio::tests::the_game_is_silent_where_the_client_was`; the install's
+  sounds still all decode and agree with ffmpeg (`audio.rs`).
+- **Wiki:** "Sounds and Music" (mirror synced 2026-09-29) says music "Must
+  be MP3" and "BMU files cannot be actual WAV encoded files": borne out, no
+  PCM WAVE plays as music, but a WAVE holding MP3 does, which it does not
+  mention. An MP3 under `.wav` needs the header: borne out for `PlaySound`,
+  but an ambient row plays no MP3 under `.wav` at all, header or not,
+  where the wiki's table lists ambient sounds as `.wav` with the header.
+  The 1.79.8193 patch notes ("The game will now read plain mp3 files (the
+  .bmu extension rename is still required...)") are borne out.
 
 ## GFF fields
 
@@ -1602,6 +2819,31 @@ JSON, packed by neverwinter.nim's `nwn_gff`), the fields are the same.
 - **Wiki:** "Placeables and the Toolset" says transforms are for "a
   usable placeable or a creature"; the engine applies them to placeables
   that aren't Useable as well, and to doors and items.
+- **Wiki:** missing.
+
+### A visual transform doesn't move a walkmesh
+
+A placeable's walkmesh (`.pwk`) and a door's (`.dwk`) block creatures
+where the object's position and Bearing put them, at their own size,
+whatever the object's visual transform: the model grows, turns, tilts
+and moves, and what it blocks stays. In the server, creatures' paths
+(each walks a lane straight across, and goes round a walkmesh on it)
+went straight over where a 4 m square scaled 3 times would be, on a
+dynamic placeable, a static one and one a script scaled
+(`SetObjectVisualTransform`), and round a 12 m square of the same size
+unscaled; over the model's spot with TranslateX 4 and round the square
+at the placeable; and round a square whose node is 6 m north, where it
+was, with X Rotation 90 (about the upright axis) and Y Rotation 90 (a
+tilt), over where a turned one would be. A walker meeting a locked door
+stops at its face; one 0.95 m inside a Scale 3 door's scaled end walks
+on. The server has every one of the transforms (`GetObjectVisualTransform`
+returns what the file or the script gave). So a placeable scaled up to
+block more needs a model with a larger walkmesh.
+
+- **Checked:** engine, `engine_placeable_walkmesh.rs`
+  (`walkmeshes_by_visual_transforms`).
+- **Moonglow:** `crates/mg-area/src/walk.rs` (`ObjectWalkmeshes::faces`:
+  the area view's Object Walkmeshes).
 - **Wiki:** missing.
 
 ### EE "x" twin part fields
@@ -1849,12 +3091,132 @@ into whole item structs at (−1, −1, −1), struct id the list index
 missing. A store gets its five pages; a sound's `Priority` is recomputed; a
 placeable without `Static` gets !`Useable`; an encounter's `CreatureList`
 is sorted by CR, then resref. Triggers and encounters stand at the
-outline's first point, with relative X/Y and absolute heights (ground +
-0.025 m). Everything faces north.
+outline's first point clicked, with relative X/Y and absolute heights
+(ground + 0.025 m); a trigger's points are saved in Aurora's own order
+([A trigger's outline](#a-triggers-outline-its-points-order-its-heights-and-trigger-type)).
+Everything faces north.
 
 - **Checked:** Aurora, `aurora_instances.rs` `placed_objects_match_aurora`;
   engine, `engine_blueprints.rs`.
 - **Moonglow:** `crates/mg-module/src/instances.rs`.
+- **Wiki:** missing.
+
+### A trigger's outline: its points' order, its heights and Trigger Type
+
+**Order.** Aurora saves every trigger's outline counterclockwise, whatever
+the order of the clicks: a clockwise drawing is reversed (five corners
+P1…P5 clicked clockwise are saved P1 P5 P4 P3 P2, which no rotation
+gives), and the list then starts at the point of smallest X relative to
+the trigger's position (of two alike, the one of smaller Y; one case).
+The comparison is exact: a corner clicked 1.9e-6 west of the first is
+saved first. A concave outline is kept as drawn (no hull). The trigger
+stands at the first click, so (0, 0) is among the points but not
+always the first. Generic, trap and transition triggers alike.
+
+**Heights.** Painting, Redraw Polygon and a drag with the mouse each put
+every point at the ground (walkmesh) under it + 0.025, point by point;
+painting and Redraw also set `ZPosition` 0, a drag leaves it as it was
+(so in Aurora a dragged trigger with a `ZPosition` other than 0 ends up
+off the ground by it). A paste gives the copy `ZPosition` = the ground's
+height at the paste point and keeps the copied `PointZ` (already
+absolute), leaving it as high again in the air (5 m on a tileset whose
+ground is 5 m up, in the same area or another): Aurora's bug. Changing
+the ground under a trigger that doesn't move (Raise/Lower, which
+replaces the tiles) leaves the outline where it was, buried or in the
+air. Aurora has no Adjust Location and no turning for a trigger. The
+waypoint Setup Area Transition makes takes its Z from the points'
+stored `PointZ` (their middle), not from the ground.
+
+**Trigger Type.** Generic to Area Transition changes `Type` 0 to 1 and
+`Cursor` 0 to 1; Area Transition to Generic changes `Type` alone
+(`Cursor` stays 1). Nothing else changes either way. Aurora's Trigger
+wizard's Area Transition category writes `Cursor` 0 and
+`HighlightHeight` 3.0 (`blueprint-wizards.mod`), which the client shows
+all the same.
+
+- **Checked:** Aurora, `transition-triggers/01-painted.mod`,
+  `04-base.mod`, `05-concave.mod` (eight drawings of known clicks),
+  `06-typechange.mod`, and `24` to `48` (round two, the heights;
+  2026-11-12); `aurora_trigger_order.rs` holds every trigger of `04`,
+  `05` and `23` to Moonglow's order and its points to the ground.
+- **Moonglow:** the order is `mg_module::instances::outline_order`,
+  taken by placing, the Alt rectangle and Redraw Polygon
+  (`crates/mg-ui/src/area_view.rs`, `place`, `redraw_outline`); Redraw
+  Polygon puts the trigger at height 0 as Aurora's; a trigger moved (a
+  drag, the arrows, Adjust Location, Q and E, a paste) keeps its
+  `ZPosition` and has each point put on the ground against it (`PointZ`
+  = the ground + 0.025 − `ZPosition`, `mg_area::edit::move_edits_on`,
+  `moved_on`): a pasted one lands on the ground, unlike Aurora's.
+  Trigger Type sets `Cursor` as Aurora's (`blueprint/trigger.rs`). The
+  ground changed under a trigger is left as Aurora leaves it, and
+  Verify's `transition-hidden` says of a transition so left a meter or
+  more off it that the game may hide it.
+- **Wiki:** missing.
+
+### Setup Area Transition with triggers
+
+Whatever links to a trigger links to a waypoint Aurora makes for it:
+`WP_` + the trigger's tag (case kept, the trigger's tag never changed),
+struct id 5, in the trigger's area, `Appearance` 1, facing north
+(`YOrientation` 1; `XOrientation` is 0 or a stray denormal), appended to
+the `WaypointList`. Its X and Y are the trigger's position plus the center
+of the bounding box of its points (not their mean or centroid); its Z is
+the middle of the points' `PointZ` (min + max over 2), not the ground's
+(a ground raised under the trigger afterwards leaves it stale). The link
+holds `LinkedToFlags` 2 on a waypoint and 1 on a door (the door's tag; a
+door gets no waypoint); nothing else of either object changes.
+
+| Current → target (connection) | Current writes | Target writes | Waypoints |
+|---|---|---|---|
+| trigger → trigger, Both Ways | `WP_<target>` / 2 | `WP_<current>` / 2 | both |
+| trigger → trigger, Current To Target | `WP_<target>` / 2 | nothing | target's |
+| trigger → trigger, Target To Current | nothing | `WP_<current>` / 2 | current's |
+| trigger → door, Both Ways | door's tag / 1 | `WP_<current>` / 2 | current's |
+| trigger → door, Current To Target | door's tag / 1 | nothing | none |
+| trigger → door, Target To Current | nothing | `WP_<current>` / 2 | current's |
+| door → trigger, Both Ways | `WP_<target>` / 2 | door's tag / 1 | target's |
+| door → trigger, Current To Target | `WP_<target>` / 2 | nothing | target's |
+| door → trigger, Target To Current | nothing | door's tag / 1 | none |
+| trigger → waypoint (Current To Target only) | waypoint's tag / 2 | nothing | none |
+| door → door, Both Ways | other's tag / 1 | current's tag / 1 | none |
+
+**The dialog** lists, for Trigger, every trigger of `Type` 1 of the target
+area, linked or not, under its tag (two alike appear twice), without the
+current one; a generic or trap trigger is not listed. Doors and
+waypoints list all of the area's. Choosing Waypoint grays out Both Ways
+and Target To Current. The Area Transition tab shows only while Trigger
+Type is Area Transition. The current object's fields are written by its
+Properties' OK, the target's and the waypoints' by the dialog's OK.
+
+**Prompts**, in order: (1) the CURRENT object's tag is still its
+blueprint's; (2) the same for the TARGET's; (3) "This action requires
+that the current area be saved" (saves it to `temp0`); (4) the object
+"already links to" another, the original link to be overwritten. No on
+any returns to the dialog with nothing written, except No on the fourth,
+which closes it back to Properties. Aurora never retags.
+
+**Aurora's defects**, not copied: every run makes another `WP_<tag>`
+(three `WP_TT_A1` after three runs) and never reuses or removes one, nor
+the old partner's; Target To Current marks the target's area unchanged,
+so the target's link reaches the file only when that area is saved later
+for another reason (saving the current one does not flush it); Properties'
+Cancel after the dialog's OK leaves a half link (the target and the
+waypoints written, the current unlinked); a pasted trigger is left in
+the air ([above](#a-triggers-outline-its-points-order-its-heights-and-trigger-type)).
+
+- **Checked:** Aurora, 48 captures in
+  `~/.local/share/moonglow-oracle/captures/transition-triggers/`
+  (2026-11-12; a module of three areas painted in Aurora; its palette
+  places no door on the off-screen display, so the four doors were
+  written by `tools/aurora/capture_transition_triggers.py` and linked in
+  Aurora; every row above measured, the doors' one-way rows in captures 44
+  to 48); `aurora_transitions.rs` holds Moonglow's links to the captures
+  field by field (eleven steps).
+- **Moonglow:** `crates/mg-edit/src/transition.rs` (`plan`,
+  `waypoint_position`), one undoable step. It reuses a waypoint of that
+  tag already inside the trigger's box, writes Target To Current's other
+  end, writes everything on the window's OK and shows lines in place of
+  the prompts ([Differences from Aurora](manual/12-differences.md)).
 - **Wiki:** missing.
 
 ### Update Instances
@@ -1970,10 +3332,14 @@ same name; Delete takes out the entry alone.
   captures `palettes/`, made by `tools/aurora/capture_palettes.py`);
   game data, `palettes.rs` `custom_palettes_rebuild_like_aurora`.
 - **Moonglow:** `crates/mg-module/src/palette.rs` (`rebuild_custom_palette`
-  for Build, `update_custom_palette` for a save), `new.rs`. A save does not
-  sort or drop fields, and a new entry for a talk-table name is its
-  `STRREF` (as Aurora's Build writes it), so that a palette changes only
-  where the builder changed something.
+  for Build, `update_custom_palette` for a save), `new.rs`. A save puts
+  in order (by name, stably) only the categories an entry went into and
+  drops no fields, and a new entry for a talk-table name is its `STRREF`
+  (as Aurora's Build writes it), so that a palette changes only where
+  the builder changed something; every creature entry gets its
+  blueprint's `CR` and `FACTION`, as Aurora's Save As gives them
+  (`aurora_palettes.rs`
+  `a_save_gives_creature_entries_their_blueprint_s_cr_and_faction`).
 - **Wiki:** "Toolset Palette ITP" says the toolset makes the `palcus.itp`
   from the module's blueprints at every save; Aurora 89.8193.37 doesn't.
 
@@ -2101,6 +3467,30 @@ gains `Mod_UUID`; `nss`, `ndb` and `gic` are left out.
 - **Moonglow:** `crates/mg-module/src/nwsync.rs`, `crates/mg-erf`.
 - **Wiki:** "NWSync technical guide" shows only the folders.
 
+### A module reloaded when empty is advertised without NWSync
+
+A server given its NWSync repository on the command line (`-nwsyncurl`,
+`-nwsynchash`) reloads its module when its last player leaves
+(`server.reload-when-empty`, Server Options' "Reload Module When Empty",
+on by default) and from then on advertises it without the manifest
+(`CServerExoAppInternal::PlayerListChange` loads it again with an empty
+`NWSync::Advertisement`): the client is told less of the server (61
+bytes where it was 125), and one whose haks came by NWSync leaves at
+once. A player who downloads leaves the server for it, so on a server
+with nobody else on it, the downloader's second join finds no manifest.
+With `reload-when-empty = false` it joins and plays. A client started
+with `+connect` ends itself (exit 0) whenever it goes back to the main
+menu (`CAutoConnectPanel::Bail`): after a download, and after such a
+refused join. With the feminine talk table published and downloaded,
+the client's own lookups for a woman still read the masculine one.
+
+- **Checked:** game client and server, `joined.rs`'s
+  `joined_nwsync_download` (2026-11-02, the client's network log on),
+  and their code (89.8193.37).
+- **Moonglow:** `mg_testkit::joined` keeps the module loaded; the
+  manual's Publish to NWSync says to.
+- **Wiki:** missing.
+
 ### Talk tables as `nwn_tlk`'s JSON (nasher's)
 
 `nwn_tlk` writes `{"language":N,"entries":[{"id":…,"text":…,"sound":…,"soundLen":…}]}`,
@@ -2147,6 +3537,34 @@ at `ffffffff`.
 
 - **Checked:** against the compiler's output, `script_frontend.rs`,
   `script_analysis.rs`.
+- **Wiki:** missing.
+
+### Aurora's Build compiles as the built-in compiler, but for an include's `main`
+
+Aurora 8193.37-17's Build Module (Compile › Scripts) makes the bytes of
+Moonglow's built-in compiler (neverwinter.nim 0972fc1f) for 992 compiled
+scripts of the base game's (every fourth source, a third of them with
+LF line ends), for constant expressions, unary minus, strings, floats,
+`?:`, shifts, switch, structs, vectors and loops, and for a script both
+in the module and in a hak: the module's copy, for both (the game puts
+a hak above the module). A script's line ends change no compiled byte,
+and Aurora saves the sources as they were. One way of writing differs:
+a script that includes a file with a `void main()` of its own. Aurora
+takes the include's `main` as the entry point, so an `int
+StartingConditional()` script compiles to the include's `main` alone,
+as does a script that is only the `#include`; the built-in compiler
+(since d20453e3, 2026-08) takes the script's own and passes the other
+over as an include. In the game Aurora's condition runs the include's
+`main` and fails, always: a script that returns nothing is a failed
+condition. Moonglow compiles the batch on one compiler a thread: the
+order of a batch changes no byte. By the owner's ruling (2026-11-26)
+Moonglow keeps the script's own entry point and warns of each script
+whose include's entry point Aurora compiles in its place.
+
+- **Checked:** `aurora_scripts` (captures `script-compile-scale/`, made
+  by `tools/aurora/capture_compile_scale.py` and
+  `tools/aurora/build_in_aurora.sh`), `engine_include_entry`.
+- **Moonglow:** `crates/mg-script/nwscript/` (README), `crates/mg-module/src/build.rs`.
 - **Wiki:** missing.
 
 ### Binary models from the game's own compiler

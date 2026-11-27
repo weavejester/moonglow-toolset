@@ -2,10 +2,14 @@
 //! here, so that they are linked once and their tests run side by side. A
 //! new test file is named here (`every_test_file_is_in_the_group` says so).
 
+#[path = "../added_haks.rs"]
+mod added_haks;
 #[path = "../areas.rs"]
 mod areas;
 #[path = "../attach.rs"]
 mod attach;
+#[path = "../bake_walkmesh.rs"]
+mod bake_walkmesh;
 #[path = "../claims.rs"]
 mod claims;
 #[path = "../compile.rs"]
@@ -22,10 +26,16 @@ mod encoding;
 mod export_files;
 #[path = "../haks.rs"]
 mod haks;
+#[path = "../import_files.rs"]
+mod import_files;
 #[path = "../json.rs"]
 mod json;
+#[path = "../ls.rs"]
+mod ls;
 #[path = "../lsp.rs"]
 mod lsp;
+#[path = "../merge_claims.rs"]
+mod merge_claims;
 #[path = "../merge_gff.rs"]
 mod merge_gff;
 #[path = "../minimap.rs"]
@@ -38,6 +48,8 @@ mod nasher;
 mod nui;
 #[path = "../nwsync_upload.rs"]
 mod nwsync_upload;
+#[path = "../palette_groups.rs"]
+mod palette_groups;
 #[path = "../places.rs"]
 mod places;
 #[path = "../plugins.rs"]
@@ -52,14 +64,22 @@ mod row_names;
 mod search;
 #[path = "../serve.rs"]
 mod serve;
+#[path = "../sounds.rs"]
+mod sounds;
 #[path = "../test_cmd.rs"]
 mod test_cmd;
+#[path = "../texture.rs"]
+mod texture;
+#[path = "../timing.rs"]
+mod timing;
 #[path = "../tlk_alloc.rs"]
 mod tlk_alloc;
 #[path = "../tlk_io.rs"]
 mod tlk_io;
 #[path = "../twoda_check.rs"]
 mod twoda_check;
+#[path = "../twoda_set.rs"]
+mod twoda_set;
 #[path = "../update_instances.rs"]
 mod update_instances;
 #[path = "../vars.rs"]
@@ -68,6 +88,8 @@ mod vars;
 mod verify;
 #[path = "../watch.rs"]
 mod watch;
+#[path = "../written_whole.rs"]
+mod written_whole;
 
 /// `mg`, as every test here starts it: with Moonglow's data and cache
 /// folders (what it remembers of the scripts it compiled, the language
@@ -75,11 +97,31 @@ mod watch;
 /// on every system (`MOONGLOW_DATA_DIR`, `MOONGLOW_CACHE_DIR`: on macOS
 /// the folders otherwise follow `HOME`, which also finds the game).
 fn mg() -> std::process::Command {
-    let home = mg_testkit::output_dir("mg-home");
+    let current = std::thread::current();
+    let name: String = current
+        .name()
+        .unwrap_or("main")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let home = mg_testkit::output_dir("mg-home").join(format!("{}-{name}", std::process::id()));
     let mut mg = std::process::Command::new(env!("CARGO_BIN_EXE_ms"));
     mg.env("MOONGLOW_DATA_DIR", home.join("data/moonglow"))
         .env("MOONGLOW_CACHE_DIR", home.join("cache/moonglow"));
     mg
+}
+
+/// `GameData` for `root` without user overrides, sharing the base KEY/BIF
+/// archives and `dialog.tlk` across tests in this binary.
+pub(crate) fn shared_game(root: &std::path::Path) -> mg_rules::GameData {
+    static TLK: mg_testkit::Shared<(std::path::PathBuf, String), std::sync::Arc<mg_tlk::Tlk>> =
+        mg_testkit::Shared::new();
+    let install = mg_resman::GameInstall::new(root, None, "en");
+    let rm = mg_testkit::shared_resman(&install).unwrap();
+    let key = (install.root.clone(), install.language.clone());
+    let tlk =
+        TLK.get(&key, || std::sync::Arc::new(mg_rules::GameData::open_tlk(&install).unwrap()));
+    mg_rules::GameData::with_shared_tlk(rm, tlk)
 }
 
 /// [`mg`] on the game installed at `root`, with `user` as the game's

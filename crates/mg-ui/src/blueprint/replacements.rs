@@ -9,6 +9,7 @@
 //! The lists are written as the game writes them: an entry edited in
 //! place, a new one at the end (struct 0, the old name, then the new).
 
+use mg_uikit::Controls as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,19 +72,42 @@ impl Pairs {
     /// `old` replaced by `new`: its entry (`entry`) given the new name,
     /// else a new entry at the end.
     fn replace(&self, f: &mut Form<'_>, entry: Option<usize>, old: &str, new: ResRef) {
-        let Ok(old_ref) = ResRef::from_str(old) else { return };
-        let mut items = self.items(f);
-        match entry.filter(|&i| i < items.len()) {
+        if let Some(items) = self.replaced(self.items(f), entry, old, new) {
+            self.set(f, items);
+        }
+    }
+
+    /// `items` with `old` replaced by `new` ([`replace`](Self::replace));
+    /// `None` where nothing changes. `entry` is where `old`'s entry was
+    /// when the pick was begun (Select Texture's window doesn't block):
+    /// where another's is there by now (one before it reset behind the
+    /// window), `old`'s is found by its name, and where it is gone a new
+    /// one is made.
+    fn replaced(
+        &self,
+        mut items: Vec<Struct>,
+        entry: Option<usize>,
+        old: &str,
+        new: ResRef,
+    ) -> Option<Vec<Struct>> {
+        let old_ref = ResRef::from_str(old).ok()?;
+        let of_old = |s: &Struct| same(&resref_text(s, self.old), old);
+        let at = match entry {
+            Some(i) if items.get(i).is_some_and(of_old) => Some(i),
+            Some(_) => items.iter().position(of_old),
+            None => None,
+        };
+        match at {
             Some(i) => {
                 if resref_text(&items[i], self.new) == new.to_string() {
-                    return;
+                    return None;
                 }
                 items[i].set(self.new, Value::resref(new));
             }
-            None if new.is_empty() => return,
+            None if new.is_empty() => return None,
             None => items.push(self.entry(old_ref, new)),
         }
-        self.set(f, items);
+        Some(items)
     }
 }
 
@@ -92,12 +116,12 @@ impl Pairs {
 const CHEST_SLOT: u32 = 0x2;
 
 /// Why a PLT texture has no replacement to pick.
-const PLT_WHY: &str = "A PLT texture: the game draws it in the object's colors and doesn't \
-    replace it (ReplaceObjectTexture draws with simple textures, DDS or TGA, not PLTs)";
+const PLT_WHY: &str = "A PLT, drawn in the object's colors. The replacement draws its texture as \
+                       it is.";
 
 /// Why a texture with a name longer than a resref has no replacement.
-const TOO_LONG: &str = "The model names it by more than 16 characters: a replacement names \
-    the texture by a resref, of at most 16, so it can't name this one";
+const TOO_LONG: &str = "The model names it with more than 16 characters, which a replacement can't \
+                        name";
 
 /// Said of an entry whose texture or animation the object's models don't have.
 const NOT_IN_THE_MODEL: &str = "not in the model";
@@ -129,17 +153,13 @@ struct Offered {
 }
 
 /// The textures and animations of the object's models, read again only
-/// when the module or the game data changes (reading a creature's part
-/// models each frame would show in its frame time). A creature is its own
-/// body: its appearance's model, or, for a body of parts, the parts its
-/// armor or its own fields name (whose textures are PLTs), its head, wings
-/// and tail; not its weapons, helmet or cloak, which are items' models.
-fn offered(f: &Form<'_>, ui: &Ui) -> Offered {
+/// when the model/appearance fields or load order change (not on unrelated edits).
+fn offered(f: &mut Form<'_>, ui: &Ui) -> Offered {
     let Some(game) = f.app.game.clone() else { return Offered::default() };
     let id = f.id("replacements-offered");
-    let stamp: Stamp = (f.app.ws.as_ref().map(|w| w.revision()), Arc::as_ptr(&game) as usize);
-    if let Some((was, o)) = ui.data(|d| d.get_temp::<(Stamp, Offered)>(id))
-        && was == stamp
+    let sig = model_sig(f);
+    if let Some((was, o)) = ui.data(|d| d.get_temp::<(u64, Offered)>(id))
+        && was == sig
     {
         return o;
     }
@@ -152,10 +172,24 @@ fn offered(f: &Form<'_>, ui: &Ui) -> Offered {
             if let Some(Value::List(slots)) = body.get_mut("Equip_ItemList") {
                 slots.retain(|s| s.id == CHEST_SLOT);
             }
+            let ws_armor: Vec<(ResRef, mg_gff::Gff)> = body
+                .list("Equip_ItemList")
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.resref("EquippedRes"))
+                .filter(|r| !r.is_empty())
+                .filter_map(|r| {
+                    let key = mg_resman::ResKey::new(r, ResType::UTI);
+                    let doc = f.app.ws.as_mut()?.doc(&key).ok()?;
+                    Some((r, doc.clone()))
+                })
+                .collect();
             let armor = |r: ResRef| -> Option<mg_gff::Gff> {
+                if let Some((_, doc)) = ws_armor.iter().find(|(cr, _)| *cr == r) {
+                    return Some(doc.clone());
+                }
                 let key = mg_resman::ResKey::new(r, ResType::UTI);
-                let module = f.app.ws.as_ref().and_then(|w| w.module.get(&key).map(<[u8]>::to_vec));
-                let data = module.or_else(|| game.resman.get(&key).ok().map(|d| d.into_owned()))?;
+                let data = game.resman.get(&key).ok()?;
                 mg_gff::Gff::read(&data).ok()
             };
             mg_preview::creature(&game, &body, &armor)
@@ -171,12 +205,48 @@ fn offered(f: &Form<'_>, ui: &Ui) -> Offered {
         },
         Err(e) => Offered { problem: Some(e.to_string()), ..Default::default() },
     };
-    ui.data_mut(|d| d.insert_temp(id, (stamp, o.clone())));
+    ui.data_mut(|d| d.insert_temp(id, (sig, o.clone())));
     o
 }
 
-/// What [`offered`] was read for: the module's revision and the game data.
-type Stamp = (Option<u64>, usize);
+fn model_sig(f: &mut Form<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    f.app.load_order.hash(&mut h);
+    f.restype().0.hash(&mut h);
+    match f.restype() {
+        ResType::UTP | ResType::UTD => {
+            f.root.integer("Appearance").hash(&mut h);
+            f.root.integer("GenericType_New").hash(&mut h);
+            f.root.integer("GenericType").hash(&mut h);
+        }
+        ResType::UTI => {
+            format!("{:?}", mg_preview::ItemLook::from_uti(&f.root)).hash(&mut h);
+        }
+        ResType::UTC => {
+            format!("{:?}", mg_preview::DressedLook::from_utc(&f.root, &|_| None)).hash(&mut h);
+            let chest =
+                f.root.list("Equip_ItemList").and_then(|l| l.iter().find(|s| s.id == CHEST_SLOT));
+            if let Some(slot) = chest
+                && slot.integer("BaseItem").is_none()
+                && let Some(r) = slot.resref("EquippedRes").filter(|r| !r.is_empty())
+            {
+                r.hash(&mut h);
+                let key = mg_resman::ResKey::new(r, ResType::UTI);
+                if let Some(ws) = f.app.ws.as_mut()
+                    && let Ok(doc) = ws.doc(&key)
+                {
+                    true.hash(&mut h);
+                    format!("{:?}", mg_preview::ItemLook::from_uti(&doc.root)).hash(&mut h);
+                } else {
+                    false.hash(&mut h);
+                }
+            }
+        }
+        _ => {}
+    }
+    h.finish()
+}
 
 /// A row of the texture table: a texture of the models, or an entry whose
 /// texture they don't have.
@@ -235,104 +305,118 @@ pub(super) fn textures(f: &mut Form<'_>, ui: &mut Ui) {
     let mut changed: Option<Vec<Struct>> = None;
     let mut pick: Option<(Option<usize>, String, String)> = None;
     let mut set_new: Option<(Option<usize>, String, ResRef)> = None;
-    egui::Grid::new(f.id(p.field)).num_columns(5).spacing([10.0, 4.0]).show(ui, |ui| {
-        if !rows.is_empty() {
-            ui.label("");
-            crate::widgets::field_label(ui, p.titles.0);
-            ui.label("");
-            crate::widgets::field_label(ui, p.titles.1);
-            ui.end_row();
-        }
-        for row in &rows {
-            let plt = row.of_model.filter(|t| t.plt).map(|t| t.colors.unwrap_or_default());
-            small_picture(f, ui, &row.name, plt, ROW_PICTURE);
-            // (A name the replacement's field can't hold: said, not offered.)
-            let long = row.name.len() > ResRef::MAX_LEN;
-            ui.horizontal(|ui| {
-                let name = ui.label(&row.name);
-                if let Some(t) = row.of_model {
-                    name.on_hover_text(format!("On {}", t.models.join(", ")));
+    // (In a narrow room, the Properties panel's, or a column of pages side
+    // by side (M4's U10): each texture on a line, what draws it on the line
+    // under.)
+    let narrow = super::narrow(ui) || ui.available_width() < TEXTURE_ROW;
+    mg_uikit::with_table_rows(ui, |ui| {
+        egui::Grid::new(f.id(p.field).with(narrow))
+            .num_columns(if narrow { 2 } else { 5 })
+            .spacing([10.0, mg_uikit::metrics::TABLE_RULE])
+            .show(ui, |ui| {
+                if !rows.is_empty() && !narrow {
+                    ui.label("");
+                    crate::widgets::field_label(ui, p.titles.0);
+                    ui.label("");
+                    crate::widgets::field_label(ui, p.titles.1);
+                    ui.end_row();
                 }
-                if row.of_model.is_none() {
-                    ui.weak(format!("({NOT_IN_THE_MODEL})")).on_hover_text(
-                        "A replacement of a texture the object's models don't have: kept as \
-                         it is",
-                    );
-                } else if plt.is_some() {
-                    ui.weak("PLT").on_hover_text(PLT_WHY);
-                }
-                if let Some(t) = row.of_model {
-                    match &t.source {
-                        Source::Mesh => {}
-                        Source::Material(m) => {
-                            ui.weak(format!("(material {m})")).on_hover_text(format!(
-                                "A texture of the material {m}.mtr a mesh is drawn with"
-                            ));
+                for row in &rows {
+                    let plt = row.of_model.filter(|t| t.plt).map(|t| t.colors.unwrap_or_default());
+                    small_picture(f, ui, &row.name, plt, ROW_PICTURE);
+                    // (A name the replacement's field can't hold: said, not offered.)
+                    let long = row.name.len() > ResRef::MAX_LEN;
+                    super::row(ui, |ui| {
+                        let name = ui.label(&row.name);
+                        if let Some(t) = row.of_model {
+                            name.on_hover_text(format!("On {}", t.models.join(", ")));
                         }
-                        Source::Emitter => {
-                            ui.weak("(emitter)").on_hover_text("A particle emitter's texture");
+                        if row.of_model.is_none() {
+                            ui.weak(format!("({NOT_IN_THE_MODEL})")).on_hover_text(
+                            "Its models don't have this texture. The replacement is kept as it is.",
+                        );
+                        } else if plt.is_some() {
+                            ui.weak("PLT").on_hover_text(PLT_WHY);
                         }
-                        Source::Flare => {
-                            ui.weak("(flare)").on_hover_text("A light's lens flare");
+                        if let Some(t) = row.of_model {
+                            match &t.source {
+                                Source::Mesh => {}
+                                Source::Material(m) => {
+                                    ui.weak(format!("(material {m})")).on_hover_text(format!(
+                                        "A texture of the material {m}.mtr a mesh is drawn with"
+                                    ));
+                                }
+                                Source::Emitter => {
+                                    ui.weak("(emitter)")
+                                        .on_hover_text("A particle emitter's texture");
+                                }
+                                Source::Flare => {
+                                    ui.weak("(flare)").on_hover_text("A light's lens flare");
+                                }
+                                // (Not offered: `named` leaves the TXIs' maps out.)
+                                Source::Txi { .. } => {}
+                            }
                         }
-                        // (Not offered: `named` leaves the TXIs' maps out.)
-                        Source::Txi { .. } => {}
+                        if long {
+                            ui.weak("(name too long)").on_hover_text(TOO_LONG);
+                        }
+                    });
+                    if narrow {
+                        ui.end_row();
                     }
-                }
-                if long {
-                    ui.weak("(name too long)").on_hover_text(TOO_LONG);
-                }
-            });
-            let new = row.entry.map(|i| resref_text(&items[i], p.new)).unwrap_or_default();
-            if new.is_empty() {
-                ui.allocate_exact_size(egui::vec2(ROW_PICTURE, ROW_PICTURE), egui::Sense::hover());
-            } else {
-                small_picture(f, ui, &new, None, ROW_PICTURE);
-            }
-            ui.horizontal(|ui| {
-                let id = f.id(&format!("{}#{}#{:?}#new", p.field, row.name, row.entry));
-                if long {
-                    ui.add_enabled(false, egui::Button::new("Select Texture…"))
-                        .on_disabled_hover_text(TOO_LONG);
-                } else if plt.is_some() && row.entry.is_none() {
-                    ui.add_enabled(false, egui::Button::new("Select Texture…"))
-                        .on_disabled_hover_text(PLT_WHY);
-                } else {
-                    if let Some(v) = crate::widgets::commit_text_in(
-                        &mut f.app.buffers,
-                        ui,
-                        id,
-                        &new,
-                        None,
-                        140.0,
-                        Some(16),
-                    ) && let Ok(r) = ResRef::from_str(v.trim())
-                    {
-                        set_new = Some((row.entry, row.name.clone(), r));
+                    let new = row.entry.map(|i| resref_text(&items[i], p.new)).unwrap_or_default();
+                    if new.is_empty() {
+                        ui.allocate_exact_size(
+                            egui::vec2(ROW_PICTURE, ROW_PICTURE),
+                            egui::Sense::hover(),
+                        );
+                    } else {
+                        small_picture(f, ui, &new, None, ROW_PICTURE);
                     }
-                    let button =
-                        ui.add_enabled(plt.is_none(), egui::Button::new("Select Texture…"));
-                    if button
-                        .on_hover_text("Pick the texture to draw it with")
-                        .on_disabled_hover_text(PLT_WHY)
-                        .clicked()
-                    {
-                        pick = Some((row.entry, row.name.clone(), new.clone()));
-                    }
+                    super::row(ui, |ui| {
+                        let id = f.id(&format!("{}#{}#{:?}#new", p.field, row.name, row.entry));
+                        if long {
+                            ui.add_enabled(false, egui::Button::new("Select Texture…"))
+                                .on_disabled_hover_text(TOO_LONG);
+                        } else {
+                            let width = super::fit(ui, 140.0);
+                            if let Some(v) = crate::widgets::commit_resref_in(
+                                &mut f.app.buffers,
+                                ui,
+                                id,
+                                &new,
+                                width,
+                            ) && let Ok(r) = ResRef::from_str(v.trim())
+                            {
+                                set_new = Some((row.entry, row.name.clone(), r));
+                            }
+                            f.hold_command(ui, id, false, |form, buf| {
+                                if buf == new {
+                                    return None;
+                                }
+                                let r = ResRef::from_str(buf.trim()).ok()?;
+                                let all = p.replaced(items.clone(), row.entry, &row.name, r)?;
+                                Some(form.nested_list_command(p.what, p.field, p.id, p.list, all))
+                            });
+                            let button = ui.button("Select Texture…");
+                            if button.on_hover_text("Pick the texture to draw it with").clicked() {
+                                pick = Some((row.entry, row.name.clone(), new.clone()));
+                            }
+                        }
+                        if let Some(i) = row.entry {
+                            let reset = ui
+                                .small_button("Reset")
+                                .on_hover_text("Remove the replacement: the model's own texture");
+                            if reset.clicked() {
+                                let mut all = items.clone();
+                                all.remove(i);
+                                changed = Some(all);
+                            }
+                        }
+                    });
+                    ui.end_row();
                 }
-                if let Some(i) = row.entry {
-                    let reset = ui
-                        .small_button("Reset")
-                        .on_hover_text("Remove the replacement: the model's own texture");
-                    if reset.clicked() {
-                        let mut all = items.clone();
-                        all.remove(i);
-                        changed = Some(all);
-                    }
-                }
-            });
-            ui.end_row();
-        }
+            })
     });
     if let Some((entry, old, new)) = pick {
         open_gallery(f, ui, entry, old, new);
@@ -351,13 +435,12 @@ pub(super) fn textures(f: &mut Form<'_>, ui: &mut Ui) {
 /// The row to add an entry of any names, typed.
 fn add_row(f: &mut Form<'_>, ui: &mut Ui, p: &Pairs, items: &[Struct]) {
     let ids = [p.old, p.new].map(|l| f.id(&format!("{}#new#{l}", p.field)));
-    ui.horizontal(|ui| {
+    super::row(ui, |ui| {
         ui.weak("Any name:");
         for (id, hint) in ids.into_iter().zip([p.titles.0, p.titles.1]) {
-            let buf = f.app.buffers.entry(id).or_default();
-            ui.add(
-                egui::TextEdit::singleline(buf).char_limit(16).desired_width(140.0).hint_text(hint),
-            );
+            let mut text = crate::widgets::ResRefText(f.app.buffers.entry(id).or_default());
+            let width = super::fit(ui, 140.0);
+            ui.add(crate::widgets::resref_edit(&mut text).desired_width(width).hint_text(hint));
         }
         let text = |f: &Form<'_>, id| {
             f.app.buffers.get(&id).map(|s| s.trim().to_string()).unwrap_or_default()
@@ -395,10 +478,20 @@ struct TexturePick {
     interface: bool,
     /// Scrolled to the one chosen, once.
     placed: bool,
-    /// The pictures it made (their keys in the app's pictures), oldest
-    /// first: let go of when it closes, and the oldest out of sight past
-    /// [`PICTURES_KEPT`] (a scroll through every texture kept gigabytes).
-    made: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct MadePictures {
+    queue: std::collections::VecDeque<String>,
+    set: std::collections::HashSet<String>,
+}
+
+impl MadePictures {
+    fn insert(&mut self, key: String) {
+        if self.set.insert(key.clone()) {
+            self.queue.push_back(key);
+        }
+    }
 }
 
 /// How many of its pictures Select Texture keeps while open (64 KB each).
@@ -491,39 +584,90 @@ fn icon_prefixes(game: &mg_rules::GameData) -> Vec<String> {
 
 /// The textures a replacement can draw with: the game's, the haks' and the
 /// module's DDS and TGA textures, each name once. The game's are listed
-/// once for the game data (29,567 of them took 15 ms a click), the
+/// once for the load order (29,567 of them took 15 ms a click), the
 /// module's each time.
 fn texture_names(app: &crate::Moonglow, ui: &Ui) -> Arc<Textures> {
     let Some(game) = app.game.clone() else { return Arc::default() };
     let id = egui::Id::new("select-texture-names");
-    let stamp = Arc::as_ptr(&game) as usize;
-    let cached = ui.data(|d| d.get_temp::<(usize, Arc<Textures>)>(id));
-    let listed = match cached {
-        Some((was, t)) if was == stamp => t,
-        _ => {
-            let mut names: Vec<String> = Vec::new();
-            for t in [ResType::DDS, ResType::TGA] {
-                names.extend(game.resman.list(t).into_iter().map(|r| r.to_lowercase().to_string()));
-            }
-            let t = Arc::new(Textures::of(names, &icon_prefixes(&game)));
-            ui.data_mut(|d| d.insert_temp(id, (stamp, t.clone())));
-            t
-        }
-    };
-    let own: Vec<String> = app.ws.as_ref().map_or_else(Vec::new, |ws| {
-        ws.module
-            .keys()
-            .filter(|k| matches!(k.restype, ResType::DDS | ResType::TGA))
-            .map(|k| k.resref.to_lowercase().to_string())
-            .filter(|n| listed.names.binary_search(n).is_err())
-            .collect()
+    let listed = super::kept_for_load_order(ui, app.load_order, id, || {
+        // (The layers' names looked through once for both types, each
+        // ResRef sorted and made a name once: listed type by type, a
+        // world's 135,000 textures took 36 ms.)
+        let names = sorted_names(
+            (game.resman.layers().iter())
+                .flat_map(|l| l.container.keys())
+                .filter(|k| k.restype == ResType::DDS || k.restype == ResType::TGA)
+                .map(|k| k.resref),
+        );
+        Arc::new(Textures::of(names, &icon_prefixes(&game)))
     });
-    if own.is_empty() {
+    let own_sig: (usize, u64) = match &app.ws {
+        Some(ws) => {
+            use std::hash::{Hash, Hasher};
+            let mut count = 0usize;
+            let mut xor = 0u64;
+            for t in [ResType::DDS, ResType::TGA] {
+                for k in ws.module.keys_of(t) {
+                    count += 1;
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    k.hash(&mut h);
+                    xor ^= h.finish();
+                }
+            }
+            (count, xor)
+        }
+        None => (0, 0),
+    };
+    if own_sig.0 == 0 {
         return listed;
     }
-    let mut names = listed.names.clone();
-    names.extend(own);
-    Arc::new(Textures::of(names, &icon_prefixes(&game)))
+    super::kept_for_key(
+        ui.ctx(),
+        egui::Id::new("select-texture-names-merged"),
+        &(app.load_order, own_sig),
+        || {
+            let Some(ws) = &app.ws else { return listed.clone() };
+            let own: Vec<String> = ws
+                .module
+                .keys_of(ResType::DDS)
+                .chain(ws.module.keys_of(ResType::TGA))
+                .map(|k| k.resref.to_lowercase().to_string())
+                .filter(|n| listed.names.binary_search(n).is_err())
+                .collect();
+            if own.is_empty() {
+                return listed.clone();
+            }
+            let mut names = listed.names.clone();
+            names.extend(own);
+            Arc::new(Textures::of(names, &icon_prefixes(&game)))
+        },
+    )
+}
+
+/// The names of `refs`, lowercase, each once, in order of their bytes.
+/// (Each as one number, its lowercase bytes padded with zeros, big end
+/// first: sorted as the bytes are, shorter first. By ResRef's own order,
+/// which folds both names at each comparison, Select Texture's sort took
+/// 19 ms of a 27 ms opening.)
+fn sorted_names(refs: impl Iterator<Item = mg_core::ResRef>) -> Vec<String> {
+    let mut keys: Vec<u128> = refs
+        .map(|r| {
+            let mut bytes = [0; mg_core::ResRef::MAX_LEN];
+            let name = r.as_bytes();
+            bytes[..name.len()].copy_from_slice(name);
+            bytes.make_ascii_lowercase();
+            u128::from_be_bytes(bytes)
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    (keys.iter())
+        .map(|k| {
+            let bytes = k.to_be_bytes();
+            let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            mg_core::ResRef::from_bytes(&bytes[..len]).unwrap_or_default().to_string()
+        })
+        .collect()
 }
 
 fn open_gallery(f: &mut Form<'_>, ui: &Ui, entry: Option<usize>, old: String, current: String) {
@@ -545,19 +689,67 @@ fn gallery(f: &mut Form<'_>, ui: &mut Ui) -> Option<(Option<usize>, String, ResR
     let mut state: TexturePick = ui.data(|d| d.get_temp(id))?;
     let needle = mg_core::text::Needle::new(&state.filter);
     let textures = state.textures.clone();
-    let shown: Vec<&String> = (textures.names.iter().zip(&textures.interface))
-        .filter(|(n, i)| (state.interface || !**i) && needle.finds(n))
-        .map(|(n, _)| n)
-        .collect();
-    let (mut ok, mut cancel, mut wanted, mut in_sight) = (false, false, Vec::new(), Vec::new());
-    let wide = (ui.ctx().content_rect().width() * 0.8).clamp(480.0, 960.0);
+    // (The places of those shown, found once for the list, what is typed
+    // and the switch: 60,000 names were searched every frame.)
+    let shown_for = (state.filter.clone(), state.interface);
+    let shown = super::kept_for(ui.ctx(), id.with("shown"), &textures, &shown_for, || {
+        // (The names are lowercase, folded as they are when ASCII: folded
+        // again for each, 135,000 took 7 ms a letter typed.)
+        let finds = |n: &str| match n.is_ascii() {
+            true => needle.is_empty() || needle.finds_folded(n),
+            false => needle.finds(n),
+        };
+        let wanted = |i: u32| {
+            let i = i as usize;
+            (state.interface || !textures.interface[i]) && finds(&textures.names[i])
+        };
+        let len = textures.names.len();
+        if needle.is_empty() {
+            return Arc::new((0..len as u32).filter(|&i| wanted(i)).collect::<Vec<u32>>());
+        }
+        // (A key typed looks among what the filter before it found, not
+        // among every name: 6.4 ms a letter at 135,000 textures.)
+        let narrowing_id = id.with("narrowing");
+        type Kept = (Arc<Textures>, bool, crate::narrowing::Narrowing);
+        let kept = ui.data(|d| d.get_temp::<Kept>(narrowing_id));
+        let mut narrowing = match kept {
+            Some((of, interface, n))
+                if Arc::ptr_eq(&of, &textures) && interface == state.interface =>
+            {
+                n
+            }
+            _ => Default::default(),
+        };
+        let shown = narrowing.find(needle.clone(), len, wanted);
+        ui.data_mut(|d| {
+            d.insert_temp::<Kept>(narrowing_id, (textures.clone(), state.interface, narrowing))
+        });
+        shown
+    });
+    let name_at = |i: u32| &textures.names[i as usize];
+    registered(ui, id);
+    let mut wanted = Vec::new();
+    let mut new_made = Vec::new();
+    let mut in_sight_indices = 0..0;
+    // (No wider than the body's room: at the least window it ran past both
+    // its edges.)
+    let wide = (ui.ctx().content_rect().width() * 0.8)
+        .clamp(480.0, 960.0)
+        .min(crate::widgets::body_room_width(ui.ctx()));
     let tall = (ui.ctx().content_rect().height() * 0.6).clamp(300.0, 700.0);
     let side = crate::appearance_gallery::tile_side(f.app);
-    let window = crate::widgets::modal(ui.ctx(), "Select Texture").id(id.with("modal"));
-    window.show(ui.ctx(), |ui| {
+    let old = state.old.to_ascii_lowercase();
+    let window =
+        crate::widgets::modal(ui.ctx(), "Select Texture").id(id.with("modal")).close_as_cancel();
+    // (OK as the grid gives it: a double click, Enter on a picture.)
+    let mut ok_flag = false;
+    let footed = window.show_foot(ui.ctx(), |ui| {
+        let ok = &mut ok_flag;
         ui.set_width(wide);
         ui.label(format!("To draw {} with", state.old));
-        ui.horizontal(|ui| {
+        // (Wrapped in the dialog's one width: a row of its own widened
+        // the dialog at its least size past the well and the preview.)
+        ui.horizontal_wrapped(|ui| {
             let field = id.with("filter");
             crate::widgets::SearchField::new(field, &mut state.filter)
                 .hint("Find")
@@ -567,14 +759,12 @@ fn gallery(f: &mut Form<'_>, ui: &mut Ui) -> Option<(Option<usize>, String, ResR
             crate::appearance_gallery::size_slider(f.app, ui);
             let all = textures.count(state.interface);
             ui.weak(format!("{} of {all} textures", shown.len())).on_hover_text(
-                "DDS and TGA textures of the game, the haks and the module (no \
-                    PLTs: the game replaces textures with simple ones alone)",
+                "The game's, the haks' and the module's DDS and TGA textures, not PLTs",
             );
-            let interface = ui.checkbox(&mut state.interface, "Interface textures too");
+            let interface = ui.check_box(&mut state.interface, "Interface textures too");
             if interface
                 .on_hover_text(
-                    "List the interface's pictures too: icons, portraits, load screens, the \
-                     area map's tiles and the GUI's own, which no model is drawn with",
+                    "Also list icons, portraits, load screens and other interface pictures",
                 )
                 .changed()
             {
@@ -582,65 +772,98 @@ fn gallery(f: &mut Form<'_>, ui: &mut Ui) -> Option<(Option<usize>, String, ResR
                 ui.ctx().request_repaint();
             }
         });
-        ui.separator();
         let preview = 200.0;
+        // (The well takes the dialog's width beside the preview: what
+        // the dialog is, not what it was asked to be.)
+        let room = (ui.available_width() - preview - 16.0).max(120.0);
         ui.horizontal_top(|ui| {
-            let gap = 4.0;
-            let room = wide - preview - 3.0 * ui.spacing().item_spacing.x;
-            let room_inside = room - ui.spacing().scroll.bar_width - 10.0;
-            let (per_row, side) = crate::appearance_gallery::fitted(room_inside, side, gap);
-            let height = side + crate::widgets::tile_label_height(ui);
-            let layout = egui::Layout::top_down(egui::Align::Min);
-            ui.allocate_ui_with_layout(egui::vec2(room, tall), layout, |ui| {
-                ui.set_width(room);
-                let mut area = egui::ScrollArea::vertical()
-                    .id_salt(id.with("grid"))
-                    .max_height(tall)
-                    .auto_shrink([false, false]);
-                if !state.placed {
-                    state.placed = true;
-                    if let Some(at) =
-                        state.chosen.as_ref().and_then(|c| shown.iter().position(|n| *n == c))
-                    {
-                        area = area.vertical_scroll_offset(
-                            (at / per_row) as f32 * (height + ui.spacing().item_spacing.y),
-                        );
-                    }
-                }
-                area.show_rows(ui, height, shown.len().div_ceil(per_row), |ui, lines| {
-                    ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
-                    for line in lines {
-                        ui.horizontal(|ui| {
-                            for name in shown.iter().skip(line * per_row).take(per_row) {
-                                let made = picture_made(f, name);
-                                let chosen = state.chosen.as_deref() == Some(name.as_str());
-                                let (r, seen) =
-                                    crate::widgets::picture_tile(ui, side, name, chosen, made);
-                                if seen {
-                                    in_sight.push(thumb_key(name, GALLERY_THUMB));
-                                }
-                                if seen && made.is_none() {
-                                    wanted.push((*name).clone());
-                                }
-                                if r.clicked() {
-                                    state.chosen = Some((*name).clone());
-                                }
-                                if r.double_clicked() {
-                                    state.chosen = Some((*name).clone());
-                                    ok = true;
-                                }
-                            }
-                        });
-                    }
+            ui.spacing_mut().item_spacing.x = 16.0;
+            {
+                // (Where the one chosen is among those shown, found once for
+                // them and it: 60,000 names were walked every frame.)
+                // (With none chosen, the texture replaced: the grid opens
+                // at it, ringed.)
+                let at_id = id.with("at");
+                let at_name = state.chosen.clone().unwrap_or_else(|| old.clone());
+                let current = super::kept_for(ui.ctx(), at_id, &shown, &at_name, || {
+                    shown.iter().position(|&i| *name_at(i) == at_name)
                 });
-            });
+                // (Not while a menu or popup is open over it: the dialog is
+                // itself what has the keys, so not `keys_blocked`.)
+                let keys = !egui::Popup::is_any_open(ui.ctx());
+                let grid =
+                    mg_uikit::gallery::GalleryGrid::new(id.with("pictures"), shown.len(), side)
+                        // (One line of name, cut: rows the board's 10
+                        // by 14 apart, not a second line's room more.)
+                        .label(mg_uikit::gallery::label_height(false, 1, false))
+                        .cursor(current)
+                        .keys_allowed(keys)
+                        .name("Textures");
+                let pad = egui::Margin { left: 10, right: 10, top: 8, bottom: 8 };
+                let well = id.with("grid");
+                let size = egui::vec2(room, tall);
+                let shown_area = crate::widgets::picture_well(ui, well, size, pad, |ui| {
+                    let out = grid.show(ui, |ui, i, rect, tile, r, cell| {
+                        let name = name_at(shown[i]);
+                        let made = picture_made(f, name);
+                        let chosen = *name == at_name;
+                        // (Names only, in the monospace of names: the
+                        // board's shared cell.)
+                        mg_uikit::gallery::GalleryCell::new(
+                            name,
+                            crate::widgets::cell_picture(made),
+                        )
+                        .model(true)
+                        .kind(mg_uikit::Icon::Texture)
+                        .selected(chosen)
+                        .paint(ui, rect, tile, cell, r);
+                        if r.clicked() {
+                            state.chosen = Some(name.clone());
+                        }
+                        if r.double_clicked() {
+                            state.chosen = Some(name.clone());
+                            *ok = true;
+                        }
+                    });
+                    // (The keys choose as they move: a picker's; Enter on the
+                    // grid is OK.)
+                    if let Some(i) = out.moved.or(out.activated) {
+                        state.chosen = Some(name_at(shown[i]).clone());
+                    }
+                    if out.activated.is_some() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        *ok = true;
+                    }
+                    // (Those in sight and a row ahead: made, a few a frame.)
+                    in_sight_indices = out.ahead.clone();
+                    for i in out.ahead.clone() {
+                        let name = name_at(shown[i]);
+                        if picture_made(f, name).is_none() {
+                            wanted.push(name.clone());
+                        }
+                    }
+                    out
+                });
+                // (Opened at the one chosen, once, where the grid put it.)
+                if !state.placed {
+                    state.placed = match current {
+                        Some(at) => crate::widgets::open_gallery_at(
+                            ui.ctx(),
+                            &shown_area,
+                            &shown_area.inner,
+                            at,
+                        ),
+                        None => true,
+                    };
+                }
+            }
             ui.vertical(|ui| {
                 ui.set_width(preview);
-                if let Some(c) = state.chosen.clone() {
+                // (The one chosen, else the texture it replaces, with
+                // its name.)
+                let shown = state.chosen.clone().or_else(|| (!old.is_empty()).then(|| old.clone()));
+                if let Some(c) = shown {
                     let key = thumb_key(&c, PREVIEW_THUMB);
-                    if !state.made.contains(&key) {
-                        state.made.push(key);
-                    }
+                    new_made.push(key);
                     let picture =
                         f.app.loader().and_then(|mut l| l.thumbnail(ui.ctx(), &c, PREVIEW_THUMB));
                     if let Some(p) = picture {
@@ -651,16 +874,12 @@ fn gallery(f: &mut Form<'_>, ui: &mut Ui) -> Option<(Option<usize>, String, ResR
                 }
             });
         });
-        ui.horizontal(|ui| {
-            let any = state.chosen.is_some();
-            ok |= ui
-                .add_enabled(any, egui::Button::new("OK"))
-                .on_hover_text("Accept changes")
-                .clicked()
-                || (any && crate::widgets::enter(ui));
-            cancel = crate::widgets::cancel_discard(ui);
-        });
+        let any = state.chosen.is_some();
+        ((), crate::widgets::picker_footer(None, any))
     });
+    let pressed = footed.map(|f| f.pressed).unwrap_or_default();
+    let ok = ok_flag || pressed.main();
+    let cancel = pressed.cancelled();
     // The pictures in sight not made yet: as many as a few milliseconds
     // make, the rest in the frames after.
     let started = Instant::now();
@@ -671,23 +890,12 @@ fn gallery(f: &mut Form<'_>, ui: &mut Ui) -> Option<(Option<usize>, String, ResR
                 break;
             }
             l.thumbnail(ui.ctx(), name, GALLERY_THUMB);
-            state.made.push(thumb_key(name, GALLERY_THUMB));
+            new_made.push(thumb_key(name, GALLERY_THUMB));
             left -= 1;
         }
     }
     if left > 0 {
         ui.ctx().request_repaint_after(Duration::from_millis(10));
-    }
-    if state.made.len() > PICTURES_KEPT {
-        let mut over = state.made.len() - PICTURES_KEPT;
-        state.made.retain(|k| {
-            let gone = over > 0 && !in_sight.contains(k);
-            if gone {
-                f.app.pictures.remove(k);
-                over -= 1;
-            }
-            !gone
-        });
     }
     let picked = state
         .chosen
@@ -695,15 +903,91 @@ fn gallery(f: &mut Form<'_>, ui: &mut Ui) -> Option<(Option<usize>, String, ResR
         .filter(|_| ok)
         .and_then(|c| ResRef::from_str(c).ok())
         .map(|r| (state.entry, state.old.clone(), r));
+    let made_id = id.with("made");
     if ok || cancel {
-        for k in &state.made {
-            f.app.pictures.remove(k);
+        if let Some(made) = ui.data_mut(|d| d.remove_temp::<MadePictures>(made_id)) {
+            for k in &made.queue {
+                f.app.pictures.remove(k);
+            }
+        }
+        for k in new_made {
+            f.app.pictures.remove(&k);
         }
         ui.data_mut(|d| d.remove::<TexturePick>(id));
     } else {
+        if !new_made.is_empty() {
+            ui.data_mut(|d| {
+                let made = d.get_temp_mut_or_default::<MadePictures>(made_id);
+                for k in new_made {
+                    made.insert(k);
+                }
+                if made.queue.len() > PICTURES_KEPT {
+                    let in_sight: std::collections::HashSet<String> = in_sight_indices
+                        .clone()
+                        .map(|i| thumb_key(name_at(shown[i]), GALLERY_THUMB))
+                        .collect();
+                    let mut over = made.queue.len() - PICTURES_KEPT;
+                    let mut kept = std::collections::VecDeque::with_capacity(made.queue.len());
+                    while let Some(k) = made.queue.pop_front() {
+                        if over > 0 && !in_sight.contains(&k) {
+                            f.app.pictures.remove(&k);
+                            made.set.remove(&k);
+                            over -= 1;
+                        } else {
+                            kept.push_back(k);
+                        }
+                    }
+                    made.queue = kept;
+                }
+            });
+        }
         ui.data_mut(|d| d.insert_temp(id, state));
     }
     picked
+}
+
+/// The Select Texture windows open, each with the pass it was last drawn
+/// in ([`registered`], [`let_go_of_unseen`]).
+type Open = Vec<(egui::Id, u64)>;
+
+fn open_id() -> egui::Id {
+    egui::Id::new("select-texture-open")
+}
+
+/// Notes that the Select Texture window `id` is drawn in this pass.
+fn registered(ui: &Ui, id: egui::Id) {
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.data_mut(|d| {
+        let open = d.get_temp_mut_or_default::<Open>(open_id());
+        match open.iter_mut().find(|(i, _)| *i == id) {
+            Some(entry) => entry.1 = pass,
+            None => open.push((id, pass)),
+        }
+    });
+}
+
+/// After a frame: a Select Texture window that was not drawn (its page
+/// left, its Properties window closed) is closed, and the pictures it
+/// made let go of. They were let go of by its OK and Cancel alone: left
+/// behind, it kept up to [`PICTURES_KEPT`] of them for the session.
+pub(crate) fn let_go_of_unseen(app: &mut crate::Moonglow, ctx: &egui::Context) {
+    let pass = ctx.cumulative_pass_nr();
+    let gone: Vec<egui::Id> = ctx.data_mut(|d| {
+        let Some(open) = d.get_temp::<Open>(open_id()).filter(|o| !o.is_empty()) else {
+            return Vec::new();
+        };
+        let (seen, unseen): (Open, Open) = open.into_iter().partition(|(_, at)| *at >= pass);
+        d.insert_temp(open_id(), seen);
+        unseen.into_iter().map(|(id, _)| id).collect()
+    });
+    for id in gone {
+        ctx.data_mut(|d| d.remove_temp::<TexturePick>(id));
+        if let Some(made) = ctx.data_mut(|d| d.remove_temp::<MadePictures>(id.with("made"))) {
+            for k in &made.queue {
+                app.pictures.remove(k);
+            }
+        }
+    }
 }
 
 /// A gallery picture: made (`Some(None)`: there is none), or not yet.
@@ -750,58 +1034,77 @@ pub(super) fn animations(f: &mut Form<'_>, ui: &mut Ui) {
     let pending_id = f.id("AnimationReplace#pending");
     let mut pending: (Option<i64>, Option<i64>) =
         ui.data(|d| d.get_temp(pending_id)).unwrap_or_default();
-    egui::Grid::new(f.id(p.field)).num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
-        crate::widgets::field_label(ui, p.titles.0);
-        crate::widgets::field_label(ui, p.titles.1);
-        ui.end_row();
-        for (i, e) in items.iter().enumerate() {
-            for label in [p.old, p.new] {
-                let now = resref_text(e, label);
-                let id = f.id(&format!("{}#{i}#{label}", p.field));
-                let list = crate::widgets::row_choice(id, &choices, row_of(&now)).width(180.0);
-                let list = if now.is_empty() { list.unset("(the original)") } else { list };
-                if let Some(r) = list.show(ui)
-                    && let Some(r) = names.get(r as usize).and_then(|n| ResRef::from_str(n).ok())
+    // (In a narrow room: each of a pair on a line of its own.)
+    let narrow = super::narrow(ui);
+    mg_uikit::with_table_rows(ui, |ui| {
+        egui::Grid::new(f.id(p.field).with(narrow))
+            .num_columns(if narrow { 1 } else { 3 })
+            .spacing([12.0, mg_uikit::metrics::TABLE_RULE])
+            .show(ui, |ui| {
+                if !narrow {
+                    crate::widgets::field_label(ui, p.titles.0);
+                    crate::widgets::field_label(ui, p.titles.1);
+                    ui.end_row();
+                }
+                for (i, e) in items.iter().enumerate() {
+                    for label in [p.old, p.new] {
+                        if narrow && label == p.new {
+                            ui.end_row();
+                        }
+                        let now = resref_text(e, label);
+                        let id = f.id(&format!("{}#{i}#{label}", p.field));
+                        let list =
+                            crate::widgets::row_choice(id, &choices, row_of(&now)).width(180.0);
+                        let list = if now.is_empty() { list.unset("(the original)") } else { list };
+                        if let Some(r) = list.show(ui)
+                            && let Some(r) =
+                                names.get(r as usize).and_then(|n| ResRef::from_str(n).ok())
+                        {
+                            let mut all = items.clone();
+                            all[i].set(label, Value::resref(r));
+                            changed = Some(all);
+                        }
+                    }
+                    let reset = ui
+                        .small_button("Reset")
+                        .on_hover_text("Remove the replacement: the model's own animation");
+                    if reset.clicked() {
+                        let mut all = items.clone();
+                        all.remove(i);
+                        changed = Some(all);
+                    }
+                    ui.end_row();
+                }
+                // A new one, picked.
+                for (k, slot) in [&mut pending.0, &mut pending.1].into_iter().enumerate() {
+                    if narrow && k == 1 {
+                        ui.end_row();
+                    }
+                    let id = f.id(&format!("{}#pick#{k}", p.field));
+                    let unset =
+                        if k == 0 { "Choose an animation" } else { "Choose the one to play" };
+                    let list =
+                        crate::widgets::row_choice(id, &choices, *slot).width(180.0).unset(unset);
+                    if let Some(r) = list.show(ui) {
+                        *slot = Some(r);
+                    }
+                }
+                let name = |r: Option<i64>| {
+                    r.and_then(|r| names.get(r as usize)).and_then(|n| ResRef::from_str(n).ok())
+                };
+                let (old, new) = (name(pending.0), name(pending.1));
+                if ui
+                    .add_enabled(old.is_some() && new.is_some(), egui::Button::new("Add").small())
+                    .clicked()
+                    && let (Some(old), Some(new)) = (old, new)
                 {
                     let mut all = items.clone();
-                    all[i].set(label, Value::resref(r));
+                    all.push(p.entry(old, new));
                     changed = Some(all);
+                    pending = (None, None);
                 }
-            }
-            let reset = ui
-                .small_button("Reset")
-                .on_hover_text("Remove the replacement: the model's own animation");
-            if reset.clicked() {
-                let mut all = items.clone();
-                all.remove(i);
-                changed = Some(all);
-            }
-            ui.end_row();
-        }
-        // A new one, picked.
-        for (k, slot) in [&mut pending.0, &mut pending.1].into_iter().enumerate() {
-            let id = f.id(&format!("{}#pick#{k}", p.field));
-            let unset = if k == 0 { "Choose an animation" } else { "Choose the one to play" };
-            let list = crate::widgets::row_choice(id, &choices, *slot).width(180.0).unset(unset);
-            if let Some(r) = list.show(ui) {
-                *slot = Some(r);
-            }
-        }
-        let name = |r: Option<i64>| {
-            r.and_then(|r| names.get(r as usize)).and_then(|n| ResRef::from_str(n).ok())
-        };
-        let (old, new) = (name(pending.0), name(pending.1));
-        if ui
-            .add_enabled(old.is_some() && new.is_some(), egui::Button::new("Add").small())
-            .clicked()
-            && let (Some(old), Some(new)) = (old, new)
-        {
-            let mut all = items.clone();
-            all.push(p.entry(old, new));
-            changed = Some(all);
-            pending = (None, None);
-        }
-        ui.end_row();
+                ui.end_row();
+            })
     });
     ui.data_mut(|d| d.insert_temp(pending_id, pending));
     if let Some(all) = changed {
@@ -810,9 +1113,59 @@ pub(super) fn animations(f: &mut Form<'_>, ui: &mut Ui) {
     add_row(f, ui, &p, &items);
 }
 
+/// The width a texture's row takes on one line: its pictures, its name,
+/// the field, Select Texture… and Reset.
+const TEXTURE_ROW: f32 = 560.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The textures' names, sorted as numbers, are in the order ResRef's
+    /// own sort gives the lowercase names, each once, the shorter of two
+    /// alike first, a full 16 letters too.
+    #[test]
+    fn texture_names_sorted_as_numbers_are_in_the_names_order() {
+        let r = |s: &str| ResRef::from_str(s).unwrap();
+        let given = ["tno01_wall", "TNO01_Wall", "a", "ab", "a_b", "zzzzzzzzzzzzzzzz", "Ab", "a1"];
+        let mut expected: Vec<ResRef> = given.iter().map(|s| r(s).to_lowercase()).collect();
+        expected.sort();
+        expected.dedup();
+        let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        assert_eq!(sorted_names(given.iter().map(|s| r(s))), expected);
+    }
+
+    /// A pick is given to the entry of the texture it was made for, not to
+    /// whatever is at that entry's place by OK (the review's B11: with A
+    /// reset behind Select Texture, B's pick drew C).
+    #[test]
+    fn a_pick_goes_to_its_texture_s_entry_wherever_it_is_by_then() {
+        let p = Pairs::TEXTURES;
+        let r = |s: &str| ResRef::from_str(s).unwrap();
+        let (a, b, c) =
+            (p.entry(r("a"), r("a2")), p.entry(r("b"), r("b2")), p.entry(r("c"), r("c2")));
+        let news = |items: &[Struct]| -> Vec<String> {
+            items.iter().map(|s| resref_text(s, p.new)).collect()
+        };
+        // As it was: B is the second.
+        let all = vec![a.clone(), b.clone(), c.clone()];
+        let set = p.replaced(all.clone(), Some(1), "B", r("pick")).unwrap();
+        assert_eq!(news(&set), ["a2", "pick", "c2"]);
+        assert_eq!(p.replaced(all, Some(1), "b", r("b2")), None, "the same: nothing to set");
+        // A reset behind the window: B is the first now.
+        let set = p.replaced(vec![b.clone(), c.clone()], Some(1), "b", r("pick")).unwrap();
+        assert_eq!(news(&set), ["pick", "c2"]);
+        // B itself reset: a new entry, C as it was.
+        let set = p.replaced(vec![a.clone(), c.clone()], Some(1), "b", r("pick")).unwrap();
+        assert_eq!(news(&set), ["a2", "c2", "pick"]);
+        assert_eq!(resref_text(&set[2], p.old), "b");
+        // No entry yet: one is made, unless nothing is picked.
+        assert_eq!(
+            news(&p.replaced(vec![a.clone()], None, "b", r("pick")).unwrap()),
+            ["a2", "pick"]
+        );
+        assert_eq!(p.replaced(vec![a], None, "b", ResRef::EMPTY), None);
+    }
 
     #[test]
     fn the_interface_s_pictures_are_told_by_their_names() {

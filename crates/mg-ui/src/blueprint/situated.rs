@@ -8,10 +8,14 @@ use mg_core::ResType;
 use mg_gff::{FieldType, Value};
 use mg_resman::ResKey;
 use mg_rules::Choice;
+use mg_uikit::Controls as _;
 
 use super::Form;
-use crate::text::{decode, encode};
+use crate::text::decode;
 use crate::widgets::spin_number;
+use crate::{Action, Moonglow};
+use mg_edit::transition::{Connection, Current, Placed, PlanError, Refused};
+use mg_rules::ObjectKind;
 
 /// The most Aurora takes in the fields the files keep as bytes (DCs,
 /// hardness, an object's saves): measured in Aurora, whose forms' own
@@ -22,7 +26,7 @@ pub(super) const BYTE_MAX: i64 = 250;
 /// trapped): type (traps.2da, with its rogue modifiers shown), disarmable,
 /// detectable, one shot, the DCs and the trap scripts.
 pub(super) fn trap(f: &mut Form<'_>, ui: &mut Ui) {
-    let trapped = f.check(ui, "Is Trapped", "TrapFlag");
+    let trapped = f.check(ui, "Is trapped", "TrapFlag");
     ui.separator();
     let traps = f.choices("traps", Some("TrapName"), Some("Label"));
     let row = f.int("TrapType");
@@ -36,26 +40,41 @@ pub(super) fn trap(f: &mut Form<'_>, ui: &mut Ui) {
             .to_string()
     };
     ui.add_enabled_ui(trapped, |ui| {
-        egui::Grid::new(("trap", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            crate::widgets::field_label(ui, "Trap Type");
+        super::form_grid(ui, ("trap", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+            crate::widgets::field_label(ui, "Trap type");
             f.choice(ui, "Trap type", "TrapType", &traps, FieldType::Byte);
             ui.end_row();
-            crate::widgets::field_label(ui, "Detect DC Mod. when set by Rogue");
+            crate::widgets::field_label(ui, "Detect DC mod. when set by Rogue");
             ui.label(cell("DetectDCMod"));
             ui.end_row();
-            crate::widgets::field_label(ui, "Disarm DC Mod. when set by Rogue");
+            crate::widgets::field_label(ui, "Disarm DC mod. when set by Rogue");
             ui.label(cell("DisarmDCMod"));
             ui.end_row();
             crate::widgets::field_label(ui, "Set DC");
             ui.label(cell("SetDC"));
             ui.end_row();
-            crate::widgets::field_label(ui, "");
-            ui.horizontal(|ui| {
-                f.check(ui, "Disarmable", "TrapDisarmable");
-                f.check(ui, "Detectable", "TrapDetectable");
-                f.check(ui, "One Shot", "TrapOneShot");
-            });
-            ui.end_row();
+            // (One under another in a narrow room, the Properties panel's,
+            // or a column of pages side by side, M4's U10.)
+            let checks = [
+                ("Disarmable", "TrapDisarmable"),
+                ("Detectable", "TrapDetectable"),
+                ("One shot", "TrapOneShot"),
+            ];
+            if super::narrow(ui) || super::room_right(ui) < TRAP_CHECKS_ROW {
+                for (text, label) in checks {
+                    crate::widgets::field_label(ui, "");
+                    f.check(ui, text, label);
+                    ui.end_row();
+                }
+            } else {
+                crate::widgets::field_label(ui, "");
+                super::row(ui, |ui| {
+                    for (text, label) in checks {
+                        f.check(ui, text, label);
+                    }
+                });
+                ui.end_row();
+            }
             crate::widgets::field_label(ui, "Disarm DC");
             f.spin(ui, "Disarm DC", "DisarmDC", 0..=BYTE_MAX);
             ui.end_row();
@@ -74,9 +93,30 @@ pub(super) fn trap(f: &mut Form<'_>, ui: &mut Ui) {
 
 /// Event scripts: (label, field) rows.
 pub(super) fn scripts(f: &mut Form<'_>, ui: &mut Ui, events: &[(&str, &str)]) {
-    egui::Grid::new(("scripts", f.key)).num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+    let narrow = super::narrow(ui);
+    let avail = ui.available_width();
+    if narrow && avail < 210.0 {
         for (label, field) in events {
             crate::widgets::field_label(ui, *label);
+            f.script(ui, label, field);
+            ui.add_space(4.0);
+        }
+        f.script_set_buttons(ui, events);
+        return;
+    }
+    let label_cap = (avail * 0.40).clamp(80.0, 128.0);
+    let spacing = if narrow { [6.0, 4.0] } else { [12.0, 4.0] };
+    egui::Grid::new(("scripts", f.key)).num_columns(2).spacing(spacing).show(ui, |ui| {
+        for (label, field) in events {
+            if narrow {
+                ui.scope(|ui| {
+                    ui.set_max_width(label_cap);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    crate::widgets::field_label(ui, *label).on_hover_text(*label);
+                });
+            } else {
+                crate::widgets::field_label(ui, *label);
+            }
             f.script(ui, label, field);
             ui.end_row();
         }
@@ -84,21 +124,35 @@ pub(super) fn scripts(f: &mut Form<'_>, ui: &mut Ui, events: &[(&str, &str)]) {
     f.script_set_buttons(ui, events);
 }
 
+/// Cached module faction names (`repute.fac`, falling back to standard factions).
+pub(crate) fn faction_names_kept(
+    app: &mut crate::Moonglow,
+    ctx: &egui::Context,
+) -> std::sync::Arc<Vec<String>> {
+    let ws_key = app.ws.as_ref().map(|ws| (ws.identity(), ws.revision()));
+    crate::blueprint::kept_for_key(ctx, egui::Id::new("repute-faction-names"), &ws_key, || {
+        let key = ResKey::parse("repute", ResType::FAC).expect("valid");
+        let names: Vec<String> = match app.ws.as_mut().map(|ws| ws.doc(&key)) {
+            Some(Ok(g)) => g
+                .root
+                .list("FactionList")
+                .unwrap_or(&[])
+                .iter()
+                .map(|s| decode(s.string("FactionName").unwrap_or_default()))
+                .collect(),
+            _ => mg_module::factions::STANDARD.iter().map(|n| n.to_string()).collect(),
+        };
+        std::sync::Arc::new(names)
+    })
+}
+
 /// The module's factions (repute.fac), as choices by index; without one,
 /// the standard factions every module starts with.
-pub(super) fn factions(f: &mut Form<'_>) -> Vec<Choice> {
-    let key = ResKey::parse("repute", ResType::FAC).expect("valid");
-    let names: Vec<String> = match f.app.ws.as_mut().map(|ws| ws.doc(&key)) {
-        Some(Ok(g)) => g
-            .root
-            .list("FactionList")
-            .unwrap_or(&[])
-            .iter()
-            .map(|s| decode(s.string("FactionName").unwrap_or_default()))
-            .collect(),
-        _ => mg_module::factions::STANDARD.iter().map(|n| n.to_string()).collect(),
-    };
-    object_factions(names)
+pub(super) fn factions(f: &mut Form<'_>, ctx: &egui::Context) -> std::sync::Arc<Vec<Choice>> {
+    let names = faction_names_kept(f.app, ctx);
+    crate::blueprint::kept_for(ctx, egui::Id::new("object-factions"), &names, &(), || {
+        std::sync::Arc::new(object_factions(names.as_ref().clone()))
+    })
 }
 
 /// The factions an object may belong to, of the module's factions by row:
@@ -120,14 +174,13 @@ pub(crate) const PC_FACTION_SHOWN: &str = "PC (not for objects)";
 
 /// A faction field: the module's factions but the PC faction.
 pub(super) fn faction(f: &mut Form<'_>, ui: &mut Ui, what: &str, label: &str) {
-    let choices = factions(f);
+    let choices = factions(f, ui.ctx());
     f.mark_mixed(ui, label);
     let current = f.int(label);
     let mut list = crate::widgets::row_choice(f.id(label), &choices, current).width(220.0);
     if current == mg_rules::objects::PC_FACTION {
         list = list.shown(PC_FACTION_SHOWN).hover_text(
-            "Faction 0 is the players' own: the game puts a creature of it in Hostile, and \
-             creatures regard a placeable, door or trigger of it as they regard players. Pick \
+            "Faction 0 is the players' own: the game puts a creature of it in Hostile. Pick \
              another.",
         );
     }
@@ -135,6 +188,10 @@ pub(super) fn faction(f: &mut Form<'_>, ui: &mut Ui, what: &str, label: &str) {
         f.set_int(what, label, v, FieldType::Dword);
     }
 }
+
+/// The room between Select Portrait's grid and its preview (the Pickers
+/// board's 16).
+const PORTRAIT_GAP: f32 = 16.0;
 
 /// The Select Portrait window's state (Aurora's `TdlgPortrait`).
 #[derive(Debug, Clone, Default)]
@@ -147,6 +204,8 @@ struct PortraitPick {
     gender: Option<i32>,
     category: Option<i32>,
     chosen: Option<usize>,
+    /// Scrolled to the one chosen (and its grid given the keys), once.
+    placed: bool,
 }
 
 /// A portrait's image (`Loader::portrait`).
@@ -177,14 +236,23 @@ pub(super) fn portrait(f: &mut Form<'_>, ui: &mut Ui) {
         return;
     };
     let base = |row: usize| table.get(row, "BaseResRef").filter(|b| *b != "****");
-    let choices: Vec<(usize, &str)> =
-        (0..table.len()).filter_map(|row| base(row).map(|b| (row, b))).collect();
+    // (The rows with a portrait's name, as a list's choices: made once
+    // for the table, and kept. Every page with a portrait made a name for
+    // every row each frame.)
+    let list = super::kept_for(ui.ctx(), egui::Id::new("portrait-rows"), &table, &(), || {
+        let rows = (0..table.len()).filter_map(|row| Some(Choice { row, text: base(row)?.into() }));
+        std::sync::Arc::new(rows.collect::<Vec<Choice>>())
+    });
     let resref = f.root.resref("Portrait").filter(|r| !r.is_empty());
     let current = match f.root.integer("PortraitId") {
         Some(id) if id != 0xFFFF => Some(id as usize),
         _ => resref.and_then(|r| {
             let name = r.to_string();
-            choices.iter().find(|(_, b)| format!("po_{b}").eq_ignore_ascii_case(&name)).map(|c| c.0)
+            let named = |c: &&Choice| {
+                name.get(..3).is_some_and(|po| po.eq_ignore_ascii_case("po_"))
+                    && name[3..].eq_ignore_ascii_case(&c.text)
+            };
+            list.iter().find(named).map(|c| c.row)
         }),
     };
     let shown = match (current.and_then(base), resref) {
@@ -192,17 +260,15 @@ pub(super) fn portrait(f: &mut Form<'_>, ui: &mut Ui) {
         (None, Some(r)) => r.to_string(),
         (None, None) => "(none)".to_string(),
     };
-    let pick_id = egui::Id::new(("portrait-pick", f.key));
+    let pick_id = f.id("portrait-pick");
     let mut pick = None;
-    let list: Vec<Choice> =
-        choices.iter().map(|&(row, b)| Choice { row, text: b.to_string() }).collect();
     // A little room below, so the picture doesn't sit on the next row.
     ui.vertical(|ui| {
-        ui.horizontal(|ui| {
+        super::row(ui, |ui| {
             if let Some(b) = current.and_then(base) {
                 portrait_image(f, ui, &b.to_lowercase(), 'm', 32.0, egui::Sense::hover());
             }
-            let id = egui::Id::new(("portrait", f.key));
+            let id = f.id("portrait");
             let row = current.map(|r| r as i64);
             let list = crate::widgets::row_choice(id, &list, row).width(200.0).shown(shown);
             pick = list.show(ui).and_then(|r| usize::try_from(r).ok());
@@ -231,47 +297,82 @@ pub(super) fn portrait(f: &mut Form<'_>, ui: &mut Ui) {
             names("placeabletypes", "StrRef", Some("Label")),
         );
         let int = |r: usize, c: &str| table.get_int(r, c);
-        // Those with a picture (and the one chosen, whatever it has).
+        // Those with a picture:
+        // looked for once for the table, the module and the load order,
+        // not for every row each frame the window is open.
         let ws = f.app.ws.as_ref();
-        let pictured = |r: usize| {
-            state.chosen == Some(r)
-                || game.zip(base(r)).is_some_and(|(g, b)| crate::images::has_portrait(g, ws, b))
-        };
-        let rows: Vec<usize> = choices
-            .iter()
-            .map(|c| c.0)
-            .filter(|&r| {
-                let (plot, inanimate) = (int(r, "Plot") == Some(1), int(r, "InanimateType"));
-                let kind = match state.mode {
-                    0 => inanimate.is_none() && !plot,
-                    1 => inanimate.is_some(),
-                    _ => plot,
-                };
-                kind && if state.mode == 1 {
-                    state.category.is_none_or(|c| inanimate == Some(c))
-                } else {
-                    state.race.is_none_or(|x| int(r, "Race") == Some(x))
-                        && state.gender.is_none_or(|g| int(r, "Sex") == Some(g))
-                }
-            })
-            .filter(|&r| pictured(r))
-            .collect();
-        let (mut ok, mut cancel) = (false, false);
-        // Most of the screen's width, the grid as many to a row as it holds.
-        let wide = (ui.ctx().content_rect().width() * 0.8).clamp(480.0, 900.0);
-        let window = crate::widgets::modal(ui.ctx(), "Select Portrait").id(pick_id.with("modal"));
-        window.show(ui.ctx(), |ui| {
+        let read_for = (ws.map(mg_edit::Workspace::revision), f.app.load_order);
+        let with_picture =
+            super::kept_for(ui.ctx(), pick_id.with("pictured"), &table, &read_for, || {
+                let pictured = game.map(|g| crate::images::Portraits::of(g, ws));
+                let has = |c: &&Choice| pictured.as_ref().is_some_and(|p| p.has(&c.text));
+                let rows: std::collections::HashSet<usize> =
+                    list.iter().filter(has).map(|c| c.row).collect();
+                std::sync::Arc::new(rows)
+            });
+        // (The rows the choices leave, found once for them and the pictures
+        // found: every row was walked each frame. Never for the one chosen:
+        // an unpictured portrait the blueprint opened with left the list as
+        // the keys moved off it, and the cursor's place shifted under it.
+        // One not in the list shows in the preview alone, as the board's
+        // `el_f_11_`.)
+        let shown_for = (state.mode, state.race, state.gender, state.category);
+        let rows =
+            super::kept_for(ui.ctx(), pick_id.with("rows"), &with_picture, &shown_for, || {
+                let rows: Vec<usize> = list
+                    .iter()
+                    .map(|c| c.row)
+                    .filter(|&r| {
+                        let (plot, inanimate) =
+                            (int(r, "Plot") == Some(1), int(r, "InanimateType"));
+                        let kind = match state.mode {
+                            0 => inanimate.is_none() && !plot,
+                            1 => inanimate.is_some(),
+                            _ => plot,
+                        };
+                        kind && if state.mode == 1 {
+                            state.category.is_none_or(|c| inanimate == Some(c))
+                        } else {
+                            state.race.is_none_or(|x| int(r, "Race") == Some(x))
+                                && state.gender.is_none_or(|g| int(r, "Sex") == Some(g))
+                        }
+                    })
+                    .filter(|r| with_picture.contains(r))
+                    .collect();
+                std::sync::Arc::new(rows)
+            });
+        let count = rows.len();
+        // Most of the screen's width (80%, 480 to 900), the grid 55% of
+        // its height (320 to 640), the preview's column beside it.
+        // (No wider than the body's room: at the least window it ran past
+        // both its edges.)
+        let wide = (ui.ctx().content_rect().width() * 0.8)
+            .clamp(480.0, 900.0)
+            .min(crate::widgets::body_room_width(ui.ctx()));
+        let tall = (ui.ctx().content_rect().height() * 0.55).clamp(320.0, 640.0);
+        let window = crate::widgets::modal(ui.ctx(), "Select Portrait")
+            .id(pick_id.with("modal"))
+            .close_as_cancel();
+        let grid_id = pick_id.with("pictures");
+        // (OK as the grid gives it: a double click, Enter on a picture.)
+        let mut ok_flag = false;
+        let footed = window.show_foot(ui.ctx(), |ui| {
+            let ok = &mut ok_flag;
             ui.set_width(wide);
-            ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            // (Wrapped where the window is narrow, the least window's.)
+            ui.horizontal_wrapped(|ui| {
+                // (The board's gap between the choices.)
+                ui.spacing_mut().item_spacing.x = 16.0;
                 for (m, text) in [
                     (0, "Characters and Creatures"),
                     (1, "Placeable Objects and Doors"),
                     (2, "Plot Characters"),
                 ] {
-                    ui.radio_value(&mut state.mode, m, text);
+                    ui.radio_choice(&mut state.mode, m, text);
                 }
             });
-            ui.horizontal(|ui| {
+            super::row(ui, |ui| {
                 let combo =
                     |ui: &mut Ui, id: &str, value: &mut Option<i32>, list: &[Choice]| {
                         let text = value
@@ -289,63 +390,90 @@ pub(super) fn portrait(f: &mut Form<'_>, ui: &mut Ui) {
                             });
                     };
                 if state.mode == 1 {
-                    ui.label("Category:");
+                    ui.label("Category");
                     combo(ui, "category", &mut state.category, &kinds);
                 } else {
-                    ui.label("Race:");
+                    ui.label("Race");
                     combo(ui, "race", &mut state.race, &races);
-                    ui.label("Gender:");
+                    ui.label("Gender");
                     combo(ui, "gender", &mut state.gender, &genders);
                 }
             });
-            ui.separator();
             ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = PORTRAIT_GAP;
                 let preview = 140.0;
-                let width = wide - preview - 2.0 * ui.spacing().item_spacing.x;
-                let (per_row, row_height) = crate::images::portrait_grid(ui, width);
-                let height = (ui.ctx().content_rect().height() * 0.55).clamp(320.0, 640.0);
-                let grid = egui::vec2(width, height);
-                let layout = egui::Layout::top_down(egui::Align::Min);
-                ui.allocate_ui_with_layout(grid, layout, |ui| {
-                    ui.set_width(grid.x);
-                    egui::ScrollArea::vertical()
-                        .max_height(height)
-                        .auto_shrink([false, true])
-                        .id_salt(pick_id.with("grid"))
-                        .show_rows(ui, row_height, rows.len().div_ceil(per_row), |ui, range| {
-                            for line in range {
-                                ui.horizontal(|ui| {
-                                    for &r in rows.iter().skip(line * per_row).take(per_row) {
-                                        let b = base(r).unwrap_or_default().to_lowercase();
-                                        let resp = portrait_image(
-                                            f,
-                                            ui,
-                                            &b,
-                                            'm',
-                                            crate::images::PORTRAIT_THUMB,
-                                            egui::Sense::click(),
-                                        )
-                                        .on_hover_text(b.as_str());
-                                        if state.chosen == Some(r) {
-                                            ui.painter().rect_stroke(
-                                                resp.rect.expand(1.0),
-                                                2.0,
-                                                ui.visuals().selection.stroke,
-                                                egui::StrokeKind::Outside,
-                                            );
-                                        }
-                                        if resp.clicked() {
-                                            state.chosen = Some(r);
-                                        }
-                                        if resp.double_clicked() {
-                                            state.chosen = Some(r);
-                                            ok = true;
-                                        }
-                                    }
-                                });
+                let size = egui::vec2(wide - preview - PORTRAIT_GAP, tall);
+                let at = pick_id.with("at");
+                let current = super::kept_for(ui.ctx(), at, &rows, &state.chosen, || {
+                    rows.iter().position(|r| state.chosen == Some(*r))
+                });
+                // (Not while a menu or popup is open over it: the dialog
+                // is itself what has the keys.)
+                let keys = !egui::Popup::is_any_open(ui.ctx());
+                let (tile, gaps) = (crate::images::PORTRAIT_TILE, crate::images::PORTRAIT_GAPS);
+                let grid = mg_uikit::gallery::GalleryGrid::new(grid_id, rows.len(), tile.x)
+                    .justified(tile, gaps.0)
+                    .row_gap(gaps.1)
+                    .label(0.0)
+                    .cursor(current)
+                    .keys_allowed(keys)
+                    .name("Portraits");
+                let pad = egui::Margin { left: 6, right: 6, top: 4, bottom: 4 };
+                let mut loader = f.app.loader();
+                let shown =
+                    crate::widgets::picture_well(ui, grid_id.with("well"), size, pad, |ui| {
+                        let out = grid.show(ui, |ui, i, rect, tile, r, cell| {
+                            let b = base(rows[i]).unwrap_or_default().to_lowercase();
+                            let picture = match loader.as_mut() {
+                                Some(l) => l.portrait_cell(ui.ctx(), &b),
+                                None => mg_uikit::gallery::Picture::Missing,
+                            };
+                            mg_uikit::gallery::GalleryCell::new("", picture)
+                                .said(&format!("po_{b}"))
+                                .lines(0)
+                                .radius(3)
+                                .kind(mg_uikit::Icon::Creature)
+                                .selected(state.chosen == Some(rows[i]))
+                                .paint(ui, rect, tile, cell, r);
+                            let r = r.clone().on_hover_text(b.as_str());
+                            if r.double_clicked() {
+                                state.chosen = Some(rows[i]);
+                                *ok = true;
+                            } else if r.clicked() {
+                                state.chosen = Some(rows[i]);
                             }
                         });
-                });
+                        // (A row ahead of those in sight: their pictures read
+                        // before they come into sight.)
+                        if let Some(l) = loader.as_mut() {
+                            for i in out.drawn.end..out.ahead.end {
+                                let b = base(rows[i]).unwrap_or_default().to_lowercase();
+                                l.portrait_cell(ui.ctx(), &b);
+                            }
+                        }
+                        // (The keys choose as they move, a picker's; Enter on
+                        // the grid is OK.)
+                        if let Some(i) = out.moved.or(out.activated) {
+                            state.chosen = Some(rows[i]);
+                        }
+                        if out.activated.is_some() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            *ok = true;
+                        }
+                        out
+                    });
+                let _ = loader;
+                // (Opened at the one chosen, once, where the grid put it;
+                // the grid given the keys.)
+                if !state.placed {
+                    state.placed = match current {
+                        Some(at) => {
+                            crate::widgets::open_gallery_at(ui.ctx(), &shown, &shown.inner, at)
+                        }
+                        None => true,
+                    };
+                    ui.memory_mut(|m| m.request_focus(grid_id));
+                }
                 ui.vertical(|ui| {
                     ui.set_width(preview);
                     if let Some(b) = state.chosen.and_then(base) {
@@ -359,16 +487,12 @@ pub(super) fn portrait(f: &mut Form<'_>, ui: &mut Ui) {
                     }
                 });
             });
-            ui.label(format!("{} portraits", rows.len()));
-            ui.horizontal(|ui| {
-                ok |= ui
-                    .add_enabled(state.chosen.is_some(), egui::Button::new("OK"))
-                    .on_hover_text("Accept changes")
-                    .clicked()
-                    || (state.chosen.is_some() && crate::widgets::enter(ui));
-                cancel = crate::widgets::cancel_discard(ui);
-            });
+            let any = state.chosen.is_some();
+            ((), crate::widgets::picker_footer(Some(format!("{count} portraits")), any))
         });
+        let pressed = footed.map(|f| f.pressed).unwrap_or_default();
+        let ok = ok_flag || pressed.main();
+        let cancel = pressed.cancelled();
         if ok {
             pick = state.chosen;
         }
@@ -391,167 +515,591 @@ pub(super) fn portrait(f: &mut Form<'_>, ui: &mut Ui) {
     }
 }
 
-/// A door or waypoint an area transition may lead to.
+/// A door, area transition trigger or waypoint an area transition may
+/// lead to.
 #[derive(Debug, Clone, PartialEq)]
 struct Destination {
+    /// Which object it is (two of one tag are two).
+    object: Placed,
     area: mg_core::ResRef,
     tag: String,
-    /// As `LinkedToFlags`: 1 a door, 2 a waypoint.
+    /// Its name, as the module tree shows it (empty without one).
+    name: String,
+    /// As `LinkedToFlags` names it: 1 a door, 2 a waypoint or a trigger
+    /// (its waypoint).
     flags: i64,
-    /// Where it stands in its area, metres.
+    /// Where it is drawn on the map, meters: a trigger at the middle of
+    /// its box, where its waypoint goes.
     at: glam::Vec2,
 }
 
-/// Doors and waypoints with tags in the module's areas, by area.
+/// The kinds a transition leads to: each one's list on the window, its
+/// name in the map's hover text, its name in the filter.
+const LEADS_TO: [(ObjectKind, &str, &str, &str); 3] = [
+    (ObjectKind::Door, "Available Doors:", "door", "Doors"),
+    (ObjectKind::Trigger, "Available Triggers:", "trigger", "Triggers"),
+    (ObjectKind::Waypoint, "Available Waypoints:", "waypoint", "Waypoints"),
+];
+
+/// The name of a kind a transition leads to (`door`).
+fn kind_name(kind: ObjectKind) -> &'static str {
+    LEADS_TO.iter().find(|k| k.0 == kind).map_or("object", |k| k.2)
+}
+
+/// Doors, area transition triggers and waypoints with tags in the
+/// module's areas, by area.
 fn destinations(f: &mut Form<'_>) -> Vec<Destination> {
-    let Some(ws) = f.app.ws.as_mut() else { return Vec::new() };
-    let gits: Vec<_> = ws.module.keys_of(ResType::GIT).copied().collect();
-    let mut out = Vec::new();
-    for key in gits {
-        let Ok(g) = ws.doc(&key) else { continue };
-        for (list, restype, flags) in
-            [("Door List", ResType::UTD, 1), ("WaypointList", ResType::UTW, 2)]
-        {
-            for s in g.root.list(list).unwrap_or(&[]) {
+    let game = f.app.game.clone();
+    let Some(ws) = f.app.ws.as_ref() else { return Vec::new() };
+    destinations_in(ws, game.as_deref())
+}
+
+/// [`destinations`] of a workspace's module. An area the workspace has
+/// read is taken as it has it (edited, perhaps); the others are read from
+/// the module's bytes, on every core, and not kept: read through the
+/// workspace, a click parsed every area's objects on the window's thread
+/// and left them all in memory for the session (a thousand areas, in a
+/// persistent world's module). Triggers of Type 1 (area transition)
+/// alone, as Aurora's: a generic or a trap trigger leads nowhere.
+fn destinations_in(ws: &mg_edit::Workspace, game: Option<&mg_rules::GameData>) -> Vec<Destination> {
+    let of = |key: &ResKey, root: &mg_gff::Struct| -> Vec<Destination> {
+        let mut out = Vec::new();
+        for (kind, ..) in LEADS_TO {
+            for (index, s) in root.list(kind.list()).unwrap_or(&[]).iter().enumerate() {
                 let tag = decode(s.string("Tag").unwrap_or_default());
-                if !tag.is_empty() {
-                    let p = mg_module::instances::placement_of(restype, s).0.position;
-                    let at = glam::Vec2::new(p[0], p[1]);
-                    out.push(Destination { area: key.resref, tag, flags, at });
+                if tag.is_empty() || (kind == ObjectKind::Trigger && s.integer("Type") != Some(1)) {
+                    continue;
                 }
+                let at = match kind {
+                    ObjectKind::Trigger => mg_edit::transition::waypoint_position(s),
+                    _ => mg_module::instances::placement_of(kind.restype(), s).0.position,
+                };
+                let at = glam::Vec2::new(at[0], at[1]);
+                let name = crate::tree::blueprint_name(game, s).trim().to_string();
+                let flags = if kind == ObjectKind::Door { 1 } else { 2 };
+                let object = Placed::new(key.resref, kind, index);
+                out.push(Destination { object, area: key.resref, tag, name, flags, at });
             }
         }
+        out
+    };
+    let mut out = Vec::new();
+    let mut unread: Vec<(ResKey, &[u8])> = Vec::new();
+    for key in ws.module.keys_of(ResType::GIT) {
+        match (ws.loaded(key), ws.module.get(key)) {
+            (Some(g), _) => out.extend(of(key, &g.root)),
+            (None, Some(data)) => unread.push((*key, data)),
+            (None, None) => {}
+        }
     }
-    out.sort_by(|a, b| (a.area, &a.tag, a.flags).cmp(&(b.area, &b.tag, b.flags)));
+    // (Their doors', triggers' and waypoints' lists alone: a persistent
+    // world's 300 areas read whole, creatures, placeables and the items
+    // they hold, took 20 ms on every core.)
+    let lists = LEADS_TO.map(|(kind, ..)| kind.list());
+    let lists = &lists;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let each = unread.len().div_ceil(threads).max(1);
+    let of = &of;
+    let read: Vec<Vec<Destination>> = std::thread::scope(|s| {
+        let mut readers = Vec::new();
+        for some in unread.chunks(each) {
+            readers.push(s.spawn(move || {
+                let mut out = Vec::new();
+                for (key, data) in some {
+                    if let Ok(g) = mg_gff::Gff::read_lists(data, lists) {
+                        out.extend(of(key, &g.root));
+                    }
+                }
+                out
+            }));
+        }
+        readers.into_iter().map(|r| r.join().unwrap_or_default()).collect()
+    });
+    out.extend(read.into_iter().flatten());
+    out.sort_by(|a, b| (a.area, &a.tag, a.object).cmp(&(b.area, &b.tag, b.object)));
     out
 }
 
+/// A line under Setup Area Transition's lists: what OK will do, or why
+/// it can't.
+#[derive(Debug, Clone, PartialEq)]
+enum Said {
+    /// What it does.
+    Does(String),
+    /// Worth a look before OK (a tag shared, a link replaced).
+    Warns(String),
+    /// Why OK can't be pressed.
+    Refuses(String),
+}
+
+/// What OK would do for one destination and connection, worked out once
+/// for each (and again once the module changes).
+#[derive(Debug, Clone)]
+struct Worked {
+    /// What it is for: the destination, the connection and the
+    /// workspace's revision.
+    of: (Placed, Connection, u64),
+    plan: Option<mg_edit::transition::Plan>,
+    said: Vec<Said>,
+}
+
 /// The Setup Area Transition window's state (Aurora's
-/// `TdlgAreaTransition`): the doors and waypoints gathered as it opened,
-/// the area shown and its map, and the one chosen (its tag and
-/// `LinkedToFlags`).
+/// `TdlgAreaTransition`): the doors, triggers and waypoints gathered as it
+/// opened, the area shown and its map, the one chosen, the connection.
 #[derive(Debug, Clone, Default)]
 struct TransitionPick {
     open: bool,
-    destinations: Vec<Destination>,
+    /// (Shared: the state is copied out of egui's memory and back each
+    /// frame, and a persistent world's thousands were copied with it.)
+    destinations: std::sync::Arc<Vec<Destination>>,
     area: Option<mg_core::ResRef>,
     map: Option<crate::minimap::Map>,
-    chosen: Option<(String, i64)>,
+    chosen: Option<Placed>,
+    /// Which kind the map and lists show (`None`: all).
+    showing: Option<ObjectKind>,
+    connection: Connection,
+    /// The placed objects the window edits (left out of the lists: a
+    /// trigger can't lead to itself, nor one of several to one of them).
+    editing: Vec<Placed>,
+    worked: Option<Worked>,
+    /// OK asked for by a double click before what it chose was worked out.
+    confirm: bool,
+    /// Cached sorted target areas and area labels for the active dialog,
+    /// and what they were listed for: the module's revision, the destinations'
+    /// count, whether areas are shown by name (Options) and the game's names
+    /// (`Moonglow::game_names`: the names may be the talk table's lines).
+    cached_areas_for: Option<(u64, usize, bool, (u64, u64))>,
+    cached_areas: std::sync::Arc<Vec<mg_core::ResRef>>,
+    cached_area_names: std::sync::Arc<std::collections::HashMap<mg_core::ResRef, String>>,
 }
 
 /// The side of Setup Area Transition's map, points.
 const TRANSITION_MAP: f32 = 320.0;
 
-/// How near the pointer must be to a door or waypoint on the map to take
-/// it, points.
+/// How near the pointer must be to a door, trigger or waypoint on the
+/// map to take it, points.
 const MARKER_REACH: f32 = 9.0;
 
+/// The object a form sets up a transition from: the one placed object
+/// it edits, else each of its blueprints or objects.
+fn current_of(f: &Form<'_>) -> Current {
+    match Placed::of(&f.key, &f.path) {
+        Some(p) if f.also.is_empty() => Current::Placed(p),
+        _ => Current::Fields(f.targets().map(|(k, p)| (k, p.clone())).collect()),
+    }
+}
+
+/// Why a connection can't be chosen, as the window says it.
+fn refused_text(r: Refused) -> &'static str {
+    match r {
+        Refused::WaypointTarget => "A waypoint leads nowhere: Current To Target only",
+        Refused::NotOnePlaced => {
+            "A blueprint or several objects can't be led back to: Current To Target only"
+        }
+        Refused::NoCurrentTag => "This object has no tag for the target to lead back to",
+        Refused::NoTargetTag => "The target has no tag to lead to",
+        Refused::Itself => "An object can't lead to itself",
+        Refused::Missing => "That object is no longer there: pick it again",
+    }
+}
+
+/// Whether placed object `s` (of `kind`) still has its blueprint's tag:
+/// the blueprint its `TemplateResRef` names, the module's, else the
+/// game's.
+fn tag_is_blueprints(app: &mut Moonglow, kind: ObjectKind, s: &mg_gff::Struct) -> bool {
+    let Some(r) = s.resref("TemplateResRef").filter(|r| !r.is_empty()) else { return false };
+    let key = ResKey::new(r, kind.restype());
+    let tag = s.string("Tag").unwrap_or_default();
+    let of = |g: &mg_gff::Gff| g.root.string("Tag") == Some(tag);
+    if let Some(ws) = app.ws.as_mut()
+        && ws.module.contains(&key)
+    {
+        return ws.doc(&key).ok().is_some_and(of);
+    }
+    let Some(data) = app.game.as_ref().and_then(|g| g.resman.get(&key).ok()) else { return false };
+    mg_gff::Gff::read(&data).ok().is_some_and(|g| of(&g))
+}
+
+/// What OK would do from `current` to `to` by `connection`, and the
+/// window's lines of it.
+fn work_out(app: &mut Moonglow, current: &Current, to: Placed, connection: Connection) -> Worked {
+    let revision = app.ws.as_ref().map_or(0, |ws| ws.revision());
+    let of = (to, connection, revision);
+    let Some(ws) = app.ws.as_mut() else { return Worked { of, plan: None, said: Vec::new() } };
+    let plan = match mg_edit::transition::plan(ws, current, to, connection) {
+        Ok(plan) => plan,
+        Err(PlanError::Refused(r)) => {
+            return Worked { of, plan: None, said: vec![Said::Refuses(refused_text(r).into())] };
+        }
+        Err(PlanError::Edit(e)) => {
+            return Worked { of, plan: None, said: vec![Said::Refuses(e.to_string())] };
+        }
+    };
+    let object = |ws: &mut mg_edit::Workspace, p: Placed| {
+        ws.doc(&p.git()).ok().and_then(|g| p.path().get(&g.root).cloned())
+    };
+    let target = object(ws, to);
+    let here = match current {
+        Current::Placed(p) => object(ws, *p).map(|s| (p.kind, s)),
+        Current::Fields(_) => None,
+    };
+    let mut said = Vec::new();
+    let area = |app: &mut Moonglow, a| crate::tabs::area_label(app, a);
+    for (w, tag) in &plan.made {
+        let name = area(app, w.area);
+        said.push(Said::Does(format!("Makes the waypoint {} in {name}", decode(tag))));
+    }
+    for (w, tag) in &plan.reused {
+        let name = area(app, w.area);
+        said.push(Said::Does(format!("Uses the waypoint {} already in {name}", decode(tag))));
+    }
+    // A tag that names a link, still its blueprint's.
+    if connection.links_target()
+        && let Some((kind, s)) = &here
+        && tag_is_blueprints(app, *kind, s)
+    {
+        let tag = decode(s.string("Tag").unwrap_or_default());
+        said.push(Said::Warns(format!(
+            "This object's tag ({tag}) is still its blueprint's: other objects may share it"
+        )));
+    }
+    if connection.links_current()
+        && to.kind != ObjectKind::Waypoint
+        && let Some(s) = &target
+        && tag_is_blueprints(app, to.kind, s)
+    {
+        let tag = decode(s.string("Tag").unwrap_or_default());
+        said.push(Said::Warns(format!(
+            "The target's tag ({tag}) is still its blueprint's: other objects may share it"
+        )));
+    }
+    const SHOWN: usize = 3;
+    for r in plan.replaced.iter().take(SHOWN) {
+        let who = if r.tag.is_empty() { "This blueprint".to_string() } else { decode(&r.tag) };
+        said.push(Said::Warns(format!(
+            "{who} already leads to {}: OK replaces that link",
+            decode(&r.was)
+        )));
+    }
+    if plan.replaced.len() > SHOWN {
+        let more = plan.replaced.len() - SHOWN;
+        let links = if more == 1 { "link" } else { "links" };
+        said.push(Said::Warns(format!("And {more} more {links} replaced")));
+    }
+    for a in &plan.writes {
+        if let Some(why) = crate::claims::read_only(app, *a) {
+            let name = area(app, *a);
+            said.push(Said::Refuses(format!(
+                "{name} is read-only here ({why}): this connection would change it"
+            )));
+        }
+    }
+    Worked { of, plan: Some(plan), said }
+}
+
+/// A trigger's marker on the map: a diamond.
+fn diamond(painter: &egui::Painter, at: egui::Pos2, fill: egui::Color32, stroke: egui::Stroke) {
+    let r = 5.5;
+    let points = vec![
+        at + egui::vec2(0.0, -r),
+        at + egui::vec2(r, 0.0),
+        at + egui::vec2(0.0, r),
+        at + egui::vec2(-r, 0.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(points, fill, stroke));
+}
+
 /// Setup Area Transition (Aurora's `TdlgAreaTransition`): the target
-/// area, its map with its doors (squares) and waypoints (dots) to click,
-/// and their lists beside. What OK says the transition leads to, or
-/// `None`.
-fn setup_transition(f: &mut Form<'_>, ui: &mut Ui, pick_id: egui::Id) -> Option<(String, i64)> {
+/// area, its map with its doors (squares), area transition triggers
+/// (diamonds) and waypoints (dots) to click, their lists beside, and the
+/// Connection Type. OK applies the links (and the waypoints a trigger is
+/// given) as one step.
+fn setup_transition(f: &mut Form<'_>, ui: &mut Ui, pick_id: egui::Id) {
     let mut state: TransitionPick = ui.data(|d| d.get_temp(pick_id)).unwrap_or_default();
     if !state.open {
-        return None;
+        return;
     }
-    let mut areas: Vec<mg_core::ResRef> = state.destinations.iter().map(|d| d.area).collect();
-    areas.dedup();
-    let names: std::collections::HashMap<mg_core::ResRef, String> =
-        areas.iter().map(|a| (*a, crate::tabs::area_label(f.app, *a))).collect();
-    let name = |a: &Option<mg_core::ResRef>| {
+    let current = current_of(f);
+    let current_tag = f.root.string("Tag").unwrap_or_default().to_vec();
+    let ws_rev = f.app.ws.as_ref().map_or(0, |ws| ws.revision());
+    let listed_for =
+        Some((ws_rev, state.destinations.len(), f.app.settings.area_names, f.app.game_names()));
+    if state.cached_areas_for != listed_for {
+        let mut areas: Vec<mg_core::ResRef> = state.destinations.iter().map(|d| d.area).collect();
+        areas.dedup();
+        let names: std::collections::HashMap<mg_core::ResRef, String> =
+            areas.iter().map(|a| (*a, crate::tabs::area_label(f.app, *a))).collect();
+        // (By name, as the module tree lists them: a builder's report, they
+        // were by ResRef.)
+        areas.sort_by_cached_key(|a| names.get(a).map(|n| n.to_lowercase()));
+        state.cached_areas = std::sync::Arc::new(areas);
+        state.cached_area_names = std::sync::Arc::new(names);
+        state.cached_areas_for = listed_for;
+    }
+    let areas = state.cached_areas.clone();
+    let names = state.cached_area_names.clone();
+    let name = move |a: &Option<mg_core::ResRef>| {
         a.map_or_else(String::new, |a| names.get(&a).cloned().unwrap_or_else(|| a.to_string()))
     };
+    let chosen_kind = state.chosen.map(|p| p.kind);
+    // (A connection the target can't take gives way to Current To Target,
+    // as Aurora's choosing a waypoint does.)
+    let refusal =
+        |c| chosen_kind.and_then(|k| mg_edit::transition::refusal(&current, &current_tag, k, c));
+    if refusal(state.connection).is_some() {
+        state.connection = Connection::CurrentToTarget;
+    }
+    // What OK does, worked out again when the choice or the module changes.
+    let revision = f.app.ws.as_ref().map_or(0, |ws| ws.revision());
+    state.worked = match state.chosen {
+        Some(to) => match state.worked.take() {
+            Some(w) if w.of == (to, state.connection, revision) => Some(w),
+            _ => Some(work_out(f.app, &current, to, state.connection)),
+        },
+        None => None,
+    };
     let ctx = ui.ctx().clone();
-    let (mut ok, mut cancel) = (false, false);
-    let window = crate::widgets::modal(&ctx, "Setup Area Transition").id(pick_id.with("modal"));
-    window.show(&ctx, |ui| {
+    // (A double click in the frame before, on a row or the map: OK, now
+    // that what it chose is worked out.)
+    let (mut ok, mut cancel) = (std::mem::take(&mut state.confirm), false);
+    // (Sized as the builder drags its edges: the lists take what the map
+    // leaves.)
+    let window = crate::widgets::modal(&ctx, "Setup Area Transition")
+        .id(pick_id.with("modal"))
+        .resizable(true)
+        .default_size([TRANSITION_MAP + 380.0, TRANSITION_MAP + 230.0])
+        .min_size([TRANSITION_MAP + 220.0, TRANSITION_MAP + 190.0]);
+    // (OK can be pressed where the plan is worked out for the choice, and
+    // nothing in it refuses.)
+    let can =
+        state.worked.as_ref().filter(|w| Some(w.of.0) == state.chosen).is_some_and(|w| {
+            w.plan.is_some() && !w.said.iter().any(|s| matches!(s, Said::Refuses(_)))
+        });
+    let footed = window.show_foot(&ctx, |ui| {
+        // What it leads to and what OK does: under the map and the lists,
+        // which take the room above but what these lines took last frame
+        // (at least half the map's side: in a short window the body
+        // scrolls, nothing drawn over another, M4's U27 review).
+        let lines_id = pick_id.with("lines-high");
+        let lines = |ui: &mut Ui, state: &TransitionPick| {
+            ui.add_space(4.0);
+            let chosen = state.chosen.and_then(|p| state.destinations.iter().find(|d| d.object == p));
+            match chosen {
+                Some(d) => {
+                    ui.label(format!("Leads to the {} tagged {}", kind_name(d.object.kind), d.tag));
+                }
+                None => {
+                    ui.weak(
+                        "Click a door (a square), a trigger (a diamond) or a waypoint (a dot) on the \
+                         map, or in a list",
+                    );
+                }
+            }
+            let worked = state.worked.as_ref().filter(|w| Some(w.of.0) == state.chosen);
+            for said in worked.map_or(&[][..], |w| &w.said) {
+                match said {
+                    Said::Does(t) => {
+                        ui.weak(t);
+                    }
+                    Said::Warns(t) => {
+                        ui.colored_label(ui.visuals().warn_fg_color, t);
+                    }
+                    Said::Refuses(t) => {
+                        ui.colored_label(ui.visuals().error_fg_color, t);
+                    }
+                }
+            }
+        };
         if areas.is_empty() {
-            ui.weak("No doors or waypoints with tags in the module's areas");
+            ui.weak("No doors, triggers or waypoints with tags in the module's areas");
         }
+        // (The destinations beside the area where the row has the room,
+        // else under it: squeezed beside, they stood a letter a line.)
+        let beside = ui.available_width() >= 640.0;
+        let shown = |ui: &mut Ui, showing: &mut Option<ObjectKind>| {
+            // Doors, triggers, waypoints, or all, on the map and in the
+            // lists (a group named for them: the area header's and the
+            // palette's Doors are others).
+            ui.horizontal(|ui| {
+                mg_uikit::name_group(ui, "Destinations Shown");
+                ui.selectable_value(showing, None, "All");
+                for (kind, .., label) in [LEADS_TO[0], LEADS_TO[2], LEADS_TO[1]] {
+                    ui.selectable_value(showing, Some(kind), label);
+                }
+            });
+        };
         ui.horizontal(|ui| {
-            crate::widgets::field_label(ui, "Target Area");
+            crate::widgets::field_label(ui, "Target area");
             let options: Vec<Option<mg_core::ResRef>> = areas.iter().copied().map(Some).collect();
+            let width = 260.0_f32.min(ui.available_width() - ui.spacing().item_spacing.x);
             crate::widgets::dropdown(pick_id.with("area"))
                 .selected_text(name(&state.area))
-                .width(260.0)
+                .width(width)
                 .show(ui, &mut state.area, &options, name);
+            if beside {
+                ui.separator();
+                shown(ui, &mut state.showing);
+            }
         });
-        let here: Vec<Destination> =
-            state.destinations.iter().filter(|d| Some(d.area) == state.area).cloned().collect();
-        let is = |d: &Destination, chosen: &Option<(String, i64)>| {
-            chosen.as_ref().is_some_and(|(t, k)| *t == d.tag && *k == d.flags)
-        };
+        if !beside {
+            shown(ui, &mut state.showing);
+        }
+        // Aurora's Connection Type: which ends are linked (wrapped onto a
+        // second line where the window is narrow).
+        ui.horizontal_wrapped(|ui| {
+            mg_uikit::name_group(ui, "Connection Type");
+            crate::widgets::field_label(ui, "Connection type");
+            for c in Connection::ALL {
+                let why = refusal(c);
+                let r = ui
+                    .add_enabled(
+                        why.is_none(),
+                        egui::RadioButton::new(state.connection == c, c.label()),
+                    )
+                    .on_hover_text(match c {
+                        Connection::BothWays => "Each leads to the other",
+                        Connection::CurrentToTarget => {
+                            "This object leads there, the target is unchanged"
+                        }
+                        Connection::TargetToCurrent => {
+                            "The target leads here, this object is unchanged"
+                        }
+                    });
+                if let Some(why) = why {
+                    r.clone().on_disabled_hover_text(refused_text(why));
+                }
+                if r.clicked() {
+                    state.connection = c;
+                }
+            }
+        });
+        if let Current::Fields(_) = current {
+            ui.weak(refused_text(Refused::NotOnePlaced));
+        } else if current_tag.is_empty() {
+            ui.weak(refused_text(Refused::NoCurrentTag));
+        }
+        let showing = state.showing;
+        // (Found once for the area and the kind shown, while the window is
+        // open: its objects edited are left out as it opened.)
+        let here_for = (state.area, showing);
+        let here = super::kept_for(ui.ctx(), pick_id.with("here"), &state.destinations, &here_for, || {
+            let here = (state.destinations.iter().enumerate())
+                .filter(|(_, d)| {
+                    Some(d.area) == state.area
+                        && showing.is_none_or(|k| d.object.kind == k)
+                        && !state.editing.contains(&d.object)
+                })
+                .map(|(i, _)| i);
+            std::sync::Arc::new(here.collect::<Vec<usize>>())
+        });
+        let is = |d: &Destination, chosen: &Option<Placed>| *chosen == Some(d.object);
+        // (The map smaller where the window is: the lines under it keep
+        // their room.)
+        let below: f32 = ui.data(|d| d.get_temp(lines_id)).unwrap_or(40.0);
+        let side = (ui.available_height() - below - ui.spacing().item_spacing.y)
+            .clamp(TRANSITION_MAP / 2.0, TRANSITION_MAP);
         ui.horizontal_top(|ui| {
-            // The map: a click on a door or waypoint takes it.
+            // The map: a click on a door, trigger or waypoint takes it.
             let shown = state.area.and_then(|a| crate::minimap::of(f.app, &ctx, a, &mut state.map));
             if let Some(map) = shown.cloned() {
-                let (rect, r) =
-                    ui.allocate_exact_size(egui::Vec2::splat(TRANSITION_MAP), egui::Sense::click());
+                let (rect, r) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
                 r.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "The area's map")
                 });
                 // (In the middle of its square, a long area's.)
-                let placed = map.placed(rect.right_top(), TRANSITION_MAP);
+                let placed = map.placed(rect.right_top(), side);
                 let rect = placed.translate(egui::vec2(
                     (placed.width() - rect.width()) / 2.0,
                     (rect.height() - placed.height()) / 2.0,
                 ));
-                let painter = ui.painter_at(rect.expand(3.0));
+                let painter = ui.painter_at(rect.expand(6.0));
                 map.draw(&painter, rect);
                 let near = r.hover_pos().and_then(|p| {
-                    let d = |x: &Destination| map.to_map(rect, x.at).distance(p);
+                    let dist = |x: &Destination| map.to_map(rect, x.at).distance(p);
                     here.iter()
-                        .filter(|x| d(x) <= MARKER_REACH)
-                        .min_by(|a, b| d(a).total_cmp(&d(b)))
+                        .map(|&i| &state.destinations[i])
+                        .filter(|x| dist(x) <= MARKER_REACH)
+                        .min_by(|a, b| dist(a).total_cmp(&dist(b)))
                 });
-                for d in &here {
+                for &idx in here.iter() {
+                    let d = &state.destinations[idx];
                     let at = map.to_map(rect, d.at);
                     let lit = is(d, &state.chosen) || near == Some(d);
-                    let (fill, edge) = if lit {
-                        (egui::Color32::YELLOW, egui::Color32::BLACK)
-                    } else if d.flags == 1 {
-                        (egui::Color32::from_rgb(90, 160, 255), egui::Color32::BLACK)
-                    } else {
-                        (egui::Color32::from_rgb(90, 220, 120), egui::Color32::BLACK)
+                    let fill = match d.object.kind {
+                        _ if lit => egui::Color32::YELLOW,
+                        ObjectKind::Door => egui::Color32::from_rgb(90, 160, 255),
+                        ObjectKind::Trigger => egui::Color32::from_rgb(230, 140, 60),
+                        _ => egui::Color32::from_rgb(90, 220, 120),
                     };
-                    let stroke = egui::Stroke::new(1.0, edge);
-                    if d.flags == 1 {
-                        let square = egui::Rect::from_center_size(at, egui::Vec2::splat(8.0));
-                        painter.rect_filled(square, 1.0, fill);
-                        painter.rect_stroke(square, 1.0, stroke, egui::StrokeKind::Outside);
-                    } else {
-                        painter.circle_filled(at, 4.0, fill);
-                        painter.circle_stroke(at, 4.0, stroke);
+                    let stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
+                    match d.object.kind {
+                        ObjectKind::Door => {
+                            let square = egui::Rect::from_center_size(at, egui::Vec2::splat(8.0));
+                            painter.rect_filled(square, 1.0, fill);
+                            painter.rect_stroke(square, 1.0, stroke, egui::StrokeKind::Outside);
+                        }
+                        ObjectKind::Trigger => diamond(&painter, at, fill, stroke),
+                        _ => {
+                            painter.circle_filled(at, 4.0, fill);
+                            painter.circle_stroke(at, 4.0, stroke);
+                        }
                     }
                 }
                 if let Some(d) = near {
-                    let kind = if d.flags == 1 { "door" } else { "waypoint" };
-                    r.clone().on_hover_text(format!("{} ({kind})", d.tag));
+                    r.clone().on_hover_text(format!("{} ({})", d.tag, kind_name(d.object.kind)));
                 }
                 if r.clicked()
                     && let Some(d) = near
                 {
-                    state.chosen = Some((d.tag.clone(), d.flags));
+                    state.chosen = Some(d.object);
                 }
                 if r.double_clicked() && near.is_some() {
                     ok = true;
                 }
             }
-            // The lists: the area's doors, then its waypoints.
+            // The lists: the area's doors, triggers, then its waypoints.
             ui.vertical(|ui| {
                 egui::ScrollArea::vertical()
                     .id_salt(pick_id.with("lists"))
-                    .max_height(TRANSITION_MAP)
-                    .min_scrolled_width(200.0)
+                    .max_height(side)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (flags, title) in [(1, "Available Doors:"), (2, "Available Waypoints:")]
-                        {
+                        mg_uikit::list_rows(ui);
+                        for (kind, title, ..) in LEADS_TO {
+                            if showing.is_some_and(|k| k != kind) {
+                                continue;
+                            }
                             ui.strong(title);
-                            for d in here.iter().filter(|d| d.flags == flags) {
-                                let r = ui.selectable_label(is(d, &state.chosen), &d.tag);
+                            for d in here.iter().map(|&i| &state.destinations[i]).filter(|d| d.object.kind == kind) {
+                                // (Its tag, which the transition names,
+                                // and its name beside.)
+                                let mut text = egui::text::LayoutJob::default();
+                                let body = egui::TextFormat::default();
+                                text.append(
+                                    &d.tag,
+                                    0.0,
+                                    egui::TextFormat {
+                                        color: ui.visuals().text_color(),
+                                        font_id: egui::TextStyle::Body.resolve(ui.style()),
+                                        ..body.clone()
+                                    },
+                                );
+                                if !d.name.is_empty() && d.name != d.tag {
+                                    text.append(
+                                        &format!("  {}", d.name),
+                                        0.0,
+                                        egui::TextFormat {
+                                            color: ui.visuals().weak_text_color(),
+                                            font_id: egui::TextStyle::Body.resolve(ui.style()),
+                                            ..body
+                                        },
+                                    );
+                                }
+                                let r = ui
+                                    .selectable_label(is(d, &state.chosen), text)
+                                    .on_hover_text(format!("Tag {}", d.tag));
                                 if r.clicked() {
-                                    state.chosen = Some((d.tag.clone(), d.flags));
+                                    state.chosen = Some(d.object);
                                 }
                                 if r.double_clicked() {
                                     ok = true;
@@ -562,90 +1110,135 @@ fn setup_transition(f: &mut Form<'_>, ui: &mut Ui, pick_id: egui::Id) -> Option<
                     });
             });
         });
-        match &state.chosen {
-            Some((tag, flags)) => {
-                let kind = if *flags == 1 { "door" } else { "waypoint" };
-                ui.label(format!("Leads to the {kind} tagged {tag}"));
-            }
-            None => {
-                ui.weak("Click a door (a square) or a waypoint (a dot) on the map, or in a list");
-            }
-        }
-        ui.horizontal(|ui| {
-            ok |= ui
-                .add_enabled(state.chosen.is_some(), egui::Button::new("OK"))
-                .on_hover_text("Lead the transition there")
-                .clicked()
-                || (state.chosen.is_some() && crate::widgets::enter(ui));
-            cancel = crate::widgets::cancel_discard(ui);
-        });
+        let top = ui.cursor().top();
+        lines(ui, &state);
+        let high = ui.min_rect().bottom().max(ui.cursor().top()) - top;
+        ui.data_mut(|d| d.insert_temp(lines_id, high));
+        ((), crate::widgets::Foot::new().main("OK", can).tip("Set up the transition, one step to undo").cancel_discard())
     });
-    let chosen = if ok { state.chosen.clone() } else { None };
-    if ok || cancel {
+    if let Some(f) = footed {
+        ok |= f.pressed.main();
+        cancel = f.pressed.cancelled();
+    }
+    // (A double click on a row or the map: as OK, where OK can be pressed.)
+    let plan = state.worked.as_ref().filter(|w| Some(w.of.0) == state.chosen);
+    let plan = plan
+        .filter(|w| !w.said.iter().any(|s| matches!(s, Said::Refuses(_))))
+        .and_then(|w| w.plan.clone());
+    // (A double click picks first: worked out in the next frame, OK then.)
+    let ok_now = ok && plan.is_some();
+    if ok && !ok_now && state.worked.as_ref().is_none_or(|w| Some(w.of.0) != state.chosen) {
+        state.confirm = true;
+        ctx.request_repaint();
+    }
+    if let Some(plan) = plan.filter(|_| ok_now) {
+        apply_transition(f, plan);
+    }
+    if ok_now || cancel {
         state = TransitionPick::default();
     }
     ui.data_mut(|d| d.insert_temp(pick_id, state));
-    chosen
+}
+
+/// Applies a transition set up, as one step: the links, and the
+/// waypoints made announced as Create Waypoint's are (their tags weighed
+/// for Duplicate Tags, the plugins told). The Properties window's Cancel
+/// leaves it (Undo takes it back whole): set back on the current object
+/// alone, it would leave the target leading to an object that leads
+/// elsewhere.
+fn apply_transition(f: &mut Form<'_>, plan: mg_edit::transition::Plan) {
+    let made: Vec<mg_plugin::Selected> = (plan.made.iter())
+        .map(|(w, _)| mg_plugin::Selected::Object { area: w.area, kind: w.kind, index: w.index })
+        .collect();
+    let made = crate::plugin_events::Made::objects("setup-area-transition", made, false);
+    f.app.actions.push(Action::ApplyMade(plan.command, made));
+    let targets: Vec<(ResKey, mg_edit::GffPath)> =
+        f.targets().map(|(k, p)| (k, p.clone())).collect();
+    if let Some(changes) = f.app.properties_changed.get_mut(&targets[0]) {
+        changes.was.retain(|w| {
+            !matches!(w, super::Was::Field(k, p, l, _)
+                if targets.iter().any(|(tk, tp)| tk == k && tp == p)
+                    && (l == "LinkedTo" || l == "LinkedToFlags"))
+        });
+    }
 }
 
 /// The Area Transition page of doors and transition triggers: the
 /// destination's tag and type, Setup Area Transition, the loading screen.
 pub(super) fn transition(f: &mut Form<'_>, ui: &mut Ui) {
     let loadscreens = f.choices("loadscreens", Some("StrRef"), Some("Label"));
-    egui::Grid::new(("utt-transition", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        crate::widgets::field_label(ui, "Destination Tag");
+    super::form_grid(ui, ("utt-transition", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+        crate::widgets::field_label(ui, "Destination tag");
         f.text(ui, "Destination tag", "LinkedTo", 32);
         ui.end_row();
         crate::widgets::field_label(ui, "Destination is a");
         let flags = f.int("LinkedToFlags");
         f.mark_mixed(ui, "LinkedToFlags");
-        ui.horizontal(|ui| {
+        super::row(ui, |ui| {
             for (text, v) in [("Door", 1), ("Waypoint", 2), ("None", 0)] {
-                if ui.radio(flags == v, text).clicked() && flags != v {
+                if ui.radio_button(flags == v, text).clicked() && flags != v {
                     f.set_int("Destination type", "LinkedToFlags", v, FieldType::Byte);
                 }
             }
         });
         ui.end_row();
         crate::widgets::field_label(ui, "");
-        // Aurora's Setup Area Transition: a door or waypoint in an area,
-        // picked on its map or from its lists (gathered as the window
-        // opens: from every area's objects).
+        // Aurora's Setup Area Transition: a door, trigger or waypoint in
+        // an area, picked on its map or from its lists (gathered as the
+        // window opens: from every area's objects).
         let pick_id = f.id("transition-setup");
         if ui
             .button("Setup Area Transition…")
-            .on_hover_text("Pick the door or waypoint it leads to, on its area's map or in a list")
+            .on_hover_text("Pick the door, trigger or waypoint it leads to, and how")
             .clicked()
         {
             let destinations = destinations(f);
-            let linked = decode(f.root.string("LinkedTo").unwrap_or_default());
-            let now = destinations.iter().find(|d| d.tag == linked).cloned();
+            let editing: Vec<Placed> = f.targets().filter_map(|(k, p)| Placed::of(&k, p)).collect();
+            let now = now_leads_to(f, &destinations, &editing);
+            let here = editing.first().and_then(|c| destinations.iter().find(|d| d.area == c.area));
             let state = TransitionPick {
                 open: true,
-                area: now.as_ref().or(destinations.first()).map(|d| d.area),
-                chosen: now.map(|d| (d.tag, d.flags)),
-                destinations,
-                map: None,
+                area: now.or(here).or(destinations.first()).map(|d| d.area),
+                chosen: now.map(|d| d.object),
+                destinations: std::sync::Arc::new(destinations),
+                editing,
+                ..Default::default()
             };
             ui.data_mut(|d| d.insert_temp(pick_id, state));
         }
-        if let Some((tag, flags)) = setup_transition(f, ui, pick_id) {
-            f.set_fields(
-                "Area transition",
-                vec![
-                    ("LinkedTo", Value::String(encode(&tag))),
-                    (
-                        "LinkedToFlags",
-                        super::integer(f.root.get("LinkedToFlags"), flags, FieldType::Byte),
-                    ),
-                ],
-            );
-        }
+        setup_transition(f, ui, pick_id);
         ui.end_row();
-        crate::widgets::field_label(ui, "Loading Screen");
+        crate::widgets::field_label(ui, "Loading screen");
         f.load_screen(ui, &loadscreens);
         ui.end_row();
     });
+}
+
+/// The destination the object leads to now, to open the window on: a
+/// door of its `LinkedTo` (flags 1); a trigger whose waypoint it names
+/// (flags 2, `WP_` and the trigger's tag), else a waypoint of that tag.
+fn now_leads_to<'d>(
+    f: &Form<'_>,
+    destinations: &'d [Destination],
+    editing: &[Placed],
+) -> Option<&'d Destination> {
+    let linked = decode(f.root.string("LinkedTo").unwrap_or_default());
+    if linked.is_empty() {
+        return None;
+    }
+    let flags = f.root.integer("LinkedToFlags").unwrap_or(0);
+    let of = |kind: ObjectKind, tag: &str| {
+        destinations
+            .iter()
+            .find(|d| d.object.kind == kind && d.tag == tag && !editing.contains(&d.object))
+    };
+    match flags {
+        1 => of(ObjectKind::Door, &linked),
+        _ => linked
+            .strip_prefix("WP_")
+            .and_then(|t| of(ObjectKind::Trigger, t))
+            .or_else(|| of(ObjectKind::Waypoint, &linked)),
+    }
 }
 
 /// The Lock page (`TfraSituatedLock`).
@@ -655,14 +1248,14 @@ pub(super) fn lock(f: &mut Form<'_>, ui: &mut Ui) {
     f.check(ui, "Key required to unlock or lock", "KeyRequired");
     f.check(ui, "Automatically remove key after use", "AutoRemoveKey");
     ui.separator();
-    egui::Grid::new(("lock", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        crate::widgets::field_label(ui, "Open Lock DC");
+    super::form_grid(ui, ("lock", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+        crate::widgets::field_label(ui, "Open lock DC");
         f.spin(ui, "Open lock DC", "OpenLockDC", 0..=BYTE_MAX);
         ui.end_row();
-        crate::widgets::field_label(ui, "Close Lock DC");
+        crate::widgets::field_label(ui, "Close lock DC");
         f.spin(ui, "Close lock DC", "CloseLockDC", 0..=BYTE_MAX);
         ui.end_row();
-        crate::widgets::field_label(ui, "Key Tag");
+        crate::widgets::field_label(ui, "Key tag");
         f.text(ui, "Key tag", "KeyName", 32);
         ui.end_row();
     });
@@ -670,7 +1263,7 @@ pub(super) fn lock(f: &mut Form<'_>, ui: &mut Ui) {
 
 /// Hit points, hardness, saves and plot (`TfraSituatedBasic`), as grid rows.
 pub(super) fn durability(f: &mut Form<'_>, ui: &mut Ui) {
-    crate::widgets::field_label(ui, "Hit Points");
+    crate::widgets::field_label(ui, "Hit points");
     // The blueprint's current hit points follow its maximum.
     f.mark_mixed(ui, "HP");
     if let Some(v) = spin_number(ui, f.int("HP"), 1..=10_000) {
@@ -683,13 +1276,13 @@ pub(super) fn durability(f: &mut Form<'_>, ui: &mut Ui) {
     crate::widgets::field_label(ui, "Hardness");
     f.spin(ui, "Hardness", "Hardness", 0..=BYTE_MAX);
     ui.end_row();
-    crate::widgets::field_label(ui, "Fortitude Save");
+    crate::widgets::field_label(ui, "Fortitude save");
     f.spin(ui, "Fortitude save", "Fort", 0..=BYTE_MAX);
     ui.end_row();
-    crate::widgets::field_label(ui, "Reflex Save");
+    crate::widgets::field_label(ui, "Reflex save");
     f.spin(ui, "Reflex save", "Ref", 0..=BYTE_MAX);
     ui.end_row();
-    crate::widgets::field_label(ui, "Will Save");
+    crate::widgets::field_label(ui, "Will save");
     f.spin(ui, "Will save", "Will", 0..=BYTE_MAX);
     ui.end_row();
     crate::widgets::field_label(ui, "");
@@ -710,46 +1303,38 @@ pub(super) fn advanced(
         .iter()
         .map(|(row, text)| Choice { row: *row as usize, text: (*text).into() })
         .collect();
-    egui::Grid::new(("situated-advanced", f.key)).num_columns(2).spacing([12.0, 6.0]).show(
-        ui,
-        |ui| {
-            crate::widgets::field_label(ui, "Blueprint ResRef");
-            f.blueprint_resref(ui);
-            ui.end_row();
-            crate::widgets::field_label(ui, "Belongs to Faction");
-            faction(f, ui, "Faction", "Faction");
-            ui.end_row();
-            crate::widgets::field_label(ui, "Conversation");
-            f.conversation(ui);
-            ui.end_row();
-            crate::widgets::field_label(ui, "Portrait");
-            portrait(f, ui);
-            ui.end_row();
-            crate::widgets::field_label(ui, "Initial State");
-            f.choice(ui, "Initial state", "AnimationState", &states, FieldType::Byte);
-            ui.end_row();
-            crate::widgets::field_label(ui, "");
-            // Aurora's No Interrupt is the inverse of Interruptable.
-            f.mark_mixed(ui, "Interruptable");
-            let mut no_interrupt = f.root.integer("Interruptable").unwrap_or(1) == 0;
-            if ui.checkbox(&mut no_interrupt, "No Interrupt").changed() {
-                f.set_int(
-                    "No interrupt",
-                    "Interruptable",
-                    i64::from(!no_interrupt),
-                    FieldType::Byte,
-                );
-            }
-            ui.end_row();
-            extra(f, ui);
-            crate::widgets::field_label(ui, "Variables");
-            f.variables(ui);
-            ui.end_row();
-            crate::widgets::field_label(ui, "");
-            f.update_instances(ui);
-            ui.end_row();
-        },
-    );
+    super::form_grid(ui, ("situated-advanced", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+        crate::widgets::field_label(ui, "Blueprint ResRef");
+        f.blueprint_resref(ui);
+        ui.end_row();
+        crate::widgets::field_label(ui, "Belongs to faction");
+        faction(f, ui, "Faction", "Faction");
+        ui.end_row();
+        crate::widgets::field_label(ui, "Conversation");
+        f.conversation(ui);
+        ui.end_row();
+        crate::widgets::field_label(ui, "Portrait");
+        portrait(f, ui);
+        ui.end_row();
+        crate::widgets::field_label(ui, "Initial state");
+        f.choice(ui, "Initial state", "AnimationState", &states, FieldType::Byte);
+        ui.end_row();
+        crate::widgets::field_label(ui, "");
+        // Aurora's No Interrupt is the inverse of Interruptable.
+        f.mark_mixed(ui, "Interruptable");
+        let mut no_interrupt = f.root.integer("Interruptable").unwrap_or(1) == 0;
+        if ui.check_box(&mut no_interrupt, "No interrupt").changed() {
+            f.set_int("No interrupt", "Interruptable", i64::from(!no_interrupt), FieldType::Byte);
+        }
+        ui.end_row();
+        extra(f, ui);
+        crate::widgets::field_label(ui, "Variables");
+        f.variables(ui);
+        ui.end_row();
+        crate::widgets::field_label(ui, "");
+        f.update_instances(ui);
+        ui.end_row();
+    });
 }
 
 /// A choice among `choices` by row, outside a field (`current` is the
@@ -757,24 +1342,24 @@ pub(super) fn advanced(
 /// a long list by name, with a Filter field.)
 pub(super) fn pick(
     ui: &mut Ui,
-    key: ResKey,
+    of: egui::Id,
     name: &str,
     choices: &[Choice],
     current: i64,
 ) -> Option<i64> {
-    pick_list(key, name, choices, current, 220.0).show(ui)
+    pick_list(of, name, choices, current, 220.0).show(ui)
 }
 
 /// [`pick`] in the order given, however long (a cost table's values,
 /// from the least).
 pub(super) fn pick_ordered(
     ui: &mut Ui,
-    key: ResKey,
+    of: egui::Id,
     name: &str,
     choices: &[Choice],
     current: i64,
 ) -> Option<i64> {
-    pick_list(key, name, choices, current, 220.0).ordered().show(ui)
+    pick_list(of, name, choices, current, 220.0).ordered().show(ui)
 }
 
 /// [`pick_ordered`], `width` wide, for a body part: the mouse wheel over
@@ -782,13 +1367,13 @@ pub(super) fn pick_ordered(
 /// on the model without opening the list).
 pub(super) fn pick_part(
     ui: &mut Ui,
-    key: ResKey,
+    of: egui::Id,
     name: &str,
     choices: &[Choice],
     current: i64,
     width: f32,
 ) -> Option<i64> {
-    pick_list(key, name, choices, current, width).ordered().wheel().show(ui)
+    pick_list(of, name, choices, current, width).ordered().wheel().show(ui)
 }
 
 /// A body or armor part's choices: none first (0, no part there: a
@@ -803,14 +1388,17 @@ pub(super) fn part_choices(numbers: &[u16], text: impl Fn(u16) -> String) -> Vec
 }
 
 /// The list [`pick`] and the others show, to add to (a row's picture).
+/// `of`: its window's own id for its lists ([`Form::picks`]). By the
+/// document alone, two Properties windows of one area's objects side by
+/// side shared a list's state.
 pub(super) fn pick_list<'a>(
-    key: ResKey,
+    of: egui::Id,
     name: &str,
     choices: &'a [Choice],
     current: i64,
     width: f32,
 ) -> crate::widgets::RowChoice<'a> {
-    crate::widgets::row_choice(egui::Id::new(("pick", key, name)), choices, current).width(width)
+    crate::widgets::row_choice(of.with(name), choices, current).width(width)
 }
 
 /// The model viewer's tab for the form's object: a placed object as it is
@@ -823,88 +1411,99 @@ fn preview_tab(f: &Form<'_>) -> crate::Tab {
     }
 }
 
-/// The model viewer in the page, `size` large, as Aurora shows a creature
-/// in its Appearance page; Pop Out, among its buttons, moves it to a window
-/// of its own (to keep beside other pages). While it is there, the page
-/// says so and offers to bring it back.
-pub(super) fn inline_preview(f: &mut Form<'_>, ui: &mut Ui, size: egui::Vec2) {
-    let tab = preview_tab(f);
-    let size = size.max(egui::vec2(120.0, 120.0));
-    let popped = f.app.open_models.contains(&tab);
-    let source = match &tab {
-        crate::Tab::InstanceModel { area, path } => {
-            crate::model_view::Source::Instance { area: *area, path: path.clone() }
-        }
-        _ => crate::model_view::Source::Resource(f.key),
-    };
-    ui.allocate_ui(size, |ui| {
-        ui.set_min_size(size);
-        ui.set_max_size(size);
-        if popped {
-            ui.weak("The preview is in a window of its own.");
-            if ui.button("Bring Back").on_hover_text("Close its window and show it here").clicked()
-            {
-                f.app.actions.push(crate::Action::CloseTab(tab));
-            }
-        } else if crate::model_view::embedded(f.app, ui, source) {
-            f.app.actions.push(crate::Action::OpenTab(tab));
-        }
-    });
-}
-
-/// A page that shows the object's model beside its fields, which take a
-/// column `side` wide on the left; the model has the rest of the window.
-/// A window too narrow for both, the model at
-/// least [`MODEL_LEAST`] wide, has the fields alone, where they were, and
-/// they are told so (`false`): Preview shows the model, or the page finds
-/// it a place among its fields.
-pub(super) fn beside_model(
-    f: &mut Form<'_>,
-    ui: &mut Ui,
-    side: f32,
-    fields: impl FnOnce(&mut Form<'_>, &mut Ui, bool),
-) {
-    let gap = ui.spacing().item_spacing.x;
-    // What is left of the page's visible height, and its width. (The
-    // visible width: a page once wider than the window would keep that.)
-    let room = egui::vec2(
-        ui.available_width().min(ui.clip_rect().right() - ui.cursor().left()),
-        (ui.clip_rect().bottom() - ui.cursor().top()).max(MODEL_LEAST.y),
-    );
-    if room.x < side + gap + MODEL_LEAST.x {
-        fields(f, ui, false);
-        return;
-    }
-    // (The fields keep their width, their scroll bar included.)
-    let width = room.x - side - 3.0 * gap - ui.spacing().scroll.bar_width;
-    let size = egui::vec2(width, room.y - gap);
-    ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-            ui.set_width(side);
-            egui::ScrollArea::vertical()
-                .id_salt(("beside-model", f.key))
-                .auto_shrink([false, false])
-                .show(ui, |ui| fields(f, ui, true));
-        });
-        ui.vertical(|ui| inline_preview(f, ui, size));
-    });
-}
-
-/// The least the model takes of a page that shows it.
-pub(super) const MODEL_LEAST: egui::Vec2 = egui::vec2(340.0, 300.0);
-
-/// Preview: the blueprint's model in the model viewer (Aurora shows it in
-/// the dialog).
+/// Preview: the object's model. Where its own tab or window brings the
+/// Preview panel (M4's U11), the panel is brought to the front (in its
+/// window's right pane where it floats); elsewhere (the area's Properties
+/// panel, a window too narrow for its pane) the model viewer opens in a
+/// tab or window of its own.
 pub(super) fn preview_button(f: &mut Form<'_>, ui: &mut Ui) {
     if ui.button("Preview").on_hover_text("Show the model").clicked() {
-        let tab = preview_tab(f);
-        f.app.actions.push(crate::Action::OpenTab(tab));
+        let action = match f.own_tab {
+            true => crate::Action::ShowPreview(super::tab_of(f.key, &f.path, &f.also)),
+            false => crate::Action::OpenTab(preview_tab(f)),
+        };
+        f.app.actions.push(action);
     }
 }
+
+/// The width of the Trap page's row of three check boxes, its label's
+/// column included (the page's labels are long).
+const TRAP_CHECKS_ROW: f32 = 540.0;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Setup Area Transition's doors and waypoints are read without
+    /// leaving every area's objects in the workspace (the review's B21),
+    /// and an area the workspace has read is taken as it is there, edited.
+    #[test]
+    fn destinations_are_read_without_keeping_every_area() {
+        use mg_gff::{Gff, Struct};
+        let git = |name: &str| ResKey::parse(name, ResType::GIT).unwrap();
+        let area = |tags: &[(&str, &str)]| {
+            let mut g = Gff::new(*b"GIT ");
+            for (list, tag) in tags {
+                let mut s = Struct::new(0);
+                s.set("Tag", Value::String(tag.as_bytes().to_vec()));
+                // (A trigger's Type by its tag: TT_GO a transition, TT_TRAP
+                // a trap, the others generic.)
+                if *list == "TriggerList" {
+                    let kind = [("TT_GO", 1), ("TT_TRAP", 2)].iter().find(|(t, _)| t == tag);
+                    s.set("Type", Value::Int(kind.map_or(0, |k| k.1)));
+                }
+                let mut all = g.root.list(list).unwrap_or(&[]).to_vec();
+                all.push(s);
+                g.root.set(list, Value::List(all));
+            }
+            g.to_bytes().unwrap()
+        };
+        let mut m = mg_module::Module::new();
+        let inn = [
+            ("WaypointList", "WP_INN"),
+            ("Door List", "DR_INN"),
+            ("TriggerList", "TT_GENERIC"),
+            ("TriggerList", "TT_GO"),
+            ("TriggerList", "TT_TRAP"),
+            ("TriggerList", "TT_GO"),
+        ];
+        m.set(git("inn"), area(&inn));
+        m.set(git("road"), area(&[("WaypointList", "WP_ROAD"), ("WaypointList", "")]));
+        for i in 0..40 {
+            let tag = format!("WP_{i:02}");
+            m.set(git(&format!("far{i:02}")), area(&[("WaypointList", tag.as_str())]));
+        }
+        let mut ws = mg_edit::Workspace::new(m);
+        // The inn read and its waypoint's tag changed, not yet written
+        // into the module.
+        ws.doc(&git("inn")).unwrap();
+        let retag = mg_edit::Edit::SetField {
+            key: git("inn"),
+            path: mg_edit::GffPath::root().item("WaypointList", 0),
+            label: "Tag".into(),
+            value: Some(Value::String(b"WP_CELLAR".to_vec())),
+        };
+        ws.apply(mg_edit::Command::new("Tag", vec![retag])).unwrap();
+        let found = destinations_in(&ws, None);
+        let of = |area: &str| -> Vec<(String, i64)> {
+            let area = git(area).resref;
+            found.iter().filter(|d| d.area == area).map(|d| (d.tag.clone(), d.flags)).collect()
+        };
+        // Area transition triggers alone (generic and trap ones lead
+        // nowhere), two of one tag as two, each its own object.
+        let inn = |t: &str| (t.to_string(), if t.starts_with("DR") { 1 } else { 2 });
+        assert_eq!(of("inn"), [inn("DR_INN"), inn("TT_GO"), inn("TT_GO"), inn("WP_CELLAR")]);
+        let gos: Vec<Placed> =
+            found.iter().filter(|d| d.tag == "TT_GO").map(|d| d.object).collect();
+        let tt = |i| Placed::new(git("inn").resref, ObjectKind::Trigger, i);
+        assert_eq!(gos, [tt(1), tt(3)]);
+        assert_eq!(of("road"), [("WP_ROAD".to_string(), 2)], "one without a tag left out");
+        assert_eq!(found.len(), 5 + 40);
+        assert!(found.windows(2).all(|w| (w[0].area, &w[0].tag) <= (w[1].area, &w[1].tag)));
+        assert!(ws.loaded(&git("inn")).is_some());
+        assert!(ws.loaded(&git("road")).is_none(), "read, and not kept");
+        assert!((0..40).all(|i| ws.loaded(&git(&format!("far{i:02}"))).is_none()));
+    }
 
     #[test]
     fn a_part_can_be_none() {

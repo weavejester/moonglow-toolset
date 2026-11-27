@@ -63,8 +63,7 @@ use mg_rules::GameData;
 use serde::Deserialize;
 
 use crate::{
-    Answer, Event, FieldKind, Host, Input, Level, Outcome, Plugin, PluginError, Question, Selected,
-    Selection,
+    Answer, Event, Host, Input, Level, Outcome, Plugin, PluginError, Question, Selected, Selection,
 };
 
 /// A test file, as written.
@@ -144,6 +143,21 @@ struct Test {
     command: Option<String>,
     event: Option<String>,
     builtin: Option<BuiltinSetting>,
+    /// An exporter, an importer, a wizard or a panel (API 0.6), by its id.
+    export: Option<String>,
+    import: Option<String>,
+    wizard: Option<String>,
+    panel: Option<String>,
+    /// The file or folder an exporter writes to: its name, which the
+    /// plugin sees as `out.name` (nothing is written).
+    to: Option<String>,
+    /// What the files an exporter writes have: by file name, text each
+    /// one has.
+    #[serde(default)]
+    content: BTreeMap<String, Vec<String>>,
+    /// What a panel shows: texts, each part of one of its texts.
+    #[serde(default)]
+    shows: Vec<String>,
     /// The fixture, if not the file's.
     module: Option<String>,
     /// The game's resources and the game's root, if not the file's.
@@ -157,6 +171,10 @@ struct Test {
     /// A form's values, by field id; the other fields take their defaults.
     #[serde(default)]
     answers: BTreeMap<String, toml::Value>,
+    /// A command's `ctx.values` (API 0.9), by field id, as the fields of
+    /// the panel it is run from give them.
+    #[serde(default)]
+    values: BTreeMap<String, toml::Value>,
     /// The answer to a question (`ctx.ui:confirm`): yes or no.
     #[serde(default)]
     yes: bool,
@@ -192,6 +210,14 @@ struct Test {
     /// How many edits, and which resources they change.
     edits: Option<usize>,
     resources: Option<Vec<String>>,
+    /// What the job puts into haks, by hak (its name without `.hak`): the
+    /// names of the resources (`tiles.set`), all of them, in any order;
+    /// nothing is written (since Moonglow 3.3.0).
+    #[serde(default)]
+    haks: BTreeMap<String, Vec<String>>,
+    /// The files the job writes into folders the user chose, by their
+    /// names, all of them, in any order; nothing is written.
+    written: Option<Vec<String>>,
     /// Lines the log must have: each is part of one.
     #[serde(default)]
     log: Vec<String>,
@@ -207,12 +233,64 @@ struct Test {
     set: BTreeMap<String, toml::Value>,
 }
 
+/// What a job wrote outside the module (haks, folders), held to the test.
+fn outside_as_wanted(t: &Test, outcome: &crate::Outcome, problems: &mut Vec<String>) {
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    let haks: BTreeMap<String, Vec<String>> = (outcome.haks.iter())
+        .map(|h| (h.name.clone(), sorted(h.files.iter().map(|(k, _)| k.to_string()).collect())))
+        .collect();
+    if !t.haks.is_empty() {
+        let wanted: BTreeMap<String, Vec<String>> = (t.haks.iter())
+            .map(|(h, v)| {
+                let h = h.strip_suffix(".hak").unwrap_or(h).to_ascii_lowercase();
+                (h, sorted(v.iter().map(|n| n.to_ascii_lowercase()).collect()))
+            })
+            .collect();
+        if wanted != haks {
+            problems.push(format!("it puts {haks:?} into haks, not {wanted:?}"));
+        }
+    }
+    if let Some(wanted) = &t.written {
+        let wrote: Vec<String> = sorted(
+            outcome.folders.iter().flat_map(|f| f.files.iter().map(|(n, _)| n.clone())).collect(),
+        );
+        if wrote != sorted(wanted.clone()) {
+            problems.push(format!("it writes {wrote:?} into folders, not {wanted:?}"));
+        }
+    }
+}
+
+/// What the files an export writes have, held to the test.
+fn content_as_wanted(t: &Test, outcome: &crate::Outcome, problems: &mut Vec<String>) {
+    for (name, parts) in &t.content {
+        let file = outcome.folders.iter().flat_map(|f| &f.files).find(|(n, _)| n == name);
+        let Some((_, bytes)) = file else {
+            problems.push(format!("it writes no {name}"));
+            continue;
+        };
+        let text = String::from_utf8_lossy(bytes);
+        for part in parts {
+            if !text.contains(part.as_str()) {
+                problems.push(format!("{name} has no {part:?}"));
+            }
+        }
+    }
+}
+
 /// A setting's value as a test file writes it.
 fn setting_of(v: &toml::Value) -> Option<crate::SettingValue> {
     match v {
         toml::Value::String(t) => Some(crate::SettingValue::Text(t.clone())),
         toml::Value::Integer(n) => Some(crate::SettingValue::Int(*n)),
         toml::Value::Boolean(b) => Some(crate::SettingValue::Bool(*b)),
+        toml::Value::Float(x) => Some(crate::SettingValue::Float(*x)),
+        toml::Value::Array(items) => (items.iter())
+            .map(|i| i.as_str().map(str::to_string))
+            .collect::<Option<Vec<String>>>()
+            .map(crate::SettingValue::List),
         _ => None,
     }
 }
@@ -281,6 +359,65 @@ impl TestResult {
     pub fn passed(&self) -> bool {
         self.problems.is_empty()
     }
+}
+
+/// The faults of a plugin's test files that can be told without running
+/// them (`mg plugin check`): a file that does not read, a test naming a
+/// check, a command or an event its manifest lacks (or none, or more
+/// than one), a fixture that is not there.
+pub fn test_faults(plugin: &Plugin) -> Vec<String> {
+    let m = &plugin.manifest;
+    let mut out = Vec::new();
+    for path in test_files(plugin) {
+        let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| toml::from_str::<File>(&text).map_err(|e| e.to_string()));
+        let f = match parsed {
+            Ok(f) => f,
+            Err(e) => {
+                out.push(format!("tests/{file}: {e}"));
+                continue;
+            }
+        };
+        let dir = path.parent().unwrap_or(Path::new("."));
+        if f.tests.is_empty() {
+            out.push(format!("tests/{file}: it has no [[test]]"));
+        }
+        for t in &f.tests {
+            let at = format!("tests/{file}: {:?}", t.name);
+            let ran = [&t.check, &t.command, &t.event, &t.export, &t.import, &t.wizard, &t.panel]
+                .iter()
+                .filter(|x| x.is_some())
+                .count()
+                + usize::from(t.builtin.is_some());
+            if ran != 1 {
+                out.push(format!(
+                    "{at}: it runs one of check, command, event, export, import, wizard, panel \
+                     or builtin"
+                ));
+            }
+            for (kind, id) in [
+                ("check", &t.check),
+                ("command", &t.command),
+                ("event", &t.event),
+                ("exporter", &t.export),
+                ("importer", &t.import),
+                ("wizard", &t.wizard),
+                ("panel", &t.panel),
+            ] {
+                if let Some(id) = id.as_ref().filter(|id| !m.ids(kind).contains(&id.as_str())) {
+                    out.push(format!("{at}: the manifest declares no {kind} {id:?}"));
+                }
+            }
+            if let Some(module) = t.module.as_ref().or(f.module.as_ref())
+                && !dir.join(module).exists()
+            {
+                out.push(format!("{at}: its fixture {module} is not there"));
+            }
+        }
+    }
+    out
 }
 
 /// The test files of a plugin: `tests/*.toml` in its folder, sorted.
@@ -477,7 +614,9 @@ impl Fixture {
         let haks = module.haks().unwrap_or_default();
         if let Some(folder) = folder {
             for name in &haks {
-                let path = folder.join("hak").join(mg_resman::named_file(name, "hak"));
+                // (A name with a folder in it is no file's there.)
+                let Some(file) = mg_resman::named_file(name, "hak") else { continue };
+                let path = folder.join("hak").join(file);
                 if !path.is_file() {
                     continue;
                 }
@@ -594,26 +733,27 @@ impl Host for TestHost {
                 Some(Answer::Yes)
             }
             Question::Confirm(_) => Some(if self.yes { Answer::Yes } else { Answer::No }),
-            Question::Form { fields, .. } => {
-                let mut values = BTreeMap::new();
-                for f in fields {
-                    let given = self.answers.get(&f.id).and_then(|v| toml_json(v).ok());
-                    let value = given.unwrap_or_else(|| match &f.kind {
-                        FieldKind::Text { default } => serde_json::json!(default),
-                        FieldKind::Number { default, .. } => serde_json::json!(default),
-                        FieldKind::Check { default } => serde_json::json!(default),
-                        FieldKind::Choice { choices, default } => {
-                            serde_json::json!(choices[*default])
-                        }
-                    });
-                    values.insert(f.id.clone(), value);
-                }
-                Some(Answer::Values(values))
+            Question::Form { fields, .. } => Some(Answer::Values(self.values(fields))),
+            // (A wizard's page: as a form, then on.)
+            Question::Page(page) => {
+                Some(Answer::Page { values: self.values(&page.fields), back: false })
             }
             Question::File { .. } | Question::Folder { .. } => {
                 self.files.borrow_mut().pop_front().map(Answer::Path)
             }
         }
+    }
+}
+
+impl TestHost {
+    /// A form's values: the test's answers, else the fields' defaults.
+    fn values(&self, fields: &[crate::FormField]) -> BTreeMap<String, serde_json::Value> {
+        (fields.iter())
+            .map(|f| {
+                let given = self.answers.get(&f.id).and_then(|v| toml_json(v).ok());
+                (f.id.clone(), given.unwrap_or_else(|| f.kind.default_value()))
+            })
+            .collect()
     }
 }
 
@@ -628,6 +768,10 @@ enum Run<'a> {
     Command(&'a str),
     Event(&'a str),
     Builtin(Builtins),
+    Export(&'a str),
+    Import(&'a str),
+    Wizard(&'a str),
+    Panel(&'a str),
 }
 
 /// Runs a test: what was not as it wants, and what it is told all the
@@ -729,20 +873,45 @@ fn held(
     {
         return vec!["was, by, warned and refused are for an event".into()];
     }
+    let given = [&t.check, &t.command, &t.event, &t.export, &t.import, &t.wizard, &t.panel];
+    let ran = given.iter().filter(|x| x.is_some()).count() + usize::from(t.builtin.is_some());
     let run = match (&t.check, &t.command, &t.event, &t.builtin) {
-        (Some(c), None, None, None) => Run::Check(c),
-        (None, Some(c), None, None) => Run::Command(c),
-        (None, None, Some(e), None) => Run::Event(e),
-        (None, None, None, Some(b)) => match builtin_checks(b) {
+        _ if ran != 1 => {
+            return vec![
+                "a test runs one thing: a check, a command, an event, an export, an import, a \
+                 wizard, a panel or a builtin check"
+                    .into(),
+            ];
+        }
+        (Some(c), ..) => Run::Check(c),
+        (_, Some(c), ..) => Run::Command(c),
+        (_, _, Some(e), _) => Run::Event(e),
+        (_, _, _, Some(b)) => match builtin_checks(b) {
             Ok(c) => Run::Builtin(c),
             Err(e) => return vec![e],
         },
-        _ => {
-            return vec![
-                "a test runs one thing: a check, a command, an event or a builtin check".into(),
-            ];
-        }
+        _ => match (&t.export, &t.import, &t.wizard, &t.panel) {
+            (Some(e), ..) => Run::Export(e),
+            (_, Some(i), ..) => Run::Import(i),
+            (_, _, Some(w), _) => Run::Wizard(w),
+            (.., Some(p)) => Run::Panel(p),
+            _ => unreachable!("one of them is given"),
+        },
     };
+    let theirs = [
+        ("to", t.to.is_some() && !matches!(run, Run::Export(_))),
+        ("content", !t.content.is_empty() && !matches!(run, Run::Export(_))),
+        ("shows", !t.shows.is_empty() && !matches!(run, Run::Panel(_))),
+        ("values", !t.values.is_empty() && !matches!(run, Run::Command(_))),
+    ];
+    if let Some((key, _)) = theirs.iter().find(|(_, wrong)| *wrong) {
+        let what = match *key {
+            "shows" => "a panel",
+            "values" => "a command (ctx.values, a panel's fields' values)",
+            _ => "an export",
+        };
+        return vec![format!("{key} is for {what}")];
+    }
     if matches!(run, Run::Builtin(_)) {
         let theirs = [
             ("select", !t.select.is_empty()),
@@ -783,8 +952,19 @@ fn held(
         Ok(s) => s,
         Err(e) => return vec![e],
     };
-    let input =
-        Input { selection, settings: Some(settings), ..Input::new(module.clone(), game.clone()) };
+    let mut values = BTreeMap::new();
+    for (id, v) in &t.values {
+        match toml_json(v) {
+            Ok(v) => values.insert(id.clone(), v),
+            Err(e) => return vec![format!("values: {id}: {e}")],
+        };
+    }
+    let input = Input {
+        selection,
+        settings: Some(settings),
+        values,
+        ..Input::new(module.clone(), game.clone())
+    };
     let codepage = fixture.data.codepage().for_language(Language::ENGLISH);
     // Moonglow's checks that count talk-table strings, with none to count.
     if let Run::Builtin(b) = &run
@@ -796,8 +976,56 @@ fn held(
             host.notes.borrow_mut().push(said);
         }
     }
+    // A panel: what it shows.
+    if let Run::Panel(id) = &run {
+        let shown = crate::run_panel(plugin, id, input, host.clone());
+        let log = host.log.borrow().clone();
+        for wanted in &t.log {
+            if !log.iter().any(|l| l.contains(wanted.as_str())) {
+                problems.push(format!("the log has no line with {wanted:?} (it has {log:?})"));
+            }
+        }
+        match (shown, &t.error) {
+            (Err(e), Some(wanted)) if !e.to_string().contains(wanted.as_str()) => {
+                problems.push(format!("it failed, saying {:?}, not {wanted:?}", e.to_string()))
+            }
+            (Err(_), Some(_)) => {}
+            (Err(e), None) => problems.push(format!("it failed: {e}")),
+            (Ok(_), Some(wanted)) => {
+                problems.push(format!("it was to fail, saying {wanted:?}, and did not"))
+            }
+            (Ok(shown), None) => {
+                let texts = shown.texts();
+                for wanted in &t.shows {
+                    if !texts.iter().any(|s| s.contains(wanted.as_str())) {
+                        problems.push(format!("it shows no {wanted:?} (it shows {texts:?})"));
+                    }
+                }
+            }
+        }
+        return problems;
+    }
+    // What an export writes to (nothing is written), and what an import
+    // reads: the first of its files.
+    let to = t.to.clone().unwrap_or_else(|| "export".into());
+    let source = match &run {
+        Run::Import(_) => match host.files.borrow_mut().pop_front() {
+            Some(f) => Some(f),
+            None => return vec!["an import reads the first of files: none is given".into()],
+        },
+        _ => None,
+    };
     // What it made: findings, or edits.
     let made: Result<Result<Vec<Found>, Outcome>, PluginError> = match &run {
+        Run::Panel(_) => unreachable!("run above"),
+        Run::Export(id) => {
+            crate::run_export(plugin, id, &dir.join(&to), input, host.clone()).map(Err)
+        }
+        Run::Import(id) => {
+            let from = source.as_deref().unwrap_or(dir);
+            crate::run_import(plugin, id, from, input, host.clone()).map(Err)
+        }
+        Run::Wizard(id) => crate::run_wizard(plugin, id, input, host.clone()).map(Err),
         Run::Check(id) => crate::run_check(plugin, id, input, host.clone()).map(Ok),
         Run::Builtin(b) => Ok(Ok(run_builtin(b, module, fixture))),
         Run::Command(id) => crate::run_command(plugin, id, input, host.clone()).map(Err),
@@ -849,6 +1077,8 @@ fn held(
         Err(outcome) => {
             settings_as_wanted(t, &outcome.settings, &mut problems);
             said_as_wanted(t, &outcome.said, &mut problems);
+            outside_as_wanted(t, outcome, &mut problems);
+            content_as_wanted(t, outcome, &mut problems);
             vec![Command::new(outcome.label.clone(), outcome.edits.clone())]
         }
     };
@@ -1243,10 +1473,18 @@ fn fixes_made(
     }
     let mut guard = Guard::new(module, fixes.iter().copied());
     for fix in fixes {
+        // (A fix that asks runs a command: a test runs that as a command.)
+        if let Some(asks) = &fix.asks {
+            problems.push(format!(
+                "the fix {label:?} asks (it runs the command {:?}): test that command instead",
+                asks.command
+            ));
+            continue;
+        }
         let made =
             guard.check(ws, fix).and_then(|now| ws.apply(now.command()).map_err(|e| e.to_string()));
         match made {
-            Ok(()) => guard.made(ws, fix),
+            Ok(()) => _ = guard.made(ws, fix),
             Err(why) => problems.push(format!("the fix {label:?} is not made: {why}")),
         }
     }

@@ -37,6 +37,10 @@ fn items_pasted_into_a_store_share_the_page_they_make() {
     h.run();
     h.get_by_label("Inventory…").click();
     h.run();
+    // (The store's page that holds the item: the Inventory page was in
+    // view, and chose its first, before the store was set up.)
+    h.get_by_label_contains("Miscellaneous (").click();
+    h.run();
     let rows: Vec<egui::Rect> = h.get_all_by_label_contains(" gp").map(|n| n.rect()).collect();
     let row = *rows.iter().max_by(|a, b| a.left().total_cmp(&b.left())).unwrap();
     h.hover_at(row.center());
@@ -62,6 +66,7 @@ fn items_pasted_into_a_store_share_the_page_they_make() {
     assert_eq!(swords.len(), 2);
     assert_ne!(at[0], at[1], "each at a place of its own");
     assert!(swords.iter().all(|i| i.integer("Infinite") == Some(0)));
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Paste 2 items"));
     h.state_mut().actions.push(mg_ui::Action::Undo);
     h.run();
     assert_eq!(field(&mut h, &key).list("StoreList").unwrap().len(), 1, "one step");
@@ -114,7 +119,7 @@ fn placeable_editor_fills_its_inventory() {
     h.get_all_by_value("nw_it_torch001").find(typed).unwrap().type_text("nw_it_mpotion001");
     h.run();
     // (The palette's row is the leftmost of that name; the list's rows are
-    // right of it, top to bottom.)
+    // right of it or under it, top to bottom.)
     let named = |h: &Harness<'_, Moonglow>, name: &str| -> Vec<egui::Rect> {
         let mut rects: Vec<egui::Rect> = h
             .get_all_by_label(name)
@@ -156,7 +161,7 @@ fn placeable_editor_fills_its_inventory() {
     // ask).
     assert_eq!(
         menu_items(&h, "Properties"),
-        ["Copy", "Paste", "Remove", "Find in Palette", "Properties"]
+        ["Cut", "Copy", "Paste", "Remove", "Find in Palette", "Properties"]
     );
     h.get_by_label("Copy").click();
     h.run();
@@ -167,8 +172,10 @@ fn placeable_editor_fills_its_inventory() {
     assert_eq!(held(&mut h)[3], "nw_it_mpotion001", "pasted");
     // The last row dragged onto the first: it takes that place (one step).
     let last = *named(&h, &potion).last().unwrap();
-    let first =
-        named(&h, "Torch").into_iter().find(|r| r.left() > 400.0).expect("the list's torch");
+    // (The palette shows the potion alone: the torches are the list's.)
+    let first = (named(&h, "Torch").into_iter())
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
+        .expect("the list's torch");
     let (from, to) = (last.center(), first.center());
     h.hover_at(from);
     h.run_steps(1);
@@ -187,23 +194,33 @@ fn placeable_editor_fills_its_inventory() {
     assert_eq!(held(&mut h)[0], "nw_it_torch001", "one undo puts it back");
     // An older blueprint's portrait is a resref (po_ and the portraits.2da
     // base resref); without a repute.fac, the standard factions.
-    h.get_by_label("Advanced").click();
+    page(&mut h, "Advanced");
     h.run();
     assert!(h.query_by_value("PLC_A08_").is_some());
     assert!(h.query_by_value("Hostile").is_some());
-    // A static placeable holds nothing: Has Inventory is disabled.
-    h.get_by_label("Basic").click();
+    // A static placeable holds nothing: Has inventory is disabled.
+    page(&mut h, "Basic");
     h.run();
     h.get_by_label("Static").click();
     h.run();
     assert_eq!(field(&mut h, &key).integer("Static"), Some(1));
-    assert!(h.get_by_label("Has Inventory").accesskit_node().is_disabled());
+    assert!(h.get_by_label("Has inventory").accesskit_node().is_disabled());
+    // Without an inventory, the Inventory page names the box as it reads
+    // (M5's W7: it said "Has Inventory").
+    h.get_by_label("Static").click();
+    h.run();
+    h.get_by_label("Has inventory").click();
+    h.run();
+    assert_eq!(field(&mut h, &key).integer("HasInventory"), Some(0));
+    page(&mut h, "Inventory");
+    h.run();
+    h.get_by_label("The placeable has no inventory (Basic › Has inventory).");
 }
 
 #[test]
 fn placed_chest_holds_whole_items() {
     use mg_module::instances::{Placement, Placing, instance};
-    let Some((mut h, area)) = area_harness("held") else { return };
+    let Some((mut h, area)) = area_ui_harness("held") else { return };
     let git_key = ResKey::new(area, ResType::GIT);
     {
         let app = h.state_mut();
@@ -230,7 +247,7 @@ fn placed_chest_holds_whole_items() {
     h.get_by_label("Inventory…").click();
     h.run_steps(2);
     // The chest's item palette, not the Palettes pane's.
-    close_tab(h.state_mut(), &Tab::Palette);
+    fold_palette(h.state_mut());
     h.run_steps(2);
     type_into_hint(&mut h, "Find", "nw_it_torch001");
     let torch = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
@@ -276,7 +293,7 @@ fn equipping_without_the_feat_asks_to_add_it() {
     };
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("no feats", vec![edit])));
     h.run();
-    h.get_by_label("Inventory").click();
+    page(&mut h, "Inventory");
     h.run();
     assert!(h.query_by_label_contains("The game may unequip items").is_some(), "the notice");
     type_into_hint(&mut h, "Find", "nw_waxbt001");
@@ -319,27 +336,46 @@ fn equipping_without_the_feat_asks_to_add_it() {
     let image = egui::accesskit::Role::Image;
     assert!(h.get_all_by_label("Battleaxe").any(|n| n.accesskit_node().role() == image));
     // (Rendering opens a GPU device.)
-    mg_testkit::gpu::hold();
-    if let Ok(img) = h.render() {
-        let _ = img.save(mg_testkit::scratch_dir("ui-inventory-icons").join("inventory.png"));
+    if let Some(dir) = shot_dir("ui-inventory-icons") {
+        mg_testkit::gpu::hold();
+        if let Ok(img) = h.render() {
+            let _ = img.save(dir.join("inventory.png"));
+        }
     }
     h.state_mut().actions.push(mg_ui::Action::Undo);
     h.run();
     assert!(feats(&mut h).is_empty());
     assert_eq!(primary(&mut h), before);
+    // Always do this: Options' choice, and not asked again (a builder's
+    // ask: a question always given the same answer).
+    use mg_ui::settings::MissingFeats;
+    h.get_all_by_label("Equip").nth(5).unwrap().click();
+    h.run();
+    h.get_by_label("Always do this").click();
+    h.run();
+    h.get_by_label("Yes").click();
+    h.run();
+    assert_eq!(h.state().settings.missing_feats, MissingFeats::Add);
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run();
+    assert!(feats(&mut h).is_empty());
+    h.get_all_by_label("Equip").nth(5).unwrap().click();
+    h.run();
+    assert!(h.query_by_label("Missing Feats").is_none(), "not asked");
+    assert_eq!((primary(&mut h).as_deref(), feats(&mut h)), (Some("nw_waxbt001"), vec![45]));
 }
 
-/// Find in Palette, from an equipped item's menu: its blueprint chosen in
-/// the palette on the left, its branch opened and its row in sight, the
-/// search that hid it cleared; from a backpack item's, the same. An item
-/// whose blueprint is in neither palette can't be found. The palette row's
-/// own menu opens the blueprint's Properties.
+/// Find in Palette on an equipped item chooses its blueprint in the
+/// page's item palette, opens its branch, scrolls its row into view and
+/// clears a search that hid it. It does the same for a backpack item. For
+/// an item whose blueprint is in neither palette, it is disabled.
+/// Properties on the palette row opens the blueprint.
 #[test]
 fn find_in_palette_chooses_an_item_s_blueprint() {
     let Some((mut h, key)) = blueprint_harness("nw_bandit001", "bandit_find", ResType::UTC) else {
         return;
     };
-    // A backpack of a torch and an item with no blueprint.
+    // Give the backpack a torch and an item with no blueprint.
     let entry = |id: u32, resref: &str| {
         let mut s = mg_gff::Struct::new(id);
         s.set("InventoryRes", mg_gff::Value::resref(ResRef::from_str(resref).unwrap()));
@@ -355,13 +391,13 @@ fn find_in_palette_chooses_an_item_s_blueprint() {
         value: Some(mg_gff::Value::List(pack)),
     };
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("pack", vec![edit])));
-    // (Tall enough for the slots and the backpack under them.)
+    // Make the window tall enough for the slots and the backpack below them.
     h.set_size(egui::vec2(1000.0, 1600.0));
     h.run();
     own_window(&mut h, &Tab::Blueprint(key), egui::pos2(20.0, 40.0), egui::vec2(960.0, 1500.0));
-    h.get_by_label("Inventory").click();
+    page(&mut h, "Inventory");
     settle(&mut h);
-    // The equipped item, and its name as its slot shows it.
+    // The equipped item, and the name its slot shows.
     let worn =
         field(&mut h, &key).list("Equip_ItemList").unwrap()[0].resref("EquippedRes").unwrap();
     let name = |h: &Harness<'_, Moonglow>, resref: ResRef| {
@@ -371,15 +407,15 @@ fn find_in_palette_chooses_an_item_s_blueprint() {
         game.locstring(uti.root.locstring("LocalizedName").unwrap()).unwrap()
     };
     let worn_name = name(&h, worn);
-    // (Its blueprint is chosen: the item chosen shows under the palette.)
+    // Whether a blueprint is chosen: the chosen item is shown under the palette.
     let chosen = |h: &Harness<'_, Moonglow>, resref: ResRef| {
         h.query_by_label_contains(&format!("· {resref}")).is_some()
     };
-    // The palette's row of an item: a button left of the slots and the
-    // backpack, in sight in the tree (between its Find and its Add to
-    // Backpack).
+    // An item's row in the palette, if it is in view: a button left of the
+    // slots and the backpack, between the palette's Find field and its Add
+    // to Backpack button.
     let palette_row = |h: &Harness<'_, Moonglow>, name: &str| -> Option<egui::Rect> {
-        // (The Find field: the text field under Standard Palette.)
+        // The Find field is the text field below Standard Palette.
         let tabs = h.get_by_label("Standard Palette").rect();
         let by = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
             n.role() == egui::accesskit::Role::TextInput
@@ -400,11 +436,12 @@ fn find_in_palette_chooses_an_item_s_blueprint() {
         let slot = buttons().max_by(|a, b| a.left().total_cmp(&b.left()))?;
         buttons().find(|r| r.right() < slot.left() && r.top() >= top && r.bottom() <= bottom)
     };
-    // A search that hides it, to be cleared.
+    // Search for something else, which hides the item. Find in Palette
+    // should clear this search.
     type_into_hint(&mut h, "Find", "nw_it_mpotion001");
     assert!(!chosen(&h, worn));
-    assert!(palette_row(&h, &worn_name).is_none(), "the branch shut: no row of it yet");
-    // (The slot's row: the rightmost button of that name.)
+    assert!(palette_row(&h, &worn_name).is_none(), "its branch is closed, so its row is not shown");
+    // An item's slot or backpack cell: the rightmost button with its name.
     let slot = |h: &Harness<'_, Moonglow>, name: &str| {
         h.query_all_by_label(name)
             .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
@@ -428,34 +465,37 @@ fn find_in_palette_chooses_an_item_s_blueprint() {
     open_menu(&mut h, at);
     assert_eq!(
         menu_items(&h, "Properties"),
-        ["To Backpack", "Copy", "Remove", "Find in Palette", "Properties"]
+        ["To Backpack", "Cut", "Copy", "Remove", "Find in Palette", "Properties"]
     );
     h.get_by_label("Find in Palette").click();
     settle(&mut h);
-    assert!(chosen(&h, worn), "the equipped item's blueprint chosen");
+    assert!(chosen(&h, worn), "the equipped item's blueprint is chosen");
     let typed =
         |n: &egui_kittest::Node<'_>| n.accesskit_node().role() == egui::accesskit::Role::TextInput;
-    assert!(h.query_all_by_value("nw_it_mpotion001").find(typed).is_none(), "the search cleared");
-    assert!(palette_row(&h, &worn_name).is_some(), "its row in sight in the palette");
+    assert!(
+        h.query_all_by_value("nw_it_mpotion001").find(typed).is_none(),
+        "the search is cleared"
+    );
+    assert!(palette_row(&h, &worn_name).is_some(), "its row is in view in the palette");
 
-    // The torch in the backpack: found the same way.
+    // Find the torch in the backpack the same way.
     let torch = name(&h, ResRef::from_str("nw_it_torch001").unwrap());
     let at = slot(&h, &torch);
     open_menu(&mut h, at);
     h.get_by_label("Find in Palette").click();
     settle(&mut h);
-    assert!(chosen(&h, ResRef::from_str("nw_it_torch001").unwrap()), "the torch chosen");
-    assert!(palette_row(&h, &torch).is_some(), "its row in the palette");
+    assert!(chosen(&h, ResRef::from_str("nw_it_torch001").unwrap()), "the torch is chosen");
+    assert!(palette_row(&h, &torch).is_some(), "its row is in view in the palette");
 
-    // An item with no blueprint: Find in Palette is there, but off.
+    // For an item with no blueprint, Find in Palette is shown but disabled.
     let at = slot(&h, "mg_gone");
     open_menu(&mut h, at);
     assert!(h.get_by_label("Find in Palette").accesskit_node().is_disabled());
     h.key_press(egui::Key::Escape);
     h.run();
 
-    // The palette's row: Properties opens the blueprint (the game's, to
-    // look at).
+    // Properties on the palette row opens the torch's blueprint (the
+    // game's, so it can only be viewed).
     let row = palette_row(&h, &torch).unwrap();
     open_menu(&mut h, row.center());
     let items = menu_items(&h, "Properties");
@@ -463,7 +503,10 @@ fn find_in_palette_chooses_an_item_s_blueprint() {
     h.get_all_by_label("Properties").last().unwrap().click();
     settle(&mut h);
     let uti = ResKey::parse("nw_it_torch001", ResType::UTI).unwrap();
-    assert!(h.state().dock.find_tab(&Tab::Blueprint(uti)).is_some(), "the torch's Properties");
+    assert!(
+        h.state().dock.find_tab(&Tab::Blueprint(uti)).is_some(),
+        "the torch's blueprint is open"
+    );
 }
 
 /// An item equipped that the creature may not wear (the game takes it off
@@ -495,13 +538,20 @@ fn what_the_game_takes_off_is_marked() {
         h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("feats", vec![e])));
         h.run();
     };
-    h.get_by_label("Inventory").click();
+    page(&mut h, "Inventory");
     h.run();
-    assert!(h.query_all_by_label("⚠ Longsword").next().is_none(), "a bandit wears its sword");
+    // (Marked off with a warning icon before its name.)
+    let marked = |h: &Harness<'_, Moonglow>| {
+        let beside = |n: &egui_kittest::Node<'_>| {
+            icon_drawn(h, mg_uikit::Icon::Warning, n.rect().expand2(egui::vec2(24.0, 4.0)))
+        };
+        h.query_all_by_label("Longsword").any(|n| beside(&n))
+    };
+    assert!(!marked(&h), "a bandit wears its sword");
     apply(&mut h, feats(Vec::new()));
-    assert!(h.query_all_by_label("⚠ Longsword").next().is_some(), "without its feats, not");
+    assert!(marked(&h), "without its feats, not");
     apply(&mut h, feats(vec![45]));
-    assert!(h.query_all_by_label("⚠ Longsword").next().is_none());
+    assert!(!marked(&h));
 }
 
 #[test]
@@ -510,7 +560,7 @@ fn creature_items_can_be_dropable_and_pickpocketable() {
         return;
     };
     h.run();
-    h.get_by_label("Inventory").click();
+    page(&mut h, "Inventory");
     h.run();
     let flag = |h: &mut Harness<'_, Moonglow>, label: &str| {
         field(h, &key).list("Equip_ItemList").unwrap()[0].integer(label)
@@ -582,7 +632,7 @@ fn creature_items_can_be_dropable_and_pickpocketable() {
 fn a_placed_creature_s_items_can_be_dropable_and_pickpocketable() {
     use mg_edit::{Command, Edit, GffPath};
     use mg_module::instances::{Placement, Placing, instance};
-    let Some((mut h, area)) = area_harness("held-flags") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-flags") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let bandit = {
         let game = h.state().game.clone().unwrap();
@@ -640,7 +690,7 @@ fn a_placed_creature_s_items_can_be_dropable_and_pickpocketable() {
 fn a_held_item_s_properties_open_from_the_inventory() {
     use mg_edit::{Command, Edit, GffPath};
     use mg_module::instances::{Placement, Placing, instance};
-    let Some((mut h, area)) = area_harness("held-item") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-item") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let chest = {
         let game = h.state().game.clone().unwrap();
@@ -687,7 +737,7 @@ fn a_held_item_s_properties_open_from_the_inventory() {
         });
     }
     h.run_steps(3);
-    h.get_by_label("Properties").click();
+    apart(&h, "Properties").click();
     h.run_steps(6);
     let held = path.item("ItemList", 0);
     let tab = Tab::Instance { area, path: held.clone() };
@@ -775,7 +825,7 @@ fn held_window(h: &Harness<'_, Moonglow>, area: ResRef, tag: &str) -> mg_edit::G
 #[test]
 fn a_held_item_s_properties_follow_the_item() {
     use mg_edit::{Command, Edit};
-    let Some((mut h, area)) = area_harness("held-follow") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-follow") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let chest = chest_of_three(&mut h, area);
     let open = |h: &mut Harness<'_, Moonglow>, i: usize| {
@@ -796,11 +846,11 @@ fn a_held_item_s_properties_follow_the_item() {
     open(&mut h, 1);
     assert_eq!(held_window(&h, area, "ITEM_B"), at(1));
     // Changed in its window (for its Cancel, below).
-    h.get_by_label("Plot Item").click();
+    h.get_by_label("Plot item").click();
     h.run_steps(3);
     assert_eq!(held(&mut h)[1].integer("Plot"), Some(1));
     // The one before it removed: the window follows it up the list.
-    apply(&mut h, "Remove item", vec![remove(0)]);
+    apply(&mut h, "Remove Item", vec![remove(0)]);
     assert_eq!(held_window(&h, area, "ITEM_B"), at(0));
     assert!(!shows_tag(&h, "ITEM_C"));
     h.state_mut().actions.push(mg_ui::Action::Undo);
@@ -831,11 +881,52 @@ fn a_held_item_s_properties_follow_the_item() {
     // deleted).
     open(&mut h, 2);
     held_window(&h, area, "ITEM_B");
-    apply(&mut h, "Remove item", vec![remove(2)]);
+    apply(&mut h, "Remove Item", vec![remove(2)]);
     let open_items = h.state().dock.iter_all_tabs().filter(
         |(_, t)| matches!(t, Tab::Instance { area: a, path } if *a == area && path.0.len() > 1),
     );
     assert_eq!(open_items.count(), 0, "closed with its item");
+}
+
+/// A placed object's Properties closed by the tab's close button, with Options'
+/// "Closing a window cancels its changes" on: what was changed is set
+/// back as by Cancel, which Undo takes back; off, it is kept.
+#[test]
+fn a_placed_object_s_properties_closed_cancel_when_asked() {
+    let Some((mut h, area)) = area_ui_harness("held-close") else { return };
+    let git = ResKey::new(area, ResType::GIT);
+    let chest = chest_of_three(&mut h, area);
+    let path = chest.item("ItemList", 1);
+    let tab = Tab::Instance { area, path: path.clone() };
+    let plot = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        path.get(&ws.doc(&git).unwrap().root).unwrap().integer("Plot")
+    };
+    let try_plot = |h: &mut Harness<'_, Moonglow>| {
+        h.state_mut().actions.push(mg_ui::Action::OpenTab(tab.clone()));
+        h.run_steps(4);
+        held_window(h, area, "ITEM_B");
+        h.get_by_label("Plot item").click();
+        h.run_steps(3);
+        click_tab_close(h, &tab);
+        h.run_steps(4);
+        assert!(h.state().dock.find_tab(&tab).is_none(), "closed");
+    };
+    let was = plot(&mut h);
+    // Off: kept.
+    try_plot(&mut h);
+    assert_ne!(plot(&mut h), was, "kept");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(3);
+    assert_eq!(plot(&mut h), was);
+    // On: set back, as one step Undo takes back.
+    h.state_mut().settings.close_cancels = true;
+    try_plot(&mut h);
+    assert_eq!(plot(&mut h), was, "set back");
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Cancel Changes"));
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(3);
+    assert_ne!(plot(&mut h), was, "Undo brings it back");
 }
 
 /// A placed store's items open their own Properties too (a page's item,
@@ -844,7 +935,7 @@ fn a_held_item_s_properties_follow_the_item() {
 fn a_placed_store_s_items_open_their_properties_and_follow_them() {
     use mg_edit::{Command, Edit, GffPath};
     use mg_module::instances::{Placement, Placing, instance};
-    let Some((mut h, area)) = area_harness("held-store") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-store") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let store = {
         let game = h.state().game.clone().unwrap();
@@ -898,7 +989,7 @@ fn a_placed_store_s_items_open_their_properties_and_follow_them() {
         });
     }
     h.run_steps(3);
-    h.get_by_label("Properties").click();
+    apart(&h, "Properties").click();
     h.run_steps(6);
     let page = path.item("StoreList", page);
     assert_eq!(
@@ -910,7 +1001,7 @@ fn a_placed_store_s_items_open_their_properties_and_follow_them() {
     assert!(h.query_all_by_label("Appearance").count() >= 1, "an item's pages");
     // The first of the page's items removed: the window follows.
     let remove = Edit::remove_item(git, page.clone(), "ItemList", 0);
-    h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("Remove item", vec![remove])));
+    h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("Remove Item", vec![remove])));
     h.run_steps(4);
     assert_eq!(held_window(&h, area, &tag), page.item("ItemList", 0));
 }
@@ -923,7 +1014,7 @@ fn a_placed_store_s_items_open_their_properties_and_follow_them() {
 fn a_placed_creature_s_equipment_is_in_sight_in_a_narrow_window() {
     use mg_edit::{Command, Edit, GffPath};
     use mg_module::instances::{Placement, Placing, instance};
-    let Some((mut h, area)) = area_harness("equipment-narrow") else { return };
+    let Some((mut h, area)) = area_ui_harness("equipment-narrow") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let bandit = {
         let game = h.state().game.clone().unwrap();
@@ -964,7 +1055,10 @@ fn a_placed_creature_s_equipment_is_in_sight_in_a_narrow_window() {
             .unwrap()
             .rect();
         assert!(name.right() < window.right(), "{item} at {name:?}, in a window at {window:?}");
-        assert!(name.left() > window.left() + 200.0, "{item}: right of the palette");
+        // (Beside the page list's rail, the room is under the 440 the
+        // palette and the slots stand side by side from: the slots under
+        // the palette, whole.)
+        assert!(name.left() > window.left(), "{item}: in the window");
     }
 }
 
@@ -977,6 +1071,9 @@ fn bandit_holding(
     area: ResRef,
     held: &dyn Fn(&mg_rules::GameData) -> Vec<mg_gff::Struct>,
 ) -> mg_edit::GffPath {
+    // (The windows' forms alone, laid side by side by their sizes: no
+    // Preview pane beside them in their windows, M4's U11.)
+    h.state_mut().palette_dock = false;
     use mg_edit::{Command, Edit, GffPath};
     use mg_module::instances::{Placement, Placing, instance};
     let game = h.state().game.clone().unwrap();
@@ -1057,25 +1154,7 @@ fn menu_of(h: &mut Harness<'_, Moonglow>, label: &str, choice: &str) {
         .map(|n| n.rect().center())
         .min_by(|a, b| a.x.total_cmp(&b.x))
         .unwrap_or_else(|| panic!("no {label} to click"));
-    h.hover_at(row);
-    for pressed in [true, false] {
-        h.event(egui::Event::PointerButton {
-            pos: row,
-            button: egui::PointerButton::Secondary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
-        });
-    }
-    h.run_steps(3);
-    // (The menu's: the one nearest below where it was opened.)
-    let item = h
-        .query_all_by_label(choice)
-        .map(|n| n.rect())
-        .filter(|r| r.top() >= row.y - 4.0)
-        .min_by(|a, b| a.center().distance(row).total_cmp(&b.center().distance(row)))
-        .unwrap_or_else(|| panic!("no {choice} in the menu"));
-    click_pos(h, item.center());
-    h.run_steps(6);
+    menu_of_at(h, row, choice);
 }
 
 /// The two lists of the creature at `path` in `area`'s GIT: its equipment
@@ -1109,7 +1188,7 @@ fn as_held_anywhere(item: &mg_gff::Struct) -> mg_gff::Struct {
 /// too.
 #[test]
 fn a_held_item_moved_to_a_slot_and_back_stays_as_it_is() {
-    let Some((mut h, area)) = area_harness("held-equip") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-equip") else { return };
     let held = |game: &mg_rules::GameData| {
         let mut gone = own_item(game, "nw_it_mring022", 1, ("MG_NOWHERE", "Nowhere Probe"));
         gone.set("TemplateResRef", mg_gff::Value::resref(ResRef::from_str("mg_gone").unwrap()));
@@ -1165,7 +1244,7 @@ fn a_held_item_moved_to_a_slot_and_back_stays_as_it_is() {
 /// an item it had equipped follows the item back into the backpack.
 #[test]
 fn a_held_item_s_window_follows_it_when_its_list_is_set_back() {
-    let Some((mut h, area)) = area_harness("held-cancel") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-cancel") else { return };
     let held = |game: &mg_rules::GameData| {
         vec![own_item(game, "nw_it_mneck020", 0, ("MG_OWN", "Moved Probe"))]
     };
@@ -1196,7 +1275,7 @@ fn a_held_item_s_window_follows_it_when_its_list_is_set_back() {
 #[test]
 fn a_held_item_s_window_keeps_what_is_typed_as_it_follows() {
     use mg_edit::{Command, Edit};
-    let Some((mut h, area)) = area_harness("held-typed") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-typed") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let chest = chest_of_three(&mut h, area);
     let at = chest.item("ItemList", 1);
@@ -1221,7 +1300,7 @@ fn a_held_item_s_window_keeps_what_is_typed_as_it_follows() {
     assert!(shows_tag(&h, "ITEM_B_TYPED"), "typed");
     // The item before it taken out: the window follows, still typing.
     let remove = Edit::remove_item(git, chest.clone(), "ItemList", 0);
-    h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("Remove item", vec![remove])));
+    h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("Remove Item", vec![remove])));
     h.run_steps(4);
     assert!(shows_tag(&h, "ITEM_B_TYPED"), "still typed where it went");
     let ws = h.state_mut().ws.as_mut().unwrap();
@@ -1248,7 +1327,7 @@ fn drag_pos(h: &mut Harness<'_, Moonglow>, from: egui::Pos2, to: egui::Pos2) {
 /// step; its own window follows it from the chest to the creature.
 #[test]
 fn a_held_item_dragged_to_another_object_is_carried_as_it_is() {
-    let Some((mut h, area)) = area_harness("held-carried") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-carried") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let chest = chest_of_three(&mut h, area);
     // (The chest is the first placeable, the bandit the first creature.)
@@ -1259,11 +1338,12 @@ fn a_held_item_dragged_to_another_object_is_carried_as_it_is() {
     h.state_mut().blueprint_pages.insert((git, chest.clone()), "Inventory");
     h.state_mut().actions.push(mg_ui::Action::OpenTab(tab.clone()));
     h.run_steps(6);
-    own_window(&mut h, &tab, egui::pos2(920.0, 40.0), egui::vec2(560.0, 640.0));
+    // (Tall enough for the palette and the chest's three rows under it.)
+    own_window(&mut h, &tab, egui::pos2(920.0, 40.0), egui::vec2(560.0, 780.0));
     let item = Tab::Instance { area, path: chest.item("ItemList", 1) };
     h.state_mut().actions.push(mg_ui::Action::OpenTab(item.clone()));
     h.run_steps(6);
-    own_window(&mut h, &item, egui::pos2(920.0, 700.0), egui::vec2(560.0, 660.0));
+    own_window(&mut h, &item, egui::pos2(920.0, 830.0), egui::vec2(560.0, 560.0));
     assert_eq!(held_window(&h, area, "ITEM_B"), chest.item("ItemList", 1));
     // The chest's second sword (its rows at the right, top to bottom), onto
     // the creature's backpack (under its heading, at the left).
@@ -1271,7 +1351,7 @@ fn a_held_item_dragged_to_another_object_is_carried_as_it_is() {
         .query_all_by_label("Longsword")
         .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
         .map(|n| n.rect())
-        .filter(|r| r.left() > 920.0 && r.top() < 680.0 && r.width() > 80.0)
+        .filter(|r| r.left() > 920.0 && r.top() < 820.0 && r.width() > 80.0)
         .collect();
     rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
     assert_eq!(rows.len(), 3, "the chest's three swords");
@@ -1304,7 +1384,7 @@ fn a_held_item_dragged_to_another_object_is_carried_as_it_is() {
 #[test]
 fn a_held_item_needing_a_feat_stays_in_the_backpack_on_no() {
     use mg_edit::{Command, Edit};
-    let Some((mut h, area)) = area_harness("held-feat") else { return };
+    let Some((mut h, area)) = area_ui_harness("held-feat") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let held = |game: &mg_rules::GameData| {
         vec![own_item(game, "nw_wswls001", 0, ("MG_SWORD", "Sword Probe"))]
@@ -1356,7 +1436,7 @@ fn a_held_item_needing_a_feat_stays_in_the_backpack_on_no() {
 #[test]
 fn an_item_dropped_on_a_taken_slot_sends_its_item_to_the_backpack() {
     use mg_edit::{Command, Edit};
-    let Some((mut h, area)) = area_harness("taken-slot") else { return };
+    let Some((mut h, area)) = area_ui_harness("taken-slot") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let held = |game: &mg_rules::GameData| {
         vec![own_item(game, "nw_it_mneck020", 0, ("MG_NEW", "New Probe"))]
@@ -1424,7 +1504,7 @@ fn a_creature_s_inventory_shows_the_icons_of_its_gender() {
     };
     assert!(!h.state().settings.armor_on_woman, "on a man, by default");
     h.run();
-    h.get_by_label("Inventory").click();
+    page(&mut h, "Inventory");
     h.run_steps(4);
     let his = drawn(&mut h);
     assert!(!his.is_empty() && his.iter().all(|n| n.starts_with("ipm_")), "{his:?}");
@@ -1450,7 +1530,7 @@ fn a_creature_s_inventory_shows_the_icons_of_its_gender() {
 #[test]
 fn a_weapon_dropped_on_the_secondary_slot_takes_a_free_primary() {
     use mg_edit::{Command, Edit};
-    let Some((mut h, area)) = area_harness("secondary-slot") else { return };
+    let Some((mut h, area)) = area_ui_harness("secondary-slot") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let held = |game: &mg_rules::GameData| {
         vec![
@@ -1518,7 +1598,7 @@ fn a_weapon_dropped_on_the_secondary_slot_takes_a_free_primary() {
 /// own item to the backpack), each one step.
 #[test]
 fn items_dragged_between_a_creature_s_slots_and_a_chest() {
-    let Some((mut h, area)) = area_harness("slots-and-chest") else { return };
+    let Some((mut h, area)) = area_ui_harness("slots-and-chest") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let chest = chest_of_three(&mut h, area);
     let bandit = bandit_holding(&mut h, area, &|_| Vec::new());
@@ -1526,7 +1606,8 @@ fn items_dragged_between_a_creature_s_slots_and_a_chest() {
     h.state_mut().blueprint_pages.insert((git, chest.clone()), "Inventory");
     h.state_mut().actions.push(mg_ui::Action::OpenTab(tab.clone()));
     h.run_steps(6);
-    own_window(&mut h, &tab, egui::pos2(920.0, 40.0), egui::vec2(560.0, 640.0));
+    // (Tall enough for the palette and the chest's three rows under it.)
+    own_window(&mut h, &tab, egui::pos2(920.0, 40.0), egui::vec2(560.0, 780.0));
     let in_chest = |h: &mut Harness<'_, Moonglow>| -> Vec<mg_gff::Struct> {
         let ws = h.state_mut().ws.as_mut().unwrap();
         let root = &ws.doc(&git).unwrap().root;
@@ -1589,7 +1670,7 @@ fn items_dragged_between_a_creature_s_slots_and_a_chest() {
 /// the copy stays where it was.
 #[test]
 fn a_placed_object_s_item_is_pasted_as_it_is() {
-    let Some((mut h, area)) = area_harness("pasted-as-it-is") else { return };
+    let Some((mut h, area)) = area_ui_harness("pasted-as-it-is") else { return };
     let git = ResKey::new(area, ResType::GIT);
     let chest = chest_of_three(&mut h, area);
     let bandit = bandit_holding(&mut h, area, &|_| Vec::new());
@@ -1636,4 +1717,528 @@ fn a_placed_object_s_item_is_pasted_as_it_is() {
     let ws = h.state_mut().ws.as_mut().unwrap();
     let left = chest.get(&ws.doc(&git).unwrap().root).unwrap().list("ItemList").unwrap().len();
     assert_eq!(left, 3, "a copy: the chest keeps it");
+}
+
+/// A store's item has Find in Palette in its menu too, which chooses its
+/// blueprint in the palette beside it.
+#[test]
+fn a_store_s_item_is_found_in_the_palette() {
+    let Some((mut h, key)) = blueprint_harness("nw_storebar01", "store_find", ResType::UTM) else {
+        return;
+    };
+    h.run();
+    let item = {
+        let s = field(&mut h, &key);
+        let pages = s.list("StoreList").unwrap();
+        pages.iter().find_map(|p| p.list("ItemList")?.first()?.resref("InventoryRes")).unwrap()
+    };
+    h.get_by_label("Inventory…").click();
+    h.run();
+    let rows: Vec<egui::Rect> = h.get_all_by_label_contains(" gp").map(|n| n.rect()).collect();
+    let row = *rows.iter().max_by(|a, b| a.left().total_cmp(&b.left())).unwrap();
+    h.hover_at(row.center());
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: row.center(),
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run();
+    let shown = h.get_all_by_label_contains(" gp").count();
+    assert!(shown > 0);
+    h.get_by_label("Find in Palette").click();
+    settle(&mut h);
+    // The first row's item, or another of the page's: one is chosen.
+    let s = field(&mut h, &key);
+    let items: Vec<ResRef> = (s.list("StoreList").unwrap().iter())
+        .flat_map(|p| p.list("ItemList").into_iter().flatten())
+        .filter_map(|i| i.resref("InventoryRes"))
+        .collect();
+    assert!(items.contains(&item));
+    let chosen = items.iter().any(|r| h.query_by_label_contains(&format!("· {r}")).is_some());
+    assert!(chosen, "an item's blueprint is chosen in the palette");
+}
+
+/// The Missing Feats question doesn't block: with an item before the one
+/// asked about removed from the backpack behind it, Yes took out whatever
+/// stood at the place by then and equipped the copy it kept, one item
+/// twice and one gone (the review's B11). The question goes when its item
+/// is no longer where it was, and is not asked again of what is there.
+#[test]
+fn the_missing_feats_question_goes_when_its_item_has_moved() {
+    use mg_edit::{Command, Edit};
+    let Some((mut h, area)) = area_ui_harness("held-feat-moved") else { return };
+    let git = ResKey::new(area, ResType::GIT);
+    let held = |game: &mg_rules::GameData| {
+        vec![
+            own_item(game, "nw_it_torch001", 0, ("MG_TORCH", "Torch Probe")),
+            own_item(game, "nw_wswls001", 1, ("MG_SWORD", "Sword Probe")),
+            own_item(game, "nw_it_torch001", 2, ("MG_LAST", "Last Probe")),
+        ]
+    };
+    let bandit = bandit_holding(&mut h, area, &held);
+    let featless = Edit::SetField {
+        key: git,
+        path: bandit.clone(),
+        label: "FeatList".into(),
+        value: Some(mg_gff::Value::List(Vec::new())),
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("No feats", vec![featless])));
+    h.run_steps(4);
+    let (worn, pack) = creature_items(&mut h, area, &bandit);
+    menu_of(&mut h, "Sword Probe", "Equip");
+    assert!(h.query_by_label("Missing Feats").is_some(), "asked");
+    // The torch before it removed behind the question: the sword is the
+    // first now.
+    let gone = Edit::remove_item(git, bandit.clone(), "ItemList", 0);
+    h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("Remove", vec![gone])));
+    h.run_steps(4);
+    assert!(h.query_by_label("Missing Feats").is_none(), "the question went with its place");
+    let left = vec![pack[1].clone(), pack[2].clone()];
+    assert_eq!(creature_items(&mut h, area, &bandit), (worn, left), "the last item still held");
+}
+
+/// The buttons labeled `label` (rows' names, wider than their icons) in
+/// the creature's window at the left, or the chest's at the right, top to
+/// bottom.
+fn named_rows(h: &Harness<'_, Moonglow>, label: &str, right: bool) -> Vec<egui::Rect> {
+    let mut rows: Vec<egui::Rect> = h
+        .query_all_by_label(label)
+        .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+        .map(|n| n.rect())
+        .filter(|r| (r.left() > 920.0) == right && r.width() > 80.0)
+        .collect();
+    rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
+    rows
+}
+
+/// A click at `at` with `modifiers` held (Ctrl, Shift: a row added to
+/// those selected).
+fn click_with(h: &mut Harness<'_, Moonglow>, at: egui::Pos2, modifiers: egui::Modifiers) {
+    h.hover_at(at);
+    press(h, at, true, modifiers);
+    press(h, at, false, modifiers);
+    settle(h);
+}
+
+/// [`drag_pos`], and whether `label` showed while the pointer was held
+/// at `to`.
+fn drag_seeing(
+    h: &mut Harness<'_, Moonglow>,
+    from: egui::Pos2,
+    to: egui::Pos2,
+    label: &str,
+) -> bool {
+    h.hover_at(from);
+    h.run_steps(1);
+    press(h, from, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    for k in 1..=5 {
+        h.hover_at(from + (to - from) * (k as f32 / 5.0));
+        h.run_steps(1);
+    }
+    let seen = h.query_by_label(label).is_some();
+    press(h, to, false, egui::Modifiers::NONE);
+    settle(h);
+    seen
+}
+
+/// The bandit's backpack and the chest's list (beside it, at the right),
+/// with the chest's items and the bandit's lists, for the tests of several
+/// items at once.
+struct Several {
+    h: Harness<'static, Moonglow>,
+    area: ResRef,
+    git: ResKey,
+    chest: mg_edit::GffPath,
+    bandit: mg_edit::GffPath,
+}
+
+impl Several {
+    fn new(name: &str, held: &dyn Fn(&mg_rules::GameData) -> Vec<mg_gff::Struct>) -> Option<Self> {
+        let (mut h, area) = area_ui_harness(name)?;
+        let git = ResKey::new(area, ResType::GIT);
+        let chest = chest_of_three(&mut h, area);
+        let bandit = bandit_holding(&mut h, area, held);
+        let tab = Tab::Instance { area, path: chest.clone() };
+        h.state_mut().blueprint_pages.insert((git, chest.clone()), "Inventory");
+        h.state_mut().actions.push(mg_ui::Action::OpenTab(tab.clone()));
+        settle(&mut h);
+        // (Tall enough for the palette and the chest's rows under it.)
+        own_window(&mut h, &tab, egui::pos2(920.0, 40.0), egui::vec2(560.0, 1000.0));
+        settle(&mut h);
+        Some(Several { h, area, git, chest, bandit })
+    }
+
+    fn in_chest(&mut self) -> Vec<mg_gff::Struct> {
+        let ws = self.h.state_mut().ws.as_mut().unwrap();
+        let root = &ws.doc(&self.git).unwrap().root;
+        self.chest.get(root).unwrap().list("ItemList").unwrap_or(&[]).to_vec()
+    }
+
+    fn tags_in_chest(&mut self) -> Vec<String> {
+        self.in_chest().iter().map(tag).collect()
+    }
+
+    fn creature(&mut self) -> (Vec<mg_gff::Struct>, Vec<mg_gff::Struct>) {
+        creature_items(&mut self.h, self.area, &self.bandit)
+    }
+
+    fn all(&mut self) -> ((Vec<mg_gff::Struct>, Vec<mg_gff::Struct>), Vec<mg_gff::Struct>) {
+        (self.creature(), self.in_chest())
+    }
+
+    /// The step Undo would take back.
+    fn last_step(&self) -> Option<&str> {
+        self.h.state().ws.as_ref().unwrap().can_undo()
+    }
+
+    fn undo(&mut self) {
+        self.h.state_mut().actions.push(mg_ui::Action::Undo);
+        settle(&mut self.h);
+    }
+
+    /// The chest's row `n` (from the top).
+    fn chest_row(&self, n: usize) -> egui::Pos2 {
+        named_rows(&self.h, "Longsword", true)[n].center()
+    }
+
+    /// Where the creature's backpack takes a drop: under its heading.
+    fn backpack(&self) -> egui::Pos2 {
+        let heading = self
+            .h
+            .query_all_by_label("Backpack")
+            .map(|n| n.rect())
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap();
+        heading.left_bottom() + egui::vec2(80.0, 40.0)
+    }
+
+    /// The creature's slot named `slot`.
+    fn slot(&self, slot: &str) -> egui::Pos2 {
+        let r = self.h.query_all_by_label(slot).map(|n| n.rect());
+        r.min_by(|a, b| a.left().total_cmp(&b.left())).unwrap().center()
+    }
+}
+
+/// An item's tag.
+fn tag(item: &mg_gff::Struct) -> String {
+    String::from_utf8_lossy(item.string("Tag").unwrap_or_default()).into_owned()
+}
+
+/// Several of a creature's items selected (its armor, then two of its
+/// backpack's, with Ctrl) and dragged onto a chest's list go in all,
+/// in their order (the slots', then the backpack's), each as it is, taken
+/// from the creature in one step, "Move 3 items"; the count shows beside
+/// the pointer while they are dragged. A row not selected is dragged
+/// alone, as before.
+#[test]
+fn several_items_dragged_onto_a_chest_go_in_their_order() {
+    let held = |game: &mg_rules::GameData| {
+        vec![
+            own_item(game, "nw_it_mneck020", 0, ("MG_AMULET", "Amulet Probe")),
+            own_item(game, "nw_it_torch001", 1, ("MG_TORCH", "Torch Probe")),
+            own_item(game, "nw_it_mring022", 2, ("MG_RING", "Ring Probe")),
+        ]
+    };
+    let Some(mut s) = Several::new("several-to-chest", &held) else { return };
+    let before = s.all();
+    let armor = before.0.0.iter().find(|i| i.id == 0x2).unwrap().clone();
+    let (amulet, ring) = (before.0.1[0].clone(), before.0.1[2].clone());
+    let armor_row = named_rows(&s.h, "Padded Armor", false)[0].center();
+    click_with(&mut s.h, armor_row, egui::Modifiers::NONE);
+    for name in ["Ring Probe", "Amulet Probe"] {
+        let at = named_rows(&s.h, name, false)[0].center();
+        click_with(&mut s.h, at, egui::Modifiers::COMMAND);
+    }
+    s.h.get_by_label("Selected Items: 3");
+    // Dragged by the ring onto the chest's last row.
+    let from = named_rows(&s.h, "Ring Probe", false)[0].center();
+    let to = s.chest_row(2);
+    assert!(drag_seeing(&mut s.h, from, to, "3 items"), "the count beside the pointer");
+    let held = s.in_chest();
+    assert_eq!(held.len(), 6, "all three: {:?}", s.h.state().log.entries);
+    for (moved, was) in held[3..].iter().zip([&armor, &amulet, &ring]) {
+        assert_eq!(as_held_anywhere(moved), as_held_anywhere(was), "as it is, in order");
+    }
+    let (worn, pack) = s.creature();
+    assert!(!worn.iter().any(|i| i.id == 0x2), "the armor taken off");
+    assert_eq!(pack.iter().map(tag).collect::<Vec<_>>(), ["MG_TORCH"], "the two taken out");
+    assert_eq!(s.last_step(), Some("Move 3 items"));
+    s.undo();
+    assert_eq!(s.all(), before, "one step");
+    // A row not among those selected: dragged alone.
+    let armor_row = named_rows(&s.h, "Padded Armor", false)[0].center();
+    click_with(&mut s.h, armor_row, egui::Modifiers::NONE);
+    let at = named_rows(&s.h, "Amulet Probe", false)[0].center();
+    click_with(&mut s.h, at, egui::Modifiers::COMMAND);
+    let from = named_rows(&s.h, "Torch Probe", false)[0].center();
+    let to = s.chest_row(2);
+    assert!(!drag_seeing(&mut s.h, from, to, "2 items"), "one item: no count");
+    assert_eq!(s.tags_in_chest(), ["ITEM_A", "ITEM_B", "ITEM_C", "MG_TORCH"]);
+    assert_eq!(s.last_step(), Some("Move item"));
+}
+
+/// The other way, between the two windows: a chest's rows selected (a
+/// click, then Shift) and dragged into a creature's backpack go in, in
+/// their order, as they are, taken from the chest in one step; dragged
+/// within the chest onto a row, they move before it together.
+#[test]
+fn several_chest_items_dragged_into_a_backpack() {
+    let Some(mut s) = Several::new("several-to-backpack", &|_| Vec::new()) else { return };
+    let before = s.all();
+    // Within the chest: the second and third before the first.
+    let (b, c) = (s.chest_row(1), s.chest_row(2));
+    click_with(&mut s.h, b, egui::Modifiers::NONE);
+    click_with(&mut s.h, c, egui::Modifiers::SHIFT);
+    let (from, to) = (s.chest_row(2), s.chest_row(0));
+    drag_seeing(&mut s.h, from, to, "2 items");
+    assert_eq!(s.tags_in_chest(), ["ITEM_B", "ITEM_C", "ITEM_A"], "moved together");
+    assert_eq!(s.last_step(), Some("Move 2 items"));
+    s.undo();
+    assert_eq!(s.all(), before, "one step");
+    // Into the bandit's backpack.
+    let (a, c) = (s.chest_row(0), s.chest_row(2));
+    click_with(&mut s.h, a, egui::Modifiers::NONE);
+    click_with(&mut s.h, c, egui::Modifiers::COMMAND);
+    let (from, to) = (s.chest_row(2), s.backpack());
+    assert!(drag_seeing(&mut s.h, from, to, "2 items"));
+    let (_, pack) = s.creature();
+    assert_eq!(pack.len(), 2, "carried: {:?}", s.h.state().log.entries);
+    for (moved, was) in pack.iter().zip([&before.1[0], &before.1[2]]) {
+        assert_eq!(as_held_anywhere(moved), as_held_anywhere(was), "as it is, in order");
+    }
+    // Each at a place of its own in the grid.
+    let place = |i: &mg_gff::Struct| (i.integer("Repos_PosX"), i.integer("Repos_Posy"));
+    assert_ne!(place(&pack[0]), place(&pack[1]));
+    assert_eq!(s.tags_in_chest(), ["ITEM_B"], "taken from the chest");
+    assert_eq!(s.last_step(), Some("Move 2 items"));
+    s.undo();
+    assert_eq!(s.all(), before, "one step");
+}
+
+/// Several dropped on a slot: the one the drag began on goes in it where
+/// it fits (else the first of them that does), the rest from another
+/// object into the backpack after what the slot held, one step; none
+/// fitting, nothing changes and the log says so. The Missing Feats
+/// question asks about the one for the slot: No leaves all where they
+/// were, Yes moves all, one step. The creature's own others stay put.
+#[test]
+fn several_items_dropped_on_a_slot() {
+    use mg_edit::{Command, Edit};
+    let held = |game: &mg_rules::GameData| {
+        vec![
+            own_item(game, "nw_it_mneck020", 0, ("MG_AMULET", "Amulet Probe")),
+            own_item(game, "nw_it_mring022", 1, ("MG_RING", "Ring Probe")),
+        ]
+    };
+    let Some(mut s) = Several::new("several-on-a-slot", &held) else { return };
+    let featless = Edit::SetField {
+        key: s.git,
+        path: s.bandit.clone(),
+        label: "FeatList".into(),
+        value: Some(mg_gff::Value::List(Vec::new())),
+    };
+    s.h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("No feats", vec![featless])));
+    settle(&mut s.h);
+    let before = s.all();
+    let own_sword = before.0.0.iter().find(|i| i.id == 0x10).unwrap().clone();
+    // All three of the chest's selected.
+    let (a, c) = (s.chest_row(0), s.chest_row(2));
+    click_with(&mut s.h, a, egui::Modifiers::NONE);
+    click_with(&mut s.h, c, egui::Modifiers::SHIFT);
+    // On the helmet's slot: none goes there.
+    let (from, to) = (s.chest_row(1), s.slot("Helmet"));
+    drag_seeing(&mut s.h, from, to, "3 items");
+    assert_eq!(s.all(), before, "nothing changed");
+    let said = s.h.state().log.entries.iter().any(|(_, m)| m.contains("None of the 3 items"));
+    assert!(said, "{:?}", s.h.state().log.entries);
+    // On the primary weapon's slot: the creature lacks the feat; No.
+    let (from, to) = (s.chest_row(1), s.slot("Primary Weapon"));
+    drag_seeing(&mut s.h, from, to, "3 items");
+    assert!(s.h.query_by_label("Missing Feats").is_some(), "asked");
+    settle(&mut s.h);
+    assert!(s.h.query_by_label("Missing Feats").is_some(), "still asked a frame later");
+    s.h.get_by_label("No").click();
+    settle(&mut s.h);
+    assert_eq!(s.all(), before, "No: all where they were");
+    // Again, Yes: the second sword (the one dragged) worn, the bandit's own
+    // to the backpack, the first and third after it.
+    let (from, to) = (s.chest_row(1), s.slot("Primary Weapon"));
+    drag_seeing(&mut s.h, from, to, "3 items");
+    s.h.get_by_label("Yes").click();
+    settle(&mut s.h);
+    let (worn, pack) = s.creature();
+    let on = worn.iter().find(|i| i.id == 0x10).expect("a primary weapon");
+    assert_eq!(tag(on), "ITEM_B", "{:?}", s.h.state().log.entries);
+    let tags: Vec<_> = pack.iter().map(tag).collect();
+    assert_eq!(tags, ["MG_AMULET", "MG_RING", &tag(&own_sword), "ITEM_A", "ITEM_C"]);
+    assert_eq!(as_held_anywhere(&pack[2]), as_held_anywhere(&own_sword), "its own, as it is");
+    assert!(s.in_chest().is_empty(), "all taken from the chest");
+    assert_eq!(s.last_step(), Some("Move 3 items"));
+    s.undo();
+    assert_eq!(s.all(), before, "one step");
+    // The creature's own ring and amulet dragged by the ring onto the
+    // amulet's slot: the amulet goes in it, the ring stays.
+    let at = named_rows(&s.h, "Amulet Probe", false)[0].center();
+    click_with(&mut s.h, at, egui::Modifiers::NONE);
+    let at = named_rows(&s.h, "Ring Probe", false)[0].center();
+    click_with(&mut s.h, at, egui::Modifiers::COMMAND);
+    let (from, to) = (named_rows(&s.h, "Ring Probe", false)[0].center(), s.slot("Amulet"));
+    drag_seeing(&mut s.h, from, to, "2 items");
+    let (worn, pack) = s.creature();
+    let on = worn.iter().find(|i| i.id == 0x200).expect("an amulet");
+    assert_eq!(tag(on), "MG_AMULET", "{:?}", s.h.state().log.entries);
+    assert_eq!(pack.iter().map(tag).collect::<Vec<_>>(), ["MG_RING"], "the ring stays");
+}
+
+/// Copy and Cut carry the rows selected (a row's menu, or Ctrl+X over
+/// the list), in their order, as they are; Paste adds them all, in one
+/// step, "Paste 2 items". A row's menu on a row not selected copies that
+/// row alone. Cut takes them all in one step.
+#[test]
+fn several_items_copied_cut_and_pasted() {
+    let Some(mut s) = Several::new("several-copied", &|_| Vec::new()) else { return };
+    let before = s.all();
+    let (a, c) = (s.chest_row(0), s.chest_row(2));
+    click_with(&mut s.h, a, egui::Modifiers::NONE);
+    click_with(&mut s.h, c, egui::Modifiers::COMMAND);
+    // Copy, from the third's menu (the chest's rows at the right).
+    let row = s.chest_row(2);
+    s.h.hover_at(row);
+    for pressed in [true, false] {
+        s.h.event(egui::Event::PointerButton {
+            pos: row,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    settle(&mut s.h);
+    let menu: Vec<_> = s.h.query_all_by_label("Cut").map(|n| n.rect()).collect();
+    assert!(!menu.is_empty(), "Cut in the row's menu");
+    s.h.get_by_label("Copy").click();
+    settle(&mut s.h);
+    let clip: Vec<_> = s.h.state().item_clip.iter().map(tag).collect();
+    assert_eq!(clip, ["ITEM_A", "ITEM_C"], "both, in their order");
+    // Pasted into the bandit's backpack.
+    let paste =
+        s.h.query_all_by_label("Paste (2)")
+            .map(|n| n.rect())
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .expect("the backpack's Paste");
+    click_pos(&s.h, paste.center());
+    settle(&mut s.h);
+    let (_, pack) = s.creature();
+    assert_eq!(pack.iter().map(tag).collect::<Vec<_>>(), ["ITEM_A", "ITEM_C"]);
+    assert_eq!(as_held_anywhere(&pack[1]), as_held_anywhere(&before.1[2]), "as it is");
+    assert_eq!(s.last_step(), Some("Paste 2 items"));
+    assert_eq!(s.in_chest().len(), 3, "copies: the chest keeps them");
+    s.undo();
+    assert_eq!(s.all(), before, "one step");
+    // Copy on the second, not selected: that one alone.
+    let row = s.chest_row(1);
+    menu_of_at(&mut s.h, row, "Copy");
+    let clip: Vec<_> = s.h.state().item_clip.iter().map(tag).collect();
+    assert_eq!(clip, ["ITEM_B"]);
+    // Cut, from the first's menu: both selected, taken in one step.
+    let row = s.chest_row(0);
+    menu_of_at(&mut s.h, row, "Cut");
+    assert_eq!(s.tags_in_chest(), ["ITEM_B"], "{:?}", s.h.state().log.entries);
+    let clip: Vec<_> = s.h.state().item_clip.iter().map(tag).collect();
+    assert_eq!(clip, ["ITEM_A", "ITEM_C"]);
+    assert_eq!(s.last_step(), Some("Cut 2 items"));
+    // Pasted back into the chest (its Paste, at the right): three rows
+    // again, and the places selected before the Cut not selected again
+    // (they hold other items now). Copy on the first copies it alone.
+    let paste =
+        s.h.query_all_by_label("Paste (2)")
+            .map(|n| n.rect())
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .expect("the chest's Paste");
+    click_pos(&s.h, paste.center());
+    settle(&mut s.h);
+    assert_eq!(s.tags_in_chest(), ["ITEM_B", "ITEM_A", "ITEM_C"]);
+    let row = s.chest_row(0);
+    menu_of_at(&mut s.h, row, "Copy");
+    let clip: Vec<_> = s.h.state().item_clip.iter().map(tag).collect();
+    assert_eq!(clip, ["ITEM_B"], "no selection left from before");
+    s.undo();
+    s.undo();
+    assert_eq!(s.all(), before, "one step each");
+    // Ctrl+X (the Cut event) over the list: the one selected.
+    let b = s.chest_row(1);
+    click_with(&mut s.h, b, egui::Modifiers::NONE);
+    s.h.hover_at(b);
+    s.h.event(egui::Event::Cut);
+    settle(&mut s.h);
+    assert_eq!(s.tags_in_chest(), ["ITEM_A", "ITEM_C"]);
+    assert_eq!(s.last_step(), Some("Cut item"));
+    assert!(s.creature().1.is_empty(), "the creature's lists not cut");
+}
+
+/// Opens the context menu of the row at `row` and clicks its `choice`
+/// (the menu's: not there before it opened; it may open above the row,
+/// near the window's foot).
+fn menu_of_at(h: &mut Harness<'_, Moonglow>, row: egui::Pos2, choice: &str) {
+    let before: Vec<egui::Rect> = h.query_all_by_label(choice).map(|n| n.rect()).collect();
+    h.hover_at(row);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: row,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    settle(h);
+    let item = h
+        .query_all_by_label(choice)
+        .map(|n| n.rect())
+        .filter(|r| !before.contains(r))
+        .min_by(|a, b| a.center().distance(row).total_cmp(&b.center().distance(row)))
+        .unwrap_or_else(|| panic!("no {choice} in the menu"));
+    click_pos(h, item.center());
+    settle(h);
+}
+
+/// A store's page selects several (a click, then Ctrl) and cuts them
+/// together (Ctrl+X over the page): both copied, in their order, taken
+/// in one step.
+#[test]
+fn a_store_s_items_are_cut_together() {
+    let Some((mut h, key)) = blueprint_harness("nw_storebar01", "store_cut", ResType::UTM) else {
+        return;
+    };
+    settle(&mut h);
+    h.get_by_label("Inventory…").click();
+    settle(&mut h);
+    let page = |h: &mut Harness<'_, Moonglow>| -> Vec<mg_gff::Struct> {
+        let s = field(h, &key);
+        let pages = s.list("StoreList").unwrap();
+        pages.iter().find_map(|p| p.list("ItemList").filter(|l| l.len() >= 2)).unwrap().to_vec()
+    };
+    let before = field(&mut h, &key);
+    let held = page(&mut h);
+    // (The page shown first: the first with items, which has two or more.)
+    let mut rows: Vec<egui::Rect> = h
+        .query_all_by_label_contains(" gp")
+        .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+        .map(|n| n.rect())
+        .collect();
+    rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
+    assert!(rows.len() >= 2, "rows: {rows:?}");
+    click_with(&mut h, rows[0].center(), egui::Modifiers::NONE);
+    click_with(&mut h, rows[1].center(), egui::Modifiers::COMMAND);
+    h.hover_at(rows[1].center());
+    h.event(egui::Event::Cut);
+    settle(&mut h);
+    let ws = h.state().ws.as_ref().unwrap();
+    assert_eq!(ws.can_undo(), Some("Cut 2 items"), "{:?}", h.state().log.entries);
+    assert_eq!(h.state().item_clip, held[..2].to_vec(), "both, as they are, in order");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    settle(&mut h);
+    assert_eq!(field(&mut h, &key), before, "one step");
 }

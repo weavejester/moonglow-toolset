@@ -13,7 +13,9 @@ use mg_module::palette::{BlueprintKind, Palette, PaletteNode};
 use mg_resman::ResKey;
 use mg_rules::GameData;
 use mg_rules::item_wizard::{self, Magical};
+use mg_uikit::Controls as _;
 
+use crate::widgets::ResRefText;
 use crate::{Action, Moonglow, Tab};
 use mg_module::project_file::Naming;
 
@@ -139,6 +141,9 @@ pub struct BlueprintWizard {
     pub item_level: Option<u8>,
     pub item_quality: Option<u8>,
     pub seed: u64,
+    /// Fields the blueprint is made with, over the wizard's own (the
+    /// appearance an Appearance Gallery's double click gives it).
+    pub given: Vec<(&'static str, mg_gff::Value)>,
 }
 
 impl BlueprintWizard {
@@ -164,7 +169,21 @@ impl BlueprintWizard {
             item_level: None,
             item_quality: None,
             seed: fastrand::u64(..),
+            given: Vec::new(),
         }
+    }
+
+    /// The wizard making its blueprint with `fields` (an appearance), named
+    /// `name` where that isn't empty (the name typed: it doesn't follow
+    /// the category), its Properties opened after.
+    pub fn given(mut self, fields: Vec<(&'static str, mg_gff::Value)>, name: &str) -> Self {
+        self.given = fields;
+        if !name.trim().is_empty() {
+            self.name = name.trim().to_string();
+            self.named = true;
+        }
+        self.launch = true;
+        self
     }
 
     fn page(&self) -> Step {
@@ -211,8 +230,16 @@ impl BlueprintWizard {
         taken: impl Fn(&ResRef) -> bool,
     ) -> (ResRef, mg_gff::Gff) {
         let name = self.name.trim();
+        // The ResRef typed, unless the module has it by now (it is checked
+        // on the Name page, which isn't every kind's last, and the window
+        // doesn't block): then the next free one from it, as the Creature
+        // Wizard takes, and no blueprint is replaced.
         let own = ResRef::from_str(self.resref.trim()).ok().filter(|r| !r.is_empty());
-        let resref = own.unwrap_or_else(|| blueprints::resref_named(name, naming, taken));
+        let resref = match own {
+            Some(r) if !taken(&r) => r,
+            Some(r) => blueprints::resref_named(&r.to_string(), naming, &taken),
+            None => blueprints::resref_named(name, naming, &taken),
+        };
         let category = self.category.unwrap_or(0);
         let mut g = match self.kind {
             BlueprintKind::Waypoint => {
@@ -241,6 +268,9 @@ impl BlueprintWizard {
             }
             BlueprintKind::Creature => unreachable!("the Creature Wizard's own window"),
         };
+        for (label, value) in &self.given {
+            g.root.set(label, value.clone());
+        }
         let tag = self.tag.trim();
         if !tag.is_empty() {
             g.root.set("Tag", mg_gff::Value::String(crate::text::encode(tag)));
@@ -254,12 +284,22 @@ impl BlueprintWizard {
 /// and 1 (the empty "assign" branch, and the creatures' Familiars and
 /// Summoned Monsters: Aurora's Creature Wizard offers Monsters, NPCs,
 /// Special and Tutorial, captured 2026-10-30).
-pub(crate) fn categories(game: &GameData, kind: BlueprintKind) -> Vec<PaletteNode> {
-    let skeleton = game
-        .resman
-        .get_named(&format!("{}pal", kind.name()), ResType::ITP)
-        .ok()
-        .and_then(|d| mg_gff::Gff::read(&d).ok())
+///
+/// Of the skeleton the palettes go by (`mg_module::palette::skeleton`):
+/// the module's own where it has one (as it is now, its categories just
+/// changed too), else the load order's.
+pub(crate) fn categories(
+    game: &GameData,
+    module: Option<&mg_module::Module>,
+    kind: BlueprintKind,
+) -> Vec<PaletteNode> {
+    let skeleton = match module {
+        Some(m) => mg_module::palette::skeleton(m, game, kind).ok(),
+        None => {
+            (game.resman.get(&kind.skeleton_key()).ok()).and_then(|d| mg_gff::Gff::read(&d).ok())
+        }
+    };
+    let skeleton = skeleton
         .map(|mut g| {
             if let Some(main) = g.root.list_mut("MAIN") {
                 main.retain(|n| !matches!(n.integer("TYPE"), Some(0 | 1)));
@@ -305,6 +345,7 @@ pub(crate) fn category_tree(
             }
             _ => {
                 egui::CollapsingHeader::new(&name)
+                    .icon(mg_uikit::collapsing_icon)
                     .id_salt(("wizard-category", &name))
                     .show(ui, |ui| category_tree(ui, &n.children, game, chosen));
             }
@@ -333,10 +374,8 @@ fn magic_ui(ui: &mut Ui, w: &mut BlueprintWizard, game: &GameData) {
     let offered = w.base_item.is_some_and(|b| item_wizard::offered(game, b));
     w.magical &= offered;
     ui.add_space(6.0);
-    ui.add_enabled(offered, egui::Checkbox::new(&mut w.magical, "Magical")).on_hover_text(
-        "Make this a magical item: random properties for the item level and quality, from the \
-         toolset's tables for its kind of item",
-    );
+    ui.add_enabled(offered, mg_uikit::Checkbox::new(&mut w.magical, "Magical"))
+        .on_hover_text("Give the item random magic properties for its level and quality");
     ui.add_enabled_ui(w.magical, |ui| {
         egui::Grid::new("item-wizard-magic").num_columns(2).spacing([40.0, 2.0]).show(ui, |ui| {
             crate::widgets::field_label(ui, "Item Level")
@@ -348,16 +387,60 @@ fn magic_ui(ui: &mut Ui, w: &mut BlueprintWizard, game: &GameData) {
                 item_wizard::LEVELS.iter().zip(item_wizard::QUALITIES).enumerate()
             {
                 let i = i as u8;
-                if ui.radio(w.item_level == Some(i), *level).clicked() {
+                if ui.radio_button(w.item_level == Some(i), *level).clicked() {
                     w.item_level = Some(i);
                 }
-                if ui.radio(w.item_quality == Some(i), quality).clicked() {
+                if ui.radio_button(w.item_quality == Some(i), quality).clicked() {
                     w.item_quality = Some(i);
                 }
                 ui.end_row();
             }
         });
     });
+}
+
+/// A wizard's footer where Finish needs `ok` (the last page's choices
+/// made): [`crate::creature_wizard::wizard_foot`] with Finish held off
+/// until then.
+pub(crate) fn finish_foot(back: bool, next: bool, last: bool, ok: bool) -> crate::widgets::Foot {
+    let foot = crate::widgets::Foot::new().button("< Back", back);
+    let foot = match last {
+        false => foot.main("Next >", next).button("Finish", false),
+        true => foot.button("Next >", false).main("Finish", ok),
+    };
+    foot.cancel()
+}
+
+/// The page's icon and its title (the step list's and the page bar's).
+fn page_bar_of(step: Step) -> (mg_uikit::Icon, &'static str) {
+    use mg_uikit::Icon;
+    match step {
+        Step::ItemType => (Icon::Item, "Item Type"),
+        Step::WaypointTag => (Icon::Waypoint, "Waypoint"),
+        Step::Timing => (Icon::Timeline, "Timing"),
+        Step::Positioning => (Icon::Compass, "Positioning"),
+        Step::Waves => (Icon::Sound, "Wave List"),
+        Step::Creatures => (Icon::Creature, "Creature List"),
+        Step::Category => (Icon::Palette, "Assign Palette Category"),
+        Step::Name => (Icon::Tag, "Name"),
+    }
+}
+
+/// The wizard's step list: the pages before the one shown done, it
+/// current, those after to come.
+fn step_list(ui: &mut Ui, w: &BlueprintWizard) {
+    use mg_uikit::dialog::{StepList, StepState};
+    let pages = steps(w.kind);
+    let mut list = StepList::new(format!("Step {} of {}", w.step + 1, pages.len()));
+    for (i, step) in pages.iter().enumerate() {
+        let state = match i.cmp(&w.step) {
+            std::cmp::Ordering::Less => StepState::Done,
+            std::cmp::Ordering::Equal => StepState::Current,
+            std::cmp::Ordering::Greater => StepState::ToCome,
+        };
+        list = list.step(page_bar_of(*step).1, state);
+    }
+    let _ = list.show(ui);
 }
 
 /// The open blueprint wizard.
@@ -370,19 +453,44 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     let mut close = false;
     let mut finish = false;
     let title = format!("{} Wizard", w.kind.label().trim_end_matches('s'));
-    crate::widgets::modal(&ctx, &title).show(&ctx, |ui| {
-        ui.set_min_width(420.0);
+    let footed = crate::widgets::modal(&ctx, &title)
+        .resizable(true)
+        .default_size([640.0, 460.0])
+        .min_size([520.0, 380.0])
+        .flush()
+        .show_foot(&ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if crate::widgets::step_list_fits(ui) {
+                    step_list(ui, &w);
+                }
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let (icon, name) = page_bar_of(w.page());
+                    mg_uikit::dialog::page_bar(ui, Some(icon), name);
+                    let pad = mg_uikit::dialog::PAGE_PADDING;
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(pad.x as i8, pad.y as i8))
+                        .show(ui, |ui| {
+                            ui.set_min_size(ui.available_size());
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         let key_taken = |app: &Moonglow, r: &ResRef| {
             app.ws.as_ref().is_some_and(|ws| ws.module.contains(&ResKey::new(*r, w.kind.restype())))
         };
         let naming = naming(app, w.kind.restype());
         match w.page() {
             Step::ItemType => {
-                ui.heading("Item Type");
                 ui.label("Please choose the type of item you wish to create");
-                let types = item_types(app.game.as_deref().expect("checked"));
+                let game = app.game.as_deref().expect("checked");
+                let types = crate::blueprint::kept_for_key(
+                    ui.ctx(),
+                    egui::Id::new("blueprint-wizard-item-types"),
+                    &app.game_names(),
+                    || std::sync::Arc::new(item_types(game)),
+                );
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    for (row, name) in types {
+                    mg_uikit::list_rows(ui);
+                    for &(row, ref name) in types.iter() {
                         if ui.selectable_label(w.base_item == Some(row), name).clicked() {
                             w.base_item = Some(row);
                         }
@@ -390,10 +498,9 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 });
             }
             Step::WaypointTag => {
-                ui.heading("Waypoint Wizard");
                 egui::Grid::new("wizard-waypoint").num_columns(2).show(ui, |ui| {
                     crate::widgets::field_label(ui, "Tag");
-                    ui.text_edit_singleline(&mut w.name);
+                    ui.add(mg_uikit::text_field(&mut w.name));
                     ui.end_row();
                     crate::widgets::field_label(ui, "Appearance");
                     let looks = crate::widgets::table_choices(
@@ -411,14 +518,13 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 });
             }
             Step::Timing => {
-                ui.heading("Timing");
                 ui.label("Choose how you want the Sound Object to play.");
-                if ui.radio(w.looping == Some(true), "Seamlessly looping").clicked() {
+                if ui.radio_button(w.looping == Some(true), "Seamlessly looping").clicked() {
                     w.looping = Some(true);
                     w.sounds.clear();
                 }
                 ui.weak("One wave that seamlessly repeats over and over again with no breaks");
-                if ui.radio(w.looping == Some(false), "Single-shot(s)").clicked() {
+                if ui.radio_button(w.looping == Some(false), "Single-shot(s)").clicked() {
                     w.looping = Some(false);
                     w.sounds.clear();
                 }
@@ -427,7 +533,6 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 );
             }
             Step::Positioning => {
-                ui.heading("Positioning");
                 ui.label("Choose where you would like this Sound Object to play from.");
                 let single = w.looping == Some(false);
                 if w.positioning == Some(Positioning::Random) && !single {
@@ -441,7 +546,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                     if ui
                         .add_enabled(
                             enabled,
-                            egui::RadioButton::new(w.positioning == Some(p), text),
+                            mg_uikit::RadioButton::new(w.positioning == Some(p), text),
                         )
                         .clicked()
                     {
@@ -450,7 +555,6 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 }
             }
             Step::Waves => {
-                ui.heading("Wave List");
                 ui.label("Select the Wave files that this Sound Object will play");
                 let pick_id = egui::Id::new("wizard-waves");
                 if let Some(r) = app.take_pick(pick_id).filter(|r| !r.is_empty()) {
@@ -481,7 +585,6 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 }
             }
             Step::Creatures => {
-                ui.heading("Creature List");
                 ui.label("Select the creatures that this Encounter can spawn.");
                 let add = crate::blueprint::picker::palette_picker(
                     app,
@@ -509,12 +612,24 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 }
             }
             Step::Category => {
-                ui.heading("Assign Palette Category");
                 ui.label("Choose the palette category that this new blueprint should appear under");
                 let game = app.game.as_deref().expect("checked");
-                let nodes = categories(game, w.kind);
+                // (Read and sorted once for the load order, the module as it
+                // is and the type: it was every frame the page showed.)
+                let module = app.ws.as_ref().map(|ws| &ws.module);
+                let mark = (
+                    app.load_order,
+                    w.kind.label(),
+                    app.ws.as_ref().map(|ws| (ws.identity(), ws.revision())),
+                );
+                let id = egui::Id::new("blueprint-wizard-categories");
+                let nodes: std::sync::Arc<Vec<PaletteNode>> =
+                    crate::blueprint::kept_for_key(ui.ctx(), id, &mark, || {
+                        std::sync::Arc::new(categories(game, module, w.kind))
+                    });
                 let before = w.category;
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    mg_uikit::list_rows(ui);
                     category_tree(ui, &nodes, game, &mut w.category);
                 });
                 // The suggested name follows the category.
@@ -524,16 +639,12 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                     && w.kind != BlueprintKind::Waypoint
                     && let Some(name) = w.category.and_then(|id| category_name(&nodes, id, game))
                 {
-                    w.name = (1..)
-                        .map(|n| blueprints::default_name(&name, n))
-                        .find(|s| !key_taken(app, &blueprints::resref_named(s, &naming, |_| false)))
-                        .expect("a free name");
+                    w.name = blueprints::suggested_name(&name, &naming, |r| key_taken(app, r));
                 }
             }
             Step::Name => {
-                ui.heading("Name");
                 ui.label("Please enter a name for the new blueprint");
-                let edit = egui::TextEdit::singleline(&mut w.name).hint_text("Name");
+                let edit = mg_uikit::text_field(&mut w.name).hint_text("Name");
                 let field = ui.add(edit);
                 crate::widgets::autofocus(ui, &field);
                 if field.changed() {
@@ -548,7 +659,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 egui::Grid::new("bw-names").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                     crate::widgets::field_label(ui, "ResRef");
                     ui.add(
-                        egui::TextEdit::singleline(&mut w.resref)
+                        crate::widgets::resref_edit(&mut ResRefText(&mut w.resref))
                             .hint_text(made.to_string())
                             .desired_width(180.0),
                     )
@@ -556,8 +667,9 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                     ui.end_row();
                     crate::widgets::field_label(ui, "Tag");
                     ui.add(
-                        egui::TextEdit::singleline(&mut w.tag)
+                        mg_uikit::text_field(&mut w.tag)
                             .hint_text(blueprints::tag(w.name.trim()))
+                            .char_limit(mg_module::tags::MAX_TAG)
                             .desired_width(180.0),
                     )
                     .on_hover_text("Left empty: made from the name");
@@ -583,30 +695,30 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
                 }
             }
         }
-        if w.last() {
-            ui.checkbox(&mut w.launch, "Launch Properties Dialog");
-        }
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.add_enabled(w.step > 0, egui::Button::new("< Back")).clicked() {
-                w.step -= 1;
-            }
+        crate::widgets::focus_in_sight(ui);
+});
+                        });
+                });
+            });
             let ok = w.complete();
-            if ui.add_enabled(ok && !w.last(), egui::Button::new("Next >")).clicked()
-                || (ok && !w.last() && crate::widgets::enter(ui))
-            {
-                w.step += 1;
-            }
-            if ui.add_enabled(ok && w.last(), egui::Button::new("Finish")).clicked()
-                || (ok && w.last() && crate::widgets::enter(ui))
-            {
-                finish = true;
-            }
-            if crate::widgets::cancel(ui) {
-                close = true;
-            }
+            let foot = finish_foot(w.step > 0, ok && !w.last(), w.last(), ok);
+            let launch = w.launch;
+            ((), if w.last() { foot.check("Launch Properties Dialog", launch, None) } else { foot })
         });
-    });
+    if let Some(f) = footed {
+        if let Some(on) = f.pressed.checked {
+            w.launch = on;
+        }
+        // (Finish is the last page's main action as it was drawn: Next on
+        // the page before it is not.)
+        finish = w.last() && f.pressed.main();
+        if f.pressed.clicked("< Back") {
+            w.step -= 1;
+        } else if f.pressed.main() && !w.last() {
+            w.step += 1;
+        }
+        close = f.pressed.cancelled();
+    }
     if finish {
         let taken = |r: &ResRef| {
             app.ws.as_ref().is_some_and(|ws| ws.module.contains(&ResKey::new(*r, w.kind.restype())))
@@ -633,5 +745,56 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     }
     if !close {
         app.blueprint_wizard = Some(w);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ResRef typed that the module has by the time Finish is clicked
+    /// (free when the Name page checked it) is not taken as it is, which
+    /// replaced that blueprint (the review's B10): the next free one from
+    /// it is, as in the Creature Wizard.
+    /// The wizards list the categories of the skeleton the palettes go by:
+    /// the module's own where it has one (the review's B29: they read the
+    /// load order's by its name, whatever the module's was by then).
+    #[test]
+    fn the_wizards_categories_are_the_module_s_own_skeleton_s() {
+        use mg_gff::{Struct, Value};
+        let game =
+            GameData::new(mg_resman::ResMan::new(), mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let kind = BlueprintKind::Waypoint;
+        let mut skeleton = mg_gff::Gff::new(*b"ITP ");
+        let node = |id: u8, name: &str| {
+            let mut s = Struct::new(0);
+            s.set("ID", Value::Byte(id));
+            s.set("NAME", Value::String(name.as_bytes().to_vec()));
+            s
+        };
+        skeleton.root.set("MAIN", Value::List(vec![node(1, "Posts"), node(0, "Gates")]));
+        let mut m = mg_module::Module::new();
+        m.set_gff(kind.skeleton_key(), &skeleton).unwrap();
+        let names = |nodes: Vec<PaletteNode>| -> Vec<String> {
+            nodes.iter().map(|n| n.name.text(&game)).collect()
+        };
+        assert_eq!(names(categories(&game, Some(&m), kind)), ["Gates", "Posts"], "by name");
+        assert!(categories(&game, None, kind).is_empty(), "the load order has none");
+        assert!(categories(&game, Some(&mg_module::Module::new()), kind).is_empty());
+    }
+
+    #[test]
+    fn a_typed_resref_taken_by_finish_gives_the_next_free_one() {
+        let game =
+            GameData::new(mg_resman::ResMan::new(), mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let mut w = BlueprintWizard::new(BlueprintKind::Waypoint);
+        w.name = "Post".into();
+        w.resref = "wp_post".into();
+        let naming = Naming::default();
+        let (free, _) = w.build(&game, &naming, |_| false);
+        assert_eq!(free.to_string(), "wp_post");
+        let (next, g) = w.build(&game, &naming, |r| r.to_string() == "wp_post");
+        assert_eq!(next.to_string(), "wp_post001");
+        assert_eq!(g.root.resref("TemplateResRef"), Some(next));
     }
 }

@@ -39,10 +39,12 @@ fn a_plugin_s_command_runs_on_the_objects_selected_in_the_area() {
     let properties = h.get_all_by_label("Properties").last().unwrap().rect();
     assert!(command.bottom() <= properties.top(), "{command:?} {properties:?}");
     assert!(h.query_by_label("Count Objects").is_none(), "that one is for areas");
-    let img = h.render().expect("render");
-    let picture = mg_testkit::scratch_dir("ui-area-plugin-menu").join("menu.png");
-    img.save(&picture).unwrap();
-    eprintln!("the menu: {}", picture.display());
+    if let Some(dir) = shot_dir("ui-area-plugin-menu") {
+        let img = h.render().expect("render");
+        let picture = dir.join("menu.png");
+        img.save(&picture).unwrap();
+        eprintln!("the menu: {}", picture.display());
+    }
     h.state_mut().plugins.answers.push_back(set_local_answer());
     h.get_by_label("Set Local Variable…").click();
     h.run_steps(3);
@@ -86,10 +88,10 @@ fn a_plugin_acts_when_the_module_is_saved() {
     save(&mut h);
     assert!(said(&h).is_empty(), "{:?}", said(&h));
     h.state_mut().enable_plugin("example.tag-conventions", true);
-    h.state_mut().plugins.window = true;
-    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
+    settle(&mut h);
     h.get_by_label("By itself, when the module is saved: saved");
-    h.state_mut().plugins.window = false;
+    h.state_mut().actions.push(mg_ui::Action::CloseTabs(vec![mg_ui::Tab::Plugins]));
     // Nothing changed since the last save: nothing to say.
     save(&mut h);
     assert!(said(&h).is_empty(), "{:?}", said(&h));
@@ -107,7 +109,7 @@ fn a_plugin_acts_when_the_module_is_saved() {
     save(&mut h);
     assert_eq!(said(&h).len(), 1, "once for a change");
     // What a plugin's events were allowed is kept in the settings, by
-    // plugin and version, shown in the Plugins window and forgotten from
+    // plugin and version, shown in the Plugins tab and forgotten from
     // there, or when the plugin is enabled or disabled. (Another of the
     // plugins installed: this one's are what its events just did.)
     let (id, name) = (h.state().plugins.installed.iter())
@@ -122,7 +124,7 @@ fn a_plugin_acts_when_the_module_is_saved() {
     };
     grant(&mut h);
     assert_eq!(h.state().plugin_grants(&id), 1);
-    h.state_mut().plugins.window = true;
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
     h.run_steps(3);
     h.get_by_label("Allowed before, and not asked again: 1").scroll_to_me();
     h.run_steps(2);
@@ -194,11 +196,14 @@ fn a_plugin_is_off_until_enabled_and_its_command_is_one_undoable_step() {
     h.get_by_label("Plugins").click();
     h.run();
     assert!(h.query_by_label("Fix Creature Tags").is_none());
-    h.get_by_label("Manage Plugins…").click();
+    h.get_by_label("Manage Plugins").click();
     h.run();
     // The window says what each adds; enabling one is a tick.
     h.get_by_label_contains("cannot reach your files");
-    h.get_by_label_contains("Plugins are experimental: the plugin API (0.4)");
+    h.get_by_label_contains(&format!(
+        "Plugins are experimental: the plugin API ({})",
+        mg_plugin::API
+    ));
     h.get_by_label("Command: Fix Creature Tags");
     h.get_by_label("Check: Creature tags are upper case");
     // (The last of the four installed: below the list's fold.)
@@ -207,7 +212,7 @@ fn a_plugin_is_off_until_enabled_and_its_command_is_one_undoable_step() {
     h.get_by_label("Tag conventions 1.0.0").click();
     h.run();
     assert_eq!(h.state().settings.plugins_enabled, ["example.tag-conventions"]);
-    h.state_mut().plugins.window = false;
+    h.state_mut().actions.push(mg_ui::Action::CloseTabs(vec![mg_ui::Tab::Plugins]));
     h.run();
 
     // Its commands are in the Plugins menu; one runs as one undoable step.
@@ -238,16 +243,12 @@ fn a_plugin_is_off_until_enabled_and_its_command_is_one_undoable_step() {
     h.run();
     assert!(h.state().log.entries.iter().any(|(_, m)| m.contains("changed nothing")));
 
-    // The Command Palette finds it, under its plugin's name.
-    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P);
-    h.run();
-    type_into_hint(&mut h, "Type a command's name", "tag conv");
-    h.get_by_label("Promote the Guards");
-    // (Escape clears the name typed, and closes the palette next.)
+    // The Command Palette (Quick Open among the commands) finds it, under
+    // its plugin's name.
+    command_palette(&mut h, "tag conv");
+    quick_open_row(&h, "Promote the Guards");
     h.key_press(egui::Key::Escape);
-    h.run();
-    h.key_press(egui::Key::Escape);
-    h.run();
+    settle(&mut h);
     // And it takes a key like any command: listed with the plugins'.
     h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
     h.run();
@@ -364,6 +365,8 @@ fn variables(
 #[test]
 fn a_plugin_s_command_is_in_the_menus_of_what_it_is_for() {
     let Some((mut h, key)) = plugin_harness("ui-plugin-menus", false) else { return };
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
     // The area's objects: a chest.
     let git = ResKey::parse("start", ResType::GIT).unwrap();
     let mut placed = Gff::new(*b"GIT ");
@@ -406,7 +409,7 @@ fn a_plugin_s_command_is_in_the_menus_of_what_it_is_for() {
 
     // An area's row: its command above the Properties that end the menu,
     // run on the area.
-    h.get_by_label("start").click_secondary();
+    tree_row(&h, "start").click_secondary();
     h.run();
     assert!(h.query_by_label("Set Local Variable…").is_none(), "that one is for objects");
     let count = h.get_by_label("Count Objects").rect();
@@ -418,14 +421,206 @@ fn a_plugin_s_command_is_in_the_menus_of_what_it_is_for() {
     assert!(log.contains(&"Set local: start: 1 placeables".to_string()), "{log:#?}");
 
     // From the Plugins menu, with nothing selected: it says so. (And
-    // the Plugins window says which menus each is in.)
+    // the Plugins tab says which menus each is in.)
     h.state_mut().run_plugin_command("example.set-local", "set-local");
     h.run_steps(3);
     assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("A chest"), "nothing changed");
-    h.state_mut().plugins.window = true;
-    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
+    settle(&mut h);
     h.get_by_label_contains("Command: Set Local Variable (right-click: creature, door,");
     h.get_by_label("Command: Count Objects (right-click: area)");
+}
+
+/// A plugin's commands in submenus (API 0.7's `menu`), as TDoD's plugin
+/// asked for its dozen Make commands: in a right-click menu each
+/// submenu is made once, where its first command is, nested at each ›,
+/// its commands in the manifest's order; a command with no `menu` stays
+/// in the menu itself. The Plugins menu nests them the same way, and the
+/// Command Palette and the Plugins tab name each by its whole path.
+#[test]
+fn a_plugin_s_commands_are_grouped_into_submenus() {
+    let Some((mut h, _)) = plugin_harness("ui-plugin-submenus", false) else { return };
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
+    let dir = mg_testkit::scratch_dir("ui-plugin-submenus-plugins");
+    let plugin = dir.join("roles");
+    std::fs::create_dir_all(&plugin).unwrap();
+    let command = |id: &str, title: &str, menu: &str| {
+        let menu = if menu.is_empty() { String::new() } else { format!("menu = \"{menu}\"\n") };
+        format!("[command]\nid = \"{id}\"\ntitle = \"{title}\"\nfor = \"creature\"\n{menu}\n")
+    };
+    let cfg = [
+        "[plugin]\nid = \"test.roles\"\nname = \"Roles\"\nversion = \"1\"\napi = \"0.7\"\n\
+         license = \"MIT\"\n\n"
+            .to_string(),
+        command("workbench", "Workbench…", "Make › Crafting"),
+        command("crier", "Crier", "Make › Services"),
+        command("node", "Harvest Node…", "Make › Crafting"),
+        command("clear", "Clear Role", ""),
+    ]
+    .concat();
+    std::fs::write(plugin.join("plugin.cfg"), cfg).unwrap();
+    let mut luau = String::from("local mg = require(\"@moonglow\")\n");
+    for id in ["workbench", "crier", "node", "clear"] {
+        luau += &format!("mg.command(\"{id}\", function(ctx) ctx.log:info(\"ran {id}\") end)\n");
+    }
+    std::fs::write(plugin.join("main.luau"), luau).unwrap();
+    h.state_mut().plugin_dir = Some(dir);
+    h.state_mut().load_plugins();
+    h.state_mut().enable_plugin("test.roles", true);
+    h.run();
+    h.get_by_label_contains("Creatures (1)").click();
+    h.run();
+    let ran = |h: &Harness<'_, Moonglow>| {
+        let mut said = h.state().log.entries.iter().rev();
+        said.find_map(|(_, m)| m.strip_prefix("Roles: ran ").map(str::to_string))
+    };
+
+    // The right-click menu: Make once, then Clear Role.
+    h.get_by_label("guard.utc").click_secondary();
+    h.run();
+    let make = h.get_all_by_label("Make").count();
+    assert_eq!(make, 1, "one Make submenu");
+    assert!(h.query_by_label("Workbench…").is_none(), "inside Make");
+    let (make, clear) = (h.get_by_label("Make").rect(), h.get_by_label("Clear Role").rect());
+    assert!(make.bottom() <= clear.top(), "Make where its first command is: {make:?} {clear:?}");
+    open_submenu(&mut h, "Make");
+    let items = menu_items(&h, "Services");
+    assert_eq!(items, ["Crafting", "Services"], "each once, in the manifest's order");
+    open_submenu(&mut h, "Crafting");
+    let items = menu_items(&h, "Workbench…");
+    assert_eq!(items, ["Workbench…", "Harvest Node…"]);
+    h.get_by_label("Harvest Node…").click();
+    h.run_steps(3);
+    assert_eq!(ran(&h).as_deref(), Some("node"));
+
+    // The Plugins menu: nested the same way.
+    // (The main menu's submenus are named alone, without the arrow.)
+    h.get_by_label("Plugins").click();
+    h.run();
+    assert_eq!(h.get_all_by_label("Make").count(), 1, "one Make submenu");
+    h.get_by_label("Clear Role");
+    assert!(h.query_by_label("Workbench…").is_none(), "inside Make");
+    h.get_by_label("Make").click();
+    h.run();
+    h.get_by_label("Crafting").click();
+    h.run();
+    h.get_by_label("Workbench…").click();
+    h.run_steps(3);
+    assert_eq!(ran(&h).as_deref(), Some("workbench"));
+
+    // The Command Palette: by the whole path, found by a submenu's name.
+    command_palette(&mut h, "crafting workbench");
+    quick_open_row(&h, "Make › Crafting › Workbench…");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+
+    // The Plugins tab says where each is.
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
+    settle(&mut h);
+    h.get_by_label("Command: Make › Services › Crier (right-click: creature)");
+    h.get_by_label("Command: Clear Role (right-click: creature)");
+}
+
+/// API 0.5: a command for placed objects alone is not in a blueprint's
+/// menu, one for blueprints alone is; a group's row of the module tree
+/// runs a command on every one of the group; a command from the Plugins
+/// menu runs on what is chosen in the pane last clicked in; several
+/// edited together are `ctx.open.together`.
+#[test]
+fn a_plugin_s_command_is_for_placed_objects_blueprints_groups_and_the_pane_clicked() {
+    let Some((mut h, _)) = plugin_harness("ui-plugin-menus-0-5", false) else { return };
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
+    let dir = mg_testkit::scratch_dir("ui-plugin-menus-0-5-plugins");
+    let plugin = dir.join("where");
+    std::fs::create_dir_all(&plugin).unwrap();
+    let mut cfg =
+        "[plugin]\nid = \"test.where\"\nname = \"Where\"\nversion = \"1\"\napi = \"0.5\"\n\
+                   license = \"MIT\"\n"
+            .to_string();
+    for (id, title, on) in [
+        ("placed", "Placed Only", "placed creature"),
+        ("blueprints", "Blueprints Only", "creature blueprint"),
+        ("both", "Both Kinds", "creature"),
+        ("plain", "Plain", ""),
+    ] {
+        cfg += &format!("\n[command]\nid = \"{id}\"\ntitle = \"{title}\"\n");
+        if !on.is_empty() {
+            cfg += &format!("for = \"{on}\"\n");
+        }
+    }
+    std::fs::write(plugin.join("plugin.cfg"), cfg).unwrap();
+    std::fs::write(
+        plugin.join("main.luau"),
+        "local mg = require(\"@moonglow\")\nlocal function say(id)\n  mg.command(id, \
+         function(ctx)\n    local on = {}\n    for _, s in ipairs(ctx.selection) do \
+         table.insert(on, s.resource) end\n    local together = ctx.open and ctx.open.together \
+         and #ctx.open.together or 0\n    ctx.log:info(id .. \": \" .. table.concat(on, \",\") .. \
+         \" together \" .. together)\n  end)\nend\nfor _, id in { \"placed\", \"blueprints\", \
+         \"both\", \"plain\" } do say(id) end\n",
+    )
+    .unwrap();
+    // A second creature blueprint.
+    let cook = ResKey::parse("cook", ResType::UTC).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "A cook",
+        vec![mg_edit::Edit::SetResource {
+            key: cook,
+            data: Some(Gff::new(*b"UTC ").to_bytes().unwrap()),
+        }],
+    )));
+    h.state_mut().plugin_dir = Some(dir.clone());
+    h.state_mut().load_plugins();
+    h.state_mut().enable_plugin("test.where", true);
+    h.run();
+    let logged = |h: &Harness<'_, Moonglow>, id: &str| -> Option<String> {
+        let start = format!("Where: {id}: ");
+        (h.state().log.entries.iter().rev())
+            .find_map(|(_, m)| m.strip_prefix(&start).map(str::to_string))
+    };
+    // A blueprint's row: those for blueprints, not those for placed ones.
+    h.get_by_label_contains("Creatures (2)").click();
+    h.run();
+    h.get_by_label("guard.utc").click_secondary();
+    h.run();
+    assert!(h.query_by_label("Placed Only").is_none(), "for placed objects alone");
+    h.get_by_label("Both Kinds");
+    h.get_by_label("Blueprints Only").click();
+    h.run_steps(3);
+    assert_eq!(logged(&h, "blueprints").as_deref(), Some("guard.utc together 0"));
+    // The group's row: on every one of the group.
+    h.get_by_label_contains("Creatures (2)").click_secondary();
+    h.run();
+    h.get_by_label("Both Kinds").click();
+    h.run_steps(3);
+    let both = logged(&h, "both").unwrap();
+    assert!(both.contains("guard.utc") && both.contains("cook.utc"), "{both}");
+    // From the Plugins menu: what is chosen in the pane clicked in last
+    // (the tree's), not the palette's.
+    h.state_mut().tree_selected = [cook].into_iter().collect();
+    h.state_mut().plugins.pane = Some(mg_ui::plugins::Pane::Tree);
+    h.state_mut().run_plugin_command("test.where", "plain");
+    h.run_steps(3);
+    assert_eq!(logged(&h, "plain").as_deref(), Some("cook.utc together 0"));
+    // Two blueprints edited together: ctx.open is the first, and
+    // ctx.open.together lists both.
+    let guard = ResKey::parse("guard", ResType::UTC).unwrap();
+    let together = Tab::Blueprints(vec![guard, cook]);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(together.clone()));
+    h.run_steps(3);
+    // (Its window in front, as a click in it puts it.)
+    let path = h.state().dock.find_tab(&together).unwrap();
+    h.state_mut().dock.set_focused_node_and_surface(path.node_path());
+    h.run();
+    h.state_mut().run_plugin_command("test.where", "plain");
+    h.run_steps(3);
+    assert!(
+        logged(&h, "plain").unwrap().ends_with("together 2"),
+        "{:?} {:?}",
+        logged(&h, "plain"),
+        h.state().front_tab()
+    );
 }
 
 /// API 0.4: in a palette, a plugin's command for the kind is last in a
@@ -456,7 +651,7 @@ fn a_plugin_s_command_is_in_a_palette_s_menu() {
     let tavern = h.state().game.as_deref().unwrap().string(mg_core::StrRef(69068)).unwrap();
     {
         let app = h.state_mut();
-        app.actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+        show_palette(app);
         app.palette.kind = mg_module::palette::BlueprintKind::Waypoint;
         app.palette.tiles = false;
         app.palette.filter = "nw_wp_tavern".into();
@@ -506,9 +701,26 @@ fn a_plugin_asks_in_its_job_s_window() {
         // (The window settles where it stands before it is clicked.)
         h.run_steps(3);
     };
-    // The form, as the plugin described it, with its defaults.
-    wait_for(&mut h, "Prefix Tags");
-    h.get_by_label("Forms: Prefix Tags");
+    // The form, as the plugin described it, with its defaults; the
+    // window headed by the command's title alone (API 0.9), which is the
+    // form's too, said once; the plugin's name on hover (the log has both).
+    // (Waited for by a field of the form: the job's window shows the
+    // heading from the job's start, before its thread has asked.)
+    wait_for(&mut h, "At most");
+    assert_eq!(h.get_all_by_label("Prefix Tags").count(), 1);
+    assert!(h.query_by_label("Forms: Prefix Tags").is_none());
+    // (Hovered until the tip shows, with a deadline: on a busy machine
+    // the tip's delay takes more frames.)
+    let started = std::time::Instant::now();
+    while h.query_by_label_contains("From the plugin Forms").is_none() {
+        h.get_by_label("Prefix Tags").hover();
+        h.run_steps(5);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "no plugin's name on hover"
+        );
+    }
     h.get_by_label("At most");
     assert!(h.get_all_by_value("NPC_").next().is_some(), "the prefix's default");
     h.get_by_label("OK").click();
@@ -528,28 +740,117 @@ fn a_plugin_asks_in_its_job_s_window() {
 
     // Canceled at the form: nothing changes.
     h.state_mut().run_plugin_command("test.forms", "rename");
-    wait_for(&mut h, "Prefix Tags");
+    wait_for(&mut h, "At most");
     h.get_by_label("Cancel").click();
+    // (Clicked again while the form still shows: on Windows CI a click
+    // as the window settled was once not taken.)
     let started = std::time::Instant::now();
+    let mut clicked = started;
     while h.state().busy() {
         h.run_steps(1);
         std::thread::sleep(std::time::Duration::from_millis(5));
+        if clicked.elapsed() > std::time::Duration::from_secs(2)
+            && h.query_by_label("Prefix Tags").is_some()
+        {
+            h.get_by_label("Cancel").click();
+            clicked = std::time::Instant::now();
+        }
         assert!(started.elapsed() < std::time::Duration::from_secs(20), "the job never ended");
     }
     h.run_steps(2);
     assert_eq!(tag_of(&mut h, &key), "NPC_GATE_GUARD");
 }
 
+/// API 0.8: a form's color field (the example `pick-tint`, run on a
+/// placed placeable): its swatch's picker, the color drawn on the
+/// placeable while it is picked (the field's `variable`) and nothing set;
+/// OK, and the plugin sets it. Its job's window (API 0.9) is headed by
+/// the command's title alone ("Tint", the form's title said once), and
+/// leaves the window behind it undimmed: drawn to pictures, before and
+/// with the form, the window about it is the same.
+#[test]
+fn a_plugin_s_color_field_is_drawn_on_the_objects_while_picked() {
+    let Some((mut h, area)) = area_harness("plugin-color") else { return };
+    let git = ResKey::new(area, ResType::GIT);
+    place_tinted_chest(h.state_mut(), git);
+    h.state_mut().plugin_dir = Some(example_plugins());
+    h.state_mut().load_plugins();
+    h.state_mut().enable_plugin("example.pick-tint", true);
+    h.run_steps(3);
+    h.state_mut().area_views.get_mut(&area).unwrap().selection =
+        vec![(mg_area::ObjectKind::Placeable, 0)];
+    h.state_mut().plugins.pane = Some(mg_ui::plugins::Pane::Area(area));
+    h.state_mut().background_jobs = true;
+    h.run();
+    let pictures = mg_testkit::scratch_dir("ui-plugin-color-window");
+    let before = h.render().expect("render");
+    before.save(pictures.join("before.png")).unwrap();
+    h.state_mut().run_plugin_command("example.pick-tint", "pick-tint");
+    let started = std::time::Instant::now();
+    while h.query_by_label("Color").is_none() {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "no form");
+    }
+    h.run_steps(3);
+    assert_eq!(h.get_all_by_label("Tint").count(), 1, "the window's heading, once");
+    assert!(h.query_by_label("Pick tint: Tint").is_none(), "not the plugin's name with it");
+    let with = h.render().expect("render");
+    with.save(pictures.join("form.png")).unwrap();
+    eprintln!("the form: {}", pictures.join("form.png").display());
+    // (The module tree, the palette, the log: about the window, not
+    // under it.)
+    let window = h.get_by_label("Color").rect();
+    for (x, y) in [(60, 400), (950, 400), (550, 720)] {
+        let at = egui::pos2(x as f32, y as f32);
+        assert!(!window.expand(200.0).contains(at), "{at:?} is under the window {window:?}");
+        let ppp = with.width() as f32 / h.ctx.content_rect().width();
+        let (px, py) = ((x as f32 * ppp) as u32, (y as f32 * ppp) as u32);
+        assert_eq!(with.get_pixel(px, py), before.get_pixel(px, py), "dimmed at {at:?}");
+    }
+    assert!(h.get_all_by_label("#ffffff").next().is_some(), "the placeable's own, first");
+    let white = vec![1.0, 1.0, 1.0, 1.0];
+    let well = h.get_by(|n| n.role() == egui::accesskit::Role::ColorWell).rect();
+    h.get_by(|n| n.role() == egui::accesskit::Role::ColorWell).click();
+    h.run_steps(3);
+    drag_picker(&mut h, well, 0.0, 80.0);
+    let picked = drawn_tint(&h, area).expect("drawn with a tint");
+    assert_ne!(picked, white, "the color being picked, drawn");
+    assert_eq!(variables(&mut h, &git, Some(("Placeable List", 0))), ["tdod_tint = #ffffff"]);
+    click_away(&mut h, egui::pos2(5.0, 700.0));
+    h.get_by_label("OK").click();
+    let started = std::time::Instant::now();
+    while h.state().busy() {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the job never ended");
+    }
+    h.run_steps(3);
+    let set = variables(&mut h, &git, Some(("Placeable List", 0)));
+    assert_eq!(set.len(), 1);
+    assert_ne!(set[0], "tdod_tint = #ffffff", "set as picked");
+    assert!(h.state().ws.as_ref().unwrap().can_undo().is_some_and(|l| l.starts_with("Tint #")));
+    assert_eq!(drawn_tint(&h, area), Some(picked), "drawn as set");
+    // (The window's work on its threads done before the GPU goes.)
+    h.state_mut().background_jobs = false;
+    settle(&mut h);
+}
+
 #[test]
 fn the_plugin_console_runs_what_is_typed() {
     let Some((mut h, key)) = plugin_harness("ui-plugin-console", false) else { return };
     h.run();
-    h.state_mut().plugins.window = true;
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
     h.state_mut().plugins.console =
         "ctx.edit:set(\"guard.utc\", \"Tag\", \"TYPED\")\nreturn ctx.module:gff(\"guard.utc\").Tag"
             .into();
+    settle(&mut h);
+    // (Under the list: the page scrolls to it.)
+    h.get_by_label("Console").scroll_to_me();
     h.run();
     h.get_by_label("Console").click();
+    h.run();
+    h.get_by_label("Run").scroll_to_me();
     h.run();
     h.get_by_label("Run").click();
     h.run();
@@ -589,7 +890,17 @@ fn a_plugin_s_checks_run_with_verify() {
         log.iter().any(|(l, m)| *l == mg_ui::Level::Error && m.contains("a check only reads")),
         "{log:#?}"
     );
+    // (M4's U28: Verify's findings are Problems' too, which it brings to
+    // the front, the plugin's among them.)
+    assert_eq!(h.state().bottom_dock_shows(), Some(mg_ui::Panel::Problems));
+    let found = problem_rows(&h, &mg_ui::problems::Source::Verify);
+    assert!(
+        found.iter().any(|r| r.starts_with("Warning: ") && r.contains("gate_guard")),
+        "{found:?}"
+    );
+    h.get_by_label(found.iter().find(|r| r.contains("gate_guard")).unwrap());
     // The log's Clear empties it, before a second Verify.
+    log_in_front(&mut h);
     h.get_by_label("Clear Log").click();
     h.run();
     assert!(h.state().log.entries.is_empty());
@@ -606,10 +917,12 @@ fn a_plugin_s_checks_run_with_verify() {
     );
     assert!(
         log.iter().any(|(_, m)| m.starts_with("Verify: ")
-            && m.ends_with("; left out, not checked (Options › Verify): Plugins' checks")),
+            && verify_summary(m)
+                .ends_with("; left out, not checked (Options › Verify): Plugins' checks")),
         "{log:#?}"
     );
     // One plugin's check left out, by its id: the other plugin's runs.
+    log_in_front(&mut h);
     h.get_by_label("Clear Log").click();
     h.run();
     h.state_mut().settings.verify_skip = vec!["example.tag-conventions/tag-case".into()];
@@ -620,11 +933,17 @@ fn a_plugin_s_checks_run_with_verify() {
     assert!(log.iter().any(|(_, m)| m.contains("a check only reads")), "{log:#?}");
     assert!(
         log.iter().any(|(_, m)| m.starts_with("Verify: ")
-            && m.ends_with(
+            && verify_summary(m).ends_with(
                 "; left out, not checked (Options › Verify): example.tag-conventions/tag-case"
             )),
         "{log:#?}"
     );
+}
+
+/// Verify's line in the log without what closes it where it found
+/// anything (where its findings are listed, `problems::LISTED`).
+fn verify_summary(line: &str) -> &str {
+    line.strip_suffix(mg_ui::problems::LISTED).unwrap_or(line)
 }
 
 /// A finding's fix is a button beside its line in Verify's report: made
@@ -653,12 +972,28 @@ fn a_finding_s_fix_is_made_when_its_button_is_clicked() {
     assert_eq!(tag(&mut h), "GATE_GUARD");
     assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Upper-case this tag"));
     assert!(h.state().log.fix_at(line).unwrap().made);
-    h.get_by_label("✔ Fixed");
+    h.get_by_label("Fixed");
+    // Undone: its button is offered again, and makes it again; Redo
+    // makes it "Fixed" again.
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run();
+    assert_eq!(tag(&mut h), "gate_guard");
+    assert!(!h.state().log.fix_at(line).unwrap().made);
+    h.get_by_label("Upper-case this tag").click();
+    h.run();
+    assert_eq!(tag(&mut h), "GATE_GUARD", "made again after its Undo");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::Redo);
+    h.run();
+    assert_eq!(tag(&mut h), "GATE_GUARD");
+    h.get_by_label("Fixed");
     // Undone, and verified again: then changed by hand, its fix is
     // refused, and says why.
     h.state_mut().actions.push(mg_ui::Action::Undo);
     h.run();
     assert_eq!(tag(&mut h), "gate_guard");
+    log_in_front(&mut h);
     h.get_by_label("Clear Log").click();
     h.run();
     assert!(h.state().log.fixes.is_empty(), "the log's fixes go with it");
@@ -681,6 +1016,95 @@ fn a_finding_s_fix_is_made_when_its_button_is_clicked() {
         "{log:#?}"
     );
     assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("By hand"));
+}
+
+/// Fix All beside a check's first fix makes every one of its fixes, as one
+/// step of Undo; a fix that asks runs the plugin's command on what the
+/// finding is about, which asks with its form.
+#[test]
+fn a_check_s_fixes_are_made_together_and_a_fix_may_ask() {
+    let Some((mut h, key)) = plugin_harness("ui-plugin-fix-all", true) else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = mg_testkit::scratch_dir("ui-plugin-fix-all-plugins");
+    let plugin = dir.join("tags");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.cfg"),
+        "[plugin]\nid = \"test.tags\"\nname = \"Tags\"\nversion = \"1\"\napi = \"0.5\"\nlicense = \
+         \"MIT\"\n\n[check]\nid = \"upper\"\ntitle = \"Tags upper case\"\n\n[check]\nid = \
+         \"named\"\ntitle = \"Tags chosen\"\n\n[command]\nid = \"retag\"\ntitle = \"Retag…\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("main.luau"),
+        r#"local mg = require("@moonglow")
+mg.check("upper", function(ctx)
+    local out = {}
+    for _, name in ctx.module:resources("utc") do
+        local tag = ctx.module:gff(name).Tag or ""
+        if tag ~= string.upper(tag) then
+            local fix = ctx.fix("Upper-case it")
+            fix:set(name, "Tag", string.upper(tag))
+            table.insert(out, { resource = name, message = "lower: " .. tag, fix = fix })
+        end
+    end
+    return out
+end)
+mg.check("named", function(ctx)
+    return { { resource = "guard.utc", message = "a tag to choose",
+        fix = ctx.fix("Retag…", { command = "retag" }) } }
+end)
+mg.command("retag", function(ctx)
+    local s = ctx.selection[1]
+    local answer = ctx.ui:form({ title = "Retag", fields = { { id = "tag", default = "x" } } })
+    if answer then ctx.edit:set(s.resource, "Tag", answer.tag) end
+end)
+"#,
+    )
+    .unwrap();
+    // A second creature with a lower-case tag.
+    let cook = ResKey::parse("cook", ResType::UTC).unwrap();
+    let mut gff = Gff::new(*b"UTC ");
+    gff.root.set("Tag", mg_gff::Value::String(b"cook".to_vec()));
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "A cook",
+        vec![mg_edit::Edit::SetResource { key: cook, data: Some(gff.to_bytes().unwrap()) }],
+    )));
+    h.state_mut().plugin_dir = Some(dir.clone());
+    h.state_mut().load_plugins();
+    h.state_mut().enable_plugin("test.tags", true);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::Verify);
+    h.run();
+    let tag = |h: &mut Harness<'_, Moonglow>, k: &ResKey| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        String::from_utf8(ws.doc(k).unwrap().root.string("Tag").unwrap().to_vec()).unwrap()
+    };
+    h.get_by_label("Fix All (2)").scroll_to_me();
+    h.run();
+    h.get_by_label("Fix All (2)").click();
+    h.run();
+    let log: Vec<String> = h.state().log.entries.iter().map(|(_, m)| m.clone()).collect();
+    assert_eq!(
+        (tag(&mut h, &key), tag(&mut h, &cook)),
+        ("GATE_GUARD".into(), "COOK".into()),
+        "{log:#?}"
+    );
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Fix All: test.tags/upper"));
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run();
+    assert_eq!((tag(&mut h, &key), tag(&mut h, &cook)), ("gate_guard".into(), "cook".into()));
+    h.get_by_label("Fix All (2)");
+    // The fix that asks: its command, its form answered, on the finding's
+    // blueprint.
+    h.state_mut().plugins.answers.push_back(Some(mg_plugin::Answer::Values(
+        [("tag".to_string(), serde_json::json!("CHOSEN"))].into(),
+    )));
+    h.get_by_label("Retag…").click();
+    h.run_steps(4);
+    assert_eq!(tag(&mut h, &key), "CHOSEN");
 }
 
 /// Plugins › Install Plugin from File…: a plugin's archive goes into the
@@ -717,7 +1141,7 @@ fn a_plugin_installs_from_a_file_and_is_off() {
     app.load_plugins();
     let mut h = harness(app, 1200.0, 900.0);
     h.run();
-    h.get_by_label("Plugins").click();
+    plugins_menu(&mut h);
     h.run();
     h.get_by_label("Install Plugin from File…").click();
     h.run();
@@ -810,6 +1234,91 @@ fn a_plugin_installs_from_a_file_and_is_off() {
     assert!(by_hand.join("main.luau").is_file());
 }
 
+/// An archive of several plugins installs each into its own folder: those
+/// new at once, and one installed already after its own question.
+#[test]
+fn an_archive_of_several_plugins_installs_each() {
+    use std::io::Write;
+    let dir = mg_testkit::scratch_dir("ui-plugin-install-several");
+    let plugins = dir.join("plugins");
+    let fixture = plugin_fixtures().join("tag-conventions");
+    let manifest = std::fs::read_to_string(fixture.join("plugin.cfg")).unwrap();
+    let bundle = |version: &str| {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (folder, id) in [("tags", "example.tag-conventions"), ("other", "example.other")] {
+            let m = manifest.replace("1.0.0", version).replace("example.tag-conventions", id);
+            zip.start_file(format!("{folder}/plugin.cfg"), options).unwrap();
+            zip.write_all(m.as_bytes()).unwrap();
+            for file in ["main.luau", "rules.luau"] {
+                zip.start_file(format!("{folder}/{file}"), options).unwrap();
+                zip.write_all(&std::fs::read(fixture.join(file)).unwrap()).unwrap();
+            }
+        }
+        let path = dir.join(format!("bundle-{version}.zip"));
+        std::fs::write(&path, zip.finish().unwrap().into_inner()).unwrap();
+        path
+    };
+    let (first, second) = (bundle("1.0.0"), bundle("1.1.0"));
+    let mut app = app_with(vec![first]);
+    app.plugin_dir = Some(plugins.clone());
+    app.load_plugins();
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+    h.state_mut().install_plugin();
+    h.run();
+    assert_eq!(h.state().plugins.installed.len(), 2);
+    for id in ["example.tag-conventions", "example.other"] {
+        assert!(plugins.join(id).join("main.luau").is_file(), "{id}");
+    }
+    let note = h.state().plugins.install_note.clone().unwrap().1;
+    assert_eq!(note.lines().count(), 2, "{note}");
+    // Again, a later version of both: each asked about in turn.
+    h.state_mut().install_plugin_from(&second);
+    h.run();
+    h.get_by_label_contains("Replace it with 1.1.0 from bundle-1.1.0.zip?");
+    h.get_by_label("Replace").click();
+    h.run();
+    h.run();
+    h.get_by_label_contains("Replace it with 1.1.0 from bundle-1.1.0.zip?");
+    h.get_by_label("Cancel").click();
+    h.run();
+    assert!(h.state().plugins.replace.is_none());
+    let versions: Vec<String> = (h.state().plugins.installed.iter())
+        .map(|i| i.plugin.as_ref().unwrap().manifest.version.clone())
+        .collect();
+    let mut sorted = versions.clone();
+    sorted.sort();
+    assert_eq!(sorted, ["1.0.0", "1.1.0"], "one replaced, the other left: {versions:?}");
+}
+
+/// Manage Plugins runs a plugin's own tests (Run Tests), as `mg plugin
+/// test` does: the log says what each came to.
+#[test]
+fn a_plugin_s_own_tests_run_in_the_window() {
+    let mut app = app_with(Vec::new());
+    app.plugin_dir = Some(example_plugins());
+    app.load_plugins();
+    app.actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+    let button = h.get_all_by_label("Run Tests").next().unwrap();
+    button.scroll_to_me();
+    h.run();
+    h.get_all_by_label("Run Tests").next().unwrap().click();
+    let started = std::time::Instant::now();
+    loop {
+        h.run_steps(1);
+        let log = &h.state().log.entries;
+        if log.iter().any(|(_, m)| m.contains(" tests, ") && m.contains(" passed, ")) {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "{log:#?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(h.state().log.entries.iter().any(|(_, m)| m.contains(": ok ")));
+}
+
 /// Started with `--no-plugins`: none is loaded, whatever is installed and
 /// was enabled, and Manage Plugins says so.
 #[test]
@@ -823,10 +1332,10 @@ fn started_without_plugins_none_is_loaded() {
     h.run();
     assert!(h.state().plugins.installed.is_empty());
     assert!(h.state().plugin_commands().is_empty());
-    h.get_by_label("Plugins").click();
+    plugins_menu(&mut h);
     h.run();
     assert!(h.query_by_label("Fix Creature Tags").is_none());
-    h.get_by_label("Manage Plugins…").click();
+    h.get_by_label("Manage Plugins").click();
     h.run();
     h.get_by_label("Started with --no-plugins: none are loaded.");
     assert!(h.query_by_label_contains("No plugins are installed").is_none());
@@ -848,7 +1357,7 @@ fn a_plugin_reads_a_chosen_folder_and_writes_a_hak() {
     let dialogs = NoDialogs { folders: vec![export], ..Default::default() };
     let mut app = game_app_with(&root, Some(user.clone()), dialogs);
     app.open_module(&path);
-    app.open_palette = false;
+    app.palette_dock = false;
     app.background_jobs = true;
     let mut h = harness(app, 1200.0, 900.0);
     h.run();
@@ -892,6 +1401,20 @@ fn a_plugin_reads_a_chosen_folder_and_writes_a_hak() {
         "{:?}",
         h.state().log.entries
     );
+    // Undo takes the hak back with the edits (the job made it: it goes),
+    // Redo writes it again.
+    let made = user.join("hak/made.hak");
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run();
+    assert!(!made.exists(), "{:?}", h.state().log.entries);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    ws.flush().unwrap();
+    assert!(ws.module.haks().unwrap().is_empty());
+    h.state_mut().actions.push(mg_ui::Action::Redo);
+    h.run();
+    let hak = mg_module::hak_edit::Hak::open(&made).unwrap();
+    assert_eq!(hak.data(ResKey::parse("note", ResType::TXT).unwrap()).unwrap(), b"from the folder");
+    assert!(h.state().log.entries.iter().any(|(_, m)| m.contains("made.hak: written again")));
 }
 
 /// A project (a module folder) with a creature whose tag lacks the team's
@@ -937,12 +1460,302 @@ fn project_harness(dir: &std::path::Path, game: bool) -> Option<Harness<'static,
     app.plugin_answers = Some(dir.with_extension("answers.toml"));
     app.load_plugins();
     app.open_module(dir);
-    app.open_palette = false;
+    app.palette_dock = false;
     Some(harness(app, 1200.0, 900.0))
 }
 
 fn runs(h: &Harness<'_, Moonglow>, id: &str) -> bool {
     h.state().enabled_plugins().iter().any(|p| p.manifest.id == id)
+}
+
+/// The project's plugins' folder changing while it is open (a pull): its
+/// plugins are read again, a changed one is off and asked about, a new
+/// one asked about too, and Allow All allows the lot. The project copied
+/// elsewhere runs them as allowed, unasked.
+#[test]
+fn a_project_s_plugins_changed_while_it_is_open_are_asked_about() {
+    let dir = plugin_project("ui-project-plugins-watched");
+    let id = "example.builder-tags";
+    let mut h = project_harness(&dir, false).unwrap();
+    h.run();
+    h.get_by_label("Allow").click();
+    h.run();
+    assert!(runs(&h, id));
+    assert!(!h.state_mut().project_plugins_changed(), "nothing changed");
+    // A pull: other code for it, and a plugin new to the project.
+    let main = dir.join("plugins/builder-tags/main.luau");
+    let code = std::fs::read_to_string(&main).unwrap();
+    std::fs::write(&main, format!("{code}\n-- pulled\n")).unwrap();
+    let hello = dir.join("plugins/hello");
+    std::fs::create_dir_all(&hello).unwrap();
+    let example =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plugins/examples/hello");
+    for file in ["plugin.cfg", "main.luau"] {
+        std::fs::copy(example.join(file), hello.join(file)).unwrap();
+    }
+    assert!(h.state_mut().project_plugins_changed());
+    h.run();
+    assert!(!runs(&h, id), "changed: off until allowed again");
+    let mut asking = h.state().plugins.project_asking.clone();
+    asking.sort();
+    assert_eq!(asking, ["example.builder-tags", "example.hello"]);
+    assert!(
+        h.state()
+            .log
+            .entries
+            .iter()
+            .any(|(_, m)| m.starts_with("The project's plugins changed in"))
+    );
+    h.get_by_label("Allow All").click();
+    h.run();
+    assert!(h.state().plugins.project_asking.is_empty());
+    assert!(runs(&h, id) && runs(&h, "example.hello"));
+    // The project copied elsewhere: the same plugins, allowed as they are,
+    // run without a question.
+    let copy = mg_testkit::scratch_dir("ui-project-plugins-copied");
+    let answers = dir.with_extension("answers.toml");
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let target = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &target);
+            } else {
+                std::fs::copy(e.path(), target).unwrap();
+            }
+        }
+    }
+    copy_dir(&dir, &copy);
+    let mut app = app_with(Vec::new());
+    app.plugin_dir = Some(plugin_fixtures());
+    app.plugin_answers = Some(answers);
+    app.load_plugins();
+    app.open_module(&copy);
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+    assert!(h.state().plugins.project_asking.is_empty());
+    assert!(runs(&h, id) && runs(&h, "example.hello"));
+}
+
+/// What a project's plugin's events were allowed is the allowance of that
+/// code: the plugin changed (a pull) and allowed again asks its questions
+/// again, and nothing is kept for the new code that it was not given.
+/// (What the old code was allowed answered the new code's question of the
+/// same wording, unasked, and was then kept under the new code's name.)
+#[test]
+fn a_changed_project_plugin_s_events_ask_again() {
+    let dir = plugin_project("ui-project-plugin-grants");
+    let asks = dir.join("plugins/asks");
+    std::fs::create_dir_all(&asks).unwrap();
+    for file in ["plugin.cfg", "main.luau"] {
+        std::fs::copy(plugin_fixtures().join("asks").join(file), asks.join(file)).unwrap();
+    }
+    let mut h = project_harness(&dir, false).unwrap();
+    h.run();
+    h.get_by_label("Allow All").click();
+    h.run();
+    assert!(runs(&h, "test.asks"));
+    let said = |h: &Harness<'_, Moonglow>| -> Vec<String> {
+        let log = h.state().log.entries.iter().map(|(_, m)| m.clone());
+        log.filter(|m| m.starts_with("Asks: ")).collect()
+    };
+    let key = ResKey::parse("captain", ResType::UTC).unwrap();
+    let mut n = 0;
+    let mut save_changed = |h: &mut Harness<'_, Moonglow>| {
+        n += 1;
+        let mut captain = Gff::new(*b"UTC ");
+        captain.root.set("Tag", mg_gff::Value::String(format!("captain_{n}").into_bytes()));
+        h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+            "A captain",
+            vec![mg_edit::Edit::SetResource { key, data: Some(captain.to_bytes().unwrap()) }],
+        )));
+        h.run_steps(2);
+        h.state_mut().actions.push(mg_ui::Action::Save);
+        h.run_steps(6);
+    };
+    // Asked and answered yes; the next save is not asked.
+    h.state_mut().plugins.answers.push_back(Some(mg_plugin::Answer::Yes));
+    save_changed(&mut h);
+    save_changed(&mut h);
+    assert_eq!(said(&h), ["Asks: noted"; 2]);
+    assert_eq!(h.state().plugin_grants("test.asks"), 1);
+    let kept = h.state().settings.plugin_grants.clone();
+    // A pull changes its code; it is allowed again.
+    let main = asks.join("main.luau");
+    let code = std::fs::read_to_string(&main).unwrap();
+    std::fs::write(&main, format!("{code}\n-- pulled\n")).unwrap();
+    assert!(h.state_mut().project_plugins_changed());
+    h.run();
+    assert_eq!(h.state().plugins.project_asking, ["test.asks"]);
+    h.get_by_label("Allow").click();
+    h.run();
+    assert!(runs(&h, "test.asks"));
+    // Its question is asked again: a no this time is a no.
+    h.state_mut().plugins.answers.push_back(Some(mg_plugin::Answer::No));
+    save_changed(&mut h);
+    assert!(h.state().plugins.answers.is_empty(), "the changed plugin asked");
+    assert_eq!(said(&h).last().unwrap(), "Asks: not noted");
+    h.run_steps(2);
+    assert_eq!(h.state().settings.plugin_grants, kept, "nothing kept for the new code");
+}
+
+/// The plugin harness with `test.asks` installed from a copy of its own
+/// (whose code a test may edit), enabled; and its code's file.
+fn asks_installed(name: &str) -> (Harness<'static, Moonglow>, ResKey, std::path::PathBuf) {
+    let (mut h, key) = plugin_harness(name, false).unwrap();
+    let plugins = mg_testkit::scratch_dir(&format!("{name}-plugins"));
+    let asks = plugins.join("asks");
+    std::fs::create_dir_all(&asks).unwrap();
+    for file in ["plugin.cfg", "main.luau"] {
+        std::fs::copy(plugin_fixtures().join("asks").join(file), asks.join(file)).unwrap();
+    }
+    h.state_mut().plugin_dir = Some(plugins);
+    h.state_mut().load_plugins();
+    h.run();
+    h.state_mut().enable_plugin("test.asks", true);
+    (h, key, asks.join("main.luau"))
+}
+
+/// What `test.asks` said of the saves, in order.
+fn asks_said(h: &Harness<'_, Moonglow>) -> Vec<String> {
+    let log = h.state().log.entries.iter().map(|(_, m)| m.clone());
+    log.filter(|m| m.starts_with("Asks: ")).collect()
+}
+
+/// Changes the guard (its tag the `n`th) and saves, which `test.asks`
+/// acts on; until the window has done what the save started.
+fn save_guard(h: &mut Harness<'_, Moonglow>, key: ResKey, n: usize) {
+    let mut guard = Gff::new(*b"UTC ");
+    guard.root.set("Tag", mg_gff::Value::String(format!("guard_{n}").into_bytes()));
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "A guard",
+        vec![mg_edit::Edit::SetResource { key, data: Some(guard.to_bytes().unwrap()) }],
+    )));
+    h.run_steps(2);
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    settle(h);
+}
+
+/// Edits an installed plugin's code by hand, under the same version.
+fn edit_by_hand(main: &std::path::Path, mark: &str) {
+    let code = std::fs::read_to_string(main).unwrap();
+    std::fs::write(main, format!("{code}\n-- {mark}\n")).unwrap();
+}
+
+/// What an installed plugin's events were allowed is the allowance of its
+/// code, as a project's plugin's is: installed fresh it asks; edited by
+/// hand under the same version, it asks again. (Its grants were kept by
+/// id and version, so the edited code was answered from the old code's.)
+#[test]
+fn an_installed_plugin_edited_by_hand_asks_again() {
+    let (mut h, key, main) = asks_installed("ui-plugin-installed-edited");
+    assert_eq!(h.state().plugin_grants("test.asks"), 0);
+    // Installed fresh: asked (a no is a no, and not kept), asked again and
+    // answered yes; the next save is not asked.
+    h.state_mut().plugins.answers.push_back(Some(mg_plugin::Answer::No));
+    save_guard(&mut h, key, 1);
+    h.state_mut().plugins.answers.push_back(Some(mg_plugin::Answer::Yes));
+    save_guard(&mut h, key, 2);
+    save_guard(&mut h, key, 3);
+    assert_eq!(asks_said(&h), ["Asks: not noted", "Asks: noted", "Asks: noted"]);
+    assert!(!h.state().busy());
+    assert_eq!(h.state().plugin_grants("test.asks"), 1);
+    // Edited by hand: asked again, and a no this time is a no.
+    edit_by_hand(&main, "edited");
+    h.state_mut().plugins.answers.push_back(Some(mg_plugin::Answer::No));
+    save_guard(&mut h, key, 4);
+    assert_eq!(asks_said(&h).last().unwrap(), "Asks: not noted", "the edited plugin asked");
+}
+
+/// What an installed plugin was allowed under its id and version (as
+/// Moonglow before 4.0.0 kept it) is carried over to its code as it is at
+/// its first event, once: it is not asked, and its grants are then its
+/// code's. The old record is gone, so code changed after that asks, after
+/// a restart too.
+#[test]
+fn an_installed_plugin_s_grants_by_version_are_carried_over_once() {
+    let (mut h, key, main) = asks_installed("ui-plugin-installed-carried");
+    // What an earlier Moonglow kept: the question answered yes, by
+    // version. (The question as asked, from an answer given now.)
+    h.state_mut().plugins.answers.push_back(Some(mg_plugin::Answer::Yes));
+    save_guard(&mut h, key, 1);
+    h.state_mut().forget_plugin_session();
+    let old = "test.asks 0.0.1".to_string();
+    let grants = &mut h.state_mut().settings.plugin_grants;
+    assert_eq!(grants.len(), 1);
+    grants[0].0 = old.clone();
+    // Moonglow started again: not asked.
+    save_guard(&mut h, key, 2);
+    assert_eq!(asks_said(&h), ["Asks: noted"; 2]);
+    assert!(!h.state().busy());
+    let names: Vec<String> =
+        h.state().settings.plugin_grants.iter().map(|(p, _, _)| p.clone()).collect();
+    assert_eq!(names.len(), 1);
+    assert!(names[0].starts_with("test.asks sha256:"), "under its code's digest: {names:?}");
+    // Its code edited, and Moonglow started again: the old record is not
+    // carried over a second time.
+    edit_by_hand(&main, "edited");
+    h.state_mut().forget_plugin_session();
+    h.state_mut().plugins.answers.push_back(Some(mg_plugin::Answer::No));
+    save_guard(&mut h, key, 3);
+    assert_eq!(asks_said(&h).last().unwrap(), "Asks: not noted", "the edited plugin asked");
+    assert!(h.state().settings.plugin_grants.iter().all(|(p, _, _)| *p != old));
+}
+
+/// Decide Later holds until the project is next opened: a change in the
+/// plugins' folder that is not the plugin's (a test fixture touched, an
+/// editor's hidden swap file, another plugin added) does not bring the
+/// question about it back, as it did within seconds; its own code
+/// changed does, and so does opening the project again.
+#[test]
+fn decide_later_holds_while_the_plugins_folder_changes() {
+    let dir = plugin_project("ui-project-plugins-put-off");
+    let id = "example.builder-tags";
+    let mut h = project_harness(&dir, false).unwrap();
+    h.run();
+    assert_eq!(h.state().plugins.project_asking, [id]);
+    h.get_by_label("Decide Later").click();
+    h.run();
+    assert!(h.state().plugins.project_asking.is_empty());
+    // What no plugin's digest reads: the folder is as it was.
+    let plugin = dir.join("plugins/builder-tags");
+    std::fs::create_dir_all(plugin.join("tests/fixtures")).unwrap();
+    std::fs::write(plugin.join("tests/fixtures/area.are"), b"a fixture").unwrap();
+    std::fs::write(plugin.join(".main.luau.swp"), b"a swap file").unwrap();
+    std::fs::create_dir_all(dir.join("plugins/.git/objects")).unwrap();
+    std::fs::write(dir.join("plugins/.git/objects/pack"), b"a nested checkout").unwrap();
+    assert!(!h.state_mut().project_plugins_changed(), "nothing a plugin is made of changed");
+    assert!(h.state().plugins.project_asking.is_empty());
+    // Another plugin comes (a pull): it is asked about, the one put off
+    // is not.
+    let hello = dir.join("plugins/hello");
+    std::fs::create_dir_all(&hello).unwrap();
+    let example =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plugins/examples/hello");
+    for file in ["plugin.cfg", "main.luau"] {
+        std::fs::copy(example.join(file), hello.join(file)).unwrap();
+    }
+    assert!(h.state_mut().project_plugins_changed());
+    assert_eq!(h.state().plugins.project_asking, ["example.hello"]);
+    h.run();
+    h.get_by_label("Decide Later").click();
+    h.run();
+    // The plugin put off changes itself: asked about again, it alone.
+    let main = plugin.join("main.luau");
+    let code = std::fs::read_to_string(&main).unwrap();
+    std::fs::write(&main, format!("{code}\n-- pulled\n")).unwrap();
+    assert!(h.state_mut().project_plugins_changed());
+    assert_eq!(h.state().plugins.project_asking, [id]);
+    h.run();
+    h.get_by_label("Decide Later").click();
+    h.run();
+    assert!(!runs(&h, id) && !runs(&h, "example.hello"), "put off is off");
+    // The project opened again: both.
+    h.state_mut().open_module(&dir);
+    h.run();
+    let mut asking = h.state().plugins.project_asking.clone();
+    asking.sort();
+    assert_eq!(asking, [id, "example.hello"]);
 }
 
 /// A project's plugins are asked about when it is opened, with what each
@@ -956,7 +1769,7 @@ fn a_project_s_plugins_are_asked_about_when_it_is_opened() {
     let mut h = project_harness(&dir, false).unwrap();
     h.run();
     assert_eq!(h.state().plugins.project_asking, [id]);
-    h.get_by_label("This project comes with plugins");
+    h.get_by_label("This Project Comes with Plugins");
     h.get_by_label_contains("Its folder plugins/ holds plugins the team shares");
     h.get_by_label("Builder tags 1.0.0");
     h.get_by_label("Command: Prefix Tags (right-click: creature, placeable)");
@@ -971,7 +1784,7 @@ fn a_project_s_plugins_are_asked_about_when_it_is_opened() {
     h.get_by_label("Decide Later").click();
     h.run();
     assert!(h.state().plugins.project_asking.is_empty() && !runs(&h, id));
-    assert!(h.query_by_label("This project comes with plugins").is_none());
+    assert!(h.query_by_label("This Project Comes with Plugins").is_none());
     h.state_mut().open_module(&dir);
     h.run();
     assert_eq!(h.state().plugins.project_asking, [id]);
@@ -1011,12 +1824,12 @@ fn a_project_s_plugins_are_asked_about_when_it_is_opened() {
     h.state_mut().open_module(&dir);
     h.run();
     assert!(h.state().plugins.project_asking.is_empty());
-    h.state_mut().plugins.window = true;
-    h.run();
-    h.get_by_label("This project's plugins").scroll_to_me();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
+    settle(&mut h);
+    h.get_by_label("This Project's Plugins").scroll_to_me();
     h.run();
     h.get_by_label("You said no: it is off.");
-    // Enabled from the Plugins window: allowed as it is now.
+    // Enabled from the Plugins tab: allowed as it is now.
     h.get_by_label("Builder tags 1.0.0").click();
     h.run();
     assert!(runs(&h, id));
@@ -1044,7 +1857,7 @@ fn answers_a_project_carries_are_not_taken() {
     h.run();
     assert_eq!(h.state().plugins.project_asking, ["example.builder-tags"]);
     assert!(!runs(&h, "example.builder-tags"));
-    h.get_by_label("This project comes with plugins");
+    h.get_by_label("This Project Comes with Plugins");
     let log = &h.state().log.entries;
     assert!(
         log.iter().any(|(l, m)| *l == mg_ui::Level::Warning
@@ -1076,8 +1889,8 @@ fn a_project_s_plugin_stands_in_for_one_installed_of_its_id() {
     h.get_by_label("Allow").click();
     h.run();
     assert_eq!(ours(&h), [true], "the project's, in its stead");
-    h.state_mut().plugins.window = true;
-    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
+    settle(&mut h);
     h.get_by_label_contains("The project has a plugin of this id, which runs in its stead");
 }
 
@@ -1093,9 +1906,9 @@ fn a_plugin_s_settings_are_edited_in_their_form() {
     h.run();
     h.get_by_label("Allow").click();
     h.run();
-    h.state_mut().plugins.window = true;
-    h.run();
-    h.get_by_label("This project's plugins").scroll_to_me();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
+    settle(&mut h);
+    h.get_by_label("This Project's Plugins").scroll_to_me();
     h.run();
     h.get_by_label("Settings…").click();
     h.run();
@@ -1120,7 +1933,7 @@ fn a_plugin_s_settings_are_edited_in_their_form() {
         form.values.insert("strict".into(), mg_plugin::SettingValue::Bool(true));
     }
     h.run();
-    h.get_by_label("Save").click();
+    apart(&h, "Save").click();
     h.run();
     assert!(h.state().plugins.settings_form.is_none());
     let team = std::fs::read_to_string(dir.join("moonglow.toml")).unwrap();
@@ -1140,7 +1953,7 @@ fn a_plugin_s_settings_are_edited_in_their_form() {
     h.run();
     h.get_by_label("Defaults").click();
     h.run();
-    h.get_by_label("Save").click();
+    apart(&h, "Save").click();
     h.run();
     // (The table stays, for the comment over it.)
     assert_eq!(
@@ -1158,6 +1971,191 @@ fn a_plugin_s_settings_are_edited_in_their_form() {
     h.run();
     let prefix = h.state().plugins.settings_form.as_ref().unwrap().values["prefix"].clone();
     assert_eq!(prefix, mg_plugin::SettingValue::Text(String::new()), "its default");
+}
+
+/// A value Tidy Up moves out of the project's file into the user's own
+/// is kept there though the tidy fails further on (here the builder's
+/// own project file can't be written): it was out of the project's file
+/// and in neither place, as with `mg plugin tidy` (the review's C23).
+#[cfg(unix)]
+#[test]
+fn a_setting_moved_by_tidy_up_is_kept_when_the_tidy_fails_further_on() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = plugin_project("ui-plugin-tidy-fails");
+    let plugins = dir.join("installed");
+    let one = plugins.join("one");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::write(
+        one.join("plugin.cfg"),
+        "[plugin]\nid = \"a.one\"\nname = \"One\"\nversion = \"1\"\napi = \"0.5\"\nlicense = \
+         \"MIT\"\n\n[setting]\nid = \"name\"\nlabel = \"Name\"\nscope = \"user\"\n",
+    )
+    .unwrap();
+    std::fs::write(one.join("main.luau"), "local mg = require(\"@moonglow\")\n").unwrap();
+    let team = dir.join("moonglow.toml");
+    std::fs::write(&team, "[plugins.\"a.one\"]\nname = \"mine\"\n").unwrap();
+    let own = dir.join(".moonglow");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("user.toml"), "[plugins.\"a.one\"]\nlost = 1\n").unwrap();
+    let values = dir.with_extension("values.json");
+    let _ = std::fs::remove_file(&values);
+    let mut app = app_with(Vec::new());
+    app.plugin_dir = Some(plugins);
+    app.plugin_answers = Some(dir.with_extension("answers.toml"));
+    app.plugin_values = Some(values.clone());
+    app.load_plugins();
+    app.open_module(&dir);
+    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // (Who may write anywhere, the administrator, is not held by it.)
+    let held = std::fs::write(own.join("probe"), b"").is_err();
+    app.tidy_plugin_settings("a.one");
+    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !held {
+        return;
+    }
+    let log = &app.log.entries;
+    assert!(log.iter().any(|(_, m)| m.starts_with("One: not tidied: ")), "{log:?}");
+    assert!(!std::fs::read_to_string(&team).unwrap().contains("mine"), "out of the team's file");
+    let mine = mg_plugin::SettingValue::Text("mine".into());
+    let kept = mg_plugin::settings::user_values(&app.settings.plugin_settings, "a.one");
+    assert_eq!(kept.get("name"), Some(&mine), "held by the window");
+    let written = mg_plugin::settings::read_user(&values).unwrap();
+    let kept = mg_plugin::settings::user_values(&written, "a.one");
+    assert_eq!(kept.get("name"), Some(&mine), "and in the user's own file");
+}
+
+/// The user's settings file shared with `mg` there and unreadable: what
+/// it keeps is unknown, and nothing of Moonglow's own copy is said to be
+/// kept wrong (the review's C-11: the copy's were said).
+#[test]
+fn an_unreadable_settings_file_says_nothing_of_moonglow_s_copy() {
+    let dir = plugin_project("ui-plugin-settings-unreadable");
+    let plugins = dir.join("installed");
+    let one = plugins.join("one");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::write(
+        one.join("plugin.cfg"),
+        "[plugin]\nid = \"a.one\"\nname = \"One\"\nversion = \"1\"\napi = \"0.5\"\nlicense = \
+         \"MIT\"\n\n[setting]\nid = \"name\"\nlabel = \"Name\"\nscope = \"user\"\n",
+    )
+    .unwrap();
+    std::fs::write(one.join("main.luau"), "local mg = require(\"@moonglow\")\n").unwrap();
+    let values = dir.with_extension("values.json");
+    std::fs::write(&values, "{ not json").unwrap();
+    let mut app = app_with(Vec::new());
+    app.plugin_dir = Some(plugins);
+    app.plugin_answers = Some(dir.with_extension("answers.toml"));
+    app.plugin_values = Some(values);
+    let lost = [("lost".to_string(), serde_json::json!(1))].into_iter().collect();
+    app.settings.plugin_settings.insert("a.one".into(), lost);
+    app.load_plugins();
+    app.open_module(&dir);
+    let p = (app.plugins.installed.iter())
+        .filter_map(|i| i.plugin.as_ref().ok())
+        .find(|p| p.manifest.id == "a.one")
+        .cloned()
+        .expect("the plugin");
+    let faults = app.plugin_settings_faults(&p);
+    assert!(!faults.iter().any(|f| f.contains("\"lost\"")), "{faults:?}");
+}
+
+/// The kinds of setting API 0.5 added, in the form: a number with a
+/// fraction, a list (of choices, and free), a color, text held to a
+/// pattern and a folder chosen by Choose…; kept, those of scope `user`, in
+/// the file shared with `mg`. What is kept wrong is tidied by Tidy Up.
+#[test]
+fn a_plugin_s_settings_of_every_kind_are_edited_and_tidied() {
+    let dir = plugin_project("ui-plugin-settings-kinds");
+    let plugins = dir.join("installed");
+    let kinds = plugins.join("kinds");
+    std::fs::create_dir_all(&kinds).unwrap();
+    std::fs::write(
+        kinds.join("plugin.cfg"),
+        "[plugin]\nid = \"test.kinds\"\nname = \"Kinds\"\nversion = \"1\"\napi = \"0.5\"\nlicense = \
+         \"MIT\"\n\n[setting]\nid = \"scale\"\ntype = \"float\"\nmin = 0\nmax = 4\ndefault = 1.5\n\n\
+         [setting]\nid = \"objects\"\ntype = \"list\"\nchoices = \"creature, door, placeable\"\n\
+         default = \"door\"\n\n[setting]\nid = \"words\"\ntype = \"list\"\n\n[setting]\nid = \
+         \"tint\"\ntype = \"color\"\ndefault = \"#336699\"\n\n[setting]\nid = \"code\"\npattern = \
+         \"[a-z]{2}\"\ndefault = \"ab\"\n\n[setting]\nid = \"out\"\ntype = \"path\"\npick = \
+         \"folder\"\n\n[setting]\nid = \"most\"\ntype = \"int\"\nmax = 9\nscope = \"project\"\n",
+    )
+    .unwrap();
+    std::fs::write(kinds.join("main.luau"), "local mg = require(\"@moonglow\")\n").unwrap();
+    // (Kept wrong in the team's file: of no kind, and of no setting.)
+    let team = dir.join("moonglow.toml");
+    let text = std::fs::read_to_string(&team).unwrap();
+    std::fs::write(&team, format!("{text}\n[plugins.\"test.kinds\"]\nmost = 40\nlost = 1\n"))
+        .unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let values = dir.with_extension("values.json");
+    let _ = std::fs::remove_file(&values);
+    let mut app = app_with(Vec::new());
+    app.dialogs = Box::new(NoDialogs { folders: vec![out.clone()], ..Default::default() });
+    app.plugin_dir = Some(plugins.clone());
+    app.plugin_answers = Some(dir.with_extension("answers.toml"));
+    app.plugin_values = Some(values.clone());
+    app.load_plugins();
+    app.open_module(&dir);
+    app.plugins.project_asking.clear();
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+    h.state_mut().open_plugin_settings("test.kinds");
+    h.run();
+    h.get_by_label("Settings: Kinds");
+    for label in ["scale", "objects", "words", "tint", "code", "out", "creature", "door"] {
+        assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+    }
+    h.get_by_label("2 values kept are not as the plugin declares them.");
+    // A folder chosen for the folder's path. (The form's buttons clicked by
+    // their action, as search.rs clicks its: the window is centered, and a
+    // pointer's click where a button was a frame before missed it on CI's
+    // Windows, even hovered first.)
+    h.get_by_label("Choose…").click_accesskit();
+    h.run();
+    {
+        let form = h.state_mut().plugins.settings_form.as_mut().unwrap();
+        let v = &form.values;
+        assert_eq!(
+            v["out"],
+            mg_plugin::SettingValue::Text(out.to_string_lossy().replace('\\', "/"))
+        );
+        assert_eq!(v["scale"], mg_plugin::SettingValue::Float(1.5));
+        assert_eq!(v["objects"], mg_plugin::SettingValue::List(vec!["door".into()]));
+        form.values.insert("scale".into(), mg_plugin::SettingValue::Float(2.25));
+        form.values.insert(
+            "words".into(),
+            mg_plugin::SettingValue::List(vec!["one".into(), "".into(), "two".into()]),
+        );
+        form.values.insert("code".into(), mg_plugin::SettingValue::Text("xyz".into()));
+    }
+    h.run();
+    h.get_by_label_contains("does not match its pattern");
+    // Tidy Up: the wrong ones out of the team's file.
+    h.get_by_label("Tidy Up").click_accesskit();
+    h.run();
+    let now = std::fs::read_to_string(&team).unwrap();
+    assert!(!now.contains("most = 40") && !now.contains("lost"), "{now}");
+    assert!(h.query_by_label_contains("not as the plugin declares").is_none());
+    {
+        let form = h.state_mut().plugins.settings_form.as_mut().unwrap();
+        form.values.insert("scale".into(), mg_plugin::SettingValue::Float(2.25));
+        form.values.insert(
+            "words".into(),
+            mg_plugin::SettingValue::List(vec!["one".into(), "".into(), "two".into()]),
+        );
+    }
+    h.run();
+    apart(&h, "Save").click_accesskit();
+    h.run();
+    // Kept in the file shared with mg, the list's empty lines left out.
+    let kept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&values).unwrap()).unwrap();
+    assert_eq!(kept["test.kinds"]["scale"], serde_json::json!(2.25));
+    assert_eq!(kept["test.kinds"]["words"], serde_json::json!(["one", "two"]));
+    let p =
+        h.state().plugins.installed.iter().find_map(|i| i.plugin.as_ref().ok()).cloned().unwrap();
+    assert_eq!(h.state().plugin_settings(&p).values["scale"], mg_plugin::SettingValue::Float(2.25));
 }
 
 /// ctx.settings in the window: a command's settings are kept when it is
@@ -1213,7 +2211,7 @@ fn house_rules_harness(name: &str) -> Harness<'static, Moonglow> {
     m.save_as(&ModuleLocation::Archive(path.clone())).unwrap();
     let mut app = app_with(Vec::new());
     app.open_module(&path);
-    app.open_palette = false;
+    app.palette_dock = false;
     app.plugin_dir = Some(example_plugins());
     app.load_plugins();
     app.enable_plugin("example.house-rules", true);
@@ -1243,7 +2241,7 @@ fn a_plugin_refuses_a_save_and_says_why() {
     h.state_mut().actions.push(mg_ui::Action::Save);
     h.run_steps(3);
     assert!(!saved(&h), "nothing written");
-    h.get_by_label("Not saved");
+    h.get_by_label("Not Saved");
     h.get_by_label("Refused");
     h.get_by_label_contains("its tag was TAVERN, now INN: players' places are kept by it");
     assert!(h.query_by_label("Save Anyway").is_none(), "a refusal is not saved anyway");
@@ -1267,6 +2265,19 @@ fn a_plugin_refuses_a_save_and_says_why() {
             && m == "House rules: tavern.are: its tag was TAVERN, now INN: players' places are kept by it"),
         "{log:#?}"
     );
+    // Save As (to another place) is asked about as Save is: refused,
+    // nothing is written there.
+    let elsewhere = mg_testkit::scratch_dir("ui-plugin-save-as").join("copy.mod");
+    let _ = std::fs::remove_file(&elsewhere);
+    h.state_mut().actions.push(mg_ui::Action::SaveAt(ModuleLocation::Archive(elsewhere.clone())));
+    h.run_steps(3);
+    h.get_by_label("Refused");
+    assert!(!elsewhere.exists(), "nothing written there");
+    // The time what plugins do at once may take: 5 s, or as Manage
+    // Plugins sets it.
+    assert_eq!(h.state().plugin_event_budget(), std::time::Duration::from_secs(5));
+    h.state_mut().settings.plugin_event_seconds = 12;
+    assert_eq!(h.state().plugin_event_budget(), std::time::Duration::from_secs(12));
 }
 
 /// A plugin's warning about what a save would write is asked about before
@@ -1288,7 +2299,7 @@ fn a_plugin_warns_before_a_save() {
     h.run_steps(2);
     h.state_mut().actions.push(mg_ui::Action::Save);
     h.run_steps(3);
-    h.get_by_label("Before saving");
+    h.get_by_label("Before Saving");
     h.get_by_label("Warning");
     h.get_by_label("tag Cellar is not upper case");
     h.get_by_label("Make it CELLAR");
@@ -1308,11 +2319,53 @@ fn a_plugin_warns_before_a_save() {
     h.state_mut().actions.push(mg_ui::Action::Save);
     h.run_steps(3);
     assert!(h.state().plugins.save.held.is_none());
-    // And the Plugins window says what the plugin does by itself.
-    h.state_mut().plugins.window = true;
-    h.run();
+    // And the Plugins tab says what the plugin does by itself.
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(mg_ui::Tab::Plugins));
+    settle(&mut h);
     h.get_by_label_contains("before a save, reads each resource it writes (are)");
     h.get_by_label_contains("when objects (waypoint) are pasted: may change them");
+}
+
+/// New Script fires `resource-created` (API 0.5's `for = "nss"`): the
+/// plugin's edit of the script goes in with it.
+#[test]
+fn a_new_script_is_made_for_the_plugins_to_see() {
+    let plugins = mg_testkit::scratch_dir("ui-plugin-made-script-plugins");
+    let dir = plugins.join("made");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.cfg"),
+        "[plugin]\nid = \"test.scripts\"\nname = \"Scripts\"\nversion = \"1\"\napi = \"0.5\"\n\
+         license = \"MIT\"\n[event]\nid = \"made\"\non = \"resource-created\"\nfor = \"nss\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.luau"),
+        r#"
+        local mg = require("@moonglow")
+        mg.on("made", function(ctx)
+            local e = ctx.event
+            ctx.edit:write(e.resource, "// header\n" .. ctx.module:text(e.resource))
+            ctx.log:info(`{e.resource} by {e.by}`)
+        end)
+        "#,
+    )
+    .unwrap();
+    let Some((mut h, _)) = plugin_harness("ui-plugin-made-script", false) else { return };
+    h.state_mut().plugin_dir = Some(plugins);
+    h.state_mut().load_plugins();
+    h.state_mut().enable_plugin("test.scripts", true);
+    h.run();
+    h.state_mut().new_script = Some("fresh".into());
+    h.run();
+    h.get_by_label("Create").click();
+    h.run_steps(3);
+    let key = ResKey::parse("fresh", ResType::NSS).unwrap();
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    ws.flush().unwrap();
+    let text = String::from_utf8_lossy(ws.module.get(&key).unwrap()).into_owned();
+    assert!(text.starts_with("// header\n"), "{text}");
+    assert!(h.state().log.entries.iter().any(|(_, m)| m == "Scripts: fresh.nss by new-script"));
 }
 
 /// What a plugin does on a resource made (a copy here; a wizard's alike):
@@ -1486,10 +2539,483 @@ fn a_save_the_claims_and_a_plugin_ask_about_is_asked_once_each() {
     h.get_by_label("Areas Not Yours");
     h.get_by_label("Save Anyway").click();
     h.run_steps(3);
-    h.get_by_label("Before saving");
+    h.get_by_label("Before Saving");
     h.get_by_label("tag Cellar is not upper case");
     h.get_by_label("Save Anyway").click();
     h.run_steps(3);
     assert!(h.query_by_label("Areas Not Yours").is_none(), "the claims are not asked again");
     assert!(!h.state().has_unsaved_work(), "saved");
+}
+
+/// Save Anyway on a Save As (which the claims are not asked about) leaves
+/// no "not asked again" behind for them: the next Save that would write
+/// another builder's area asks. (It took the flag a Save As's answer had
+/// set, and wrote without the question.)
+#[test]
+fn save_anyway_on_a_save_as_does_not_answer_the_claims_for_the_next_save() {
+    let (dir, mut app) = claimed_project(
+        "ui-claims-after-save-as",
+        "[claims]\nfile = \"claims.2da\"\n",
+        &claims_table("cd", "claimed"),
+    );
+    app.plugin_dir = Some(example_plugins());
+    app.load_plugins();
+    app.enable_plugin("example.house-rules", true);
+    let mut h = harness(app, 1000.0, 700.0);
+    h.run();
+    // A new area whose tag the plugin warns of; Save As, to where it is.
+    let mut are = Gff::new(*b"ARE ");
+    are.root.set("Tag", mg_gff::Value::String(b"Cellar".to_vec()));
+    let key = ResKey::parse("cellar", ResType::ARE).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new(
+        "A cellar",
+        vec![mg_edit::Edit::SetResource { key, data: Some(are.to_bytes().unwrap()) }],
+    )));
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::SaveAt(ModuleLocation::Folder(dir)));
+    h.run_steps(3);
+    h.get_by_label("Before Saving");
+    h.get_by_label("Save Anyway").click();
+    h.run_steps(3);
+    assert!(!h.state().has_unsaved_work(), "saved");
+    // Another builder's area changed, and Save: the claims ask.
+    h.state_mut().actions.push(rename_start("Market"));
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    h.run_steps(3);
+    h.get_by_label("Areas Not Yours");
+    assert!(h.state().has_unsaved_work(), "held");
+}
+
+/// A click on the Top Bar's Plugins menu (the Welcome page, with no module
+/// open, has a Plugins chapter link too).
+fn plugins_menu(h: &mut egui_kittest::Harness<'_, mg_ui::Moonglow>) {
+    let link = egui::accesskit::Role::Link;
+    h.get_all_by_label("Plugins").find(|n| n.accesskit_node().role() != link).unwrap().click();
+}
+
+/// Plugins › Manage Plugins opens the Plugins tab (M4's U29; a dialog
+/// before), with no module open too: a document tab named Plugins, brought
+/// to the front when open, closed by Ctrl+W and by its tab's menu, and
+/// a window of its own where editors open as floating windows; closed, it
+/// forgets the install note.
+#[test]
+fn plugins_is_a_document_tab() {
+    let mut app = app_with(Vec::new());
+    app.plugin_dir = Some(plugin_fixtures());
+    app.load_plugins();
+    app.settings.open_editors = mg_ui::OpenEditors::Tabs;
+    let mut h = harness(app, 1280.0, 720.0);
+    settle(&mut h);
+    assert!(h.state().ws.is_none());
+    menu_command(&mut h, "Plugins", "Manage Plugins");
+    let path = h.state().dock.find_tab(&Tab::Plugins).expect("the tab");
+    assert!(path.surface.is_main(), "docked");
+    settle(&mut h);
+    h.try_run().unwrap_or_else(|e| panic!("docked, at rest, a frame asks another: {e}"));
+    assert_eq!(h.state().active_editor(), Some(&Tab::Plugins));
+    h.get_by_label_contains("A plugin adds commands");
+    h.get_all_by_role(egui::accesskit::Role::Tab)
+        .find(|n| n.accesskit_node().label().as_deref() == Some("Plugins"))
+        .expect("named Plugins");
+    // Ctrl+W.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::W);
+    settle(&mut h);
+    assert!(h.state().dock.find_tab(&Tab::Plugins).is_none(), "Ctrl+W closes it");
+    // As floating windows: a window of its own.
+    h.state_mut().settings.open_editors = mg_ui::OpenEditors::Floating;
+    menu_command(&mut h, "Plugins", "Manage Plugins");
+    let path = h.state().dock.find_tab(&Tab::Plugins).expect("the tab");
+    assert!(!path.surface.is_main(), "a window of its own");
+    settle(&mut h);
+    h.try_run().unwrap_or_else(|e| panic!("floating, at rest, a frame asks another: {e}"));
+    // The install note goes with it.
+    h.state_mut().plugins.install_note = Some((mg_ui::Level::Info, "Installed".into()));
+    h.state_mut().actions.push(mg_ui::Action::CloseTabs(vec![Tab::Plugins]));
+    settle(&mut h);
+    assert!(h.state().plugins.install_note.is_none(), "closed, the note forgotten");
+}
+
+/// What `plugins_is_a_document_tab`'s words claim, held (M4's U29 review),
+/// with the module's tabs reopened or not (Options' Open a module with the
+/// tabs it had): Manage Plugins with the tab open brings it to the front
+/// (one tab, beside another in front of it, and in a split's other group);
+/// its tab's menu closes it.
+#[test]
+fn plugins_comes_to_the_front_when_open_and_its_tab_s_menu_closes_it() {
+    for no_reopen in [false, true] {
+        let dir = mg_testkit::scratch_dir("u29f-plugins-front");
+        let mut app = app_with(Vec::new());
+        app.plugin_dir = Some(plugin_fixtures());
+        app.load_plugins();
+        app.settings.open_editors = mg_ui::OpenEditors::Tabs;
+        app.settings.no_reopen_tabs = no_reopen;
+        app.open_module(&sample_module(&dir));
+        let mut h = harness(app, 1280.0, 720.0);
+        settle(&mut h);
+        menu_command(&mut h, "Plugins", "Manage Plugins");
+        settle(&mut h);
+        // Another tab in front of it in its group.
+        h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Manual));
+        settle(&mut h);
+        assert_eq!(
+            h.state().active_editor(),
+            Some(&Tab::Manual),
+            "{no_reopen}: the manual in front"
+        );
+        menu_command(&mut h, "Plugins", "Manage Plugins");
+        settle(&mut h);
+        assert_eq!(
+            h.state().active_editor(),
+            Some(&Tab::Plugins),
+            "{no_reopen}: brought to the front"
+        );
+        let count = |h: &Harness<'_, mg_ui::Moonglow>| {
+            h.state().dock.iter_all_tabs().filter(|(_, t)| **t == Tab::Plugins).count()
+        };
+        assert_eq!(count(&h), 1, "{no_reopen}: one tab");
+        // In a split's other group, the manual's group in front.
+        {
+            let dock = &mut h.state_mut().dock;
+            let at = dock.find_tab(&Tab::Plugins).unwrap();
+            dock.remove_tab(at);
+            let node = dock.find_tab(&Tab::Manual).unwrap().node;
+            dock.main_surface_mut().split_right(node, 0.5, vec![Tab::Plugins]);
+            let manual = dock.find_tab(&Tab::Manual).unwrap();
+            dock.set_active_tab(manual).expect("the manual in front of its group");
+            dock.set_focused_node_and_surface(manual.node_path());
+        }
+        settle(&mut h);
+        assert_eq!(
+            h.state().active_editor(),
+            Some(&Tab::Manual),
+            "{no_reopen}: the split's manual"
+        );
+        menu_command(&mut h, "Plugins", "Manage Plugins");
+        settle(&mut h);
+        assert_eq!(h.state().active_editor(), Some(&Tab::Plugins), "{no_reopen}: from the split");
+        assert_eq!(count(&h), 1, "{no_reopen}: one tab in the split");
+        // Its tab's menu: Close. (The press and the release in frames of
+        // their own: in one, the menu came up with its rows disabled, as
+        // the press began a drag of the tab.)
+        let tab = doc_tab(&h, "Plugins").rect().center();
+        h.hover_at(tab);
+        h.run();
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: tab,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run();
+        }
+        crate::tool_sections::wait_for(&mut h, "the tab's menu", |h| {
+            h.query_by_label("Close Others").is_some()
+        });
+        let at = h.get_by_label("Close").rect().center();
+        h.hover_at(at);
+        h.run();
+        click_pos(&h, at);
+        settle(&mut h);
+        assert_eq!(count(&h), 0, "{no_reopen}: its menu's Close");
+    }
+}
+
+/// The Plugins tab's folder: its path given the room to the tab's edge,
+/// past the page's width, not cut with "…" beside free room (M4's U29
+/// review).
+#[test]
+fn the_plugins_folder_s_path_takes_the_room_there_is() {
+    let mut app = app_with(Vec::new());
+    let long = mg_testkit::scratch_dir("u29f-plugins-path")
+        .join("a folder of plugins with a long name to see it whole beside the free room");
+    std::fs::create_dir_all(&long).unwrap();
+    app.plugin_dir = Some(long.clone());
+    app.load_plugins();
+    app.settings.open_editors = mg_ui::OpenEditors::Tabs;
+    let mut h = harness(app, 1280.0, 720.0);
+    let path = long.display().to_string();
+    let words = h.ctx.fonts_mut(|f| {
+        f.layout_no_wrap(path.clone(), egui::FontId::proportional(13.0), egui::Color32::WHITE)
+            .size()
+            .x
+    });
+    assert!(words > 700.0, "expected path wider than form page: {words}");
+    if words + 160.0 > 1280.0 {
+        h.set_size(egui::vec2(words + 160.0, 720.0));
+    }
+    settle(&mut h);
+    menu_command(&mut h, "Plugins", "Manage Plugins");
+    settle(&mut h);
+    let r = h.get_by_label(&path).rect();
+    assert!(r.width() + 1.0 >= words, "whole: {r:?} for {words} of words");
+}
+
+/// A project's plugins asked about (Allow, Don't Allow, what each adds and
+/// the settings it keeps), pictured in both themes at the four sizes (M4's
+/// U29 review). By hand:
+/// `MG_U29_PICS=<folder> cargo test -p mg-ui --test app u29_pictures -- --ignored`.
+#[test]
+#[ignore]
+fn u29_pictures_project_plugins_asked() {
+    mg_testkit::gpu::hold();
+    let label = |l: &'static str| {
+        move |n: &egui_kittest::Node<'_>| crate::tool_sections::words(n).as_deref() == Some(l)
+    };
+    for light in [false, true] {
+        for size in crate::tool_sections::PICTURE_SIZES {
+            let dir = plugin_project("u29-pics-project-plugins");
+            let Some(mut h) = project_harness(&dir, false) else { return };
+            h.state_mut().settings.light_theme = light;
+            h.set_size(size);
+            h.run();
+            crate::tool_sections::scroll_to(&mut h, label("Allow"));
+            let what = "Allow and what the plugin adds";
+            crate::tool_sections::picture_of(&mut h, "plugins-project-asks", what, |h| {
+                let s = h.ctx.content_rect();
+                crate::tool_sections::label_in(h, s, "Allow")
+                    && crate::tool_sections::label_in(
+                        h,
+                        s,
+                        "Check: Tags begin with the team's prefix",
+                    )
+            });
+        }
+    }
+}
+
+#[test]
+fn invalid_plugin_settings_stay_open_disable_save_and_log_error() {
+    let dir = mg_testkit::scratch_dir("ui-plugin-settings-invalid");
+    let plug_dir = dir.join("plugins/color-check");
+    std::fs::create_dir_all(&plug_dir).unwrap();
+    std::fs::write(
+        plug_dir.join("plugin.cfg"),
+        "[plugin]\nid = \"test.color-check\"\nname = \"Color Check\"\nversion = \"1.0.0\"\n\
+         api = \"0.5\"\nlicense = \"MIT\"\n\n\
+         [setting]\nid = \"tint\"\nlabel = \"Tint\"\ntype = \"color\"\ndefault = \"#336699\"\n",
+    )
+    .unwrap();
+    std::fs::write(plug_dir.join("main.luau"), "-- settings only\n").unwrap();
+
+    let mut app = app_with(Vec::new());
+    app.plugin_dir = Some(dir.join("plugins"));
+    app.plugin_values = Some(dir.join("values.json"));
+    app.load_plugins();
+    assert!(
+        app.plugins
+            .installed
+            .iter()
+            .any(|i| i.plugin.as_ref().is_ok_and(|p| p.manifest.id == "test.color-check")),
+        "{:#?}",
+        app.log.entries
+    );
+    app.enable_plugin("test.color-check", true);
+    app.open_plugin_settings("test.color-check");
+    let mut h = harness(app, 1200.0, 900.0);
+    settle(&mut h);
+    assert!(h.state().plugins.settings_form.is_some());
+
+    // Enter invalid color on SettingKind::Color ("tint").
+    h.state_mut()
+        .plugins
+        .settings_form
+        .as_mut()
+        .unwrap()
+        .values
+        .insert("tint".into(), mg_plugin::SettingValue::Text("notacolor".into()));
+    h.run();
+    assert!(
+        apart(&h, "Save").accesskit_node().is_disabled(),
+        "Save must be disabled when settings are invalid"
+    );
+    h.get_by_label_contains("#rrggbb");
+
+    // Calling save_plugin_settings directly keeps form open and logs an Error.
+    h.state_mut().save_plugin_settings();
+    assert!(
+        h.state().plugins.settings_form.is_some(),
+        "invalid values must leave settings_form open"
+    );
+    assert!(
+        h.state().log.entries.iter().any(|(l, _)| *l == mg_ui::Level::Error),
+        "expected Error log entry for invalid settings: {:#?}",
+        h.state().log.entries
+    );
+
+    // Restoring valid hex color enables Save and closes cleanly.
+    h.state_mut()
+        .plugins
+        .settings_form
+        .as_mut()
+        .unwrap()
+        .values
+        .insert("tint".into(), mg_plugin::SettingValue::Text("#336699".into()));
+    h.run();
+    assert!(!apart(&h, "Save").accesskit_node().is_disabled());
+    apart(&h, "Save").click();
+    settle(&mut h);
+    assert!(h.state().plugins.settings_form.is_none());
+}
+
+#[test]
+fn plugin_protected_area_cancel_rolls_back_hak_and_confirm_tracks_undo() {
+    let Some(root) = mg_testkit::nwn_root() else { return };
+    let dir = project_folder(
+        "ui-plugin-protected-hak",
+        &[("moonglow.toml", "[claims]\nprotected = [\"start\"]\n")],
+    );
+    let export = dir.join("export");
+    std::fs::create_dir_all(&export).unwrap();
+    std::fs::write(export.join("note.txt"), "from the plugin").unwrap();
+    let user = user_folder(&dir, &[]);
+    let hak = user.join("hak/made.hak");
+
+    let dialogs = NoDialogs { folders: vec![export.clone(), export], ..Default::default() };
+    let mut app = game_app_with(&root, Some(user), dialogs);
+    app.open_module(&dir);
+    app.palette_dock = false;
+    app.background_jobs = true;
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+
+    let wait_for = |h: &mut Harness<'_, Moonglow>, label: &str| {
+        let started = std::time::Instant::now();
+        while h.query_by_label(label).is_none() {
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "missing {label}");
+        }
+        h.run_steps(2);
+    };
+    let wait_idle = |h: &mut Harness<'_, Moonglow>| {
+        let started = std::time::Instant::now();
+        while h.state().busy() {
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "job hung");
+        }
+        h.run_steps(2);
+    };
+    let start_tag = |h: &mut Harness<'_, Moonglow>| -> String {
+        let are = module_gff(h, "start", ResType::ARE).unwrap();
+        String::from_utf8_lossy(are.root.string("Tag").unwrap_or_default()).into_owned()
+    };
+
+    h.state_mut().plugins.console = r#"
+        local folder = ctx.ui:open_folder({ title = "The folder to take" })
+        folder:to_hak("made", "note.txt")
+        ctx.edit:set("start.are", "Tag", "BY_PLUGIN")
+    "#
+    .into();
+
+    // First run: cancel on Protected Area rolls back the written hak and keeps start.are unchanged.
+    h.state_mut().run_console();
+    wait_for(&mut h, "Choose Folder…");
+    h.get_by_label("Choose Folder…").click();
+    wait_for(&mut h, "Yes");
+    h.get_by_label("Yes").click();
+    wait_for(&mut h, "Protected Area");
+    assert!(hak.is_file(), "hak was staged on disk while awaiting confirmation");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    wait_idle(&mut h);
+    assert!(!hak.exists(), "Cancel on Protected Area must roll back written hak");
+    assert_ne!(start_tag(&mut h), "BY_PLUGIN");
+
+    // Second run: confirming applies edit and records hak write with Undo step.
+    h.state_mut().run_console();
+    wait_for(&mut h, "Choose Folder…");
+    h.get_by_label("Choose Folder…").click();
+    wait_for(&mut h, "Yes");
+    h.get_by_label("Yes").click();
+    wait_for(&mut h, "Protected Area");
+    h.get_by_label("Change It Anyway").click();
+    wait_idle(&mut h);
+    assert!(hak.is_file(), "confirmed plugin apply keeps written hak");
+    assert_eq!(start_tag(&mut h), "BY_PLUGIN");
+
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(3);
+    assert_ne!(start_tag(&mut h), "BY_PLUGIN", "Undo reverts area tag");
+    assert!(!hak.exists(), "Undo removes hak recorded via FinishPluginApply");
+}
+
+/// A second plugin run while the first is held for the Protected Area
+/// window does not start (it took the first's place, whose hak stayed
+/// written past Cancel), and an event's job waits; Quit with a run held
+/// takes its hak back.
+#[test]
+fn a_second_plugin_run_waits_for_the_protected_area_answer_and_quit_rolls_back() {
+    let Some(root) = mg_testkit::nwn_root() else { return };
+    let dir = project_folder(
+        "ui-plugin-protected-second",
+        &[("moonglow.toml", "[claims]\nprotected = [\"start\"]\n")],
+    );
+    let export = dir.join("export");
+    std::fs::create_dir_all(&export).unwrap();
+    std::fs::write(export.join("note.txt"), "from the plugin").unwrap();
+    let user = user_folder(&dir, &[]);
+    let (first, second) = (user.join("hak/made.hak"), user.join("hak/second.hak"));
+
+    let dialogs = NoDialogs { folders: vec![export.clone(); 4], ..Default::default() };
+    let mut app = game_app_with(&root, Some(user), dialogs);
+    app.open_module(&dir);
+    app.palette_dock = false;
+    app.background_jobs = true;
+    let mut h = harness(app, 1200.0, 900.0);
+    h.run();
+
+    let wait_for = |h: &mut Harness<'_, Moonglow>, label: &str| {
+        let started = std::time::Instant::now();
+        while h.query_by_label(label).is_none() {
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "missing {label}");
+        }
+        h.run_steps(2);
+    };
+    let run = |h: &mut Harness<'_, Moonglow>, hak: &str| {
+        h.state_mut().plugins.console = format!(
+            r#"
+            local folder = ctx.ui:open_folder({{ title = "The folder to take" }})
+            folder:to_hak("{hak}", "note.txt")
+            ctx.edit:set("start.are", "Tag", "BY_{hak}")
+        "#
+        );
+        h.state_mut().run_console();
+    };
+    let held = |h: &mut Harness<'_, Moonglow>, hak: &str| {
+        run(h, hak);
+        wait_for(h, "Choose Folder…");
+        h.get_by_label("Choose Folder…").click();
+        wait_for(h, "Yes");
+        h.get_by_label("Yes").click();
+        wait_for(h, "Protected Area");
+    };
+
+    held(&mut h, "made");
+    assert!(first.is_file(), "the first run's hak, written while it waits");
+    // The second: not started, and said.
+    run(&mut h, "second");
+    h.run_steps(3);
+    assert!(!h.state().busy(), "the second run did not start");
+    assert!(!second.exists());
+    let log: Vec<String> = h.state().log.entries.iter().map(|(_, m)| m.clone()).collect();
+    assert!(
+        log.iter().any(|m| m.contains("not run while the Protected Area window waits")),
+        "{log:?}"
+    );
+    // Cancel takes back the first's hak.
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run_steps(3);
+    assert!(!first.exists(), "Cancel rolls back the held run's hak");
+    assert!(h.query_by_label("Protected Area").is_none());
+
+    // Held again, and the window quit: its hak is taken back.
+    held(&mut h, "made");
+    assert!(first.is_file());
+    h.state_mut().actions.push(mg_ui::Action::Quit);
+    h.run_steps(3);
+    assert!(!first.exists(), "Quit rolls back the held run's hak");
 }

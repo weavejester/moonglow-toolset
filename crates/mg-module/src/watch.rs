@@ -84,6 +84,7 @@ impl Drop for Watch {
 fn signature(paths: &[PathBuf], deep: bool) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let mut dirs = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     for path in paths {
         match std::fs::metadata(path) {
             Ok(meta) if meta.is_dir() => dirs.push(path.clone()),
@@ -92,6 +93,10 @@ fn signature(paths: &[PathBuf], deep: bool) -> u64 {
         }
     }
     while let Some(dir) = dirs.pop() {
+        let Ok(canon) = std::fs::canonicalize(&dir) else { continue };
+        if !visited.insert(canon) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         let mut seen: Vec<(std::ffi::OsString, Option<std::time::SystemTime>, u64)> = Vec::new();
         for e in entries.flatten() {
@@ -130,11 +135,14 @@ fn heard_of(
         // (Moonglow's own reads are heard too: only a write's end counts.)
         EventKind::Access(AccessKind::Close(AccessMode::Write)) => {}
         EventKind::Access(_) => return Heard::default(),
-        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder) => {
-            return Heard { changed: true, all: true, ..Heard::default() };
-        }
         _ => {}
     }
+    // (A folder made or removed: all of it is looked at, where it is the
+    // watch's, as a file is; not one in a folder's folder, not deep.)
+    let folder_event = matches!(
+        event.kind,
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
+    );
     // (A folder's own entry modified, not renamed: Windows says so of the
     // folder a file is written in, whose files are said themselves.)
     let touched = matches!(event.kind, EventKind::Modify(k) if !matches!(k, ModifyKind::Name(_)));
@@ -165,7 +173,7 @@ fn heard_of(
             continue;
         }
         heard.changed = true;
-        let folder = dir.unwrap_or_else(|_| path.extension().is_none());
+        let folder = folder_event || dir.unwrap_or_else(|_| path.extension().is_none());
         if folder {
             heard.all = true;
         } else {
@@ -226,7 +234,12 @@ impl Watch {
         let first = Heard { changed: true, all: true, ..Heard::default() };
         let heard = Arc::new(std::sync::Mutex::new(first));
         let (send, told) = std::sync::mpsc::channel();
-        let system = if walk { None } else { system_watch(&paths, deep, send) };
+        let (system, polled) = match walk {
+            true => (None, Vec::new()),
+            false => {
+                system_watch(&paths, deep, send).map_or((None, Vec::new()), |(w, p)| (Some(w), p))
+            }
+        };
         let is_told = system.is_some();
         let (dirs, said, done) = (paths.clone(), heard.clone(), stop.clone());
         let in_burst = hearing.clone();
@@ -240,11 +253,22 @@ impl Watch {
             let real = real_paths(&dirs);
             let mut last = signature(&dirs, deep);
             let mut walked = Instant::now();
+            // (The paths the system could not watch, walked every `every`.)
+            let mut polled_last = signature(&polled, deep);
+            let mut polled_at = Instant::now();
             while !done.load(Ordering::Relaxed) {
                 if is_told {
                     // Told: what the system says, once it is quiet a moment
                     // (at most ten seconds of a burst).
                     let Ok(event) = told.recv_timeout(Duration::from_millis(100)) else {
+                        if !polled.is_empty() && polled_at.elapsed() >= every {
+                            let now = signature(&polled, deep);
+                            polled_at = Instant::now();
+                            if now != polled_last {
+                                polled_last = now;
+                                say(Heard { changed: true, all: true, ..Heard::default() });
+                            }
+                        }
                         if walked.elapsed() >= Watch::CHECK {
                             let now = signature(&dirs, deep);
                             walked = Instant::now();
@@ -272,6 +296,7 @@ impl Watch {
                     if heard.changed {
                         // (What it walks next is as it is now.)
                         last = signature(&dirs, deep);
+                        polled_last = signature(&polled, deep);
                         walked = Instant::now();
                         say(heard);
                     }
@@ -282,6 +307,9 @@ impl Watch {
                 let until = Instant::now() + every;
                 while Instant::now() < until && !done.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(100));
+                }
+                if done.load(Ordering::Relaxed) {
+                    break;
                 }
                 let mut now = signature(&dirs, deep);
                 if now == last {
@@ -294,11 +322,17 @@ impl Watch {
                 let settle = (every / 6).min(Duration::from_millis(500));
                 for _ in 0..20 {
                     std::thread::sleep(settle);
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let again = signature(&dirs, deep);
                     if again == now || done.load(Ordering::Relaxed) {
                         break;
                     }
                     now = again;
+                }
+                if done.load(Ordering::Relaxed) {
+                    break;
                 }
                 last = now;
                 say(Heard { changed: true, all: true, ..Heard::default() });
@@ -348,12 +382,14 @@ impl Watch {
 
 /// The system's watch of `paths` (a folder with what is under it where
 /// `deep`; a file, or a file not there yet by its folder), its events
-/// sent to `send`; `None` where one of them can't be watched.
+/// sent to `send`, and the paths it could not watch (a folder not there
+/// yet, one the system refuses), which the watch walks for instead;
+/// `None` where none of them can be watched: all are walked for.
 fn system_watch(
     paths: &[PathBuf],
     deep: bool,
     send: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
-) -> Option<notify::RecommendedWatcher> {
+) -> Option<(notify::RecommendedWatcher, Vec<PathBuf>)> {
     use notify::{RecursiveMode, Watcher};
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = send.send(event);
@@ -361,6 +397,8 @@ fn system_watch(
     .ok()?;
     let mode = if deep { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
     let mut watched: Vec<(&Path, RecursiveMode)> = Vec::new();
+    // Each path with the folder it is watched by (none: it can't be).
+    let mut by: Vec<(&PathBuf, Option<&Path>)> = Vec::new();
     for path in paths {
         // (A file under a folder watched whole is told of with it.)
         if deep && paths.iter().any(|p| p != path && path.starts_with(p)) {
@@ -371,16 +409,35 @@ fn system_watch(
         // the first doesn't hear of.
         let (what, mode) = match path.is_dir() {
             true => (path.as_path(), mode),
-            false => (path.parent()?, RecursiveMode::NonRecursive),
+            false => match path.parent().filter(|p| p.is_dir()) {
+                Some(parent) => (parent, RecursiveMode::NonRecursive),
+                None => {
+                    by.push((path, None));
+                    continue;
+                }
+            },
         };
+        by.push((path, Some(what)));
         if !watched.iter().any(|(w, _)| *w == what) {
             watched.push((what, mode));
         }
     }
+    let mut refused: Vec<&Path> = Vec::new();
+    let mut watched_any = false;
     for (what, mode) in watched {
-        watcher.watch(what, mode).ok()?;
+        match watcher.watch(what, mode) {
+            Ok(()) => watched_any = true,
+            Err(_) => refused.push(what),
+        }
     }
-    Some(watcher)
+    if !watched_any && !paths.is_empty() {
+        return None;
+    }
+    let polled = (by.into_iter())
+        .filter(|(_, what)| what.is_none_or(|w| refused.contains(&w)))
+        .map(|(p, _)| p.clone())
+        .collect();
+    Some((watcher, polled))
 }
 
 #[cfg(test)]
@@ -464,10 +521,17 @@ mod tests {
         assert!(watch.told, "inotify, FSEvents or ReadDirectoryChangesW watches the folder");
         let first = heard(&watch).expect("looked at once, at the start");
         assert!(first.all);
-        // (Windows' ReadDirectoryChangesW may still say the files made just
-        // before the watch began: what is said while it settles is let go.)
-        std::thread::sleep(Duration::from_millis(400));
-        let _ = watch.take();
+        // (Windows' ReadDirectoryChangesW and macOS's FSEvents may still
+        // say the files made just before the watch began, a while after:
+        // what is said while it settles is let go, with a deadline.)
+        let quiet = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            std::thread::sleep(Duration::from_millis(400));
+            let said = watch.take().is_some();
+            if (!said && !watch.hearing()) || std::time::Instant::now() > quiet {
+                break;
+            }
+        }
         std::thread::sleep(Duration::from_millis(400));
         assert!(watch.take().is_none(), "nothing changed: nothing said");
         // Read: nothing. In a hidden folder: nothing.
@@ -532,8 +596,16 @@ mod tests {
         let watch = Watch::start(vec![dir.clone()], true, Duration::from_millis(40), false, None);
         assert!(watch.told, "inotify, FSEvents or ReadDirectoryChangesW watches the folder");
         heard(&watch).expect("looked at once, at the start");
-        std::thread::sleep(Duration::from_millis(400));
-        let _ = watch.take();
+        // (FSEvents may still tell of the folder made before the watch
+        // began a while after: waited out, with a deadline.)
+        let quiet = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = watch.take();
+            if !watch.hearing() || std::time::Instant::now() > quiet {
+                break;
+            }
+        }
         assert!(!watch.hearing(), "nothing changed: nothing being heard");
         std::fs::write(dir.join("src/a.nss"), "void main() {}").unwrap();
         // (Polled: it is heard for at least Watch::QUIET.)
@@ -572,9 +644,15 @@ mod tests {
         let watch = Watch::start(paths, false, Duration::from_millis(40), false, None);
         assert!(watch.told);
         assert!(heard(&watch).is_some());
-        std::fs::write(dir.join("override/below/x.2da"), "x").unwrap();
+        // (Late news of the set-up, which macOS's FSEvents can give after
+        // the watch has started, taken first.)
         std::thread::sleep(Duration::from_millis(600));
-        assert!(watch.take().is_none(), "a folder's folder isn't the game's");
+        let _ = watch.take();
+        std::fs::write(dir.join("override/below/x.2da"), "x").unwrap();
+        std::fs::create_dir(dir.join("override/below/deeper")).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let late = watch.take();
+        assert!(late.is_none(), "a folder's folder isn't the game's: {late:?}");
         std::fs::write(dir.join("my.hak"), "ERF again").unwrap();
         let hak = heard(&watch).expect("the hak written is said");
         assert_eq!(hak.paths.iter().collect::<Vec<_>>(), [&dir.join("my.hak")]);
@@ -589,5 +667,45 @@ mod tests {
         assert!(
             heard(&watch).expect("a file in override").paths.contains(&dir.join("override/y.2da"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signature_breaks_symlink_cycles_cleanly() {
+        let dir = mg_testkit::scratch_dir("watch-symlink-cycle");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "hello").unwrap();
+        let _ = std::os::unix::fs::symlink(&dir, sub.join("loop"));
+        let sig = signature(&[dir], true);
+        assert_ne!(sig, 0);
+    }
+
+    #[test]
+    fn system_watch_skips_missing_parents_without_aborting_existing_watches() {
+        let dir = mg_testkit::scratch_dir("watch-missing-parent");
+        let existing = dir.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        let missing_file = dir.join("missing/sub/ghost.hak");
+        let watch = Watch::start(
+            vec![existing.clone(), missing_file],
+            false,
+            Duration::from_millis(40),
+            false,
+            None,
+        );
+        assert!(watch.told);
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = watch.take();
+        std::fs::write(existing.join("live.2da"), "2DA V2.0\r\n").unwrap();
+        let h = heard(&watch).expect("existing directory stays watched");
+        assert!(h.paths.contains(&existing.join("live.2da")), "{h:?}");
+        // The file whose folder wasn't there is walked for: made later, it
+        // is heard of, though the system was never asked to watch it.
+        let _ = watch.take();
+        std::fs::create_dir_all(dir.join("missing/sub")).unwrap();
+        std::fs::write(dir.join("missing/sub/ghost.hak"), "HAK V1.0").unwrap();
+        let h = heard(&watch).expect("a path the system could not watch is walked for");
+        assert!(h.all, "{h:?}");
     }
 }

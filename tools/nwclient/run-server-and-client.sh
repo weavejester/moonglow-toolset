@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # The game's headless server and the game client joined to it, in one
 # sandbox whose network is a loopback of its own (bubblewrap's
 # --unshare-net brings `lo` up and nothing else): for tests of what a
@@ -22,20 +22,32 @@
 #   (default 8080) inside the sandbox, by Python's http.server: an NWSync
 #   repository, the server given -nwsyncurl http://127.0.0.1:PORT.
 # - MG_CLIENT_ARGS (optional): more of the client's arguments.
+# - MG_CLIENT_SETTINGS (optional, under MG_SCRATCH): the client's
+#   settings.tml, put back before each start (the client writes its own
+#   over it as it ends, without the debug logging asked for).
 # - MG_CLIENT_RUNS (optional, default 1): how many times the client is
 #   started, each after the last ended (after an NWSync download).
 #
 # As run-client.sh: the system read-only, Steam hidden, no D-Bus or audio,
-# the client drawn on $DISPLAY (default :1, the off-screen display), never
-# the desktop's :0. Killing this process (bwrap) ends everything in the
+# the client drawn on $DISPLAY (the off-screen display; none set, nothing
+# runs), never the desktop's :0. Killing this process (bwrap) ends everything in the
 # sandbox: the server and the client are in its own PID namespace.
+#
+# With a client, the machine's display lock (tools/locks.sh, docs/locks.md) is
+# taken first, unless an ancestor holds it (MOONGLOW_LOCKS_HELD), and kept
+# for the sandbox's life (a kill -9 of it frees it). MG_CLIENT=none takes
+# nothing.
 #
 # The game install comes from $NWN_ROOT (default: the Steam path).
 set -e
+. "$(dirname "$0")/../locks.sh"
 [ -n "$MG_SCRATCH" ] || { echo "MG_SCRATCH is not set" >&2; exit 1; }
 SCRATCH=$(realpath "$MG_SCRATCH")
 NWN=${NWN_ROOT:-"$HOME/.local/share/Steam/steamapps/common/Neverwinter Nights"}
-DISP=${DISPLAY:-:1}
+DISP=${DISPLAY:-}
+[ "${MG_CLIENT:-player}" = none ] || mg_lock_display "run-server-and-client.sh $MG_SCRATCH"
+# Only the running off-screen session's display (headless.sh check).
+"$(dirname "$0")/../aurora/headless.sh" check "$DISP"
 [ "$DISP" = ":0" ] && { echo "refusing to run on the desktop display :0" >&2; exit 1; }
 SOCKET=/tmp/.X11-unix/X${DISP#:}
 
@@ -102,6 +114,9 @@ if [ -n "$CLIENT" ]; then
   (
     n=0
     while [ $n -lt "${MG_CLIENT_RUNS:-1}" ]; do
+      if [ -n "$MG_CLIENT_SETTINGS" ]; then
+        cp "$MG_CLIENT_SETTINGS" "$SCRATCH/user/settings.tml"
+      fi
       ./nwmain-linux -userdirectory "$SCRATCH/user" $CLIENT $MG_CLIENT_ARGS \
         >> "$SCRATCH/client.out" 2>&1
       echo "MG_CLIENT_EXIT $?" >> "$SCRATCH/client.out"
@@ -119,6 +134,7 @@ for a in "$@"; do
   prev=$a
 done
 
+[ "${MG_CLIENT:-player}" = none ] || mg_display_history "run-server-and-client.sh start: display $DISP, $MG_SCRATCH"
 exec bwrap \
   --ro-bind / / \
   --dev-bind /dev /dev \
@@ -139,4 +155,5 @@ exec bwrap \
   --setenv WEB "$WEB" --setenv WEB_PORT "$WEB_PORT" --setenv NWSYNC "$NWSYNC" \
   --setenv CLIENT "$CLIENT" --setenv MG_CLIENT_ARGS "${MG_CLIENT_ARGS:-}" \
   --setenv MG_CLIENT_RUNS "${MG_CLIENT_RUNS:-1}" \
+  --setenv MG_CLIENT_SETTINGS "${MG_CLIENT_SETTINGS:-}" \
   /bin/sh -c "$INNER" sh "$@"

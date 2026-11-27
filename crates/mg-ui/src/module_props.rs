@@ -8,6 +8,7 @@ use mg_edit::{Command, Edit, GffPath};
 use mg_gff::{Struct, Value};
 use mg_resman::{GameInstall, ResKey};
 use mg_schema::{ExoString, Field, GffValue, StructExt, ifo};
+use mg_uikit::Controls as _;
 
 use crate::blueprint::Form;
 use crate::{Action, Moonglow};
@@ -29,6 +30,9 @@ fn set<T: GffValue>(label: &str, f: &Field<T>, v: T) -> Action {
     ))
 }
 
+/// The width under which the hak list's commands take two rows.
+const HAK_CONTROLS_ROW: f32 = 600.0;
+
 /// The dialog's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
@@ -36,15 +40,17 @@ pub enum Page {
     Basic,
     Events,
     Advanced,
+    Variables,
     Description,
     CustomContent,
 }
 
 /// The dialog's tabs and their names.
-pub(crate) const PAGES: [(Page, &str); 5] = [
+pub(crate) const PAGES: [(Page, &str); 6] = [
     (Page::Basic, "Basic"),
     (Page::Events, "Events"),
     (Page::Advanced, "Advanced"),
+    (Page::Variables, "Variables"),
     (Page::Description, "Description"),
     (Page::CustomContent, "Custom Content"),
 ];
@@ -76,14 +82,30 @@ pub(crate) const EVENTS: [(&str, &str); 22] = [
     ("OnModuleStart", "Mod_OnModStart"),
 ];
 
-/// Module Properties, over its OK and Cancel (`blueprint::ok_cancel`).
+/// Module Properties, under its header with OK and Cancel at its right
+/// end (`blueprint::ok_cancel_header`).
 pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     let targets = [(info_key(), mg_edit::GffPath::root())];
-    let pressed = app.ws.is_some().then(|| crate::blueprint::ok_cancel(ui, &targets[0], false));
+    let pressed = match &mut app.ws {
+        Some(ws) => {
+            let name = ws.doc(&info_key()).ok().map(|g| g.root.read(&ifo::MOD_NAME));
+            let name =
+                name.map(|n| crate::tree::shown(app.game.as_deref(), &n)).unwrap_or_default();
+            let title = crate::blueprint::Title {
+                header: "Module Properties header".into(),
+                icon: mg_uikit::Icon::Module,
+                name: if name.trim().is_empty() { "Module Properties" } else { name.trim() },
+                sub: "module.ifo",
+            };
+            let tips = crate::blueprint::OK_CANCEL_TIPS;
+            crate::blueprint::ok_cancel_header(ui, &title, false, tips)
+        }
+        None => None,
+    };
     let pending = app.actions.len();
     pages(app, ui);
     let tab = crate::Tab::ModuleProperties;
-    crate::blueprint::window_drawn(app, pending, &tab, &targets, pressed.flatten());
+    crate::blueprint::window_drawn(app, pending, &tab, &targets, pressed);
 }
 
 fn pages(app: &mut Moonglow, ui: &mut Ui) {
@@ -98,15 +120,23 @@ fn pages(app: &mut Moonglow, ui: &mut Ui) {
             return;
         }
     };
-    ui.horizontal(|ui| {
-        for (page, label) in PAGES {
-            ui.selectable_value(&mut app.module_page, page, label);
-        }
-    });
-    ui.separator();
-    let page = app.module_page;
-    // (Sideways too: the window fits its pane, `TabViewer::scroll_bars`.)
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+    // (The pages one after another on one scroll, the list at their left:
+    // `module_page` keeps the page at the top.)
+    let names: Vec<&'static str> = PAGES.iter().map(|(_, n)| *n).collect();
+    let asked = app.module_page;
+    let mut top = PAGES.iter().position(|(p, _)| *p == asked).unwrap_or(0);
+    let id = egui::Id::new("module-properties-pages");
+    let mut listed = crate::form_pages::list(ui, id, mg_uikit::pages::PAGES, &names, &mut top);
+    let narrow = crate::form_pages::narrow(listed.body.available_width());
+    let scroll = crate::form_pages::scroll(
+        id,
+        &names,
+        !narrow,
+        listed.chosen,
+        crate::form_pages::page_columns(listed.body.available_width()),
+    );
+    scroll.show(&mut listed.body, &mut top, |ui, i| {
+        let page = PAGES[i].0;
         // (The module's fields as a blueprint's are: `blueprint::Form`'s,
         // their typing kept, a tag of 32 characters, a slider's drag one
         // change.)
@@ -114,15 +144,30 @@ fn pages(app: &mut Moonglow, ui: &mut Ui) {
             return custom_content(app, ui, &root);
         }
         let key = info_key();
-        let mut f = Form { app, key, path: GffPath::root(), also: Vec::new(), root };
+        let mut f = Form {
+            app,
+            key,
+            path: GffPath::root(),
+            also: Default::default(),
+            root: root.clone(),
+            together: Default::default(),
+            own_tab: false,
+        };
         match page {
             Page::Basic => basic(&mut f, ui),
             Page::Events => events(&mut f, ui),
             Page::Advanced => advanced(&mut f, ui),
+            Page::Variables => f.variables_page(ui),
             Page::Description => f.locstring_memo(ui, "Description", ifo::MOD_DESCRIPTION.label),
             Page::CustomContent => {}
         }
     });
+    // (Unless a page asked for another while it was drawn: brought to the
+    // top in the next frame.)
+    match app.module_page == asked {
+        true => app.module_page = PAGES[top].0,
+        false => ui.ctx().request_repaint(),
+    }
 }
 
 fn basic(f: &mut Form<'_>, ui: &mut Ui) {
@@ -320,21 +365,32 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
     let mut remove = false;
 
     ui.horizontal(|ui| {
-        crate::widgets::section_heading(ui, format!("Hak Files ({n})"));
+        // (The heading's rule stops short of the note at its right.)
+        let note = "Top overrides lower";
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let room = ui
+            .fonts_mut(|f| f.layout_no_wrap(note.into(), font, egui::Color32::PLACEHOLDER))
+            .size()
+            .x
+            + 2.0 * ui.spacing().item_spacing.x;
+        ui.scope(|ui| {
+            ui.set_max_width((ui.available_width() - room).max(0.0));
+            crate::widgets::section_heading(ui, format!("Hak Files ({n})"));
+        });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.weak("Top overrides lower").on_hover_text(
-                "Where two haks have a resource of the same name, the game takes the one \
-                 from the hak higher in this list",
+            ui.weak(note).on_hover_text(
+                "Where two haks have the same resource, the game takes the higher one's",
             );
         });
     });
     let row_height = ui.spacing().interact_size.y;
     let frame = egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let tall = (row_height + ui.spacing().item_spacing.y) * 14.0;
+        let tall = mg_uikit::row_metrics(ui).1 * 14.0;
         let mut rects = Vec::with_capacity(n);
         egui::ScrollArea::vertical().id_salt("ifo-haks").max_height(tall).show(ui, |ui| {
             ui.set_width(ui.available_width());
+            mg_uikit::list_rows(ui);
             // (An older module's single hak, `Mod_Hak`, read where it has
             // no list: the haks layered, `mg_module::haks_of`.)
             match mg_module::haks_of(root).first().filter(|_| n == 0) {
@@ -376,24 +432,25 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
                         Some(mg_resman::Listed::Missing) => {
                             let warn = ui.visuals().warn_fg_color;
                             ui.colored_label(warn, "not found").on_hover_text(
-                                "No hak of this name is in the hak folders: the game will not \
-                                 load the module until there is, or it is removed here",
+                                "No hak of this name is in the hak folders: the game won't load \
+                                 the module",
                             );
                         }
                         Some(mg_resman::Listed::OtherCase(file)) => {
                             let warn = ui.visuals().warn_fg_color;
                             ui.colored_label(warn, format!("not found: the file is {file}.hak"))
                                 .on_hover_text(format!(
-                                    "The game opens a hak only by its exact name, and on Linux \
-                                     {file}.hak, in another case, is another file: the game \
-                                     will not load the module. Rename the file to {h}.hak, or \
-                                     remove {h} here and add {file}"
+                                    "The game needs the hak's exact name, case and all. Rename \
+                                     {file}.hak to {h}.hak, or attach {file}."
                                 ));
                         }
                         Some(mg_resman::Listed::Found) | None => {}
                     }
                     if state.reveal && state.cursor == Some(i) {
                         name.scroll_to_me(None);
+                        // (Once: asked every frame after an arrow key, it
+                        // pulled the row back against the wheel.)
+                        state.reveal = false;
                     }
                     if name.clicked() {
                         let (command, shift) =
@@ -513,13 +570,21 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
         .filter(|h| mg_resman::listed(&haks, h) != mg_resman::Listed::Found)
         .collect();
     // The list's commands, under it: what adds to it and checks it, and
-    // what is done with the rows chosen.
-    ui.horizontal(|ui| {
+    // what is done with the rows chosen. (In a narrow window, the latter
+    // on a row of their own: at their row's right end they stood over the
+    // first.)
+    let narrow = ui.available_width() < HAK_CONTROLS_ROW;
+    let commands = |ui: &mut Ui| {
         // (Commands, not a choice: the arrows move along them, Enter adds.)
-        crate::widgets::dropdown("ifo-add-hak").selected_text("Add hak…").show_menu(
+        // (A Filter field over a long list: a builder's hundreds of haks.)
+        let long = available.len() > crate::widgets::FILTERED_CHOICES;
+        crate::widgets::dropdown("ifo-add-hak").selected_text("Add hak…").filtered(long).show_menu(
             ui,
             |ui, keys| {
                 for h in &available {
+                    if !keys.shows(h) {
+                        continue;
+                    }
                     let r = ui.selectable_label(false, h.as_str());
                     if keys.row(&r) || r.clicked() {
                         let mut item = ifo::MOD_HAK_LIST.new_item();
@@ -540,8 +605,7 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
         if ui
             .button("Add Haks and Talk Table…")
             .on_hover_text(
-                "Haks and a talk table from anywhere: copied into your hak and tlk folders \
-                 and attached to the module in one step",
+                "Copy haks and a talk table from anywhere into your folders and attach them",
             )
             .clicked()
         {
@@ -549,6 +613,9 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
         }
         if ui.add_enabled(!haks.is_empty(), egui::Button::new("Check for Conflicts…")).clicked() {
             app.actions.push(Action::HakReport);
+        }
+        if narrow {
+            ui.end_row();
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (low, high) = (state.selected.first().copied(), state.selected.last().copied());
@@ -562,22 +629,29 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
             }
             let can_down = high.is_some_and(|h| h + 1 < n);
             if ui
-                .add_enabled(can_down, egui::Button::new("⏷"))
-                .on_hover_text("Move the haks chosen down (Alt + Down)")
+                .add_enabled(
+                    can_down,
+                    crate::widgets::icon_only(mg_uikit::Icon::ArrowDown, "Move Down"),
+                )
+                .on_hover_text("Move the haks chosen down (Alt+Down)")
                 .clicked()
             {
                 move_to = high.map(|h| h + 2);
             }
             let can_up = low.is_some_and(|l| l > 0);
             if ui
-                .add_enabled(can_up, egui::Button::new("⏶"))
-                .on_hover_text("Move the haks chosen up (Alt + Up)")
+                .add_enabled(can_up, crate::widgets::icon_only(mg_uikit::Icon::ArrowUp, "Move Up"))
+                .on_hover_text("Move the haks chosen up (Alt+Up)")
                 .clicked()
             {
                 move_to = low.map(|l| l - 1);
             }
         });
-    });
+    };
+    match narrow {
+        true => ui.horizontal_wrapped(commands),
+        false => ui.horizontal(commands),
+    };
     ui.weak(
         "Drag rows to reorder them (Ctrl or Shift + click chooses more), or click the list and \
          use the keys: Up and Down, Alt + Up and Down to move, Delete to remove.",
@@ -653,9 +727,163 @@ fn custom_content(app: &mut Moonglow, ui: &mut Ui, root: &Struct) {
         }
         let label = if tlk.is_empty() { "New…" } else { "Edit…" };
         if ui.button(label).on_hover_text("Tools › Talk Table").clicked() {
-            app.actions.push(Action::OpenTab(crate::Tab::TalkTable));
+            app.actions.push(Action::ShowModuleTalk);
         }
     });
+    typed_lines(app, ui);
+}
+
+/// The lines typed text takes (`crate::talk_typed`): the project's range
+/// (`moonglow.toml`'s `[talk] lines`), set here, each builder's part of
+/// it, and how many are left.
+fn typed_lines(app: &mut Moonglow, ui: &mut Ui) {
+    use mg_module::project_file::ProjectFile;
+    use mg_module::talk_range::{Allowed, Lines};
+    // (The table opened, to say how much of it is left.)
+    crate::talk_view::load(app);
+    let Some(ws) = &app.ws else { return };
+    let pf = &ws.module.project_file;
+    let rules = pf.talk.clone();
+    let allowed = pf.talk_allowed();
+    let code = pf.user.builder_code.clone();
+    let place = ws.module.location.as_ref().and_then(ProjectFile::place_to_write);
+    let file = place
+        .as_ref()
+        .map_or_else(|| mg_module::project_file::FILE_NAME.to_string(), |p| p.team_name());
+    // (Its lines as kept while the file is as it was: not read again.)
+    let map = crate::talk_typed::map_lines(app);
+    let id = egui::Id::new("typed-lines");
+    let shown = |l: Option<Lines>| {
+        l.map_or((String::new(), String::new()), |l| (l.from.to_string(), l.to.to_string()))
+    };
+    let mut draft: (String, String, Option<Lines>) = ui
+        .data_mut(|d| d.get_temp(id))
+        .filter(|d: &(String, String, Option<Lines>)| d.2 == rules.lines)
+        .unwrap_or_else(|| {
+            let (a, b) = shown(rules.lines);
+            (a, b, rules.lines)
+        });
+    ui.horizontal(|ui| {
+        crate::widgets::field_label(ui, "Typed text lines");
+        ui.add(mg_uikit::text_field(&mut draft.0).desired_width(80.0).hint_text("from"));
+        ui.label("to");
+        ui.add(mg_uikit::text_field(&mut draft.1).desired_width(80.0).hint_text("to"));
+        let typed = format!("{}-{}", draft.0.trim(), draft.1.trim());
+        let parsed = match (draft.0.trim(), draft.1.trim()) {
+            ("", "") => Ok(None),
+            _ => Lines::parse(&typed).map(Some),
+        };
+        let can = place.is_some() && parsed.as_ref().is_ok_and(|l| *l != rules.lines);
+        let tip = match (&place, &parsed) {
+            (None, _) => "Save the module first: the range is kept in its project's file".into(),
+            (_, Err(e)) => e.clone(),
+            (Some(_), Ok(_)) => format!(
+                "Kept in {file} ([talk] lines) for every builder of the project. Empty: the \
+                 table's end."
+            ),
+        };
+        if ui
+            .add_enabled(can, egui::Button::new("Set"))
+            .on_hover_text(&tip)
+            .on_disabled_hover_text(&tip)
+            .clicked()
+            && let (Some(place), Ok(lines)) = (&place, &parsed)
+        {
+            match ProjectFile::set_talk_lines(place, *lines) {
+                Ok(()) => {
+                    match lines {
+                        Some(l) => app.log.info(format!(
+                            "Text typed takes lines {l} of the talk table (StrRefs {} to {}), \
+                             kept in {file}",
+                            l.from | mg_core::StrRef::CUSTOM_FLAG,
+                            l.to | mg_core::StrRef::CUSTOM_FLAG
+                        )),
+                        None => app.log.info(format!(
+                            "Text typed goes at the talk table's end (no lines in {file})"
+                        )),
+                    }
+                    if let Some(ws) = app.ws.as_mut() {
+                        let had = ws.module.project_file.found;
+                        if ws.module.reread_project_file() {
+                            app.log_project_file(true, had);
+                        }
+                    }
+                }
+                Err(e) => app.log.error(format!("{file}: {e}")),
+            }
+        }
+        if let Err(e) = &parsed {
+            ui.colored_label(ui.visuals().warn_fg_color, e);
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(id, draft));
+    // Each builder's own part, as the project's file says.
+    if !rules.builders.is_empty() {
+        let parts: Vec<String> = rules.builders.iter().map(|(c, l)| format!("{c} {l}")).collect();
+        ui.weak(format!("Builders' own lines ({file} [talk.builders]): {}", parts.join(", ")));
+    }
+    // Where the next one goes, and how many are left.
+    // (Kept while the table, the range and the map are as they were: the
+    // used part of the range was gone through twice a frame.)
+    let said = match crate::talk_typed::room(app) {
+        None => None,
+        Some((next, left)) => Some(match (next, left) {
+            (Err(e), _) => (e, true),
+            (Ok(row), Some((free, total))) => (
+                format!(
+                    "Next: line {row} (StrRef {}); {free} of {total} left{}",
+                    mg_module::talk::Table::strref(row).0,
+                    match (&allowed, code.as_deref()) {
+                        (Allowed::Range { but, .. }, _) if !but.is_empty() => {
+                            " (the others' parts passed over)".to_string()
+                        }
+                        (_, Some(c)) if rules.builders.contains_key(c) => {
+                            format!(" of your own ({c})")
+                        }
+                        _ => String::new(),
+                    }
+                ),
+                free * 10 <= total,
+            ),
+            (Ok(row), None) => (
+                format!(
+                    "Next: line {row} (StrRef {}), at the table's end",
+                    mg_module::talk::Table::strref(row).0
+                ),
+                false,
+            ),
+        }),
+    };
+    match said {
+        Some((text, true)) => {
+            ui.colored_label(ui.visuals().warn_fg_color, text);
+        }
+        Some((text, false)) => {
+            ui.weak(text);
+        }
+        None => {}
+    }
+    if let Err(e) = &map {
+        ui.colored_label(ui.visuals().warn_fg_color, e);
+    }
+    match (rules.typed, app.settings.talk_typed) {
+        (Some(true), _) => {
+            ui.weak(format!("On for everyone: {file} says so ([talk] typed = true)"));
+        }
+        (Some(false), _) => {
+            ui.weak(format!(
+                "Off for everyone: {file} says so ([talk] typed = false); text typed is the \
+                 field's own, as Aurora writes it"
+            ));
+        }
+        (None, false) => {
+            ui.weak(
+                "Off: text typed is the field's own, as Aurora writes it (Options › Language › \
+                 Talk Table puts it here)",
+            );
+        }
+        (None, true) => {}
+    }
 }
 
 /// Add Haks and Talk Table: the files chosen, where each goes, and whether
@@ -667,7 +895,8 @@ pub struct AttachDraft {
 }
 
 fn start_attach(app: &mut Moonglow) {
-    let Some(user) = app.install.as_ref().and_then(|i| i.user_dir.clone()) else {
+    let folders = app.install.as_ref().and_then(|i| i.user_folder("hak").zip(i.user_folder("tlk")));
+    let Some((hak_dir, tlk_dir)) = folders else {
         app.log.error("Adding haks needs the game's user folder (Tools › Options)");
         return;
     };
@@ -675,11 +904,23 @@ fn start_attach(app: &mut Moonglow) {
     if files.is_empty() {
         return;
     }
-    match mg_module::attach::placements(&user, &files) {
-        Ok(placements) => app.attach = Some(AttachDraft { placements, replace: false }),
-        Err(e) => app.log.error(format!("Add Haks and Talk Table: {e}")),
-    }
+    // (As a job: an archive's haks are listed, and each file is compared
+    // with the one of its name in the user folder, gigabytes of them.)
+    app.start_job(
+        ATTACH,
+        move |cx| {
+            cx.progress.say("Looking at the files chosen");
+            mg_module::attach::placements(&hak_dir, &tlk_dir, &files)
+        },
+        |app, placements| match placements {
+            Ok(placements) => app.attach = Some(AttachDraft { placements, replace: false }),
+            Err(e) => app.log.error(format!("{ATTACH}: {e}")),
+        },
+    );
 }
+
+/// Add Haks and Talk Table's name, its window's and its jobs'.
+const ATTACH: &str = "Add Haks and Talk Table";
 
 /// The Add Haks and Talk Table window: the haks in their order (highest
 /// first), the talk table, and what's copied where.
@@ -687,12 +928,14 @@ pub(crate) fn attach_window(app: &mut Moonglow, ctx: &egui::Context) {
     use mg_module::attach::There;
     let Some(mut draft) = app.attach.take() else { return };
     let mut done = None;
-    crate::widgets::modal(ctx, "Add Haks and Talk Table").show(ctx, |ui| {
+    let footed = crate::widgets::modal(ctx, "Add Haks and Talk Table").show_foot(ctx, |ui| {
         ui.label("Haks go at the top of the module's list, highest priority first:");
         let n = draft.placements.len();
         let mut swap = None;
         for (i, p) in draft.placements.iter().enumerate() {
-            ui.horizontal(|ui| {
+            // (Wrapped where the window is narrow: its Move Down ran past
+            // the least window's edge.)
+            ui.horizontal_wrapped(|ui| {
                 ui.monospace(if p.is_tlk {
                     format!("{}.tlk", p.name)
                 } else {
@@ -710,7 +953,7 @@ pub(crate) fn attach_window(app: &mut Moonglow, ctx: &egui::Context) {
                 };
                 ui.weak(what).on_hover_text(format!(
                     "{from}
-→ {}",
+-> {}",
                     p.to.display()
                 ));
                 if !p.is_tlk {
@@ -737,17 +980,17 @@ pub(crate) fn attach_window(app: &mut Moonglow, ctx: &egui::Context) {
             draft.placements.swap(a, b);
         }
         if draft.placements.iter().any(|p| p.there == There::Different) {
-            ui.checkbox(&mut draft.replace, "Replace the files of the same names that are there");
+            ui.check_box(&mut draft.replace, "Replace the files of the same names that are there");
         }
-        ui.horizontal(|ui| {
-            if ui.button("OK").clicked() {
-                done = Some(true);
-            }
-            if crate::widgets::cancel(ui) {
-                done = Some(false);
-            }
-        });
+        ((), crate::widgets::Foot::new().main("OK", true).cancel())
     });
+    if let Some(f) = footed {
+        if f.pressed.main() {
+            done = Some(true);
+        } else if f.pressed.cancelled() {
+            done = Some(false);
+        }
+    }
     match done {
         None => app.attach = Some(draft),
         Some(false) => {}
@@ -755,16 +998,29 @@ pub(crate) fn attach_window(app: &mut Moonglow, ctx: &egui::Context) {
     }
 }
 
-/// Copies the files and attaches them, as one undoable step (the copies
-/// stay).
+/// Copies the files (as a job: haks of gigabytes were copied inside the
+/// frame) and attaches them, as one undoable step (the copies stay).
+/// Canceled, the module is as it was; what was copied by then stays in
+/// the user folder.
 fn attach(app: &mut Moonglow, draft: &AttachDraft) {
-    let copied = match mg_module::attach::copy(&draft.placements, draft.replace) {
-        Ok(n) => n,
-        Err(e) => {
-            app.log.error(format!("Add Haks and Talk Table: {e}"));
-            return;
-        }
-    };
+    let draft = draft.clone();
+    let copying = draft.clone();
+    app.start_job(
+        ATTACH,
+        move |cx| {
+            cx.progress.say("Copying into the user folder");
+            mg_module::attach::copy(&copying.placements, copying.replace)
+        },
+        move |app, copied| match copied {
+            Ok(copied) => attached(app, &draft, copied),
+            Err(e) => app.log.error(format!("{ATTACH}: {e}")),
+        },
+    );
+}
+
+/// The files copied: the module's hak list and talk table set, as one
+/// undoable step.
+fn attached(app: &mut Moonglow, draft: &AttachDraft, copied: usize) {
     let Some(ws) = &mut app.ws else { return };
     let Ok(info) = ws.doc(&info_key()) else { return };
     let haks: Vec<String> =

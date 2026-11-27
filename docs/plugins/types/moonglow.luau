@@ -1,5 +1,5 @@
 --!strict
--- The types of Moonglow's plugin API, version 0.4, for editors that check
+-- The types of Moonglow's plugin API, version 0.10, for editors that check
 -- Luau (luau-lsp): point the alias "moonglow" at this file in a `.luaurc`
 -- in or above your plugin's folder, and `require("@moonglow")` is typed
 -- and completed:
@@ -26,14 +26,21 @@ export type Finding = {
     fix: Fix?,
 }
 
+-- A choice's option: its text, or (API 0.9) its text and the color of
+-- the swatch drawn before it. The field's value is the text.
+export type ChoiceOption = string | { text: string, color: string? }
+
 export type FormField = {
     id: string,
     label: string?,
-    type: ("text" | "number" | "check" | "choice")?,
+    type: ("text" | "number" | "check" | "choice" | "color")?,
     default: any?,
     min: number?,
     max: number?,
-    choices: { string }?,
+    choices: { ChoiceOption }?,
+    -- A color's (API 0.8): the string variable the objects are drawn with
+    -- while it is picked.
+    variable: string?,
 }
 
 export type Form = { title: string?, fields: { FormField } }
@@ -41,12 +48,7 @@ export type Form = { title: string?, fields: { FormField } }
 export type Reader = {
     resources: (self: Reader, kind: string?) -> { string },
     has: (self: Reader, name: string) -> boolean,
-    -- (ctx.game's gff, text and bytes take a layer's label after the name:
-    -- that layer's copy.)
-    gff: (self: Reader, name: string, layer: string?) -> Struct,
     raw: (self: Reader, name: string, path: string?) -> Struct,
-    text: (self: Reader, name: string, layer: string?) -> string,
-    bytes: (self: Reader, name: string, layer: string?) -> string,
 }
 
 -- One of the game's 2DA tables. Rows count from 0, as in the file; a cell
@@ -77,10 +79,17 @@ export type Tlk = {
 -- The module: its resources, and a name for a new one as the window
 -- proposes it (the builder's code in the team's pattern, the first free).
 export type Module = Reader & {
+    gff: (self: Module, name: string) -> Struct,
+    text: (self: Module, name: string) -> string,
+    bytes: (self: Module, name: string) -> string,
     new_name: (self: Module, name: string, kind: string) -> string,
 }
 
 export type Game = Reader & {
+    -- (A layer's label after the name: that layer's copy.)
+    gff: (self: Game, name: string, layer: string?) -> Struct,
+    text: (self: Game, name: string, layer: string?) -> string,
+    bytes: (self: Game, name: string, layer: string?) -> string,
     table: (self: Game, name: string) -> TwoDa,
     string: (self: Game, strref: number) -> string?,
 }
@@ -176,19 +185,25 @@ export type Area = {
     cross: (self: Area, crosser: string, path: { { number } }) -> boolean,
     erase: (self: Area, x: number, y: number) -> boolean,
     set_tile: (self: Area, x: number, y: number, id: number, orientation: number?, height: number?) -> (),
+    -- Its strokes made at once (API 0.5): the tiles read once, put in when f returns.
+    batch: (self: Area, f: () -> ...any) -> ...any,
 }
 
 export type Terrain = {
     tilesets: (self: Terrain) -> { { resref: string, name: string } },
     new_area: (self: Terrain, spec: { name: string, tileset: string, width: number, height: number }) -> string,
-    open: (self: Terrain, area: string) -> Area,
+    -- A seed (API 0.10): the area's tiles and lights chosen by its own
+    -- random choices, begun from it.
+    open: (self: Terrain, area: string, options: { seed: number? }?) -> Area,
+    -- The job's random choices begun again from n (API 0.10).
+    seed: (self: Terrain, n: number) -> (),
 }
 
 -- Something selected or open in the window (API 0.4): what it is, and
 -- where (the resource and path that ctx.edit takes: a field of it is
 -- `path .. "/Tag"`).
 export type Selected = {
-    -- "creature", "placeable"... (placed, or a blueprint), "area"; for
+    -- "creature", "placeable"... (placed, or a blueprint), "area", "tile"; for
     -- another editor open, or a layer's copy, its resource's type ("nss",
     -- "dlg").
     kind: string,
@@ -201,8 +216,13 @@ export type Selected = {
     module: boolean,
     -- The area's resref, for a placed object and an area.
     area: string?,
-    -- A placed object's place in its list, from 0.
+    -- A placed object's place in its list, or a tile's in Tile_List, from 0.
     index: number?,
+    -- A tile's column and row, from 0 at the south-west (API 0.5).
+    x: number?,
+    y: number?,
+    -- ctx.open edited together with others: each, itself first (API 0.5).
+    together: { Selected }?,
     tag: string?,
     -- A blueprint's or an area's own; a placed object's blueprint.
     resref: string?,
@@ -214,12 +234,14 @@ export type Selected = {
 -- The plugin's settings (API 0.4), as its manifest declares them
 -- ([setting]): each read by its id (ctx.settings.code), and gone through
 -- with `for id, value in ctx.settings`. A value is text (a string, a
--- choice, a path), a whole number (an int) or true or false (a bool).
+-- choice, a path, a color as "#rrggbb"), a whole number (an int), a
+-- number (a float; API 0.5), true or false (a bool), or a list of texts
+-- (a list; API 0.5).
 export type Settings = {
     -- Sets one, for Moonglow to keep where its scope says when the job is
     -- done (nil: back to its default). Not in a check.
-    set: (self: Settings, id: string, value: (string | number | boolean)?) -> (),
-    [string]: string | number | boolean,
+    set: (self: Settings, id: string, value: (string | number | boolean | { string })?) -> (),
+    [string]: string | number | boolean | { string },
 }
 
 -- What happened, for an event's handler (mg.on): its name, and what it is
@@ -266,6 +288,10 @@ export type Context = {
     selection: { Selected },
     -- The area or editor in front, if any (API 0.4).
     open: Selected?,
+    -- The values of the panel's fields, by field id, for a command run
+    -- from the panel (its button, or a field set); empty for a command run
+    -- from anywhere else (API 0.9).
+    values: { [string]: any },
     module: Module,
     game: Game,
     edit: Edit,
@@ -281,12 +307,75 @@ export type Context = {
     event: Event?,
     -- In a check's handler, and a resource-saving one's: a fix to give a
     -- finding or a warning (API 0.4).
-    fix: ((label: string) -> Fix)?,
+    fix: ((label: string, asks: { command: string, on: { resource: string, path: string? }? }?) -> Fix)?,
+}
+
+-- Where an exporter writes (API 0.6): the file or the folder the user
+-- chose, its name; `write` is the whole file (to a file), or a file of the
+-- folder by name (to a folder).
+export type Out = {
+    name: string,
+    write: ((self: Out, bytes: string) -> ()) & ((self: Out, name: string, bytes: string) -> ()),
+}
+
+-- A wizard's answers so far: every page's values, by field id.
+export type Answers = { [string]: any }
+
+-- A wizard's page (API 0.6): a form's fields, what it says above them,
+-- and a check of what was given (text: what is wrong, and the page stays).
+export type Page = {
+    id: string?,
+    title: string?,
+    text: string?,
+    fields: { FormField }?,
+    check: ((ctx: Context, answers: Answers) -> string?)?,
+}
+
+export type Wizard = {
+    -- Each a page, or a function that makes one from the answers so far
+    -- (nil: the page is skipped).
+    pages: { Page | (ctx: Context, answers: Answers) -> Page? },
+    finish: (ctx: Context, answers: Answers) -> ...any,
+}
+
+-- An entry a panel's button or item names: as ctx.selection's, or its text
+-- ("tavern.are", "tavern.git/Creature List[0]").
+export type Entry = string | { resource: string, path: string? }
+
+export type PanelItem = string | {
+    text: string,
+    hint: string?,
+    open: Entry?,
+    command: string?,
+    on: (Entry | { Entry })?,
+}
+
+-- What a panel shows (API 0.6): each element a table with its type, or
+-- text alone. A field (API 0.9) is a form's, its kind its `kind` and what
+-- it shows its `value`; its `command` runs when the user sets it.
+export type Element = string | {
+    type: "heading" | "text" | "value" | "separator" | "button" | "list" | "field",
+    text: string?,
+    weak: boolean?,
+    color: ("warning" | "error")?,
+    label: string?,
+    hint: string?,
+    command: string?,
+    on: (Entry | { Entry })?,
+    items: { PanelItem }?,
+    -- A field's (API 0.9).
+    id: string?,
+    kind: ("text" | "number" | "check" | "choice" | "color")?,
+    value: any?,
+    min: number?,
+    max: number?,
+    choices: { ChoiceOption }?,
+    variable: string?,
 }
 
 local mg = {}
 
-mg.api = "0.4"
+mg.api = "0.10"
 
 -- A command's handler may return what Undo calls the change:
 -- { label = "..." }, or the text alone.
@@ -299,6 +388,17 @@ function mg.check(id: string, handler: (ctx: Context) -> { Finding }?) end
 -- "resource-saving", "resource-saved", "object-placed", "object-pasted"
 -- or "resource-created"): ctx.event says what happened.
 function mg.on(id: string, handler: (ctx: Context) -> ...any) end
+
+-- An exporter (API 0.6): it reads, and writes only with out:write, where
+-- the user chose. What it returns, as text, goes to the log.
+function mg.exporter(id: string, handler: (ctx: Context, out: Out) -> ...any) end
+-- An importer (API 0.6): source is the file, or the folder, the user chose.
+-- It may return what Undo calls the change.
+function mg.importer(id: string, handler: (ctx: Context, source: File | Folder) -> ...any) end
+-- A wizard (API 0.6): its pages, asked in turn, and what its Finish does.
+function mg.wizard(id: string, wizard: Wizard) end
+-- A panel (API 0.6): what it shows, drawn by Moonglow; it only reads.
+function mg.panel(id: string, handler: (ctx: Context) -> { Element }?) end
 
 local function typed(type: string, value: any): Value
     return { type = type, value = value }

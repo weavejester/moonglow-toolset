@@ -1,6 +1,8 @@
 //! Changes to what Advanced Search found (`mg_module::search`): a local
-//! variable set or removed, an event's script set, or a field set, on
-//! each object found, as the edits of one command.
+//! variable set or removed, an event's script set, a field set, or an
+//! entry of a list added or removed (a feat, a class, an item property,
+//! an item held: through `crate::lists`, as Edit Together's pages make
+//! them), on each object found, as the edits of one command.
 //!
 //! An area's variables are its GIT's (the game reads none from its ARE,
 //! `engine_area_variables`); its events and fields are its ARE's. A
@@ -11,12 +13,13 @@
 use std::collections::{HashMap, HashSet};
 
 use mg_core::{Codepage, ResRef, ResType};
-use mg_gff::{Gff, Struct, Value};
+use mg_gff::{FieldType, Gff, Struct, Value};
 use mg_module::Module;
 use mg_module::search::{Hit, Object, VarType};
 use mg_resman::ResKey;
+use mg_rules::{GameData, ItemProperty};
 
-use crate::{Edit, GffPath, Step};
+use crate::{Edit, GffPath, Step, lists};
 
 /// What to change on each object found.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,7 +32,54 @@ pub enum Change {
     /// an empty name clears it.
     SetScript { event: String, script: String },
     /// A field (by label) set to a value typed as its type reads it.
-    SetField { label: String, value: String },
+    /// `add`: also added, of the type the game's files give it, to each
+    /// object that lacks it where its kind of object has the field (the
+    /// engine reads a field missing as its default; added, it reads the
+    /// value given). Off, an object without the field is left, said.
+    SetField { label: String, value: String, add: bool },
+    /// An entry added to each object found that lacks it (`name`: what
+    /// the command is named by, "Alertness").
+    AddEntry { entry: Entry, name: String },
+    /// An entry taken from each object found that has it.
+    RemoveEntry { entry: Entry, name: String },
+}
+
+/// An entry of an object's list, as Advanced Search adds or removes it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    /// A creature's feat (feat.2da row).
+    Feat(u16),
+    /// A creature's class (classes.2da row), added at `level`.
+    Class { class: i32, level: i16 },
+    /// An item's property: `property` as added; removed where an item's
+    /// is of its type and of the subtype, value and parameter given (a
+    /// part not given: any).
+    Property { property: ItemProperty, subtype: Option<u16>, value: Option<u16>, param: Option<u8> },
+    /// An item of this blueprint held: added (one, at its first free
+    /// place; a store's on the page of its kind) or taken (every one, from
+    /// a creature's backpack, a placeable's inventory, a store's pages).
+    Item(ResRef),
+}
+
+impl Entry {
+    /// The kinds of object that have the list.
+    fn kinds(&self) -> &'static [ResType] {
+        match self {
+            Entry::Feat(_) | Entry::Class { .. } => &[ResType::UTC],
+            Entry::Property { .. } => &[ResType::UTI],
+            Entry::Item(_) => &[ResType::UTC, ResType::UTP, ResType::UTM],
+        }
+    }
+
+    /// What an object of another kind lacks.
+    fn lacking(&self) -> &'static str {
+        match self {
+            Entry::Feat(_) => "no feats",
+            Entry::Class { .. } => "no classes",
+            Entry::Property { .. } => "no item properties",
+            Entry::Item(_) => "no inventory",
+        }
+    }
 }
 
 impl Change {
@@ -42,7 +92,19 @@ impl Change {
                 format!("Set {} script", mg_module::search::event(event))
             }
             Change::SetField { label, .. } => format!("Set {label}"),
+            Change::AddEntry { entry, name } => format!("Add {} {name}", entry_kind(entry)),
+            Change::RemoveEntry { entry, name } => format!("Remove {} {name}", entry_kind(entry)),
         }
+    }
+}
+
+/// What an entry is called in a command's name.
+fn entry_kind(e: &Entry) -> &'static str {
+    match e {
+        Entry::Feat(_) => "feat",
+        Entry::Class { .. } => "class",
+        Entry::Property { .. } => "property",
+        Entry::Item(_) => "item",
     }
 }
 
@@ -113,15 +175,21 @@ fn field_found(h: &Hit) -> Option<(GffPath, String)> {
 }
 
 /// The edits that make `change` on what `hits` found (in `module`, its
-/// text in `codepage`).
+/// text in `codepage`; the game's data, `game`, for an item's place and
+/// what a base item takes).
 pub fn edits(
     module: &Module,
     hits: &[&Hit],
     change: &Change,
     codepage: Codepage,
+    game: Option<&GameData>,
 ) -> Result<Outcome, String> {
     let mut r = Reader { module, read: HashMap::new() };
     let mut out = Outcome::default();
+    // (A hak's or the game's blueprint found is read-only: none of its
+    // copy is the module's to change.)
+    let hits: Vec<&Hit> = hits.iter().copied().filter(|h| h.layer.is_none()).collect();
+    let hits = &hits[..];
     match change {
         Change::SetVariable { name, kind, value } => {
             let value = kind.value(value, codepage)?;
@@ -164,7 +232,12 @@ pub fn edits(
             }
         }
         Change::RemoveVariable { name } => {
-            let name_bytes = codepage.encode(name).map(|b| b.into_owned()).unwrap_or_default();
+            // (A name the module can't hold names no variable: not those
+            // with no name.)
+            let name_bytes = codepage
+                .encode(name)
+                .ok_or_else(|| format!("{name:?} has characters the module can't hold"))?
+                .into_owned();
             for (o, place) in objects(hits) {
                 let (key, path) = variables_of(&o);
                 let vars = r.get(key, &path).and_then(|s| s.list("VarTable")).unwrap_or(&[]);
@@ -184,18 +257,16 @@ pub fn edits(
         Change::SetScript { event, script } => {
             let script = ResRef::from_str(script.trim())
                 .map_err(|e| format!("{script:?} is not a script's name: {e}"))?;
-            let mut set =
-                |old: &Value| matches!(old, Value::ResRef(_)).then(|| Value::resref(script));
-            set_fields(&mut r, hits, event, &mut set, &mut out);
+            let mut set = |_: FieldType, old: Option<&Value>| {
+                matches!(old, Some(Value::ResRef(_))).then(|| Value::resref(script))
+            };
+            set_fields(&mut r, hits, event, false, &mut set, &mut out);
         }
-        Change::SetField { label, value } => {
+        Change::SetField { label, value, add } => {
             // (Checked on the first field, so a typing error says so.)
             let mut problem = None;
-            let mut set = |old: &Value| match Value::from_text(
-                old.field_type(),
-                value,
-                Some(old),
-                codepage,
+            let mut set = |ty: FieldType, old: Option<&Value>| match Value::from_text(
+                ty, value, old, codepage,
             ) {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -203,38 +274,234 @@ pub fn edits(
                     None
                 }
             };
-            set_fields(&mut r, hits, label, &mut set, &mut out);
+            set_fields(&mut r, hits, label, *add, &mut set, &mut out);
             if out.changed == 0
                 && let Some(e) = problem
             {
                 return Err(e);
             }
         }
+        Change::AddEntry { entry, .. } | Change::RemoveEntry { entry, .. } => {
+            let add = matches!(change, Change::AddEntry { .. });
+            // The objects found that have the list.
+            let mut targets = Vec::new();
+            for (o, place) in objects(hits) {
+                if !entry.kinds().contains(&o.kind) {
+                    out.skipped.push(format!("{place}: {}", entry.lacking()));
+                    continue;
+                }
+                let Some(s) = r.get(o.key, &o.path) else { continue };
+                let mut t = lists::Target::new(o.key, o.path.clone(), s.clone());
+                t.name = place;
+                targets.push(t);
+            }
+            let done = list_entry(module, game, &targets, entry, add)?;
+            out.edits = done.edits;
+            out.changed = done.changed;
+            out.skipped.extend(done.left);
+        }
     }
     Ok(out)
 }
 
+/// The edits that add `entry` to each of `targets` that lacks it, or (not
+/// `add`) take it from each that has it.
+fn list_entry(
+    module: &Module,
+    game: Option<&GameData>,
+    targets: &[lists::Target],
+    entry: &Entry,
+    add: bool,
+) -> Result<lists::Outcome, String> {
+    Ok(match (entry, add) {
+        (Entry::Feat(row), true) => lists::add_feat(targets, *row),
+        (Entry::Feat(row), false) => lists::remove_feat(targets, *row),
+        (Entry::Class { class, level }, true) => lists::add_class(targets, *class, *level),
+        (Entry::Class { class, .. }, false) => lists::remove_class(targets, *class),
+        (Entry::Property { property, .. }, true) => {
+            let takes = |t: &lists::Target| {
+                let base = t.at.integer("BaseItem").unwrap_or(0).max(0) as u32;
+                game.is_none_or(|g| {
+                    g.available_properties(base).iter().any(|a| a.row == property.property)
+                })
+            };
+            lists::add_property(targets, property, takes)
+        }
+        (Entry::Property { property, subtype, value, param }, false) => {
+            let is = |e: &Struct| {
+                let p = ItemProperty::from_gff(e);
+                p.property == property.property
+                    && subtype.is_none_or(|s| s == p.subtype)
+                    && value.is_none_or(|v| v == p.cost_value)
+                    && param.is_none_or(|v| v == p.param1_value)
+            };
+            lists::remove(targets, "PropertiesList", is, |_| None)
+        }
+        (Entry::Item(r), true) => {
+            let game = game.ok_or("Adding an item needs the game's data (its size)")?;
+            add_item(module, game, targets, *r)
+        }
+        (Entry::Item(r), false) => remove_item(targets, *r),
+    })
+}
+
+/// The places an object keeps its items in: its `ItemList` (a
+/// creature's backpack), or each of a store's pages'.
+fn item_bags(t: &lists::Target) -> Vec<(GffPath, &[Struct])> {
+    if t.at.get("StoreList").is_some() {
+        let pages = t.list("StoreList").iter().enumerate();
+        pages
+            .map(|(i, p)| (t.path.clone().item("StoreList", i), p.list("ItemList").unwrap_or(&[])))
+            .collect()
+    } else {
+        vec![(t.path.clone(), t.list("ItemList"))]
+    }
+}
+
+/// Every item of blueprint `r` taken from each target.
+fn remove_item(targets: &[lists::Target], r: ResRef) -> lists::Outcome {
+    let mut out = lists::Outcome::default();
+    for t in targets {
+        let mut any = false;
+        for (path, items) in item_bags(t) {
+            let at = items.iter().enumerate().rev().filter(|(_, e)| lists::item_of(e) == Some(r));
+            for (i, _) in at {
+                out.edits.push(Edit::remove_item(t.key, path.clone(), "ItemList", i));
+                any = true;
+            }
+        }
+        out.changed += usize::from(any);
+    }
+    out
+}
+
+/// One item of blueprint `r` added to each target, at the first free
+/// place of its inventory (a store's on the page of its kind, made where
+/// it has none): a placed object holds the whole item, a blueprint names
+/// its blueprint.
+fn add_item(
+    module: &Module,
+    game: &GameData,
+    targets: &[lists::Target],
+    r: ResRef,
+) -> lists::Outcome {
+    let mut out = lists::Outcome::default();
+    let read = |r: ResRef| mg_module::gff_root(Some(module), game, &ResKey::new(r, ResType::UTI));
+    let Some(bp) = read(r) else {
+        for t in targets {
+            out.left.push(format!("{}: no item blueprint {r}", t.name));
+        }
+        return out;
+    };
+    let mut bases: HashMap<ResRef, i64> = HashMap::new();
+    let mut base_of = |e: &Struct| -> i64 {
+        if let Some(b) = e.integer("BaseItem") {
+            return b;
+        }
+        let Some(r) = lists::item_of(e) else { return -1 };
+        *bases.entry(r).or_insert_with(|| read(r).and_then(|g| g.integer("BaseItem")).unwrap_or(-1))
+    };
+    let cell = |base: i64, col: &str| -> Option<u32> {
+        let t = game.table("baseitems").ok()?;
+        t.get_int(usize::try_from(base).ok()?, col).and_then(|v| u32::try_from(v).ok())
+    };
+    // (The room an item takes, by the one reading of it.)
+    let size = |base: i64| {
+        let (w, h) = usize::try_from(base).map_or((1, 1), |b| game.inventory_size(b));
+        (u32::from(w), u32::from(h))
+    };
+    let base = bp.integer("BaseItem").unwrap_or(-1);
+    let (w, h) = size(base);
+    for t in targets {
+        let store = t.at.get("StoreList").is_some();
+        let pages = t.list("StoreList");
+        let (path, items, new_page) = if store {
+            let panel = cell(base, "StorePanel").unwrap_or(4);
+            let id = lists::STORE_PANEL_PAGE.get(panel as usize).copied().unwrap_or(1);
+            match pages.iter().position(|p| p.id == id) {
+                Some(i) => (
+                    t.path.clone().item("StoreList", i),
+                    pages[i].list("ItemList").unwrap_or(&[]).to_vec(),
+                    None,
+                ),
+                None => {
+                    let at = pages.len();
+                    (
+                        t.path.clone().item("StoreList", at),
+                        Vec::new(),
+                        Some(Edit::insert_item(
+                            t.key,
+                            t.path.clone(),
+                            "StoreList",
+                            at,
+                            Struct::new(id),
+                        )),
+                    )
+                }
+            }
+        } else {
+            (t.path.clone(), t.list("ItemList").to_vec(), None)
+        };
+        let taken: Vec<(u32, u32, u32, u32)> = items
+            .iter()
+            .map(|e| {
+                let (ew, eh) = size(base_of(e));
+                let (x, y) = lists::placed_at(e);
+                (x, y, ew, eh)
+            })
+            .collect();
+        let width = u32::from(mg_rules::levelup::INVENTORY_WIDTH);
+        let (x, y) = lists::place(&taken, width, w, h);
+        let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
+            out.left.push(format!("{}: inventory is full", t.name));
+            continue;
+        };
+        if let Some(page) = new_page {
+            out.edits.push(page);
+        }
+        let id = items.len() as u32;
+        let item = if t.key.restype == ResType::GIT {
+            mg_module::instances::with_placing(game, Some(module), |placing, _| {
+                mg_module::instances::held(placing, &bp, id)
+            })
+        } else {
+            let mut e = Struct::new(id);
+            e.set("InventoryRes", Value::resref(r));
+            e
+        };
+        let mut item = mg_module::instances::listed_item(&item, id, x, y);
+        if store && !item.contains("Infinite") {
+            item.set("Infinite", Value::Byte(0));
+        }
+        out.edits.push(Edit::insert_item(t.key, path, "ItemList", items.len(), item));
+        out.changed += 1;
+    }
+    out
+}
+
 /// Sets field `label` where each hit found it, else on each object's own
-/// struct, to what `value` makes of the old value (`None`: it can't hold
-/// it).
+/// struct, to what `value` makes of the field's type and old value
+/// (`None`: it can't hold it); `add`: added to an object that lacks it,
+/// where its kind of object has it ([`fields_of`]), with no old value.
 fn set_fields(
     r: &mut Reader<'_>,
     hits: &[&Hit],
     label: &str,
-    value: &mut dyn FnMut(&Value) -> Option<Value>,
+    add: bool,
+    value: &mut dyn FnMut(FieldType, Option<&Value>) -> Option<Value>,
     out: &mut Outcome,
 ) {
     let mut done: HashSet<(ResKey, GffPath)> = HashSet::new();
     let mut objects_done: HashSet<Object> = HashSet::new();
     for h in hits {
-        let (key, path) = match field_found(h) {
-            Some((path, l)) if l.eq_ignore_ascii_case(label) => (h.key, path),
+        let (key, path, object) = match field_found(h) {
+            Some((path, l)) if l.eq_ignore_ascii_case(label) => (h.key, path, None),
             _ => {
                 let Some(o) = h.object() else { continue };
                 if !objects_done.insert(o.clone()) {
                     continue;
                 }
-                (o.key, o.path.clone())
+                (o.key, o.path.clone(), Some(o))
             }
         };
         if !done.insert((key, path.clone())) {
@@ -246,17 +513,61 @@ fn set_fields(
         let Some(f) =
             s.fields.iter().find(|f| f.label.to_string_lossy().eq_ignore_ascii_case(label))
         else {
-            out.skipped.push(format!("{place}: no {label}"));
+            // (Added where asked, by the label as the game's files spell
+            // it, of their type: an object of a kind without it is left.)
+            let known = object
+                .filter(|_| add)
+                .and_then(|o| fields_of(&o).iter().find(|f| f.label.eq_ignore_ascii_case(label)));
+            match known {
+                Some(f) => match value(f.field_type, None) {
+                    Some(v) => {
+                        let label = f.label.to_string();
+                        out.edits.push(Edit::SetField { key, path, label, value: Some(v) });
+                        out.changed += 1;
+                    }
+                    None => out.skipped.push(format!("{place}: {} can't hold it", f.label)),
+                },
+                None => out.skipped.push(format!("{place}: no {label}")),
+            }
             continue;
         };
-        let real = f.label.to_string_lossy().to_string();
-        match value(&f.value) {
+        let real = f.label.to_string_lossy();
+        match value(f.value.field_type(), Some(&f.value)) {
             Some(v) => {
                 out.edits.push(Edit::SetField { key, path, label: real, value: Some(v) });
                 out.changed += 1;
             }
             None => out.skipped.push(format!("{place}: {real} can't hold it")),
         }
+    }
+}
+
+/// The fields an object of its kind has in the game's files (the schema
+/// observed in them, `mg_schema`): a blueprint's or an area's top-level
+/// fields; a placed object's, those of its GIT list's entries; an item a
+/// placed object holds (or a store sells), those of that list's items.
+/// None for the rest (an item in a bag held, a conversation).
+fn fields_of(o: &Object) -> &'static [mg_schema::FieldInfo] {
+    use mg_schema::git;
+    if o.key.restype != ResType::GIT {
+        return if o.path.is_root() { mg_schema::root_fields(o.kind) } else { &[] };
+    }
+    let lists: Vec<&str> = o.path.0.iter().filter_map(|s| s.item().map(|(l, _)| l)).collect();
+    match lists.as_slice() {
+        ["Creature List"] => git::creature_list::FIELDS,
+        ["Door List"] => git::door_list::FIELDS,
+        ["Encounter List"] => git::encounter_list::FIELDS,
+        ["List"] => git::list::FIELDS,
+        ["Placeable List"] => git::placeable_list::FIELDS,
+        ["SoundList"] => git::sound_list::FIELDS,
+        ["StoreList"] => git::store_list::FIELDS,
+        ["TriggerList"] => git::trigger_list::FIELDS,
+        ["WaypointList"] => git::waypoint_list::FIELDS,
+        ["Creature List", "ItemList"] => git::creature_list::item_list::FIELDS,
+        ["Creature List", "Equip_ItemList"] => git::creature_list::equip_item_list::FIELDS,
+        ["Placeable List", "ItemList"] => git::placeable_list::item_list::FIELDS,
+        ["StoreList", "StoreList", "ItemList"] => git::store_list::store_list::item_list::FIELDS,
+        _ => &[],
     }
 }
 
@@ -277,7 +588,7 @@ pub fn events(module: &Module, hits: &[&Hit]) -> Vec<String> {
         for f in &s.fields {
             let l = f.label.to_string_lossy();
             if matches!(f.value, Value::ResRef(_)) && mg_module::refs::is_script_field(&l) {
-                out.push(l.to_string());
+                out.push(l);
             }
         }
     }
@@ -346,7 +657,7 @@ mod tests {
 
     fn apply(m: &Module, hits: &[Hit], change: Change) -> (Module, Outcome) {
         let hits: Vec<&Hit> = hits.iter().collect();
-        let out = edits(m, &hits, &change, Codepage::WINDOWS_1252).unwrap();
+        let out = edits(m, &hits, &change, Codepage::WINDOWS_1252, None).unwrap();
         let mut ws = crate::Workspace::new(m.clone());
         ws.apply(crate::Command::new(change.describe(), out.edits.clone())).unwrap();
         ws.flush().unwrap();
@@ -355,6 +666,27 @@ mod tests {
 
     fn gff(m: &Module, name: &str, t: ResType) -> Gff {
         m.gff(&ResKey::new(rr(name), t)).unwrap().unwrap()
+    }
+
+    /// A name the module's codepage cannot hold is refused, as setting
+    /// one is: it was read as no name, and took the variables without a
+    /// name off every object found.
+    #[test]
+    fn a_variable_s_name_the_module_cannot_hold_removes_none() {
+        let mut m = module();
+        let key = ResKey::parse("guard", ResType::UTC).unwrap();
+        let mut utc = gff(&m, "guard", ResType::UTC);
+        utc.root.set("VarTable", Value::List(vec![var("", 1), var("nOld", 2)]));
+        m.set_gff(key, &utc).unwrap();
+        let found = find(&m, Search::Class(4));
+        let hits: Vec<&Hit> = found.iter().collect();
+        let remove = Change::RemoveVariable { name: "\u{438}\u{43c}\u{44f}".into() };
+        let out = edits(&m, &hits, &remove, Codepage::WINDOWS_1252, None);
+        assert!(out.as_ref().is_err_and(|e| e.contains("can't hold")), "{out:?}");
+        // (The variable with no name is still one to remove by it.)
+        let none = Change::RemoveVariable { name: String::new() };
+        let out = edits(&m, &hits, &none, Codepage::WINDOWS_1252, None).unwrap();
+        assert_eq!((out.changed, out.edits.len()), (1, 1));
     }
 
     #[test]
@@ -405,7 +737,7 @@ mod tests {
         // A value its type can't hold.
         let bad = Change::SetVariable { name: "n".into(), kind: VarType::Int, value: "x".into() };
         let hits: Vec<&Hit> = fighters.iter().collect();
-        assert!(edits(&m, &hits, &bad, Codepage::WINDOWS_1252).is_err());
+        assert!(edits(&m, &hits, &bad, Codepage::WINDOWS_1252, None).is_err());
     }
 
     #[test]
@@ -420,7 +752,7 @@ mod tests {
         // An event the object doesn't have.
         let set = Change::SetScript { event: "OnEnter".into(), script: "x".into() };
         let hits: Vec<&Hit> = fighters.iter().collect();
-        let out = edits(&m, &hits, &set, Codepage::WINDOWS_1252).unwrap();
+        let out = edits(&m, &hits, &set, Codepage::WINDOWS_1252, None).unwrap();
         assert_eq!(out.changed, 0);
         assert_eq!(out.skipped.len(), 2);
         // The events offered: the objects'.
@@ -431,7 +763,7 @@ mod tests {
         // A field found is set where found: the class's level; the
         // object's own by label otherwise, kept of its type.
         let levels = find(&m, Search::Field { label: Some("ClassLevel".into()), value: None });
-        let set = Change::SetField { label: "ClassLevel".into(), value: "9".into() };
+        let set = Change::SetField { label: "ClassLevel".into(), value: "9".into(), add: false };
         let (after, out) = apply(&m, &levels, set);
         assert_eq!(out.changed, 2);
         let utc = gff(&after, "guard", ResType::UTC);
@@ -439,12 +771,221 @@ mod tests {
             utc.root.list("ClassList").unwrap()[0].get("ClassLevel"),
             Some(&Value::Short(9))
         );
-        let set = Change::SetField { label: "appearance_type".into(), value: "7".into() };
+        let set =
+            Change::SetField { label: "appearance_type".into(), value: "7".into(), add: false };
         let (after, _) = apply(&m, &fighters, set);
         let utc = gff(&after, "guard", ResType::UTC);
         assert_eq!(utc.root.get("Appearance_Type"), Some(&Value::Word(7)));
         // A value the field can't hold.
-        let bad = Change::SetField { label: "Appearance_Type".into(), value: "-1".into() };
-        assert!(edits(&m, &hits, &bad, Codepage::WINDOWS_1252).is_err());
+        let bad =
+            Change::SetField { label: "Appearance_Type".into(), value: "-1".into(), add: false };
+        assert!(edits(&m, &hits, &bad, Codepage::WINDOWS_1252, None).is_err());
+    }
+
+    /// A field the objects found lack is added only where asked, and only
+    /// to the kinds of object that have it in the game's files, of the
+    /// type they give it, spelled as they spell it: the blueprint, the
+    /// placed creature and the item it holds, not the area. Undone, the
+    /// field is gone again.
+    #[test]
+    fn a_field_missing_is_added_only_where_asked_and_known() {
+        let m = module();
+        let tagged = find(&m, Search::Field { label: Some("Tag".into()), value: None });
+        assert_eq!(tagged.len(), 4, "{tagged:?}");
+        let plot = |add| Change::SetField { label: "plot".into(), value: "1".into(), add };
+        let (_, out) = apply(&m, &tagged, plot(false));
+        assert_eq!((out.changed, out.skipped.len()), (0, 4), "none added unasked");
+        let (after, out) = apply(&m, &tagged, plot(true));
+        assert_eq!(out.changed, 3, "{:?}", out.skipped);
+        assert_eq!(out.skipped, ["keep (area): no plot"], "an area has no Plot");
+        let utc = gff(&after, "guard", ResType::UTC);
+        assert_eq!(utc.root.get("Plot"), Some(&Value::Byte(1)));
+        let git = gff(&after, "keep", ResType::GIT);
+        let placed = &git.root.list("Creature List").unwrap()[0];
+        assert_eq!(placed.get("Plot"), Some(&Value::Byte(1)));
+        assert_eq!(placed.list("ItemList").unwrap()[0].get("Plot"), Some(&Value::Byte(1)));
+        assert_eq!(gff(&after, "keep", ResType::ARE).root.get("Plot"), None);
+        // A value the type can't hold is refused, nothing added.
+        let bad = Change::SetField { label: "Plot".into(), value: "x".into(), add: true };
+        let hits: Vec<&Hit> = tagged.iter().collect();
+        assert!(edits(&m, &hits, &bad, Codepage::WINDOWS_1252, None).is_err());
+        // A label no kind of object has: none added.
+        let odd = Change::SetField { label: "NoSuchField".into(), value: "1".into(), add: true };
+        let (_, out) = apply(&m, &tagged, odd);
+        assert_eq!(out.changed, 0);
+        // Undone: the fields added are gone.
+        let hits: Vec<&Hit> = tagged.iter().collect();
+        let out = edits(&m, &hits, &plot(true), Codepage::WINDOWS_1252, None).unwrap();
+        let mut ws = crate::Workspace::new(m.clone());
+        ws.apply(crate::Command::new("Set Plot", out.edits)).unwrap();
+        ws.undo().unwrap();
+        ws.flush().unwrap();
+        let utc = ws.module.gff(&ResKey::parse("guard", ResType::UTC).unwrap()).unwrap().unwrap();
+        assert_eq!(utc.root.get("Plot"), None);
+    }
+
+    /// Feats, classes and items held, added to and taken from the
+    /// creatures found by the list rules Edit Together's pages use: where
+    /// they lack it, where there is room, never a creature's only class;
+    /// other kinds of object found are left, said.
+    #[test]
+    fn list_entries_added_and_taken_on_each_object_found() {
+        let m = module();
+        let fighters = find(&m, Search::Class(4));
+        let feats = |m: &Module| -> Vec<Vec<i64>> {
+            let utc = gff(m, "guard", ResType::UTC).root;
+            let git = gff(m, "keep", ResType::GIT).root;
+            let placed = git.list("Creature List").unwrap()[0].clone();
+            [utc, placed]
+                .iter()
+                .map(|c| c.list("FeatList").unwrap_or(&[]).iter().filter_map(lists::feat).collect())
+                .collect()
+        };
+        let add = Change::AddEntry { entry: Entry::Feat(7), name: "Alertness".into() };
+        assert_eq!(add.describe(), "Add feat Alertness");
+        let (after, out) = apply(&m, &fighters, add.clone());
+        assert_eq!(out.changed, 2);
+        assert_eq!(feats(&after), [vec![7], vec![7]]);
+        // Again: each has it already.
+        let (again, out) = apply(&after, &find(&after, Search::Class(4)), add);
+        assert_eq!(out.changed, 0);
+        assert_eq!(
+            out.skipped,
+            ["guard.utc: has it already", "keep › creature GUARD_01: has it already"]
+        );
+        assert_eq!(feats(&again), feats(&after));
+        let remove = Change::RemoveEntry { entry: Entry::Feat(7), name: "Alertness".into() };
+        let (taken, _) = apply(&after, &find(&after, Search::Class(4)), remove);
+        assert_eq!(feats(&taken), [Vec::<i64>::new(), Vec::new()]);
+
+        // A class added at its level; the fighter class, their only one,
+        // never taken.
+        let rogue =
+            Change::AddEntry { entry: Entry::Class { class: 8, level: 3 }, name: "Rogue".into() };
+        let (after, out) = apply(&m, &fighters, rogue);
+        assert_eq!(out.changed, 2);
+        let utc = gff(&after, "guard", ResType::UTC);
+        let classes = utc.root.list("ClassList").unwrap();
+        assert_eq!(classes[1].integer("Class"), Some(8));
+        assert_eq!(classes[1].integer("ClassLevel"), Some(3));
+        let fighter = Change::RemoveEntry {
+            entry: Entry::Class { class: 4, level: 1 },
+            name: "Fighter".into(),
+        };
+        let hits: Vec<&Hit> = fighters.iter().collect();
+        let out = edits(&m, &hits, &fighter, Codepage::WINDOWS_1252, None).unwrap();
+        assert!(out.edits.is_empty());
+        assert_eq!(out.skipped.len(), 2);
+        assert!(out.skipped[0].ends_with("its only class"));
+
+        // An item the placed guard holds (a whole item: its tag only here,
+        // and no blueprint), taken by its blueprint: none of it here.
+        let sword = Change::RemoveEntry { entry: Entry::Item(rr("nw_wswls001")), name: "x".into() };
+        let out = edits(&m, &hits, &sword, Codepage::WINDOWS_1252, None).unwrap();
+        assert_eq!(out.changed, 0);
+        // Adding one needs the game's data, for its size.
+        let sword = Change::AddEntry { entry: Entry::Item(rr("nw_wswls001")), name: "x".into() };
+        assert!(edits(&m, &hits, &sword, Codepage::WINDOWS_1252, None).is_err());
+        // An area found has no feats: left, said.
+        let area = find(&m, Search::Field { label: Some("Tag".into()), value: None });
+        let area: Vec<&Hit> = area.iter().filter(|h| h.key.restype == ResType::ARE).collect();
+        let add = Change::AddEntry { entry: Entry::Feat(7), name: "Alertness".into() };
+        let out = edits(&m, &area, &add, Codepage::WINDOWS_1252, None).unwrap();
+        assert_eq!(out.changed, 0);
+        assert!(out.skipped[0].ends_with("no feats"), "{:?}", out.skipped);
+    }
+
+    /// Item properties added where an item lacks one of that type,
+    /// subtype and value, and taken by the parts given (one not given:
+    /// any).
+    #[test]
+    fn item_properties_added_and_taken_on_each_item_found() {
+        let mut m = module();
+        let p = |cost: u16| ItemProperty {
+            property: 6,
+            subtype: 0,
+            cost_table: 2,
+            cost_value: cost,
+            param1: 255,
+            param1_value: 0,
+            chance: 100,
+        };
+        for (name, props) in [("sword_a", vec![p(1)]), ("sword_b", vec![p(2)])] {
+            let mut uti = Gff::new(*b"UTI ");
+            uti.root.set("Tag", Value::String(b"SWORD".to_vec()));
+            uti.root.set("BaseItem", Value::Int(1));
+            let list = props.iter().map(ItemProperty::to_gff).collect();
+            uti.root.set("PropertiesList", Value::List(list));
+            m.set_gff(ResKey::new(rr(name), ResType::UTI), &uti).unwrap();
+        }
+        let swords =
+            find(&m, Search::ItemProperty { property: 6, subtype: None, value: None, param: None });
+        let swords: Vec<Hit> =
+            swords.into_iter().filter(|h| h.key.restype == ResType::UTI).collect();
+        assert_eq!(swords.len(), 2);
+        let costs = |m: &Module, n: &str| -> Vec<i64> {
+            let uti = gff(m, n, ResType::UTI).root;
+            let list = uti.list("PropertiesList").unwrap_or(&[]).to_vec();
+            list.iter().filter_map(|e| e.integer("CostValue")).collect()
+        };
+        let entry = Entry::Property { property: p(1), subtype: None, value: Some(1), param: None };
+        let add = Change::AddEntry { entry: entry.clone(), name: "+1".into() };
+        let (after, out) = apply(&m, &swords, add);
+        assert_eq!(out.changed, 1, "the +2 sword gains a +1");
+        assert_eq!(costs(&after, "sword_b"), [2, 1]);
+        // Any value: every enhancement taken.
+        let any = Entry::Property { property: p(1), subtype: None, value: None, param: None };
+        let (taken, out) =
+            apply(&after, &swords, Change::RemoveEntry { entry: any, name: "x".into() });
+        assert_eq!(out.changed, 2);
+        assert!(costs(&taken, "sword_a").is_empty() && costs(&taken, "sword_b").is_empty());
+    }
+
+    #[test]
+    fn add_item_rejects_coordinates_past_u16_max_without_wrapping() {
+        let mut m = Module::new();
+        let mut new_uti = Gff::new(*b"UTI ");
+        new_uti.root.set("BaseItem", Value::Int(0));
+        m.set_gff(ResKey::new(rr("big"), ResType::UTI), &new_uti).unwrap();
+
+        let mut baseitems = mg_resman::MemContainer::new();
+        baseitems.insert(
+            ResKey::parse("baseitems", ResType::TWODA).unwrap(),
+            b"2DA V2.0\r\n\r\nLabel InvSlotWidth InvSlotHeight\r\n0 big 10 255\r\n".to_vec(),
+        );
+        let mut rm = mg_resman::ResMan::new();
+        rm.add(mg_resman::priority::KEY, "base", mg_resman::LayerClass::Key, baseitems);
+        let g = GameData::new(rm, mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+
+        // 258 items of size 10x255 occupy rows 0..65790, past u16::MAX (65535).
+        let occupied: Vec<Struct> = (0..258)
+            .map(|row| {
+                let mut e = Struct::new(row);
+                e.set("BaseItem", Value::Int(0));
+                e.set("Repos_PosX", Value::Word(0));
+                e.set("Repos_Posy", Value::Word((row * 255) as u16));
+                e.set("InventoryRes", Value::resref(rr("big")));
+                e
+            })
+            .collect();
+        let mut chest = Gff::new(*b"UTP ");
+        chest.root.set("Tag", Value::String(b"FULL".to_vec()));
+        chest.root.set("ItemList", Value::List(occupied));
+        let key = ResKey::new(rr("fullchest"), ResType::UTP);
+        m.set_gff(key, &chest).unwrap();
+
+        let hits = find(&m, Search::Field { label: Some("Tag".into()), value: None });
+        let hit_refs: Vec<&Hit> = hits.iter().collect();
+        let out = edits(
+            &m,
+            &hit_refs,
+            &Change::AddEntry { entry: Entry::Item(rr("big")), name: "big".into() },
+            Codepage::WINDOWS_1252,
+            Some(&g),
+        )
+        .unwrap();
+        assert_eq!(out.changed, 0);
+        assert!(out.edits.is_empty());
+        assert_eq!(out.skipped, ["fullchest.utp: inventory is full"]);
     }
 }

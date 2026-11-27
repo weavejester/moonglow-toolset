@@ -1,4 +1,4 @@
-//! The area view's placeable brush (Paint, on its toolbar): placeables
+//! The area view's placeable brush (Paint, on its tool shelf): placeables
 //! chosen in the palette (Ctrl + click for several) are painted onto the
 //! ground, as builders asked for trees, rocks and bushes.
 //!
@@ -31,7 +31,9 @@
 //! Undo takes it away. What an eraser's stroke takes out is marked until
 //! then.
 
+use mg_uikit::Controls as _;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use egui::{Color32, Stroke};
 use glam::{Vec2, Vec3};
@@ -43,6 +45,7 @@ use mg_resman::ResKey;
 use crate::area_view::AreaView;
 use crate::settings::PaintSettings;
 use crate::{Action, Moonglow};
+use mg_uikit::status::Hint;
 
 /// A placeable the brush puts down (or would): of which blueprint, where,
 /// turned how far from as its blueprint stands (radians, anticlockwise),
@@ -82,6 +85,122 @@ pub struct PaintState {
     /// What the last frame showed see-through: the stroke's placeables
     /// and the next dab.
     pub shown: usize,
+    /// How many of those were not drawn (past [`GHOSTS_MAX`]): the status
+    /// line says so. They are laid all the same.
+    pub more: usize,
+    /// The next dab as last worked out, and what for: the pointer resting
+    /// on the view asks for the same one every frame.
+    next: Option<(DabKey, Vec<Painted>)>,
+    /// How many times the next dab was worked out (for tests: not every
+    /// frame the pointer rests).
+    pub worked: u64,
+    /// Bumped whenever `pending` changes.
+    pending_gen: u64,
+    /// Bumped whenever `templates` or `bounds` changes or clears.
+    templates_gen: u64,
+    /// Monotonic stamp allocated whenever `ghosts_cache` is rebuilt.
+    ghost_gen: u64,
+    /// Cached `row_to` result while pointer/settings stay fixed.
+    row_cache: Option<(RowKey, (Vec<Painted>, Vec3))>,
+    /// Cached built ghost `AreaObject`s, counts, and stamp.
+    ghosts_cache: Option<GhostsCache>,
+    /// Cached 64-point ground circle in `overlay`.
+    circle_cache: Option<(CircleKey, Vec<Vec3>)>,
+    /// Cached eraser hit indices in `overlay`.
+    eraser_cache: Option<(EraserKey, Vec<usize>)>,
+}
+
+type GhostsCache = (GhostBuildKey, Arc<[AreaObject]>, usize, usize, u64);
+
+#[derive(Debug, Clone, PartialEq)]
+struct RowKey {
+    to: [u32; 3],
+    row_from: Option<[u32; 3]>,
+    row_end: Option<[u32; 3]>,
+    settings: PaintSettings,
+    keys: Vec<ResKey>,
+    templates_gen: u64,
+    turn: u32,
+    snap_angle: Option<u32>,
+    snap_grid: Option<u32>,
+    seed: u64,
+    area: (Option<u64>, bool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GhostBuildKey {
+    pending_gen: u64,
+    templates_gen: u64,
+    painting: bool,
+    row: bool,
+    preview_row: Option<RowKey>,
+    preview_dab: Option<DabKey>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CircleKey {
+    at: [u32; 3],
+    radius_cm: u16,
+    area: (Option<u64>, bool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct EraserKey {
+    at: [u32; 3],
+    radius_cm: u16,
+    keys: Vec<ResKey>,
+    area: Option<u64>,
+    shows: bool,
+}
+
+/// What the next dab under the pointer is worked out from: where, by
+/// which seed and settings, with which blueprints (and how many of their
+/// models are read), how turned and snapped, in the area as read at which
+/// revision (with its scene or without), over how much of a stroke.
+#[derive(Debug, Clone, PartialEq)]
+struct DabKey {
+    center: [u32; 3],
+    seed: u64,
+    settings: PaintSettings,
+    keys: Vec<ResKey>,
+    sized: usize,
+    turn: u32,
+    snap: Option<u32>,
+    area: (Option<u64>, bool, bool),
+    /// Whether the area's placeables are shown (those hidden are not kept
+    /// a distance from).
+    shows: bool,
+    pending: usize,
+}
+
+/// The most see-through placeables the brush draws: a dab of a forest at
+/// its widest is tens of thousands, each a model posed every frame.
+const GHOSTS_MAX: usize = 400;
+
+impl PaintState {
+    /// Drops the stroke going on: nothing of it is laid or taken out.
+    pub(crate) fn drop_stroke(&mut self) {
+        if !self.pending.is_empty() {
+            self.pending.clear();
+            self.pending_gen = self.pending_gen.wrapping_add(1);
+        }
+        self.erasing.clear();
+        self.painting = false;
+        self.row_from = None;
+    }
+
+    /// Clears cached blueprint objects, bounds, and next-dab previews after
+    /// resources are reloaded.
+    pub(crate) fn clear_caches(&mut self) {
+        self.templates.clear();
+        self.bounds.clear();
+        self.templates_gen = self.templates_gen.wrapping_add(1);
+        self.next = None;
+        self.row_cache = None;
+        self.ghosts_cache = None;
+        self.circle_cache = None;
+        self.eraser_cache = None;
+    }
 }
 
 /// The circle's color, a dab's green.
@@ -130,7 +249,14 @@ pub(crate) fn keys(app: &Moonglow) -> Vec<ResKey> {
     if p.tiles || p.prefabs {
         return Vec::new();
     }
-    let mut keys: Vec<ResKey> = p.selected.into_iter().chain(p.chosen.iter().copied()).collect();
+    chosen_keys(p.selected, &p.chosen)
+}
+
+/// The placeables among the blueprint clicked in the palette
+/// (`selected`) and those chosen with Ctrl + click: what the brush
+/// paints with, where the palette shows placeables.
+pub(crate) fn chosen_keys(selected: Option<ResKey>, chosen: &[ResKey]) -> Vec<ResKey> {
+    let mut keys: Vec<ResKey> = selected.into_iter().chain(chosen.iter().copied()).collect();
     keys.retain(|k| k.restype == ResType::UTP);
     keys.dedup();
     keys
@@ -160,6 +286,49 @@ pub(crate) struct Near {
 /// way they face.
 pub(crate) fn reach_of((min, max): (Vec3, Vec3), scale: f32) -> f32 {
     [min.x, max.x, min.y, max.y].into_iter().map(f32::abs).fold(0.0, f32::max) * scale
+}
+
+/// The places a dab keeps its distance from, each with how far its sides
+/// reach: asked whether a new one at a point would be too near any. In
+/// squares as wide as the farthest two can be and still be too near, so
+/// that a point is held against those of its square and the eight around
+/// it, not against every one (a thousand placeables a dab, thirty tries
+/// each).
+struct Taken {
+    /// The least gap between two, before their reaches.
+    spacing: f32,
+    /// A square's side: `spacing` and twice the longest reach.
+    cell: f32,
+    cells: HashMap<(i32, i32), Vec<(Vec2, f32)>>,
+}
+
+impl Taken {
+    /// `longest`: the longest reach any of them, or one asked about,
+    /// has.
+    fn new(spacing: f32, longest: f32) -> Taken {
+        let cell = (spacing + 2.0 * longest).max(0.01);
+        Taken { spacing, cell, cells: HashMap::new() }
+    }
+
+    fn square(&self, p: Vec2) -> (i32, i32) {
+        ((p.x / self.cell).floor() as i32, (p.y / self.cell).floor() as i32)
+    }
+
+    fn push(&mut self, p: Vec2, reach: f32) {
+        self.cells.entry(self.square(p)).or_default().push((p, reach));
+    }
+
+    /// Whether one at `p` reaching `reach` would be nearer than the
+    /// spacing to one of them.
+    fn too_near(&self, p: Vec2, reach: f32) -> bool {
+        let (x, y) = self.square(p);
+        (-1..=1).flat_map(|dx| (-1..=1).map(move |dy| (dx, dy))).any(|(dx, dy)| {
+            let at = (x.saturating_add(dx), y.saturating_add(dy));
+            self.cells.get(&at).is_some_and(|there| {
+                there.iter().any(|(q, rq)| q.distance(p) < self.spacing + rq + reach)
+            })
+        })
+    }
 }
 
 /// The ground's height at a point (`None`: none there).
@@ -205,13 +374,17 @@ pub(crate) fn dab(
     let mut rng = fastrand::Rng::with_seed(seed);
     // (Each one's middle, and how far its sides reach: none, unless by size.)
     let sized = |reach: f32| if s.by_size { reach } else { 0.0 };
-    let mut taken: Vec<(Vec2, f32)> = around
-        .iter()
-        .filter(|n| n.at.distance(middle) <= radius + spacing + sized(n.reach))
-        .map(|n| (n.at, sized(n.reach)))
-        .collect();
-    let spread = f32::from(s.turn_spread.min(360)).to_radians();
     let (low, high) = (s.scale_min.min(s.scale_max), s.scale_max.max(s.scale_min));
+    let near =
+        || around.iter().filter(|n| n.at.distance(middle) <= radius + spacing + sized(n.reach));
+    // (The longest reach of those around and of what the dab may lay.)
+    let largest = keys.iter().map(|k| size(*k)).fold(0.0, f32::max) * f32::from(high) / 100.0;
+    let longest = near().map(|n| sized(n.reach)).fold(sized(largest), f32::max);
+    let mut taken = Taken::new(spacing, longest);
+    for n in near() {
+        taken.push(n.at, sized(n.reach));
+    }
+    let spread = f32::from(s.turn_spread.min(360)).to_radians();
     let lift = f32::from(s.lift_cm) / 100.0;
     let mut out = Vec::new();
     for _ in 0..count * TRIES {
@@ -224,12 +397,12 @@ pub(crate) fn dab(
         let key = keys[rng.usize(..keys.len())];
         let scale = f32::from(low + rng.u16(..=high - low)) / 100.0;
         let reach = sized(size(key) * scale);
-        if taken.iter().any(|(q, rq)| q.distance(p) < spacing + rq + reach) {
+        if taken.too_near(p, reach) {
             continue;
         }
         let Some(z) = ground(p) else { continue };
         let turn = mg_area::arrange::snap_rotation(turn + (rng.f32() - 0.5) * spread, snap);
-        taken.push((p, reach));
+        taken.push(p, reach);
         out.push(Painted { key, position: p.extend(z + lift), turn, scale });
     }
     out
@@ -486,15 +659,58 @@ fn object(template: &AreaObject, p: &Painted) -> AreaObject {
     o
 }
 
-/// What the brush shows see-through this frame: the stroke's placeables,
-/// and before a press, the next dab under the pointer.
-pub(crate) fn ghosts(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView) -> Vec<AreaObject> {
+fn row_key(app: &Moonglow, view: &AreaView, keys: &[ResKey], to: Vec3) -> RowKey {
+    RowKey {
+        to: to.to_array().map(f32::to_bits),
+        row_from: view.paint.row_from.map(|p| p.to_array().map(f32::to_bits)),
+        row_end: view.paint.row_end.map(|p| p.to_array().map(f32::to_bits)),
+        settings: app.settings.paint,
+        keys: keys.to_vec(),
+        templates_gen: view.paint.templates_gen,
+        turn: view.ghost_turn().to_bits(),
+        snap_angle: view.snap_angle().map(f32::to_bits),
+        snap_grid: view.snap_grid().map(f32::to_bits),
+        seed: view.paint.seed,
+        area: (view.read_at(), view.ground().is_some()),
+    }
+}
+
+fn row_to_cached(
+    app: &Moonglow,
+    view: &mut AreaView,
+    keys: &[ResKey],
+    to: Vec3,
+) -> (Vec<Painted>, Vec3) {
+    let key = row_key(app, view, keys, to);
+    if let Some((was, out)) = &view.paint.row_cache
+        && *was == key
+    {
+        return out.clone();
+    }
+    let out = row_to(app, view, keys, to);
+    view.paint.row_cache = Some((key, out.clone()));
+    out
+}
+
+/// The ghost `AreaObject`s for the current paint stroke/preview, and an opaque stamp
+/// identifying that batch (`0` when empty).
+pub(crate) fn ghosts(
+    app: &mut Moonglow,
+    ui: &egui::Ui,
+    view: &mut AreaView,
+) -> (Arc<[AreaObject]>, u64) {
     let Some(keys) = active(app) else {
         // (Read anew when it is next on: the blueprints may have changed.)
-        view.paint.templates.clear();
-        view.paint.bounds.clear();
-        view.paint.shown = 0;
-        return Vec::new();
+        if !view.paint.templates.is_empty() || !view.paint.bounds.is_empty() {
+            view.paint.templates.clear();
+            view.paint.bounds.clear();
+            view.paint.templates_gen = view.paint.templates_gen.wrapping_add(1);
+        }
+        (view.paint.shown, view.paint.more) = (0, 0);
+        view.paint.next = None;
+        view.paint.row_cache = None;
+        view.paint.ghosts_cache = None;
+        return (Arc::from([]), 0);
     };
     view.read_walkable(app);
     for key in &keys {
@@ -504,35 +720,109 @@ pub(crate) fn ghosts(app: &mut Moonglow, ui: &egui::Ui, view: &mut AreaView) -> 
                 view.paint.bounds.insert(*key, bounds);
             }
             view.paint.templates.insert(*key, template);
+            view.paint.templates_gen = view.paint.templates_gen.wrapping_add(1);
         }
     }
     if app.settings.paint.erase {
         // (The eraser shows nothing see-through: what it takes out is
         // marked, `overlay`.)
-        view.paint.shown = 0;
-        return Vec::new();
+        (view.paint.shown, view.paint.more) = (0, 0);
+        return (Arc::from([]), 0);
     }
     let at = pointer(ui, view);
     let row = app.settings.paint.by_drag();
     if row && view.paint.painting {
         // The row as far as the pointer now.
         if let Some(at) = at {
-            view.paint.pending = row_to(app, view, &keys, at).0;
+            let laid = row_to_cached(app, view, &keys, at).0;
+            if view.paint.pending != laid {
+                view.paint.pending = laid;
+                view.paint.pending_gen = view.paint.pending_gen.wrapping_add(1);
+            }
         }
     }
-    let mut shown = view.paint.pending.clone();
-    match at.filter(|_| !view.paint.painting) {
-        Some(at) if row => shown.extend(row_to(app, view, &keys, at).0),
-        Some(at) => shown.extend(next_dab(app, view, &keys, at)),
-        None => {}
+    let (preview_row, preview_dab) = match at.filter(|_| !view.paint.painting) {
+        Some(at) if row => (Some(row_key(app, view, &keys, at)), None),
+        Some(at) => {
+            // (The same dab while the pointer rests and nothing it is
+            // worked out from changes: not worked out every frame.)
+            let key = DabKey {
+                center: at.to_array().map(f32::to_bits),
+                seed: view.paint.seed,
+                settings: app.settings.paint,
+                sized: view.paint.bounds.len(),
+                turn: view.ghost_turn().to_bits(),
+                snap: view.snap_angle().map(f32::to_bits),
+                area: (view.read_at(), view.holds_scene(), view.ground().is_some()),
+                shows: view.show[ObjectKind::Placeable.index()],
+                pending: view.paint.pending.len(),
+                keys: keys.clone(),
+            };
+            if !view.paint.next.as_ref().is_some_and(|(k, _)| *k == key) {
+                let dab = next_dab(app, view, &keys, at);
+                view.paint.next = Some((key.clone(), dab));
+                view.paint.worked += 1;
+            }
+            (None, Some(key))
+        }
+        None => (None, None),
+    };
+    let build_key = GhostBuildKey {
+        pending_gen: view.paint.pending_gen,
+        templates_gen: view.paint.templates_gen,
+        painting: view.paint.painting,
+        row,
+        preview_row,
+        preview_dab,
+    };
+    if let Some((was, objects, total, more, stamp)) = &view.paint.ghosts_cache
+        && *was == build_key
+    {
+        view.paint.shown = *total;
+        view.paint.more = *more;
+        return (objects.clone(), *stamp);
     }
+    let preview: &[Painted] = if view.paint.painting {
+        &[]
+    } else if row {
+        match at {
+            Some(at) => {
+                let _ = row_to_cached(app, view, &keys, at);
+                view.paint.row_cache.as_ref().map_or(&[], |(_, (laid, _))| laid.as_slice())
+            }
+            None => &[],
+        }
+    } else if at.is_some() {
+        view.paint.next.as_ref().map_or(&[], |(_, dab)| dab.as_slice())
+    } else {
+        &[]
+    };
     let templates = &view.paint.templates;
-    let objects: Vec<AreaObject> = shown
-        .iter()
-        .filter_map(|p| templates.get(&p.key)?.as_ref().map(|t| object(t, p)))
-        .collect();
-    view.paint.shown = objects.len();
-    objects
+    let known = |p: &&Painted| templates.get(&p.key).is_some_and(|t| t.is_some());
+    let total = view.paint.pending.iter().chain(preview).filter(known).count();
+    let objects: Arc<[AreaObject]> = if total == 0 {
+        Arc::from([])
+    } else {
+        view.paint
+            .pending
+            .iter()
+            .chain(preview)
+            .filter_map(|p| templates.get(&p.key)?.as_ref().map(|t| object(t, p)))
+            .take(GHOSTS_MAX)
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let more = total - objects.len();
+    let stamp = if objects.is_empty() {
+        0
+    } else {
+        view.paint.ghost_gen = view.paint.ghost_gen.wrapping_add(1).max(1);
+        view.paint.ghost_gen
+    };
+    view.paint.ghosts_cache = Some((build_key, objects.clone(), total, more, stamp));
+    view.paint.shown = total;
+    view.paint.more = more;
+    (objects, stamp)
 }
 
 /// Shift + wheel over the view sizes the brush's circle: whether the wheel
@@ -578,7 +868,8 @@ fn under_eraser(app: &Moonglow, view: &AreaView, keys: &[ResKey], center: Vec3) 
 }
 
 /// The brush's clicks and drags on the view: whether they were its (Paint
-/// is on with placeables chosen), and nothing else is to take them.
+/// is on with placeables chosen, or Escape or a right click put Paint
+/// away), and nothing else is to take them.
 pub(crate) fn input(
     app: &mut Moonglow,
     ui: &egui::Ui,
@@ -586,15 +877,22 @@ pub(crate) fn input(
     response: &egui::Response,
 ) -> bool {
     let Some(keys) = active(app) else {
-        view.paint.pending.clear();
+        if !view.paint.pending.is_empty() {
+            view.paint.pending.clear();
+            view.paint.pending_gen = view.paint.pending_gen.wrapping_add(1);
+        }
         view.paint.erasing.clear();
         view.paint.painting = false;
         view.paint.row_from = None;
         view.paint.row_end = None;
-        // Paint on with nothing chosen to place: Escape or a right click
-        // puts it away, as the status line says.
-        let stop = crate::area_view::cancelled(ui, response);
-        if app.paint && app.palette.selected.is_none() && stop {
+        // Paint on with no placeable chosen: Escape or a right click
+        // puts it away. The rest is the view's as with Paint off, but for
+        // a click that would place what is in hand, which places nothing
+        // (`area_view::input`). A paste, an outline drawn anew or a tile
+        // paste in hand is dropped first (the innermost thing, as the
+        // view's own order has it), and Paint stays on.
+        let inner = view.pasting || view.redraw.is_some() || view.tile_pasting;
+        if app.paint && !inner && crate::area_view::cancelled(ui, response) {
             app.paint = false;
             return true;
         }
@@ -607,10 +905,7 @@ pub(crate) fn input(
     let stop = crate::area_view::cancelled(ui, response);
     if stop {
         if view.paint.painting {
-            view.paint.pending.clear();
-            view.paint.erasing.clear();
-            view.paint.painting = false;
-            view.paint.row_from = None;
+            view.paint.drop_stroke();
         } else {
             app.paint = false;
         }
@@ -618,10 +913,9 @@ pub(crate) fn input(
     }
     // A press with Ctrl or Alt held is the camera's (Ctrl + drag, Alt +
     // drag move the view): the brush lays nothing with it.
-    let (pressed, down, camera, now) = ui.input(|i| {
-        let p = &i.pointer;
-        (p.primary_pressed(), p.primary_down(), i.modifiers.command || i.modifiers.alt, i.time)
-    });
+    let (pressed, down, now) =
+        ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.time));
+    let camera = view.camera_press;
     let s = app.settings.paint;
     if pressed && hovered && !camera {
         view.paint.painting = true;
@@ -656,8 +950,11 @@ pub(crate) fn input(
         // when let go.
         let mut end = None;
         if let Some(to) = pointer(ui, view) {
-            let (laid, at) = row_to(app, view, &keys, to);
-            view.paint.pending = laid;
+            let (laid, at) = row_to_cached(app, view, &keys, to);
+            if view.paint.pending != laid {
+                view.paint.pending = laid;
+                view.paint.pending_gen = view.paint.pending_gen.wrapping_add(1);
+            }
             end = Some(at);
         }
         if !down {
@@ -678,7 +975,10 @@ pub(crate) fn input(
         });
         if due {
             let laid = next_dab(app, view, &keys, at);
-            view.paint.pending.extend(laid);
+            if !laid.is_empty() {
+                view.paint.pending.extend(laid);
+                view.paint.pending_gen = view.paint.pending_gen.wrapping_add(1);
+            }
             view.paint.seed = fastrand::u64(..);
             view.paint.last = Some((at, now));
         }
@@ -701,6 +1001,7 @@ fn commit(app: &mut Moonglow, view: &mut AreaView) {
     if pending.is_empty() {
         return;
     }
+    view.paint.pending_gen = view.paint.pending_gen.wrapping_add(1);
     let git = view.git();
     let list = ObjectKind::Placeable.list();
     let lock = app.settings.paint.lock;
@@ -743,7 +1044,7 @@ fn commit(app: &mut Moonglow, view: &mut AreaView) {
 /// The brush's circle, on the ground around the pointer (the eraser's in
 /// red, and what it takes out marked); a row's line, a fill's rectangle,
 /// and the last row's end, which a drag may go on from.
-pub(crate) fn overlay(app: &Moonglow, ui: &egui::Ui, view: &AreaView) {
+pub(crate) fn overlay(app: &Moonglow, ui: &egui::Ui, view: &mut AreaView) {
     let Some(keys) = active(app) else { return };
     let painter = ui.painter_at(view.rect);
     let s = &app.settings.paint;
@@ -790,19 +1091,27 @@ pub(crate) fn overlay(app: &Moonglow, ui: &egui::Ui, view: &AreaView) {
     let color = if s.erase { ERASER } else { CIRCLE };
     let radius = f32::from(s.radius_cm) / 100.0;
     const POINTS: usize = 64;
-    let circle: Vec<Vec3> = (0..POINTS)
-        .map(|k| {
-            let a = k as f32 / POINTS as f32 * std::f32::consts::TAU;
-            at + Vec3::new(a.cos(), a.sin(), 0.0) * radius
-        })
-        .collect();
-    // On the walkable ground nearest the pointer's level, as a dab finds
-    // it (not up a tower's wall beside it); level where there is none.
-    let ground = ground(view, at);
-    let circle: Vec<Vec3> = circle
-        .into_iter()
-        .map(|p| p.truncate().extend(ground(p.truncate()).unwrap_or(at.z) + 0.05))
-        .collect();
+    let circle_key = CircleKey {
+        at: at.to_array().map(f32::to_bits),
+        radius_cm: s.radius_cm,
+        area: (view.read_at(), view.ground().is_some()),
+    };
+    if !view.paint.circle_cache.as_ref().is_some_and(|(k, _)| *k == circle_key) {
+        let circle: Vec<Vec3> = {
+            // On the walkable ground nearest the pointer's level, as a dab finds
+            // it (not up a tower's wall beside it); level where there is none.
+            let ground = ground(view, at);
+            (0..POINTS)
+                .map(|k| {
+                    let a = k as f32 / POINTS as f32 * std::f32::consts::TAU;
+                    at + Vec3::new(a.cos(), a.sin(), 0.0) * radius
+                })
+                .map(|p| p.truncate().extend(ground(p.truncate()).unwrap_or(at.z) + 0.05))
+                .collect()
+        };
+        view.paint.circle_cache = Some((circle_key, circle));
+    }
+    let circle = &view.paint.circle_cache.as_ref().expect("just set").1;
     for k in 0..POINTS {
         if let Some(line) = view.screen_segment(circle[k], circle[(k + 1) % POINTS]) {
             painter.line_segment(line, Stroke::new(2.0, color));
@@ -812,12 +1121,22 @@ pub(crate) fn overlay(app: &Moonglow, ui: &egui::Ui, view: &AreaView) {
         painter.circle_filled(middle, 2.5, color);
     }
     if s.erase {
+        let eraser_key = EraserKey {
+            at: at.to_array().map(f32::to_bits),
+            radius_cm: s.radius_cm,
+            keys,
+            area: view.read_at(),
+            shows: view.show[ObjectKind::Placeable.index()],
+        };
+        if !view.paint.eraser_cache.as_ref().is_some_and(|(k, _)| *k == eraser_key) {
+            let under = under_eraser(app, view, &eraser_key.keys, at);
+            view.paint.eraser_cache = Some((eraser_key, under));
+        }
+        let under = view.paint.eraser_cache.as_ref().map_or(&[][..], |(_, u)| u.as_slice());
         // What goes: what the stroke passed over, and what the circle is
         // over now.
-        let mut gone = view.paint.erasing.clone();
-        gone.extend(under_eraser(app, view, &keys, at));
         let model = view.model.as_ref();
-        for i in gone {
+        for i in view.paint.erasing.iter().copied().chain(under.iter().copied()) {
             let o = model.and_then(|m| m.object(ObjectKind::Placeable, i));
             if let Some(p) = o.and_then(|o| view.screen_pos(o.position)) {
                 let d = egui::vec2(5.0, 5.0);
@@ -831,179 +1150,453 @@ pub(crate) fn overlay(app: &Moonglow, ui: &egui::Ui, view: &AreaView) {
     }
 }
 
-/// The status line while Paint is on.
-pub(crate) fn status(app: &Moonglow) -> Option<String> {
+/// The Status Bar's hints while Paint is on (the AreaPaint board's): what
+/// the brush is doing as a notice, then its keys.
+pub(crate) fn hints(app: &Moonglow, k: &crate::shell::HintKeys) -> Option<Vec<Hint>> {
     if !app.paint {
         return None;
     }
+    use crate::keys::Cmd;
     let keys = keys(app);
     let s = &app.settings.paint;
+    let several = Hint::keys([k.ctrl(), "Click"], "Choose several in the palette");
+    let stop = Hint::either(["Right Click", "Esc"], "Stop");
+    let size = Hint::keys(["Shift", "Wheel"], "Brush size");
     let what = match keys.len() {
         0 => {
-            return Some(
-                "Paint: choose placeables in the palette (Ctrl + click for several); Escape: stop"
-                    .to_string(),
-            );
+            let note = if app.palette.selected.is_some() {
+                "Paint works with placeables: choose some in the palette"
+            } else {
+                "Paint: choose placeables in the palette"
+            };
+            let choose = Hint::note(note);
+            return Some(vec![choose, several, Hint::keys(["Esc"], "Stop")]);
         }
         1 => keys[0].resref.to_string(),
         n => format!("{n} placeables"),
     };
-    Some(if s.erase {
-        format!(
-            "Erasing {what}: drag over them to take them out (not locked ones), Shift + wheel: \
-             the brush's size; right click or Escape: stop"
-        )
+    let turn = |word: &str| k.either(Cmd::TurnLeft, Cmd::TurnRight, word);
+    let mut out = Vec::new();
+    if s.erase {
+        out.push(Hint::note(format!("Erasing {what}")));
+        out.push(Hint::keys(["Drag"], "Take them out (not locked ones)"));
+        out.push(size);
+        out.push(stop);
     } else if s.fill {
-        format!(
-            "Filling with {what}: drag a rectangle from one corner to the other, Q and E: turn \
-             the grid; right click or Escape: stop"
-        )
+        out.push(Hint::note(format!("Filling with {what}")));
+        out.push(Hint::keys(["Drag"], "Fill a rectangle"));
+        out.extend(turn("Turn the grid"));
+        out.push(stop);
     } else if s.row {
-        format!(
-            "Laying a row of {what}: drag from one end to the other (from the last row's end, \
-             its ring, to go on from it), Q and E: turn the pieces on the row; right click or \
-             Escape: stop"
-        )
+        out.push(Hint::note(format!("Laying a row of {what}")));
+        out.push(Hint::keys(["Drag"], "Lay a row, or go on from the last one's ring"));
+        out.extend(turn("Turn the pieces"));
+        out.push(stop);
     } else {
-        format!(
-            "Painting {what}: drag to paint, Shift + wheel: the brush's size, Q and E: turn; \
-             right click or Escape: stop"
-        )
-    })
+        out.push(Hint::note(format!("Painting {what}")));
+        out.push(Hint::keys(["Drag"], "Paint"));
+        out.push(size);
+        out.extend(turn("Turn"));
+        out.push(stop);
+        out.push(several);
+    }
+    Some(out)
 }
 
-/// A length kept in centimeters, edited in meters.
-fn meters(ui: &mut egui::Ui, cm: &mut i32, range: (f32, f32)) -> egui::Response {
+/// A length kept in centimeters, edited in meters, in a field `width`
+/// wide named `name` (its label is drawn apart).
+fn meters(
+    ui: &mut egui::Ui,
+    cm: &mut i32,
+    range: (f32, f32),
+    (name, width): (&str, f32),
+) -> egui::Response {
     let mut m = *cm as f32 / 100.0;
-    let r = ui.add(
-        egui::DragValue::new(&mut m)
-            .speed(0.05)
-            .range(range.0..=range.1)
-            .fixed_decimals(2)
-            .suffix(" m"),
-    );
+    let field = egui::DragValue::new(&mut m).speed(0.05).range(range.0..=range.1).fixed_decimals(2);
+    let r = number(ui, name, width, field.suffix(" m"));
     if r.changed() {
         *cm = (m * 100.0).round() as i32;
     }
     r
 }
 
-/// The strip of the brush's settings, above the view while Paint is on.
-pub(crate) fn strip(app: &mut Moonglow, ui: &mut egui::Ui) {
-    use crate::widgets::field_label;
-    let chosen = keys(app).len();
-    let s = &mut app.settings.paint;
-    ui.horizontal_wrapped(|ui| {
-        let mode = |s: &PaintSettings| (s.row && !s.erase, s.fill && !s.erase, s.erase);
-        for ((row, fill, erase), label, tip) in [
-            ((false, false, false), "Scatter", "Paint at random in a circle"),
-            (
-                (true, false, false),
-                "Row",
-                "Lay pieces end to end along a drag (fences, walls), each facing along the row; \
-                 a drag from the last row's end goes on from it",
-            ),
-            (
-                (false, true, false),
-                "Fill",
-                "Fill the rectangle dragged with rows of pieces (floors), on a grid Q and E \
-                 turn, each piece by its own size",
-            ),
-            (
-                (false, false, true),
-                "Erase",
-                "Take the chosen blueprints' placeables out of the circle as it is dragged \
-                 over them (not locked ones)",
-            ),
-        ] {
-            let on = mode(s) == (row, fill, erase);
-            if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
-                (s.row, s.fill, s.erase) = (row, fill, erase);
-            }
-        }
-        ui.separator();
-        if !s.by_drag() {
-            field_label(ui, "Radius");
-            let mut cm = i32::from(s.radius_cm);
+/// A number field `width` wide and a control high, named `name` for a
+/// screen reader (and tests): its words beside it are drawn, not a label
+/// of their own.
+fn number(ui: &mut egui::Ui, name: &str, width: f32, field: egui::DragValue<'_>) -> egui::Response {
+    let r = ui.add_sized([width, mg_uikit::metrics::CONTROL_HEIGHT], field);
+    ui.ctx().accesskit_node_builder(r.id, |node| node.set_label(name));
+    r
+}
+
+/// A field's words, `width` wide (its own where 0), in `color`: drawn,
+/// so that the field beside it is what its name names.
+fn words(ui: &mut egui::Ui, words: &str, width: f32, color: Color32) {
+    let font = egui::FontId::proportional(mg_uikit::metrics::BODY_SIZE);
+    let galley = ui.painter().layout_no_wrap(words.to_string(), font, color);
+    let w = if width > 0.0 { width } else { galley.size().x };
+    let size = egui::vec2(w, mg_uikit::metrics::CONTROL_HEIGHT);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let at = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(at, galley, color);
+}
+
+/// The width of `w` in the body's text.
+fn text_width(ui: &egui::Ui, w: &str) -> f32 {
+    let font = egui::FontId::proportional(mg_uikit::metrics::BODY_SIZE);
+    ui.painter().layout_no_wrap(w.to_string(), font, Color32::WHITE).size().x
+}
+
+/// The header's segmented control of how the brush paints (its group's
+/// name).
+pub(crate) const MODE: &str = "How the brush paints";
+/// The Brush popover's name and words.
+pub(crate) const BRUSH: &str = "Brush";
+/// The palette's Brush section's group (named apart from the popover).
+pub(crate) const BRUSH_SECTION: &str = "Brush blueprints";
+
+/// The modes, as `(row, fill, erase)`, with their words and tips.
+const MODES: [((bool, bool, bool), &str, &str); 4] = [
+    ((false, false, false), "Scatter", "Paint at random in a circle"),
+    ((true, false, false), "Row", "Lay pieces end to end along a drag, such as fences and walls"),
+    (
+        (false, true, false),
+        "Fill",
+        "Fill the rectangle dragged with rows of pieces, such as floors",
+    ),
+    (
+        (false, false, true),
+        "Erase",
+        "Remove the chosen blueprints' placeables under the circle, except locked ones",
+    ),
+];
+
+fn mode_of(s: &PaintSettings) -> (bool, bool, bool) {
+    (s.row && !s.erase, s.fill && !s.erase, s.erase)
+}
+
+/// The words of the mode `s` paints in (the Brush popover's title note).
+fn mode_words(s: &PaintSettings) -> &'static str {
+    MODES.iter().find(|(m, ..)| *m == mode_of(s)).map_or("Scatter", |(_, w, _)| w)
+}
+
+/// A header field's width (the AreaPaint board's `.hnum`).
+const HEADER_FIELD: f32 = 58.0;
+/// The gap between a header field's words and the field (`.grp`: 6).
+const HEADER_GAP: f32 = 6.0;
+/// The Brush popover's width, its label column and its fields' (the
+/// board's `.brush-pop`, `--lbl-w` and `.num`).
+const BRUSH_WIDTH: f32 = 286.0;
+const BRUSH_LABEL: f32 = 64.0;
+const BRUSH_FIELD: f32 = 76.0;
+/// The Brush popover's Spacing field (the board's, wider than the rest).
+const BRUSH_SPACING: f32 = 120.0;
+/// A Brush popover row's height inside its 1 point margins.
+const BRUSH_ROW: f32 = 26.0;
+
+/// Paint's options in the area header's left group while Paint is the
+/// tool in hand (the AreaPaint board; the proposal's section 6.1): the
+/// mode as a segmented control (Scatter, Row, Fill, Erase), Radius and
+/// Density where the mode takes them (Scatter both, Erase the radius
+/// alone), and the Brush popover with the rest: Count all, Spacing and
+/// By size, Flow, Turn, Scale (Scatter), Gap (Row and Fill), Height and
+/// Lock (all but Erase), the note on which mode takes which, and Snap and
+/// Turn "as with the Select tool". Each moves into More where the row
+/// has no room. `s` is the settings, written back by the caller after
+/// the header is drawn; `placing` the Select tool's Snap and Turn (none
+/// where both are hidden).
+pub(crate) fn header_items<'a>(
+    mut h: mg_uikit::header::EditorHeader<'a>,
+    ui: &egui::Ui,
+    s: &'a std::cell::Cell<PaintSettings>,
+    placing: Option<impl FnOnce(&mut egui::Ui) + 'a>,
+) -> mg_uikit::header::EditorHeader<'a> {
+    use mg_uikit::header::Item;
+    use mg_uikit::metrics::CONTROL_PADDING_X;
+    let now = s.get();
+    // The mode.
+    let seg_width =
+        MODES.iter().map(|(_, w, _)| text_width(ui, w) + 2.0 * CONTROL_PADDING_X).sum::<f32>()
+            + (MODES.len() - 1) as f32;
+    let seg_width = seg_width.ceil();
+    let seg = move |ui: &mut egui::Ui| {
+        let mut p = s.get();
+        let mut m = mode_of(&p);
+        let choices = MODES.map(|(m, w, t)| (m, w, t));
+        mg_uikit::segmented(ui, MODE, &mut m, &choices);
+        (p.row, p.fill, p.erase) = m;
+        s.set(p);
+    };
+    h = h.left(Item::custom(MODE, seg_width, seg).more(seg_width, move |ui| {
+        ui.horizontal(seg);
+    }));
+    // Radius and Density.
+    let t = mg_uikit::tokens(ui.ctx());
+    let label = t.text_2;
+    if !now.by_drag() {
+        let width = (text_width(ui, "Radius") + HEADER_GAP + HEADER_FIELD).ceil();
+        let radius = move |ui: &mut egui::Ui| {
+            ui.spacing_mut().item_spacing.x = HEADER_GAP;
+            words(ui, "Radius", 0.0, label);
+            let mut p = s.get();
+            let mut cm = i32::from(p.radius_cm);
             let (low, high) = (f32::from(RADIUS.0) / 100.0, f32::from(RADIUS.1) / 100.0);
-            meters(ui, &mut cm, (low, high)).on_hover_text("The circle's size (Shift + wheel)");
-            s.radius_cm = cm.clamp(i32::from(RADIUS.0), i32::from(RADIUS.1)) as u16;
-        }
-        if !s.by_drag() && !s.erase {
-            field_label(ui, "Density");
-            ui.add(egui::DragValue::new(&mut s.density).range(1..=400).suffix(" a tile"))
-                .on_hover_text(
-                    "How many placeables a tile's ground (10 by 10 m) holds once painted: the \
-                     brush adds until the circle has its share, counting those of these \
-                     blueprints already there (every placeable there, with Count All)",
+            meters(ui, &mut cm, (low, high), ("Radius", HEADER_FIELD))
+                .on_hover_text("The circle's size (Shift+wheel)");
+            p.radius_cm = cm.clamp(i32::from(RADIUS.0), i32::from(RADIUS.1)) as u16;
+            s.set(p);
+        };
+        h = h.left(Item::custom("Radius", width, radius).more(width, move |ui| {
+            ui.horizontal(radius);
+        }));
+    }
+    if !now.by_drag() && !now.erase {
+        let width = (text_width(ui, "Density") + HEADER_GAP + HEADER_FIELD).ceil();
+        let density = move |ui: &mut egui::Ui| {
+            ui.spacing_mut().item_spacing.x = HEADER_GAP;
+            words(ui, "Density", 0.0, label);
+            let mut p = s.get();
+            let field = egui::DragValue::new(&mut p.density).range(1..=400).suffix(" a tile");
+            number(ui, "Density", HEADER_FIELD, field)
+                .on_hover_text("How many placeables a 10 by 10 m tile holds once painted");
+            s.set(p);
+        };
+        h = h.left(Item::custom("Density", width, density).more(width, move |ui| {
+            ui.horizontal(density);
+        }));
+    }
+    // The Brush popover.
+    let text = t.text;
+    let row = move |ui: &mut egui::Ui, label: &str| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        // (Rows 28 apart, the board's: 26 and the popover's 1 at each
+        // side.)
+        ui.set_min_height(BRUSH_ROW);
+        words(ui, label, BRUSH_LABEL, text);
+    };
+    let mut pop = mg_uikit::popover::Popover::new(BRUSH)
+        .title(Some(mg_uikit::Icon::Brush), BRUSH)
+        .title_note(mode_words(&now))
+        .min_width(BRUSH_WIDTH);
+    if !now.by_drag() && !now.erase {
+        pop = pop
+            .custom(move |ui| {
+                row(ui, "");
+                let mut p = s.get();
+                ui.check_box(&mut p.count_all, "Count all").on_hover_text(
+                    "Density counts every placeable in the circle, not only these blueprints'",
                 );
-            ui.checkbox(&mut s.count_all, "Count All").on_hover_text(
-                "Density counts every placeable in the circle, not only these blueprints'",
-            );
-            field_label(ui, "Spacing");
-            let mut cm = i32::from(s.spacing_cm);
-            meters(ui, &mut cm, (0.0, 20.0)).on_hover_text(
-                "The least distance from one placeable to the next: between their middles, or \
-                 between their sides with By Size",
-            );
-            s.spacing_cm = cm.clamp(0, 2000) as u16;
-            ui.checkbox(&mut s.by_size, "By Size").on_hover_text(
-                "Spacing is kept between the placeables' sides, each by its model's box (as \
-                 scaled), rather than between their middles: large ones stand further apart",
-            );
-            field_label(ui, "Flow");
-            ui.add(egui::DragValue::new(&mut s.flow).range(1..=100).suffix("%")).on_hover_text(
-                "How much of what the circle lacks each dab adds: 100% fills it at once; less \
-                 fills it as you go over it, or hold the button",
-            );
-            field_label(ui, "Turn");
-            ui.add(egui::DragValue::new(&mut s.turn_spread).range(0..=360).suffix("°"))
-                .on_hover_text(
-                    "How far each one's facing strays from the brush's (Q and E turn it): 360° \
-                     is any way",
+                s.set(p);
+            })
+            .custom(move |ui| {
+                row(ui, "Spacing");
+                let mut p = s.get();
+                let mut cm = i32::from(p.spacing_cm);
+                meters(ui, &mut cm, (0.0, 20.0), ("Spacing", BRUSH_SPACING)).on_hover_text(
+                    "The least distance between placeables, middle to middle (side to side with \
+                     By size)",
                 );
-            field_label(ui, "Scale");
-            ui.add(egui::DragValue::new(&mut s.scale_min).range(10..=500).suffix("%"));
-            ui.label("to");
-            ui.add(egui::DragValue::new(&mut s.scale_max).range(10..=500).suffix("%"))
-                .on_hover_text(
-                    "Each one's scale, picked between these. Static placeables take none (the \
-                     game gives them none)",
+                p.spacing_cm = cm.clamp(0, 2000) as u16;
+                ui.check_box(&mut p.by_size, "By size").on_hover_text(
+                    "Keep spacing between the placeables' sides, so large ones stand further \
+                     apart",
                 );
-        }
-        if s.by_drag() {
-            field_label(ui, "Gap");
-            let mut cm = i32::from(s.gap_cm);
-            meters(ui, &mut cm, (-10.0, 10.0)).on_hover_text(
-                "Room between pieces (an overlap, less than 0): a piece's size is its model's \
-                 box, which parts that stick out make larger",
-            );
-            s.gap_cm = cm.clamp(-1000, 1000) as i16;
-        }
-        if !s.erase {
-            field_label(ui, "Height");
-            let mut cm = i32::from(s.lift_cm);
-            meters(ui, &mut cm, (-10.0, 10.0))
-                .on_hover_text("How far above the ground they stand (below it, less than 0)");
-            s.lift_cm = cm.clamp(-1000, 1000) as i16;
-            ui.checkbox(&mut s.lock, "Lock").on_hover_text(
-                "Lock what is painted (as the selection's Lock does): later clicks and boxes \
-                 pass through it to what is beneath",
-            );
-        }
-        ui.separator();
-        if chosen == 0 {
-            ui.weak("Choose placeables in the palette (Ctrl + click for several)");
-        } else {
-            ui.weak(format!("{chosen} chosen"))
-                .on_hover_text("Ctrl + click in the palette for more, or fewer");
-        }
+                s.set(p);
+            })
+            .custom(move |ui| {
+                row(ui, "Flow");
+                let mut p = s.get();
+                let field = egui::DragValue::new(&mut p.flow).range(1..=100).suffix(" %");
+                number(ui, "Flow", BRUSH_FIELD, field).on_hover_text(
+                    "How much of what the circle lacks each dab adds. 100% fills it at once.",
+                );
+                s.set(p);
+            })
+            .custom(move |ui| {
+                row(ui, "Turn");
+                let mut p = s.get();
+                let field = egui::DragValue::new(&mut p.turn_spread).range(0..=360).suffix("°");
+                number(ui, TURN_SPREAD, BRUSH_FIELD, field)
+                    .on_hover_text("How far each facing strays from the brush's: 360° is any way");
+                s.set(p);
+            })
+            .custom(move |ui| {
+                row(ui, "Scale");
+                let mut p = s.get();
+                let low = egui::DragValue::new(&mut p.scale_min).range(10..=500).suffix(" %");
+                number(ui, "Scale", BRUSH_FIELD, low);
+                ui.label(egui::RichText::new("to").color(t.text_2));
+                let high = egui::DragValue::new(&mut p.scale_max).range(10..=500).suffix(" %");
+                number(ui, "Scale to", BRUSH_FIELD, high).on_hover_text(
+                    "Each one's scale, picked between these. Static placeables take none.",
+                );
+                s.set(p);
+            });
+    }
+    if now.by_drag() {
+        pop = pop.custom(move |ui| {
+            row(ui, "Gap");
+            let mut p = s.get();
+            let mut cm = i32::from(p.gap_cm);
+            meters(ui, &mut cm, (-10.0, 10.0), ("Gap", BRUSH_FIELD))
+                .on_hover_text("Room between pieces, by their models' boxes (below 0, an overlap)");
+            p.gap_cm = cm.clamp(-1000, 1000) as i16;
+            s.set(p);
+        });
+    }
+    if !now.erase {
+        pop = pop
+            .custom(move |ui| {
+                row(ui, "Height");
+                let mut p = s.get();
+                let mut cm = i32::from(p.lift_cm);
+                meters(ui, &mut cm, (-10.0, 10.0), ("Height", BRUSH_FIELD))
+                    .on_hover_text("How far above the ground they stand (below it, less than 0)");
+                p.lift_cm = cm.clamp(-1000, 1000) as i16;
+                s.set(p);
+            })
+            .custom(move |ui| {
+                row(ui, "");
+                let mut p = s.get();
+                ui.check_box(&mut p.lock, "Lock").on_hover_text(
+                    "Lock what is painted, so later clicks and boxes pass through it",
+                );
+                s.set(p);
+            });
+    }
+    let note = t.text_3;
+    pop = pop.custom(move |ui| {
+        let width = ui.available_width();
+        ui.vertical(|ui| {
+            ui.set_width(width);
+            let words = "Row and Fill take Gap, Height and Lock, Erase the radius alone.";
+            ui.add(egui::Label::new(egui::RichText::new(words).color(note)).wrap());
+        });
     });
+    // (Snap and Turn, where the header shows them: no heading over none.)
+    if let Some(placing) = placing {
+        pop = pop.separator().heading("Placing, as with the Select tool").custom(placing);
+    }
+    let tip = "The brush's other settings, and Snap and Turn";
+    h.left(Item::popover(Some(mg_uikit::Icon::Brush), pop).words_icon(false).tip(tip))
+}
+
+/// The name of the Brush popover's Turn field (how far facings stray),
+/// apart from the Turn combo box under it (the angle turned objects snap
+/// to).
+pub(crate) const TURN_SPREAD: &str = "Turn spread";
+
+/// The palette's Brush section while Paint is on (the AreaPaint board):
+/// "Brush" with how many blueprints are chosen, a row for each of `keys`
+/// (its name by `names`, its ResRef) with × to take it out of the brush,
+/// and a note on choosing more; with none chosen, how to choose them. The
+/// blueprint whose × was clicked.
+pub(crate) fn brush_section(
+    ui: &mut egui::Ui,
+    keys: &[ResKey],
+    names: &dyn Fn(ResKey) -> Option<String>,
+) -> Option<ResKey> {
+    let t = mg_uikit::tokens(ui.ctx());
+    mg_uikit::name_group(ui, BRUSH_SECTION);
+    // (The board's `.sec-h`: its heading, the note beside it, a rule.)
+    ui.horizontal(|ui| {
+        mg_uikit::table_heading(ui, BRUSH);
+        let chosen = match keys.len() {
+            0 => "none chosen".to_string(),
+            n => format!("{n} chosen"),
+        };
+        ui.label(egui::RichText::new(chosen).color(t.text_3));
+    });
+    let (rule, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(rule.x_range(), rule.center().y, Stroke::new(1.0, t.line_soft));
+    ui.add_space(mg_uikit::metrics::GAP_S);
+    let mut out = None;
+    for key in keys {
+        ui.horizontal(|ui| {
+            ui.set_min_height(mg_uikit::metrics::ROW_HEIGHT);
+            let square = egui::Vec2::splat(mg_uikit::metrics::ICON);
+            let (rect, _) = ui.allocate_exact_size(square, egui::Sense::hover());
+            crate::icons::object(mg_module::palette::BlueprintKind::Placeable).paint(
+                ui.painter(),
+                rect,
+                t.text_2,
+            );
+            let name = names(*key).unwrap_or_else(|| key.resref.to_string());
+            ui.label(egui::RichText::new(name).color(t.text));
+            // (The board's room between the name and the ResRef.)
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(key.resref.to_string()).monospace().color(t.text_3));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let x = mg_uikit::icon_button(ui, mg_uikit::Icon::Close, &take_out_name(*key));
+                if x.clicked() {
+                    out = Some(*key);
+                }
+            });
+        });
+    }
+    let words = match keys.len() {
+        0 => "Choose placeables in the palette (Ctrl + click for several).",
+        _ => {
+            "Ctrl + click in the palette for more, or fewer. The brush's numbers are in the \
+             header."
+        }
+    };
+    let width = ui.available_width();
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        ui.add(egui::Label::new(egui::RichText::new(words).color(t.text_3)).wrap());
+    });
+    out
+}
+
+/// The accessible name and tip of a Brush row's ×: "Take x3_plc_bush001
+/// out of the brush (Ctrl+click it in the palette)".
+pub(crate) fn take_out_name(key: ResKey) -> String {
+    format!("Take {} out of the brush (Ctrl+click it in the palette)", key.resref)
+}
+
+/// `key` taken out of the brush: out of those chosen with Ctrl + click
+/// (`chosen`), or, the one clicked (`selected`), the next chosen in its
+/// place.
+pub(crate) fn take_out(selected: &mut Option<ResKey>, chosen: &mut Vec<ResKey>, key: ResKey) {
+    if *selected == Some(key) {
+        *selected = if chosen.is_empty() { None } else { Some(chosen.remove(0)) };
+    }
+    chosen.retain(|k| *k != key);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The review's A17: a dab asks of each place it tries whether it is
+    /// too near what is there, of squares of them, not of every one. The
+    /// squares answer as going through them all does, whatever the
+    /// spacing and the reaches (none, small, larger than the spacing).
+    #[test]
+    fn the_places_taken_answer_by_squares_as_gone_through() {
+        let mut rng = fastrand::Rng::with_seed(11);
+        for (spacing, longest) in [(0.0, 0.0), (0.4, 0.0), (0.0, 1.5), (0.75, 2.0), (3.0, 0.3)] {
+            let mut taken = Taken::new(spacing, longest);
+            let mut all: Vec<(Vec2, f32)> = Vec::new();
+            let point = |rng: &mut fastrand::Rng| {
+                Vec2::new(rng.f32() * 40.0 - 20.0, rng.f32() * 40.0 - 20.0)
+            };
+            let mut near = 0;
+            for _ in 0..600 {
+                let (p, reach) = (point(&mut rng), rng.f32() * longest);
+                let scan = all.iter().any(|(q, rq)| q.distance(p) < spacing + rq + reach);
+                assert_eq!(taken.too_near(p, reach), scan, "{p} reaching {reach}");
+                near += usize::from(scan);
+                if !scan || rng.bool() {
+                    taken.push(p, reach);
+                    all.push((p, reach));
+                }
+            }
+            assert_eq!(near > 0, spacing + longest > 0.0, "spacing {spacing}, reach {longest}");
+        }
+    }
 
     fn key(name: &str) -> ResKey {
         ResKey::parse(name, ResType::UTP).unwrap()

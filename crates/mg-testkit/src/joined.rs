@@ -8,14 +8,17 @@
 //! script standing in for its program: the script reads the port and the
 //! password the client joins with from the server's own arguments. The
 //! sandbox's network is a loopback of its own; the client draws on the
-//! off-screen display (`DISPLAY`, never `:0`).
+//! off-screen display (`DISPLAY`, never `:0`), which [`start`] holds
+//! ([`crate::display`]) for the rest of the test binary's run.
 //!
 //! **A CD key.** The sandboxed client has no Steam, so no CD key: its
 //! Multiplayer asks for one ("Enter CD-KEY", seen 2026-10-29, 89.8193.37),
 //! and `+connect` ends in "Your CD Key is unauthorized". A key is not made
 //! up here: [`start`] takes the `cdkey.ini` that `MG_CLIENT_CDKEY` names
 //! (the owner's to give; copied into the scratch user directory, never
-//! sent anywhere but the sandbox's loopback) and is an error without it.
+//! sent anywhere but the sandbox's loopback, and removed from there when
+//! the sandbox ends: the scratch folder is where pictures to share come
+//! from) and is an error without it.
 //! The server checks no key: its master server is out of reach in the
 //! sandbox, so its `masterserver.key-authentication` is `if-reachable`
 //! (with `always`, the default, nobody gets in without the master server).
@@ -42,6 +45,30 @@ pub struct Joined {
     /// The scratch directory: the client's user directory is `user`, the
     /// server's `server`.
     pub scratch: PathBuf,
+    /// The CD key's copy in the client's user directory, removed when
+    /// this goes (after `server`, so once the sandbox has ended).
+    key: KeyCopy,
+}
+
+/// The copy of the owner's `cdkey.ini` in a scratch user directory:
+/// removed when dropped, however the run ended ([`Joined::stop`], a
+/// failed test's unwinding, a start that failed after the copy).
+#[derive(Debug)]
+struct KeyCopy(PathBuf);
+
+impl KeyCopy {
+    fn make(key: &Path, user: &Path) -> io::Result<KeyCopy> {
+        // (The guard first: a copy cut short is removed too.)
+        let copy = KeyCopy(user.join("cdkey.ini"));
+        std::fs::copy(key, &copy.0)?;
+        Ok(copy)
+    }
+}
+
+impl Drop for KeyCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// The repository's root.
@@ -85,30 +112,52 @@ pub fn start(
     })?;
     let root = crate::nwn_root()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no game install (NWN_ROOT)"))?;
-    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
+    // (The off-screen display, given: none is assumed, as a default once
+    // sent the client to the desktop's.)
+    let display = std::env::var("DISPLAY").ok().filter(|d| !d.is_empty()).ok_or_else(|| {
+        io::Error::other("DISPLAY is not set: give the off-screen display (headless.sh start)")
+    })?;
     if display == ":0" {
         return Err(io::Error::other("refusing the desktop display :0"));
     }
+    // The display lock, before the server and the client start (and before
+    // anything of theirs is timed): kept to the end of the process, and the
+    // script is told it is held, or it would wait for its own parent.
+    crate::display::try_hold().map_err(io::Error::other)?;
     let user = client_dir(scratch);
     std::fs::create_dir_all(&user)?;
-    std::fs::copy(&key, user.join("cdkey.ini"))?;
+    let key = KeyCopy::make(&key, &user)?;
     let server = server_dir(scratch);
     std::fs::create_dir_all(&server)?;
+    // (And the module kept loaded when the last player leaves: reloaded
+    // then, as by default, the server advertises no NWSync manifest any
+    // more, and a client that has just downloaded one, joining again,
+    // finds the module's haks missing and leaves.)
     std::fs::write(
         server.join("settings.tml"),
-        "[masterserver]\n\t[masterserver.key-authentication]\n\t\tmode = \"if-reachable\"\n",
+        "[masterserver]\n\t[masterserver.key-authentication]\n\t\tmode = \"if-reachable\"\n\
+         [server]\n\treload-when-empty = false\n",
     )?;
     let mut env: Vec<(OsString, OsString)> = vec![
         ("MG_SCRATCH".into(), scratch.into()),
         ("MG_CLIENT".into(), if join == Join::Dm { "dm" } else { "player" }.into()),
         ("NWN_ROOT".into(), root.into()),
         ("DISPLAY".into(), display.into()),
+        ("MOONGLOW_LOCKS_HELD".into(), "display".into()),
     ];
+    // (`<scratch>/client-settings.tml`, if there is one: the client's
+    // settings put back before each start.)
+    let settings = scratch.join("client-settings.tml");
+    if settings.is_file() {
+        env.push(("MG_CLIENT_SETTINGS".into(), settings.into()));
+    }
     if let Some(web) = web {
         env.push(("MG_WEB".into(), web.into()));
         // (The client ends itself after an NWSync download, and its own
-        // restart doesn't come back in the sandbox: started once more.)
-        env.push(("MG_CLIENT_RUNS".into(), "2".into()));
+        // restart doesn't come back in the sandbox: started once more, or
+        // as many times as `MG_CLIENT_RUNS` says.)
+        let runs = std::env::var("MG_CLIENT_RUNS").unwrap_or_else(|_| "2".into());
+        env.push(("MG_CLIENT_RUNS".into(), runs.into()));
     }
     let server = mg_serve::Server::start(&mg_serve::Options {
         server: repo().join("tools/nwclient/run-server-and-client.sh"),
@@ -119,7 +168,7 @@ pub fn start(
         args: server_args.iter().map(Into::into).collect(),
         ..Default::default()
     })?;
-    Ok(Joined { server, scratch: scratch.to_path_buf() })
+    Ok(Joined { server, scratch: scratch.to_path_buf(), key })
 }
 
 impl Joined {
@@ -154,8 +203,34 @@ impl Joined {
             .then_some(shot)
     }
 
-    /// Ends the sandbox (the server and the client with it).
+    /// Ends the sandbox (the server and the client with it), and removes
+    /// the CD key's copy from the scratch directory (as dropping this
+    /// does).
     pub fn stop(self) {
         self.server.stop(Duration::from_secs(1));
+        drop(self.key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CD key's copy is gone from the scratch user directory once its
+    /// run has ended, and the owner's file is as it was.
+    #[test]
+    fn the_cd_key_s_copy_goes_with_the_run() {
+        let dir = crate::scratch_dir("joined-key-copy");
+        let user = client_dir(&dir);
+        std::fs::create_dir_all(&user).unwrap();
+        let owners = dir.join("owners-cdkey.ini");
+        std::fs::write(&owners, "[NWN1]\nYourKey=not-a-key\n").unwrap();
+        let copy = KeyCopy::make(&owners, &user).unwrap();
+        assert_eq!(std::fs::read(user.join("cdkey.ini")).unwrap(), std::fs::read(&owners).unwrap());
+        drop(copy);
+        assert!(!user.join("cdkey.ini").exists() && owners.is_file());
+        // A key that isn't there: nothing left behind.
+        assert!(KeyCopy::make(&dir.join("none.ini"), &user).is_err());
+        assert!(!user.join("cdkey.ini").exists());
     }
 }

@@ -81,9 +81,10 @@ impl Form<'_> {
         ui.data(|d| d.get_temp::<(bool, String, Option<ResRef>)>(state_id)).and_then(|s| s.2)
     }
 
-    /// Find in Palette: the blueprint `resref` chosen in the type's palette
-    /// picker, the branches that hold it opened and the tree scrolled to
-    /// it (as the picker is next drawn, [`palette_picker`]).
+    /// Find in Palette: asks the palette picker for `kind` to choose the
+    /// blueprint `resref`, open the branches above it and scroll the tree
+    /// to it. This happens the next time the picker is drawn
+    /// ([`palette_picker`]).
     pub(crate) fn find_in_palette(&self, ui: &Ui, kind: BlueprintKind, resref: ResRef) {
         let state_id = self.id(&format!("picker-{}", kind.name()));
         ui.data_mut(|d| d.insert_temp(reveal_id(state_id), Reveal { resref, at: None, frames: 0 }));
@@ -143,9 +144,9 @@ pub(crate) fn palette_picker(
     let (mut custom, mut filter, mut chosen): (bool, String, Option<ResRef>) =
         ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
     let (mut taken, mut viewed) = (None, None);
-    // A blueprint to show (Find in Palette): found first, in the standard
-    // palette or else the custom one, and chosen there; the search cleared
-    // if it hides it.
+    // Find in Palette: look for the blueprint in the standard palette,
+    // then in the custom one, and choose it in the first that has it.
+    // Clear the search if it hides the blueprint.
     let mut reveal: Option<Reveal> = ui.data(|d| d.get_temp(reveal_id(state_id)));
     if let Some(r) = reveal.as_mut().filter(|r| r.at.is_none()) {
         let found = [false, true].into_iter().find_map(|c| {
@@ -165,7 +166,7 @@ pub(crate) fn palette_picker(
             _ => reveal = None,
         }
     }
-    ui.horizontal(|ui| {
+    super::row(ui, |ui| {
         ui.selectable_value(&mut custom, false, "Standard Palette");
         ui.selectable_value(&mut custom, true, "Custom Palette");
     });
@@ -198,6 +199,7 @@ pub(crate) fn palette_picker(
     let list = egui::ScrollArea::vertical().id_salt(state_id.with("tree")).max_height(height);
     let mut shown = false;
     list.auto_shrink([false, true]).show(ui, |ui| {
+        mg_uikit::list_rows(ui);
         if let (Some(p), Some(game)) = (palette, game) {
             let mut at = Tree {
                 game,
@@ -219,9 +221,9 @@ pub(crate) fn palette_picker(
     if let Some(r) = viewed {
         palette_view::view_blueprint(app, ResKey::new(r, kind.restype()));
     }
-    // The blueprint shown is asked for again until its row is in sight:
-    // the branches above it open over a few frames, and the tree scrolls
-    // as they do. (Given up after a second, should the row never show.)
+    // Keep the request until the blueprint's row is in view. The branches
+    // above it take a few frames to open, and the tree scrolls as they do.
+    // Give up after 60 frames (about a second) if the row never appears.
     match reveal {
         Some(mut r) if !shown && r.frames < 60 => {
             r.frames += 1;
@@ -234,14 +236,14 @@ pub(crate) fn palette_picker(
     taken
 }
 
-/// Where a picker keeps the blueprint Find in Palette asked it to show.
+/// The key under which a picker stores a pending Find in Palette request.
 fn reveal_id(state_id: egui::Id) -> egui::Id {
     state_id.with("reveal")
 }
 
-/// A blueprint a picker is to show (Find in Palette): `at`, the place in
-/// the tree of the branch that holds it, once found; `frames`, how many
-/// it has been asked for.
+/// A pending Find in Palette request. `at` is the tree path of the branch
+/// that holds the blueprint, set once it has been found. `frames` counts
+/// the frames the request has waited for the row to come into view.
 #[derive(Debug, Clone)]
 struct Reveal {
     resref: ResRef,
@@ -249,7 +251,8 @@ struct Reveal {
     frames: u32,
 }
 
-/// The place in the tree of the first branch of `p` that holds `resref`.
+/// The tree path (child indices) of the first branch of `p` that holds
+/// `resref`.
 fn path_to(p: &Palette, resref: ResRef) -> Option<Vec<usize>> {
     fn walk(n: &PaletteNode, path: &mut Vec<usize>, resref: ResRef) -> bool {
         if n.blueprints.iter().any(|b| b.resref == resref) {
@@ -287,6 +290,21 @@ pub(crate) struct Kept {
     /// with the palette and the search it was found for.
     #[allow(clippy::type_complexity)]
     found: HashMap<(BlueprintKind, bool), (Arc<Palette>, String, Arc<Found>)>,
+    /// The workspace revision `targets` were read at.
+    pub(super) targets_revision: Option<u64>,
+    /// The objects a window of several edits together, as its list pages
+    /// take them (`Form::list_targets`).
+    #[allow(clippy::type_complexity)]
+    pub(super) targets:
+        HashMap<(ResKey, mg_edit::GffPath, crate::widgets::Also), Arc<Vec<mg_edit::lists::Target>>>,
+    /// The last of `targets` asked for, found again by its objects' list
+    /// itself (the same `Arc`): hashing the list of 5,000 objects the
+    /// Properties panel edits together took a quarter of its frame.
+    #[allow(clippy::type_complexity)]
+    pub(super) targets_last: Option<(
+        (ResKey, mg_edit::GffPath, crate::widgets::Also),
+        Arc<Vec<mg_edit::lists::Target>>,
+    )>,
 }
 
 /// A blueprint's fields: the module's, else the game's.
@@ -363,9 +381,10 @@ impl Found {
 }
 
 /// A palette's tree as a picker draws it: what the search found (none:
-/// every blueprint), the blueprint chosen, the one taken and the one whose
-/// Properties were asked for; the blueprint to show (the branch that holds
-/// it, and its resref), and whether its row was in sight.
+/// every blueprint), the blueprint chosen and the one taken. It also holds
+/// the blueprint opened with Properties, the blueprint Find in Palette is
+/// showing (its branch's path and its resref), and whether that
+/// blueprint's row is in view.
 struct Tree<'a> {
     game: &'a mg_rules::GameData,
     found: Option<&'a Found>,
@@ -389,10 +408,11 @@ impl Tree<'_> {
         if self.found.is_some_and(|f| !f.branches.contains(path)) {
             return;
         }
-        // While searching, every branch with a match is open; so are those
-        // that hold the blueprint to show.
+        // While searching, every branch with a match is open. So is every
+        // branch on the way to the blueprint that Find in Palette is showing.
         let revealing = self.reveal.is_some_and(|(at, _)| at.starts_with(path));
         egui::CollapsingHeader::new(node.name.text(self.game))
+            .icon(mg_uikit::collapsing_icon)
             .id_salt((salt, path))
             .open((self.found.is_some() || revealing).then_some(true))
             .show(ui, |ui| {
@@ -412,8 +432,8 @@ impl Tree<'_> {
     }
 
     /// A blueprint's row: out of sight, its room only (a branch may hold
-    /// thousands); the tree scrolled to it where it is the one to show
-    /// (`reveal`).
+    /// thousands). If `reveal` is set, the row is drawn even out of sight,
+    /// and the tree scrolls to it.
     fn row(
         &mut self,
         ui: &mut Ui,
@@ -453,7 +473,7 @@ impl Tree<'_> {
         if kind == BlueprintKind::Item && r.drag_started() {
             r.dnd_set_drag_payload(super::inventory::Dragged::Palette(b.resref));
         }
-        r.context_menu(|ui| {
+        mg_uikit::context_menu(&r, |ui| {
             if ui.button(add).clicked() {
                 *self.taken = Some(b.resref);
                 ui.close();
@@ -466,11 +486,11 @@ impl Tree<'_> {
                 ui.close();
             }
             // Properties last, as in Aurora's menus.
-            ui.separator();
+            mg_uikit::menu_separator(ui);
             if ui
                 .button("Properties")
                 .on_hover_text(
-                    "The blueprint's properties: the module's to edit, the game's to look at",
+                    "Open the blueprint: the module's can be edited, the game's only viewed",
                 )
                 .clicked()
             {

@@ -31,7 +31,7 @@ fn err<T>(path: &str, message: impl Into<String>) -> Result<T, JsonError> {
 /// Fails if a struct has two fields with the same label (JSON objects cannot
 /// hold both) or a float is NaN or infinite.
 pub fn to_json(gff: &Gff, codepage: Codepage) -> Result<Json, JsonError> {
-    let mut obj = struct_map(&gff.root, codepage, "")?;
+    let mut obj = struct_map(&gff.root, codepage, "", true)?;
     obj.insert(
         "__data_type".into(),
         Json::String(String::from_utf8_lossy(&gff.file_type).into_owned()),
@@ -46,7 +46,7 @@ pub fn to_json(gff: &Gff, codepage: Codepage) -> Result<Json, JsonError> {
 /// A struct on its own (a list's item, say) as nwn-lib JSON, with its
 /// `"__struct_id"`.
 pub fn struct_to_json(s: &Struct, codepage: Codepage) -> Result<Json, JsonError> {
-    struct_map(s, codepage, "").map(Json::Object)
+    struct_map(s, codepage, "", false).map(Json::Object)
 }
 
 /// A field's value on its own as nwn-lib JSON: `{"type": .., "value": ..}`.
@@ -54,7 +54,12 @@ pub fn value_to_json(value: &Value, codepage: Codepage) -> Result<Json, JsonErro
     field_map(value, codepage, "").map(Json::Object)
 }
 
-fn struct_map(s: &Struct, cp: Codepage, path: &str) -> Result<Map<String, Json>, JsonError> {
+fn struct_map(
+    s: &Struct,
+    cp: Codepage,
+    path: &str,
+    is_root: bool,
+) -> Result<Map<String, Json>, JsonError> {
     let mut obj = Map::new();
     if s.id != ROOT_STRUCT_ID {
         // nwn_gff keeps struct ids as signed 32-bit numbers.
@@ -63,6 +68,9 @@ fn struct_map(s: &Struct, cp: Codepage, path: &str) -> Result<Map<String, Json>,
     for f in &s.fields {
         let label = f.label.to_string_lossy();
         let fpath = format!("{path}/{label}");
+        if label == "__struct_id" || (is_root && label == "__data_type") {
+            return err(&fpath, "reserved JSON key");
+        }
         if obj.contains_key(&label) {
             return err(&fpath, "duplicate label cannot be represented in JSON");
         }
@@ -104,13 +112,13 @@ fn field_map(value: &Value, cp: Codepage, fpath: &str) -> Result<Map<String, Jso
         Value::Void(v) => _ = field.insert("value64".into(), json!(BASE64.encode(v))),
         Value::Struct(child) => {
             field.insert("__struct_id".into(), json!(child.id as i32));
-            field.insert("value".into(), Json::Object(struct_map(child, cp, fpath)?));
+            field.insert("value".into(), Json::Object(struct_map(child, cp, fpath, false)?));
         }
         Value::List(items) => {
             let list = items
                 .iter()
                 .enumerate()
-                .map(|(i, s)| struct_map(s, cp, &format!("{fpath}[{i}]")).map(Json::Object))
+                .map(|(i, s)| struct_map(s, cp, &format!("{fpath}[{i}]"), false).map(Json::Object))
                 .collect::<Result<Vec<_>, _>>()?;
             field.insert("value".into(), Json::Array(list));
         }
@@ -128,7 +136,7 @@ pub fn from_json(json: &Json, codepage: Codepage) -> Result<Gff, JsonError> {
         Ok(t) => t,
         Err(_) => return err("/__data_type", "must be exactly 4 characters"),
     };
-    let mut root = struct_read(obj, codepage, "")?;
+    let mut root = struct_read(obj, codepage, "", true, 0)?;
     root.id = ROOT_STRUCT_ID;
     Ok(Gff { file_type, version: Gff::VERSION, root })
 }
@@ -136,32 +144,67 @@ pub fn from_json(json: &Json, codepage: Codepage) -> Result<Gff, JsonError> {
 /// Reads a struct on its own (a list's item) from nwn-lib JSON.
 pub fn struct_from_json(json: &Json, codepage: Codepage) -> Result<Struct, JsonError> {
     let Json::Object(obj) = json else { return err("", "expected an object") };
-    struct_read(obj, codepage, "")
+    struct_read(obj, codepage, "", false, 0)
 }
 
 /// Reads a field's value on its own from its `{"type": .., "value": ..}`.
 pub fn value_from_json(json: &Json, codepage: Codepage) -> Result<Value, JsonError> {
     let Json::Object(field) = json else { return err("", "field must be an object") };
-    field_read(field, codepage, "")
+    field_read(field, codepage, "", 0)
 }
 
-fn struct_read(obj: &Map<String, Json>, cp: Codepage, path: &str) -> Result<Struct, JsonError> {
+/// A struct's id: signed, as nwn_gff writes them, or unsigned; an error
+/// for a number that is neither (cut to 32 bits it would be another id).
+fn struct_id(v: &Json, path: &str) -> Result<u32, JsonError> {
+    match as_int(v, path)? {
+        id @ -0x8000_0000..0 => Ok(id as i32 as u32),
+        id => id.try_into().or_else(|_| err(path, "__struct_id out of range")),
+    }
+}
+
+/// A localized string's talk-table line: -1 for none, else a line's
+/// number; an error for any other (`4294967296` cut to 32 bits is line 0).
+fn strref_read(v: &Json, path: &str) -> Result<StrRef, JsonError> {
+    match as_int(v, path)? {
+        -1 => Ok(StrRef::NONE),
+        id => match u32::try_from(id) {
+            Ok(id) => Ok(StrRef(id)),
+            Err(_) => err(path, format!("id {id} out of range (-1 for none, or a line's number)")),
+        },
+    }
+}
+
+fn struct_read(
+    obj: &Map<String, Json>,
+    cp: Codepage,
+    path: &str,
+    is_root: bool,
+    depth: usize,
+) -> Result<Struct, JsonError> {
+    const MAX_DEPTH: usize = 128;
+    if depth > MAX_DEPTH {
+        return err(path, "nesting too deep");
+    }
     let id = match obj.get("__struct_id") {
         None => ROOT_STRUCT_ID,
-        // Signed, as nwn_gff writes them, or unsigned.
-        Some(v) => match as_int(v, path)? {
-            id @ -0x8000_0000..0 => id as i32 as u32,
-            id => id.try_into().or_else(|_| err(path, "__struct_id out of range"))?,
-        },
+        Some(v) => struct_id(v, path)?,
     };
     let mut s = Struct::new(id);
     for (label, field) in obj {
-        if label.starts_with("__") {
+        // (The root's file type, and off the root a string `__data_type`
+        // or `__row`: a whole document inserted as a struct keeps its
+        // type, which a struct can't hold. A field of that label is an
+        // object, and is read as one.)
+        let tagged = matches!(field, Json::String(_));
+        if label == "__struct_id"
+            || (label == "__data_type" && (is_root || tagged))
+            || (!is_root && label == "__row" && tagged)
+        {
             continue;
         }
         let fpath = format!("{path}/{label}");
         let Json::Object(field) = field else { return err(&fpath, "field must be an object") };
-        let v = field_read(field, cp, &fpath)?;
+        let v = field_read(field, cp, &fpath, depth)?;
         let Ok(label) = Label::new(label) else { return err(&fpath, "label longer than 16 bytes") };
         s.fields.push(Field { label, value: v });
     }
@@ -170,7 +213,12 @@ fn struct_read(obj: &Map<String, Json>, cp: Codepage, path: &str) -> Result<Stru
 
 /// A field's value from its `{"type": .., "value": ..}`; `fpath` is where
 /// it is, for errors.
-fn field_read(field: &Map<String, Json>, cp: Codepage, fpath: &str) -> Result<Value, JsonError> {
+fn field_read(
+    field: &Map<String, Json>,
+    cp: Codepage,
+    fpath: &str,
+    depth: usize,
+) -> Result<Value, JsonError> {
     let Some(Json::String(ty)) = field.get("type") else {
         return err(fpath, "missing \"type\"");
     };
@@ -225,12 +273,12 @@ fn field_read(field: &Map<String, Json>, cp: Codepage, fpath: &str) -> Result<Va
             };
             // The strref used to live next to "value"; nwn_gff still reads it there.
             let mut ls = LocString::from_strref(match field.get("id") {
-                Some(id) => StrRef(as_int(id, fpath)? as u32),
+                Some(id) => strref_read(id, fpath)?,
                 None => StrRef::NONE,
             });
             for (k, v) in entries {
                 if k == "id" {
-                    ls.strref = StrRef(as_int(v, fpath)? as u32);
+                    ls.strref = strref_read(v, fpath)?;
                     continue;
                 }
                 let Ok(key) = k.parse::<u32>() else {
@@ -246,10 +294,10 @@ fn field_read(field: &Map<String, Json>, cp: Codepage, fpath: &str) -> Result<Va
         }
         FieldType::Struct => {
             let Json::Object(o) = need()? else { return err(fpath, "expected an object") };
-            let mut child = struct_read(o, cp, fpath)?;
+            let mut child = struct_read(o, cp, fpath, false, depth + 1)?;
             if !o.contains_key("__struct_id") {
                 child.id = match field.get("__struct_id") {
-                    Some(v) => as_int(v, fpath)? as i64 as u32,
+                    Some(v) => struct_id(v, fpath)?,
                     None => 0,
                 };
             }
@@ -263,7 +311,7 @@ fn field_read(field: &Map<String, Json>, cp: Codepage, fpath: &str) -> Result<Va
                 .map(|(i, item)| {
                     let p = format!("{fpath}[{i}]");
                     match item {
-                        Json::Object(o) => struct_read(o, cp, &p),
+                        Json::Object(o) => struct_read(o, cp, &p, false, depth + 1),
                         _ => err(&p, "list items must be objects"),
                     }
                 })
@@ -328,7 +376,7 @@ fn write_pretty(out: &mut String, v: &Json, style: TextStyle, indent: usize, bea
                     out.push_str(",\n");
                 }
                 pad(out, indent + 2);
-                escape_nim(out, k);
+                mg_core::nim::escape_json(out, k);
                 out.push_str(": ");
                 let bearing = bearing || k == "Bearing" || k == "Orientation";
                 write_pretty(out, child, style, indent + 2, bearing);
@@ -352,7 +400,7 @@ fn write_pretty(out: &mut String, v: &Json, style: TextStyle, indent: usize, bea
             out.push(']');
         }
         Json::Array(_) => out.push_str("[]"),
-        Json::String(s) => escape_nim(out, s),
+        Json::String(s) => mg_core::nim::escape_json(out, s),
         Json::Number(n) => match (n.as_i64(), n.as_u64()) {
             (Some(i), _) if !n.is_f64() => out.push_str(&i.to_string()),
             (_, Some(u)) if !n.is_f64() => out.push_str(&u.to_string()),
@@ -362,7 +410,7 @@ fn write_pretty(out: &mut String, v: &Json, style: TextStyle, indent: usize, bea
                     Some(places) => truncate_float(f, places, bearing),
                     None => f,
                 };
-                out.push_str(&if style.g16_floats { g16_float(f) } else { nim_float(f) });
+                out.push_str(&if style.g16_floats { g16_float(f) } else { mg_core::nim::float(f) });
             }
         },
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -381,59 +429,6 @@ fn truncate_float(f: f64, places: u8, bearing: bool) -> f64 {
     }
     let v: f64 = trimmed.trim_end_matches('.').parse().unwrap_or(f);
     if bearing && trimmed == format!("{:.places$}", -std::f64::consts::PI) { v.abs() } else { v }
-}
-
-/// A float as Nim's `addFloat` writes it: the shortest digits that read back
-/// to it, fixed when the decimal point falls within -6 to 17 places of them
-/// (with `.0` for whole numbers), else scientific (`1.5e+17`, `1e-8`).
-fn nim_float(f: f64) -> String {
-    if !f.is_finite() {
-        return if f.is_nan() {
-            "nan".into()
-        } else if f > 0.0 {
-            "inf".into()
-        } else {
-            "-inf".into()
-        };
-    }
-    let sci = format!("{:e}", f.abs()); // shortest digits: "1.2345e-9"
-    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let exp: i32 = exp.parse().unwrap_or(0);
-    // The decimal point's position after the first digit's.
-    let point = exp + 1;
-    let mut out = String::new();
-    if f.is_sign_negative() {
-        out.push('-');
-    }
-    let n = digits.len() as i32;
-    if f == 0.0 {
-        out.push_str("0.0");
-    } else if (-6..=17).contains(&point) {
-        if point <= 0 {
-            out.push_str("0.");
-            out.extend(std::iter::repeat_n('0', (-point) as usize));
-            out.push_str(&digits);
-        } else if point < n {
-            out.push_str(&digits[..point as usize]);
-            out.push('.');
-            out.push_str(&digits[point as usize..]);
-        } else {
-            out.push_str(&digits);
-            out.extend(std::iter::repeat_n('0', (point - n) as usize));
-            out.push_str(".0");
-        }
-    } else {
-        out.push_str(&digits[..1]);
-        if n > 1 {
-            out.push('.');
-            out.push_str(&digits[1..]);
-        }
-        out.push('e');
-        out.push(if exp < 0 { '-' } else { '+' });
-        out.push_str(&exp.abs().to_string());
-    }
-    out
 }
 
 /// A float as Nim 1 wrote it: C's `%.16g` (16 significant digits, trailing
@@ -488,26 +483,6 @@ fn g16_float(f: f64) -> String {
     out
 }
 
-/// A string as Nim's `escapeJson` writes it.
-fn escape_nim(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\t' => out.push_str("\\t"),
-            '\u{b}' => out.push_str("\\u000b"),
-            '\r' => out.push_str("\\r"),
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
 fn as_int(v: &Json, path: &str) -> Result<i128, JsonError> {
     match v {
         // (A whole number written as a float, `4.0`, is one: scripting
@@ -559,6 +534,37 @@ mod tests {
         assert_eq!(j["V"]["value64"], "AQID");
         let back = from_json(&j, Codepage::WINDOWS_1252).unwrap();
         assert_eq!(back, g);
+    }
+
+    /// A talk-table line or a struct's id past 32 bits (or below what a
+    /// signed one holds) is an error that names the field, not the number
+    /// its low 32 bits make: `4294967296` was line 0, `-2` line 4294967294.
+    #[test]
+    fn ids_out_of_range_are_errors() {
+        let read = |field: Json| {
+            from_json(&json!({"__data_type": "GFF ", "N": field}), Codepage::default())
+        };
+        let name = |id: i64| json!({"type": "cexolocstring", "value": {"id": id, "0": "a"}});
+        let legacy = |id: i64| json!({"type": "cexolocstring", "id": id, "value": {}});
+        for make in [&name as &dyn Fn(i64) -> Json, &legacy] {
+            for (id, strref) in [(-1, StrRef::NONE), (0, StrRef(0)), (4_294_967_295, StrRef::NONE)]
+            {
+                let g = read(make(id)).unwrap();
+                assert_eq!(g.root.locstring("N").unwrap().strref, strref, "{id}");
+            }
+            for id in [4_294_967_296, -2, i64::MIN] {
+                let e = read(make(id)).unwrap_err().to_string();
+                assert!(e.contains('N') && e.contains("out of range"), "{id}: {e}");
+            }
+        }
+        let child = |id: i64| json!({"type": "struct", "__struct_id": id, "value": {}});
+        for (id, read_as) in [(-1, u32::MAX), (7, 7), (4_294_967_295, u32::MAX)] {
+            assert_eq!(read(child(id)).unwrap().root.child("N").unwrap().id, read_as, "{id}");
+        }
+        for id in [4_294_967_296, -2_147_483_649] {
+            let e = read(child(id)).unwrap_err().to_string();
+            assert!(e.contains('N') && e.contains("out of range"), "{id}: {e}");
+        }
     }
 
     #[test]
@@ -627,7 +633,7 @@ mod tests {
             (12345678.0, "12345678.0"),
             (1.5707942247390747, "1.5707942247390747"),
         ] {
-            assert_eq!(nim_float(v), text, "{v:e}");
+            assert_eq!(mg_core::nim::float(v), text, "{v:e}");
         }
     }
 
@@ -693,5 +699,51 @@ mod tests {
         let j = to_json(&g, Codepage::default()).unwrap();
         assert_eq!(j["L"]["value"][0]["__struct_id"], -2);
         assert_eq!(from_json(&j, Codepage::default()).unwrap(), g);
+    }
+
+    #[test]
+    fn double_underscore_fields_round_trip_reserved_keys_reject_and_depth_is_capped() {
+        let mut g = Gff::new(*b"GFF ");
+        g.root.set("__custom", Value::Int(42));
+        let mut child = Struct::new(1);
+        child.set("__data_type", Value::Byte(7));
+        child.set("__row", Value::Int(3));
+        g.root.set("Child", Value::Struct(child));
+        let mut list_item = Struct::new(2);
+        list_item.set("Name", Value::Int(9));
+        g.root.set("Items", Value::List(vec![list_item]));
+        let mut j = to_json(&g, Codepage::default()).unwrap();
+        j["Items"]["value"][0].as_object_mut().unwrap().insert("__row".into(), json!("Hide"));
+        assert_eq!(from_json(&j, Codepage::default()).unwrap(), g);
+
+        // A whole document inserted as a list's item or a struct: its
+        // `__data_type` off the root is no field, and is left out.
+        let mut doc = to_json(&g, Codepage::default()).unwrap();
+        doc["Items"]["value"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("__data_type".into(), json!("UTI "));
+        let item = struct_from_json(
+            &json!({"__data_type": "UTC ", "N": {"type": "int", "value": 1}}),
+            Codepage::default(),
+        )
+        .unwrap();
+        assert_eq!(item.fields.len(), 1);
+        assert_eq!(from_json(&doc, Codepage::default()).unwrap(), g);
+
+        let mut bad_root = Gff::new(*b"GFF ");
+        bad_root.root.set("__data_type", Value::Int(1));
+        assert!(to_json(&bad_root, Codepage::default()).is_err());
+
+        let mut bad_id = Gff::new(*b"GFF ");
+        bad_id.root.set("__struct_id", Value::Int(1));
+        assert!(to_json(&bad_id, Codepage::default()).is_err());
+
+        let mut deep = json!({});
+        for _ in 0..130 {
+            deep = json!({ "N": { "type": "struct", "value": deep } });
+        }
+        deep.as_object_mut().unwrap().insert("__data_type".into(), json!("GFF "));
+        assert!(from_json(&deep, Codepage::default()).is_err());
     }
 }

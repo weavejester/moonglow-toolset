@@ -11,7 +11,7 @@ use mg_edit::wire::{command_from_json, command_to_json, field_from_str};
 use mg_edit::{Command, Edit, GffPath, Workspace};
 use mg_gff::{FieldType, Value};
 use mg_module::Module;
-use mg_resman::ResKey;
+use mg_resman::{GameInstall, ResKey};
 use serde_json::json;
 
 use super::plugins::SaveGuard;
@@ -26,6 +26,7 @@ pub(crate) fn apply(
     dry_run: bool,
     codepage: Codepage,
     guard: Option<&SaveGuard>,
+    gi: Option<&GameInstall>,
 ) -> Result<Output> {
     let text = if edits == Path::new("-") {
         let mut text = String::new();
@@ -38,11 +39,12 @@ pub(crate) fn apply(
         serde_json::from_str(&text).with_context(|| format!("{} is not JSON", edits.display()))?;
     let cmd =
         command_from_json(&json, codepage).map_err(|e| anyhow!("{}: {e}", edits.display()))?;
-    run(Workspace::new(module), cmd, dry_run, None, false, codepage, guard)
+    run(Workspace::new(module), cmd, dry_run, None, false, codepage, guard, gi)
 }
 
 /// `mg set`: fields of one resource, each `FIELD=VALUE` (or
 /// `FIELD:TYPE=VALUE` for a field the resource lacks), and fields to remove.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn set(
     module: Module,
     resource: &str,
@@ -51,6 +53,7 @@ pub(crate) fn set(
     dry_run: bool,
     codepage: Codepage,
     guard: Option<&SaveGuard>,
+    gi: Option<&GameInstall>,
 ) -> Result<Output> {
     let key = resource_key(resource)?;
     let mut ws = Workspace::new(module);
@@ -117,7 +120,8 @@ pub(crate) fn set(
         [Edit::SetField { label, .. }] => format!("Remove {label}"),
         _ => format!("Set {} fields of {key}", edits.len()),
     };
-    let mut out = run(ws, Command::new(label, edits), dry_run, Some(lines), true, codepage, guard)?;
+    let mut out =
+        run(ws, Command::new(label, edits), dry_run, Some(lines), true, codepage, guard, gi)?;
     for w in warnings {
         out.note(w);
     }
@@ -273,8 +277,39 @@ fn said_twice(clashes: &[mg_module::tags::Clash]) -> Vec<String> {
 /// only checks that it applies. `lines`: what to print for people in
 /// place of the resources changed; `show`: the command is in the JSON, as
 /// `mg apply` reads it; `guard`: the plugins that look at what is saved
-/// (before: a refusal is an error, and nothing is written; after).
+/// (before: a refusal is an error, and nothing is written; after); `gi`:
+/// the game, to bring the custom palettes up to date with the blueprints
+/// changed ([`crate::keep_palettes`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
+    ws: Workspace,
+    cmd: Command,
+    dry_run: bool,
+    lines: Option<Vec<String>>,
+    show: bool,
+    codepage: Codepage,
+    guard: Option<&SaveGuard>,
+    gi: Option<&GameInstall>,
+) -> Result<Output> {
+    run_with_before_save(ws, cmd, dry_run, lines, show, codepage, guard, gi, || Ok(()), || {})
+}
+
+/// Like [`run`], running `before_save` right after `guard.before` accepts
+/// and before palettes/module saving, and invoking `rollback` if `before_save`,
+/// palette updates, or saving fails.
+/// Distinct resource keys touched by `edits` in first-seen order.
+pub(crate) fn unique_keys(edits: &[Edit]) -> Vec<ResKey> {
+    let mut resources: Vec<ResKey> = Vec::new();
+    for e in edits {
+        if !resources.contains(e.key()) {
+            resources.push(*e.key());
+        }
+    }
+    resources
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_before_save(
     mut ws: Workspace,
     cmd: Command,
     dry_run: bool,
@@ -282,13 +317,11 @@ pub(crate) fn run(
     show: bool,
     codepage: Codepage,
     guard: Option<&SaveGuard>,
+    gi: Option<&GameInstall>,
+    before_save: impl FnOnce() -> Result<()>,
+    rollback: impl FnOnce(),
 ) -> Result<Output> {
-    let mut resources: Vec<ResKey> = Vec::new();
-    for e in &cmd.edits {
-        if !resources.contains(e.key()) {
-            resources.push(*e.key());
-        }
-    }
+    let resources = unique_keys(&cmd.edits);
     let written = command_to_json(&cmd, codepage).map_err(|e| anyhow!("{e}"))?;
     let (label, count) = (cmd.label.clone(), cmd.edits.len());
     let was = guard.map(|_| ws.module.clone());
@@ -311,9 +344,27 @@ pub(crate) fn run(
         ws.flush()?;
         said = g.before(was, &ws.module, &mut notes)?;
     }
-    if !dry_run && count > 0 {
-        ws.save()?;
-        if let (Some(g), Some(was)) = (guard, &was) {
+    if !dry_run {
+        // `before_save` writes what the edits do not carry (a baked hak): it
+        // runs whether or not the module changed, since a bake can need its
+        // files written with no edit left (an object already on its row).
+        if let Err(err) = (|| -> Result<()> {
+            before_save()?;
+            if count > 0 {
+                // The custom palettes follow the blueprints changed, as a save in
+                // the window brings them up to date.
+                let opened = ws.saved().clone();
+                ws.derive(|m| crate::keep_palettes(gi, m, &opened, &mut notes))?;
+                ws.save()?;
+            }
+            Ok(())
+        })() {
+            rollback();
+            return Err(err);
+        }
+        if count > 0
+            && let (Some(g), Some(was)) = (guard, &was)
+        {
             g.after(was, &ws.module, &mut notes);
         }
     }

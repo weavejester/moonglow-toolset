@@ -33,8 +33,16 @@
 //! when = { column = "Effect", is = "CURE" }
 //! require = "Cures"
 //! ```
+//!
+//! One description may be a family's: `tables = ["loot_*"]` in a file of
+//! the folder (`loot.2da.toml`, or any `*.2da.toml`) describes each table
+//! there whose name is so and has no description of its own. And Moonglow
+//! brings descriptions of some of the game's own tables
+//! ([`game_description`]), for a copy of one that has none.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mg_2da::TwoDa;
 
@@ -99,6 +107,10 @@ pub struct Rule {
 /// A table's description.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Description {
+    /// The names of the tables it describes, beside its own (`loot_*`: a
+    /// family's; `*` any run of letters, `?` one): empty, the table of
+    /// its file's name alone.
+    pub tables: Vec<String>,
     /// The table (without `.2da`) each of whose rows this table's row of
     /// the same number says more of.
     pub rows: Option<String>,
@@ -107,6 +119,11 @@ pub struct Description {
     /// What was not understood, which leaves the rest as it reads: a
     /// script's constant that is not a plain number, a key unknown.
     pub notes: Vec<String>,
+    /// Of [`Description::read`], the columns and rules it could not read
+    /// and left out (each also among `notes`, by its line): what Verify
+    /// and `mg 2da-check` report one by one. Always empty from
+    /// [`Description::parse`], which stops at the first.
+    pub mistakes: Vec<String>,
 }
 
 /// The description file of the table at `table` (`name.2da` gives
@@ -115,6 +132,135 @@ pub fn path_beside(table: &Path) -> PathBuf {
     let mut name = table.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".toml");
     table.with_file_name(name)
+}
+
+/// Whether a table's name (without `.2da`) is one a description's
+/// `tables` names: `*` any run of letters, `?` one, whatever their case.
+pub fn names_table(pattern: &str, name: &str) -> bool {
+    let p = mg_core::text::strip_suffix_ascii_ci(pattern.trim(), ".2da").as_bytes();
+    let n = name.as_bytes();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, mut sn)) = star {
+            sn += 1;
+            star = Some((sp, sn));
+            pi = sp + 1;
+            ni = sn;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// The names a description file says it describes (its `tables`), read
+/// alone: no lists are read from scripts for it.
+fn tables_of(file: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(file) else { return Vec::new() };
+    let Ok(t) = text.parse::<toml::Table>() else { return Vec::new() };
+    patterns(&t)
+}
+
+fn patterns(t: &toml::Table) -> Vec<String> {
+    match t.get("tables") {
+        Some(toml::Value::String(s)) => vec![s.clone()],
+        Some(toml::Value::Array(a)) => {
+            a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// How closely a pattern names a table: its letters that are not `*` or
+/// `?` (`loot_gold*` before `loot_*`).
+fn closeness(pattern: &str) -> usize {
+    pattern.chars().filter(|c| *c != '*' && *c != '?').count()
+}
+
+/// Of the description files `files` (each with the tables it names), the
+/// one that describes the table `name`: the closest pattern, then the
+/// first file by name.
+fn family_of<'a>(name: &str, files: &'a [(PathBuf, Vec<String>)]) -> Option<&'a Path> {
+    files
+        .iter()
+        .filter_map(|(file, names)| {
+            let best = names.iter().filter(|p| names_table(p, name)).map(|p| closeness(p)).max()?;
+            Some((best, file))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+        .map(|(_, f)| f.as_path())
+}
+
+/// The description files of a folder that name tables of a family
+/// (`tables = […]`), each with the names.
+fn families_in(dir: &Path) -> Vec<(PathBuf, Vec<String>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<(PathBuf, Vec<String>)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().to_ascii_lowercase().ends_with(".2da.toml"))
+        .map(|p| {
+            let names = tables_of(&p);
+            (p, names)
+        })
+        .filter(|(_, names)| !names.is_empty())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The description of the table at `table` (its file, or where its file
+/// would be): `name.2da.toml` beside it, else a family's in its folder
+/// (a `*.2da.toml` whose `tables` name it). `None`: neither is there.
+pub fn find_for(table: &Path) -> Option<PathBuf> {
+    let own = path_beside(table);
+    if own.is_file() {
+        return Some(own);
+    }
+    let name = table.file_stem()?.to_string_lossy().into_owned();
+    let dir = table.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    family_of(&name, &families_in(dir)).map(Path::to_path_buf)
+}
+
+/// Where the module's table would be on disk, for its description: its
+/// file (a nasher project's source, a module folder's file), or, for a
+/// module kept in one file, beside that file.
+pub fn table_in_module(module: &crate::Module, key: &mg_resman::ResKey) -> Option<PathBuf> {
+    if let Some(file) = module.file_of(key) {
+        return Some(file.to_path_buf());
+    }
+    match &module.location {
+        Some(crate::ModuleLocation::Archive(path)) => Some(path.with_file_name(key.to_string())),
+        _ => None,
+    }
+}
+
+/// The description of one of the module's tables that is there
+/// ([`find_for`] where [`table_in_module`] puts it).
+pub fn description_in_module(module: &crate::Module, key: &mg_resman::ResKey) -> Option<PathBuf> {
+    find_for(&table_in_module(module, key)?)
+}
+
+/// The description Moonglow brings of one of the game's own tables, by
+/// its name (from nwn.wiki's pages on it): a table of that name with no
+/// description of the builder's is held to it, its lists and flags shown
+/// by name.
+pub fn game_description(name: &str) -> Option<&'static str> {
+    match mg_core::text::strip_suffix_ascii_ci(name, ".2da").to_ascii_lowercase().as_str() {
+        "spells" => Some(include_str!("table_desc/spells.2da.toml")),
+        "baseitems" => Some(include_str!("table_desc/baseitems.2da.toml")),
+        _ => None,
+    }
 }
 
 /// Where the description of one of a module's tables would be: beside
@@ -185,13 +331,23 @@ impl Beside {
                             dirs.push(e.path());
                         }
                     }
-                    Ok(t) if t.is_file() => files.push(e.path()),
+                    Ok(_) if mg_resman::is_file_or_link_to_one(&e) => files.push(e.path()),
                     _ => {}
                 }
             }
         }
         files.sort();
         Beside { files }
+    }
+
+    /// Every file walked.
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    /// A table of the folder's file, by its name: where it is.
+    pub fn table_file(&self, name: &str) -> Option<&Path> {
+        self.named(name, "2da")
     }
 
     /// A table of the folder, by its name.
@@ -220,16 +376,37 @@ impl Beside {
         self.table(name, codepage).map(|t| t.len())
     }
 
-    /// The tables of the folder that have a description beside them: each
-    /// with its description's file.
+    /// The tables of the folder that have a description: each with its
+    /// description's file (beside it, or a family's in its folder).
     pub fn described(&self) -> Vec<(PathBuf, PathBuf)> {
-        let mut out: Vec<(PathBuf, PathBuf)> = self
+        let mut families: std::collections::HashMap<PathBuf, Vec<(PathBuf, Vec<String>)>> =
+            Default::default();
+        let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for p in self
             .files
             .iter()
             .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("2da")))
-            .map(|p| (p.clone(), path_beside(p)))
-            .filter(|(_, d)| self.files.contains(d))
-            .collect();
+        {
+            let own = path_beside(p);
+            if self.files.contains(&own) {
+                out.push((p.clone(), own));
+                continue;
+            }
+            let dir = p.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let in_dir = families.entry(dir.clone()).or_insert_with(|| {
+                self.files
+                    .iter()
+                    .filter(|f| f.parent() == Some(dir.as_path()))
+                    .filter(|f| f.to_string_lossy().to_ascii_lowercase().ends_with(".2da.toml"))
+                    .map(|f| (f.clone(), tables_of(f)))
+                    .filter(|(_, names)| !names.is_empty())
+                    .collect()
+            });
+            let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if let Some(family) = family_of(&name, in_dir) {
+                out.push((p.clone(), family.to_path_buf()));
+            }
+        }
         out.sort();
         out
     }
@@ -240,21 +417,62 @@ impl Beside {
 /// the script's other constants comes to (`A | B`, `1 << 3`); with `text`,
 /// a string constant's text too. And how many could not be worked out (a
 /// function's result).
-pub(crate) fn constants(source: &[u8], prefix: &str, text: bool) -> (Vec<Entry>, usize) {
-    let outline = mg_script::outline::outline(source);
-    // (A constant may be made of others of its script: `A | B`.)
-    let given = |g: &&mg_script::outline::Global| g.is_const || g.value.is_some();
-    let mut known: Vec<(&str, i64)> = Vec::new();
-    for g in outline.globals.iter().filter(given) {
+///
+/// The scripts it includes are read too (`script` reads one by its name):
+/// their constants are listed with its own, and a constant made of theirs
+/// is worked out.
+pub(crate) fn constants_in(
+    source: &[u8],
+    prefix: &str,
+    text: bool,
+    script: &dyn Fn(&str) -> Option<Arc<[u8]>>,
+) -> (Vec<Entry>, usize) {
+    // The script and those it includes, each once, those included first
+    // (as the compiler reads them).
+    fn gather(
+        source: &[u8],
+        script: &dyn Fn(&str) -> Option<Arc<[u8]>>,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<mg_script::outline::Outline>,
+    ) {
+        let outline = mg_script::outline::outline(source);
+        for include in &outline.includes {
+            let name =
+                mg_core::text::strip_suffix_ascii_ci(&include.name, ".nss").to_ascii_lowercase();
+            if seen.len() > 64 || !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(included) = script(&name) {
+                gather(&included, script, seen, out);
+            }
+        }
+        out.push(outline);
+    }
+    let mut outlines = Vec::new();
+    gather(source, script, &mut HashSet::new(), &mut outlines);
+    // (Each once: a script that includes itself, or one included twice.)
+    let mut globals: Vec<&mg_script::outline::Global> = Vec::new();
+    let mut seen_globals: HashSet<&str> = HashSet::new();
+    for g in outlines.iter().flat_map(|o| o.globals.iter()) {
+        if seen_globals.insert(g.name.as_str()) {
+            globals.push(g);
+        }
+    }
+    // (A constant may be made of others of its script, or of one it
+    // includes: `A | B`.)
+    let given = |g: &&&mg_script::outline::Global| g.is_const || g.value.is_some();
+    let mut known: HashMap<&str, i64> = HashMap::new();
+    for g in globals.iter().filter(given) {
         if let Some(v) = g.value.as_deref().and_then(|v| evaluate(v, &known)) {
-            known.push((g.name.as_str(), v));
+            known.insert(g.name.as_str(), v);
         }
     }
     let (mut entries, mut unread) = (Vec::new(), 0);
+    let mut seen_entries: HashSet<&str> = HashSet::new();
     // (Constants, and the globals given a value: the game's own
     // `nwscript` declares its constants so, `int DAMAGE_TYPE_ACID =
     // 16;`.)
-    for g in outline.globals.iter().filter(given).filter(|g| g.name.starts_with(prefix)) {
+    for g in globals.iter().filter(given).filter(|g| g.name.starts_with(prefix)) {
         // A number as written, a text or a fraction as it is, or what an
         // expression of whole numbers comes to.
         let written = g.value.as_deref().map(str::trim);
@@ -264,11 +482,10 @@ pub(crate) fn constants(source: &[u8], prefix: &str, text: bool) -> (Vec<Entry>,
             .map(str::to_string);
         let written = written.map(|v| v.trim_matches('"').to_string());
         let plain = written.filter(|v| whole(v).is_some() || v.parse::<f64>().is_ok());
-        let value = quoted
-            .or(plain)
-            .or_else(|| known.iter().find(|(n, _)| *n == g.name).map(|(_, v)| v.to_string()));
+        let value =
+            quoted.or(plain).or_else(|| known.get(g.name.as_str()).map(ToString::to_string));
         match value {
-            Some(value) if !entries.iter().any(|e: &Entry| e.name == g.name) => {
+            Some(value) if seen_entries.insert(g.name.as_str()) => {
                 entries.push(Entry { name: g.name.clone(), value });
             }
             Some(_) => {}
@@ -300,8 +517,11 @@ pub fn whole(text: &str) -> Option<i64> {
 
 /// What a constant's expression comes to: whole numbers and the names
 /// in `known`, with `| & ^ ~ << >> + - *` and brackets, as NWScript
-/// reads them. `None` for anything else.
-fn evaluate(text: &str, known: &[(&str, i64)]) -> Option<i64> {
+/// reads them. `None` for anything else, and for one nested deeper than
+/// 64 brackets and signs (no constant is; a crafted one of thousands
+/// overflowed the stack).
+fn evaluate(text: &str, known: &HashMap<&str, i64>) -> Option<i64> {
+    const MOST_NESTED: usize = 64;
     #[derive(Clone, Debug, PartialEq)]
     enum Tok {
         Num(i64),
@@ -322,12 +542,17 @@ fn evaluate(text: &str, known: &[(&str, i64)]) -> Option<i64> {
             return None;
         }
         let word = &rest[..end];
-        let value = whole(word).or_else(|| known.iter().find(|(n, _)| *n == word).map(|k| k.1))?;
+        let value = whole(word).or_else(|| known.get(word).copied())?;
         toks.push(Tok::Num(value));
         rest = rest[end..].trim_start();
     }
     // Lowest first: | ^ & shifts, + and -, *, then a sign or ~ and brackets.
-    fn level(toks: &[Tok], at: &mut usize, depth: usize) -> Option<i64> {
+    // (`nested`: the brackets and signs it is within, which a constant
+    // of a crafted script may have thousands of, each a call deeper.)
+    fn level(toks: &[Tok], at: &mut usize, depth: usize, nested: usize) -> Option<i64> {
+        if nested > MOST_NESTED {
+            return None;
+        }
         const LEVELS: [&[&str]; 6] = [&["|"], &["^"], &["&"], &["<<", ">>"], &["+", "-"], &["*"]];
         if depth == LEVELS.len() {
             return match toks.get(*at)? {
@@ -337,13 +562,13 @@ fn evaluate(text: &str, known: &[(&str, i64)]) -> Option<i64> {
                 }
                 Tok::Op("(") => {
                     *at += 1;
-                    let v = level(toks, at, 0)?;
+                    let v = level(toks, at, 0, nested + 1)?;
                     (toks.get(*at) == Some(&Tok::Op(")"))).then(|| *at += 1)?;
                     Some(v)
                 }
                 Tok::Op(op @ ("-" | "~" | "+")) => {
                     *at += 1;
-                    let v = level(toks, at, depth)?;
+                    let v = level(toks, at, depth, nested + 1)?;
                     Some(match *op {
                         "-" => v.checked_neg()?,
                         "~" => !v & 0xFFFF_FFFF,
@@ -353,12 +578,12 @@ fn evaluate(text: &str, known: &[(&str, i64)]) -> Option<i64> {
                 Tok::Op(_) => None,
             };
         }
-        let mut left = level(toks, at, depth + 1)?;
+        let mut left = level(toks, at, depth + 1, nested)?;
         while let Some(Tok::Op(op)) = toks.get(*at)
             && LEVELS[depth].contains(op)
         {
             *at += 1;
-            let right = level(toks, at, depth + 1)?;
+            let right = level(toks, at, depth + 1, nested)?;
             left = match *op {
                 "|" => left | right,
                 "^" => left ^ right,
@@ -373,7 +598,7 @@ fn evaluate(text: &str, known: &[(&str, i64)]) -> Option<i64> {
         Some(left)
     }
     let mut at = 0;
-    let value = level(&toks, &mut at, 0)?;
+    let value = level(&toks, &mut at, 0, 0)?;
     (at == toks.len()).then_some(value)
 }
 
@@ -515,36 +740,150 @@ fn cell_text(v: &toml::Value) -> Option<String> {
     }
 }
 
+/// Where a description's parts are written, for the lines its messages
+/// name.
+struct Lines<'s> {
+    source: &'s str,
+    file: Option<toml::Spanned<toml::de::DeTable<'s>>>,
+}
+
+impl<'s> Lines<'s> {
+    fn new(source: &'s str) -> Lines<'s> {
+        Lines { source, file: toml::de::DeTable::parse(source).ok() }
+    }
+
+    /// The line of the key at `path` (`columns`, a column's name, a key
+    /// of it), or of as much of the path as is there.
+    fn key(&self, path: &[&str]) -> usize {
+        let mut line = 1;
+        let mut table = self.file.as_ref().map(|f| f.get_ref());
+        for part in path {
+            let Some(t) = table else { break };
+            let Some((k, v)) = t.iter().find(|(k, _)| k.get_ref() == *part) else { break };
+            line = crate::project_file::line_of(self.source, k.span().start);
+            table = match v.get_ref() {
+                toml::de::DeValue::Table(t) => Some(t),
+                _ => None,
+            };
+        }
+        line
+    }
+
+    /// The line of rule `i` (from 0).
+    fn rule(&self, i: usize) -> usize {
+        let rules = (self.file.as_ref())
+            .and_then(|f| f.get_ref().iter().find(|(k, _)| k.get_ref() == "rules"));
+        let at = rules.and_then(|(_, v)| match v.get_ref() {
+            toml::de::DeValue::Array(a) => a.get(i).map(|r| r.span().start),
+            _ => None,
+        });
+        at.map_or_else(|| self.key(&["rules"]), |at| crate::project_file::line_of(self.source, at))
+    }
+}
+
+/// How a description's mistakes are taken: the first an error
+/// ([`Description::parse`]), or each a note and the rest read
+/// ([`Description::read`]); either way by its line.
+struct Said<'s> {
+    keep: bool,
+    lines: Lines<'s>,
+}
+
+impl Said<'_> {
+    /// A column or a rule that cannot be read.
+    fn mistake(&self, d: &mut Description, line: usize, message: String) -> Result<(), String> {
+        let message = format!("line {line}: {message}");
+        if !self.keep {
+            return Err(message);
+        }
+        d.notes.push(message.clone());
+        d.mistakes.push(message);
+        Ok(())
+    }
+
+    /// What is not understood and leaves the rest as it reads.
+    fn note(&self, notes: &mut Vec<String>, line: usize, message: String) {
+        notes.push(if self.keep { format!("line {line}: {message}") } else { message });
+    }
+}
+
+/// A column's mistake: the key of it that is wrong (none: the column
+/// itself), and what is.
+type Mistake = (&'static str, String);
+
 impl Description {
     /// Reads a description. `script` reads a script's source by name
-    /// (without `.nss`), for the lists that are a script's constants.
+    /// (without `.nss`), for the lists that are a script's constants. A
+    /// column or a rule that cannot be read is an error, by its line
+    /// (`line 12: column Damage: "flag" is no kind…`), and nothing is
+    /// described: what a check of the tables wants.
     pub fn parse(
         source: &str,
         script: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Result<Description, String> {
+        Self::read_as(source, script, false)
+    }
+
+    /// [`Description::parse`] for the builder at work on the table: a
+    /// column or a rule that cannot be read is a note by its line and is
+    /// left out, and the rest of the description is read (one `kind`
+    /// mistyped among forty columns left none of them described). Only a
+    /// file that is no TOML at all is an error. Every note begins with
+    /// its line.
+    pub fn read(
+        source: &str,
+        script: &dyn Fn(&str) -> Option<Vec<u8>>,
+    ) -> Result<Description, String> {
+        Self::read_as(source, script, true)
+    }
+
+    fn read_as(
+        source: &str,
+        script: &dyn Fn(&str) -> Option<Vec<u8>>,
+        keep: bool,
+    ) -> Result<Description, String> {
         let file: toml::Table = source.parse().map_err(|e| format!("{e}"))?;
+        let said = Said { keep, lines: Lines::new(source) };
         let mut d = Description { rows: text(&file, "rows"), ..Default::default() };
+        d.tables = patterns(&file);
         for key in file.keys() {
-            if !["rows", "columns", "rules"].contains(&key.as_str()) {
-                d.notes.push(format!("\"{key}\" is not a key this reads"));
+            if !["rows", "columns", "rules", "tables"].contains(&key.as_str()) {
+                let line = said.lines.key(&[key]);
+                said.note(&mut d.notes, line, format!("\"{key}\" is not a key this reads"));
             }
         }
+        let none = toml::Table::new();
         let columns = match file.get("columns") {
-            Some(toml::Value::Table(t)) => t.clone(),
-            Some(_) => return Err("\"columns\" is not a table of columns".to_string()),
-            None => toml::Table::new(),
+            Some(toml::Value::Table(t)) => t,
+            Some(_) => {
+                let message = "\"columns\" is not a table of columns".to_string();
+                said.mistake(&mut d, said.lines.key(&["columns"]), message)?;
+                &none
+            }
+            None => &none,
         };
-        for (name, column) in &columns {
+        for (name, column) in columns {
             let Some(c) = column.as_table() else {
-                return Err(format!("column {name}: not a table ([columns.{name}])"));
+                let message = format!("column {name}: not a table ([columns.{name}])");
+                said.mistake(&mut d, said.lines.key(&["columns", name]), message)?;
+                continue;
             };
-            let kind = d.kind(name, c, script)?;
-            d.columns.push((name.clone(), Column { kind, note: text(c, "note") }));
+            match d.kind(name, c, script, &said) {
+                Ok(kind) => d.columns.push((name.clone(), Column { kind, note: text(c, "note") })),
+                Err((key, message)) => {
+                    let line = said.lines.key(&["columns", name, key]);
+                    said.mistake(&mut d, line, message)?;
+                }
+            }
         }
-        let rules = match file.get("rules") {
-            Some(toml::Value::Array(a)) => a.clone(),
-            Some(_) => return Err("\"rules\" is not a list ([[rules]])".to_string()),
-            None => Vec::new(),
+        let rules: &[toml::Value] = match file.get("rules") {
+            Some(toml::Value::Array(a)) => a,
+            Some(_) => {
+                let message = "\"rules\" is not a list ([[rules]])".to_string();
+                said.mistake(&mut d, said.lines.key(&["rules"]), message)?;
+                &[]
+            }
+            None => &[],
         };
         for (i, rule) in rules.iter().enumerate() {
             let at = i + 1;
@@ -557,10 +896,11 @@ impl Description {
                     d.rules.push(Rule { column, is, require: require.to_string() });
                 }
                 _ => {
-                    return Err(format!(
+                    let message = format!(
                         "rule {at}: it reads `when = {{ column = \"…\", is = \"…\" }}` and \
                          `require = \"…\"`"
-                    ));
+                    );
+                    said.mistake(&mut d, said.lines.rule(i), message)?;
                 }
             }
         }
@@ -572,7 +912,8 @@ impl Description {
         name: &str,
         c: &toml::Table,
         script: &dyn Fn(&str) -> Option<Vec<u8>>,
-    ) -> Result<Kind, String> {
+        said: &Said,
+    ) -> Result<Kind, Mistake> {
         let int = |key: &str| c.get(key).and_then(|v| v.as_integer());
         let float = |key: &str| {
             c.get(key).and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
@@ -585,18 +926,22 @@ impl Description {
             "strref" => Kind::StrRef,
             "script" => Kind::Script,
             "row" => match text(c, "table") {
-                Some(table) => Kind::Row(table.trim_end_matches(".2da").to_ascii_lowercase()),
+                Some(table) => Kind::Row(
+                    mg_core::text::strip_suffix_ascii_ci(&table, ".2da").to_ascii_lowercase(),
+                ),
                 None => {
-                    return Err(format!("column {name}: a row of which table? (table = \"…\")"));
+                    let message = format!("column {name}: a row of which table? (table = \"…\")");
+                    return Err(("kind", message));
                 }
             },
             "list" | "flags" => {
-                let entries = self.entries(name, c, script)?;
+                let entries = self.entries(name, c, script, said)?;
                 if entries.is_empty() {
-                    return Err(format!(
+                    let message = format!(
                         "column {name}: no values (values = {{ NAME = 1 }}, or constants = \
                          \"script\" with prefix = \"…\")"
-                    ));
+                    );
+                    return Err(("kind", message));
                 }
                 match kind.as_str() {
                     "list" => Kind::List {
@@ -605,20 +950,22 @@ impl Description {
                     },
                     _ => {
                         if let Some(e) = entries.iter().find(|e| whole(&e.value).is_none()) {
-                            return Err(format!(
+                            let message = format!(
                                 "column {name}: the flag {} is not a whole number ({})",
                                 e.name, e.value
-                            ));
+                            );
+                            return Err(("values", message));
                         }
                         Kind::Flags { entries }
                     }
                 }
             }
             other => {
-                return Err(format!(
+                let message = format!(
                     "column {name}: \"{other}\" is no kind (text, int, float, list, flags, row, \
                      strref)"
-                ));
+                );
+                return Err(("kind", message));
             }
         })
     }
@@ -630,39 +977,50 @@ impl Description {
         name: &str,
         c: &toml::Table,
         script: &dyn Fn(&str) -> Option<Vec<u8>>,
-    ) -> Result<Vec<Entry>, String> {
+        said: &Said,
+    ) -> Result<Vec<Entry>, Mistake> {
         let mut entries: Vec<Entry> = Vec::new();
         match c.get("values") {
             Some(toml::Value::Table(values)) => {
                 for (n, v) in values {
                     let Some(value) = cell_text(v) else {
-                        return Err(format!("column {name}: the value of {n} is not a value"));
+                        let message = format!("column {name}: the value of {n} is not a value");
+                        return Err(("values", message));
                     };
                     entries.push(Entry { name: n.clone(), value });
                 }
             }
             Some(_) => {
-                return Err(format!("column {name}: values are written {{ NAME = 1, OTHER = 2 }}"));
+                let message =
+                    format!("column {name}: values are written {{ NAME = 1, OTHER = 2 }}");
+                return Err(("values", message));
             }
             None => {}
         }
         if let Some(from) = text(c, "constants") {
             let prefix = text(c, "prefix").unwrap_or_default();
-            let from = from.trim_end_matches(".nss");
+            let from = mg_core::text::strip_suffix_ascii_ci(&from, ".nss");
             let Some(source) = script(from) else {
-                return Err(format!("column {name}: the script {from} was not found"));
+                return Err((
+                    "constants",
+                    format!("column {name}: the script {from} was not found"),
+                ));
             };
-            let (found, unread) = constants(&source, &prefix, false);
+            let (found, unread) =
+                constants_in(&source, &prefix, false, &|n| script(n).map(Arc::from));
             for e in found {
                 if !entries.iter().any(|x| x.name == e.name) {
                     entries.push(e);
                 }
             }
             if unread > 0 {
-                self.notes.push(format!(
-                    "column {name}: {unread} of {from}'s constants that begin {prefix} are \
-                     not numbers that can be worked out, and are left out"
-                ));
+                let message = format!(
+                    "column {name}: {unread} of {from}'s values that begin {prefix} are not \
+                     numbers that can be worked out (a global given by a function as the \
+                     script runs: no const can be, the compiler refuses it), and are left out"
+                );
+                let line = said.lines.key(&["columns", name, "constants"]);
+                said.note(&mut self.notes, line, message);
             }
         }
         entries.sort_by(|a, b| match (whole(&a.value), whole(&b.value)) {
@@ -689,6 +1047,27 @@ impl Description {
         rows_of: &dyn Fn(&str) -> Option<usize>,
         tlk: TalkTables,
     ) -> Vec<CellFault> {
+        self.faults_in(t, 0..t.len(), rows_of, tlk)
+    }
+
+    /// Like [`Self::faults`], checking only the given row indices.
+    pub fn faults_rows(
+        &self,
+        t: &TwoDa,
+        rows: &[usize],
+        rows_of: &dyn Fn(&str) -> Option<usize>,
+        tlk: TalkTables,
+    ) -> Vec<CellFault> {
+        self.faults_in(t, rows.iter().copied().filter(|&r| r < t.len()), rows_of, tlk)
+    }
+
+    fn faults_in(
+        &self,
+        t: &TwoDa,
+        rows: impl Iterator<Item = usize> + Clone,
+        rows_of: &dyn Fn(&str) -> Option<usize>,
+        tlk: TalkTables,
+    ) -> Vec<CellFault> {
         let mut out = Vec::new();
         for (name, column) in &self.columns {
             let Some(at) = t.column(name) else { continue };
@@ -696,7 +1075,7 @@ impl Description {
                 Kind::Row(table) => rows_of(table),
                 _ => None,
             };
-            for row in 0..t.len() {
+            for row in rows.clone() {
                 let Some(cell) = t.cell(row, at) else { continue };
                 if let Some(message) = cell_fault(&column.kind, cell, length, tlk) {
                     out.push(CellFault { row, column: at, message });
@@ -709,7 +1088,7 @@ impl Description {
                 continue;
             };
             let kind = self.column(&rule.column).map(|c| &c.kind);
-            for row in 0..t.len() {
+            for row in rows.clone() {
                 let Some(cell) = t.cell(row, when) else { continue };
                 let named = kind.and_then(|k| k.named(cell));
                 let is = same(cell, &rule.is)
@@ -724,7 +1103,10 @@ impl Description {
         if let Some(table) = &self.rows
             && let Some(length) = rows_of(table)
         {
-            for row in length..t.len() {
+            for row in rows {
+                if row < length {
+                    continue;
+                }
                 // (An empty row past the end is padding.)
                 if let Some(column) = (0..t.columns().len()).find(|c| t.cell(row, *c).is_some()) {
                     let message = format!(
@@ -866,12 +1248,32 @@ require = "Cures"
         // worked out is left out, and said.)
         assert_eq!(names, ["DAMAGE_ACID", "DAMAGE_COLD", "DAMAGE_BOTH", "DAMAGE_FIRE"]);
         assert_eq!(damage.entries()[2].value, "48");
-        let known = [("A", 0x10), ("B", 3)];
+        let known = HashMap::from([("A", 0x10), ("B", 3)]);
         assert_eq!(evaluate("A | 1 << B", &known), Some(0x18));
         assert_eq!(evaluate("(A + 2) * -B", &known), Some(-54));
         assert_eq!(evaluate("~0 & A", &known), Some(0x10));
         assert_eq!((evaluate("A | C", &known), evaluate("A |", &known)), (None, None));
         assert_eq!((evaluate("GetX()", &known), evaluate("(A", &known)), (None, None));
+        // Brackets and signs without end (a crafted script's constant, read
+        // on a worker's small stack): no value, and no stack overflow.
+        let deep = |open: &str, close: &str, n: usize| {
+            let empty = HashMap::new();
+            evaluate(&format!("{}1{}", open.repeat(n), close.repeat(n)), &empty)
+        };
+        assert_eq!(
+            (deep("(", ")", 60), deep("-", "", 60), deep("~", "", 2)),
+            (Some(1), Some(1), Some(1))
+        );
+        let small = std::thread::Builder::new().stack_size(256 * 1024);
+        let run = small.spawn(move || {
+            let empty = HashMap::new();
+            [
+                deep("(", ")", 100_000),
+                deep("-", "", 100_000),
+                evaluate(&"(".repeat(100_000), &empty),
+            ]
+        });
+        assert_eq!(run.unwrap().join().unwrap(), [None, None, None]);
         assert_eq!(damage.named("0x0030").as_deref(), Some("DAMAGE_ACID | DAMAGE_COLD"));
         assert_eq!(damage.named("0x0050").as_deref(), Some("DAMAGE_ACID | 0x40"));
         assert_eq!(damage.flags_cell(0x30, None).as_deref(), Some("0x0030"));
@@ -963,6 +1365,103 @@ require = "Cures"
         assert_eq!(d.column("Script").unwrap().kind, Kind::Script);
     }
 
+    /// A constant made of another script's that the script includes is
+    /// worked out, and the included script's constants are listed too; a
+    /// global given by a function is left out, and said so.
+    #[test]
+    fn constants_of_included_scripts_are_worked_out() {
+        let scripts = |name: &str| match name {
+            "my_flags" => Some(
+                b"#include \"my_base\"\nconst int FLAG_BOTH = BASE_A | BASE_B;\nint FLAG_RUN = \
+                  Foo();\n#include \"my_flags\"\n"
+                    .to_vec(),
+            ),
+            "my_base" => Some(b"const int BASE_A = 1;\nconst int BASE_B = 0x4;\n".to_vec()),
+            _ => None,
+        };
+        let d = Description::parse(
+            "[columns.F]\nkind = \"flags\"\nconstants = \"my_flags\"\nprefix = \"\"\n",
+            &scripts,
+        )
+        .unwrap();
+        let entries = d.column("F").unwrap().kind.entries();
+        let named: Vec<(&str, &str)> =
+            entries.iter().map(|e| (e.name.as_str(), e.value.as_str())).collect();
+        assert_eq!(named, [("BASE_A", "1"), ("BASE_B", "0x4"), ("FLAG_BOTH", "5")]);
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert!(d.notes[0].contains("1 of my_flags's values") && d.notes[0].contains("function"));
+    }
+
+    /// One description for a family of tables (`tables = ["loot_*"]`), in
+    /// the folder: a table's own description comes before it, and the
+    /// closest name before another family's.
+    #[test]
+    fn a_family_s_description_is_found_for_its_tables() {
+        assert!(names_table("loot_*", "LOOT_gold") && names_table("loot_?", "loot_a"));
+        assert!(!names_table("loot_*", "loo") && !names_table("loot_?", "loot_ab"));
+        assert!(names_table("spells.2da", "spells") && names_table("*", "x"));
+        let dir = mg_testkit::scratch_dir("table-desc-family");
+        let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+        write("loot.2da.toml", "tables = [\"loot_*\"]\n[columns.Gold]\nkind = \"int\"\n");
+        write("gold.2da.toml", "tables = \"loot_gold*\"\n[columns.Gold]\nkind = \"int\"\n");
+        write("loot_own.2da.toml", "[columns.Gold]\nkind = \"text\"\n");
+        for t in ["loot_a", "loot_gold1", "loot_own", "spells"] {
+            write(&format!("{t}.2da"), "2DA V2.0\n\n   Gold\n0  1\n");
+        }
+        let found = |t: &str| find_for(&dir.join(format!("{t}.2da")));
+        assert_eq!(found("loot_a"), Some(dir.join("loot.2da.toml")));
+        assert_eq!(found("loot_gold1"), Some(dir.join("gold.2da.toml")), "the closest");
+        assert_eq!(found("loot_own"), Some(dir.join("loot_own.2da.toml")), "its own");
+        assert_eq!(found("spells"), None);
+        let d = Description::parse(
+            &std::fs::read_to_string(dir.join("loot.2da.toml")).unwrap(),
+            &script,
+        )
+        .unwrap();
+        assert_eq!((d.tables.as_slice(), d.notes.len()), (&["loot_*".to_string()][..], 0));
+        // A folder's described tables, the family's among them.
+        let described: Vec<String> = Beside::of(&dir)
+            .described()
+            .iter()
+            .map(|(t, d)| {
+                let name = |p: &PathBuf| p.file_name().unwrap().to_string_lossy().into_owned();
+                format!("{} {}", name(t), name(d))
+            })
+            .collect();
+        assert_eq!(
+            described,
+            [
+                "loot_a.2da loot.2da.toml",
+                "loot_gold1.2da gold.2da.toml",
+                "loot_own.2da loot_own.2da.toml"
+            ]
+        );
+    }
+
+    /// Moonglow's descriptions of the game's own tables read, with no
+    /// script (`nwscript`'s constants are written out in them).
+    #[test]
+    fn the_game_s_tables_moonglow_describes_read() {
+        // (Read with no script: they need no game install.)
+        let text = game_description("Spells.2da").expect("spells is described");
+        let d = Description::parse(text, &|_| None).unwrap();
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+        assert_eq!(d.column("School").unwrap().kind.named("V").as_deref(), Some("Evocation"));
+        assert_eq!(
+            d.column("MetaMagic").unwrap().kind.named("0x09").as_deref(),
+            Some("Empower | Quicken")
+        );
+        assert_eq!(d.column("Name").unwrap().kind, Kind::StrRef);
+        let d = Description::parse(game_description("baseitems").unwrap(), &|_| None).unwrap();
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+        let slots = &d.column("EquipableSlots").unwrap().kind;
+        assert_eq!(
+            slots.named("0x1C030").as_deref(),
+            Some("Main hand | Off-hand | Left claw | Right claw | Bite")
+        );
+        assert!(game_description("feat").is_none());
+    }
+
     #[test]
     fn a_description_that_cannot_be_read_says_where() {
         let bad = |text: &str| Description::parse(text, &script).unwrap_err();
@@ -977,5 +1476,85 @@ require = "Cures"
         );
         assert!(bad("[[rules]]\nrequire = \"A\"").contains("rule 1"));
         assert!(!bad("[columns").is_empty());
+        // By its line: the key that is wrong, else the column's or the
+        // rule's own.
+        assert!(bad("# mine\n[columns.A]\nnote = \"x\"\nkind = \"bits\"").starts_with("line 4: "));
+        assert!(
+            bad("[columns.A]\nkind = \"int\"\n\n[columns.B]\nkind = \"row\"")
+                .starts_with("line 5: ")
+        );
+        assert!(
+            bad("[columns.A]\nkind = \"list\"\nconstants = \"nowhere\"").starts_with("line 3: ")
+        );
+        assert!(bad("[columns]\nA = 3\n").starts_with("line 2: column A: not a table"));
+        let rules = "[[rules]]\nwhen = { column = \"A\", is = 1 }\nrequire = \"B\"\n\n[[rules]]\n\
+                     require = \"A\"\n";
+        let line: usize = bad(rules)["line ".len()..].split(':').next().unwrap().parse().unwrap();
+        assert!((5..=6).contains(&line), "{}", bad(rules));
+    }
+
+    /// For the builder at work on a table, one column mistyped among
+    /// many is a note by its line and the rest is described (none was).
+    #[test]
+    fn a_description_read_for_its_builder_keeps_what_reads() {
+        let text = "extra = 1\n\n[columns.Level]\nkind = \"int\"\nmin = 0\n\n[columns.Damage]\n\
+                    kind = \"flag\"\n\n[columns.Shape]\nkind = \"list\"\nvalues = { Sphere = 0 }\n\n\
+                    [[rules]]\nrequire = \"Level\"\n\n[[rules]]\nwhen = { column = \"Shape\", is = 0 }\n\
+                    require = \"Level\"\n";
+        assert!(
+            Description::parse(text, &script).unwrap_err().starts_with("line 8: column Damage")
+        );
+        let d = Description::read(text, &script).unwrap();
+        let names: Vec<&str> = d.columns.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Level", "Shape"]);
+        assert_eq!(d.column("level").unwrap().kind, Kind::Int { min: Some(0), max: None });
+        assert_eq!(d.rules.len(), 1);
+        assert_eq!(d.notes.len(), 3, "{:?}", d.notes);
+        // (The two it could not read, apart from the one it did not understand.)
+        assert_eq!(d.mistakes, d.notes[1..], "{:?}", d.mistakes);
+        assert_eq!(d.notes[0], "line 1: \"extra\" is not a key this reads");
+        assert!(
+            d.notes[1].starts_with("line 8: column Damage: \"flag\" is no kind"),
+            "{:?}",
+            d.notes
+        );
+        assert!(
+            d.notes[2].starts_with("line 1") && d.notes[2].contains(": rule 1: "),
+            "{:?}",
+            d.notes
+        );
+        // One with nothing wrong reads the same either way, and what is
+        // no TOML is an error either way.
+        let strict = Description::parse(DESCRIPTION, &script).unwrap();
+        let kept = Description::read(DESCRIPTION, &script).unwrap();
+        assert_eq!(
+            (&kept.columns, &kept.rules, &kept.rows),
+            (&strict.columns, &strict.rules, &strict.rows)
+        );
+        assert!(Description::read("[columns", &script).is_err());
+        assert!(Description::read("columns = 3\nrules = 4\n", &script).unwrap().notes.len() == 2);
+    }
+
+    #[test]
+    fn uppercase_extensions_strip_case_insensitively() {
+        assert!(game_description("SPELLS.2DA").is_some());
+        assert!(names_table("LOOT_*.2DA", "loot_a"));
+        let script = |name: &str| {
+            if name == "INC_FOO" || name == "inc_foo" {
+                Some(b"#include \"INC_BAR.NSS\"\nconst int X = 1;\n".to_vec())
+            } else if name == "inc_bar" {
+                Some(b"const int Y = 2;\n".to_vec())
+            } else {
+                None
+            }
+        };
+        let d = Description::read(
+            "[columns.Kind]\nkind = \"list\"\nconstants = \"INC_FOO.NSS\"\n[columns.Ref]\nkind = \"row\"\ntable = \"CLS_FEAT.2DA\"\n",
+            &script,
+        )
+        .unwrap();
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+        let ref_kind = d.columns.iter().find(|(n, _)| n == "Ref").map(|(_, c)| &c.kind);
+        assert_eq!(ref_kind, Some(&Kind::Row("cls_feat".into())));
     }
 }

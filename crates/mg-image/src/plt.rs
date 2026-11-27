@@ -42,6 +42,25 @@ pub const PALETTES: [&str; 10] = [
     "pal_tattoo01",
 ];
 
+/// A texture name drawn without the material (MTR) of that name, as the
+/// renderer's assets take it (`mg_render::Assets::texture`): `name!`,
+/// before any colours ([`colored_name`]). The game draws a body part's
+/// own name so on the part's meshes that name another texture
+/// (`part_textures_look` in mg-corpus-tests' `client_render`, row J),
+/// where a texture replacement's new name is drawn through its MTR.
+pub fn plain_name(name: &str) -> String {
+    format!("{name}!")
+}
+
+/// A texture name, and whether it is to be drawn without its material
+/// ([`plain_name`]).
+pub fn split_plain(name: &str) -> (&str, bool) {
+    match name.strip_suffix('!') {
+        Some(n) => (n, true),
+        None => (name, false),
+    }
+}
+
 /// A texture name with PLT colours (layer order), as the renderer's
 /// assets take it (`mg_render::Assets::texture`): `name#c0,c1,…,c9`.
 pub fn colored_name(name: &str, colors: [u8; 10]) -> String {
@@ -64,20 +83,47 @@ pub struct Plt {
     pub height: u32,
     /// (grey, layer) per pixel.
     pub pixels: Vec<[u8; 2]>,
+    /// The header's bytes 8 to 15, which nwn.wiki calls unused: 10 and 0
+    /// in most of the game's files, another from 1 to 11 in some (62 of
+    /// its 500 `pmh0_` parts), not their layer count. Kept as read,
+    /// so a file written back is the same bytes.
+    pub header: [u8; 8],
 }
 
+/// The header bytes 8 to 15 that [`Plt::new`] writes, as most of the
+/// game's files have them.
+pub const HEADER: [u8; 8] = [10, 0, 0, 0, 0, 0, 0, 0];
+
 impl Plt {
+    /// A PLT of `width`×`height` (shade, layer) pixels, rows bottom first,
+    /// with the usual header ([`HEADER`]).
+    pub fn new(width: u32, height: u32, pixels: Vec<[u8; 2]>) -> Plt {
+        Plt { width, height, pixels, header: HEADER }
+    }
+
+    /// The file: its header (`PLT V1  `, [`header`](Self::header), width,
+    /// height) and two bytes a pixel.
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = b"PLT V1  ".to_vec();
+        out.extend_from_slice(&self.header);
+        out.extend_from_slice(&self.width.to_le_bytes());
+        out.extend_from_slice(&self.height.to_le_bytes());
+        self.pixels.iter().for_each(|p| out.extend_from_slice(p));
+        out
+    }
+
     pub fn read(data: &[u8]) -> Result<Plt, ImageError> {
         if !data.starts_with(b"PLT V1  ") {
             return Err(ImageError::NotPlt);
         }
-        let mut r = Reader::at(data, 16)?;
+        let mut r = Reader::at(data, 8)?;
+        let header = r.array::<8>()?;
         let width = r.u32()?;
         let height = r.u32()?;
         check_size(width, height)?;
         let bytes = r.bytes(width as usize * height as usize * 2)?;
         let pixels = bytes.as_chunks::<2>().0.to_vec();
-        Ok(Plt { width, height, pixels })
+        Ok(Plt { width, height, pixels, header })
     }
 
     /// The layers the image uses.
@@ -174,6 +220,18 @@ mod tests {
         assert_eq!((grey.pixel(0, 0), grey.pixel(1, 0)), ([0, 0, 0, 255], [255, 255, 255, 255]));
     }
 
+    /// What is written reads back, its header word kept.
+    #[test]
+    fn a_plt_written_reads_back() {
+        let pixels: Vec<[u8; 2]> = (0..12u8).map(|i| [i * 20, i % 10]).collect();
+        let mut plt = Plt::new(4, 3, pixels);
+        assert_eq!(Plt::read(&plt.write()).unwrap(), plt);
+        plt.header[0] = 6;
+        let f = plt.write();
+        assert_eq!(&f[..12], b"PLT V1  \x06\0\0\0");
+        assert_eq!(Plt::read(&f).unwrap().header[0], 6);
+    }
+
     /// Every prefix of a PLT is an error (and never a panic); the whole
     /// file reads.
     #[test]
@@ -183,7 +241,9 @@ mod tests {
             f.extend_from_slice(&v.to_le_bytes());
         }
         f.extend((0..12u8).map(|i| i % 10));
-        assert_eq!(Plt::read(&f).unwrap().pixels.len(), 6);
+        let plt = Plt::read(&f).unwrap();
+        assert_eq!(plt.pixels.len(), 6);
+        assert_eq!(plt.write(), f, "written back the same bytes");
         for len in 0..f.len() {
             assert!(Plt::read(&f[..len]).is_err(), "{len}");
         }

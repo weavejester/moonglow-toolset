@@ -2,8 +2,7 @@
 //! `docs/plugins/examples` run, and the API reference and the editor's type
 //! file name everything a plugin can use.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -11,10 +10,11 @@ use mg_edit::{Command, Workspace};
 use mg_gff::{Gff, Struct, Value};
 use mg_module::Module;
 use mg_plugin::{
-    Answer, Host, Input, Level, Plugin, Question, api_names, discover, inspect, run_check,
-    run_command,
+    Answer, Input, Plugin, Question, api_names, discover, inspect, run_check, run_command,
 };
 use mg_resman::ResKey;
+
+use crate::common::TestHost;
 
 fn docs() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs")
@@ -51,25 +51,6 @@ fn module() -> Module {
     m
 }
 
-/// A host that keeps the log and answers from a list.
-#[derive(Default)]
-struct TestHost {
-    log: RefCell<Vec<String>>,
-    answers: RefCell<VecDeque<Option<Answer>>>,
-    asked: RefCell<Vec<Question>>,
-}
-
-impl Host for TestHost {
-    fn log(&self, _: Level, text: &str) {
-        self.log.borrow_mut().push(text.to_string());
-    }
-
-    fn ask(&self, question: &Question) -> Option<Answer> {
-        self.asked.borrow_mut().push(question.clone());
-        self.answers.borrow_mut().pop_front().flatten()
-    }
-}
-
 fn input(module: &Module) -> Input {
     Input::new(module.clone(), None)
 }
@@ -90,12 +71,17 @@ fn every_example_registers_what_it_declares() {
         [
             "example.builder-tags",
             "example.creature-report",
+            "example.creature-sheet",
             "example.hello",
             "example.house-rules",
+            "example.module-overview",
+            "example.pick-tint",
             "example.set-local",
             "example.store-markup",
+            "example.store-wizard",
             "example.tag-conventions",
-            "example.tileset-import"
+            "example.tileset-import",
+            "example.tint-panel"
         ]
     );
 }
@@ -107,7 +93,7 @@ fn hello_is_the_plugin_of_the_manual() {
     let host = Rc::new(TestHost::default());
     let outcome = run_command(&plugin, "count", input(&module()), host.clone()).unwrap();
     assert!(outcome.edits.is_empty());
-    assert_eq!(host.log.borrow().as_slice(), ["The module has 2 creature blueprints"]);
+    assert_eq!(host.log_texts(), ["The module has 2 creature blueprints"]);
 
     // Asked, and answered no: nothing. Yes: every creature's comment.
     let outcome = run_command(&plugin, "stamp", input(&module()), host.clone()).unwrap();
@@ -151,7 +137,7 @@ fn tag_conventions_fixes_what_its_check_finds() {
 
     let outcome = run_command(&plugin, "fix-tags", input(&module()), host.clone()).unwrap();
     assert_eq!(outcome.label, "Upper-case creature tags");
-    assert_eq!(host.log.borrow().as_slice(), ["1 creature tags changed"]);
+    assert_eq!(host.log_texts(), ["1 creature tags changed"]);
     let mut ws = Workspace::new(module());
     ws.apply(Command::new(outcome.label, outcome.edits)).unwrap();
     ws.flush().unwrap();
@@ -187,6 +173,43 @@ fn tag_conventions_passes_its_own_tests() {
     }
     for line in ["local fix = ctx.fix(\"Upper-case this tag\")", "fix = fix,"] {
         assert!(guide.contains(line), "the manual lacks main.luau's line {line:?}");
+    }
+}
+
+/// The examples of API 0.6, an exporter and an importer, a wizard and a
+/// panel: their own tests pass (an export's file, an import's edits, the
+/// wizard's pages answered and refused, what the panel shows), and the
+/// manual shows their code as it is.
+#[test]
+fn the_examples_of_0_6_pass_their_own_tests() {
+    let guide = std::fs::read_to_string(docs().join("manual/16-writing-plugins.md")).unwrap();
+    let examples: [(&str, usize, &[&str]); 3] = [
+        (
+            "creature-sheet",
+            4,
+            &[
+                "mg.exporter(\"creatures-csv\", function(ctx, out)",
+                "    out:write(csv.write(rows))",
+                "mg.importer(\"creatures-csv\", function(ctx, file)",
+            ],
+        ),
+        ("store-wizard", 4, &["mg.wizard(\"new-store\", {", "    finish = function(ctx, answers)"]),
+        (
+            "module-overview",
+            3,
+            &["mg.panel(\"overview\", function(ctx)", "refresh = \"edits, selection\""],
+        ),
+    ];
+    for (name, tests, lines) in examples {
+        let plugin = example(name);
+        assert_eq!(plugin.manifest.api, "0.6", "{name}");
+        let results = mg_plugin::run_tests(&plugin, None, &|_, _| Ok(None));
+        assert_eq!(results.len(), tests, "{name}: {results:#?}");
+        assert!(results.iter().all(|r| r.passed()), "{name}: {results:#?}");
+        assert!(mg_plugin::test_faults(&plugin).is_empty(), "{name}");
+        for line in lines {
+            assert!(guide.contains(line), "the manual lacks {name}'s line {line:?}");
+        }
     }
 }
 
@@ -269,7 +292,7 @@ fn store_markup_sets_what_its_form_says() {
     };
     assert_eq!(prices("smith.utm"), (Some(Value::Int(200)), Some(Value::Int(40))));
     assert_eq!(prices("fence.utm"), (Some(Value::Int(120)), Some(Value::Int(60))));
-    assert_eq!(host.log.borrow().as_slice(), ["1 of 2 stores set to sell at 200% and buy at 40%"]);
+    assert_eq!(host.log_texts(), ["1 of 2 stores set to sell at 200% and buy at 40%"]);
 
     // The form closed: nothing changes.
     let host = Rc::new(TestHost::default());
@@ -291,6 +314,287 @@ fn store_markup_sets_what_its_form_says() {
 /// API 0.4: commands for what was right-clicked. A local variable set on
 /// a placed object and a blueprint (one of that name replaced), the
 /// game's blueprint left alone; and an area's objects counted.
+/// A color field (API 0.8): the form asks for a color, starting from the
+/// placeable's own, which the window draws on the placeables while it is
+/// picked (its `variable`); what comes back, `"#rrggbb"`, is set.
+#[test]
+fn pick_tint_asks_for_a_color_and_sets_it() {
+    use mg_core::ResRef;
+    use mg_plugin::{FieldKind, Selected, Selection};
+    use mg_rules::ObjectKind;
+    let plugin = example("pick-tint");
+    let mut m = module();
+    let mut git = Gff::new(*b"GIT ");
+    let mut rug = Struct::new(9);
+    rug.set("Tag", Value::String(b"RUG".to_vec()));
+    let mut var = Struct::new(0);
+    var.set("Name", Value::String(b"tdod_tint".to_vec()));
+    var.set("Type", Value::Dword(3));
+    var.set("Value", Value::String(b"#2a4d8f".to_vec()));
+    rug.set("VarTable", Value::List(vec![var]));
+    git.root.set("Placeable List", Value::List(vec![rug]));
+    m.set_gff(key("tavern.git"), &git).unwrap();
+    let area = ResRef::from_str("tavern").unwrap();
+    let selection = Selection {
+        selected: vec![Selected::Object { area, kind: ObjectKind::Placeable, index: 0 }],
+        ..Default::default()
+    };
+    let host = Rc::new(TestHost::default());
+    let values = BTreeMap::from([("tint".to_string(), serde_json::json!("#ff0000"))]);
+    host.answers.borrow_mut().push_back(Some(Answer::Values(values)));
+    let outcome =
+        run_command(&plugin, "pick-tint", Input { selection, ..input(&m) }, host.clone()).unwrap();
+    let Question::Form { fields, .. } = &host.asked.borrow()[0] else { panic!("no form") };
+    assert_eq!(
+        fields[0].kind,
+        FieldKind::Color { default: [0x2a, 0x4d, 0x8f], variable: Some("tdod_tint".into()) }
+    );
+    assert_eq!(outcome.label, "Tint #ff0000");
+    let mut ws = Workspace::new(m);
+    ws.apply(Command::new(outcome.label, outcome.edits)).unwrap();
+    let g = ws.doc(&key("tavern.git")).unwrap();
+    let vars = g.root.list("Placeable List").unwrap()[0].list("VarTable").unwrap();
+    assert_eq!(vars.len(), 1, "replaced");
+    assert_eq!(vars[0].string("Value"), Some(&b"#ff0000"[..]));
+}
+
+/// A panel's fields (API 0.9), the example `tint-panel`: its own tests
+/// pass (the selected placeable's tint in a color field with its
+/// `variable` and its command, a choice of named tints each with its
+/// swatch, and the commands run with the panel's values, `ctx.values`);
+/// and what its panel returns is read as the window draws it.
+#[test]
+fn tint_panel_shows_the_tint_in_its_fields_and_sets_it() {
+    use mg_core::ResRef;
+    use mg_plugin::{Choice, Element, FieldKind, Selected, Selection};
+    use mg_rules::ObjectKind;
+    let plugin = example("tint-panel");
+    assert_eq!(plugin.manifest.api, "0.9");
+    let results = mg_plugin::run_tests(&plugin, None, &|_, _| Ok(None));
+    assert_eq!(results.len(), 7, "{results:#?}");
+    assert!(results.iter().all(|r| r.passed()), "{results:#?}");
+    assert!(mg_plugin::test_faults(&plugin).is_empty());
+
+    let mut m = module();
+    let mut git = Gff::new(*b"GIT ");
+    let mut rug = Struct::new(9);
+    rug.set("Tag", Value::String(b"RUG".to_vec()));
+    let mut var = Struct::new(0);
+    var.set("Name", Value::String(b"tdod_tint".to_vec()));
+    var.set("Type", Value::Dword(3));
+    var.set("Value", Value::String(b"#A01010".to_vec()));
+    rug.set("VarTable", Value::List(vec![var]));
+    git.root.set("Placeable List", Value::List(vec![rug]));
+    m.set_gff(key("tavern.git"), &git).unwrap();
+    let area = ResRef::from_str("tavern").unwrap();
+    let selection = Selection {
+        selected: vec![Selected::Object { area, kind: ObjectKind::Placeable, index: 0 }],
+        ..Default::default()
+    };
+    let host = Rc::new(TestHost::default());
+    let shown =
+        mg_plugin::run_panel(&plugin, "tint", Input { selection, ..input(&m) }, host).unwrap();
+    let fields: Vec<_> = (shown.elements.iter())
+        .filter_map(|e| match e {
+            Element::Field { field, command } => Some((field, command.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fields.len(), 2);
+    let (tint, command) = &fields[0];
+    assert_eq!(
+        (tint.id.as_str(), tint.label.as_str(), *command),
+        ("tint", "Tint", Some("set-tint"))
+    );
+    assert_eq!(
+        tint.kind,
+        FieldKind::Color { default: [0xa0, 0x10, 0x10], variable: Some("tdod_tint".into()) }
+    );
+    let (named, command) = &fields[1];
+    assert_eq!(*command, Some("set-preset"));
+    let FieldKind::Choice { choices, default } = &named.kind else { panic!("{named:?}") };
+    assert_eq!(choices[0], Choice::text("Custom"), "text alone: no swatch");
+    assert_eq!(choices[1], Choice { text: "Crimson".into(), color: Some([0xa0, 0x10, 0x10]) });
+    assert_eq!(choices.len(), 5);
+    assert_eq!(*default, 1, "its own, by its text");
+    assert_eq!(named.kind.default_value(), serde_json::json!("Crimson"));
+
+    // The manual shows its code as it is.
+    let guide = std::fs::read_to_string(docs().join("manual/16-writing-plugins.md")).unwrap();
+    for (file, line) in [
+        ("plugin.cfg", "hint = \"The tint of the placed placeables selected\""),
+        ("main.luau", "            kind = \"color\","),
+        ("main.luau", "            variable = VARIABLE,"),
+        ("main.luau", "            command = \"set-tint\","),
+        ("main.luau", "mg.command(\"set-tint\", function(ctx)"),
+        ("main.luau", "    if not ctx.values.tint then"),
+    ] {
+        let text = std::fs::read_to_string(plugin.dir.join(file)).unwrap();
+        assert!(text.lines().any(|l| l == line), "{file} lacks {line:?}");
+        assert!(guide.contains(line), "the manual lacks {file}'s line {line:?}");
+    }
+}
+
+/// `ctx.values` is the values a command is run with, by field id as a
+/// form's come back; a command run from anywhere else gets an empty table.
+#[test]
+fn ctx_values_is_what_the_command_is_run_with() {
+    let dir = mg_testkit::scratch_dir("plugin-ctx-values");
+    std::fs::write(
+        dir.join("plugin.cfg"),
+        "[plugin]\nid = \"t.values\"\nname = \"t\"\nversion = \"1.0.0\"\napi = \"0.9\"\nlicense = \"MIT\"\n\n\
+         [command]\nid = \"go\"\ntitle = \"Go\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.luau"),
+        "local mg = require(\"@moonglow\")\nmg.command(\"go\", function(ctx)\n  \
+         local n = 0\n  for _ in ctx.values do n += 1 end\n  \
+         ctx.log:info(`{n} {ctx.values.tint} {ctx.values.count} {ctx.values.on}`)\nend)\n",
+    )
+    .unwrap();
+    let plugin = Plugin::load(&dir).unwrap();
+    let host = Rc::new(TestHost::default());
+    run_command(&plugin, "go", input(&module()), host.clone()).unwrap();
+    let values = BTreeMap::from([
+        ("tint".to_string(), serde_json::json!("#ff8000")),
+        ("count".to_string(), serde_json::json!(3.5)),
+        ("on".to_string(), serde_json::json!(true)),
+    ]);
+    run_command(&plugin, "go", Input { values, ..input(&module()) }, host.clone()).unwrap();
+    assert_eq!(host.log_texts(), ["0 nil nil nil", "3 #ff8000 3.5 true"]);
+}
+
+/// What a panel's field is held to: a `kind`, its `value` (not a form's
+/// `default`), an id of its own, a command the manifest declares; a
+/// choice's options text or `{ text, color }` with a color `"#rrggbb"`.
+#[test]
+fn a_panel_s_fields_are_checked() {
+    let dir = mg_testkit::scratch_dir("plugin-panel-fields");
+    std::fs::write(
+        dir.join("plugin.cfg"),
+        "[plugin]\nid = \"t.fields\"\nname = \"t\"\nversion = \"1.0.0\"\napi = \"0.9\"\nlicense = \"MIT\"\n\n\
+         [panel]\nid = \"p\"\ntitle = \"P\"\n\n[command]\nid = \"go\"\ntitle = \"Go\"\n",
+    )
+    .unwrap();
+    let cases: [(&str, &str); 7] = [
+        (r##"{ type = "field", id = "a", value = "x" }"##, "kind = \"text\""),
+        (r##"{ type = "field", kind = "text", id = "a", default = "x" }"##, "not default"),
+        (r##"{ type = "field", kind = "slider", id = "a" }"##, "not \"slider\""),
+        (
+            r##"{ type = "field", kind = "check", id = "a" }, { type = "field", kind = "text", id = "a" }"##,
+            "two fields \"a\"",
+        ),
+        (
+            r##"{ type = "field", kind = "check", id = "a", command = "nope" }"##,
+            "no command \"nope\"",
+        ),
+        (
+            r##"{ type = "field", kind = "choice", id = "a", choices = { { color = "#ff0000" } } }"##,
+            "{ text = \"…\", color = \"#rrggbb\" }",
+        ),
+        (
+            r##"{ type = "field", kind = "choice", id = "a", choices = { { text = "Red", color = "red" } } }"##,
+            "\"Red\"'s color is \"#rrggbb\", not \"red\"",
+        ),
+    ];
+    for (elements, said) in cases {
+        std::fs::write(
+            dir.join("main.luau"),
+            format!(
+                "local mg = require(\"@moonglow\")\nmg.panel(\"p\", function(ctx) return {{ {elements} }} end)\n\
+                 mg.command(\"go\", function(ctx) end)\n"
+            ),
+        )
+        .unwrap();
+        let plugin = Plugin::load(&dir).unwrap();
+        let host = Rc::new(TestHost::default());
+        let e = mg_plugin::run_panel(&plugin, "p", input(&module()), host).unwrap_err();
+        assert!(e.to_string().contains(said), "{elements}: {e}");
+    }
+    // Each kind, its value as given, its command; texts as a test reads them.
+    std::fs::write(
+        dir.join("main.luau"),
+        "local mg = require(\"@moonglow\")\nmg.panel(\"p\", function(ctx) return {\n  \
+         { type = \"field\", kind = \"text\", id = \"t\", label = \"Name\", value = \"Rug\", command = \"go\" },\n  \
+         { type = \"field\", kind = \"number\", id = \"n\", value = 4, min = 1, max = 9 },\n  \
+         { type = \"field\", kind = \"check\", id = \"c\", label = \"On\", value = true },\n  \
+         { type = \"field\", kind = \"color\", id = \"k\", label = \"Tint\", value = \"#FF8000\" },\n  \
+         { type = \"field\", kind = \"choice\", id = \"h\", label = \"Hue\", choices = { \"Red\", { text = \"Blue\", color = \"#0000ff\" } }, value = \"Blue\" },\n\
+         } end)\nmg.command(\"go\", function(ctx) end)\n",
+    )
+    .unwrap();
+    let plugin = Plugin::load(&dir).unwrap();
+    let host = Rc::new(TestHost::default());
+    let shown = mg_plugin::run_panel(&plugin, "p", input(&module()), host).unwrap();
+    assert_eq!(shown.texts(), ["Name: Rug", "n: 4", "On: true", "Tint: #ff8000", "Hue: Blue"]);
+    let mg_plugin::Element::Field { command, .. } = &shown.elements[0] else { panic!() };
+    assert_eq!(command.as_deref(), Some("go"));
+    let mg_plugin::Element::Field { command, .. } = &shown.elements[1] else { panic!() };
+    assert_eq!(*command, None);
+}
+
+/// A form's choice may have swatches too (API 0.9): an option `{ text,
+/// color }`, its value the text.
+#[test]
+fn a_form_s_choice_may_have_swatches() {
+    use mg_plugin::{Choice, FieldKind};
+    let dir = mg_testkit::scratch_dir("plugin-form-swatches");
+    std::fs::write(
+        dir.join("plugin.cfg"),
+        "[plugin]\nid = \"t.swatches\"\nname = \"t\"\nversion = \"1.0.0\"\napi = \"0.9\"\nlicense = \"MIT\"\n\n\
+         [command]\nid = \"go\"\ntitle = \"Go\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.luau"),
+        "local mg = require(\"@moonglow\")\nmg.command(\"go\", function(ctx)\n  \
+         local a = ctx.ui:form({ fields = { { id = \"h\", type = \"choice\", default = \"Blue\", \
+         choices = { \"Red\", { text = \"Blue\", color = \"#0000FF\" } } } } })\n  \
+         ctx.log:info(a.h)\nend)\n",
+    )
+    .unwrap();
+    let plugin = Plugin::load(&dir).unwrap();
+    let host = Rc::new(TestHost::default());
+    let values = BTreeMap::from([("h".to_string(), serde_json::json!("Red"))]);
+    host.answers.borrow_mut().push_back(Some(Answer::Values(values)));
+    run_command(&plugin, "go", input(&module()), host.clone()).unwrap();
+    let Question::Form { fields, .. } = &host.asked.borrow()[0] else { panic!("no form") };
+    assert_eq!(
+        fields[0].kind,
+        FieldKind::Choice {
+            choices: vec![
+                Choice::text("Red"),
+                Choice { text: "Blue".into(), color: Some([0, 0, 255]) }
+            ],
+            default: 1,
+        }
+    );
+    assert_eq!(host.log_texts(), ["Red"]);
+}
+
+/// A color field's default is `"#rrggbb"`; anything else is said.
+#[test]
+fn a_color_field_s_default_is_checked() {
+    let dir = mg_testkit::scratch_dir("plugin-color-default");
+    std::fs::write(
+        dir.join("plugin.cfg"),
+        "[plugin]\nid = \"t.color\"\nname = \"t\"\nversion = \"1.0.0\"\napi = \"0.8\"\nlicense = \"MIT\"\n\n\
+         [command]\nid = \"go\"\ntitle = \"Go\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.luau"),
+        "local mg = require(\"@moonglow\")\nmg.command(\"go\", function(ctx)\n  \
+         ctx.ui:form({ fields = { { id = \"c\", type = \"color\", default = \"blue\" } } })\nend)\n",
+    )
+    .unwrap();
+    let plugin = Plugin::load(&dir).unwrap();
+    let host = Rc::new(TestHost::default());
+    let e = run_command(&plugin, "go", input(&module()), host).unwrap_err();
+    assert!(e.to_string().contains("\"#rrggbb\", not \"blue\""), "{e}");
+}
+
 #[test]
 fn set_local_acts_on_the_selection() {
     use mg_core::ResRef;
@@ -329,6 +633,7 @@ fn set_local_acts_on_the_selection() {
             Selected::Blueprint(key("nw_chest.utp")),
         ],
         open: Some(Selected::Area(area)),
+        together: Vec::new(),
     };
     let host = Rc::new(TestHost::default());
     let values = BTreeMap::from([
@@ -342,10 +647,7 @@ fn set_local_acts_on_the_selection() {
     let Question::Form { title, .. } = &host.asked.borrow()[0] else { panic!("no form") };
     assert_eq!(title, "A local variable on 2 objects", "not the game's blueprint");
     assert_eq!(outcome.label, "Set role");
-    assert_eq!(
-        host.log.borrow().as_slice(),
-        ["CHEST: role = workbench", "gate_guard: role = workbench"]
-    );
+    assert_eq!(host.log_texts(), ["CHEST: role = workbench", "gate_guard: role = workbench"]);
     let mut ws = Workspace::new(m.clone());
     ws.apply(Command::new(outcome.label, outcome.edits)).unwrap();
     let vars = |ws: &mut Workspace, name: &str, at: Option<(&str, usize)>| {
@@ -370,14 +672,14 @@ fn set_local_acts_on_the_selection() {
 
     // The area right-clicked; else the one open.
     let host = Rc::new(TestHost::default());
-    let on = Selection { selected: vec![Selected::Area(area)], open: None };
+    let on = Selection { selected: vec![Selected::Area(area)], ..Default::default() };
     run_command(&plugin, "count-objects", Input { selection: on, ..input(&m) }, host.clone())
         .unwrap();
-    let opened = Selection { selected: vec![], open: Some(Selected::Area(area)) };
+    let opened = Selection { open: Some(Selected::Area(area)), ..Default::default() };
     run_command(&plugin, "count-objects", Input { selection: opened, ..input(&m) }, host.clone())
         .unwrap();
     assert_eq!(
-        host.log.borrow().as_slice(),
+        host.log_texts(),
         ["TAVERN: 1 placeables, 2 waypoints", "TAVERN: 1 placeables, 2 waypoints"]
     );
     // Nothing selected, no area open: it says so.
@@ -393,19 +695,18 @@ fn set_local_acts_on_the_selection() {
 /// from `classes.2da` and the talk table.
 #[test]
 fn creature_report_names_the_classes() {
-    let Some(root) = mg_testkit::nwn_root() else {
-        eprintln!("skipped: no game install");
-        return;
-    };
+    let root = mg_testkit::corpus!();
     let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = std::sync::Arc::new(mg_rules::GameData::open(&install).unwrap());
+    let rm = mg_testkit::shared_resman(&install).unwrap();
+    let tlk = std::sync::Arc::new(mg_rules::GameData::open_tlk(&install).unwrap());
+    let game = std::sync::Arc::new(mg_rules::GameData::with_shared_tlk(rm, tlk));
     let host = Rc::new(TestHost::default());
     let input = Input::new(module(), Some(game));
     let outcome =
         run_command(&example("creature-report"), "list-classes", input, host.clone()).unwrap();
     assert!(outcome.edits.is_empty());
     assert_eq!(
-        host.log.borrow().as_slice(),
+        host.log_texts(),
         [
             "captain.utc (CAPTAIN): Paladin 3",
             "guard.utc (gate_guard): Fighter 3",
@@ -427,6 +728,209 @@ fn the_reference_names_the_whole_api() {
     assert!(reference.contains(&format!("API {}", mg_plugin::API)));
     let changes = std::fs::read_to_string(docs().join("plugins/CHANGES.md")).unwrap();
     assert!(changes.contains(&format!("## {}", mg_plugin::API)));
+}
+
+/// A function's parameters: each one's name, and whether it may be left
+/// out.
+type Params = Vec<(String, bool)>;
+
+/// A parameter list (`a, b?` or `self: T, a: X, b: Y?`) split at its own
+/// commas (not those in a type's brackets): each parameter's name and
+/// whether it may be left out; `self` left out.
+fn parameters(list: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let (mut depth, mut part) = (0i32, String::new());
+    for c in list.chars().chain([',']) {
+        match c {
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                let p = part.trim();
+                let name = p.split(':').next().unwrap_or_default().trim().trim_end_matches('?');
+                // (A function's type may end in `?`, its result's: not
+                // the parameter's, unless the whole is bracketed.)
+                let ty = p.split_once(':').map_or("", |(_, t)| t.trim());
+                let optional = if ty.contains("->") {
+                    ty.starts_with('(') && ty.ends_with(")?")
+                } else {
+                    p.ends_with('?')
+                };
+                if !p.is_empty() && name != "self" && name != "..." {
+                    out.push((name.to_string(), optional));
+                }
+                part.clear();
+                continue;
+            }
+            _ => {}
+        }
+        part.push(c);
+    }
+    out
+}
+
+/// The text inside the brackets that open at `from` (just after its `(`).
+fn bracketed(text: &str) -> &str {
+    let mut depth = 1;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+/// What the reference's tables describe: each row's first code span, as a
+/// name (`ctx.module:gff`) and, where it is a call, its parameters.
+fn reference_rows(reference: &str) -> Vec<(String, Option<Params>)> {
+    let mut out = Vec::new();
+    for line in reference.lines() {
+        let Some(rest) = line.strip_prefix("| `") else { continue };
+        let Some(code) = rest.split('`').next() else { continue };
+        let (name, call) = match code.split_once('(') {
+            Some((name, args)) => (name, Some(parameters(bracketed(args)))),
+            None => (code, None),
+        };
+        // (A name of the API: words joined by dots or a colon.)
+        let named = name.contains(['.', ':'])
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.:".contains(c));
+        if named {
+            out.push((name.to_string(), call));
+        }
+    }
+    out
+}
+
+/// A function's parameters as the type file declares it: a member of a
+/// type (`gff: (self: Reader, name: string) -> …`) or one of `mg`'s
+/// (`function mg.image(bytes: string, kind: string?)`, or a table's
+/// member `parse = function(bytes: string)`).
+fn typed_parameters(types: &str, of: Option<&str>, member: &str) -> Option<Vec<(String, bool)>> {
+    let find = |within: &str, pattern: &str| {
+        within.find(pattern).map(|at| parameters(bracketed(&within[at + pattern.len()..])))
+    };
+    match of {
+        Some(of) => {
+            let block = type_block(types, of);
+            // (A member that only some have: `((self: …) -> …)?`.)
+            (find(block, &format!(" {member}: (("))
+                .or_else(|| find(block, &format!(" {member}: ("))))
+            .or_else(|| {
+                (matches!(of, "Game" | "Module"))
+                    .then(|| find(type_block(types, "Reader"), &format!(" {member}: (")))
+                    .flatten()
+            })
+        }
+        None => find(types, &format!("function mg.{member}(")).or_else(|| {
+            find(types, &format!(" {}= function(", member.rsplit('.').next()?.to_string() + " "))
+        }),
+    }
+}
+
+/// The reference, written by hand, held to the code where that can be
+/// done mechanically: every name it describes is one of the API's (as the
+/// code builds it), with its dot or colon; each function's parameters, and
+/// which may be left out, as the type file declares them (the code's own
+/// can't be read from it: Luau functions don't say); the events it lists
+/// are the manifest's, the kinds of setting the manifest takes, and the
+/// kinds of object a selection's `kind` names.
+#[test]
+fn the_reference_says_what_the_code_has() {
+    let reference = std::fs::read_to_string(docs().join("manual/17-plugin-api.md")).unwrap();
+    let types = std::fs::read_to_string(docs().join("plugins/types/moonglow.luau")).unwrap();
+    let names = api_names();
+    let rows = reference_rows(&reference);
+    assert!(rows.len() > 100, "{}", rows.len());
+    // Names: each one the API has. (What `mg.vars.describe` and
+    // `mg.twoda.describe` return, `d.`, is described as a value of theirs.)
+    let unknown: Vec<&String> = (rows.iter().map(|(n, _)| n))
+        .filter(|n| !n.starts_with("d.") && !n.starts_with("d:") && !names.contains(n))
+        .collect();
+    assert!(unknown.is_empty(), "the reference describes what the API hasn't: {unknown:?}");
+    // Parameters: as the type file declares them.
+    let of = |owner: &str| -> Option<&str> {
+        Some(match owner {
+            "ctx.module" => "Module",
+            "ctx.game" => "Game",
+            "ctx.edit" => "Edit",
+            "ctx.log" => "Log",
+            "ctx.ui" => "Ui",
+            "ctx.hak" => "Hak",
+            "ctx.terrain" => "Terrain",
+            "ctx.settings" => "Settings",
+            "ctx.event" => "Event",
+            "area" => "Area",
+            "folder" => "Folder",
+            "image" => "Image",
+            "out" => "Out",
+            "twoda" => "TwoDa",
+            "tlk" => "Tlk",
+            _ => return None,
+        })
+    };
+    let mut differ = Vec::new();
+    let mut compared = 0;
+    for (name, call) in &rows {
+        let Some(said) = call else { continue };
+        let Some((owner, member)) = name.rsplit_once(['.', ':']) else { continue };
+        let typed = match owner {
+            "mg" | "mg.twoda" | "mg.tlk" | "mg.vars" => {
+                let member = name.strip_prefix("mg.").unwrap_or(name);
+                typed_parameters(&types, None, member)
+            }
+            "ctx" => typed_parameters(&types, Some("Context"), member),
+            owner => of(owner).and_then(|o| typed_parameters(&types, Some(o), member)),
+        };
+        let Some(typed) = typed else { continue };
+        compared += 1;
+        let shape = |p: &[(String, bool)]| p.iter().map(|(_, o)| *o).collect::<Vec<bool>>();
+        if shape(said) != shape(&typed) {
+            differ.push(format!("{name}: the reference {said:?}, the type file {typed:?}"));
+        }
+    }
+    assert!(compared > 60, "only {compared} functions compared");
+    assert!(differ.is_empty(), "parameters that differ:\n{}", differ.join("\n"));
+    // Kinds: the events, as the manifest names them, each a row of the
+    // table of events.
+    for kind in mg_plugin::EventKind::ALL {
+        assert!(
+            reference.contains(&format!("| `{}` ", kind.name())),
+            "the reference's events lack {}",
+            kind.name()
+        );
+    }
+    // The kinds of setting, as the manifest's error lists those it takes.
+    let refused = mg_plugin::Manifest::parse(
+        "[plugin]\nid = \"a.b\"\nname = \"x\"\nversion = \"1\"\napi = \"0.5\"\nlicense = \"MIT\"\n\
+         \n[setting]\nid = \"x\"\ntype = \"nothing\"\n",
+    )
+    .unwrap_err();
+    let list = refused.split("type is ").nth(1).unwrap().split(", not").next().unwrap();
+    let kinds: Vec<&str> = list.split([',', ' ']).filter(|k| !k.is_empty() && *k != "or").collect();
+    assert!(kinds.len() >= 8, "{kinds:?}");
+    let writing = std::fs::read_to_string(docs().join("manual/16-writing-plugins.md")).unwrap();
+    let settings_row = reference.lines().find(|l| l.starts_with("| `ctx.settings.<id>`")).unwrap();
+    for k in &kinds {
+        assert!(settings_row.contains(&format!("`{k}`")), "ctx.settings.<id> lacks {k}");
+        assert!(writing.contains(&format!("`\"{k}\"`")), "Writing plugins' [setting] lacks {k}");
+    }
+    // The kinds a selected entry is, as a command's `for` names them.
+    let kind_row = reference.lines().find(|l| l.starts_with("| `selected.kind`")).unwrap();
+    for t in mg_plugin::Target::all() {
+        assert!(
+            kind_row.contains(&format!("`\"{}\"`", t.name())),
+            "selected.kind lacks {}",
+            t.name()
+        );
+    }
 }
 
 /// The block of a type in the type file: from `export type NAME =` to the
@@ -472,6 +976,7 @@ fn the_type_file_has_the_whole_api() {
                     "fix" => "Fix",
                     "ctx.settings" => "Settings",
                     "ctx.event" => "Event",
+                    "out" => "Out",
                     "ctx" | "ctx.plugin" => "Context",
                     other => panic!("no type for {other}"),
                 };

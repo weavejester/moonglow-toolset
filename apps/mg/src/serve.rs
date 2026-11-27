@@ -202,14 +202,26 @@ fn same(a: &Path, b: &Path) -> bool {
 /// The server's name for a module: what `-module` takes, and the file in
 /// `modules`. (Lower case, the letters a resource name may have.)
 pub(crate) fn module_name(module: &Path) -> String {
-    let path = match module.file_name() {
-        Some(n) if n == "nasher.cfg" => module.parent().unwrap_or(module),
-        _ => module,
+    let is_nasher = module.file_name().is_some_and(|n| n == "nasher.cfg");
+    let dir_or_file = if is_nasher {
+        module.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."))
+    } else {
+        module
     };
-    let stem = match path.is_dir() {
-        true => path.file_name(),
-        false => path.file_stem(),
+    let resolved = if dir_or_file.file_name().is_none() {
+        dir_or_file.canonicalize().ok().or_else(|| {
+            let cur = std::env::current_dir().ok()?;
+            if dir_or_file.as_os_str().is_empty() || dir_or_file == Path::new(".") {
+                Some(cur)
+            } else {
+                cur.join(dir_or_file).canonicalize().ok()
+            }
+        })
+    } else {
+        None
     };
+    let path = resolved.as_deref().unwrap_or(dir_or_file);
+    let stem = if path.is_dir() || is_nasher { path.file_name() } else { path.file_stem() };
     let name: String = stem
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default()
@@ -228,6 +240,19 @@ fn place(from: &Path, to: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::hard_link(from, to).or_else(|_| std::fs::copy(from, to).map(|_| ()))
+}
+
+/// Saves a module's copy for a server as an archive at `to`, keeping no
+/// backup of the copy it takes the place of. (A `.bak` there that this
+/// save did not make is somebody's, and stays.)
+pub(crate) fn save_copy(m: &mut mg_module::Module, to: &Path) -> Result<()> {
+    let replaced = to.is_file();
+    m.save_as(&ModuleLocation::Archive(to.to_path_buf()))
+        .with_context(|| to.display().to_string())?;
+    if replaced {
+        let _ = std::fs::remove_file(to.with_extension("mod.bak"));
+    }
+    Ok(())
 }
 
 /// The user directory made ready: the module as an archive in `modules`,
@@ -254,15 +279,22 @@ pub(crate) fn prepare(
     // language): the server finds no other.
     let language = mg_core::Language::from_short_code(&gi.language);
     // (Or the project's an archive was built from, `mg watch`'s.)
-    let own_tlk = match (&tlk, m.project.as_deref(), project) {
-        (Some(name), Some(p), _) => mg_module::nasher::in_language(p.talk_tables(name)?, language),
-        (Some(name), None, Some(root)) if mg_module::nasher::Package::is_package(root) => {
-            let package = mg_module::nasher::Package::read(root)?;
-            let settings = mg_module::nasher::Settings::read(root);
-            let tables = mg_module::nasher::talk_tables(&package, &settings, name)?;
-            mg_module::nasher::in_language(tables, language)
-        }
-        _ => None,
+    let project_tlk = |table_name: &str| -> Result<_> {
+        Ok(match (m.project.as_deref(), project) {
+            (Some(p), _) => mg_module::nasher::in_language(p.talk_tables(table_name)?, language),
+            (None, Some(root)) if mg_module::nasher::Package::is_package(root) => {
+                let package = mg_module::nasher::Package::read(root)?;
+                let settings = mg_module::nasher::Settings::read(root);
+                let tables = mg_module::nasher::talk_tables(&package, &settings, table_name)?;
+                mg_module::nasher::in_language(tables, language)
+            }
+            _ => None,
+        })
+    };
+    let own_tlk = tlk.as_deref().map(&project_tlk).transpose()?.flatten();
+    let own_fem_tlk = match tlk.as_deref().filter(|t| mg_resman::named_file(t, "tlk").is_some()) {
+        Some(t) => project_tlk(&mg_module::talk::feminine(t))?,
+        None => None,
     };
     if matches!(m.location, Some(ModuleLocation::Archive(_))) {
         if !same(module, &target) {
@@ -276,7 +308,10 @@ pub(crate) fn prepare(
         // packed without them loads and does nothing). The folder or
         // project itself is not written.
         let mut rm = mg_resman::ResMan::for_game(gi)?;
-        let _ = m.stack_onto(&mut rm, gi);
+        let (_, wrong) = m.stack_onto(&mut rm, gi);
+        if let Some(e) = wrong {
+            return Err(e.into());
+        }
         let made_with = mg_module::build::made_with(Some(module), None, Some(&gi.root), &rm);
         let changed = mg_module::build::changed(&m, &crate::remembered(module, made_with), false);
         if !changed.is_empty() {
@@ -296,11 +331,16 @@ pub(crate) fn prepare(
             }
         }
         // (The server loads an archive only.)
-        m.save_as(&ModuleLocation::Archive(target.clone()))?;
-        let _ = std::fs::remove_file(target.with_extension("mod.bak"));
+        save_copy(&mut m, &target)?;
     }
     for hak in &haks {
-        let to = dir.join("hak").join(mg_resman::named_file(hak, "hak"));
+        // (A name with a folder in it is placed nowhere: `../x` would be
+        // a file outside the server's hak folder.)
+        let Some(file) = mg_resman::named_file(hak, "hak") else {
+            notes.push(format!("warning: {}", gi.hak_not_found(hak)));
+            continue;
+        };
+        let to = dir.join("hak").join(file);
         match gi.find_hak(hak) {
             Some(from) if !same(&from, &to) => place(&from, &to)?,
             Some(_) => {}
@@ -309,23 +349,44 @@ pub(crate) fn prepare(
         }
     }
     if let Some(tlk) = tlk {
-        let file = mg_resman::named_file(&tlk, "tlk");
-        let to = dir.join("tlk").join(&file);
-        if let Some(own) = own_tlk {
-            let bytes = own.tlk.to_bytes_as_nwn_tlk()?;
-            if !std::fs::read(&to).is_ok_and(|had| had == bytes) {
-                // (Not through a link to the player's own folder.)
-                let _ = std::fs::remove_file(&to);
-                std::fs::write(&to, bytes).with_context(|| to.display().to_string())?;
+        let mut place_tlk = |table_name: &str,
+                             own: Option<mg_module::nasher::TalkTable>,
+                             required: bool|
+         -> Result<()> {
+            let Some(file) = mg_resman::named_file(table_name, "tlk") else {
+                if required {
+                    notes.push(format!(
+                        "warning: talk table {table_name} not found: {}",
+                        mg_resman::NO_FILE_NAME
+                    ));
+                }
+                return Ok(());
+            };
+            let to = dir.join("tlk").join(&file);
+            if let Some(own) = own {
+                let bytes = own.tlk.to_bytes_as_nwn_tlk()?;
+                if !std::fs::read(&to).is_ok_and(|had| had == bytes) {
+                    // (Not through a link to the player's own folder.)
+                    let _ = std::fs::remove_file(&to);
+                    std::fs::write(&to, bytes).with_context(|| to.display().to_string())?;
+                }
+                notes.push(format!("talk table {table_name} made from {}", own.path.display()));
+                return Ok(());
             }
-            notes.push(format!("talk table {tlk} made from {}", own.path.display()));
-            return Ok((name, notes));
-        }
-        match gi.tlk_dirs().iter().map(|d| d.join(&file)).find(|p| p.is_file()) {
-            Some(from) if !same(&from, &to) => place(&from, &to)?,
-            Some(_) => {}
-            None if to.is_file() => {}
-            None => notes.push(format!("warning: talk table {tlk} not found")),
+            match gi.tlk_dirs().iter().map(|d| d.join(&file)).find(|p| p.is_file()) {
+                Some(from) if !same(&from, &to) => place(&from, &to)?,
+                Some(_) => {}
+                None if to.is_file() => {}
+                None if required => {
+                    notes.push(format!("warning: talk table {table_name} not found"));
+                }
+                None => {}
+            }
+            Ok(())
+        };
+        place_tlk(&tlk, own_tlk, true)?;
+        if mg_resman::named_file(&tlk, "tlk").is_some() {
+            place_tlk(&mg_module::talk::feminine(&tlk), own_fem_tlk, false)?;
         }
     }
     Ok((name, notes))
@@ -368,6 +429,74 @@ fn lines(reader: impl std::io::Read + Send + 'static) -> Receiver<String> {
 /// How long after a command the server has its answer ready to print.
 const NUDGE: Duration = Duration::from_millis(400);
 
+/// Refuses a server's user directory that is the player's own NWN folder
+/// (unless `real_user_dir` allows it) or lies in the game's: asked before
+/// anything is made or written under it, by every command that takes
+/// `--dir`.
+///
+/// `real_user_dir`: what `--real-user-dir` said, `None` for a command that
+/// has no such option.
+pub(crate) fn refuse_dir(gi: &GameInstall, dir: &Path, real_user_dir: Option<bool>) -> Result<()> {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let players =
+        (gi.user_dir.iter().cloned()).chain(mg_resman::default_user_dir()).find(|p| same(p, &dir));
+    if let Some(theirs) = players
+        && real_user_dir != Some(true)
+    {
+        let anyway = match real_user_dir {
+            Some(_) => " (pass --real-user-dir to serve from it anyway)",
+            None => "",
+        };
+        bail!(
+            "{} is your own NWN folder: a server there writes its vault, database and settings \
+             into it{anyway}",
+            theirs.display()
+        );
+    }
+    // (A folder not made yet is told by the nearest one above it that is.)
+    let mut there = Some(dir.as_path());
+    let real = loop {
+        let Some(at) = there else { break None };
+        match std::fs::canonicalize(at) {
+            Ok(real) => break Some(real),
+            Err(_) => there = at.parent(),
+        }
+    };
+    let root = std::fs::canonicalize(&gi.root).unwrap_or_else(|_| gi.root.clone());
+    if real.is_some_and(|d| d.starts_with(&root) || d.starts_with(&gi.root)) {
+        bail!("{} is in the game's own folder", dir.display());
+    }
+    Ok(())
+}
+
+/// What a line the server's console printed says: that the module loaded
+/// (`Ready`, `seconds` since `started`), that it could not (`failed`), and
+/// the line itself.
+fn console_events(line: String, started: Instant, failed: &mut bool) -> Vec<Event> {
+    let mut events = Vec::new();
+    if line.starts_with("Server: Module loaded") {
+        events.push(Event::Ready { seconds: started.elapsed().as_secs_f32() });
+    }
+    *failed |= line.contains("Unable to load module");
+    events.push(Event::Console(line));
+    events
+}
+
+/// The last of the console's lines, after the loop: reported as the loop
+/// does, so a load that came late is still a `Ready`.
+fn drain_console(
+    lines: impl Iterator<Item = String>,
+    started: Instant,
+    failed: &mut bool,
+    each: &mut dyn FnMut(&Event) -> Flow,
+) {
+    for line in lines {
+        for e in console_events(line, started, failed) {
+            each(&e);
+        }
+    }
+}
+
 /// Serves the module until `each` says to stop or the server ends.
 pub(crate) fn serve(
     gi: &GameInstall,
@@ -386,20 +515,7 @@ pub(crate) fn serve(
     };
     let dir = std::path::absolute(&dir).unwrap_or(dir);
     let caught = catch_interrupt();
-    let players =
-        (gi.user_dir.iter().cloned()).chain(mg_resman::default_user_dir()).find(|p| same(p, &dir));
-    if let Some(theirs) = players
-        && !c.real_user_dir
-    {
-        bail!(
-            "{} is your own NWN folder: a server there writes its vault, database and settings \
-             into it (pass --real-user-dir to serve from it anyway)",
-            theirs.display()
-        );
-    }
-    if std::fs::canonicalize(&dir).is_ok_and(|d| d.starts_with(&gi.root)) {
-        bail!("{} is in the game's own folder", dir.display());
-    }
+    refuse_dir(gi, &dir, Some(c.real_user_dir))?;
     let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
     for file in &c.env {
         let text = std::fs::read_to_string(file).with_context(|| file.display().to_string())?;
@@ -478,11 +594,7 @@ pub(crate) fn serve(
         let end = loop {
             let mut events = Vec::new();
             for line in console.try_iter() {
-                if line.starts_with("Server: Module loaded") {
-                    events.push(Event::Ready { seconds: started.elapsed().as_secs_f32() });
-                }
-                failed |= line.contains("Unable to load module");
-                events.push(Event::Console(line));
+                events.extend(console_events(line, started, &mut failed));
             }
             events.extend(engine.more().into_iter().filter(grave).map(Event::Engine));
             events.extend(log.more().into_iter().map(Event::Log));
@@ -538,9 +650,9 @@ pub(crate) fn serve(
             if let Some(status) = server.exited() {
                 // (What it said last.)
                 std::thread::sleep(Duration::from_millis(100));
-                for line in console.try_iter() {
-                    failed |= line.contains("Unable to load module");
-                    each(&Event::Console(line));
+                drain_console(console.try_iter(), started, &mut failed, each);
+                for line in engine.more().into_iter().filter(grave) {
+                    each(&Event::Engine(line));
                 }
                 for line in log.more() {
                     each(&Event::Log(line));
@@ -559,9 +671,7 @@ pub(crate) fn serve(
         server.stop(Duration::from_secs(5));
         // (What it said last, once its console has closed.)
         std::thread::sleep(Duration::from_millis(100));
-        for line in console.try_iter() {
-            each(&Event::Console(line));
-        }
+        drain_console(console.try_iter(), started, &mut failed, each);
         for line in engine.more().into_iter().filter(grave) {
             each(&Event::Engine(line));
         }
@@ -651,6 +761,23 @@ pub(crate) fn text(e: &Event) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The server's last lines, read after the loop has ended (at the
+    /// timeout, or at its exit), still tell that the module loaded.
+    #[test]
+    fn a_load_said_after_the_loop_is_still_ready() {
+        let lines = ["Server: Loading module", "Server: Module loaded", "Server: Exiting..."];
+        let mut seen = Vec::new();
+        let mut failed = false;
+        drain_console(lines.iter().map(|l| l.to_string()), Instant::now(), &mut failed, &mut |e| {
+            seen.push(json(e).unwrap()["event"].as_str().unwrap().to_string());
+            Flow::Continue
+        });
+        assert_eq!(seen, ["console", "ready", "console", "console"]);
+        assert!(!failed);
+        let mut e = console_events("Unable to load module x".into(), Instant::now(), &mut failed);
+        assert!(failed && matches!(e.pop(), Some(Event::Console(_))) && e.is_empty());
+    }
+
     #[test]
     fn a_module_s_name_for_the_server() {
         assert_eq!(module_name(Path::new("/x/Neverwinter Chess.mod")), "neverwinter_chess");
@@ -704,6 +831,40 @@ mod tests {
         assert_eq!(made.entries[0].text, b"Changed");
     }
 
+    /// A module whose hak and talk table are named with a folder in
+    /// them (`../x`): nothing is placed outside the server's `hak` and
+    /// `tlk` folders, and each is said not to be found.
+    #[test]
+    fn a_hak_named_with_a_folder_is_placed_nowhere() {
+        let Some(root) = mg_testkit::nwn_root() else { return };
+        let dir = mg_testkit::scratch_dir("mg-serve-hak-outside");
+        let user = dir.join("user");
+        for sub in ["hak", "tlk"] {
+            std::fs::create_dir_all(user.join(sub)).unwrap();
+        }
+        // (Where `<user>/hak/../x.hak` and `<user>/tlk/../y.tlk` are.)
+        std::fs::write(user.join("x.hak"), b"not the module's").unwrap();
+        std::fs::write(user.join("y.tlk"), b"not the module's").unwrap();
+        let gi = GameInstall::new(&root, Some(user.clone()), "en");
+        assert_eq!(gi.find_hak("../x"), None);
+        let mut m = mg_module::Module::new();
+        let mut info = mg_gff::Gff::new(*b"IFO ");
+        let mut hak = mg_gff::Struct::new(8);
+        hak.set("Mod_Hak", mg_gff::Value::String(b"../x".to_vec()));
+        info.root.set("Mod_HakList", mg_gff::Value::List(vec![hak]));
+        info.root.set("Mod_CustomTlk", mg_gff::Value::String(b"../y".to_vec()));
+        m.set_info(&info).unwrap();
+        let module = dir.join("outside.mod");
+        m.save_as(&ModuleLocation::Archive(module.clone())).unwrap();
+        let server = dir.join("server");
+        let (_, notes) = prepare(&gi, &module, &server, None).unwrap();
+        assert!(!server.join("x.hak").exists() && !server.join("y.tlk").exists());
+        let warned =
+            |what: &str| notes.iter().any(|n| n.contains(what) && n.contains("folder separator"));
+        assert!(warned("hak ../x not found") && warned("talk table ../y not found"), "{notes:?}");
+        assert_eq!(std::fs::read(user.join("x.hak")).unwrap(), b"not the module's");
+    }
+
     #[test]
     fn a_scratch_directory_is_the_module_s_own() {
         let module = |p: &str| Path::new(p).join(format!("a{}.mod", std::process::id()));
@@ -725,5 +886,97 @@ mod tests {
         let first = a.dir.clone();
         drop((a, again));
         assert_eq!(run_dir("serve", &module("/x")).dir, first);
+    }
+
+    #[test]
+    fn module_name_handles_dot_and_bare_nasher_cfg() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected: String = cwd
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        assert_eq!(module_name(Path::new(".")), expected);
+        assert_eq!(module_name(Path::new("nasher.cfg")), expected);
+    }
+
+    #[test]
+    fn prepare_places_optional_feminine_tlk_and_propagates_corrupt_hak() {
+        let Some(root) = mg_testkit::nwn_root() else { return };
+        let dir = mg_testkit::scratch_dir("mg-serve-fem-and-hak");
+        let _ = std::fs::remove_dir_all(&dir);
+        let user = dir.join("user");
+        for sub in ["tlk", "hak"] {
+            std::fs::create_dir_all(user.join(sub)).unwrap();
+        }
+        let gi = GameInstall::new(&root, Some(user.clone()), "en");
+
+        // Project JSON primary + feminine TLK.
+        let mut m = mg_module::Module::new();
+        let mut info = mg_gff::Gff::new(*b"IFO ");
+        info.root.set("Mod_CustomTlk", mg_gff::Value::String(b"mytlk".to_vec()));
+        m.set_info(&info).unwrap();
+        let project = dir.join("project");
+        m.save_as(&ModuleLocation::Project { root: project.clone(), target: "default".into() })
+            .unwrap();
+        let mut cfg = std::fs::read_to_string(project.join("nasher.cfg")).unwrap();
+        cfg.push_str(
+            "\n[target]\nname = \"tlk\"\nfile = \"mytlk.tlk\"\n  [target.sources]\n  include = \"src/tlk/*.json\"\n\
+             \n[target]\nname = \"tlkf\"\nfile = \"mytlkf.tlk\"\n  [target.sources]\n  include = \"src/tlk/*.json\"\n",
+        );
+        std::fs::write(project.join("nasher.cfg"), cfg).unwrap();
+        std::fs::create_dir_all(project.join("src/tlk")).unwrap();
+        std::fs::write(
+            project.join("src/tlk/mytlk.tlk.json"),
+            r#"{"language":0,"entries":[{"id":0,"text":"Ours"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("src/tlk/mytlkf.tlk.json"),
+            r#"{"language":0,"entries":[{"id":0,"text":"Fem"}]}"#,
+        )
+        .unwrap();
+        let server = dir.join("server_proj");
+        prepare(&gi, &project, &server, None).unwrap();
+        let fem =
+            mg_tlk::Tlk::read(&std::fs::read(server.join("tlk/mytlkf.tlk")).unwrap()).unwrap();
+        assert_eq!(fem.entries[0].text, b"Fem");
+
+        // Loose TLK files: copies <tlk>f.tlk when present, no warning when absent.
+        std::fs::write(user.join("tlk/loose.tlk"), b"male").unwrap();
+        std::fs::write(user.join("tlk/loosef.tlk"), b"female").unwrap();
+        let loose_mod = dir.join("loose.mod");
+        let mut lm = mg_module::Module::new();
+        let mut linfo = mg_gff::Gff::new(*b"IFO ");
+        linfo.root.set("Mod_CustomTlk", mg_gff::Value::String(b"loose".to_vec()));
+        lm.set_info(&linfo).unwrap();
+        lm.save_as(&ModuleLocation::Archive(loose_mod.clone())).unwrap();
+        let server2 = dir.join("server_loose");
+        let (_, notes) = prepare(&gi, &loose_mod, &server2, None).unwrap();
+        assert_eq!(std::fs::read(server2.join("tlk/loosef.tlk")).unwrap(), b"female");
+        assert!(!notes.iter().any(|n| n.contains("not found")), "{notes:?}");
+
+        std::fs::write(user.join("tlk/onlymale.tlk"), b"male").unwrap();
+        linfo.root.set("Mod_CustomTlk", mg_gff::Value::String(b"onlymale".to_vec()));
+        lm.set_info(&linfo).unwrap();
+        let male_mod = dir.join("male.mod");
+        lm.save_as(&ModuleLocation::Archive(male_mod.clone())).unwrap();
+        let (_, notes) = prepare(&gi, &male_mod, &dir.join("server_male"), None).unwrap();
+        assert!(!notes.iter().any(|n| n.contains("not found")), "{notes:?}");
+
+        // Module folder referencing a corrupt hak surfaces ResError.
+        std::fs::write(user.join("hak/corrupt.hak"), b"not an erf").unwrap();
+        let bad_dir = dir.join("bad_folder");
+        let mut bm = mg_module::Module::new();
+        let mut binfo = mg_gff::Gff::new(*b"IFO ");
+        let mut hak = mg_gff::Struct::new(8);
+        hak.set("Mod_Hak", mg_gff::Value::String(b"corrupt".to_vec()));
+        binfo.root.set("Mod_HakList", mg_gff::Value::List(vec![hak]));
+        bm.set_info(&binfo).unwrap();
+        bm.save_as(&ModuleLocation::Folder(bad_dir.clone())).unwrap();
+        assert!(prepare(&gi, &bad_dir, &dir.join("server_bad"), None).is_err());
     }
 }

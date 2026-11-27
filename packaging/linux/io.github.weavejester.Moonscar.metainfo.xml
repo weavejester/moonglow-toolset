@@ -59,6 +59,334 @@
         below this one are Moonglow's.</p>
       </description>
     </release>
+    <release version="5.4.0" date="2026-11-26">
+      <description>
+        <p>Plugin seeds for repeatable terrain (API 0.10), Compile All's
+        Details saying why each script was compiled and a warning for an
+        include with its own main, an Anti-aliasing setting, several
+        inventory items moved at once, Advanced Search editing objects
+        of several areas together, Custom Light flicker, the Area
+        Wizard in Aurora's three steps and zoom in the picture
+        viewer.</p>
+        <p>Game-data changes wait for the data instead of being lost,
+        grass and see-through surfaces take shadows, shiny water shows
+        a fountain's floor, textures take less memory, Verify checks
+        four more mistakes, and many windows are quicker. See the
+        release notes.</p>
+      </description>
+    </release>
+    <release version="5.3.0" date="2026-11-25">
+      <description>
+        <p>File, Export Changed Resources for what changed since the
+        module was opened, doors placed anywhere and not only on a
+        tile's door hooks, Focus Selection that frames an object's
+        model, a New button beside an empty Conversation field, and an
+        Areas group in the Module panel as tall as you drag it.</p>
+        <p>Closing a script with unsaved text asks first, every kind of
+        floating window keeps its pane sizes, Paint with no placeable
+        chosen works as Select Objects, and the interface says check
+        where it said tick. Adjust Location with several objects
+        selected no longer gives them all the first one's visual
+        transform. See the release notes.</p>
+      </description>
+    </release>
+    <release version="5.2.0" date="2026-11-24">
+      <description>
+        <p>Script Help back under the text, the error found as you type
+        shown whole, completion and tips that show a name's
+        declaration, Find in read-only texts, a right-click menu in
+        every text field, Copy and Copy All in every list of results,
+        Interface size up to 300% with View, Interface Size and zoom
+        keys, an option for Smooth scrolling, and colored icons.</p>
+        <p>The zoom keys now change the Interface size setting, a
+        comment after a declaration documents that declaration, and Go
+        to Definition opens a game script at the line. The script editor
+        is Moonglow's own and quick with very large scripts, large
+        modules and dense areas draw faster, and the tileset editor
+        saves names in Windows-1252, as the game reads them. See the
+        release notes.</p>
+      </description>
+    </release>
+    <release version="5.1.0" date="2026-11-23">
+      <description>
+        <p>An outline color of its own for each placed encounter
+        (Properties, Basic), Focus Selection (F or .), a triple click
+        on an object's row in the Module Tree or Outliner to open its
+        Properties, Hide Properties and Pop In, a Right Dock you can
+        rearrange, and a Resource Browser Type list that takes several
+        types.</p>
+        <p>A single click in the Module Tree no longer moves the
+        camera, Shift adds to the selection, and Adjust Location saves
+        as you go. Test Module starts a Steam copy through Steam only
+        when Options, Folders, Read Steam Workshop content is on. See
+        the release notes.</p>
+      </description>
+    </release>
+    <release version="5.0.0" date="2026-11-22">
+      <description>
+        <p>A new shell around every editor: a Top Bar with Quick Open
+        (Ctrl+P), docks at the left, right and bottom that hold the
+        panels of the editor in front, an Outliner, a Status Bar that
+        shows the keys and clicks at hand, editor groups side by side,
+        and editors that open as tabs or as windows (Options, General,
+        Open editors).</p>
+        <p>Every editor has one header row: an area's Properties, Tile
+        Properties and Edit Areas Together are in the Right Dock, and
+        Find, Build and Verify results in the Bottom Dock. Some behavior
+        changes on purpose: see the release notes.</p>
+      </description>
+    </release>
+    <release version="4.2.1" date="2026-11-14">
+      <description>
+        <p>A helmet is drawn in the PLT of its own name, as the game
+        draws it, and mg test reports an assertion made later (in a
+        DelayCommand) under the test that made it.</p>
+      </description>
+    </release>
+    <release version="4.2.0" date="2026-11-13">
+      <description>
+        <p>A new look on the same window layout: a Dark and a Light
+        theme (Options, General, Light theme), drawn icons in place of
+        the emoji, 22-point rows in every tree, list and table, and
+        windows that open taller to fit.</p>
+        <p>Closing with a changed hak asks of it by name and goes on;
+        Q or E during a long drag no longer stops the toolset; with a
+        tile in hand a press on an object picks it. Setup Area
+        Transition links triggers as Aurora does, with Connection
+        Type, and transitions drawn in Moonglow show in the game. A
+        WAVE holding MP3 plays, and Verify says which sounds the game
+        is silent on. mg ls --sha256 and mg cat --to are faster.</p>
+      </description>
+    </release>
+    <release version="4.1.0" date="2026-11-10">
+      <description>
+        <p>A body part is drawn in its own PLT, and effects worn as
+        tails and wings show their particles, as in the game. A color
+        TGA or DDS is drawn over a PLT of the same name, and a DXT1's
+        one-bit texels are opaque black with Shaders on.</p>
+        <p>New mg commands: texture convert, info, plt-split and
+        plt-join; cat --to for many resources in one run; --hak for
+        your own haks and folders; model info; 2da-set; ls --sha256.</p>
+      </description>
+    </release>
+    <release version="4.0.0" date="2026-11-10">
+      <description>
+        <p>The fixes of a review of the whole codebase: of its 349
+        findings, 348 are fixed whole or in part. Work is no longer lost
+        after an Undo past a save, by the module's Undo in a script's
+        unsaved text, or by an open window writing to the object that
+        took its object's place. Crafted tilesets, models, archives,
+        windows and plugins are bounded, and the window is faster in
+        long lists, large selections and Verify.</p>
+        <p>Some behavior changes on purpose: mg dialog-import replaces a
+        conversation only with --force; mg compile and mg nui generate
+        fail on a compile error; a recovery copy belongs to its window,
+        and a second Moonglow keeps its own; Alt + drag moves the view
+        in Paint, Select Tiles and with a tile brush; the built-in
+        manual follows its links; mg gff writes neverwinter.nim's
+        notation; files linked into development and override are
+        read, as the game reads them; Light Shadows need Creature
+        Shadows, as in the game.</p>
+      </description>
+    </release>
+    <release version="3.18.1" date="2026-11-09">
+      <description>
+        <p>Exact Tile places tile groups as they are and replaces a group
+        of one tile, such as Fort Interior's staircases.</p>
+      </description>
+    </release>
+    <release version="3.18.0" date="2026-11-08">
+      <description>
+        <p>The area toolbar's buttons can be hidden, Verify checks that a
+        material's textures are there, plugins get panels with fields,
+        and tooltips are short.</p>
+      </description>
+    </release>
+    <release version="3.17.0" date="2026-11-08">
+      <description>
+        <p>Lists take typed letters, the Appearance Gallery places by
+        click, and the area view works more like Aurora's: Alt + drag
+        raises the selection, Shift + right click steps a tile, Q and E
+        turn what is dragged.</p>
+      </description>
+    </release>
+    <release version="3.16.0" date="2026-11-08">
+      <description>
+        <p>A tint shows as it is picked, plugins get a color picker
+        (plugin API 0.8), a project can hide tilesets from the pickers,
+        and resizing a file dialog no longer crashes Moonglow on
+        macOS.</p>
+      </description>
+    </release>
+    <release version="3.15.2" date="2026-11-08">
+      <description>
+        <p>A project's commands are given MOONGLOW_MG, the path of the mg
+        that came with Moonglow.</p>
+      </description>
+    </release>
+    <release version="3.15.1" date="2026-11-07">
+      <description>
+        <p>The blueprint wizards no longer freeze at Assign Palette
+        Category in a category whose name has an "&amp;".</p>
+      </description>
+    </release>
+    <release version="3.15.0" date="2026-11-07">
+      <description>
+        <p>A Variables page in every Properties window, and questions that
+        keep coming up answered once for all (Options › General ›
+        Questions).</p>
+      </description>
+    </release>
+    <release version="3.14.1" date="2026-11-07">
+      <description>
+        <p>Edits in busy areas no longer stall: an edit reads again only
+        what it changed, and Q and E turn at once and make one step. Q and
+        E turn a paste before it is put down.</p>
+      </description>
+    </release>
+    <release version="3.14.0" date="2026-11-07">
+      <description>
+        <p>The Options window in sections, an option to hide the palettes'
+        empty categories, and plugin commands in submenus (plugin API
+        0.7).</p>
+      </description>
+    </release>
+    <release version="3.13.0" date="2026-11-07">
+      <description>
+        <p>A new release opens the update window, asking. Adjust Location
+        from the module tree, an option to hide its empty groups, and
+        Export's question with Append and Overwrite. A click passes a
+        locked object to the one behind it.</p>
+      </description>
+    </release>
+    <release version="3.12.2" date="2026-11-06">
+      <description>
+        <p>Export and Import open in the user folder's erf folder, as
+        Aurora's do, then in the folder last used.</p>
+      </description>
+    </release>
+    <release version="3.12.1" date="2026-11-06">
+      <description>
+        <p>nwn.ini's folder aliases are read through a Proton or Wine
+        prefix, and a switch in Options turns them off.</p>
+      </description>
+    </release>
+    <release version="3.12.0" date="2026-11-06">
+      <description>
+        <p>Find in Palette on inventory items; Billboard_to_Local_Z particles
+        lie flat as the game draws them; a creature's head stays on under a
+        robe whose row sets HIDEHEAD.</p>
+      </description>
+    </release>
+    <release version="3.11.0" date="2026-11-06">
+      <description>
+        <p>Edit › Change Tileset lays an area anew in another tileset, all the
+        rest of it kept; the NUI Creator's preview places a window's root group
+        as the game does; a folder typed with ~ is the home folder's.</p>
+      </description>
+    </release>
+    <release version="3.10.0" date="2026-11-06">
+      <description>
+        <p>The user folder's nwn.ini folder aliases are followed, as the game
+        follows them; shader values set on objects and The Domains of Dread's
+        color tints are drawn, with color pickers for the tints; mg
+        merge-claims merges a claims table in git by area; Verify on a
+        project counts its scripts that compile.</p>
+      </description>
+    </release>
+    <release version="3.9.2" date="2026-11-05">
+      <description>
+        <p>A resref typed takes letters, digits and underscores alone, in
+        lower case, as in Aurora; Verify finds an area's neighboring tiles
+        that don't fit together.</p>
+      </description>
+    </release>
+    <release version="3.9.1" date="2026-11-05">
+      <description>
+        <p>A window made of a tab dragged out of a pane, Module Properties
+        among them, is maximized by a double click on its bar and by its
+        Maximize button.</p>
+      </description>
+    </release>
+    <release version="3.9.0" date="2026-11-05">
+      <description>
+        <p>Several areas' minimaps are exported at once, and with their map
+        notes marked as the game's map marks them; the notice that the
+        game's shaders draw wrong can be hidden on a GPU where it says the
+        same every time; an area the module tree's Filter opened closes
+        again.</p>
+      </description>
+    </release>
+    <release version="3.8.1" date="2026-11-04">
+      <description>
+        <p>Crossers are painted as Aurora paints them: a click puts a
+        doorway in a wall, and a drag lays what the tileset has tiles for,
+        passing over the rest, where it had laid nothing.</p>
+      </description>
+    </release>
+    <release version="3.8.0" date="2026-11-04">
+      <description>
+        <p>Copy Set and Paste Set carry a script's parameters or a
+        blueprint's variables from one place to another without saving a
+        set. Edit Copy's Cancel takes the copy back, an option makes a
+        window's close cancel its changes as Aurora's does, and custom
+        bodies whose parts hang from a skeleton's own bones draw as the
+        game draws them.</p>
+      </description>
+    </release>
+    <release version="3.7.0" date="2026-11-04">
+      <description>
+        <p>Import Files and Import Folder bring loose scripts, blueprints,
+        conversations and areas into a module, choosing which of its own
+        to overwrite, and files dropped onto the window are imported the
+        same way. Several conversations can be exported at once as Ink,
+        Twine, text or CSV, from the module tree or mg dialog-export.</p>
+      </description>
+    </release>
+    <release version="3.6.0" date="2026-11-03">
+      <description>
+        <p>Bake Walkmesh to Transform gives a scaled or tilted placeable a
+        walkmesh that follows its shape, in the project's hak, with the
+        new placeables.2da rows written for the project's build; Verify
+        and mg bake-walkmesh go with it. The conversation editor keeps a
+        script's parameters as sets to reuse, Page Up and Page Down lift a
+        blueprint onto a surface before it is placed, and palette
+        groupings can sort their groups by name.</p>
+      </description>
+    </release>
+    <release version="3.5.0" date="2026-11-03">
+      <description>
+        <p>The palettes can be grouped more than one way: by their
+        categories, and by groupings a project defines in its project
+        file, such as what each blueprint is, with every blueprint type,
+        the search and the Gallery. mg find lists a group, and Verify
+        checks the groupings. An item icon that is only a DDS shows as the
+        game shows it.</p>
+      </description>
+    </release>
+    <release version="3.4.0" date="2026-11-02">
+      <description>
+        <p>Page Up and Page Down move the selected objects to the next
+        surface above or below them: a placeable's top, such as a
+        stall's counter, a floor or the ground. Adjust Location shows its
+        changes in the area view as they are typed. The module tree
+        stays where it was when an area or a Properties window closes,
+        and the kinds under an area close again while the Filter is
+        typed.</p>
+      </description>
+    </release>
+    <release version="3.3.0" date="2026-11-02">
+      <description>
+        <p>Moonglow installs its own updates, checked against the
+        project's signature. Text typed into names, descriptions and
+        conversations can go into the module's talk table. Edit Together
+        edits lists across several blueprints, and typing in very large
+        scripts keeps up. The 2DA editor, Advanced Search and the palettes
+        do more, plugins can add exporters, importers, wizards and panels
+        (plugin API 0.6), and shadows, see-through meshes, custom shaders
+        and textures draw closer to the game.</p>
+      </description>
+    </release>
     <release version="3.2.0" date="2026-11-01">
       <description>
         <p>The area view can draw the tile border past an area's edge, as

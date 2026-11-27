@@ -25,10 +25,40 @@ pub struct Copies {
     /// Tells one target's copies from another's (the game's bind groups
     /// are made for one).
     pub(crate) id: u64,
+    /// Gone with the copies: what the renderer keeps for their view
+    /// ([`crate::views`]) is dropped once they are.
+    pub(crate) alive: std::sync::Arc<()>,
 }
 
 /// The depth copy's format.
 pub(crate) const DEPTH_COPY: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
+/// The vertex program of a draw over the whole target (one triangle, of
+/// three vertices and no buffer): the framebuffer's copy, the shadows'
+/// darkening, the shadow volumes' depth copy and the watch's look.
+pub(crate) const FULLSCREEN_VS: &str = "\
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+";
+
+/// How the shaders that read the scene's depth by the texel
+/// (`textureLoad`: the copies here, the shadows' darkening, the shadow
+/// volumes' depth copy, the watch) bind it: as a float texture, not
+/// filterable, which a depth format allows. Not as a depth texture: naga's
+/// GLSL writer makes one a shadow sampler, which GLSL can't fetch a texel
+/// from, and wgpu's OpenGL back end refuses the pipeline ("WGSL
+/// `textureLoad` from depth textures is not supported in GLSL").
+pub(crate) const DEPTH_READ: wgpu::TextureSampleType =
+    wgpu::TextureSampleType::Float { filterable: false };
+
+/// The WGSL type those shaders declare the depth as ([`DEPTH_READ`]),
+/// for `samples` samples a pixel: a texel's depth is its first
+/// component (`textureLoad(…).x`).
+pub(crate) fn depth_read_type(samples: u32) -> &'static str {
+    if samples > 1 { "texture_multisampled_2d<f32>" } else { "texture_2d<f32>" }
+}
 
 impl Copies {
     pub(crate) fn new(
@@ -56,6 +86,7 @@ impl Copies {
             color: make("framebuffer colour", format),
             depth: make("framebuffer depth", DEPTH_COPY),
             id: NEXT.fetch_add(1, Ordering::Relaxed),
+            alive: Default::default(),
         }
     }
 }
@@ -71,28 +102,25 @@ pub(crate) fn source(samples: u32) -> String {
     let (color, depth, sum) = if samples > 1 {
         (
             "texture_multisampled_2d<f32>",
-            "texture_depth_multisampled_2d",
+            depth_read_type(samples),
             format!(
                 "var c = vec4<f32>(0.0);\n    for (var s = 0; s < {samples}; s++) {{ c += textureLoad(color, at, s); }}\n    c = c / {samples}.0;"
             ),
         )
     } else {
-        ("texture_2d<f32>", "texture_depth_2d", "let c = textureLoad(color, at, 0);".into())
+        ("texture_2d<f32>", depth_read_type(1), "let c = textureLoad(color, at, 0);".into())
     };
+    let vs = FULLSCREEN_VS;
     format!(
         "@group(0) @binding(0) var color: {color};
 @group(0) @binding(1) var depth: {depth};
 struct Out {{ @location(0) color: vec4<f32>, @location(1) depth: vec4<f32> }}
-@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
-    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
-    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
-}}
-@fragment fn fs(@builtin(position) p: vec4<f32>) -> Out {{
+{vs}@fragment fn fs(@builtin(position) p: vec4<f32>) -> Out {{
     // (OpenGL's rows: the copy's first row is the picture's last.)
     var at = vec2<i32>(p.xy);
     at.y = i32(textureDimensions(color).y) - 1 - at.y;
     {sum}
-    let d = textureLoad(depth, at, 0);
+    let d = textureLoad(depth, at, 0).x;
     return Out(c, vec4<f32>(d, 0.0, 0.0, 1.0));
 }}
 "
@@ -120,7 +148,7 @@ impl Copier {
             label: Some("framebuffer copy"),
             entries: &[
                 texture(0, wgpu::TextureSampleType::Float { filterable: false }),
-                texture(1, wgpu::TextureSampleType::Depth),
+                texture(1, DEPTH_READ),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -152,17 +180,14 @@ impl Copier {
         Copier { pipeline, layout }
     }
 
-    /// Fills `copies` from the target drawn into (`color`: multisampled or
-    /// not) and its `depth`.
-    pub(crate) fn copy(
+    /// Builds the bind group sampling `color` and `depth` for [`copy_with`](Self::copy_with).
+    pub(crate) fn make_group(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
-        copies: &Copies,
-    ) {
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("framebuffer copy"),
             layout: &self.layout,
             entries: &[
@@ -175,7 +200,16 @@ impl Copier {
                     resource: wgpu::BindingResource::TextureView(depth),
                 },
             ],
-        });
+        })
+    }
+
+    /// Fills `copies` from a bind group built by [`make_group`](Self::make_group).
+    pub(crate) fn copy_with(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        group: &wgpu::BindGroup,
+        copies: &Copies,
+    ) {
         let attach = |view| {
             Some(wgpu::RenderPassColorAttachment {
                 view,
@@ -193,7 +227,7 @@ impl Copier {
             ..Default::default()
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &group, &[]);
+        pass.set_bind_group(0, group, &[]);
         pass.draw(0..3, 0..1);
     }
 }

@@ -3,20 +3,53 @@
 
 use std::sync::Arc;
 
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use mg_core::{ResRef, ResType};
 use mg_gff::Gff;
 use mg_mdl::Model;
 use mg_preview::compose::Composed;
-use mg_preview::{CreatureLook, Preview, creature, creature_look, door, item, placeable};
+use mg_preview::{
+    CreatureLook, DressedLook, ItemLook, Preview, VisualTransform, creature, creature_look, door,
+    dressed_look, item, placeable, slot,
+};
 use mg_render::{AreaLight, Camera, Gpu, Renderer, Scene};
 use mg_resman::GameInstall;
 use mg_rules::GameData;
 use mg_rules::items::{ArmorChannel, set_armor_part_color};
 
+fn gpu() -> Option<Gpu> {
+    mg_testkit::gpu::hold();
+    static BASE: std::sync::OnceLock<Option<(wgpu::Device, wgpu::Queue)>> =
+        std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        let g = Gpu::headless();
+        if g.is_none() {
+            eprintln!("skipped: no GPU adapter");
+        }
+        g.map(|g| (g.device, g.queue))
+    });
+    base.as_ref().map(|(d, q)| Gpu::new(d.clone(), q.clone()))
+}
+
+fn shared_game(root: &std::path::Path, user: Option<std::path::PathBuf>) -> GameData {
+    static TLK: mg_testkit::Shared<(std::path::PathBuf, String), Arc<mg_tlk::Tlk>> =
+        mg_testkit::Shared::new();
+    let install = GameInstall::new(root, user, "en");
+    let rm = mg_testkit::shared_resman(&install).unwrap();
+    let key = (install.root.clone(), install.language.clone());
+    let tlk = TLK.get(&key, || Arc::new(GameData::open_tlk(&install).unwrap()));
+    GameData::with_shared_tlk(rm, tlk)
+}
+
 fn game() -> Option<GameData> {
-    let root = mg_testkit::nwn_root()?;
-    GameData::open(&GameInstall::new(&root, None, "en")).ok()
+    let root = match mg_testkit::nwn_root() {
+        Some(r) => r,
+        None if mg_testkit::corpus_required() => {
+            panic!("MOONGLOW_REQUIRE_CORPUS is set but no game install was found (set NWN_ROOT)")
+        }
+        None => return None,
+    };
+    Some(shared_game(&root, None))
 }
 
 fn blueprint(game: &GameData, name: &str, t: ResType) -> Gff {
@@ -62,6 +95,35 @@ fn creatures_by_appearance() {
     let badger = creature_look(&game, &CreatureLook::new(8)).unwrap();
     assert_eq!(models(&badger), ["c_badger"]);
     assert!(creature_look(&game, &CreatureLook::new(60_000)).is_err());
+}
+
+/// A robe whose `parts_robe` row says `HIDEHEAD` 1 leaves the head on,
+/// as the client draws it (`creatures_look` with `MG_PARTS=Robe=3`, the
+/// row set to 1 in the override: the head drawn as with 0; issue #42, a
+/// Vault hak's robes that hid the head in Moonglow alone).
+#[test]
+fn a_robe_s_hidehead_leaves_the_head_on() {
+    let root = mg_testkit::corpus!();
+    let base = shared_game(&root, None);
+    let table = base.resman.get_named("parts_robe", ResType::TWODA).unwrap();
+    let mut lines: Vec<String> =
+        String::from_utf8_lossy(&table).lines().map(str::to_owned).collect();
+    // Robe 4's row: every HIDE column 1, the head's (the last) among them.
+    let row = lines.iter().position(|l| l.split_whitespace().next() == Some("4")).unwrap();
+    let mut cells: Vec<String> = lines[row].split_whitespace().map(str::to_owned).collect();
+    *cells.last_mut().unwrap() = "1".into();
+    lines[row] = cells.join(" ");
+    let user = mg_testkit::scratch_dir("preview-hidehead");
+    std::fs::create_dir_all(user.join("override")).unwrap();
+    std::fs::write(user.join("override/parts_robe.2da"), lines.join("\n") + "\n").unwrap();
+    let game = shared_game(&root, Some(user));
+    let hidehead = game.table("parts_robe").unwrap();
+    assert_eq!(hidehead.get(4, "HIDEHEAD").map(str::trim), Some("1"));
+    // A gnome in robe 4.
+    let utc = blueprint(&game, "nw_hen_bod_05", ResType::UTC);
+    let p = creature(&game, &utc.root, &items(&game)).unwrap();
+    assert!(p.parts.iter().any(|x| x.model == "pmg0_robe004"));
+    assert!(p.parts.iter().any(|x| x.model.starts_with("pmg0_head")), "{:?}", models(&p));
 }
 
 #[test]
@@ -164,12 +226,12 @@ fn an_object_s_preview_is_its_kind_s() {
     let old = placeable(&game, &utp).unwrap();
     let texture = mg_preview::replaceable::textures(&game, &old).into_iter().next().unwrap();
     entry.set("OldTexture", mg_gff::Value::resref(ResRef::from_str(&texture.name).unwrap()));
-    entry.set("NewTexture", mg_gff::Value::resref(ResRef::from_str("mg_new").unwrap()));
+    entry.set("NewTexture", mg_gff::Value::resref(ResRef::from_str("chrome1").unwrap()));
     let mut outer = mg_gff::Struct::new(0);
     outer.set("TextureReplaceLi", mg_gff::Value::List(vec![entry]));
     replacing.set("TextureReplace", mg_gff::Value::Struct(outer));
     let replaced_one = of(K::Placeable, &replacing, alone).unwrap();
-    assert_eq!(replaced_one, replaced(old, &replacing));
+    assert_eq!(replaced_one, replaced(&game, old, &replacing));
     assert_ne!(replaced_one, placeable(&game, &utp).unwrap(), "a texture replaced");
     // Encounters and triggers have no model.
     assert!(of_object(&game, K::Trigger, &utp, &items, alone).is_none());
@@ -214,11 +276,7 @@ fn what_a_creature_may_not_wear_is_not_drawn() {
     let plate = blueprint(&game, "nw_aarcl007", ResType::UTI).root;
     assert!(item(&game, &plate).unwrap().parts.iter().any(|x| x.model.contains("chest")));
 
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
+    let Some(gpu) = gpu() else { return };
     let rm = &game.resman;
     let load = |name: &str| -> Option<Arc<Model>> {
         let data = rm.get_named(name, ResType::MDL).ok()?;
@@ -292,11 +350,7 @@ fn a_part_whose_node_the_base_lacks_is_not_drawn() {
         eprintln!("skipped: no game install");
         return;
     };
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
+    let Some(gpu) = gpu() else { return };
     let rm = &game.resman;
     let load = |name: &str| -> Option<Arc<Model>> {
         let data = rm.get_named(name, ResType::MDL).ok()?;
@@ -317,11 +371,7 @@ fn previews_render() {
         eprintln!("skipped: no game install");
         return;
     };
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
+    let Some(gpu) = gpu() else { return };
     let rm = &game.resman;
     let load = |name: &str| -> Option<Arc<Model>> {
         let data = rm.get_named(name, ResType::MDL).ok()?;
@@ -415,11 +465,7 @@ fn previews_draw_with_the_game_s_shaders() {
         eprintln!("skipped: no game install");
         return;
     };
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
+    let Some(gpu) = gpu() else { return };
     let rm = &game.resman;
     let load = |name: &str| -> Option<Arc<Model>> {
         let data = rm.get_named(name, ResType::MDL).ok()?;
@@ -457,8 +503,8 @@ fn previews_draw_with_the_game_s_shaders() {
             ..Default::default()
         };
         let mut pictures = Vec::new();
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
         for on in [false, true] {
-            let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
             r.game_shaders = on;
             let img = r.render_image(&gpu, rm, &scene, &camera, 256, 256);
             if on {
@@ -555,6 +601,95 @@ fn a_helmet_without_its_model_is_the_bag() {
     }
 }
 
+/// A creature holding an item that names no model at all (a base item
+/// row with no `ItemClass`, as a hak's row not yet filled in, or one whose
+/// hak is not installed) is drawn without it, as it is drawn without a
+/// helmet or a cloak whose model is nowhere: the whole creature was left
+/// undrawn for its weapon (the review's M13; what the game draws of such
+/// an item was not read from the client).
+#[test]
+fn a_creature_holding_what_has_no_model_is_drawn_without_it() {
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let mut utc = CreatureLook::new(6).to_utc();
+    let held = |slot: u32, name: &str| {
+        let mut s = mg_gff::Struct::new(slot);
+        s.set("EquippedRes", mg_gff::Value::resref(name.parse().unwrap()));
+        s
+    };
+    utc.set(
+        "Equip_ItemList",
+        mg_gff::Value::List(vec![held(0x10, "nothing"), held(0x20, "torch")]),
+    );
+    // (baseitems.2da row 84 is padding: no item class, no default model.)
+    let items = |r: ResRef| -> Option<Gff> {
+        let mut g = Gff::new(*b"UTI ");
+        let torch = r.to_string() == "torch";
+        g.root.set("BaseItem", mg_gff::Value::Int(if torch { 15 } else { 84 }));
+        for part in ["ModelPart1", "ModelPart2", "ModelPart3"] {
+            g.root.set(part, mg_gff::Value::Byte(1));
+        }
+        Some(g)
+    };
+    let preview = creature(&game, &utc, &items).unwrap();
+    assert_eq!(preview.base.model, "pmh0");
+    assert!(models(&preview).contains(&"pmh0_chest001"), "{:?}", models(&preview));
+    let at =
+        |node: &str| preview.parts.iter().filter(|p| p.attach.as_deref() == Some(node)).count();
+    assert_eq!((at("rhand"), at("lhand")), (0, 1), "the other hand's torch is drawn");
+}
+
+/// The game's torch (`nw_it_torch001`: base item 15, Light bright and
+/// yellow) held in a commoner's left hand raises his arm (`torchl`, his
+/// skeleton's supermodels') and lights around him as the client does
+/// (`part_emitters_torch_light`): `fx_light_clr`'s `Yello_20m`, the color
+/// 1.75, 1.5, 1 to 13.3 m, ahead of and above his `headconjure`, casting
+/// shadows. Without it, neither.
+#[test]
+fn the_game_s_torch_raises_the_arm_and_lights() {
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let utc = blueprint(&game, "nw_commale", ResType::UTC).root;
+    let mut held = utc.clone();
+    let mut torch = mg_gff::Struct::new(0x20);
+    torch.set("EquippedRes", mg_gff::Value::resref("nw_it_torch001".parse().unwrap()));
+    held.set("Equip_ItemList", mg_gff::Value::List(vec![torch]));
+    let preview = creature(&game, &held, &items(&game)).unwrap();
+    assert_eq!(preview.overlay.as_deref(), Some(mg_preview::TORCH_OVERLAY));
+    let light = &preview.effect_lights[..];
+    assert_eq!(light.len(), 1, "{light:?}");
+    assert_eq!(
+        (light[0].model.as_str(), light[0].animation.as_str()),
+        ("fx_light_clr", "Yello_20m")
+    );
+    assert!(light[0].shadows);
+    let bare = creature(&game, &utc, &items(&game)).unwrap();
+    assert_eq!((bare.overlay, bare.effect_lights.len()), (None, 0));
+    let Some(gpu) = gpu() else { return };
+    let rm = &game.resman;
+    let load = |name: &str| -> Option<Arc<Model>> {
+        Model::read(&rm.get_named(name, ResType::MDL).ok()?).ok().map(Arc::new)
+    };
+    let c = Composed::new(&gpu, &preview, &load).unwrap();
+    assert!(c.animations().iter().any(|a| a == "torchl"), "{:?}", c.animations());
+    let lights = c.point_lights(Mat4::IDENTITY);
+    let lit = lights.iter().find(|l| (l.cutoff - 13.3 * 2.0 * 1.75).abs() < 1e-3);
+    let l = lit.unwrap_or_else(|| panic!("{lights:?}"));
+    assert!(l.color.abs_diff_eq((Vec3::new(1.0, 1.5 / 1.75, 1.0 / 1.75)).powf(2.2), 1e-4));
+    assert!(l.casts_shadows && l.position.z > 2.5 && l.position.y > 0.4, "{l:?}");
+    // His left hand up, above his head's base, as the client holds it.
+    let drawn = c.instances(c.idle.as_deref(), 0.0, Mat4::IDENTITY);
+    let plain = Composed::new(&gpu, &Preview { overlay: None, ..preview.clone() }, &load).unwrap();
+    let down = plain.instances(plain.idle.as_deref(), 0.0, Mat4::IDENTITY);
+    let lhand = c.base().model.nodes.iter().position(|n| n.name == "lhand").unwrap();
+    let z = |i: &[mg_render::Instance]| i[0].pose.as_ref().unwrap()[lhand].w_axis.z;
+    assert!(z(&drawn) > 1.6 && z(&down) < 1.0, "{} {}", z(&drawn), z(&down));
+}
+
 /// A cloak moves with the bones of the body wearing it: on an elf (whose
 /// skeleton plays the human animations at 0.894 of their size, while her
 /// cloak's model has no scale of its own) its bones are where hers are,
@@ -565,11 +700,7 @@ fn a_cloak_sits_on_a_smaller_body_s_shoulders() {
         eprintln!("skipped: no game install");
         return;
     };
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
+    let Some(gpu) = gpu() else { return };
     let rm = &game.resman;
     let load = |name: &str| -> Option<Arc<Model>> {
         Model::read(&rm.get_named(name, ResType::MDL).ok()?).ok().map(Arc::new)
@@ -606,11 +737,7 @@ fn a_dragon_s_box_is_around_its_pause_not_its_rest() {
         eprintln!("skipped: no game install");
         return;
     };
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
+    let Some(gpu) = gpu() else { return };
     let rm = &game.resman;
     let load = |name: &str| -> Option<Arc<Model>> {
         let data = rm.get_named(name, ResType::MDL).ok()?;
@@ -658,6 +785,45 @@ fn a_dragon_s_box_is_around_its_pause_not_its_rest() {
     assert!(rest_outside > 20, "at rest it lies out of the box: {rest_outside}");
 }
 
+/// Every surface a ray straight down crosses, with the way each faces: the
+/// game's Table (placeables.2da row 97, `PLC_M05`) at its middle, its
+/// tabletop's top facing up and its underside facing down, between 0.7
+/// and 0.9 m (its tabletop node is at 0.8, its edges up to 0.9). Page Up
+/// in the area view sets things on the first, not the second.
+#[test]
+fn a_ray_down_through_a_table_meets_its_top_facing_up() {
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let Some(gpu) = gpu() else { return };
+    let rm = &game.resman;
+    let load = |name: &str| -> Option<Arc<Model>> {
+        let data = rm.get_named(name, ResType::MDL).ok()?;
+        Model::read(&data).ok().map(Arc::new)
+    };
+    let mut utp = blueprint(&game, "plc_chest1", ResType::UTP).root;
+    utp.set("Appearance", mg_gff::Value::Dword(97));
+    let c = Composed::new(&gpu, &placeable(&game, &utp).unwrap(), &load).unwrap();
+    let stance = c.stance(None, 0.0);
+    let from = glam::Vec3::new(0.0, 0.0, 10.0);
+    let crossings = c.ray_crossings_in(&stance, from, glam::Vec3::NEG_Z);
+    let at = |t: f32| from.z - t;
+    // (Flat ones: an edge's sides may be crossed too.)
+    let flat: Vec<(f32, f32)> =
+        crossings.iter().filter(|(_, n)| n.z.abs() >= 0.7).map(|&(t, n)| (at(t), n.z)).collect();
+    let up: Vec<f32> = flat.iter().filter(|f| f.1 > 0.0).map(|f| f.0).collect();
+    let down: Vec<f32> = flat.iter().filter(|f| f.1 < 0.0).map(|f| f.0).collect();
+    assert_eq!(up.len(), 1, "one top: {flat:?}");
+    assert!((0.8..0.9).contains(&up[0]), "the tabletop's top: {flat:?}");
+    assert_eq!(down.len(), 1, "one underside: {flat:?}");
+    assert!((0.7..up[0]).contains(&down[0]), "below the top: {flat:?}");
+    // The nearest of them is the click's.
+    let nearest = c.ray_hit_in(&stance, from, glam::Vec3::NEG_Z).unwrap();
+    let first = crossings.iter().map(|c| c.0).fold(f32::MAX, f32::min);
+    assert_eq!(nearest, first);
+}
+
 /// A look at creatures of custom content (GitHub issue 5): `MG_PROBE_USER`
 /// a user directory with the haks, `MG_PROBE_HAKS` their names (top
 /// first, comma-separated), `MG_PROBE_UTC` the blueprints' files.
@@ -668,12 +834,11 @@ fn probe_custom_creatures() {
         return;
     };
     let install = GameInstall::new(&root, Some(std::path::PathBuf::from(user)), "en");
-    let mut game = GameData::open(&install).unwrap();
+    let mut game = shared_game(&install.root, install.user_dir.clone());
     let haks = std::env::var("MG_PROBE_HAKS").unwrap_or_default();
     let haks: Vec<&str> = haks.split(',').filter(|h| !h.is_empty()).collect();
     game.resman.add_haks(&install, &haks).unwrap();
-    mg_testkit::gpu::hold();
-    let gpu = Gpu::headless().unwrap();
+    let gpu = gpu().unwrap();
     let dir = mg_testkit::scratch_dir("probe-creatures");
     let files = std::env::var("MG_PROBE_UTC").unwrap_or_default();
     let folder =
@@ -748,11 +913,8 @@ fn probe_custom_creatures() {
 /// and one the bag.
 #[test]
 fn a_cloak_of_a_base_item_of_its_own_lies_as_its_model() {
-    let Some(root) = mg_testkit::nwn_root() else {
-        eprintln!("skipped: no game install");
-        return;
-    };
-    let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let root = mg_testkit::corpus!();
+    let base = shared_game(&root, None);
     let table = base.resman.get_named("baseitems", ResType::TWODA).unwrap();
     let mut table = String::from_utf8_lossy(&table).into_owned();
     let row: Vec<String> = table
@@ -777,7 +939,7 @@ fn a_cloak_of_a_base_item_of_its_own_lies_as_its_model() {
     let user = mg_testkit::scratch_dir("preview_custom_cloak");
     std::fs::create_dir_all(user.join("override")).unwrap();
     std::fs::write(user.join("override/baseitems.2da"), table).unwrap();
-    let game = GameData::open(&GameInstall::new(&root, Some(user), "en")).unwrap();
+    let game = shared_game(&root, Some(user));
     let mut cloak = blueprint(&game, "nw_maarcl055", ResType::UTI).root;
     let mut lying = |base_item: usize| {
         cloak.set("BaseItem", mg_gff::Value::Int(base_item as i32));
@@ -837,6 +999,15 @@ fn what_is_only_worn_lies_in_an_area_as_aurora_shows_it() {
     let sword = blueprint(&game, "nw_wswls001", ResType::UTI);
     let lying = mg_preview::item_placed(&game, &sword.root).unwrap();
     assert_eq!(models(&lying), models(&item(&game, &sword.root).unwrap()));
+    // Its own models reflect the area's map (`default`), lying and held:
+    // a small shield lying in `tin01` shows its copper map in the client
+    // (`batch6_item_env_map_own_model`), and one held reflects the area's
+    // map too (`chrome1_helmet_reflection_look` with `MG_CHROME_HELD`).
+    let shield = blueprint(&game, "nw_ashsw001", ResType::UTI);
+    let lying = mg_preview::item_placed(&game, &shield.root).unwrap();
+    assert_eq!(lying.base.env_map.as_deref(), Some("default"));
+    let held = item(&game, &shield.root).unwrap();
+    assert_eq!(held.base.env_map.as_deref(), Some("default"));
     // How each is turned where it lies: baseitems.2da's RotateOnGround.
     let turn =
         |name: &str| mg_preview::ground_turn(&game, &blueprint(&game, name, ResType::UTI).root);
@@ -959,10 +1130,7 @@ fn a_race_s_body_part_wears_the_human_s_texture_of_its_name() {
 /// own material.
 #[test]
 fn a_part_s_material_without_texture0_takes_the_human_s_plt() {
-    let Some(root) = mg_testkit::nwn_root() else {
-        eprintln!("skipped: no game install");
-        return;
-    };
+    let root = mg_testkit::corpus!();
     let user = mg_testkit::scratch_dir("preview_part_material");
     let over = user.join("override");
     std::fs::create_dir_all(&over).unwrap();
@@ -985,7 +1153,7 @@ fn a_part_s_material_without_texture0_takes_the_human_s_plt() {
         ),
     )
     .unwrap();
-    let game = GameData::open(&GameInstall::new(&root, Some(user), "en")).unwrap();
+    let game = shared_game(&root, Some(user));
     let mut utc = CreatureLook::new(1).to_utc();
     for side in ["LBicep", "RBicep"] {
         utc.set(&format!("BodyPart_{side}"), mg_gff::Value::Byte(1));
@@ -997,6 +1165,295 @@ fn a_part_s_material_without_texture0_takes_the_human_s_plt() {
     };
     assert_eq!(drawn("pme0_bicepl001", "pmh0_bicepl001"), "pmh0_bicepl001");
     assert_eq!(drawn("pme0_bicepr001", "pme0_bicepr001"), "pmh0_bicepr001");
+}
+
+/// A part model of one mesh per texture of `bitmaps`.
+fn part_model(name: &str, bitmaps: &[&str]) -> String {
+    let mut s = format!(
+        "newmodel {name}\nsetsupermodel {name} NULL\nclassification character\n\
+         beginmodelgeom {name}\nnode dummy {name}\n  parent NULL\nendnode\n"
+    );
+    for (i, b) in bitmaps.iter().enumerate() {
+        s += &format!(
+            "node trimesh m{i}\n  parent {name}\n  ambient 1 1 1\n  diffuse 1 1 1\n  \
+             bitmap {b}\n  verts 3\n    0 0 0\n    1 0 0\n    0 1 0\n  faces 1\n    \
+             0 1 2 1 0 0 0 0\nendnode\n"
+        );
+    }
+    s + &format!("endmodelgeom {name}\ndonemodel {name}\n")
+}
+
+/// What a body part is drawn with where its mesh names another texture,
+/// row by row of the client's reading (`part_textures_look` in
+/// mg-corpus-tests' `client_render.rs`; a builder's report on 4.0: a part
+/// drawn in the texture its mesh names, where the game draws its PLT).
+/// Where the part has a PLT of its own name, or of the first of its
+/// fallbacks that has one (a head's stop at its race's phenotype 0), every
+/// mesh is drawn with that name; a texture of its own name that is a TGA
+/// alone replaces nothing, and a mesh naming a material with a `texture0`
+/// keeps it; robes are parts as any. (Which of a TGA and a PLT of
+/// one name is drawn is the renderer's: `mg_render`'s
+/// `only_a_plt_takes_an_instance_s_colors`.)
+#[test]
+fn a_part_with_a_plt_of_its_name_is_drawn_in_it_whatever_its_meshes_name() {
+    let root = mg_testkit::corpus!();
+    let user = mg_testkit::scratch_dir("preview_part_textures");
+    let over = user.join("override");
+    std::fs::create_dir_all(&over).unwrap();
+    let put = |file: &str, data: &[u8]| std::fs::write(over.join(file), data).unwrap();
+    for t in ["mg_red.tga", "mg_green.tga", "pmh0_chest299.tga"] {
+        put(t, b"tga");
+    }
+    put("mg_pltx.plt", b"plt");
+    // (Materials: one with a texture0, one with a normal map alone.)
+    put("mg_mtrb.mtr", b"texture0 mg_pink\n");
+    put("mg_mtrm.mtr", b"renderhint NormalAndSpecMapped\ntexture1 mg_nrm\n");
+    // (Robes: a man's, and an elf's with only the man's PLT.)
+    put("pmh0_robe232.mdl", part_model("pmh0_robe232", &["mg_red"]).as_bytes());
+    put("pmh0_robe232.plt", b"plt");
+    put("pme0_robe233.mdl", part_model("pme0_robe233", &["mg_red"]).as_bytes());
+    put("pmh0_robe233.plt", b"plt");
+    // (Row by row: the part's number, its skeleton, its meshes' textures,
+    // `own` the part's own name, and the files of its own name, `pmh0`
+    // where only the human man's has them.)
+    let rows: [(u16, &str, &[&str], &[&str]); 12] = [
+        (201, "pmh0", &["mg_red"], &["plt"]),
+        (202, "pmh0", &["mg_pltx"], &["plt"]),
+        (203, "pmh0", &["own", "mg_green"], &["plt"]),
+        (204, "pmh0", &["mg_red"], &[]),
+        (206, "pmh0", &["own"], &["tga", "plt"]),
+        (207, "pmh0", &["pmh0_chest299"], &["plt"]),
+        (210, "pmh0", &["mg_red"], &["tga"]),
+        (211, "pmh0", &["mg_red", "mg_green"], &["plt"]),
+        (212, "pmh0", &["mg_red"], &["tga", "plt"]),
+        (223, "pmh0", &["pmh0_chest299"], &["tga"]),
+        (205, "pme0", &["mg_red"], &["pmh0.plt"]),
+        (209, "pme0", &["own", "mg_green"], &["pmh0.plt"]),
+    ];
+    let extra: [(u16, &str, &[&str], &[&str]); 5] = [
+        (226, "pmh0", &["mg_mtrb"], &["plt"]),
+        (240, "pmh0", &["mg_mtrm"], &["plt"]),
+        (205, "pmh2", &["mg_red"], &[]),
+        (224, "pme0", &["mg_red"], &["tga", "pmh0.plt"]),
+        (219, "pfh0", &["mg_red"], &["pmh0.plt"]),
+    ];
+    for (n, skeleton, meshes, own) in rows.iter().chain(&extra) {
+        for part in ["chest", "head"] {
+            let name = format!("{skeleton}_{part}{n}");
+            let bitmaps: Vec<&str> =
+                meshes.iter().map(|m| if *m == "own" { name.as_str() } else { m }).collect();
+            put(&format!("{name}.mdl"), part_model(&name, &bitmaps).as_bytes());
+            for file in *own {
+                match file.split_once('.') {
+                    Some((other, ext)) => put(&format!("{other}_{part}{n}.{ext}"), ext.as_bytes()),
+                    None => put(&format!("{name}.{file}"), file.as_bytes()),
+                }
+            }
+        }
+    }
+    let game = shared_game(&root, Some(user));
+    // What each mesh of the creature's chest and head is drawn with.
+    let drawn = |appearance: u16, gender: u8, phenotype: u8, n: u16| -> [Vec<String>; 2] {
+        let look = CreatureLook { gender, phenotype, ..CreatureLook::new(appearance) };
+        let mut utc = look.to_utc();
+        utc.set("BodyPart_Torso", mg_gff::Value::Byte(n as u8));
+        utc.set("Appearance_Head", mg_gff::Value::Byte(n as u8));
+        let c = creature(&game, &utc, &|_| None).unwrap();
+        ["chest", "head"].map(|part| {
+            let p = c
+                .parts
+                .iter()
+                .find(|p| p.model.ends_with(&format!("_{part}{n}")))
+                .unwrap_or_else(|| panic!("{part} {n}: {:?}", models(&c)));
+            let model = game.resman.get_named(&p.model, ResType::MDL).unwrap();
+            let model = Model::read(&model).unwrap();
+            model
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.kind {
+                    mg_mdl::NodeKind::Mesh(m) => m.textures[0].clone(),
+                    _ => None,
+                })
+                .map(|b| p.textures.get(&b).cloned().unwrap_or(b))
+                .collect()
+        })
+    };
+    let man = |n| drawn(6, 0, 0, n);
+    let both =
+        |name: &str| [vec![name.replace("PART", "chest")], vec![name.replace("PART", "head")]];
+    // The report: a mesh naming a texture of no part's name, a PLT of the
+    // part's name: the PLT; a PLT of no part's name, the same.
+    assert_eq!(man(201), both("pmh0_PART201"));
+    assert_eq!(man(202), both("pmh0_PART202"));
+    // A head's hair, a gem: the second mesh too.
+    let own = |n| ["chest", "head"].map(|p| vec![format!("pmh0_{p}{n}"); 2]);
+    assert_eq!(man(203), own(203));
+    assert_eq!(man(211), own(211));
+    // Another part's TGA: the PLT.
+    assert_eq!(man(207), both("pmh0_PART207"));
+    // No PLT of the part's name: what the mesh names, though a TGA of the
+    // part's name is there.
+    assert_eq!(man(204), both("mg_red"));
+    assert_eq!(man(210), both("mg_red"));
+    assert_eq!(man(223), both("pmh0_chest299"));
+    // A TGA and a PLT of the part's name: its name (the renderer draws the
+    // TGA), whatever the mesh names.
+    assert_eq!(man(206), both("pmh0_PART206"));
+    assert_eq!(man(212), both("pmh0_PART212"));
+    // An elf's chest without a PLT of its name takes the human's, its own
+    // TGA alone not counting; its head does not, and keeps what its mesh
+    // names, a mesh of its own name that is missing too.
+    let elf = |n| drawn(1, 0, 0, n);
+    assert_eq!(elf(205), [vec!["pmh0_chest205".to_string()], vec!["mg_red".to_string()]]);
+    assert_eq!(elf(224), [vec!["pmh0_chest224".to_string()], vec!["mg_red".to_string()]]);
+    let [chest, head] = elf(209);
+    assert_eq!(chest, ["pmh0_chest209"; 2]);
+    assert_eq!(head, ["pme0_head209", "mg_green"]);
+    // Phenotype 2's chest and head take phenotype 0's; a woman's chest the
+    // man's, her head not.
+    assert_eq!(drawn(6, 0, 2, 205), both("pmh0_PART205"));
+    assert_eq!(
+        drawn(6, 1, 0, 219),
+        [vec!["pmh0_chest219".to_string()], vec!["mg_red".to_string()]]
+    );
+    // A mesh naming a material with a texture0 keeps it; one whose
+    // material has no texture0 (a normal map alone) takes the PLT.
+    assert_eq!(man(226), both("mg_mtrb"));
+    assert_eq!(man(240), both("pmh0_PART240"));
+    // A robe as any part: its PLT, the human man's for an elf's.
+    let robe = |appearance: u16, n: u16| -> Vec<String> {
+        let mut armor = blueprint(&game, "nw_cloth001", ResType::UTI);
+        armor.root.set("ArmorPart_Robe", mg_gff::Value::Byte(n as u8));
+        let mut utc = CreatureLook::new(appearance).to_utc();
+        let mut slot = mg_gff::Struct::new(2);
+        slot.set("EquippedRes", mg_gff::Value::resref("worn".parse().unwrap()));
+        utc.set("Equip_ItemList", mg_gff::Value::List(vec![slot]));
+        let c = creature(&game, &utc, &|_| Some(armor.clone())).unwrap();
+        let p = c
+            .parts
+            .iter()
+            .find(|p| p.model.ends_with(&format!("_robe{n}")))
+            .unwrap_or_else(|| panic!("robe {n}: {:?}", models(&c)));
+        vec![p.textures.get("mg_red").cloned().unwrap_or_else(|| "mg_red".into())]
+    };
+    assert_eq!(robe(6, 232), ["pmh0_robe232"]);
+    assert_eq!(robe(1, 233), ["pmh0_robe233"]);
+}
+
+/// What a helmet is drawn with where its mesh names another texture, as
+/// an item and worn, row by row of the client's reading
+/// (`part_textures_look`'s helmet rows; GitHub issue 45: the game's hood,
+/// `helm_033`, whose mesh names `helm`, a texture that is nowhere, was
+/// drawn untextured, where the game draws it in its PLT). Where the
+/// helmet has a PLT of its own name, every mesh is drawn with that name,
+/// as a body part's; a TGA of its name alone replaces nothing, and a mesh
+/// naming a material with a `texture0` keeps it, beside a mesh drawn in
+/// the PLT.
+#[test]
+fn a_helmet_with_a_plt_of_its_name_is_drawn_in_it_whatever_its_meshes_name() {
+    let root = mg_testkit::corpus!();
+    let user = mg_testkit::scratch_dir("preview_helmet_textures");
+    let over = user.join("override");
+    std::fs::create_dir_all(&over).unwrap();
+    let put = |file: &str, data: &[u8]| std::fs::write(over.join(file), data).unwrap();
+    put("mg_red.tga", b"tga");
+    put("helm_248.plt", b"plt");
+    // (Two meshes: a material with a texture0 and a TGA of no part's
+    // name; a TGA and a PLT of the helmet's name.)
+    put("helm_242.mdl", part_model("helm_242", &["mg_mtrb", "mg_red"]).as_bytes());
+    put("helm_242.plt", b"plt");
+    put("helm_243.mdl", part_model("helm_243", &["mg_red"]).as_bytes());
+    put("helm_243.tga", b"tga");
+    put("helm_243.plt", b"plt");
+    put("mg_mtrb.mtr", b"texture0 mg_pink\n");
+    // (The helmet's number, its mesh's texture, the files of its name.)
+    let rows: [(u8, &str, &[&str]); 7] = [
+        (251, "mg_none", &["plt"]),
+        (252, "helm_248", &["plt"]),
+        (253, "mg_red", &["plt"]),
+        (254, "mg_none", &[]),
+        (245, "NULL", &["plt"]),
+        (246, "mg_mtrb", &["plt"]),
+        (247, "mg_none", &["tga"]),
+    ];
+    for (n, mesh, own) in rows {
+        let name = format!("helm_{n}");
+        put(&format!("{name}.mdl"), part_model(&name, &[mesh]).as_bytes());
+        for ext in own {
+            put(&format!("{name}.{ext}"), ext.as_bytes());
+        }
+    }
+    let game = shared_game(&root, Some(user));
+    // What the helmet's meshes are drawn with, as an item and worn by a
+    // man (`NULL`: a mesh that names none).
+    let meshes = |n: u8| -> [Vec<String>; 2] {
+        let mut helmet = blueprint(&game, "nw_arhe001", ResType::UTI).root;
+        helmet.set("ModelPart1", mg_gff::Value::Byte(n));
+        if helmet.get("xModelPart1").is_some() {
+            helmet.set("xModelPart1", mg_gff::Value::Word(u16::from(n)));
+        }
+        let name = format!("helm_{n:03}");
+        let model = game.resman.get_named(&name, ResType::MDL).unwrap();
+        let model = Model::read(&model).unwrap();
+        let names: Vec<String> = model
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                mg_mdl::NodeKind::Mesh(m) => Some(m.textures[0].clone().unwrap_or_default()),
+                _ => None,
+            })
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        let of = |p: &Preview| -> Vec<String> {
+            let part = std::iter::once(&p.base)
+                .chain(&p.parts)
+                .find(|part| part.model == name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", models(p)));
+            names
+                .iter()
+                .map(|mesh| {
+                    let t = part.textures.get(mesh).cloned().unwrap_or_else(|| mesh.clone());
+                    if t.is_empty() { "NULL".into() } else { t }
+                })
+                .collect()
+        };
+        let mut utc = CreatureLook::new(6).to_utc();
+        let mut slot = mg_gff::Struct::new(1);
+        slot.set("EquippedRes", mg_gff::Value::resref("worn".parse().unwrap()));
+        utc.set("Equip_ItemList", mg_gff::Value::List(vec![slot]));
+        let worn = helmet.clone();
+        let worn = creature(&game, &utc, &move |_| {
+            let mut g = Gff::new(*b"UTI ");
+            g.root = worn.clone();
+            Some(g)
+        })
+        .unwrap();
+        [of(&item(&game, &helmet).unwrap()), of(&worn)]
+    };
+    let drawn = |n: u8| -> [String; 2] { meshes(n).map(|m| m.concat()) };
+    let both = |name: &str| [name.to_string(), name.to_string()];
+    // A mesh naming a texture that is nowhere, another helmet's PLT, a TGA
+    // of no part's name, or none: the helmet's own PLT.
+    assert_eq!(drawn(251), both("helm_251"));
+    assert_eq!(drawn(252), both("helm_252"));
+    assert_eq!(drawn(253), both("helm_253"));
+    assert_eq!(drawn(245), both("helm_245"));
+    // No PLT of its name: what the mesh names, a TGA of its name alone
+    // not counting.
+    assert_eq!(drawn(254), both("mg_none"));
+    assert_eq!(drawn(247), both("mg_none"));
+    // A material with a texture0 is kept, beside a mesh in the PLT (rows 1
+    // and $).
+    assert_eq!(drawn(246), both("mg_mtrb"));
+    let kept = vec!["mg_mtrb".to_string(), "helm_242".to_string()];
+    assert_eq!(meshes(242), [kept.clone(), kept]);
+    // A TGA and a PLT of its name: its name (the renderer draws the TGA,
+    // as the client does: rows E and &).
+    assert_eq!(drawn(243), both("helm_243"));
+    // The game's own: the hood (`helm_033`, its mesh naming `helm`), and
+    // `helm_006`, its mesh naming `helm_003`'s PLT.
+    assert_eq!(drawn(33), both("helm_033"));
+    assert_eq!(drawn(6), both("helm_006"));
 }
 
 /// An authored ASCII model: a small square, the dummies `nodes` (name,
@@ -1034,11 +1491,7 @@ fn lamp_model(
 /// where the base's node holds it; `row_lights` is the appearance's alone.
 #[test]
 fn an_object_casts_its_models_lights() {
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
+    let Some(gpu) = gpu() else { return };
     let base = Arc::new(lamp_model(
         "mg_lampbase",
         &[("hand", [0.5, 0.0, 1.0])],
@@ -1088,11 +1541,7 @@ fn an_object_casts_its_models_lights() {
 /// and a mesh's self-illumination keyed in its idle animation plays.
 #[test]
 fn a_light_node_s_keys_play_with_its_animation() {
-    mg_testkit::gpu::hold();
-    let Some(gpu) = Gpu::headless() else {
-        eprintln!("skipped: no GPU");
-        return;
-    };
+    let Some(gpu) = gpu() else { return };
     let text = "newmodel mg_flicker\nsetsupermodel mg_flicker NULL\nclassification placeable\n\
                 beginmodelgeom mg_flicker\nnode dummy mg_flicker\n  parent NULL\nendnode\n\
                 node trimesh square\n  parent mg_flicker\n  bitmap NULL\n  verts 3\n    0 0 0\n    \
@@ -1205,4 +1654,371 @@ fn an_item_s_part_scopes_transform_its_parts() {
     assert_eq!(which(254), vec!["wswls_m_011".to_string()]);
     assert_eq!(which(253), vec!["wswls_t_011".to_string()]);
     assert!(which(252).is_empty() && which(251).is_empty());
+}
+
+/// A model with no mesh to draw, a fog of particles alone (a builder's
+/// custom fog), is boxed by what its emitters' particles fill, so that the
+/// viewer frames it: its emitter's area (3 m square about it, a metre and
+/// a half each way), as far up as its particles fly in their life (0.5
+/// m/s for 4 s), and half their size round it; where it had a 2 m box
+/// about the origin, whatever its emitters.
+#[test]
+fn a_model_of_emitters_alone_is_boxed_by_its_particles() {
+    let Some(gpu) = gpu() else { return };
+    let text = "newmodel mg_fog\nsetsupermodel mg_fog NULL\nclassification EFFECT\n\
+                beginmodelgeom mg_fog\nnode dummy mg_fog\n  parent NULL\nendnode\n\
+                node emitter fog\n  parent mg_fog\n  position 2 0 1\n  xsize 300\n  \
+                ysize 300\n  velocity 0.5\n  lifeExp 4\n  sizeStart 1\n  sizeEnd 1\n  \
+                birthrate 1\n  update Fountain\n  render Normal\n  blend Normal\nendnode\n\
+                endmodelgeom mg_fog\ndonemodel mg_fog\n";
+    let model = Arc::new(Model::read(text.as_bytes()).unwrap());
+    let load = |name: &str| (name == "mg_fog").then(|| model.clone());
+    let c = Composed::new(&gpu, &Preview::model("mg_fog"), &load).unwrap();
+    let (min, max) = c.bounds();
+    let near = |a: glam::Vec3, b: glam::Vec3| (a - b).abs().max_element() < 0.01;
+    assert!(near(min, glam::Vec3::new(0.0, -2.0, 0.5)), "{min}");
+    assert!(near(max, glam::Vec3::new(4.0, 2.0, 3.5)), "{max}");
+}
+
+/// A builder's FFXIV-style bodies (a builder's report, 2026-11-04, "custom
+/// phenotype appearances aren't working as they should"), from the files
+/// they sent, where they are on this machine (`mg_testkit::builder_files`;
+/// skipped without them, and never committed): races Q (appearance 15100,
+/// `pmq0`) and V (15101, `pmv0`), male, phenotype 0, bare. Each is drawn
+/// (its parts hang from the skeleton's FFXIV bones and are skins bound to
+/// it), stands in its idle (`pause1`, two supermodels up: its arms down,
+/// narrower than the A-pose it rests in), finds the animations of its whole
+/// chain of supermodels, and with the game's shaders is tinted by its
+/// custom shaders' palette (`texture7` to `texture10`), not left white.
+/// The pictures go to `target/test-output/builder-body/`. By hand:
+/// `cargo test -p mg-preview --test previews builder -- --ignored`.
+#[test]
+#[ignore = "a builder's files"]
+fn a_builder_s_custom_skeleton_body_draws_as_the_client_does() {
+    let Some(files) = mg_testkit::builder_files("dafena-males/x") else {
+        eprintln!("skipped: the builder's files are not on this machine");
+        return;
+    };
+    let Some(mut game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    game.resman.add(
+        mg_resman::priority::HAK_USER,
+        "hak:builder",
+        mg_resman::LayerClass::Directory,
+        mg_resman::DirContainer::open(&files),
+    );
+    game.invalidate();
+    let Some(gpu) = gpu() else { return };
+    let rm = &game.resman;
+    let load = |name: &str| -> Option<Arc<Model>> {
+        Model::read(&rm.get_named(name, ResType::MDL).ok()?).ok().map(Arc::new)
+    };
+    let dir = mg_testkit::scratch_dir("builder-body");
+    // (Each skeleton's chain as far as the files have it: `pmq0`'s ends at
+    // `pmq0_ba3_f1`, which they lack, after 21 models; `pmv0`'s is 25 long.
+    // Where the walk stopped at 17, 127 and 168.)
+    for (row, base, anims) in [(15100u16, "pmq0", 165), (15101, "pmv0", 175)] {
+        let preview = creature(&game, &CreatureLook::new(row).to_utc(), &|_| None).unwrap();
+        assert_eq!(preview.base.model, base);
+        let c = Composed::new(&gpu, &preview, &load).unwrap();
+        assert!(c.missing.is_empty(), "{base}: missing {:?}", c.missing);
+        assert_eq!(c.animations().len(), anims, "{base}: its whole chain's");
+        let width = |animation: Option<&str>| {
+            let points = c.points_in(&c.stance(animation, 0.5));
+            assert!(points.len() > 1000, "{base}: {} vertices drawn", points.len());
+            let (lo, hi) =
+                points.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.x), hi.max(p.x)));
+            hi - lo
+        };
+        let (rest, idle) = (width(None), width(c.idle.as_deref()));
+        eprintln!(
+            "{base}: {} animations, {rest:.2} m wide at rest, {idle:.2} standing",
+            c.animations().len()
+        );
+        assert!(rest > 1.3 && idle < 0.9 * rest, "{base}: {rest} at rest, {idle} standing");
+        let (min, max) = c.bounds();
+        let camera = Camera::orbit(
+            (min + max) * 0.5,
+            ((max - min).length() * 0.5) / 20f32.to_radians().sin() * 1.1,
+            90f32.to_radians(),
+            15f32.to_radians(),
+        );
+        let scene = Scene {
+            instances: c.instances(c.idle.as_deref(), 0.5, Mat4::IDENTITY),
+            lights: c.point_lights(Mat4::IDENTITY),
+            area: AreaLight::default(),
+            background: [0.2, 0.25, 0.3],
+            ..Default::default()
+        };
+        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm, 4);
+        r.game_shaders = true;
+        let img = r.render_image(&gpu, rm, &scene, &camera, 384, 384);
+        assert_eq!(r.game_shader_failures(), &[], "{base}");
+        let out = std::fs::File::create(dir.join(format!("{base}.png"))).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(out), img.width, img.height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.write_header().unwrap().write_image_data(&img.data).unwrap();
+        // Tinted: the body's pixels warmer (skin) than gray, on average.
+        let bg = [51u8, 64, 77];
+        let body: Vec<&[u8]> = img
+            .data
+            .chunks(4)
+            .filter(|p| p[..3].iter().zip(bg).any(|(a, b)| a.abs_diff(b) > 3))
+            .collect();
+        let mean = |i: usize| body.iter().map(|p| f64::from(p[i])).sum::<f64>() / body.len() as f64;
+        eprintln!("{base}: red {:.0}, blue {:.0}", mean(0), mean(2));
+        assert!(mean(0) > mean(2) + 25.0, "{base}: drawn gray, not tinted");
+    }
+}
+
+/// Run by hand: the models other than body parts that have a PLT of their
+/// own name (helmets, the game's `gi_cloak01`), and of them those whose
+/// meshes name something else, which the client draws in that PLT
+/// (`creature::helmet_textures`; GitHub issue 45). Over the game, and
+/// the haks of each folder `MOONGLOW_HAKS` names. Prints a line a model,
+/// what its meshes name and whether each is a PLT, a TGA or DDS, or
+/// nowhere (`NULL`: a mesh that names none); a material with a
+/// `texture0` is left out, as the client keeps it. Seen (2026-11-13): the
+/// game, 36 such models (35 helmets and `gi_cloak01`), 11 helmets whose
+/// meshes name something else; with The Domains of Dread's 151 haks, 195
+/// and 78, all helmets.
+/// `MOONGLOW_HAKS=… cargo test -p mg-preview --test previews models_with_a_plt -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn models_with_a_plt_of_their_own_name() {
+    let root = mg_testkit::corpus!();
+    let user = mg_testkit::scratch_dir("models_with_own_plt");
+    std::fs::create_dir_all(user.join("hak")).unwrap();
+    let mut haks = Vec::new();
+    for dir in mg_testkit::builder_hak_dirs() {
+        for f in mg_testkit::files_with_ext(&dir, "hak") {
+            let to = user.join("hak").join(f.file_name().unwrap());
+            mg_testkit::link_or_copy(&std::fs::canonicalize(&f).unwrap(), &to).unwrap();
+            haks.push(f.file_stem().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    let install = GameInstall::new(&root, Some(user), "en");
+    let mut game = shared_game(&install.root, install.user_dir.clone());
+    let missing = game.resman.add_haks(&install, &haks).unwrap();
+    assert!(missing.is_empty(), "{missing:?}");
+    let rm = &game.resman;
+    let has = |n: &str, t: ResType| mg_resman::ResKey::parse(n, t).is_some_and(|k| rm.contains(&k));
+    let texture0 = |n: &str| {
+        rm.get_named(n, ResType::MTR)
+            .is_ok_and(|d| mg_image::mtr::Mtr::parse(&d).textures[0].is_some())
+    };
+    let (mut own, mut otherwise) = (Vec::new(), Vec::new());
+    for (k, _) in rm.entries() {
+        let name = k.resref.to_string().to_ascii_lowercase();
+        if k.restype != ResType::MDL
+            || mg_rules::models::part_name(&name).is_some()
+            || !has(&name, ResType::PLT)
+        {
+            continue;
+        }
+        own.push(name.clone());
+        let Some(model) = rm.get(&k).ok().and_then(|d| Model::read(&d).ok()) else { continue };
+        let mut named: Vec<String> = model
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.kind {
+                mg_mdl::NodeKind::Mesh(m) if m.render => Some(m.textures[0].clone()),
+                _ => None,
+            })
+            .filter_map(|t| match t.map(|t| t.to_ascii_lowercase()) {
+                None => Some("NULL".to_string()),
+                Some(t) if t == name || texture0(&t) => None,
+                Some(t) => {
+                    let found = if has(&t, ResType::PLT) {
+                        "PLT"
+                    } else if has(&t, ResType::TGA) || has(&t, ResType::DDS) {
+                        "TGA/DDS"
+                    } else {
+                        "nowhere"
+                    };
+                    Some(format!("{t} ({found})"))
+                }
+            })
+            .collect();
+        named.sort();
+        named.dedup();
+        if !named.is_empty() {
+            otherwise.push(format!("{name}: {}", named.join(", ")));
+        }
+    }
+    own.sort();
+    otherwise.sort();
+    let helmets = |v: &[String]| v.iter().filter(|m| m.starts_with("helm_")).count();
+    println!("{} models with a PLT of their own name ({} helmets)", own.len(), helmets(&own));
+    for m in own.iter().filter(|m| !m.starts_with("helm_")) {
+        println!("  not a helmet: {m}");
+    }
+    println!("{} of them name something else ({} helmets):", otherwise.len(), helmets(&otherwise));
+    for line in &otherwise {
+        println!("  {line}");
+    }
+}
+
+/// A creature's looks given as values (`DressedLook`, a game client's,
+/// told them by the server) and the same looks as a creature's fields,
+/// written by hand each, make the same preview: an armored human woman
+/// with a helmet, a cloak, a sword with its visual transform and a shield,
+/// her head turned, a part of her armor in a color of its own, a part
+/// number past 255 in its EE twin.
+#[test]
+fn a_look_given_as_values_is_the_look_read_from_its_fields() {
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    use mg_gff::{Struct, Value};
+    use mg_rules::items::set_armor_part_color;
+    let axis = |v: f32| {
+        let mut a = Struct::new(0);
+        a.set("ValueTo", Value::Float(v));
+        Value::Struct(a)
+    };
+    let scoped = |scope: i32, label: &str, v: f32| {
+        let mut e = Struct::new(6);
+        e.set("Scope", Value::Int(scope));
+        e.set(label, axis(v));
+        Value::List(vec![e])
+    };
+    // The fields.
+    let mut utc = CreatureLook { gender: 1, head: 3, ..CreatureLook::new(6) }.to_utc();
+    utc.set("Color_Skin", Value::Byte(5));
+    utc.set("Color_Hair", Value::Byte(6));
+    utc.set("VisTransformList", scoped(254, "RotateX", 20.0));
+    let mut armor = Struct::new(slot::CHEST);
+    armor.set("BaseItem", Value::Int(16));
+    for (field, _) in mg_rules::items::ARMOR_PARTS {
+        armor.set(field, Value::Byte(1));
+    }
+    armor.set("ArmorPart_Torso", Value::Byte(12));
+    armor.set("ArmorPart_Robe", Value::Byte(0));
+    armor.set("ArmorPart_LBicep", Value::Byte(255));
+    armor.set("xArmorPart_LBice", Value::Word(1));
+    armor.set("Cloth1Color", Value::Byte(20));
+    armor.set("Metal1Color", Value::Byte(30));
+    set_armor_part_color(&mut armor, 7, ArmorChannel::Cloth1, Some(33));
+    let mut helmet = Struct::new(slot::HEAD);
+    helmet.set("BaseItem", Value::Int(17));
+    helmet.set("ModelPart1", Value::Byte(1));
+    helmet.set("Metal2Color", Value::Byte(44));
+    let mut cloak = Struct::new(slot::CLOAK);
+    cloak.set("BaseItem", Value::Int(80));
+    cloak.set("ModelPart1", Value::Byte(1));
+    let mut sword = Struct::new(slot::RIGHT_HAND);
+    sword.set("BaseItem", Value::Int(1));
+    for (field, n) in [("ModelPart1", 61), ("ModelPart2", 11), ("ModelPart3", 11)] {
+        sword.set(field, Value::Byte(n));
+    }
+    sword.set("VisTransformList", scoped(255, "TranslateZ", 0.25));
+    let mut shield = Struct::new(slot::LEFT_HAND);
+    shield.set("BaseItem", Value::Int(14));
+    shield.set("ModelPart1", Value::Byte(11));
+    let worn = vec![armor, helmet, cloak, sword, shield];
+    // (The feats the items need, or the game takes them off her.)
+    let mut feats = Vec::new();
+    for it in &worn {
+        if let Some(mg_rules::items::WearProblem::Feats(f)) = game.wear_problem(&utc, it) {
+            feats.extend(f);
+        }
+    }
+    let feat_list = feats
+        .into_iter()
+        .map(|f| {
+            let mut s = Struct::new(1);
+            s.set("Feat", Value::Word(f));
+            s
+        })
+        .collect();
+    utc.set("FeatList", Value::List(feat_list));
+    utc.set("Equip_ItemList", Value::List(worn));
+
+    // The values.
+    let mut armor = ItemLook { base_item: 16, armor_parts: [1; 19], ..ItemLook::default() };
+    armor.armor_parts[7] = 12;
+    armor.armor_parts[18] = 0;
+    armor.colors[ArmorChannel::Cloth1 as usize] = Some(20);
+    armor.colors[ArmorChannel::Metal1 as usize] = Some(30);
+    armor.part_colors[7][ArmorChannel::Cloth1 as usize] = Some(33);
+    let mut helmet = ItemLook { base_item: 17, model_parts: [1, 0, 0], ..ItemLook::default() };
+    helmet.colors[ArmorChannel::Metal2 as usize] = Some(44);
+    let up = VisualTransform { translate: [0.0, 0.0, 0.25], ..VisualTransform::default() };
+    let look = DressedLook {
+        colors: [5, 6, 0, 0],
+        head_transform: Some(VisualTransform {
+            rotate: [20.0, 0.0, 0.0],
+            ..VisualTransform::default()
+        }),
+        armor: Some(armor),
+        helmet: Some(helmet),
+        cloak: Some(ItemLook { base_item: 80, model_parts: [1, 0, 0], ..ItemLook::default() }),
+        right_hand: Some(ItemLook {
+            base_item: 1,
+            model_parts: [61, 11, 11],
+            scopes: [Some(up), None, None],
+            ..ItemLook::default()
+        }),
+        left_hand: Some(ItemLook { base_item: 14, model_parts: [11, 0, 0], ..ItemLook::default() }),
+        ..DressedLook::from(CreatureLook { gender: 1, head: 3, ..CreatureLook::new(6) })
+    };
+
+    assert_eq!(DressedLook::from_utc_as_the_game(&game, &utc, &|_| None), look);
+    let from_fields = creature(&game, &utc, &|_| None).unwrap();
+    let from_values = dressed_look(&game, &look).unwrap();
+    assert_eq!(from_fields, from_values);
+    // She is dressed as written: the sword in her right hand, moved up,
+    // the shield on her left forearm, the helmet in her head's place,
+    // turned as it is, the cloak, the torso in its own cloth.
+    let p = &from_values;
+    let at = |node: &str| p.parts.iter().find(|x| x.attach.as_deref() == Some(node));
+    assert!(at("rhand").and_then(|x| x.local).is_some(), "{:?}", models(p));
+    assert!(at("lforearm").is_some(), "{:?}", models(p));
+    let helm = p.parts.iter().find(|x| x.model == "helm_001").expect("the helmet");
+    assert!(helm.local.is_some() && helm.colors.unwrap()[3] == 44);
+    assert!(p.parts.iter().any(|x| x.model.starts_with("pfh0_cloak_")), "{:?}", models(p));
+    let torso = p.parts.iter().find(|x| x.model == "pfh0_chest012").expect("the torso");
+    assert_eq!(torso.colors.unwrap()[4], 33);
+    let pelvis = p.parts.iter().find(|x| x.model.starts_with("pfh0_pelvis")).unwrap();
+    assert_eq!(pelvis.colors.unwrap()[4], 20);
+    // Given as values, what she wears is drawn whatever her feats: the
+    // values are what is shown.
+    utc.remove("FeatList");
+    assert_ne!(DressedLook::from_utc_as_the_game(&game, &utc, &|_| None), look);
+    assert_eq!(DressedLook::from_utc(&utc, &|_| None), look);
+}
+
+/// Every creature of the game read into values (`DressedLook`) is drawn as
+/// its blueprint is, and its values written as fields read back as
+/// themselves: nothing a preview reads is lost between the two.
+#[test]
+fn the_game_s_creatures_as_values() {
+    let Some(game) = game() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let mut names = game.resman.list(ResType::UTC);
+    names.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    let one_in = 4;
+    let names = mg_testkit::sweep(names, one_in);
+    let (mut drawn, mut dressed) = (0, 0);
+    for name in &names {
+        let Some(n) = name.as_str() else { continue };
+        let Ok(data) = game.resman.get_named(n, ResType::UTC) else { continue };
+        let Ok(gff) = Gff::read(&data) else { continue };
+        let look = DressedLook::from_utc_as_the_game(&game, &gff.root, &items(&game));
+        assert_eq!(DressedLook::from_utc(&look.to_utc(), &|_| None), look, "{n}");
+        let blueprint = creature(&game, &gff.root, &items(&game));
+        let values = dressed_look(&game, &look);
+        assert_eq!(blueprint.as_ref().ok(), values.as_ref().ok(), "{n}");
+        drawn += usize::from(values.is_ok());
+        dressed += usize::from(look.armor.is_some() || look.right_hand.is_some());
+    }
+    eprintln!("{drawn} of {} creatures drawn, {dressed} dressed", names.len());
+    assert!(drawn >= mg_testkit::at_least(1500, one_in), "{drawn}");
+    assert!(dressed >= mg_testkit::at_least(300, one_in), "{dressed}");
 }

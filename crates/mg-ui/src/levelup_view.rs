@@ -31,6 +31,10 @@ const CHANGED: [&str; 14] = [
     "Cha",
 ];
 
+/// The highest level the wizard levels a class up to (the game's, and
+/// `GameData::level_up`'s).
+const MAX_LEVEL: u32 = 60;
+
 /// The wizard's state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LevelupWizard {
@@ -74,7 +78,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         crate::widgets::table_choices(app.game.as_deref(), "classes", Some("Name"), Some("Label"));
     let name = |class: u32| mg_rules::choice_text(&names, i64::from(class));
     let (mut ok, mut cancel) = (false, false);
-    crate::widgets::modal(ctx, "Creature Levelup Wizard").show(ctx, |ui| {
+    let footed = crate::widgets::modal(ctx, "Creature Levelup Wizard").show_foot(ctx, |ui| {
         ui.heading("Add Classes and Levels");
         ui.label(
             "Please choose 1 to 8 classes for this creature and select the level for each class.",
@@ -96,6 +100,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     ui,
                     |ui| {
                         ui.set_width(160.0);
+                        mg_uikit::list_rows(ui);
                         for c in names.iter() {
                             let class = c.row as u32;
                             if w.slots.iter().any(|(k, _, _)| *k == class) {
@@ -104,7 +109,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                             let picked = w.chosen == Some(class);
                             let r = ui
                                 .selectable_label(picked, &c.text)
-                                .on_hover_text("Select a Class to add");
+                                .on_hover_text("Select a class to add");
                             if r.clicked() {
                                 w.chosen = Some(class);
                             }
@@ -127,35 +132,46 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     w.slots.push((class, 1, 0));
                 }
                 let mut remove = None;
-                egui::Grid::new("levelup-slots").num_columns(3).show(ui, |ui| {
-                    ui.strong("Class");
-                    ui.strong("Level");
-                    ui.end_row();
-                    for (i, (class, level, had)) in w.slots.iter_mut().enumerate() {
-                        ui.label(name(*class));
-                        crate::widgets::spin_draft(ui, level, (*had).max(1)..=60, 1.0, |d| d)
-                            .on_hover_text("Adjust the Level of this Class");
-                        // Classes the creature has stay.
-                        if *had == 0
-                            && ui.small_button("✖").on_hover_text("Remove this Class").clicked()
-                        {
-                            remove = Some(i);
-                        }
+                mg_uikit::with_table_rows(ui, |ui| {
+                    egui::Grid::new("levelup-slots").num_columns(3).show(ui, |ui| {
+                        ui.strong("Class");
+                        ui.strong("Level");
                         ui.end_row();
-                    }
+                        for (i, (class, level, had)) in w.slots.iter_mut().enumerate() {
+                            let named = name(*class);
+                            ui.label(&named);
+                            crate::widgets::name_next_number(ui, &named);
+                            // (A class a file has past level 60 stays as it is.)
+                            let least = (*had).clamp(1, MAX_LEVEL);
+                            crate::widgets::spin_draft(ui, level, least..=MAX_LEVEL, 1.0, |d| d)
+                                .on_hover_text("Adjust the level of this class");
+                            // Classes the creature has stay.
+                            if *had == 0
+                                && crate::widgets::icon_button(
+                                    ui,
+                                    mg_uikit::Icon::Close,
+                                    &format!("Remove {named}"),
+                                    "Remove this class",
+                                )
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                            ui.end_row();
+                        }
+                    })
                 });
                 if let Some(i) = remove {
                     w.slots.remove(i);
                 }
             });
         });
-        ui.separator();
-        ui.horizontal(|ui| {
-            ok = ui.button("OK").on_hover_text("Accept changes").clicked()
-                || crate::widgets::enter(ui);
-            cancel = crate::widgets::cancel_discard(ui);
-        });
+        ((), crate::widgets::Foot::new().main("OK", true).tip("Accept changes").cancel_discard())
     });
+    if let Some(f) = footed {
+        ok = f.pressed.main();
+        cancel = f.pressed.cancelled();
+    }
     if ok {
         level_up(app, &w);
     } else if !cancel {

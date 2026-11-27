@@ -21,21 +21,46 @@ impl Drop for Unblank {
     }
 }
 
+struct Unwait;
+
+impl Drop for Unwait {
+    fn drop(&mut self) {
+        mg_render::watch::wait_for_looks(false);
+    }
+}
+
 /// A harness of `app` (with an area's tab asked for), a quarter of a
 /// second a frame: the watch looks once a second and fails after five,
-/// each look read in the frame after it.
-fn watched(app: Moonglow, rs: egui_wgpu::RenderState) -> Harness<'static, Moonglow> {
-    mg_testkit::gpu::hold();
+/// each look read in the frame after it. Callers must hold
+/// `mg_testkit::gpu::alone()` before opening the GPU because
+/// `wait_for_looks` is process-global.
+fn watched(app: Moonglow, rs: egui_wgpu::RenderState) -> (Harness<'static, Moonglow>, Unwait) {
     // (Each look read in the frame after it: the verdicts follow the
     // harness's clock, not the GPU's load.)
     mg_render::watch::wait_for_looks(true);
+    let unwait = Unwait;
     let mut h = Harness::builder()
         .with_size(egui::vec2(1100.0, 800.0))
         .with_step_dt(0.25)
         .renderer(egui_kittest::wgpu::WgpuTestRenderer::from_render_state(rs))
         .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
     h.run_steps(3);
-    h
+    (h, unwait)
+}
+
+/// Acquires `mg_testkit::gpu::alone()` before `area_app` opens the GPU, then
+/// runs `prepare` and enters `watched`.
+fn watched_area(
+    name: &str,
+    tileset: &str,
+    edit: &dyn Fn(&mut mg_module::Module, &mg_rules::GameData, ResRef),
+    prepare: impl FnOnce(&mut Moonglow),
+) -> Option<(Harness<'static, Moonglow>, Unwait, ResRef)> {
+    mg_testkit::gpu::alone();
+    let (mut app, rs, area) = area_app(name, tileset, None, 4, None, edit)?;
+    prepare(&mut app);
+    let (h, unwait) = watched(app, rs);
+    Some((h, unwait, area))
 }
 
 /// Runs `seconds` of frames, `each` before every frame (given the
@@ -66,11 +91,13 @@ fn failed(verdicts: &[Verdict]) -> bool {
     verdicts.iter().any(|v| matches!(v, Verdict::Failed(_)))
 }
 
-/// The picture of the window, in `target/test-output/renderer-watch/`.
-fn picture(h: &mut Harness<'_, Moonglow>, name: &str) -> std::path::PathBuf {
+/// Saves the picture of the window in `target/test-output/renderer-watch/`
+/// when `MG_SHOT` is set.
+fn picture(h: &mut Harness<'_, Moonglow>, name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("MG_SHOT")?;
     let path = mg_testkit::output_dir("renderer-watch").join(format!("{name}.png"));
     h.render().expect("render").save(&path).unwrap();
-    path
+    Some(path)
 }
 
 /// The area drawn (a 4 by 4 rural area, Moonglow's own shader): every
@@ -79,11 +106,10 @@ fn picture(h: &mut Harness<'_, Moonglow>, name: &str) -> std::path::PathBuf {
 /// against its own frame's camera.
 #[test]
 fn the_watch_stays_quiet_where_the_area_is_drawn_and_while_zooming() {
-    let Some((app, rs, area)) = area_app("watch-drawn", "ttr01", None, 4, None, &|_, _, _| {})
+    let Some((mut h, _unwait, area)) = watched_area("watch-drawn", "ttr01", &|_, _, _| {}, |_| {})
     else {
         return;
     };
-    let mut h = watched(app, rs);
     let verdicts = watch_for(&mut h, area, 10.0, |_, _| {});
     eprintln!("drawn: {verdicts:?}");
     assert!(verdicts.len() >= 7, "{verdicts:?}");
@@ -115,10 +141,9 @@ fn the_watch_stays_quiet_on_an_empty_area() {
         }
         m.set_gff(key, &are).unwrap();
     };
-    let Some((app, rs, area)) = area_app("watch-empty", "ttr01", None, 4, None, &empty) else {
+    let Some((mut h, _unwait, area)) = watched_area("watch-empty", "ttr01", &empty, |_| {}) else {
         return;
     };
-    let mut h = watched(app, rs);
     let verdicts = watch_for(&mut h, area, 12.0, |_, _| {});
     eprintln!("empty: {verdicts:?}");
     assert!(verdicts.len() >= 8, "{verdicts:?}");
@@ -141,11 +166,11 @@ fn the_watch_stays_quiet_with_fade_geometry() {
         }
         m.set_gff(key, &are).unwrap();
     };
-    let Some((mut app, rs, area)) = area_app("watch-fade", "tin01", None, 4, None, &walled) else {
+    let Some((mut h, _unwait, area)) = watched_area("watch-fade", "tin01", &walled, |app| {
+        app.settings.fade_geometry = Fade::Always as u8;
+    }) else {
         return;
     };
-    app.settings.fade_geometry = Fade::Always as u8;
-    let mut h = watched(app, rs);
     assert_eq!(h.state().area_views[&area].fade, Fade::Always);
     // (A view from the side and above, where the walls would stand.)
     {
@@ -164,10 +189,10 @@ fn the_watch_stays_quiet_with_fade_geometry() {
 /// the sky expects nothing, and little ground is left to expect.
 #[test]
 fn the_watch_stays_quiet_with_the_camera_to_the_sky() {
-    let Some((app, rs, area)) = area_app("watch-sky", "ttr01", None, 4, None, &|_, _, _| {}) else {
+    let Some((mut h, _unwait, area)) = watched_area("watch-sky", "ttr01", &|_, _, _| {}, |_| {})
+    else {
         return;
     };
-    let mut h = watched(app, rs);
     {
         let view = h.state_mut().area_views.get_mut(&area).unwrap();
         let o = view.orbit.as_mut().unwrap();
@@ -179,6 +204,43 @@ fn the_watch_stays_quiet_with_the_camera_to_the_sky() {
     let (o, _) = h.state().area_views[&area].watching.seen.unwrap();
     assert!(o.expected < (36 * 64) / 2, "most of the view is sky: {o:?}");
     picture(&mut h, "sky");
+}
+
+/// Medieval City 2 builds its ground 5 m above its tiles' height (0): a
+/// view brought down near the ground from the overview (whose target is
+/// at the tiles' height) has its camera under that ground, where nothing
+/// of it is drawn (its underside isn't) and nothing of it is to be
+/// expected. The watch expected the ground at the tiles' height, found
+/// none of it drawn and failed, blaming the driver (M5 V3). From above
+/// the ground, the ground is expected and found drawn.
+#[test]
+fn the_watch_stays_quiet_with_the_camera_under_a_raised_ground() {
+    let Some((mut h, _unwait, area)) = watched_area("watch-raised", "tcm02", &|_, _, _| {}, |_| {})
+    else {
+        return;
+    };
+    {
+        // Tilted down and zoomed in, as the mouse does, from a target at
+        // the tiles' height (as the overview put it before it was put on
+        // the ground; as Ctrl + Shift lowers it): the eye 1.3 m up, the
+        // ground at 5.
+        let o = h.state_mut().area_views.get_mut(&area).unwrap().orbit.as_mut().unwrap();
+        (o.target.z, o.pitch, o.distance) = (0.0, 0.16, 8.0);
+    }
+    let under = watch_for(&mut h, area, 10.0, |_, _| {});
+    eprintln!("under: {under:?}");
+    picture(&mut h, "under_raised_ground");
+    assert!(!failed(&under), "{under:?}");
+    assert!(under[3..].iter().all(|v| *v == Verdict::Quiet(Quiet::BelowFloor)), "{under:?}");
+    assert_eq!(h.state().renderer_check.trouble, None);
+    {
+        let o = h.state_mut().area_views.get_mut(&area).unwrap().orbit.as_mut().unwrap();
+        (o.target.z, o.pitch, o.distance) = (5.0, 0.7, 30.0);
+    }
+    let above = watch_for(&mut h, area, 6.0, |_, _| {});
+    eprintln!("above: {above:?}");
+    assert!(above[2..].iter().all(|v| *v == Verdict::Quiet(Quiet::Drawn)), "{above:?}");
+    picture(&mut h, "above_raised_ground");
 }
 
 /// The game's shaders warming up (their programs made on the worker, from
@@ -201,16 +263,14 @@ fn the_watch_waits_out_the_game_s_shaders_and_catches_their_path_drawing_nothing
     }
     // (The programs held back and every draw blanked: no other test
     // renders meanwhile.)
-    mg_testkit::gpu::alone();
-    let Some((mut app, rs, area)) = area_app("watch-warm", "ttr01", None, 4, None, &|_, _, _| {})
-    else {
+    let _unhold = Unhold;
+    let Some((mut h, _unwait, area)) = watched_area("watch-warm", "ttr01", &|_, _, _| {}, |app| {
+        app.settings.game_shaders = Some(true);
+        mg_render::guard::hold_programs(true);
+        mg_render::guard::blank_draws(true);
+    }) else {
         return;
     };
-    app.settings.game_shaders = Some(true);
-    let _unhold = Unhold;
-    mg_render::guard::hold_programs(true);
-    mg_render::guard::blank_draws(true);
-    let mut h = watched(app, rs);
     let pending = |h: &Harness<'_, Moonglow>| {
         h.state().viewport.as_ref().unwrap().renderer.drawn.game_pending
     };
@@ -264,7 +324,6 @@ fn tiles_left_out_as_they_failed_are_expected() {
         }
     }
     // (Every tile's model made to fail: no other test renders meanwhile.)
-    mg_testkit::gpu::alone();
     let model = std::cell::RefCell::new(String::new());
     let one = |m: &mut mg_module::Module, game: &mg_rules::GameData, area: ResRef| {
         let set = mg_area::tileset(game, ResRef::from_str("ttr01").unwrap()).unwrap();
@@ -277,12 +336,12 @@ fn tiles_left_out_as_they_failed_are_expected() {
         }
         m.set_gff(key, &are).unwrap();
     };
-    let Some((app, rs, area)) = area_app("watch-failed-tiles", "ttr01", None, 4, None, &one) else {
+    let _unfail = Unfail;
+    let Some((mut h, _unwait, area)) = watched_area("watch-failed-tiles", "ttr01", &one, |_| {
+        mg_render::guard::fail_on(Some(&model.borrow()));
+    }) else {
         return;
     };
-    let _unfail = Unfail;
-    mg_render::guard::fail_on(Some(&model.borrow()));
-    let mut h = watched(app, rs);
     let verdicts = watch_for(&mut h, area, 12.0, |_, _| {});
     eprintln!("failed tiles: {verdicts:?}");
     picture(&mut h, "failed_tiles");
@@ -307,18 +366,24 @@ fn frames_that_never_get_ready_are_judged_after_a_while() {
     }
     use mg_render::watch::PATIENCE;
     // (Every texture held back: no other test renders meanwhile.)
-    mg_testkit::gpu::alone();
-    let Some((mut app, rs, area)) = area_app("watch-stuck", "ttr01", None, 4, None, &|_, _, _| {})
-    else {
+    let _unstall = Unstall;
+    let Some((mut h, _unwait, area)) = watched_area("watch-stuck", "ttr01", &|_, _, _| {}, |app| {
+        app.background_jobs = true;
+        mg_render::guard::stall_textures(true);
+    }) else {
         return;
     };
-    app.background_jobs = true;
-    let _unstall = Unstall;
-    mg_render::guard::stall_textures(true);
-    let mut h = watched(app, rs);
     // (The area read on a thread of its own, as in the desktop app: its
-    // first look a few seconds in.)
-    let verdicts = watch_for(&mut h, area, PATIENCE as f32 + 20.0, |_, _| {});
+    // first look a few seconds in, and on a busy machine many more frames
+    // in. The watch is counted from that look: counted from the start, a
+    // first look 18 s of frames in left too few for the failure.)
+    let (started, before) = (std::time::Instant::now(), h.state().area_views[&area].watching.looks);
+    while h.state().area_views[&area].watching.looks == before {
+        h.step();
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "never looked at");
+    }
+    let mut verdicts = vec![h.state().area_views[&area].watching.seen.expect("a verdict").1];
+    verdicts.extend(watch_for(&mut h, area, PATIENCE as f32 + 20.0, |_, _| {}));
     eprintln!("never ready: {verdicts:?}");
     picture(&mut h, "never_ready");
     let pending = h.state().viewport.as_ref().unwrap().renderer.drawn.textures_pending;
@@ -344,15 +409,14 @@ fn frames_that_never_get_ready_are_judged_after_a_while() {
 /// rock still waited for its textures, read apart a mesh at a time: black.)
 #[test]
 fn the_lit_check_turns_the_game_s_shaders_off_where_they_draw_wrong() {
-    let Some((mut app, rs, area)) = area_app("lit-check", "ttr01", None, 4, None, &|_, _, _| {})
-    else {
+    let Some((mut h, _unwait, area)) = watched_area("lit-check", "ttr01", &|_, _, _| {}, |app| {
+        app.settings.game_shaders = Some(true);
+        app.background_jobs = true;
+        app.renderer_check.adapter = Some(heeds(wgpu::Backend::Dx12));
+        app.renderer_check.other = Some(wgpu::Backend::Vulkan);
+    }) else {
         return;
     };
-    app.settings.game_shaders = Some(true);
-    app.background_jobs = true;
-    app.renderer_check.adapter = Some(heeds(wgpu::Backend::Dx12));
-    app.renderer_check.other = Some(wgpu::Backend::Vulkan);
-    let mut h = watched(app, rs);
     let started = std::time::Instant::now();
     while h.state().lit_check.found.is_none() {
         assert!(started.elapsed().as_secs() < 60, "the lit check never ended");
@@ -403,10 +467,16 @@ fn the_lit_check_turns_the_game_s_shaders_off_where_they_draw_wrong() {
     assert_eq!(trouble.offer, Some(wgpu::Backend::Vulkan));
     // Every mesh drawn with the game's programs drawn with Moonglow's own,
     // and every tile in the picture (at its middle, a little square).
-    let path = picture(&mut h, "lit_check_game_off");
+    let shot = h.render().expect("render");
+    let shot_label = if std::env::var_os("MG_SHOT").is_some() {
+        let path = mg_testkit::output_dir("renderer-watch").join("lit_check_game_off.png");
+        shot.save(&path).unwrap();
+        path.display().to_string()
+    } else {
+        "lit_check_game_off".to_owned()
+    };
     let now = drawn(&h);
     assert_eq!((now.meshes, now.textures_pending, now.game), (meshes, 0, 0), "{now:?}");
-    let shot = image::open(&path).unwrap().to_rgba8();
     let ppp = h.ctx.pixels_per_point();
     for (x, y) in (0..4).flat_map(|y| (0..4).map(move |x| (x, y))) {
         let middle = glam::Vec3::new(x as f32 * 10.0 + 5.0, y as f32 * 10.0 + 5.0, 0.0);
@@ -418,7 +488,7 @@ fn the_lit_check_turns_the_game_s_shaders_off_where_they_draw_wrong() {
             sum += 0.299 * f32::from(p[0]) + 0.587 * f32::from(p[1]) + 0.114 * f32::from(p[2]);
         }
         let luma = sum / 81.0;
-        assert!(luma > 30.0, "tile ({x}, {y}) is black ({luma:.0}) in {}", path.display());
+        assert!(luma > 30.0, "tile ({x}, {y}) is black ({luma:.0}) in {shot_label}");
     }
     // Drawing nothing of it: said as such.
     let wrong = mg_render::probe::Lit {
@@ -440,6 +510,114 @@ fn the_lit_check_turns_the_game_s_shaders_off_where_they_draw_wrong() {
     assert!(h.state().viewport.as_ref().unwrap().renderer.game_shaders);
 }
 
+/// Philos's case (November 2026: a Radeon RX 480 that has to draw through
+/// Vulkan, where the game's programs draw the lit mesh pink as Heed's RX
+/// 580 did, on every start): the notice offers Don't Show Again. Hidden,
+/// it is closed and remembered for this GPU, driver and backend; on the
+/// next start the check finds the same, Moonglow draws with its own
+/// shaders as before, and the log alone says so (as news, not a warning,
+/// naming where to show the notice again); Options › General's Show Again
+/// shows it again. The notices of Moonglow's own drawing wrong don't offer
+/// it.
+#[test]
+fn the_game_s_shaders_notice_can_be_hidden_on_this_driver() {
+    let mut info = heeds(wgpu::Backend::Vulkan);
+    (info.device, info.name) = (0x67df, "Radeon (TM) RX 480 Graphics".into());
+    let pink = mg_render::probe::Lit {
+        backend: wgpu::Backend::Vulkan,
+        adapter: info.name.clone(),
+        own: Ok(()),
+        game: Some(Err("the lit mesh is [212, 133, 133] at (24, 24), not red".into())),
+        fell_back: None,
+        panicked: false,
+        own_time: Default::default(),
+        game_time: Default::default(),
+        own_picture: None,
+        game_picture: None,
+        own_color: Some([204, 56, 56]),
+        game_color: Some([212, 133, 133]),
+        overridden: Vec::new(),
+    };
+    let start = |settings: mg_ui::Settings| {
+        let mut app = app_with(Vec::new());
+        app.settings = settings;
+        app.settings.game_shaders = Some(true);
+        let check = &mut app.renderer_check;
+        (check.adapter, check.asked_for, check.other) =
+            (Some(info.clone()), true, Some(wgpu::Backend::Dx12));
+        mg_ui::renderer_check::lit_found(&mut app, pink.clone());
+        let mut h = harness(app, 1270.0, 700.0);
+        h.run_steps(2);
+        h
+    };
+    let mut h = start(mg_ui::Settings::default());
+    let trouble = h.state().renderer_check.trouble.clone().expect("the notice");
+    assert!(trouble.hideable, "{trouble:?}");
+    assert!(!h.state().game_shaders());
+    // (Pictures to look at, where there is a GPU.)
+    if std::env::var_os("MG_SHOT").is_some() && adapter() {
+        mg_testkit::gpu::hold();
+        if let Some(p) = picture(&mut h, "notice_hideable") {
+            eprintln!("{}", p.display());
+        }
+    }
+    h.get_by_label("Don't Show Again").click();
+    h.run_steps(2);
+    let app = h.state();
+    assert_eq!(app.renderer_check.trouble, None);
+    let hidden = &app.settings.graphics_notices_hidden;
+    assert_eq!(hidden.len(), 1, "{hidden:?}");
+    assert_eq!(
+        (hidden[0].backend.as_str(), hidden[0].adapter.as_str()),
+        ("Vulkan", "Radeon (TM) RX 480 Graphics")
+    );
+    assert!(app.settings.graphics_failures.is_empty(), "no backend passed over");
+    assert!(!app.game_shaders(), "Moonglow's own still");
+
+    // The next start: the settings as saved; the same found, said in the log alone.
+    let saved: mg_ui::Settings = ron::from_str(&ron::to_string(&app.settings).unwrap()).unwrap();
+    let mut h = start(saved);
+    let app = h.state();
+    assert_eq!(app.renderer_check.trouble, None, "hidden");
+    assert!(!app.game_shaders(), "Moonglow's own for the run");
+    assert!(app.settings.game_shaders(), "the builder's setting is kept");
+    let (level, said) = app.log.entries.last().cloned().expect("the log's line");
+    assert_eq!(level, mg_ui::Level::Info, "{said}");
+    assert!(said.contains("the game's shaders draw the lit, textured test mesh"), "{said}");
+    assert!(said.contains("Options › General shows it again"), "{said}");
+
+    // Options › General › Show Again, then OK: shown again from the next start.
+    h.state_mut().actions.push(mg_ui::Action::OptionsDialog);
+    h.run_steps(2);
+    h.get_by_label("General").click();
+    h.run_steps(2);
+    if std::env::var_os("MG_SHOT").is_some() && adapter() {
+        mg_testkit::gpu::hold();
+        if let Some(p) = picture(&mut h, "notice_hidden_options") {
+            eprintln!("{}", p.display());
+        }
+    }
+    // (Under Appearance, below the page's first sections.)
+    // (Scrolling is animated: run until it is there.)
+    h.get_by_label("Show Again").scroll_to_me();
+    h.run();
+    h.get_by_label("Show Again").click();
+    h.run_steps(2);
+    h.get_by_label("OK").click();
+    h.run_steps(2);
+    let settings = h.state().settings.clone();
+    assert!(settings.graphics_notices_hidden.is_empty());
+    let h = start(settings);
+    assert!(h.state().renderer_check.trouble.as_ref().is_some_and(|t| t.hideable));
+
+    // Moonglow's own shader drawing wrong: no Don't Show Again.
+    let own = mg_render::probe::Lit { own: Err("the lit mesh is black".into()), ..pink.clone() };
+    let mut app = app_with(Vec::new());
+    app.renderer_check.adapter = Some(info.clone());
+    mg_ui::renderer_check::lit_found(&mut app, own);
+    assert!(!app.renderer_check.trouble.unwrap().hideable);
+}
+
 /// The adapter Heed's machine draws with on Automatic, as Windows lists
 /// it, and its other backend: Moonglow can't run Direct3D 12 here, so the
 /// app is told this one (the picture is Vulkan's, blanked).
@@ -459,15 +637,13 @@ fn heeds(backend: wgpu::Backend) -> wgpu::AdapterInfo {
 /// Direct3D 12 on this GPU and driver and takes Vulkan.
 #[test]
 fn nothing_drawn_raises_the_notice_and_the_next_start_passes_the_backend_over() {
-    let Some((mut app, rs, area)) = area_app("watch-heed", "ttr01", None, 4, None, &|_, _, _| {})
-    else {
+    let _unblank = Unblank;
+    let Some((mut h, _unwait, area)) = watched_area("watch-heed", "ttr01", &|_, _, _| {}, |app| {
+        app.renderer_check.adapter = Some(heeds(wgpu::Backend::Dx12));
+        app.renderer_check.other = Some(wgpu::Backend::Vulkan);
+    }) else {
         return;
     };
-    app.renderer_check.adapter = Some(heeds(wgpu::Backend::Dx12));
-    app.renderer_check.other = Some(wgpu::Backend::Vulkan);
-    let mut h = watched(app, rs);
-    mg_testkit::gpu::alone();
-    let _unblank = Unblank;
     let drawn = watch_for(&mut h, area, 4.0, |_, _| {});
     assert!(!failed(&drawn), "{drawn:?}");
     picture(&mut h, "before_blank");
@@ -479,8 +655,9 @@ fn nothing_drawn_raises_the_notice_and_the_next_start_passes_the_backend_over() 
     let said = h.state().renderer_check.trouble.clone().expect("the notice").said;
     assert!(said.contains("Direct3D 12 on Radeon RX 580 Series"), "{said}");
     h.run_steps(2);
-    let shot = picture(&mut h, "notice");
-    eprintln!("{}", shot.display());
+    if let Some(shot) = picture(&mut h, "notice") {
+        eprintln!("{}", shot.display());
+    }
     let restart = h.get_by_label("Restart with Vulkan");
     restart.click();
     h.run_steps(3);

@@ -1,7 +1,7 @@
 //! A module opened from a nasher project: its resources read from the
 //! target's source files, and saved back into them in place.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,35 +50,29 @@ pub struct Project {
 }
 
 /// Adds the line `exclude` to the sources of the target named `target` in
-/// `nasher.cfg`'s lines: in its `[target.sources]` (made at the end of its
-/// block where it has none). A target with no excludes of its own has the
-/// package's (`had`, nasher's inheritance, list by list): written in with
-/// it, so that it keeps them. `None` where no target has that name.
+/// `nasher.cfg`'s lines: in its `[target.sources]` (or `[sources]`, or made
+/// at the end of its block where it has none), using parsed [`Package::layout_bytes`].
+/// A target with no excludes of its own has the package's (`had`, nasher's
+/// inheritance, list by list) written in with it so it keeps them. `None`
+/// where `nasher.cfg` cannot be parsed or no target has that name.
 fn exclude_in_target(
     lines: &mut Vec<String>,
+    raw_bytes: &[u8],
     target: &str,
     exclude: &str,
     had: &[String],
 ) -> Option<()> {
-    let header = |l: &str| l.trim().eq_ignore_ascii_case("[target]");
-    let starts: Vec<usize> = (0..lines.len()).filter(|&i| header(&lines[i])).collect();
-    let named = |l: &str| {
-        let t = l.trim();
-        t.strip_prefix("name")
-            .map(str::trim_start)
-            .and_then(|r| r.strip_prefix('='))
-            .is_some_and(|v| v.trim().trim_matches('"') == target)
+    let layout = Package::layout_bytes(raw_bytes, &|k| std::env::var(k).ok()).ok()?;
+    let tl = layout.target(target)?;
+    let start = tl.start_line.saturating_sub(1).min(lines.len());
+    let end = tl.end_line.saturating_sub(1).min(lines.len());
+    let mut add: Vec<String> = if tl.has_own_exclude {
+        Vec::new()
+    } else {
+        had.iter().map(|e| format!("exclude = \"{e}\"")).collect()
     };
-    let (start, end) = starts.iter().enumerate().find_map(|(n, &s)| {
-        let end = starts.get(n + 1).copied().unwrap_or(lines.len());
-        lines[s..end].iter().any(|l| named(l)).then_some((s, end))
-    })?;
-    let own = lines[start..end].iter().any(|l| l.trim_start().starts_with("exclude"));
-    let mut add: Vec<String> =
-        if own { Vec::new() } else { had.iter().map(|e| format!("exclude = \"{e}\"")).collect() };
     add.push(exclude.to_string());
-    let sources = (start..end).find(|&i| lines[i].trim().eq_ignore_ascii_case("[target.sources]"));
-    match sources {
+    match tl.sources_line.map(|l| l.saturating_sub(1)).filter(|&i| i < lines.len()) {
         Some(s) => {
             let indent: String = (lines.get(s + 1))
                 .map(|l| l.chars().take_while(|c| c.is_whitespace()).collect())
@@ -203,8 +197,6 @@ fn source_name(key: &ResKey, form: Form) -> String {
     }
 }
 
-/// The resource a source file name stands for, and the form the file keeps
-/// it in; `None` if it isn't a resource.
 /// The folder an include looks in, relative to the project (the part
 /// before its first wildcard): `src/**/*.nss` looks in `src`. `None` for one
 /// that looks outside the project's folder, or in all of it.
@@ -240,6 +232,8 @@ fn left_out_kinds(files: &[PathBuf]) -> Vec<String> {
     kinds
 }
 
+/// The resource a source file name stands for, and the form the file keeps
+/// it in; `None` if it isn't a resource.
 fn resource_of(file_name: &str) -> Option<(ResKey, Form)> {
     let (name, form) = Form::of(file_name);
     crate::folder_key(name).map(|k| (k, form))
@@ -429,11 +423,12 @@ impl Project {
     /// project whose include names only scripts and JSON are the usual.
     pub fn uncovered(&self, keys: &[ResKey]) -> Vec<PathBuf> {
         let root = self.root();
+        let covers = self.target().covers_under(root);
         let mut out: Vec<PathBuf> = keys
             .iter()
             .filter(|k| !self.sources.contains_key(*k) && k.restype != ResType::NCS)
             .filter_map(|k| self.new_file(k))
-            .filter(|p| !self.target().covers(root, p))
+            .filter(|p| !covers.covers(p))
             .collect();
         out.sort();
         out.dedup();
@@ -477,22 +472,26 @@ impl Project {
         let cfg = Package::config_path(&root);
         let bad =
             |message: String| ModuleError::Source { name: cfg.display().to_string(), message };
-        let text = std::fs::read_to_string(&cfg).map_err(io(&cfg))?;
+        // (As text a character a byte where it is not UTF-8: nasher reads
+        // such a file, and every other line of it is written as it was.)
+        let file = super::cfg::FileText::read(&cfg).map_err(io(&cfg))?;
+        let text = file.text.as_str();
         // The include of the target's whose folder holds the first file.
         let pattern = (self.target().includes.iter())
             .find(|p| source_base(p).is_some_and(|base| left[0].starts_with(root.join(base))))
             .cloned()
             .ok_or_else(|| bad("no include of the target's looks in the files' folder".into()))?;
         let added = self.include_for(&left).expect("files under an include's folder");
-        // Beside that include's line, as indented.
+        // Beside that include's line, as indented, resolved from parsed cfg AST
+        // (supporting `:`, comments, `source =`, `[sources]`, `$var` includes,
+        // and inherited parent targets).
         let lines: Vec<&str> = text.lines().collect();
-        let at = lines
-            .iter()
-            .position(|l| {
-                let t = l.trim_start();
-                t.starts_with("include") && l.contains(&format!("\"{pattern}\""))
-            })
+        let raw_bytes = file.bytes(text);
+        let layout = Package::layout_bytes(&raw_bytes, &|k| std::env::var(k).ok()).map_err(bad)?;
+        let end_line = layout
+            .include_end_line(&self.target, &pattern, &|k| std::env::var(k).ok())
             .ok_or_else(|| bad(format!("include = \"{pattern}\" is not a line of it")))?;
+        let at = end_line.saturating_sub(1).min(lines.len().saturating_sub(1));
         let indent: String = lines[at].chars().take_while(|c| c.is_whitespace()).collect();
         let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         out.insert(at + 1, format!("{indent}{added}"));
@@ -503,9 +502,21 @@ impl Project {
         if text.ends_with('\n') {
             written.push_str(newline);
         }
-        let tmp = crate::sibling(&cfg, ".moonglow-tmp");
-        std::fs::write(&tmp, written).map_err(io(&tmp))?;
-        std::fs::rename(&tmp, &cfg).map_err(io(&cfg))?;
+        // Not written unless it takes files in for the target edited (a
+        // line that does not would be added again at every try).
+        let written = file.bytes(&written);
+        let taken = Package::parse_bytes(&root, &written, &|k| std::env::var(k).ok())
+            .ok()
+            .and_then(|p| p.target(&self.target).map(|t| left_out_of(&root, t)))
+            .is_some_and(|after| after.len() < left.len());
+        if !taken {
+            return Err(bad(format!(
+                "the line {added} beside include = \"{pattern}\" would not take the files in for \
+                 the target {:?}: add an include for them by hand",
+                self.target
+            )));
+        }
+        crate::write_replacing(&cfg, &written).map_err(io(&cfg))?;
         self.package = Package::read(&root)?;
         self.left_out = self.left_out();
         Ok(Some(added))
@@ -569,7 +580,8 @@ impl Project {
             }
             files.push(file);
         }
-        let text = std::fs::read_to_string(&cfg).map_err(io(&cfg))?;
+        let cfg_text = super::cfg::FileText::read(&cfg).map_err(io(&cfg))?;
+        let text = cfg_text.text.as_str();
         let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
         let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
         // The module target's own sources leave the tables out, where it
@@ -578,7 +590,7 @@ impl Project {
         let exclude = format!("exclude = \"**/*.tlk.{ext}\"");
         if files.iter().any(|f| self.target().covers(&root, f)) {
             let had = self.target().excludes.clone();
-            exclude_in_target(&mut lines, &self.target, &exclude, &had)
+            exclude_in_target(&mut lines, &cfg_text.bytes(text), &self.target, &exclude, &had)
                 .ok_or_else(|| bad(format!("no [target] named {:?} in it", self.target)))?;
         }
         let taken: Vec<String> = self.package.targets.iter().map(|t| t.name.clone()).collect();
@@ -602,6 +614,7 @@ impl Project {
         }
         let mut written = lines.join(newline);
         written.push_str(newline);
+        let written = cfg_text.bytes(&written);
         // The tables first: a nasher.cfg naming files that aren't there
         // would be read as a mistake.
         let empty = mg_tlk::Tlk::new(language);
@@ -610,9 +623,7 @@ impl Project {
                 ModuleError::Source { name: file.display().to_string(), message }
             })?;
         }
-        let tmp = crate::sibling(&cfg, ".moonglow-tmp");
-        std::fs::write(&tmp, written).map_err(io(&tmp))?;
-        std::fs::rename(&tmp, &cfg).map_err(io(&cfg))?;
+        crate::write_replacing(&cfg, &written).map_err(io(&cfg))?;
         self.package = Package::read(&root)?;
         // (A package's own excludes, which a target with none takes, could
         // leave a table's file out of its target.)
@@ -656,7 +667,7 @@ impl Project {
                  [package.rules]\n  \"*\" = \"src\"\n\n[target]\nname = \"default\"\nfile = \"{file}\"\n\
                  description = \"\"\n"
             );
-            std::fs::write(&cfg, text).map_err(io(&cfg))?;
+            crate::write_replacing(&cfg, text.as_bytes()).map_err(io(&cfg))?;
         }
         let (mut project, resources) = Project::open(root, None)?;
         if !resources.is_empty() {
@@ -758,16 +769,10 @@ impl Project {
     /// the resources they are, by their names (a file moved is a known
     /// resource at a new path).
     pub(crate) fn outside_scan_of(&self, paths: &[PathBuf]) -> OutsideScan {
-        let mut keys: Vec<ResKey> = (paths.iter())
-            .filter_map(|p| resource_of(&p.file_name()?.to_string_lossy()).map(|(k, _)| k))
-            .collect();
-        keys.sort();
-        keys.dedup();
-        let files = (keys.iter())
-            .filter_map(|k| self.sources.get(k).map(|src| Self::known(*k, src)))
-            .collect();
-        let only = Some(paths.iter().cloned().collect());
-        OutsideScan { files, kind: self.scan_kind(), only }
+        let key_of = |name: &str| resource_of(name).map(|(k, _)| k);
+        OutsideScan::of_paths(paths, self.scan_kind(), key_of, |k| {
+            self.sources.get(k).map(|src| Self::known(*k, src))
+        })
     }
 
     /// Takes what [`OutsideScan::run`] found: the times of the files found
@@ -840,11 +845,24 @@ impl Project {
     /// The change counts as read, so it is written only with other changes
     /// to `module.ifo`.
     pub(crate) fn settle_area_list(&mut self, resources: &mut Resources) {
+        let Some(bytes) = self.area_list_of(resources, true) else { return };
+        let info_key = crate::Module::info_key();
+        resources.insert(info_key, bytes.clone());
+        if let Some(s) = self.sources.get_mut(&info_key) {
+            s.resource = bytes;
+        }
+    }
+
+    /// `resources`' `module.ifo` with the areas it doesn't list added to
+    /// its list ([`Project::settle_area_list`]); `None` where it lists
+    /// them all, or the project keeps unlisted areas out. `warn`: said
+    /// among the project's warnings.
+    pub(crate) fn area_list_of(&mut self, resources: &Resources, warn: bool) -> Option<Arc<[u8]>> {
         if !self.settings.remove_unused_areas {
-            return;
+            return None;
         }
         let info_key = crate::Module::info_key();
-        let Some(Ok(mut info)) = resources.get(&info_key).map(|b| Gff::read(b)) else { return };
+        let mut info = resources.get(&info_key).map(|b| Gff::read(b))?.ok()?;
         let listed: Vec<ResRef> = info
             .root
             .items(&ifo::MOD_AREA_LIST)
@@ -857,7 +875,7 @@ impl Project {
             .map(|k| k.resref)
             .collect();
         if added.is_empty() {
-            return;
+            return None;
         }
         added.sort();
         let list = info.root.items_mut(&ifo::MOD_AREA_LIST);
@@ -866,16 +884,13 @@ impl Project {
             s.write(&ifo::mod_area_list::AREA_NAME, *a);
             list.push(s);
         }
-        self.warnings.push(format!(
-            "module.ifo: areas added to the area list: {}",
-            added.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")
-        ));
-        let Ok(bytes) = info.to_bytes() else { return };
-        let bytes: Arc<[u8]> = Arc::from(bytes);
-        resources.insert(info_key, bytes.clone());
-        if let Some(s) = self.sources.get_mut(&info_key) {
-            s.resource = bytes;
+        if warn {
+            self.warnings.push(format!(
+                "module.ifo: areas added to the area list: {}",
+                added.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")
+            ));
         }
+        Some(Arc::from(info.to_bytes().ok()?))
     }
 
     /// A resource's source file contents. An area's objects' lock byte
@@ -930,6 +945,10 @@ impl Project {
         // New files the target's sources don't take in: nasher won't pack
         // them, and the project won't read them back.
         let mut uncovered: Vec<PathBuf> = Vec::new();
+        // New resources whose names are no files': not written.
+        let mut unnamed: Vec<String> = Vec::new();
+        // (The target's sources, made ready once a new file asks.)
+        let mut covers = None;
         for (key, bytes) in resources {
             match self.sources.get(key) {
                 // (A compiled script kept without its source has one now:
@@ -948,9 +967,19 @@ impl Project {
                     }
                 }
                 None => {
-                    let Some(path) = self.new_file(key) else { continue };
+                    let Some(path) = self.new_file(key) else {
+                        // (The rules discard it, which is the builder's
+                        // word; a name that is no file's is not, and the
+                        // resource would be gone at the next open with
+                        // nothing said.)
+                        if !key.resref.is_file_name() {
+                            unnamed.push(format!("{key:?}"));
+                        }
+                        continue;
+                    };
                     let form = self.new_form(key);
-                    if !self.target().covers(&root, &path) {
+                    let covers = covers.get_or_insert_with(|| self.target().covers_under(&root));
+                    if !covers.covers(&path) {
                         uncovered.push(path.clone());
                     }
                     let text = self.source_bytes(key, form, bytes, None)?;
@@ -1000,18 +1029,26 @@ impl Project {
                 self.include_for(&uncovered).unwrap_or_default()
             ));
         }
+        if !unnamed.is_empty() {
+            unnamed.sort();
+            self.warnings.push(format!(
+                "{}: not written: the name is not a file's (it names a folder), so the project \
+                 cannot keep {}, and the module is without {} when it is opened again. Rename \
+                 or delete {}.",
+                unnamed.join(", "),
+                if unnamed.len() == 1 { "it" } else { "them" },
+                if unnamed.len() == 1 { "it" } else { "them" },
+                if unnamed.len() == 1 { "it" } else { "them" },
+            ));
+        }
         let wrote_uncovered = !uncovered.is_empty();
         let mut report = SaveReport::default();
         for step in steps {
             match step {
                 Step::Write(key, path, form, text) => {
-                    if let Some(dir) = path.parent() {
-                        std::fs::create_dir_all(dir).map_err(io(dir))?;
-                    }
-                    let tmp = crate::sibling(&path, ".moonglow-tmp");
-                    std::fs::write(&tmp, &text).map_err(io(&tmp))?;
-                    std::fs::rename(&tmp, &path).map_err(io(&path))?;
+                    crate::write_replacing_one_of_many(&path, &text).map_err(io(&path))?;
                     let resource = resources[&key].clone();
+                    let written_stamp = stamp(&path);
                     self.sources.insert(
                         key,
                         Source {
@@ -1019,13 +1056,14 @@ impl Project {
                             form,
                             file: Arc::from(text),
                             resource,
-                            stamp: None,
+                            stamp: written_stamp,
                         },
                     );
                     report.written.push(path);
                 }
                 Step::Adopt(key, path, form, text) => {
                     let resource = resources[&key].clone();
+                    let kept_stamp = stamp(&path);
                     self.sources.insert(
                         key,
                         Source {
@@ -1033,7 +1071,7 @@ impl Project {
                             form,
                             file: Arc::from(text),
                             resource,
-                            stamp: None,
+                            stamp: kept_stamp,
                         },
                     );
                 }
@@ -1060,15 +1098,13 @@ impl Project {
                 continue;
             };
             let other = src.path.to_path_buf();
-            let tmp = crate::sibling(&lower, ".moonglow-tmp");
-            std::fs::write(&tmp, &src.file).map_err(io(&tmp))?;
-            std::fs::rename(&tmp, &lower).map_err(io(&lower))?;
+            crate::write_replacing_one_of_many(&lower, &src.file).map_err(io(&lower))?;
             if other.exists() {
                 std::fs::remove_file(&other).map_err(io(&other))?;
             }
             let src = self.sources.get_mut(&key).expect("looked up");
             src.path = lower.as_path().into();
-            src.stamp = None;
+            src.stamp = stamp(&lower);
             report.written.push(lower);
             report.removed.push(other);
         }
@@ -1230,8 +1266,9 @@ pub(crate) fn scan(
     // walked.)
     let sources = match only {
         Some(only) => {
+            let covers = target.covers_under(root);
             let mut paths: Vec<PathBuf> =
-                only.iter().filter(|p| p.is_file() && target.covers(root, p)).cloned().collect();
+                only.iter().filter(|p| p.is_file() && covers.covers(p)).cloned().collect();
             paths.sort();
             paths
         }
@@ -1290,18 +1327,26 @@ pub(crate) fn scan(
     found
 }
 
-/// [`Project::left_out`] of a project at `root` editing `target`.
+/// [`Project::left_out`] of a project at `root` editing `target`. The
+/// walk of the source folders is also where a file half written when
+/// Moonglow stopped is taken away ([`crate::left_writing`]): an include
+/// (`src/**/*.{nss,json}`) does not find `x.nss.moonglow-tmp`, so the
+/// project's own files never held it, and version control offered it for
+/// commit.
 fn left_out_of(root: &Path, target: &Target) -> Vec<PathBuf> {
     let mut bases: Vec<String> = target.includes.iter().filter_map(|p| source_base(p)).collect();
     bases.sort();
     bases.dedup();
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
+    // (Each pattern compiled once, not for every file of the walk.)
+    let covers = target.covers_under(root);
     for base in bases {
         for path in super::glob::walk(root, &format!("{base}/**/*")).unwrap_or_default() {
-            if out.contains(&path)
-                || target.covers(root, &path)
-                || target.excludes.iter().any(|p| super::glob::covers(root, p, &path))
-            {
+            if crate::left_writing(&path) {
+                continue;
+            }
+            if !seen.insert(path.clone()) || covers.covers(&path) || covers.excluded(&path) {
                 continue;
             }
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -1331,10 +1376,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mg-nasher-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        mg_testkit::scratch_dir(&format!("mg-nasher-{name}"))
     }
 
     /// A small module: module.ifo listing area `a1`, area `a1` and a script.
@@ -1369,7 +1411,7 @@ mod tests {
         let mut m = module();
         m.save_as(&project_location(&root)).unwrap();
         let cfg = std::fs::read_to_string(root.join("nasher.cfg")).unwrap();
-        assert!(cfg.contains("file = \"mg-nasher-create-"), "{cfg}");
+        assert!(cfg.contains("file = \"mg-nasher-create."), "{cfg}");
         let src = root.join("src");
         let mut files: Vec<String> = std::fs::read_dir(&src)
             .unwrap()
@@ -1436,6 +1478,62 @@ mod tests {
         let (changes, _) = m.outside().unwrap();
         let again = changes.iter().find(|c| c.key == script).unwrap();
         assert_eq!(again.resource.as_deref(), Some(&b"void main() { int four, more; }\n"[..]));
+    }
+
+    /// A pull that adds an area has it listed in `module.ifo`, and the
+    /// listed file counts as read. Where Module Properties had changes
+    /// not yet saved, the module's own `module.ifo` counted as read with
+    /// them, and the next Save passed it over: the changes were gone at
+    /// the next open (the review of November 2026, P1).
+    #[test]
+    fn an_area_added_outside_leaves_unsaved_module_properties_to_be_saved() {
+        let root = scratch("outside-area-unsaved-ifo");
+        module().save_as(&project_location(&root)).unwrap();
+        let mut m = Module::open(&root).unwrap();
+        let info = Module::info_key();
+        let tag =
+            |m: &Module| m.gff(&info).unwrap().unwrap().root.string("Mod_Tag").map(<[u8]>::to_vec);
+        // Module Properties changed, not saved.
+        let mut ifo = m.gff(&info).unwrap().unwrap();
+        ifo.root.set("Mod_Tag", mg_gff::Value::String(b"CHANGED".to_vec()));
+        m.set(info, ifo.to_bytes().unwrap());
+        // An area's files added outside, taken as the window takes them.
+        for ext in ["are", "git"] {
+            let from = root.join(format!("src/a1.{ext}.json"));
+            std::fs::copy(from, root.join(format!("src/pulled.{ext}.json"))).unwrap();
+        }
+        let (changes, _) = m.outside().unwrap();
+        assert_eq!(changes.len(), 2);
+        for c in &changes {
+            m.took(c);
+            m.set(c.key, c.resource.clone().unwrap());
+        }
+        let settled = m.area_list_settled().expect("the area is listed");
+        assert_ne!(settled.module, settled.read, "the module's has the change, the file's not");
+        m.set(info, settled.module);
+        assert_eq!(tag(&m).as_deref(), Some(&b"CHANGED"[..]));
+        m.save().unwrap();
+        let again = Module::open(&root).unwrap();
+        assert_eq!(tag(&again).as_deref(), Some(&b"CHANGED"[..]), "saved with the area list");
+        let listed = again.gff(&info).unwrap().unwrap();
+        let areas: Vec<_> = (listed.root.items(&ifo::MOD_AREA_LIST).iter())
+            .filter_map(|a| a.try_read(&ifo::mod_area_list::AREA_NAME))
+            .map(|r| r.to_string())
+            .collect();
+        assert!(areas.contains(&"pulled".to_string()), "{areas:?}");
+
+        // With nothing unsaved the two are one, and a save writes nothing
+        // of it (the list's change waits for another).
+        std::fs::copy(root.join("src/a1.are.json"), root.join("src/more.are.json")).unwrap();
+        std::fs::copy(root.join("src/a1.git.json"), root.join("src/more.git.json")).unwrap();
+        let mut m = again;
+        let (changes, _) = m.outside().unwrap();
+        for c in &changes {
+            m.took(c);
+            m.set(c.key, c.resource.clone().unwrap());
+        }
+        let settled = m.area_list_settled().unwrap();
+        assert_eq!(settled.module, settled.read);
     }
 
     /// Where the system named the files that changed (a watch), only they
@@ -1740,6 +1838,115 @@ mod tests {
         );
         assert!(p.uncovered(&window).is_empty() && p.left_out.is_empty());
         assert!(Module::open(&root).unwrap().contains(&window[0]));
+    }
+
+    /// Two targets with the same include, each in its own sources, and
+    /// the second edited: the line is added to that one's, not beside the
+    /// first such line in the file (the other target's, which then packed
+    /// the files while this one still left them out, at every try).
+    #[test]
+    fn left_out_files_are_taken_in_by_the_edited_target_s_own_include() {
+        let root = scratch("left-out-two-targets");
+        let target = |name: &str| {
+            format!(
+                "[target]\nname = \"{name}\"\nfile = \"{name}.mod\"\n  [target.sources]\n  \
+                 include = \"src/**/*.{{nss,json}}\"\n"
+            )
+        };
+        let first = target("demo");
+        let cfg = format!("[package]\nname = \"p\"\n\n{first}\n{}", target("m"));
+        std::fs::write(root.join("nasher.cfg"), &cfg).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let location = ModuleLocation::Project { root: root.clone(), target: "m".into() };
+        module().save_as(&location).unwrap();
+        std::fs::write(root.join("src/win.jui"), b"{}").unwrap();
+        let (mut p, _) = Project::open(&root, Some("m")).unwrap();
+        assert_eq!(p.left_out, [root.join("src/win.jui")]);
+        assert_eq!(p.take_in_left_out().unwrap().as_deref(), Some("include = \"src/**/*.jui\""));
+        assert!(p.left_out.is_empty() && p.left_out().is_empty());
+        let written = std::fs::read_to_string(root.join("nasher.cfg")).unwrap();
+        assert!(written.starts_with(&format!("[package]\nname = \"p\"\n\n{first}\n")), "{written}");
+        assert!(
+            written
+                .ends_with("  include = \"src/**/*.{nss,json}\"\n  include = \"src/**/*.jui\"\n"),
+            "{written}"
+        );
+        // The other target still leaves the file out, as it did.
+        let (demo, _) = Project::open(&root, Some("demo")).unwrap();
+        assert_eq!(demo.left_out, [root.join("src/win.jui")]);
+
+        // A target with no includes of its own has the package's: the
+        // line goes there.
+        let root = scratch("left-out-inherited");
+        std::fs::write(
+            root.join("nasher.cfg"),
+            "[package]\n  [package.sources]\n  include = \"src/**/*.{nss,json}\"\n\n[target]\nname \
+             = \"demo\"\nfile = \"demo.mod\"\n  [target.sources]\n  include = \
+             \"src/**/*.{nss,json}\"\n\n[target]\nname = \"m\"\nfile = \"m.mod\"\n",
+        )
+        .unwrap();
+        let location = ModuleLocation::Project { root: root.clone(), target: "m".into() };
+        module().save_as(&location).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/win.jui"), b"{}").unwrap();
+        let (mut p, _) = Project::open(&root, Some("m")).unwrap();
+        assert!(p.take_in_left_out().unwrap().is_some());
+        assert!(p.left_out.is_empty());
+        let written = std::fs::read_to_string(root.join("nasher.cfg")).unwrap();
+        assert!(
+            written.starts_with(
+                "[package]\n  [package.sources]\n  include = \"src/**/*.{nss,json}\"\n  include = \
+                 \"src/**/*.jui\"\n"
+            ),
+            "{written}"
+        );
+
+        // A nasher.cfg that is not UTF-8 throughout (a comment typed in
+        // Windows-1252), which nasher reads: opened, and the line added
+        // leaves its bytes as they were.
+        let root = scratch("left-out-bytes");
+        let cfg = b"# M\xf3dulo\r\n[package]\r\n  [package.sources]\r\n  include = \
+                    \"src/**/*.{nss,json}\"\r\n[target]\r\nname = \"m\"\r\nfile = \"m.mod\"\r\n";
+        std::fs::write(root.join("nasher.cfg"), cfg).unwrap();
+        module().save_as(&project_location(&root)).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/win.jui"), b"{}").unwrap();
+        let (mut p, _) = Project::open(&root, None).unwrap();
+        assert!(p.take_in_left_out().unwrap().is_some());
+        assert!(p.left_out.is_empty());
+        let written = std::fs::read(root.join("nasher.cfg")).unwrap();
+        let added = b"  include = \"src/**/*.jui\"\r\n";
+        let at = cfg.windows(8).position(|w| w == b"[target]").unwrap();
+        assert_eq!(written, [&cfg[..at], added, &cfg[at..]].concat());
+        p.add_talk_table("words", mg_core::Language::ENGLISH, false).unwrap();
+        let written = std::fs::read(root.join("nasher.cfg")).unwrap();
+        assert!(written.starts_with(b"# M\xf3dulo\r\n[package]\r\n"));
+        assert!(Project::open(&root, None).is_ok());
+    }
+
+    /// A resource whose name is no file's (`a/b`, from an archive made by
+    /// another tool) has no file in a project: the save says so, where it
+    /// passed over it without a word and the module was without it at
+    /// the next open. One the rules discard is the builder's own word.
+    #[test]
+    fn a_resource_no_file_can_be_named_after_is_said_at_the_save() {
+        let root = scratch("unnamed");
+        std::fs::write(
+            root.join("nasher.cfg"),
+            "[package]\n  [package.sources]\n  include = \"src/**/*\"\n  [package.rules]\n  \
+             \"*.ndb\" = \"/dev/null\"\n  \"*\" = \"src\"\n[target]\nname = \"m\"\nfile = \"m.mod\"\n",
+        )
+        .unwrap();
+        let mut m = module();
+        m.save_as(&project_location(&root)).unwrap();
+        m.project.as_mut().unwrap().warnings.clear();
+        m.set(key("a/b", ResType::NSS), b"void main() {}".to_vec());
+        m.set(key("gone", ResType::NDB), b"NDB".to_vec());
+        m.save().unwrap();
+        let said = &m.project.as_ref().unwrap().warnings;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("a/b.nss: not written: the name is not a file's"), "{said:?}");
+        assert!(!root.join("src/a").exists() && !root.join("src/gone.ndb").exists());
     }
 
     #[test]
@@ -2231,5 +2438,69 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].key, key("bread", ResType::UTI));
+    }
+
+    #[test]
+    fn cfg_layout_edits_support_colons_comments_variables_inheritance_and_save_stamps() {
+        // Test save populates stamps on written sources and colon/comment/$var/parent includes work.
+        let root = scratch("cfg-layout-parsecfg");
+        let cfg = "\
+[package]
+name: \"p\"
+  [package.variables]
+  dir: \"src\"
+[target]
+name: \"base\"
+file: \"base.mod\"
+# exclude = \"src/**\"
+; comment
+source = \"$dir/**/*.{nss,json}\"
+[target]
+name: \"child\"
+parent: \"base\"
+file: \"child.mod\"
+";
+        std::fs::write(root.join("nasher.cfg"), cfg).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let location = ModuleLocation::Project { root: root.clone(), target: "child".into() };
+        let mut m = module();
+        m.save_as(&location).unwrap();
+        // Saved project sources should record non-None file stamps right after write.
+        let proj = m.project.as_ref().unwrap();
+        assert!(proj.sources.values().all(|s| s.stamp.is_some()));
+
+        std::fs::write(root.join("src/win.jui"), b"{}").unwrap();
+        let (mut p, _) = Project::open(&root, Some("child")).unwrap();
+        assert_eq!(p.left_out, [root.join("src/win.jui")]);
+        assert_eq!(p.take_in_left_out().unwrap().as_deref(), Some("include = \"src/**/*.jui\""));
+        assert!(p.left_out.is_empty());
+
+        // `add_talk_table` uses parsed `[sources]` / `has_own_exclude` (ignoring commented `# exclude`).
+        let pkg_tlk_cfg = "\
+[package]
+name: \"p\"
+  [package.sources]
+  exclude: \"**/test_*.nss\"
+  [package.rules]
+  \"*\" = \"src\"
+[target]
+name: \"m\"
+file: \"m.mod\"
+# exclude = \"commented\"
+  [sources]
+  include: \"src/**/*\"
+";
+        let root2 = scratch("cfg-layout-exclude-sources");
+        std::fs::write(root2.join("nasher.cfg"), pkg_tlk_cfg).unwrap();
+        std::fs::create_dir_all(root2.join("src")).unwrap();
+        module()
+            .save_as(&ModuleLocation::Project { root: root2.clone(), target: "m".into() })
+            .unwrap();
+        let mut m2 = Module::open(&root2).unwrap();
+        let p2 = m2.project.as_mut().unwrap();
+        p2.add_talk_table("mytlk", mg_core::Language::ENGLISH, false).unwrap();
+        let re_opened = Package::read(&root2).unwrap();
+        let t = re_opened.target("m").unwrap();
+        assert_eq!(t.excludes, ["**/test_*.nss", "**/*.tlk.json"]);
     }
 }

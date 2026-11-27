@@ -1,11 +1,20 @@
 //! What Moonglow keeps under a name in its data folder, for any module:
-//! variable sets, prefabs and lighting. Each kind is a folder of small
+//! variable sets, parameter sets, prefabs and lighting. Each kind is a folder of small
 //! JSON files, one a name; this is where they are listed, read and
 //! written (each kind's own module says what a file holds).
 
 use std::path::{Path, PathBuf};
 
 use crate::recovery;
+
+/// Writes `text` to `path` whole or not at all (`mg_module::write_replacing`:
+/// beside it, then put in its place, its folder made where it is not
+/// there): a set, a script set or a spell list written in place was cut
+/// short by a full disk or a crash, where a whole one had stood.
+pub(crate) fn write_whole(path: &Path, text: &str) -> Result<(), String> {
+    mg_module::write_replacing(path, text.as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
 
 /// A kind of thing kept under a name: its folder and its files' ending.
 #[derive(Debug, Clone, Copy)]
@@ -47,10 +56,7 @@ impl Shelf {
     /// Keeps `text` as the one named `name` (in place of one of that name).
     pub fn write(&self, dir: Option<&Path>, name: &str, text: &str) -> Result<PathBuf, String> {
         let path = self.file(dir, name)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        write_whole(&path, text)?;
         Ok(path)
     }
 
@@ -58,6 +64,59 @@ impl Shelf {
     pub fn read(&self, dir: Option<&Path>, name: &str) -> Result<String, String> {
         let path = self.file(dir, name)?;
         std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The one named `name`, read by `from_text` (its kind's reader); why
+    /// not, by its name.
+    pub fn load<T>(
+        &self,
+        dir: &Path,
+        name: &str,
+        from_text: impl Fn(&str) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let text = self.read(Some(dir), name)?;
+        from_text(&text).map_err(|e| format!("{name}: {e}"))
+    }
+
+    /// What the file of one named `name` is called: `NAME` and the ending.
+    pub fn file_name(&self, name: &str) -> String {
+        format!("{}{}", name.trim(), self.suffix)
+    }
+
+    /// Writes `text` to the file `path` (anywhere), named with the kind's
+    /// ending whatever the dialog gave (Windows' adds `.json` to a name
+    /// typed bare, others add nothing): so a copy put in the kind's folder
+    /// is listed. The file written.
+    pub fn save_file(&self, path: &Path, text: &str) -> Result<PathBuf, String> {
+        let path = match path.file_name() {
+            Some(n) => {
+                let n = n.to_string_lossy();
+                // (`.params.json`, `.json` or `.params` already there.)
+                let bare = self.suffix.strip_suffix(".json").unwrap_or(self.suffix);
+                let cut = [self.suffix, ".json", bare]
+                    .iter()
+                    .find(|s| {
+                        n.len() >= s.len()
+                            && n.is_char_boundary(n.len() - s.len())
+                            && n[n.len() - s.len()..].eq_ignore_ascii_case(s)
+                    })
+                    .map_or(n.len(), |s| n.len() - s.len());
+                path.with_file_name(self.file_name(&n[..cut]))
+            }
+            None => path.to_path_buf(),
+        };
+        write_whole(&path, text)?;
+        Ok(path)
+    }
+
+    /// The one in the file `path` (anywhere), read by `from_text`.
+    pub fn load_file<T>(
+        &self,
+        path: &Path,
+        from_text: impl Fn(&str) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        from_text(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// Deletes the one named `name`: its text, to put it back with
@@ -76,7 +135,7 @@ impl Shelf {
         if path.exists() {
             return Err(format!("there is a {} named '{}' again", self.what, name.trim()));
         }
-        std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+        write_whole(&path, text)
     }
 
     /// Gives the one named `from` another name. A name another has is
@@ -95,6 +154,72 @@ impl Shelf {
         }
         std::fs::rename(&old, &new).map_err(|e| format!("{}: {e}", old.display()))
     }
+
+    /// The ones kept in `dir`, by name, each read by `load` (from `dir`
+    /// and its name): what it holds, or why its file isn't one (bad JSON,
+    /// an unknown type), which a menu or window says beside its name. A
+    /// file is read again when its size or modified time changes
+    /// (`kept`, from the last call: a window lists them every frame).
+    pub fn read_all<T: Clone>(
+        &self,
+        dir: Option<&Path>,
+        kept: &mut Read<T>,
+        load: impl Fn(&Path, &str) -> Result<T, String>,
+    ) -> Vec<(String, Result<T, String>)> {
+        let names = self.list(dir);
+        let mut out = Vec::with_capacity(names.len());
+        let mut now = Read::default();
+        for name in names {
+            let Ok(path) = self.file(dir, &name) else { continue };
+            let stamp = std::fs::metadata(&path).ok().map(|m| (m.len(), m.modified().ok()));
+            let read = match kept.0.remove(&path) {
+                Some((was, read)) if was == stamp => read,
+                _ => load(dir.expect("listed"), &name),
+            };
+            now.0.insert(path, (stamp, read.clone()));
+            out.push((name, read));
+        }
+        *kept = now;
+        out
+    }
+}
+
+/// A file's size and modified time, as [`Shelf::read_all`] saw them.
+type Stamp = Option<(u64, Option<std::time::SystemTime>)>;
+
+/// What [`Shelf::read_all`] last read, by file.
+#[derive(Debug, Clone)]
+pub struct Read<T>(pub(crate) std::collections::HashMap<PathBuf, (Stamp, Result<T, String>)>);
+
+impl<T> Default for Read<T> {
+    fn default() -> Self {
+        Read(Default::default())
+    }
+}
+
+/// Most items shown in a saved set's tooltip summary before `"and N more"`.
+const DESCRIBED: usize = 12;
+
+/// Formats a saved set's tooltip summary: optional header line, `empty` when no
+/// entries exist, else the first [`DESCRIBED`] formatted entries plus `"and N more"`.
+pub(crate) fn describe_lines(
+    header: Option<String>,
+    empty: &str,
+    items: impl ExactSizeIterator<Item = String>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(header) = header {
+        lines.push(header);
+    }
+    let total = items.len();
+    if total == 0 {
+        lines.push(empty.to_string());
+    }
+    lines.extend(items.take(DESCRIBED));
+    if total > DESCRIBED {
+        lines.push(format!("and {} more", total - DESCRIBED));
+    }
+    lines.join("\n")
 }
 
 /// Whether a name can be kept under (it names a file).
@@ -121,6 +246,36 @@ mod tests {
         assert_eq!(shelf.read(dir, "Alpha").unwrap(), "[]");
         assert!(shelf.write(dir, "../out", "x").is_err(), "not a name");
         assert!(shelf.read(None, "beta").is_err(), "no data folder");
+    }
+
+    /// A name written over is written whole beside the file it replaces,
+    /// then put in its place (the review's B30: written in place, a full
+    /// disk or a crash left it cut short where a whole one had stood). So
+    /// another name for the old file still has the old text, and nothing
+    /// of the writing is left in the folder.
+    #[test]
+    fn a_name_written_over_replaces_its_file_and_leaves_no_other() {
+        let dir = mg_testkit::scratch_dir("ui-saved-whole");
+        let shelf = Shelf { folder: "things", suffix: ".thing.json", what: "thing" };
+        let at = Some(dir.as_path());
+        let file = shelf.write(at, "Loot", "the first, a long one").unwrap();
+        #[cfg(unix)]
+        std::fs::hard_link(&file, dir.join("as-it-was")).unwrap();
+        assert_eq!(shelf.write(at, "Loot", "the second").unwrap(), file);
+        assert_eq!(shelf.read(at, "Loot").unwrap(), "the second");
+        #[cfg(unix)]
+        {
+            let was = std::fs::read_to_string(dir.join("as-it-was")).unwrap();
+            assert_eq!(was, "the first, a long one", "not written into");
+            std::fs::remove_file(dir.join("as-it-was")).unwrap();
+        }
+        let left: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["Loot.thing.json"], "no temporary file");
+        // A file anywhere (Save to File…), its folder made.
+        let far = dir.join("made").join("set.json");
+        write_whole(&far, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&far).unwrap(), "{}");
     }
 
     #[test]

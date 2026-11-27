@@ -3,15 +3,19 @@ type: Manual Page
 title: Troubleshooting
 description: Troubleshooting - the game is not found, no GPU in the area viewer, an area that draws nothing or loses its tiles on AMD under Windows (the graphics backend, its startup check, the lit check and the area view's watch; what to send), Direct3D 12's shader compiler (the DXC shipped beside Moonglow, and FXC where it is missing), Test Module does nothing, no sound, after a crash, and where Moonglow keeps its files.
 tags: [manual, troubleshooting]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-31T02:02:20Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-21T23:56:23Z }
 ---
 
 # Troubleshooting
 
 ## Moonglow does not find the game
 
-The log says "No Neverwinter Nights installation found" and the status
-bar "No game install". Choose **Tools › Options… › Folders** and set the
+The log says "No Neverwinter Nights installation found" (with the log
+closed, as a new installation starts, that is its last line in the
+Status Bar, beside the Log switch), the Status Bar says "No game
+install" at its right end where the window is wide enough, and the
+Welcome page's Status says "No game data" beside **Options…**. Choose
+**Tools › Options › Folders** and set the
 game's folder: the one with `data/` and `bin/` in it (for Steam,
 `steamapps/common/Neverwinter Nights` in the library you installed it
 to). Moonglow needs Enhanced Edition; the original 1.69 release is not
@@ -32,13 +36,30 @@ flatpak override --user --filesystem="/path/to/Neverwinter Nights:ro" io.github.
 
 The area viewer and model previews need a graphics card with Vulkan or
 Direct3D 12 (Windows), Vulkan (Linux) or Metal (macOS). Where only
-OpenGL is there, Moonglow draws with it, but its renderer is not made
-for it: particles, the game's shaders and more are drawn wrong. Everything else in Moonglow works
+OpenGL is there, Moonglow draws with it, with one sample a pixel (no
+anti-aliasing: wgpu's OpenGL backend can't read a multisampled picture
+back), tried on Mesa's drivers on Linux only; and
+where only a software adapter is there (llvmpipe, Microsoft's Basic
+Render Driver: a virtual machine, a remote desktop, Windows without the
+GPU maker's driver), the 3D views are drawn at a few frames a second.
+Automatic takes either only where nothing else is there, and a notice
+under the Top Bar and the log then say what Moonglow draws through and
+what to install. Everything else in Moonglow works
 without one. Update the graphics driver; on Linux, install your
 distribution's Vulkan driver (Mesa's `vulkan-radeon` or `vulkan-intel`,
-or NVIDIA's). **Tools › Options… › General › Graphics backend** chooses
+or NVIDIA's). **Tools › Options › General › Graphics backend** chooses
 the backend (from the next start); the debug log's `graphics:` line
 says which adapter was taken, and why.
+
+## The window stops drawing: the graphics device was lost
+
+When the graphics driver is reset or updated while Moonglow runs, or the
+GPU is removed (a laptop's dock, a remote desktop session ending), the
+window's graphics device is lost and nothing more can be drawn in that
+run: the window keeps its last picture. Moonglow writes a recovery copy
+of the unsaved work at once (unless Options › General keeps none) and
+says so in a dialog of the system's. Close Moonglow and start it again:
+it offers the copy back.
 
 ## An area draws nothing, or loses its tiles, on an AMD GPU under Windows
 
@@ -48,22 +69,30 @@ Two builders' AMD GPUs under Windows went wrong in opposite ways
 - A Radeon PRO, through AMD's **Vulkan** driver (25.10.37.03), drew an
   area's tiles when the area opened, then lost them one by one; through
   Direct3D 12 they stayed.
-- A Radeon RX 580 (Windows 10, since Moonglow 2.11.0), through
+- A Radeon RX 580 (Windows 10), through
   **Direct3D 12**, drew nothing of an area but the start location's
   marker and the doors' arrows; through Vulkan it drew it all. (The
   marker and the arrows are drawn over the picture, not in it: they show
-  whatever the GPU draws.) Moonglow 2.13.0's checks didn't catch it.
+  whatever the GPU draws.)
 
 So no fixed rule serves every AMD GPU. Automatic (**Options › General
-› Graphics backend**) still takes Direct3D 12 first for AMD on Windows,
+› Graphics backend**) takes Direct3D 12 first for AMD on Windows,
 and Moonglow looks at what it draws:
 
 - **As it starts**, before the window opens, it draws a small scene
   offscreen and checks it. Where nothing is drawn, it takes the same
   GPU's other backend (once: if that fails too, it keeps the first and
-  says so in a notice under the toolbar). The backend that failed is
+  says so in a notice under the Top Bar). The backend that failed is
   remembered for this GPU and driver; Automatic passes over it until a
-  driver update. The log says what happened, and the debug log's
+  driver update, or an update of Moonglow (a new version tries it
+  again: what failed may be mended). It is remembered only where the
+  check drew the scene and found it wrong, or the GPU gave an error: a
+  check that could open no device (the GPU's memory taken by another
+  program), did not finish or lost its device takes the other backend
+  for that run and is made again at the next start. Where Moonglow
+  itself ends during the check (the driver ends the program), the next
+  start finds that out, remembers the backend and passes over it. The
+  log says what happened, and the debug log's
   `graphics:` line what the check found on each backend.
 - **Once the game's data is read**, it draws a lit, textured test mesh
   (red) as a tile is drawn, with Moonglow's own shader and with the
@@ -71,8 +100,15 @@ and Moonglow looks at what it draws:
   wrong colors. Where Moonglow's own draws it wrong, the notice offers
   **Restart with …** (below). Where only the game's shaders draw it
   wrong, Moonglow draws with its own for the rest of the session and the
-  notice says so (the **Shaders** button turns the game's on again): the
-  area is still drawn, only not by the game's shaders. The check draws
+  notice says so (**Shaders** in the area header's Lighting popover turns
+  the game's on again): the
+  area is still drawn, only not by the game's shaders. On a GPU where
+  that is found every time (two Radeon RX 480 and 580 cards through
+  AMD's Vulkan driver draw the game's shaders' red a washed-out pink),
+  that notice's **Don't Show Again** hides it on that GPU, driver and
+  backend: Moonglow then draws with its own shaders there each time and
+  only the log says so. A driver update shows it again, and so does
+  **Show Again** in Options › General. The check draws
   the game's own shader files, as the game installs them, even where
   `override`, `development`, a Workshop item or a hak has its own copy
   of one (a builder's `inc_lighting`, say), since what the game's own
@@ -83,12 +119,15 @@ and Moonglow looks at what it draws:
   of the area's ground the GPU drew against what the camera should see
   (the game's shaders included, once they are compiled; tiles whose
   models failed included). Where less than a fifth of it has been drawn
-  for five seconds, a notice under the toolbar names the GPU and the
+  for five seconds, a notice under the Top Bar names the GPU and the
   backend and offers **Restart with …** the other one. It closes
   Moonglow as File › Exit does (asking about unsaved work first) and
   starts it again with the same module; on Automatic the failing
   backend is remembered as above, and a backend you chose in Options is
-  changed there. The watch says nothing on an empty area, while the
+  changed there. Where tiles' models could not be built, or textures
+  never came, the area's content may be what is wrong and not the
+  backend: the restart is then through the other backend for that run
+  alone, and nothing is remembered. The watch says nothing on an empty area, while the
   game's shaders are being compiled or textures read, with Fade
   Geometry, with the camera turned to the sky, or while zooming; but
   where an area waits twenty seconds for textures or shaders and none
@@ -104,17 +143,21 @@ two builders to confirm them. If an area still draws nothing, a report
 helps most with these files from `%APPDATA%\Moonglow` (paste it into
 the File Explorer's address bar): the **debug log** of the session
 (`logs\debug-log-<date>-<time>.txt`; its lines starting `graphics` say
-what the checks found), and any `crash-<time>.txt` or
+what the checks found), and any `crash-<time>.txt`,
+`graphics-check-<time>.txt` (a check that failed outright, which
+Moonglow carries on from) or
 `model-failure-<time>.txt` written then, even where Moonglow went on.
-Say too whether the area is drawn with the area view's **Shaders**
-button off.
+Say too whether the area is drawn with **Shaders** off in the area
+header's Lighting popover.
 
 If you set a backend in Options yourself, it is kept even where the
 check fails (the notice offers the other). Where nothing helps, update
-the graphics driver, or turn the game's shaders off with the area
-view's **Shaders** button. To try a backend without changing the setting, start Moonglow
+the graphics driver, or turn the game's shaders off with **Shaders** in
+the area header's Lighting popover. To try a backend without changing the setting, start Moonglow
 with the `WGPU_BACKEND` environment variable set (`dx12`, `vulkan` or
-`gl`): it decides over the setting. In a Command Prompt, in the folder
+`gl`): it decides over the setting. Set but empty, or naming no backend
+(`d3d`), it is passed over as though it were not set, and the log says
+so. In a Command Prompt, in the folder
 Moonglow is installed in:
 
 ```bat
@@ -155,7 +198,7 @@ moonglow.exe
 ## Test Module does nothing
 
 The log tells why. The module must be saved in the user folder's
-`modules` folder (File › Save As…), and the game must be installed where
+`modules` folder (File › Save As), and the game must be installed where
 Options › Folders says. The game starts with your first local character;
 if there is none, make one in the game first.
 
@@ -163,7 +206,14 @@ if there is none, make one in the game first.
 
 Sounds need a sound device. On Linux, Moonglow plays through ALSA
 (PulseAudio and PipeWire provide it). The area's sounds also need
-**🔊 Sounds**, **Ambient** or **Music** on in the area viewer's toolbar.
+**Sounds**, **Ambient** or **Music** on in the area header's Audio
+popover.
+When a sound does not play, the log says why: that it was not found, or
+what kind of file it is. The log also says when a sound that plays in
+Moonglow would be silent in the game, and **Build › Verify Module**
+lists such music, ambient sounds and placed sounds of every area in the
+Problems panel (`sound-silent`). [Area sounds](04-areas.md#area-sounds) lists
+the files the game plays as music and as ambient sounds.
 
 ## A model is left out
 
@@ -203,10 +253,11 @@ whether one of them is the cause, start Moonglow with `--no-plugins`
 
 ## The window shows only the module tree
 
-Before 1.10, a very long name in the module tree (an area listed by
-name) could widen the tree over the whole window, hiding the area and the
-palettes, and it could not be dragged narrower. The tree now takes at
-most two fifths of the window and cuts long names short.
+A very long name in the module tree (an area listed by name) does not
+widen the tree over the window: the Left Dock takes at most two fifths
+of the window, and a long name goes on past its edge, the tree
+scrolling sideways to show it. Drag the dock's edge to make it wider or
+narrower, or fold it.
 
 ## Something fails without a word
 
@@ -214,9 +265,9 @@ When something doesn't happen and nothing says why (an area that won't
 open, an empty pane), or after a crash, send the newest
 `debug-log-<date>-<time>.txt` from the `logs` folder of Moonglow's data
 folder with your report. Moonglow writes this debug log unless **Tools ›
-Options › General › Write a debug log** is switched off. Each line has the time of day (UTC) and the
-seconds since Moonglow started. It records each thing asked
-for, the tabs opened and where the panes are, what an area's view and
+Options › General › Write a debug log** is switched off. Each line
+has the time of day (UTC) and the seconds since Moonglow started. It
+records each thing asked for, the tabs opened and where the panes are, what an area's view and
 the palettes find as they load, the graphics adapter, and the graphics
 libraries' warnings. It holds the names of your module's files and
 folders, not their contents. A new one is started each time Moonglow
@@ -233,8 +284,8 @@ off.)
 | What | Linux | Windows | macOS |
 | --- | --- | --- | --- |
 | Settings | `~/.local/share/moonglowtoolset` | `%APPDATA%\Moonglow Toolset\data` | `~/Library/Application Support/Moonglow-Toolset` |
-| Recovery copies, crash reports, debug logs (`logs`), prefabs (`prefabs`), variable sets (`variable-sets`), plugins (`plugins`), each module's open tabs (`open-tabs`) | `~/.local/share/moonglow` | `%APPDATA%\Moonglow` | `~/Library/Application Support/Moonglow` |
-| Conversation backups | `/tmp/moonglow-backups` | `%TEMP%\moonglow-backups` | `$TMPDIR/moonglow-backups` |
+| Recovery copies, crash reports, debug logs (`logs`), prefabs (`prefabs`), variable sets (`variable-sets`), conversation parameter sets (`parameter-sets`), conversation backups (`conversation-backups`), plugins (`plugins`), each module's open tabs (`open-tabs`) | `~/.local/share/moonglow` | `%APPDATA%\Moonglow` | `~/Library/Application Support/Moonglow` |
+| What Moonglow makes and can make again (`MOONGLOW_CACHE_DIR`): the game's shaders compiled, and a folder of each run's own (`scratch`) for a script opened in the external editor, a page to print, a Round-Trip Check's copy | `~/.cache/moonglow` | `%LOCALAPPDATA%\Moonglow\cache` | `~/Library/Caches/Moonglow` |
 
 On Linux, `$XDG_DATA_HOME` takes the place of `~/.local/share` when set
 (in the Flatpak: `~/.var/app/io.github.moonglow_toolset.Moonglow/data`).

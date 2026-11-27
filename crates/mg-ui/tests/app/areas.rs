@@ -14,8 +14,10 @@ fn minimap_exported_and_object_walkmeshes_shown() {
     let mut app = game_app_with(&root, None, dialogs);
     app.open_module(&path);
     let mut h = harness(app, 1200.0, 800.0);
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
     h.run();
-    h.get_by_label("CHESS").click_secondary();
+    tree_row(&h, "CHESS").click_secondary();
     h.run();
     open_submenu(&mut h, "Export");
     h.get_by_label("Export Minimap…").click();
@@ -27,24 +29,26 @@ fn minimap_exported_and_object_walkmeshes_shown() {
     let area = ResRef::from_str("chess").unwrap();
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Area(area)));
     h.run();
-    // (One button for the walkmeshes: a right click, or holding it,
-    // opens the two to choose from.)
-    h.get_by_label("👣 Walkmesh…").click_secondary();
-    h.run();
-    h.get_by_label("Object Walkmeshes").click();
-    h.run();
+    // (The two in the header's Overlays popover.)
+    area_click(&mut h, "Object walkmeshes");
     assert!(h.state().area_views[&area].object_walkmesh);
     assert!(!h.state().area_views[&area].walkmesh);
-    // A click on the button hides what is shown.
-    h.get_by_label("Ground Walkmesh");
+    // The wide row's one Walkmesh toggle (Overlays unfolded into the
+    // row, WideArea): a right click, or holding it, opens the two to
+    // choose from; a click hides what is shown.
+    h.set_size(egui::vec2(3000.0, 800.0));
+    h.run_steps(4);
+    area_tool(&mut h, "Walkmesh").click_secondary();
+    h.run_steps(3);
+    h.get_by_label("Ground walkmesh");
     h.key_press(egui::Key::Escape);
-    h.run();
-    h.get_by_label("👣 Walkmesh…").click();
-    h.run();
+    h.run_steps(3);
+    area_click(&mut h, "Walkmesh");
+    h.run_steps(2);
     assert!(!h.state().area_views[&area].object_walkmesh);
     // Held down a moment: the two open, and stay open when it is let go
     // (the release no click); one chosen there.
-    let at = h.get_by_label("👣 Walkmesh…").rect().center();
+    let at = area_tool(&mut h, "Walkmesh").rect().center();
     h.hover_at(at);
     let button = |pressed| egui::Event::PointerButton {
         pos: at,
@@ -54,14 +58,131 @@ fn minimap_exported_and_object_walkmeshes_shown() {
     };
     h.event(button(true));
     h.run_steps(30);
-    h.get_by_label("Ground Walkmesh");
+    h.get_by_label("Ground walkmesh");
     h.event(button(false));
     h.run_steps(2);
     let view = &h.state().area_views[&area];
     assert!(!view.walkmesh && !view.object_walkmesh, "the release is no click");
-    h.get_by_label("Ground Walkmesh").click();
-    h.run();
+    h.get_by_label("Ground walkmesh").click();
+    h.run_steps(3);
     assert!(h.state().area_views[&area].walkmesh, "chosen in what the hold opened");
+}
+
+/// El Grillo's asks: several areas' minimaps exported at once (each
+/// `NAME.png` in a folder chosen, asked before writing over them), and
+/// minimaps with their map notes marked as the game's map marks them (the
+/// menus' … with Map Notes…): Chess's board and a copy of it,
+/// with a waypoint's map note added and not yet saved.
+#[test]
+fn minimaps_are_exported_together_and_with_their_map_notes() {
+    use mg_gff::Value;
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-minimaps");
+    let path = dir.join("chess.mod");
+    std::fs::copy(root.join("data/mod/Neverwinter Chess.mod"), &path).unwrap();
+    // A copy of the board.
+    let mut m = mg_module::Module::open(&path).unwrap();
+    let chess = ResRef::from_str("chess").unwrap();
+    let copy = ResRef::from_str("chess2").unwrap();
+    for t in [ResType::ARE, ResType::GIT, ResType::GIC] {
+        let data = m.get(&ResKey::new(chess, t)).unwrap().to_vec();
+        m.set(ResKey::new(copy, t), data);
+    }
+    m.save().unwrap();
+    let mut app = game_app_with(&root, None, NoDialogs::default());
+    app.open_module(&path);
+    let mut h = harness(app, 1200.0, 800.0);
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
+    h.run();
+    // A map note on the board, not saved: an edit of its GIT.
+    let git_key = ResKey::new(chess, ResType::GIT);
+    let mut git = h.state_mut().ws.as_mut().unwrap().doc(&git_key).unwrap().clone();
+    let mut w = mg_module::instances::walk_waypoint(b"MG_NOTE", [15.0, 25.0, 0.0]);
+    w.set("HasMapNote", Value::Byte(1));
+    w.set("MapNoteEnabled", Value::Byte(1));
+    let mut list = match git.root.get("WaypointList") {
+        Some(Value::List(l)) => l.clone(),
+        _ => Vec::new(),
+    };
+    list.push(w);
+    git.root.set("WaypointList", Value::List(list));
+    let set = mg_edit::Edit::SetResource { key: git_key, data: Some(git.to_bytes().unwrap()) };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Note", vec![set])));
+    h.run_steps(3);
+    let drawn = |h: &Harness<'_, Moonglow>, area: ResRef, notes: bool| {
+        let app = h.state();
+        let ws = app.ws.as_ref().unwrap();
+        let doc = |t| ws.module.gff(&ResKey::new(area, t)).unwrap().unwrap();
+        let are = doc(ResType::ARE);
+        let git = if area == chess { git.clone() } else { doc(ResType::GIT) };
+        let rm = &app.game.as_ref().unwrap().resman;
+        let codepage = mg_core::Codepage::default();
+        let d = mg_module::minimap::draw(rm, &are.root, notes.then_some(&git.root), None, codepage)
+            .unwrap();
+        mg_module::minimap::png(&d.image).unwrap()
+    };
+
+    // One area, with its map notes: the note, unsaved, marked.
+    let png = dir.join("one.png");
+    h.state_mut().dialogs = Box::new(NoDialogs { save: vec![png.clone()], ..Default::default() });
+    tree_row(&h, "chess").click_secondary();
+    h.run();
+    open_submenu(&mut h, "Export");
+    h.get_by_label("Export Minimap with Map Notes…").click();
+    h.run();
+    let one = std::fs::read(&png).expect("the minimap is saved");
+    assert_eq!(one, drawn(&h, chess, true), "marked as mg_module draws it");
+    assert_ne!(one, drawn(&h, chess, false), "the note marked");
+
+    // Both areas chosen: Export Minimaps… into a folder.
+    let folder = dir.join("maps");
+    let into = |h: &mut Harness<'_, Moonglow>, item: &str| {
+        h.state_mut().dialogs =
+            Box::new(NoDialogs { folders: vec![folder.clone()], ..Default::default() });
+        tree_row(h, "chess").click();
+        h.run_steps(2);
+        tree_row(h, "chess2").click_modifiers(egui::Modifiers::SHIFT);
+        h.run_steps(2);
+        h.get_by_label("chess2").click_secondary();
+        h.run_steps(2);
+        open_submenu(h, "Export");
+        h.get_by_label(item).click();
+        h.run_steps(3);
+    };
+    into(&mut h, "Export Minimaps with Map Notes…");
+    assert!(h.state().dialog_export_ask.is_none(), "nothing to write over");
+    let read = |name: &str| std::fs::read(folder.join(name)).unwrap();
+    assert_eq!(read("chess.png"), one);
+    assert_eq!(read("chess2.png"), drawn(&h, copy, true));
+    // Again, without the notes: asked first, then written over.
+    into(&mut h, "Export Minimaps…");
+    let ask = h.state().dialog_export_ask.clone().expect("asked before writing over them");
+    assert_eq!(ask.existing, ["chess.png", "chess2.png"]);
+    h.get_by_label("Replace 2").click();
+    h.run_steps(3);
+    assert_eq!(read("chess.png"), drawn(&h, chess, false), "unmarked now");
+    let said = h.state().log.entries.last().unwrap().1.clone();
+    assert!(said.starts_with("Wrote 2 minimaps to "), "{said}");
+    // Skip Those: the files there left as they are (the notes not drawn).
+    into(&mut h, "Export Minimaps with Map Notes…");
+    h.get_by_label("Skip Those").click();
+    h.run_steps(3);
+    assert_eq!(read("chess.png"), drawn(&h, chess, false), "left as it was");
+    // Always do this: Options' choice, and not asked again (a builder's
+    // ask: a question always given the same answer).
+    use mg_ui::settings::FilesThere;
+    assert_eq!(h.state().settings.files_there, FilesThere::Ask);
+    into(&mut h, "Export Minimaps with Map Notes…");
+    h.get_by_label("Always do this").click();
+    h.run_steps(2);
+    h.get_by_label("Replace 2").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.files_there, FilesThere::Replace);
+    assert_eq!(read("chess.png"), one, "written over");
+    into(&mut h, "Export Minimaps…");
+    assert!(h.state().dialog_export_ask.is_none(), "not asked");
+    assert_eq!(read("chess.png"), drawn(&h, chess, false), "written over without asking");
 }
 
 /// Area Properties › Visual: another area's lighting given to this one
@@ -168,9 +289,12 @@ fn an_area_s_lighting_is_copied_and_kept_for_another() {
     h.get_by_label("None saved yet");
     h.get_by_label("Save This Lighting…").click();
     h.run_steps(3);
-    h.get_all_by_role(egui::accesskit::Role::TextInput).last().unwrap().type_text("Dusk");
+    h.get_all_by_role(egui::accesskit::Role::TextInput)
+        .rfind(|n| n.accesskit_node().label().as_deref() != Some("Quick Open"))
+        .unwrap()
+        .type_text("Dusk");
     h.run_steps(2);
-    h.get_by_label("Save").click();
+    apart(&h, "Save").click();
     h.run_steps(2);
     assert_eq!(mg_ui::lighting::list(Some(&dir)), ["Dusk"]);
     // Given to the second: its colors are the first's.
@@ -216,11 +340,17 @@ fn an_area_s_lighting_is_copied_and_kept_for_another() {
     open_menu(&mut h, "Rename");
     h.get_all_by_label("Dusk").last().unwrap().click();
     h.run_steps(3);
-    let input = h.get_all_by_role(egui::accesskit::Role::TextInput).last().unwrap();
+    let input = h
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .rfind(|n| n.accesskit_node().label().as_deref() != Some("Quick Open"))
+        .unwrap();
     input.focus();
     h.run_steps(1);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
-    h.get_all_by_role(egui::accesskit::Role::TextInput).last().unwrap().type_text("Evening");
+    h.get_all_by_role(egui::accesskit::Role::TextInput)
+        .rfind(|n| n.accesskit_node().label().as_deref() != Some("Quick Open"))
+        .unwrap()
+        .type_text("Evening");
     h.run_steps(2);
     h.get_by_label("Rename").click();
     h.run_steps(2);
@@ -259,56 +389,29 @@ fn an_area_s_lighting_is_copied_and_kept_for_another() {
     assert_eq!(saved.unwrap().get(row, "LABEL"), Some("Evening"));
 }
 
-/// Options › General › Toolbar buttons, Icons only: the area view's
-/// toolbar too, at once: glyphs alone, named in their tips (a button with
-/// no tip of its own: its name) and by their names for a screen reader,
-/// not by their glyphs; the toggles still toggling. All, None, Together,
-/// To Scratch and Save as Prefab… have glyphs too.
+/// The area's header's toggles toggle and its Area Properties opens the
+/// area's properties. (It read Options' "Toolbar buttons" no more since
+/// M4's U3, which U23 retired: its row yields by its width alone,
+/// `area_view` and the header tests.)
 #[test]
-fn the_area_toolbar_shows_icons_only_when_asked() {
+fn the_area_header_s_toggles_toggle() {
     let Some((mut h, area)) = area_harness("area-icons-only") else { return };
-    h.get_by_label("🎥 Reorient Camera");
-    h.get_by_label("☑ All");
-    h.state_mut().settings.toolbar_icons_only = true;
-    h.run_steps(2);
-    for gone in ["🎥 Reorient Camera", "⊞ Grid", "🎥", "⊞", "☑ All", "📤 To Scratch"] {
-        assert!(h.query_by_label(gone).is_none(), "{gone}");
-    }
-    for name in ["All", "None", "Together", "To Scratch", "Area Properties"] {
-        h.get_by_label(name);
-    }
-    let camera = h.get_by_label("Reorient Camera").rect().center();
-    h.hover_at(camera);
-    // (A tooltip waits a moment.)
-    h.run_steps(60);
-    assert_eq!(h.query_all_by_label("Reorient Camera").count(), 2, "the button and its tip");
-    h.get_by_label("Grid").hover();
-    h.run_steps(60);
-    h.get_by_label("Grid\nDisplay Grid");
     let shown = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].grid;
     let before = shown(&h);
-    h.get_by_label("Grid").click();
-    h.run_steps(2);
-    assert_ne!(shown(&h), before, "Grid toggled by its glyph");
-    let on = match before {
-        true => egui::accesskit::Toggled::False,
-        false => egui::accesskit::Toggled::True,
-    };
-    let grid = h.get_by_label("Grid").accesskit_node();
-    assert_eq!(grid.toggled(), Some(on), "a toggle, said to be on or off");
-    h.get_by_label("Area Properties").click();
-    h.run_steps(2);
+    area_click(&mut h, "Grid");
+    assert_ne!(shown(&h), before, "Grid toggled");
+    area_click(&mut h, "Area Properties");
     assert!(h.state().dock.find_tab(&Tab::AreaProperties(area)).is_some());
 }
 
 #[test]
 fn area_properties_edit_the_area() {
-    let Some((mut h, area)) = area_harness("area-props") else { return };
+    let Some((mut h, area)) = area_ui_harness("area-props") else { return };
     let are = |h: &mut Harness<'_, Moonglow>| -> mg_gff::Struct {
         let ws = h.state_mut().ws.as_mut().unwrap();
         ws.doc(&ResKey::new(area, ResType::ARE)).unwrap().root.clone()
     };
-    h.get_by_label("🔧 Area Properties").click();
+    area_click(&mut h, "Area Properties");
     h.run_steps(2);
     assert!(h.state().dock.find_tab(&Tab::AreaProperties(area)).is_some());
 
@@ -348,14 +451,69 @@ fn area_properties_edit_the_area() {
     let a = are(&mut h);
     assert_eq!(a.integer("LightingScheme"), Some(game_row as i64));
     assert_eq!(a.integer("SunAmbientColor"), Some(0x32_3A_3C), "ExteriorDark's 60, 58, 50");
-    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Lighting scheme"));
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Lighting Scheme"));
     // Always dark.
-    h.get_by_label("Always Dark").click();
+    click_in_sight(&mut h, "Always Dark");
     h.run_steps(2);
     let a = are(&mut h);
     assert_eq!((a.integer("DayNightCycle"), a.integer("IsNight")), (Some(0), Some(1)));
-    let img = h.render().expect("render");
-    img.save(mg_testkit::scratch_dir("ui-area-props").join("visual.png")).unwrap();
+    if let Some(dir) = shot_dir("ui-area-props") {
+        let img = h.render().expect("render");
+        img.save(dir.join("visual.png")).unwrap();
+    }
+}
+
+/// The Copy window's ResRef set to `resref`, and its Tag to the
+/// original's (a builder keeping it: an area's copy is offered its ResRef).
+fn keep_the_original_s_tag(h: &mut Harness<'_, Moonglow>, resref: &str) {
+    let draft = h.state_mut().copy_as.as_mut().expect("the Copy window");
+    draft.resref = resref.into();
+    (draft.tag, draft.tag_follows) = (draft.original_tag.clone(), false);
+}
+
+/// An area's copy is tagged as its ResRef: the Tag follows the ResRef as
+/// it is typed, until the Tag itself is changed (a builder's ask: the
+/// copy kept the original's tag).
+#[test]
+fn an_area_s_copy_takes_its_resref_as_its_tag() {
+    let Some((mut h, area)) = area_ui_harness("copy-area-resref-tag") else { return };
+    let key = ResKey::new(area, ResType::ARE);
+    h.state_mut().actions.push(mg_ui::Action::CopyDialog(key));
+    h.run_steps(3);
+    let draft = h.state().copy_as.clone().expect("the Copy window");
+    assert_eq!(draft.tag.as_deref(), Some(draft.resref.as_str()), "the ResRef offered");
+    // Typed in the ResRef (focused when the window opens).
+    let is_input =
+        |n: &egui_kittest::Node<'_>| n.accesskit_node().role() == egui::accesskit::Role::TextInput;
+    h.get_all_by_value(&draft.resref).find(is_input).expect("the ResRef field").click();
+    h.run();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_all_by_value(&draft.resref).find(is_input).unwrap().type_text("field_two");
+    h.run();
+    assert_eq!(h.state().copy_as.as_ref().unwrap().tag.as_deref(), Some("field_two"));
+    h.get_by_label("Create Copy").click();
+    h.run_steps(3);
+    let new = ResKey::new(ResRef::from_str("field_two").unwrap(), ResType::ARE);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    assert_eq!(ws.doc(&new).unwrap().root.string("Tag"), Some(&b"field_two"[..]));
+    // A Tag typed is kept, the ResRef changed after it.
+    h.state_mut().actions.push(mg_ui::Action::CopyDialog(key));
+    h.run_steps(3);
+    let draft = h.state().copy_as.clone().expect("the Copy window");
+    let fields: Vec<_> = h.get_all_by_value(&draft.resref).filter(is_input).collect();
+    assert_eq!(fields.len(), 2, "the ResRef and the Tag");
+    fields[1].click();
+    h.run();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_all_by_value(&draft.resref).filter(is_input).nth(1).unwrap().type_text("MARKET");
+    h.run();
+    h.state_mut().copy_as.as_mut().unwrap().resref = "field_three".into();
+    h.run();
+    h.get_by_label("Create Copy").click();
+    h.run_steps(3);
+    let new = ResKey::new(ResRef::from_str("field_three").unwrap(), ResType::ARE);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    assert_eq!(ws.doc(&new).unwrap().root.string("Tag"), Some(&b"MARKET"[..]));
 }
 
 /// An area copied with its tag and its objects': the area's own tag and
@@ -363,7 +521,7 @@ fn area_properties_edit_the_area() {
 /// gives the copy's their own.
 #[test]
 fn an_area_copied_with_its_tags_offers_retag() {
-    let Some((mut h, area)) = area_harness("copy-area-tags") else { return };
+    let Some((mut h, area)) = area_ui_harness("copy-area-tags") else { return };
     // (Options › General › Show duplicate tags warning: off by default.)
     h.state_mut().settings.warn_duplicate_tags = true;
     h.state_mut().ws.as_mut().unwrap().module.project_file.tags.unique =
@@ -371,7 +529,7 @@ fn an_area_copied_with_its_tags_offers_retag() {
     let key = ResKey::new(area, ResType::ARE);
     h.state_mut().actions.push(mg_ui::Action::CopyDialog(key));
     h.run_steps(3);
-    h.state_mut().copy_as.as_mut().unwrap().resref = "field_two".into();
+    keep_the_original_s_tag(&mut h, "field_two");
     h.run_steps(2);
     h.get_by_label("Create Copy").click();
     h.run_steps(3);
@@ -412,7 +570,7 @@ fn an_area_copied_with_its_tags_offers_retag() {
 /// script that spells the waypoint's tag is said, not changed.
 #[test]
 fn retag_all_follows_the_copy_s_transitions_and_names_the_scripts() {
-    let Some((mut h, area)) = area_harness("copy-area-retag-all") else { return };
+    let Some((mut h, area)) = area_ui_harness("copy-area-retag-all") else { return };
     let git = ResKey::new(area, ResType::GIT);
     {
         let app = h.state_mut();
@@ -451,7 +609,7 @@ fn retag_all_follows_the_copy_s_transitions_and_names_the_scripts() {
         h.state_mut().tag_clash = None;
         h.state_mut().actions.push(mg_ui::Action::CopyDialog(ResKey::new(area, ResType::ARE)));
         h.run_steps(3);
-        h.state_mut().copy_as.as_mut().unwrap().resref = name.into();
+        keep_the_original_s_tag(h, name);
         h.run_steps(2);
         h.get_by_label("Create Copy").click();
         h.run_steps(3);
@@ -489,12 +647,143 @@ fn retag_all_follows_the_copy_s_transitions_and_names_the_scripts() {
     assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Retag"));
 }
 
+/// The Duplicate Tags window keeps the new objects by their places in
+/// their lists and doesn't stop the editor: with another object of the
+/// list deleted behind it, Retag gave whatever stood at the place the new
+/// tag (the review of November 2026, D2). In a module changed since the
+/// tags were checked it retags nothing, and says so.
+#[test]
+fn retag_leaves_a_module_changed_since_the_check_alone() {
+    use mg_edit::{Command, Edit, GffPath};
+    use mg_gff::{Struct, Value};
+    let dir = mg_testkit::scratch_dir("ui-retag-stale");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let placeable = |tag: &str| {
+        let mut p = Struct::new(9);
+        p.set("Tag", Value::String(tag.as_bytes().to_vec()));
+        p
+    };
+    let mut git = Gff::new(*b"GIT ");
+    let list = vec![placeable("LAMP"), placeable("LAMP"), placeable("CHEST")];
+    git.root.set("Placeable List", Value::List(list));
+    let start = ResKey::parse("start", ResType::GIT).unwrap();
+    let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
+    let tags = |app: &mut Moonglow| -> Vec<String> {
+        let ws = app.ws.as_mut().unwrap();
+        let doc = ws.doc(&start).unwrap();
+        (doc.root.list("Placeable List").unwrap().iter())
+            .map(|p| String::from_utf8_lossy(p.string("Tag").unwrap()).into_owned())
+            .collect()
+    };
+    // The second lamp was pasted: the window holds it at place 1.
+    let made =
+        mg_ui::tag_clash::Made { key: start, path: GffPath::root().item("Placeable List", 1) };
+    let clash = |app: &Moonglow| mg_ui::tag_clash::TagClash {
+        what: "“Paste”".into(),
+        clashes: vec![mg_module::tags::Clash {
+            tag: "LAMP".into(),
+            raw: b"LAMP".to_vec(),
+            count: 2,
+            unique: None,
+            area: None,
+        }],
+        objects: vec![(made.clone(), "LAMP".into())],
+        others: 0,
+        more: Vec::new(),
+        made: vec![made.clone()],
+        scripts: Vec::new(),
+        from_option: true,
+        revision: app.ws.as_ref().unwrap().revision(),
+    };
+    app.tag_clash = Some(clash(&app));
+    // The first lamp deleted behind the window: the chest is at place 1.
+    let remove = Edit::remove_item(start, GffPath::root(), "Placeable List", 0);
+    app.ws.as_mut().unwrap().apply(Command::new("Delete", vec![remove])).unwrap();
+    let mut h = harness(app, 1100.0, 760.0);
+    h.run();
+    h.get_by_label("Retag").click();
+    h.run_steps(2);
+    assert_eq!(tags(h.state_mut()), ["LAMP", "CHEST"], "nothing retagged");
+    assert!(h.state().tag_clash.is_none());
+    let said = |h: &Harness<'_, Moonglow>, what: &str| {
+        h.state().log.entries.iter().any(|(_, l)| l.contains(what))
+    };
+    assert!(said(&h, "Nothing was retagged"), "{:?}", h.state().log.entries);
+    // In the module as it was checked, the object held gets the new tag.
+    h.state_mut().actions.push(mg_ui::Action::Undo);
+    h.run_steps(2);
+    let fresh = clash(h.state());
+    h.state_mut().tag_clash = Some(fresh);
+    h.run();
+    h.get_by_label("Retag").click();
+    h.run_steps(2);
+    assert_eq!(tags(h.state_mut()), ["LAMP", "LAMP_2", "CHEST"]);
+}
+
+/// A tag with a letter outside ASCII is bytes in the module's codepage
+/// (`Señor`: `Se\xF1or` in Windows-1252). Compared as UTF-8 text, Find
+/// References found it nowhere, and the Duplicate Tags window listed it
+/// with a mark in place of the letter, matched no object and retagged
+/// none (the review of November 2026, D17). It is compared as the module
+/// has it, and read as the game reads it.
+#[test]
+fn a_tag_outside_ascii_is_found_and_retagged() {
+    use mg_edit::{Command, Edit, GffPath};
+    use mg_gff::{Struct, Value};
+    let dir = mg_testkit::scratch_dir("ui-tag-outside-ascii");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.settings.no_last_area = true;
+    app.settings.warn_duplicate_tags = true;
+    app.open_module(&path);
+    let senor = b"Se\xF1or";
+    let placeable = || {
+        let mut p = Struct::new(9);
+        p.set("Tag", Value::String(senor.to_vec()));
+        p
+    };
+    let mut git = Gff::new(*b"GIT ");
+    git.root.set("Placeable List", Value::List(vec![placeable()]));
+    let start = ResKey::parse("start", ResType::GIT).unwrap();
+    let set = Edit::SetResource { key: start, data: Some(git.to_bytes().unwrap()) };
+    app.ws.as_mut().unwrap().apply(Command::new("setup", vec![set])).unwrap();
+    let mut h = harness(app, 1100.0, 760.0);
+    h.run();
+    // Found by its tag, typed as it reads.
+    h.state_mut().find_references(mg_ui::references::Query::Tag("Señor".into()));
+    settle(&mut h);
+    let found = h.state().references.usages.clone();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].from, start);
+    // A second object with the tag, as a paste makes one: said as it
+    // reads, and Retag gives the new one a tag of its own.
+    let paste = Edit::insert_item(start, GffPath::root(), "Placeable List", 1, placeable());
+    h.state_mut().actions.push(mg_ui::Action::Apply(Command::new("Paste", vec![paste])));
+    settle(&mut h);
+    let clash = h.state().tag_clash.clone().expect("the Duplicate Tags window");
+    assert_eq!(clash.clashes[0].tag, "Señor");
+    assert_eq!(clash.objects.len(), 1, "the object pasted: {:?}", clash.objects);
+    h.get_by_label("• Señor is now on two objects");
+    h.get_by_label("Retag").click();
+    settle(&mut h);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let doc = ws.doc(&start).unwrap();
+    let tags: Vec<Vec<u8>> = (doc.root.list("Placeable List").unwrap().iter())
+        .map(|p| p.string("Tag").unwrap().to_vec())
+        .collect();
+    assert_eq!(tags, [senor.to_vec(), b"Se\xF1or_2".to_vec()]);
+}
+
 /// An area copied whose tags the project wants unique in each area
 /// (`unique_in_area`): the copy's own tag is in another area, as meant,
 /// and not listed; its two waypoints of one tag are, in the copy.
 #[test]
 fn an_area_copied_counts_tags_unique_in_each_area_in_the_copy() {
-    let Some((mut h, area)) = area_harness("copy-area-tags-in-area") else { return };
+    let Some((mut h, area)) = area_ui_harness("copy-area-tags-in-area") else { return };
     let key = ResKey::new(area, ResType::ARE);
     let tag = |h: &mut Harness<'_, Moonglow>, k: ResKey, path: mg_edit::GffPath| {
         let ws = h.state_mut().ws.as_mut().unwrap();
@@ -537,13 +826,13 @@ fn the_area_wizard_opens_at_the_top_of_its_tilesets() {
     let path = sample_module(&dir);
     let mut app = game_app(&root, None);
     app.open_module(&path);
-    app.open_palette = false;
+    app.palette_dock = false;
     let first = mg_module::new::tilesets(app.game.as_deref().unwrap())[0].name.clone();
     let mut h = harness(app, 1200.0, 900.0);
     h.run();
     let shown = |h: &Harness<'_, Moonglow>| {
         let top = h.get_by_label("Tileset").rect().bottom();
-        let bottom = h.get_by_label("Size").rect().top();
+        let bottom = h.get_by_label("Next >").rect().top();
         let r = h.get_by_label(&first).rect();
         r.top() >= top && r.bottom() <= bottom
     };
@@ -571,12 +860,133 @@ fn the_area_wizard_opens_at_the_top_of_its_tilesets() {
     assert!(shown(&h), "{first} is at the top of the list again");
 }
 
+/// The Area Wizard's tilesets are rows across the list (U30's #11: the
+/// one chosen filled behind its words alone): each as wide as the list,
+/// whatever its name's length, the one chosen too.
+#[test]
+fn the_area_wizard_s_tileset_rows_fill_the_list() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = mg_testkit::scratch_dir("ui-area-wizard-rows");
+    let path = sample_module(&dir);
+    let mut app = game_app(&root, None);
+    app.open_module(&path);
+    app.palette_dock = false;
+    let names: Vec<String> = (mg_module::new::tilesets(app.game.as_deref().unwrap()).iter())
+        .take(4)
+        .map(|t| t.name.clone())
+        .collect();
+    let mut h = harness(app, 1200.0, 900.0);
+    h.state_mut().actions.push(mg_ui::Action::AreaWizard);
+    settle(&mut h);
+    h.get_by_label(&names[0]).click();
+    settle(&mut h);
+    let rows: Vec<egui::Rect> = names.iter().map(|n| h.get_by_label(n).rect()).collect();
+    for (name, row) in names.iter().zip(&rows) {
+        assert!(row.width() >= 270.0, "{name}: {row:?} not across the list");
+        assert!((row.left() - rows[0].left()).abs() < 0.5, "{name}: {row:?} beside the others");
+        assert!((row.width() - rows[0].width()).abs() < 0.5, "{name}: {row:?} not as wide");
+    }
+}
+
+/// The Area Wizard has three pages, as Aurora's: Name and Tileset, Size and
+/// Finish. Next is off on the first without a tileset (or a name), Back
+/// keeps what was entered, a double click on a tileset goes on, Finish is
+/// off before the last page, and Finish there makes the area.
+#[test]
+fn the_area_wizard_walks_its_three_pages() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = mg_testkit::scratch_dir("ui-area-wizard-pages");
+    let path = sample_module(&dir);
+    let mut app = game_app(&root, None);
+    app.open_module(&path);
+    app.palette_dock = false;
+    let tilesets = mg_module::new::tilesets(app.game.as_deref().unwrap());
+    let (first, second) = (tilesets[0].name.clone(), tilesets[1].name.clone());
+    let areas = |h: &Harness<'_, Moonglow>| {
+        h.state().ws.as_ref().unwrap().module.keys_of(ResType::ARE).count()
+    };
+    let mut h = harness(app, 1200.0, 900.0);
+    let was = areas(&h);
+    // (The step list has a Finish too: the buttons by their role.)
+    let button = |h: &Harness<'_, Moonglow>, name: &str| {
+        h.get_by_role_and_label(egui::accesskit::Role::Button, name).accesskit_node().is_disabled()
+    };
+    let enabled = |h: &Harness<'_, Moonglow>, name: &str| !button(h, name);
+    let page = |h: &Harness<'_, Moonglow>| match &h.state().wizard {
+        Some(mg_ui::Wizard::NewArea(w)) => w.page,
+        _ => panic!("the Area Wizard is open"),
+    };
+    h.state_mut().actions.push(mg_ui::Action::AreaWizard);
+    settle(&mut h);
+    // Page 1: Name and Tileset, with the step list; Finish is not yet on.
+    assert_eq!(page(&h), 0);
+    h.get_by_label_contains("Step 1 of 3");
+    h.get_by_label(&first);
+    assert!(enabled(&h, "Next >") && !enabled(&h, "Finish") && !enabled(&h, "< Back"));
+    // No tileset chosen: Next is off.
+    if let Some(mg_ui::Wizard::NewArea(w)) = &mut h.state_mut().wizard {
+        w.selected = None;
+    }
+    settle(&mut h);
+    assert!(!enabled(&h, "Next >"), "no tileset: no Next");
+    // A double click on a tileset chooses it and goes on to Size.
+    let at = h.get_by_label(&second).rect().center();
+    double_click_now(&mut h, at);
+    settle(&mut h);
+    assert_eq!(page(&h), 1, "a double click goes to the next page");
+    h.get_by_label("Area size");
+    h.get_by_label("Large").click();
+    settle(&mut h);
+    // Back keeps the name and the tileset.
+    h.get_by_label("< Back").click();
+    settle(&mut h);
+    assert_eq!(page(&h), 0);
+    match &h.state().wizard {
+        Some(mg_ui::Wizard::NewArea(w)) => {
+            assert_eq!(w.tilesets[w.selected.unwrap()].name, second);
+            assert_eq!((w.width, w.height), (16, 16));
+        }
+        _ => panic!("the Area Wizard is open"),
+    }
+    // A name is wanted too.
+    if let Some(mg_ui::Wizard::NewArea(w)) = &mut h.state_mut().wizard {
+        w.name = "  ".into();
+    }
+    settle(&mut h);
+    assert!(!enabled(&h, "Next >"), "no name: no Next");
+    if let Some(mg_ui::Wizard::NewArea(w)) = &mut h.state_mut().wizard {
+        w.name = "Glade".into();
+    }
+    settle(&mut h);
+    area_wizard_next(&mut h, 2);
+    assert_eq!(page(&h), 2);
+    h.get_by_label_contains("Step 3 of 3");
+    h.get_by_label_contains("\"Glade\"");
+    h.get_by_label("Open Area Properties");
+    assert!(enabled(&h, "Finish") && !enabled(&h, "Next >"));
+    assert_eq!(areas(&h), was, "nothing made before Finish");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Finish").click();
+    settle(&mut h);
+    assert!(h.state().wizard.is_none(), "Finish closes the wizard");
+    assert_eq!(areas(&h), was + 1, "Finish made the area");
+    // Opened again, it starts on its first page.
+    h.state_mut().actions.push(mg_ui::Action::AreaWizard);
+    settle(&mut h);
+    assert_eq!(page(&h), 0);
+}
+
 #[test]
 fn an_area_is_renamed_from_its_tab() {
     let Some((mut h, area)) = area_harness("rename-tab") else { return };
     h.run_steps(3);
     // Right click on the area's tab: Rename….
-    h.get_by_label(&area.to_string()).click_secondary();
+    doc_tab(&h, &area.to_string()).click_secondary();
     h.run_steps(2);
     h.get_by_label("Rename…").click();
     h.run_steps(2);
@@ -646,6 +1056,9 @@ fn areas_are_chosen_by_what_they_hold_and_kept_as_a_set() {
     h.run();
     h.get_by_label("Edit Areas Together…").click();
     h.run();
+    // (The Right Dock's section, its Areas page: the box where it comes
+    // to rest.)
+    at_rest(&mut h, "the Holding box", &|h| h.get_by_value("Anything").rect());
     h.get_by_value("Anything").click();
     h.run();
     h.get_all_by_label("A variable").last().unwrap().click();
@@ -667,7 +1080,7 @@ fn areas_are_chosen_by_what_they_hold_and_kept_as_a_set() {
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Var", vec![edit])));
     h.run();
     h.get_by_label_contains("Wolf Cave");
-    h.get_by_label("Tick Shown").click();
+    h.get_by_label("Check Shown").click();
     h.run();
     // Kept as a set, and ticked again.
     type_into_hint(&mut h, "set name", "Caves");
@@ -677,18 +1090,19 @@ fn areas_are_chosen_by_what_they_hold_and_kept_as_a_set() {
     let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     assert_eq!(kept["areas"], serde_json::json!(["cave1", "cave2"]));
     assert_eq!(kept["module"], "sample");
-    h.get_by_label("Untick All").click();
+    h.get_by_label("Uncheck All").click();
     h.run();
-    assert!(h.query_by_label("Edit 0 Together").is_some());
-    h.get_by_value("Tick a Set…").click();
+    h.get_by_label("No areas checked");
+    h.get_by_value("Check a Set…").click();
     h.run();
     h.get_all_by_label("Caves").last().unwrap().click();
     h.run();
-    h.get_by_label("Edit 2 Together");
+    h.get_by_label("2 areas checked");
 }
 
-/// Edit › Edit Areas Together…: areas ticked in the chooser (narrowed by
-/// its filters) open in one Area Properties, where a change is set on each:
+/// Edit › Edit Areas Together…: areas ticked in the Right Dock's section
+/// (narrowed by its filters) open by Open in Tab in one Area Properties,
+/// where a change is set on each:
 /// a field, a flag (each area keeping its other flags), and the variables
 /// added or changed (each keeping its own).
 #[test]
@@ -739,22 +1153,26 @@ fn several_areas_are_edited_together() {
     h.get_by_label("Edit Areas Together…").click();
     h.run();
     h.get_by_label_contains("Apple Inn");
+    // (Where the section comes to rest.)
+    at_rest(&mut h, "the ground box", &|h| h.get_by_value("Above or under ground").rect());
     h.get_by_value("Above or under ground").click();
     h.run();
     h.get_all_by_label("Underground").last().unwrap().click();
     h.run();
     assert!(h.query_by_label_contains("Apple Inn").is_none(), "the inn is above ground");
-    assert!(h.query_by_label("Edit 0 Together").is_some());
-    h.get_by_label("Tick Shown").click();
+    h.get_by_label("No areas checked");
+    assert!(h.get_by_label("Open in Tab").accesskit_node().is_disabled(), "two at the least");
+    h.get_by_label("Check Shown").click();
     h.run();
-    h.get_by_label("Edit 2 Together").click();
+    h.get_by_label("2 areas checked");
+    h.get_by_label("Open in Tab").click();
     h.run_steps(3);
     let caves: Vec<ResRef> = ["cave1", "cave2"].map(|n| ResRef::from_str(n).unwrap()).to_vec();
     assert!(h.state().dock.find_tab(&Tab::AreasProperties(caves)).is_some());
-    assert!(h.query_by_label("Edit Areas Together").is_none(), "the chooser closed");
+    assert!(h.query_by_label("Edit Areas Together").is_none(), "the section closed");
 
     // Visual: always dark, on both caves and not on the inn.
-    h.get_by_label("Always Dark").click();
+    click_in_sight(&mut h, "Always Dark");
     h.run_steps(2);
     for (name, night) in [("cave1", 1), ("cave2", 1), ("inn", 0)] {
         let a = are(&mut h, name);
@@ -771,7 +1189,7 @@ fn several_areas_are_edited_together() {
     h.get_by_label("Names, tags and comments are edited one area at a time.");
     // The flags they differ in, each marked: natural or artificial, and
     // shader flag 0x100 (one field holds them all).
-    assert_eq!(h.query_all_by_value("≠").count(), 2);
+    assert_eq!(h.query_all_by_value("mixed").count(), 2);
     h.get_by_label("Above ground").click();
     h.run_steps(2);
     let flags = |h: &mut Harness<'_, Moonglow>, name: &str| are(h, name).integer("Flags");
@@ -780,14 +1198,22 @@ fn several_areas_are_edited_together() {
     assert_eq!(flags(&mut h, "inn"), Some(0x1));
     h.get_by_label("Artificial").click();
     h.run_steps(2);
-    assert_eq!(h.query_all_by_value("≠").count(), 1, "both artificial now");
+    assert_eq!(h.query_all_by_value("mixed").count(), 1, "both artificial now");
     // Variables: one added is added to each, which keeps its own. (The
     // caves' are in their ARE, as Moonglow wrote them before 1.34.3:
     // opening the window moves them to the GIT, where the game reads
     // them, one step of its own.)
-    h.get_by_label("Variables (1)…").click();
+    // (Below the page's fields, one under the other in a window this
+    // narrow: scrolled to.)
+    click_in_sight(&mut h, "Variables (1)…");
     h.run();
-    h.get_by_label("Add").click();
+    // (The Variables window's Add: the page's own, further down the window,
+    // is laid out too once it is scrolled to the Advanced page's foot.)
+    let screen = h.ctx.content_rect();
+    (h.get_all_by_label("Add").filter(|n| screen.contains_rect(n.rect())))
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .expect("the Variables window's Add")
+        .click();
     h.run();
     {
         let row = h.state_mut().var_edit.as_mut().unwrap().rows.last_mut().unwrap();
@@ -817,7 +1243,7 @@ fn several_areas_are_edited_together() {
     assert_eq!(names(&mut h, "cave1"), ["nDepth"]);
 }
 
-/// Give Every Area This Page's Visual Settings, on areas edited together:
+/// Copy This Page to Every Area (Visual's), on areas edited together:
 /// an area of another lighting scheme gets the first's, and its tiles'
 /// lights from that scheme's colors, as choosing the scheme gives them;
 /// one of the same scheme keeps its tiles' own. One step to undo.
@@ -872,7 +1298,7 @@ fn every_area_is_given_the_scheme_s_tile_lights() {
     let before = sources(&mut h, "cave2");
     h.get_by_label("Visual").click();
     h.run_steps(2);
-    h.get_by_label("Give Every Area This Page's Visual Settings").click();
+    h.get_by_label("Copy This Page to Every Area").click();
     h.run_steps(3);
     let (scheme, lights) = sources(&mut h, "cave2");
     assert_eq!(scheme, Some(i64::from(evil)));
@@ -883,9 +1309,11 @@ fn every_area_is_given_the_scheme_s_tile_lights() {
         "the same scheme: its own"
     );
     // (Rendering opens a GPU device.)
-    mg_testkit::gpu::hold();
-    let img = h.render().expect("render");
-    img.save(mg_testkit::output_dir("ui-areas-scheme").join("visual.png")).unwrap();
+    if let Some(dir) = shot_dir("ui-areas-scheme") {
+        mg_testkit::gpu::hold();
+        let img = h.render().expect("render");
+        img.save(dir.join("visual.png")).unwrap();
+    }
     h.state_mut().actions.push(mg_ui::Action::Undo);
     h.run_steps(2);
     assert_eq!(sources(&mut h, "cave2"), before, "one undo");
@@ -895,13 +1323,14 @@ fn every_area_is_given_the_scheme_s_tile_lights() {
 /// under the ResRef and Tag given, and the module lists it.
 #[test]
 fn an_area_is_copied_with_its_objects() {
-    let Some((mut h, area)) = area_harness("copy-area") else { return };
+    let Some((mut h, area)) = area_ui_harness("copy-area") else { return };
     let key = ResKey::new(area, ResType::ARE);
     h.state_mut().actions.push(mg_ui::Action::CopyDialog(key));
     h.run_steps(3);
     let draft = h.state_mut().copy_as.as_mut().expect("the Copy window");
     draft.resref = "start_two".into();
-    draft.tag = Some("StartTwo".into());
+    // (A Tag typed: the ResRef no longer gives it.)
+    (draft.tag, draft.tag_follows) = (Some("StartTwo".into()), false);
     h.run_steps(2);
     h.get_by_label("Create Copy").click();
     h.run_steps(3);
@@ -951,7 +1380,7 @@ fn an_area_is_copied_with_its_objects() {
 #[test]
 fn an_area_s_variables_are_kept_in_its_git() {
     use mg_gff::{Struct, Value};
-    let Some((mut h, area)) = area_harness("area-variables") else { return };
+    let Some((mut h, area)) = area_ui_harness("area-variables") else { return };
     let (are, git) = (ResKey::new(area, ResType::ARE), ResKey::new(area, ResType::GIT));
     let var = |name: &str, value: i32| {
         let mut s = Struct::new(0);
@@ -1056,4 +1485,39 @@ fn a_module_folder_saved_with_nothing_changed_is_as_it_was() {
         .filter(|name| before.get(*name) != after.get(*name))
         .collect();
     assert!(changed.is_empty(), "rewritten though nothing changed: {changed:?}");
+}
+
+/// Edit Areas Together lists the areas as the Module panel does, a space
+/// a name begins with kept, as Aurora sorts them (#54): " Zeta Keep"
+/// before "Apple Inn".
+#[test]
+fn areas_together_keeps_a_leading_space_in_its_order() {
+    let dir = mg_testkit::scratch_dir("ui-areas-leading-space");
+    let path = sample_module(&dir);
+    let mut m = mg_module::Module::open(&path).unwrap();
+    for (name, title) in [("keep", " Zeta Keep"), ("inn", "Apple Inn")] {
+        let mut are = Gff::new(*b"ARE ");
+        let title = LocString::from_text(Language::ENGLISH, Gender::Male, title);
+        are.root.set("Name", mg_gff::Value::LocString(title));
+        m.set(ResKey::parse(name, ResType::ARE).unwrap(), are.to_bytes().unwrap());
+    }
+    m.save().unwrap();
+    let mut app = app_with(Vec::new());
+    app.settings.area_names = true;
+    app.area_set_dir = Some(dir.join("area-sets"));
+    app.open_module(&path);
+    let mut h = window_harness(app);
+    h.run();
+    h.get_by_label("Edit").click();
+    h.run();
+    h.get_by_label("Edit Areas Together…").click();
+    h.run();
+    at_rest(&mut h, "the Holding box", &|h| h.get_by_value("Anything").rect());
+    // (The section's rows: in the Right Dock, right of the module tree's.)
+    let row = |h: &Harness<'_, Moonglow>, name: &str| {
+        (h.get_all_by_label_contains(name).map(|n| n.rect()))
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap()
+    };
+    assert!(row(&h, "Zeta Keep").top() < row(&h, "Apple Inn").top(), "the leading space first");
 }

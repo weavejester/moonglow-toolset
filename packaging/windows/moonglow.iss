@@ -62,3 +62,14 @@ Root: HKA; Subkey: "Software\Classes\MoonscarToolset.Module\shell\open\command";
 
 [Run]
 Filename: "{app}\moonscar.exe"; Description: "{cm:LaunchProgram,Moonscar Toolset}"; Flags: nowait postinstall skipifsilent
+; Moonglow's own update (Restart Now) runs this installer silently with
+; /MOONGLOWRESTART=1 (mg_update::install::installer_args; a name of its
+; own, none of Setup's switches): Moonglow is started again once it is
+; installed, as the user who started the update.
+Filename: "{app}\moonscar.exe"; Flags: nowait skipifnotsilent runasoriginaluser; Check: RestartAsked
+
+[Code]
+function RestartAsked: Boolean;
+begin
+  Result := ExpandConstant('{param:MOONGLOWRESTART|0}') = '1';
+end;

@@ -11,14 +11,14 @@
 use std::collections::HashMap;
 
 use egui::Ui;
-use mg_core::{Gender, Language};
+
 use mg_edit::{Command, Edit, GffPath, Step};
 use mg_gff::{Struct, Value};
 use mg_resman::ResKey;
 use mg_rules::GameData;
 use mg_rules::rows::{Meaning, list_item_name, meaning};
 
-use crate::text::{decode, encode, to_editor, with_english};
+use crate::text::{decode, encode, to_editor, with_edited_text};
 use crate::{Action, Moonglow};
 
 struct Ctx<'a> {
@@ -160,6 +160,8 @@ fn fields(app: &mut Moonglow, ui: &mut Ui, key: ResKey) {
     let file_type = doc.file_type_str();
     let mut ctx = Ctx { key, file_type, game: game.as_deref(), factions, actions, buffers };
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        // (A table of fields: rows 22 apart, a line between.)
+        mg_uikit::table_rows(ui);
         struct_ui(&mut ctx, ui, &doc.root, &GffPath::root());
     });
 }
@@ -192,6 +194,7 @@ fn struct_ui(ctx: &mut Ctx<'_>, ui: &mut Ui, s: &Struct, path: &GffPath) {
                         ui.weak(format!("struct {}", child.id));
                         let child_path = path.field(&label);
                         egui::CollapsingHeader::new(format!("{} fields", child.fields.len()))
+                            .icon(mg_uikit::collapsing_icon)
                             .id_salt(id)
                             .show(ui, |ui| struct_ui(ctx, ui, child, &child_path));
                     }
@@ -199,6 +202,7 @@ fn struct_ui(ctx: &mut Ctx<'_>, ui: &mut Ui, s: &Struct, path: &GffPath) {
                         ui.label(&label);
                         ui.weak("list");
                         egui::CollapsingHeader::new(format!("{} items", items.len()))
+                            .icon(mg_uikit::collapsing_icon)
                             .id_salt(id)
                             .show(ui, |ui| {
                                 // An item that stands for a row of a table
@@ -206,6 +210,13 @@ fn struct_ui(ctx: &mut Ctx<'_>, ui: &mut Ui, s: &Struct, path: &GffPath) {
                                 // each named.
                                 let labels = labels(path);
                                 for (i, item) in items.iter().enumerate() {
+                                    // (An item closed and out of sight takes
+                                    // its header's room: an area's thousands
+                                    // of placeables were each named and laid
+                                    // out every frame.)
+                                    if closed_out_of_sight(ui, (id, i)) {
+                                        continue;
+                                    }
                                     let item_path = path.item(&label, i);
                                     let at = (i, item.id);
                                     let name = list_item_name(
@@ -221,6 +232,7 @@ fn struct_ui(ctx: &mut Ctx<'_>, ui: &mut Ui, s: &Struct, path: &GffPath) {
                                         "[{i}] struct {}{name}",
                                         item.id
                                     ))
+                                    .icon(mg_uikit::collapsing_icon)
                                     .id_salt((id, i))
                                     .show(ui, |ui| struct_ui(ctx, ui, item, &item_path));
                                 }
@@ -249,9 +261,13 @@ fn struct_ui(ctx: &mut Ctx<'_>, ui: &mut Ui, s: &Struct, path: &GffPath) {
                                     meaning_ui(ctx, ui, id, (path, &label), v, m, *n);
                                 }
                                 if warned {
-                                    ui.colored_label(
-                                        ui.visuals().warn_fg_color,
-                                        PC_FACTION_WARNING,
+                                    let warn = ui.visuals().warn_fg_color;
+                                    let text = egui::RichText::new(PC_FACTION_WARNING).color(warn);
+                                    mg_uikit::icon_label(
+                                        ui,
+                                        mg_uikit::Icon::Warning,
+                                        Some(warn),
+                                        text,
                                     )
                                     .on_hover_text(PC_FACTION_HOVER);
                                 }
@@ -267,10 +283,9 @@ fn struct_ui(ctx: &mut Ctx<'_>, ui: &mut Ui, s: &Struct, path: &GffPath) {
 
 /// Beside an object's faction field of 0 (what Verify's `pc-faction`
 /// warns of).
-const PC_FACTION_WARNING: &str = "⚠ The PC faction: the players' alone";
-const PC_FACTION_HOVER: &str = "Faction 0 is the player characters'. The game puts a creature \
-    of it in Hostile; creatures regard a placeable or door of it as they regard players. Give \
-    it another faction (Verify warns of it: pc-faction).";
+const PC_FACTION_WARNING: &str = "The PC faction: the players' alone";
+const PC_FACTION_HOVER: &str = "Faction 0 is the players' own: the game puts a creature of it in \
+                                Hostile. Pick another.";
 
 /// Beside a number that stands for something: its name, in a list to
 /// choose another by name (a row of the table, a faction, an animation);
@@ -362,13 +377,14 @@ fn value_ui(ctx: &mut Ctx<'_>, ui: &mut Ui, id: egui::Id, path: &GffPath, label:
                         ui.weak(shortened(&text, 48));
                     }
                 }
-                let english = crate::text::codepage_of(Language::ENGLISH);
-                let current = ls
-                    .text_in(Language::ENGLISH, Gender::Male, english)
-                    .map(|t| t.into_owned())
-                    .unwrap_or_default();
+                // The text in the language edited (Options › Language), which
+                // is the one `with_edited_text` writes: the box showed the
+                // English text whatever was edited, so with another
+                // language what was typed replaced that language's text
+                // and the box went back to the English, as if refused.
+                let current = crate::text::edited_text(ls);
                 if let Some(t) = ctx.loc_text(ui, id, &current) {
-                    ctx.set(path, label, Value::LocString(with_english(ls.clone(), &t)));
+                    ctx.set(path, label, Value::LocString(with_edited_text(ls.clone(), &t)));
                 }
             });
         }
@@ -377,6 +393,25 @@ fn value_ui(ctx: &mut Ctx<'_>, ui: &mut Ui, id: egui::Id, path: &GffPath, label:
         }
         Value::Struct(_) | Value::List(_) => {}
     }
+}
+
+/// For a list's item drawn as a header that opens (`salt`: what its
+/// `CollapsingHeader` is given as `id_salt`): whether it is closed and
+/// out of sight, in which case a closed header's room is taken in its
+/// place and the caller draws nothing. An open one is always drawn, at
+/// its own height.
+pub(crate) fn closed_out_of_sight(ui: &mut Ui, salt: impl egui::AsIdSalt) -> bool {
+    // (As `CollapsingHeader` makes its id of the salt it is given.)
+    let id = ui.make_persistent_id(egui::IdSalt::new(salt));
+    let open = egui::collapsing_header::CollapsingState::load(ui.ctx(), id)
+        .is_some_and(|state| state.is_open());
+    let height = ui.spacing().interact_size.y;
+    let room = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(1.0, height));
+    let hidden = !open && !ui.is_rect_visible(room);
+    if hidden {
+        ui.add_space(height + ui.spacing().item_spacing.y);
+    }
+    hidden
 }
 
 #[cfg(test)]

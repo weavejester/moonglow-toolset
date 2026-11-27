@@ -24,14 +24,14 @@ pub fn client_binary(root: &Path) -> Option<PathBuf> {
 }
 
 /// The module's name for `+TestNewModule`, if `module` (a `.mod` file or a
-/// module folder) is in `user_dir`'s `modules` folder.
-pub fn module_name(user_dir: &Path, module: &Path) -> Option<String> {
+/// module folder) is in the game's modules folder `modules` (the user
+/// directory's, or the one `nwn.ini` aliases: `GameInstall::user_folder`).
+pub fn module_name(modules: &Path, module: &Path) -> Option<String> {
     let folder = module.parent()?;
-    let modules = user_dir.join("modules");
     let same = |a: &Path, b: &Path| {
         a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b)
     };
-    if !same(folder, &modules) {
+    if !same(folder, modules) {
         return None;
     }
     let is_mod = module.extension().is_some_and(|e| e.eq_ignore_ascii_case("mod"));
@@ -42,11 +42,23 @@ pub fn module_name(user_dir: &Path, module: &Path) -> Option<String> {
 /// The game's number on Steam.
 const STEAM_APP: &str = "704450";
 
+/// The environment variables that tell a Steam copy of the game it is
+/// Steam's.
+const STEAM_VARS: [&str; 2] = ["SteamAppId", "SteamGameId"];
+
+/// Whether the client is a Steam copy of the game: in a Steam library's
+/// `steamapps` (`SteamApps` in older Windows libraries).
+pub fn steam_copy(client: &Path) -> bool {
+    client.ancestors().any(|a| a.file_name().is_some_and(|n| n.eq_ignore_ascii_case("steamapps")))
+}
+
 /// The command Test Module runs: the client, from its own folder. The game
 /// starts the module with the first character of the list
 /// (`+TestNewModule`, as Aurora's F9 does), or, with `choose`, shows its
 /// character selection for the module (`+LoadNewModule`). With `steam`, a
-/// Steam copy is told it is Steam's (Options › General).
+/// Steam copy is told it is Steam's: Moonglow then reads the Workshop's
+/// content too (Options › Folders' Read Steam Workshop content,
+/// [`crate::Settings::test_through_steam`]).
 pub fn command(client: &Path, user_dir: &Path, module: &str, choose: bool, steam: bool) -> Command {
     let mut c = Command::new(client);
     if let Some(dir) = client.parent() {
@@ -54,14 +66,49 @@ pub fn command(client: &Path, user_dir: &Path, module: &str, choose: bool, steam
     }
     let how = if choose { "+LoadNewModule" } else { "+TestNewModule" };
     c.arg("-userdirectory").arg(user_dir).arg(how).arg(module);
-    // A Steam copy is told which game it is, so that it reaches Steam when
-    // Steam is running and loads what Steam brings it (the Workshop's
-    // content), as when started from Steam; started bare it doesn't (no
-    // overlay, no Workshop content: what some builders find steadier).
-    if steam && client.ancestors().any(|a| a.file_name().is_some_and(|n| n == "steamapps")) {
-        c.env("SteamAppId", STEAM_APP).env("SteamGameId", STEAM_APP);
+    // A Steam copy told which game it is reaches Steam when Steam is
+    // running and is expected to load what Steam brings it (the Workshop
+    // items subscribed to: overrides of the game's textures, materials),
+    // as when started from Steam. Started without the app ID (as Aurora
+    // starts it) it is expected to run without Steam's Workshop content,
+    // so that the test is nearer what Moonglow's views show (a builder's
+    // report of 2026-11-22; the owner's ruling). Not tried with Steam
+    // running: the client here only ever runs with Steam hidden. Only the
+    // two variables are taken away: what else a Moonglow started from
+    // Steam inherits (the overlay's LD_PRELOAD) is passed on.
+    // (That the client has no relaunch through Steam rests on reading the
+    // binaries' strings, not on a run: they load Steam's library
+    // themselves and name no RestartAppIfNecessary. A bare start is how
+    // the tests here run the Steam copy, Steam hidden.)
+    if steam_copy(client) {
+        if steam {
+            for var in STEAM_VARS {
+                c.env(var, STEAM_APP);
+            }
+        } else {
+            // (Not passed on from Moonglow's own, where Steam started it.)
+            for var in STEAM_VARS {
+                c.env_remove(var);
+            }
+        }
     }
     c
+}
+
+/// The log's line for a test of a Steam copy of the game, which says
+/// whether it was started through Steam and why; none for
+/// another copy (GOG's, Beamdog's), where Steam has no part.
+pub fn steam_line(client: &Path, steam: bool) -> Option<&'static str> {
+    if !steam_copy(client) {
+        return None;
+    }
+    Some(if steam {
+        "Test Module: started through Steam, as Read Steam Workshop content is on \
+         (Options › Folders)."
+    } else {
+        "Test Module: started without Steam, as Read Steam Workshop content is off \
+         (Options › Folders)."
+    })
 }
 
 /// The module Test From Here writes into the modules folder (and replaces
@@ -136,6 +183,11 @@ impl Running {
     }
 }
 
+/// How long the system's own tool that lists what runs (`ps`, `tasklist`)
+/// is waited for: `mg_core::process::output_within` stops it then.
+#[cfg(any(target_os = "macos", windows))]
+const SYSTEM_TOOL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The programs running whose name is one of `names` (case aside), as the
 /// system lists them; read only: nothing is ever stopped (the user may be
 /// playing). Empty where the list can't be read.
@@ -172,7 +224,10 @@ pub(crate) fn running(names: &[&str]) -> Vec<Running> {
     {
         // (`ps`'s accounting name, the program's own without its path,
         // which has spaces: `Neverwinter Nights`; then its command line.)
-        let Ok(ps) = Command::new("ps").args(["-ax", "-o", "pid=,ucomm=,args="]).output() else {
+        // (Within a time: one that hangs held the window.)
+        let mut ps = Command::new("ps");
+        ps.args(["-ax", "-o", "pid=,ucomm=,args="]);
+        let Ok(ps) = mg_core::process::output_within(&mut ps, SYSTEM_TOOL) else {
             return out;
         };
         for line in String::from_utf8_lossy(&ps.stdout).lines() {
@@ -188,9 +243,10 @@ pub(crate) fn running(names: &[&str]) -> Vec<Running> {
         use std::os::windows::process::CommandExt;
         // (No console window flashing up for it.)
         const NO_WINDOW: u32 = 0x0800_0000;
-        let Ok(list) =
-            Command::new("tasklist").args(["/FO", "CSV", "/NH"]).creation_flags(NO_WINDOW).output()
-        else {
+        // (Within a time: one that hangs held the window.)
+        let mut list = Command::new("tasklist");
+        list.args(["/FO", "CSV", "/NH"]).creation_flags(NO_WINDOW);
+        let Ok(list) = mg_core::process::output_within(&mut list, SYSTEM_TOOL) else {
             return out;
         };
         for line in String::from_utf8_lossy(&list.stdout).lines() {
@@ -306,16 +362,14 @@ mod tests {
 
     #[test]
     fn the_module_is_named_from_the_modules_folder() {
-        let dir = std::env::temp_dir().join(format!("mg-test-module-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-test-module");
         let modules = dir.join("modules");
         std::fs::create_dir_all(modules.join("Folder Module")).unwrap();
         std::fs::write(modules.join("My Module.mod"), b"").unwrap();
-        assert_eq!(module_name(&dir, &modules.join("My Module.mod")).as_deref(), Some("My Module"));
-        assert_eq!(
-            module_name(&dir, &modules.join("Folder Module")).as_deref(),
-            Some("Folder Module")
-        );
-        assert_eq!(module_name(&dir, &dir.join("elsewhere.mod")), None);
+        let named = |m: &Path| module_name(&modules, m);
+        assert_eq!(named(&modules.join("My Module.mod")).as_deref(), Some("My Module"));
+        assert_eq!(named(&modules.join("Folder Module")).as_deref(), Some("Folder Module"));
+        assert_eq!(named(&dir.join("elsewhere.mod")), None);
         let c =
             command(Path::new("/game/bin/linux-x86/nwmain-linux"), &dir, "My Module", false, true);
         let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -332,16 +386,76 @@ mod tests {
         let c =
             command(Path::new("/game/bin/linux-x86/nwmain-linux"), &dir, "My Module", true, true);
         assert_eq!(c.get_args().nth(2).unwrap(), "+LoadNewModule");
-        // A Steam copy is told which game it is; another isn't.
+        // A copy outside Steam is told nothing of Steam, either way.
         assert_eq!(c.get_envs().count(), 0);
+        let other = Path::new("/game/bin/linux-x86/nwmain-linux");
+        assert_eq!(command(other, &dir, "My Module", false, false).get_envs().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a test of a Steam copy is told: through Steam (Read Steam
+    /// Workshop content on), the game's Steam number in both variables;
+    /// without (off), both taken away, so that none of Moonglow's own
+    /// reaches the game; a copy outside Steam is told nothing either way.
+    /// The arguments are the same both ways.
+    #[test]
+    fn a_steam_copy_is_started_through_steam_only_when_asked() {
+        let dir = Path::new("/home/me/nwn");
+        let envs = |c: &Command| -> Vec<(String, Option<String>)> {
+            let mut all: Vec<_> = (c.get_envs())
+                .map(|(k, v)| {
+                    (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+                })
+                .collect();
+            all.sort();
+            all
+        };
+        let args = |c: &Command| -> Vec<String> {
+            c.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        for steam in [
+            "/lib/steamapps/common/Neverwinter Nights/bin/linux-x86/nwmain-linux",
+            r"C:\Program Files (x86)\Steam\SteamApps\common\Neverwinter Nights\bin\win32\nwmain.exe",
+        ] {
+            let steam = Path::new(steam);
+            // (A Windows path is split at `\` on Windows alone.)
+            if !cfg!(windows) && steam.to_string_lossy().contains('\\') {
+                assert!(!steam_copy(steam), "one name on Linux");
+                continue;
+            }
+            assert!(steam_copy(steam), "{}", steam.display());
+            let through = command(steam, dir, "My Module", false, true);
+            let app = Some("704450".to_string());
+            assert_eq!(
+                envs(&through),
+                [("SteamAppId".into(), app.clone()), ("SteamGameId".into(), app)]
+            );
+            let bare = command(steam, dir, "My Module", false, false);
+            assert_eq!(envs(&bare), [("SteamAppId".into(), None), ("SteamGameId".into(), None)]);
+            assert_eq!(args(&through), args(&bare));
+            assert_eq!(args(&bare)[2], "+TestNewModule");
+        }
+        assert!(steam_copy(Path::new("/x/SteamApps/common/nwn/bin/macos/nwmain")));
+        assert!(!steam_copy(Path::new("/opt/gog/Neverwinter Nights/bin/linux-x86/nwmain-linux")));
+    }
+
+    /// The log says how a test of a Steam copy started, naming the option
+    /// as Options shows it; of another copy it says nothing of Steam.
+    #[test]
+    fn the_log_says_how_a_steam_copy_was_started() {
         let steam =
             Path::new("/lib/steamapps/common/Neverwinter Nights/bin/linux-x86/nwmain-linux");
-        let c = command(steam, &dir, "My Module", false, true);
-        let told: Vec<_> =
-            c.get_envs().map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect();
-        assert!(told.contains(&("SteamAppId".into(), Some("704450".into()))), "{told:?}");
-        // Unless it is to start without Steam.
-        assert_eq!(command(steam, &dir, "My Module", false, false).get_envs().count(), 0);
-        std::fs::remove_dir_all(&dir).unwrap();
+        let through = steam_line(steam, true).unwrap();
+        let bare = steam_line(steam, false).unwrap();
+        assert!(through.starts_with("Test Module: started through Steam"), "{through}");
+        assert!(bare.starts_with("Test Module: started without Steam"), "{bare}");
+        for line in [through, bare] {
+            assert!(line.contains(", as Read Steam Workshop content is o"), "{line}");
+        }
+        assert!(through.ends_with("is on (Options › Folders)."), "{through}");
+        assert!(bare.ends_with("is off (Options › Folders)."), "{bare}");
+        let other = Path::new("/opt/gog/Neverwinter Nights/bin/linux-x86/nwmain-linux");
+        assert_eq!(steam_line(other, true), None);
+        assert_eq!(steam_line(other, false), None);
     }
 }

@@ -18,6 +18,8 @@
 //!   a plugin keeps.
 
 mod files;
+mod kept;
+mod kinds;
 mod manifest;
 mod package;
 pub mod project;
@@ -33,8 +35,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub use manifest::{
-    API, APIS, CheckDecl, CommandDecl, EventDecl, EventKind, Manifest, Scope, SettingDecl,
-    SettingKind, SettingValue, Target,
+    API, APIS, CheckDecl, CommandDecl, EventDecl, EventKind, ExporterDecl, ImporterDecl, Manifest,
+    PanelDecl, RESOURCE_TARGETS, Scope, SettingDecl, SettingKind, SettingValue, Target, WizardDecl,
+    is_color, path_title,
 };
 use mg_core::{ResRef, ResType};
 pub use mg_edit::fix::{Fix, Found};
@@ -45,11 +48,12 @@ use mg_resman::ResKey;
 use mg_rules::GameData;
 use mg_rules::ObjectKind;
 pub use package::{
-    Existing, MARKER, MAX_ARCHIVE, MAX_BYTES, MAX_FILES, Package, from_archive, pack, remove,
+    Existing, MARKER, MAX_ALL, MAX_ARCHIVE, MAX_BYTES, MAX_FILES, MAX_PLUGINS, Package,
+    from_archive, pack, remove,
 };
 pub use runtime::EVENT_NAMES;
 pub use settings::{SettingWrite, Settings};
-pub use testing::{GAME_FOLDER, GameFor, TestResult, run_tests, test_files};
+pub use testing::{GAME_FOLDER, GameFor, TestResult, run_tests, test_faults, test_files};
 use thiserror::Error;
 
 /// What can go wrong with a plugin.
@@ -153,6 +157,17 @@ impl Plugin {
         self.frozen.as_ref().map(|f| f.digest.as_str())
     }
 
+    /// The digest of its code as it is now: a project's as it was read
+    /// ([`Plugin::digest`]), an installed one's as its folder holds it
+    /// (the same files and rule, read again: it runs from its folder).
+    /// None: its folder could not be read.
+    pub fn code_digest(&self) -> Option<String> {
+        match &self.frozen {
+            Some(f) => Some(f.digest.clone()),
+            None => package::files_of(&self.dir).ok().map(|files| Frozen::new(files).digest),
+        }
+    }
+
     /// Whether it is a project's (read whole, [`Plugin::load_project`]).
     pub fn is_project(&self) -> bool {
         self.frozen.is_some()
@@ -236,9 +251,63 @@ pub enum FieldKind {
     },
     /// One of these; the default is its place in them.
     Choice {
-        choices: Vec<String>,
+        choices: Vec<Choice>,
         default: usize,
     },
+    /// A color (API 0.8), its value `"#rrggbb"`. `variable`: a string
+    /// variable the objects the job was given are drawn with, set to the
+    /// color, while it is being picked (nothing is set by it).
+    Color {
+        default: [u8; 3],
+        variable: Option<String>,
+    },
+}
+
+impl FieldKind {
+    /// What a field of this kind starts with, as its value comes back.
+    pub fn default_value(&self) -> serde_json::Value {
+        match self {
+            FieldKind::Text { default } => serde_json::json!(default),
+            FieldKind::Number { default, .. } => serde_json::json!(default),
+            FieldKind::Check { default } => serde_json::json!(default),
+            FieldKind::Choice { choices, default } => serde_json::json!(choices[*default].text),
+            FieldKind::Color { default, .. } => serde_json::json!(color_text(*default)),
+        }
+    }
+}
+
+/// One of a choice field's options: its text (what the field's value is
+/// when it is chosen) and the color of the swatch drawn before it (API
+/// 0.9), if it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub text: String,
+    pub color: Option<[u8; 3]>,
+}
+
+impl Choice {
+    /// An option of text alone.
+    pub fn text(text: impl Into<String>) -> Choice {
+        Choice { text: text.into(), color: None }
+    }
+}
+
+impl From<&str> for Choice {
+    fn from(text: &str) -> Choice {
+        Choice::text(text)
+    }
+}
+
+/// A color as a color field gives it: `"#rrggbb"`, in lower case.
+pub fn color_text([r, g, b]: [u8; 3]) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// A color from `"#rrggbb"` (the `#` may be left out, any case), as a
+/// color field takes one; `None` for anything else.
+pub fn color_of(text: &str) -> Option<[u8; 3]> {
+    let t = text.trim();
+    mg_core::text::hex_bytes(t.strip_prefix('#').unwrap_or(t))
 }
 
 /// Something a plugin asks of the user.
@@ -255,6 +324,31 @@ pub enum Question {
     File { title: String, extensions: Vec<String> },
     /// A folder of the user's to read the files of.
     Folder { title: String },
+    /// A page of a wizard (API 0.6), answered by [`Answer::Page`].
+    Page(Page),
+}
+
+/// A page of a plugin's wizard, as the window shows it: its fields (their
+/// defaults what was typed before, going back or kept on the page), and
+/// where it is among the wizard's pages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page {
+    /// The wizard's title, and the page's.
+    pub wizard: String,
+    pub title: String,
+    /// What the page says above its fields.
+    pub text: String,
+    pub fields: Vec<FormField>,
+    /// Its place, from 1, among `steps` pages.
+    pub step: usize,
+    pub steps: usize,
+    /// There is a page to go back to.
+    pub back: bool,
+    /// It is the last: Finish, not Next.
+    pub last: bool,
+    /// What the page's check said is wrong with what was given, asking
+    /// again.
+    pub error: Option<String>,
 }
 
 /// The user's answer.
@@ -268,6 +362,12 @@ pub enum Answer {
     Values(BTreeMap<String, serde_json::Value>),
     /// The file or the folder chosen.
     Path(PathBuf),
+    /// A wizard's page answered: its values, by field id, and whether the
+    /// user went back (else on: Next, or Finish on the last).
+    Page {
+        values: BTreeMap<String, serde_json::Value>,
+        back: bool,
+    },
 }
 
 /// What a plugin's code reaches of whoever runs it.
@@ -279,6 +379,13 @@ pub trait Host {
 
     /// Whether the job was called off: the plugin's code stops at once.
     fn cancelled(&self) -> bool {
+        false
+    }
+
+    /// Whether a person answers the questions (a window), who can change
+    /// what a wizard's page's check objects to. Without one (`mg`, a
+    /// test), that check ends the wizard with what it said.
+    fn interactive(&self) -> bool {
         false
     }
 
@@ -314,13 +421,24 @@ pub struct Input {
     /// as long as it takes (until it is canceled). An event that runs at
     /// once, within what the user is doing, has [`EVENT_BUDGET`].
     pub budget: Option<std::time::Duration>,
+    /// The values of the panel's fields a command is run from (its button,
+    /// or a field set; API 0.9), by field id, as a form's come back
+    /// (`ctx.values`): empty for a command run from anywhere else.
+    pub values: BTreeMap<String, serde_json::Value>,
 }
 
 impl Input {
     /// A job's input with nothing selected or open, and the plugin's
     /// settings at their defaults.
     pub fn new(module: Module, game: Option<Arc<GameData>>) -> Input {
-        Input { module, game, selection: Selection::default(), settings: None, budget: None }
+        Input {
+            module,
+            game,
+            selection: Selection::default(),
+            settings: None,
+            budget: None,
+            values: BTreeMap::new(),
+        }
     }
 }
 
@@ -349,6 +467,9 @@ pub enum Selected {
     /// by the layer's label (`hak:castle`, `key:nwn_base`): the resource
     /// browser's overridden copies, open read-only (only as what is open).
     Copy { key: ResKey, layer: String },
+    /// A tile of an area, item `index` of its ARE's `Tile_List` (rows
+    /// from the south-west, as the list has them; API 0.5).
+    Tile { area: ResRef, index: usize },
 }
 
 impl Selected {
@@ -363,20 +484,33 @@ impl Selected {
                 None => key.restype.extension().unwrap_or_default().to_string(),
             },
             Selected::Area(_) => "area".to_string(),
+            Selected::Tile { .. } => "tile".to_string(),
             Selected::Resource(key) | Selected::Copy { key, .. } => {
                 key.restype.extension().unwrap_or_default().to_string()
             }
         }
     }
 
-    /// What a command must be for to be run on it.
+    /// What it is, as a command's `for` takes it ([`Target::takes`]): a
+    /// placed object `Placed`, a blueprint `Blueprint`.
     pub fn target(&self) -> Option<Target> {
         match self {
-            Selected::Object { kind, .. } => Some(Target::Object(*kind)),
-            Selected::Blueprint(key) => ObjectKind::from_restype(key.restype).map(Target::Object),
+            Selected::Object { kind, .. } => Some(Target::Placed(*kind)),
+            Selected::Blueprint(key) => {
+                ObjectKind::from_restype(key.restype).map(Target::Blueprint)
+            }
             Selected::Area(_) => Some(Target::Area),
-            Selected::Resource(_) | Selected::Copy { .. } => None,
+            Selected::Tile { .. } => Some(Target::Tile),
+            Selected::Resource(key) => {
+                RESOURCE_TARGETS.contains(&key.restype).then_some(Target::Resource(key.restype))
+            }
+            Selected::Copy { .. } => None,
         }
+    }
+
+    /// Whether a command for `targets` is for it.
+    pub fn fits(&self, targets: &[Target]) -> bool {
+        self.target().is_some_and(|t| targets.iter().any(|c| c.takes(t)))
     }
 
     /// The resource it is in, and where in it (the root: `""`), as
@@ -391,6 +525,9 @@ impl Selected {
                 (*key, GffPath::root())
             }
             Selected::Area(area) => (ResKey::new(*area, ResType::ARE), GffPath::root()),
+            Selected::Tile { area, index } => {
+                (ResKey::new(*area, ResType::ARE), GffPath::root().item("Tile_List", *index))
+            }
         }
     }
 
@@ -421,6 +558,18 @@ impl Selected {
         };
         let key = ResKey::from_filename(name)
             .ok_or_else(|| format!("{name:?} is not a resource's name (name.ext)"))?;
+        if key.restype == ResType::ARE && !path.is_empty() {
+            let path: GffPath = path.parse().map_err(|e| format!("{text:?}: {e}"))?;
+            return match path.0.as_slice() {
+                [mg_edit::Step::Item(list, index)] if list == "Tile_List" => {
+                    Ok(Selected::Tile { area: key.resref, index: *index })
+                }
+                _ => Err(format!(
+                    "{text:?}: a tile is its area's ARE and its place in the tile list \
+                     (\"{name}/Tile_List[0]\")"
+                )),
+            };
+        }
         if key.restype == ResType::GIT {
             let path: GffPath = match path {
                 "" => GffPath::root(),
@@ -457,6 +606,10 @@ impl Selected {
 pub struct Selection {
     pub selected: Vec<Selected>,
     pub open: Option<Selected>,
+    /// What is open in front edited together, where it is several
+    /// (`ctx.open.together`; `open` is the first): several blueprints,
+    /// placed objects or areas in one Properties window. Empty for one.
+    pub together: Vec<Selected>,
 }
 
 /// What a command made: the edits to apply as one command, and its name;
@@ -511,7 +664,8 @@ pub fn is_file_name(name: &str) -> bool {
 impl FolderWrite {
     /// Writes the files into the folder: how many were new and how many
     /// replaced. A name that is a link out of the folder, or a folder, is
-    /// refused, and then nothing is written.
+    /// refused, and then nothing is written. Each file is written whole or
+    /// not at all, in the place of the one of its name.
     pub fn write(&self) -> Result<(usize, usize), String> {
         let root = self.dir.canonicalize().map_err(|e| format!("{}: {e}", self.dir.display()))?;
         let mut replaced = 0;
@@ -529,7 +683,10 @@ impl FolderWrite {
             }
         }
         for (name, bytes) in &self.files {
-            std::fs::write(root.join(name), bytes).map_err(|e| format!("{name}: {e}"))?;
+            // (Whole or not at all, and in the place of a link the file,
+            // not what the link leads to.)
+            mg_module::write_replacing(&root.join(name), bytes)
+                .map_err(|e| format!("{name}: {e}"))?;
         }
         Ok((self.files.len() - replaced, replaced))
     }
@@ -608,10 +765,15 @@ impl Event {
 pub struct HakWrite {
     /// The hak's name, without `.hak`.
     pub name: String,
-    /// Each resource's bytes, or the file of the user's it is a copy of.
+    /// Each resource's bytes, or the file of the user's it is a copy of
+    /// (or a scratch file of the job's, past what it holds in memory:
+    /// [`HELD_IN_MEMORY`]).
     pub files: Vec<(ResKey, HakData)>,
+    /// The job's scratch files, kept while this is.
+    pub held: Option<Arc<Held>>,
 }
 
+pub use kept::{HELD_IN_MEMORY, HakWritten, Held, UNDO_FOLDER};
 pub use mg_module::hak_edit::Source as HakData;
 
 impl HakWrite {
@@ -619,9 +781,16 @@ impl HakWrite {
     /// ([`mg_module::hak_edit::write_into`]): how many were added and how
     /// many replaced.
     pub fn write(&self, dir: &Path) -> Result<(usize, usize), String> {
-        let path = dir.join(format!("{}.hak", self.name));
-        let done = mg_module::hak_edit::write_into(&path, self.files.clone())?;
+        let done = self.write_kept(dir)?;
         Ok((done.added, done.replaced))
+    }
+
+    /// Writes the resources into the hak in folder `dir`, keeping the hak
+    /// as it was before and as it is written (linked, in the folder's
+    /// hidden [`UNDO_FOLDER`]), so that it can be taken back (the
+    /// command's Undo, or its edits failing) and written again (Redo).
+    pub fn write_kept(&self, dir: &Path) -> Result<HakWritten, String> {
+        HakWritten::write(self, dir)
     }
 }
 
@@ -630,6 +799,11 @@ pub const MAX_FILE: u64 = 64 << 20;
 
 /// The most memory a plugin's code may hold, in bytes.
 pub const MEMORY_LIMIT: usize = 256 << 20;
+
+/// The most a job may make Moonglow hold for it besides, in bytes: the
+/// tables and talk tables it makes, the pictures it has decoded, and the
+/// edits and files that wait to be written.
+pub const HELD_LIMIT: usize = 512 << 20;
 
 /// Runs a command of a plugin on a module: the edits it made, to apply as
 /// one command. Nothing is changed here.
@@ -687,6 +861,86 @@ pub fn run_check(
     })?;
     runtime::run_check(plugin, decl, input, host)
 }
+
+/// Runs an exporter of a plugin (`exporter`: its id) on a module, writing
+/// to `to`, the file or the folder the user chose: the files it wrote, as
+/// the outcome's `folders` (to write when it is done), and no edits.
+pub fn run_export(
+    plugin: &Plugin,
+    exporter: &str,
+    to: &Path,
+    input: Input,
+    host: Rc<dyn Host>,
+) -> Result<Outcome, PluginError> {
+    let decl = plugin.manifest.exporters.iter().find(|c| c.id == exporter).ok_or_else(|| {
+        PluginError::Unknown {
+            plugin: plugin.manifest.id.clone(),
+            kind: "exporter",
+            id: exporter.to_string(),
+        }
+    })?;
+    kinds::run_export(plugin, decl, to, input, host)
+}
+
+/// Runs an importer of a plugin on a module, reading `from`, the file or
+/// the folder the user chose: its edits, to apply as one command.
+pub fn run_import(
+    plugin: &Plugin,
+    importer: &str,
+    from: &Path,
+    input: Input,
+    host: Rc<dyn Host>,
+) -> Result<Outcome, PluginError> {
+    let decl = plugin.manifest.importers.iter().find(|c| c.id == importer).ok_or_else(|| {
+        PluginError::Unknown {
+            plugin: plugin.manifest.id.clone(),
+            kind: "importer",
+            id: importer.to_string(),
+        }
+    })?;
+    kinds::run_import(plugin, decl, from, input, host)
+}
+
+/// Runs a wizard of a plugin: its pages asked of the host one at a time
+/// ([`Question::Page`]), then its Finish: the edits, to apply as one
+/// command. Canceled on a page: [`PluginError::Canceled`], nothing made.
+pub fn run_wizard(
+    plugin: &Plugin,
+    wizard: &str,
+    input: Input,
+    host: Rc<dyn Host>,
+) -> Result<Outcome, PluginError> {
+    let decl = plugin.manifest.wizards.iter().find(|c| c.id == wizard).ok_or_else(|| {
+        PluginError::Unknown {
+            plugin: plugin.manifest.id.clone(),
+            kind: "wizard",
+            id: wizard.to_string(),
+        }
+    })?;
+    kinds::run_wizard(plugin, decl, input, host)
+}
+
+/// Runs a panel's handler: what the panel shows. It only reads; past
+/// [`PANEL_BUDGET`] (unless the input says another) it is stopped.
+pub fn run_panel(
+    plugin: &Plugin,
+    panel: &str,
+    input: Input,
+    host: Rc<dyn Host>,
+) -> Result<Shown, PluginError> {
+    let decl = plugin.manifest.panels.iter().find(|c| c.id == panel).ok_or_else(|| {
+        PluginError::Unknown {
+            plugin: plugin.manifest.id.clone(),
+            kind: "panel",
+            id: panel.to_string(),
+        }
+    })?;
+    kinds::run_panel(plugin, decl, input, host)
+}
+
+pub use kinds::{
+    Element, Item, MAX_CHOICES, MAX_ELEMENTS, MAX_TEXT, PANEL_BUDGET, Shown, Tone, value_text,
+};
 
 /// Runs code typed into the plugin console on a module, with `mg` (the
 /// API) and `ctx` (as a command's handler gets it) at hand: what it

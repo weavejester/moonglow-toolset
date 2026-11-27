@@ -1,5 +1,5 @@
 //! Door Properties (`TdlgDoorEdit`): Basic, Lock, Trap, Area Transition,
-//! Scripts, Advanced, Description, Comments.
+//! Scripts, Advanced, Variables, Visuals, Description, Comments.
 
 use egui::Ui;
 use mg_gff::FieldType;
@@ -8,13 +8,14 @@ use mg_rules::{Choice, ChoiceColumns};
 
 use super::{Form, situated};
 
-pub(super) const PAGES: [&str; 9] = [
+pub(super) const PAGES: [&str; 10] = [
     "Basic",
     "Lock",
     "Trap",
     "Area Transition",
     "Scripts",
     "Advanced",
+    "Variables",
     "Visuals",
     "Description",
     "Comments",
@@ -23,12 +24,9 @@ pub(super) const PAGES: [&str; 9] = [
 /// A door's initial states (`AnimationState`).
 const STATES: [(i64, &str); 2] = [(0, "Closed"), (1, "Open")];
 
-/// The width of the Basic page's fields beside the model.
-const BASIC_SIDE: f32 = 440.0;
-
 pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
     match page {
-        "Basic" => situated::beside_model(f, ui, BASIC_SIDE, |f, ui, _| basic(f, ui)),
+        "Basic" => basic(f, ui),
         "Lock" => situated::lock(f, ui),
         "Trap" => situated::trap(f, ui),
         "Area Transition" => situated::transition(f, ui),
@@ -59,38 +57,33 @@ pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
 
 /// Tileset doors (doortypes.2da; row 0 is the generic door): the name and
 /// the tileset.
-fn door_types(f: &Form<'_>) -> Vec<Choice> {
-    let Some(game) = f.app.game.as_deref() else { return Vec::new() };
-    let Ok(table) = game.table("doortypes") else { return Vec::new() };
-    let names = game
-        .choices("doortypes", ChoiceColumns { name: Some("StringRefGame"), label: Some("Label") })
-        .unwrap_or_default();
-    names
-        .into_iter()
-        .map(|c| {
+/// (Made once for the table's rows, and kept: not every frame.)
+fn door_types(f: &Form<'_>, ui: &Ui) -> std::sync::Arc<Vec<Choice>> {
+    let Some(game) = f.app.game.as_deref() else { return Default::default() };
+    let Ok(table) = game.table("doortypes") else { return Default::default() };
+    let columns = ChoiceColumns { name: Some("StringRefGame"), label: Some("Label") };
+    let Ok(names) = game.choice_list("doortypes", columns) else { return Default::default() };
+    super::kept_for(ui.ctx(), egui::Id::new("door-types"), &names, &(), || {
+        let named = names.iter().map(|c| {
             let tileset = table.get(c.row, "TileSet").filter(|t| *t != "****");
             match tileset {
                 Some(t) => Choice { row: c.row, text: format!("{} ({t})", c.text) },
-                None => c,
+                None => c.clone(),
             }
-        })
-        .collect()
+        });
+        std::sync::Arc::new(named.collect())
+    })
 }
 
 fn basic(f: &mut Form<'_>, ui: &mut Ui) {
-    let types = door_types(f);
-    let types = f.appearance_rows(mg_rules::ObjectKind::Door, &types);
+    let types = door_types(f, ui);
+    let types = f.appearance_rows(ui.ctx(), mg_rules::ObjectKind::Door, &types);
     let generic = f.choices("genericdoors", Some("Name"), Some("Label"));
-    egui::Grid::new(("utd-basic", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        crate::widgets::field_label(ui, "Name");
-        f.locstring(ui, "Name", "LocName");
-        ui.end_row();
-        crate::widgets::field_label(ui, "Tag");
-        f.tag(ui, "Tag", "Tag");
-        ui.end_row();
+    super::form_grid(ui, ("utd-basic", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+        f.name_and_tag(ui, "LocName");
         // (Each door's picture beside the row the pointer rests on; the
         // generic door's, the generic appearance chosen below.)
-        crate::widgets::field_label(ui, "Appearance Type");
+        crate::widgets::field_label(ui, "Appearance type");
         let current = f.int(mg_rules::rows::generic_door_field(&f.root));
         let mut shown =
             |app: &mut _, ui: &mut Ui, row| super::door_type_picture(app, ui, row, current);
@@ -98,12 +91,16 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
         ui.end_row();
         // The generic door's model (EE: GenericType_New; the old byte field
         // follows it where the blueprint has one).
-        crate::widgets::field_label(ui, "Generic Appearance");
+        crate::widgets::field_label(ui, "Generic appearance");
+        // (Gallery… under the list where the row is short of both: a
+        // narrow form, a column of pages side by side, M4's U10.)
+        let under = super::narrow(ui) || super::room_right(ui) < GENERIC_ROW;
         f.mark_mixed(ui, mg_rules::rows::generic_door_field(&f.root));
         ui.add_enabled_ui(f.int("Appearance") == 0, |ui| {
+            let picks = f.picks();
             let app = &mut *f.app;
             let mut shown = |ui: &mut Ui, row| super::generic_door_picture(app, ui, row);
-            let list = situated::pick_list(f.key, "generic", &generic, current, 220.0);
+            let list = situated::pick_list(picks, "generic", &generic, current, 220.0);
             if let Some(v) = list.about(&mut shown).show(ui) {
                 let mut fields = vec![("GenericType_New", v, FieldType::Dword)];
                 if f.root.get("GenericType").is_some() && v <= 255 {
@@ -112,6 +109,12 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
                 f.set_many("Generic appearance", &fields);
             }
         });
+        // (Under the list in a narrow room: beside it, it was past the
+        // Properties panel's edge.)
+        if under {
+            ui.end_row();
+            ui.label("");
+        }
         f.gallery_button(ui, crate::appearance_gallery::Kind::Door);
         ui.end_row();
         f.model_warning(ui, mg_rules::ObjectKind::Door);
@@ -124,3 +127,6 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
         ui.end_row();
     });
 }
+
+/// The width of the generic appearance's list and Gallery… beside it.
+const GENERIC_ROW: f32 = 450.0;

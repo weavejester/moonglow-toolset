@@ -102,24 +102,24 @@ fn risky(c: &Card) -> bool {
 
 /// Where a card stands in its model (west to east, in rows of twelve):
 /// its lower west corner.
-fn card_corner(i: usize) -> (f32, f32) {
+pub(super) fn card_corner(i: usize) -> (f32, f32) {
     ((i % 12) as f32 - 6.0 + 0.1, (i / 12) as f32 + 0.1)
 }
 
 /// A quad's mesh in a model of [`model`]: `corners` (four, a face's
 /// front seen in their order), at `at`.
-struct Quad {
-    name: String,
-    at: [f32; 3],
-    corners: [[f32; 3]; 4],
-    bitmap: &'static str,
-    extra: &'static str,
-    tverts: bool,
-    colors: bool,
+pub(super) struct Quad {
+    pub(super) name: String,
+    pub(super) at: [f32; 3],
+    pub(super) corners: [[f32; 3]; 4],
+    pub(super) bitmap: std::borrow::Cow<'static, str>,
+    pub(super) extra: &'static str,
+    pub(super) tverts: bool,
+    pub(super) colors: bool,
 }
 
 /// An ASCII model of quads.
-fn model(name: &str, quads: &[Quad]) -> String {
+pub(super) fn model(name: &str, quads: &[Quad]) -> String {
     let mut s = format!(
         "newmodel {name}\nsetsupermodel {name} NULL\nclassification character\n\
          setanimationscale 1\nbeginmodelgeom {name}\nnode dummy {name}\n  parent NULL\nendnode\n"
@@ -144,7 +144,7 @@ fn model(name: &str, quads: &[Quad]) -> String {
 }
 
 /// A square of `size` facing −Y (standing, its front to the south).
-fn standing(size: f32) -> [[f32; 3]; 4] {
+pub(super) fn standing(size: f32) -> [[f32; 3]; 4] {
     [[0.0, 0.0, 0.0], [size, 0.0, 0.0], [size, 0.0, size], [0.0, 0.0, size]]
 }
 
@@ -162,7 +162,7 @@ fn cards_model(name: &str, which: &dyn Fn(&Card) -> bool, board: bool) -> String
                 name: format!("p{i}"),
                 at: [x, 0.0, z],
                 corners: standing(0.8),
-                bitmap: c.bitmap,
+                bitmap: c.bitmap.into(),
                 extra: c.extra,
                 tverts: c.tverts,
                 colors: c.colors,
@@ -174,7 +174,7 @@ fn cards_model(name: &str, which: &dyn Fn(&Card) -> bool, board: bool) -> String
             name: "board".into(),
             at: [-6.0, 0.05, 0.0],
             corners: [[0.0, 0.0, 0.0], [12.0, 0.0, 0.0], [12.0, 0.0, 4.1], [0.0, 0.0, 4.1]],
-            bitmap: "mgp_decal",
+            bitmap: "mgp_decal".into(),
             extra: "",
             tverts: true,
             colors: false,
@@ -192,7 +192,7 @@ fn turned_model() -> String {
         name: name.into(),
         at: [x, 0.0, 0.05],
         corners: flat,
-        bitmap: "mgp_plain",
+        bitmap: "mgp_plain".into(),
         extra,
         tverts: true,
         colors: false,
@@ -217,7 +217,7 @@ fn lying_model() -> String {
         name: "lying".into(),
         at: [0.0, 0.0, 0.03],
         corners: flat,
-        bitmap,
+        bitmap: bitmap.into(),
         extra: "",
         tverts: true,
         colors: false,
@@ -251,7 +251,7 @@ fn checker(x: u32, y: u32) -> [u8; 4] {
 /// A standard DDS of 64 by 64 texels with all its levels (the client reads
 /// past a single level: what it drew was noise), in `fourcc`'s blocks:
 /// `block(x, of)` for each block, `x` of the level's `of` blocks a row.
-fn dds(fourcc: &[u8; 4], block: impl Fn(u32, u32) -> Vec<u8>) -> Vec<u8> {
+pub(super) fn dds(fourcc: &[u8; 4], block: impl Fn(u32, u32) -> Vec<u8>) -> Vec<u8> {
     let block = &block;
     let mut blocks = Vec::new();
     for level in 0..7u32 {
@@ -320,7 +320,7 @@ fn dxt5(alpha: u8) -> Vec<u8> {
 }
 
 /// The textures, their TXIs, and the materials.
-fn write_textures(over: &Path) {
+pub(super) fn write_textures(over: &Path) {
     let w = |name: &str, bytes: Vec<u8>| std::fs::write(over.join(name), bytes).unwrap();
     for name in ["mgp_plain", "mgp_add", "mgp_decal", "mgp_env", "mgp_envd", "mgp_bumpy"] {
         w(&format!("{name}.tga"), tga(false, checker));
@@ -381,7 +381,7 @@ fn write_textures(over: &Path) {
 /// The programs marked, vertex and fragment, by name (their numbers are
 /// their places, from 1): every stock program but the post passes'
 /// (`vsfb*`, `fsfb*`) and the PLT's.
-fn programs(game: &GameData) -> (Vec<String>, Vec<String>) {
+pub(super) fn programs(game: &GameData) -> (Vec<String>, Vec<String>) {
     let mut names: Vec<String> = game
         .resman
         .entries()
@@ -456,7 +456,7 @@ float MgBand(int k)
 "#;
 
 /// A program's text marked with its number: `main` wrapped.
-fn marked(src: &str, vertex: bool, id: usize) -> String {
+pub(super) fn marked(src: &str, vertex: bool, id: usize) -> String {
     marked_as(src, vertex, id, false)
 }
 
@@ -502,14 +502,14 @@ fn marked_as(src: &str, vertex: bool, id: usize, black: bool) -> String {
 
 /// A pixel's mark: the pair's numbers and the defines, if it is one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct Mark {
-    fs: u8,
-    vs: u8,
-    no_discard: bool,
-    fragment_lighting: bool,
-    keyholing: bool,
+pub(super) struct Mark {
+    pub(super) fs: u8,
+    pub(super) vs: u8,
+    pub(super) no_discard: bool,
+    pub(super) fragment_lighting: bool,
+    pub(super) keyholing: bool,
     /// `m_texture`'s turn, in quarters (3 also: no texture matrix).
-    rot: u8,
+    pub(super) rot: u8,
 }
 
 fn mark(p: &[u8]) -> Option<Mark> {
@@ -532,7 +532,7 @@ fn mark(p: &[u8]) -> Option<Mark> {
 
 /// The commonest marks in a square of `r` pixels around (x, y), each with
 /// the share of the square's pixels it is, most first.
-fn marks_at(img: &Rgba, x: f32, y: f32, r: i32) -> Vec<(Mark, f32)> {
+pub(super) fn marks_at(img: &Rgba, x: f32, y: f32, r: i32) -> Vec<(Mark, f32)> {
     let mut counts: HashMap<Mark, usize> = HashMap::new();
     let mut n = 0;
     for dy in -r..=r {
@@ -919,7 +919,7 @@ fn program_choice_in_the_client() {
     for name in vs.iter().chain(&fs) {
         let _ = std::fs::remove_file(over.join(format!("{name}.shd")));
     }
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped Moonglow's side: no GPU");
         return;
@@ -1068,7 +1068,7 @@ fn surfaces_in_the_client() {
                     name: format!("s{i}"),
                     at: [x, 0.0, z],
                     corners: standing(0.8),
-                    bitmap,
+                    bitmap: (*bitmap).into(),
                     extra: "",
                     tverts: true,
                     colors: false,
@@ -1078,7 +1078,7 @@ fn surfaces_in_the_client() {
                 name: "board".into(),
                 at: [-6.0, 0.05, 0.0],
                 corners: [[0.0, 0.0, 0.0], [12.0, 0.0, 0.0], [12.0, 0.0, 3.1], [0.0, 0.0, 3.1]],
-                bitmap: "mgp_decal",
+                bitmap: "mgp_decal".into(),
                 extra: "",
                 tverts: true,
                 colors: false,
@@ -1342,7 +1342,7 @@ const SURFACE_REGIONS: [(&str, [f32; 4]); 7] = [
 /// the programs the game path chose for the surfaces, held to the client's
 /// (as the marked runs read them).
 fn surfaces_in_moonglow(game: &GameData, are: &Gff, git: &Gff, client: &Rgba, dir: &Path) {
-    mg_testkit::gpu::hold();
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("skipped Moonglow's side: no GPU");
         return;

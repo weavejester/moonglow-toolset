@@ -17,8 +17,9 @@ use mg_edit::tags::Weighed;
 use mg_edit::{Command, Edit, Workspace};
 use mg_gff::Value;
 use mg_module::project_file::PasteWarning;
-use mg_module::tags::{Clash, MadeTag, TagCache, TagIndex, clashes, retag};
+use mg_module::tags::{Clash, MadeTag, TagCache, TagView, clashes, retag};
 use mg_resman::ResKey;
+use mg_uikit::Controls as _;
 
 use crate::Moonglow;
 
@@ -46,6 +47,12 @@ pub struct TagClash {
     /// Shown as the builder's option says (the project's moonglow.toml
     /// doesn't set `paste_warning`): the window offers Don't warn again.
     pub from_option: bool,
+    /// The module's revision (`Workspace::revision`) the objects were
+    /// found at. They are kept by their places in their lists, and the
+    /// window doesn't stop the editor: once the module has changed
+    /// (another object of a list deleted, an Undo), Retag would give
+    /// whatever stands there the new tag, so it retags nothing then.
+    pub revision: u64,
 }
 
 /// The module's objects by tag, as they are now (unsaved edits too). An
@@ -53,8 +60,8 @@ pub struct TagClash {
 /// document (the workspace's documents are written back at a save, and a
 /// module folder's file would be rewritten for one only read here): its
 /// tags are kept in `cache`, read again only once its bytes change.
-pub(crate) fn index(cache: &mut TagCache, ws: &Workspace) -> TagIndex {
-    cache.index(&ws.module, |k| ws.loaded(k).map(|g| &g.root))
+pub(crate) fn view<'a>(cache: &'a mut TagCache, ws: &Workspace) -> TagView<'a> {
+    cache.view(&ws.module, |k| ws.loaded(k).map(|g| &g.root))
 }
 
 /// What a made object's tag is to [`clashes`] (`mg_edit::tags::weigh`),
@@ -100,7 +107,7 @@ pub(crate) fn check(app: &mut Moonglow, what: &str, made: Vec<Made>, whole_area:
         .cloned()
         .filter_map(|m| Some((m.clone(), weigh(ws, game.as_deref(), &m)?)))
         .collect();
-    let index = index(&mut app.tag_cache, ws);
+    let view = view(&mut app.tag_cache, ws);
     let tags: Vec<MadeTag> = weighed
         .iter()
         .map(|(m, w)| MadeTag {
@@ -110,7 +117,14 @@ pub(crate) fn check(app: &mut Moonglow, what: &str, made: Vec<Made>, whole_area:
             is_static: w.is_static,
         })
         .collect();
-    let mut found = clashes(&index, &tags, &rules, warning);
+    let mut found = clashes(&view, &tags, &rules, warning);
+    // (Said as the game reads them: a tag is bytes in the module's
+    // codepage, kept in `raw`, which the objects' are compared with. As
+    // UTF-8 text, a tag with a letter outside ASCII, `Señor`, was listed
+    // with a mark in it, matched no object, and Retag passed it over.)
+    for c in &mut found {
+        c.tag = crate::text::decode(&c.raw);
+    }
     let tagged: Vec<(Made, Vec<u8>)> = weighed
         .iter()
         .filter(|(_, w)| !w.is_static)
@@ -118,10 +132,9 @@ pub(crate) fn check(app: &mut Moonglow, what: &str, made: Vec<Made>, whole_area:
         .collect();
     let mut counted = Vec::new();
     if whole_area && warning == PasteWarning::Any {
-        let own = |t: &str| {
-            tagged.iter().any(|(m, tag)| m.key.restype == ResType::ARE && tag == t.as_bytes())
-        };
-        (found, counted) = found.into_iter().partition(|c| c.unique.is_some() || own(&c.tag));
+        let own =
+            |t: &[u8]| tagged.iter().any(|(m, tag)| m.key.restype == ResType::ARE && tag == t);
+        (found, counted) = found.into_iter().partition(|c| c.unique.is_some() || own(&c.raw));
     }
     let others = counted.len();
     if found.is_empty() && others == 0 {
@@ -129,7 +142,7 @@ pub(crate) fn check(app: &mut Moonglow, what: &str, made: Vec<Made>, whole_area:
     }
     let of = |clashes: &[Clash]| -> Vec<(Made, String)> {
         (tagged.iter())
-            .filter(|(_, t)| clashes.iter().any(|c| c.tag.as_bytes() == t.as_slice()))
+            .filter(|(_, t)| clashes.iter().any(|c| c.raw == *t))
             .map(|(m, t)| (m.clone(), crate::text::decode(t)))
             .collect()
     };
@@ -147,9 +160,18 @@ pub(crate) fn check(app: &mut Moonglow, what: &str, made: Vec<Made>, whole_area:
     }
     let scripts = spelled(app, &[&found[..], &counted[..]].concat());
     let what = what.to_string();
-    let clash =
-        TagClash { what, clashes: found, objects, others, more, made, scripts, from_option };
-    app.tag_clash = Some(clash);
+    let revision = app.ws.as_ref().map_or(0, Workspace::revision);
+    app.tag_clash = Some(TagClash {
+        what,
+        clashes: found,
+        objects,
+        others,
+        more,
+        made,
+        scripts,
+        from_option,
+        revision,
+    });
 }
 
 /// The strings in the module's scripts that spell one of the tags
@@ -164,7 +186,8 @@ fn spelled(app: &mut Moonglow, clashes: &[Clash]) -> Vec<String> {
     };
     let mut out = Vec::new();
     for c in clashes {
-        for m in index.mentions(&c.tag, false, codepage) {
+        // (As the scripts' files spell it, in their codepage.)
+        for m in index.mentions_of(&codepage.encode_lossy(&c.tag), false, codepage) {
             out.push(format!("{} line {}", m.script, m.line));
         }
     }
@@ -223,17 +246,16 @@ pub(crate) fn blueprint_copy_warning(
 /// as the original's within the original.
 pub(crate) fn retag_edits(app: &mut Moonglow, clash: &TagClash, all: bool) -> Vec<Edit> {
     let Some(ws) = app.ws.as_mut() else { return Vec::new() };
-    let index = index(&mut app.tag_cache, ws);
-    let mut given: Vec<String> = Vec::new();
+    let view = view(&mut app.tag_cache, ws);
+    let mut given: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut edits = Vec::new();
     // (Where, the tag it had, the one it is given.)
     let mut retagged: Vec<(&Made, &str, String)> = Vec::new();
     let chosen = clash.objects.iter().chain(clash.more.iter().filter(|_| all));
     for (made, tag) in chosen {
-        let taken =
-            |t: &str| index.count(&crate::text::encode(t)) > 0 || given.iter().any(|g| g == t);
+        let taken = |t: &str| view.count(&crate::text::encode(t)) > 0 || given.contains(t);
         let new = retag(tag, &taken);
-        given.push(new.clone());
+        given.insert(new.clone());
         edits.push(Edit::SetField {
             key: made.key,
             path: made.path.clone(),
@@ -265,10 +287,10 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some(clash) = app.tag_clash.take() else { return };
     let mut open = true;
     let (mut retag_them, mut retag_all, mut keep) = (false, false, false);
-    crate::widgets::dialog(ctx, "Duplicate Tags", &mut open)
+    let footed = crate::widgets::dialog(ctx, "Duplicate Tags", &mut open)
         .collapsible(false)
         .resizable(false)
-        .show(ctx, |ui| {
+        .show_foot(ctx, |ui| {
             ui.label(format!("{} put tags on more than one object of the module:", clash.what));
             // (Eight lines at most, "and N more" one of them, as
             // `text::some_of` names things.)
@@ -300,11 +322,9 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             if clash.from_option {
                 let mut dont = !app.settings.warn_duplicate_tags;
                 if ui
-                    .checkbox(&mut dont, "Don't warn again")
+                    .check_box(&mut dont, "Don't warn again")
                     .on_hover_text(
-                        "Turns off Options › General › Show duplicate tags warning after a \
-                         paste or a copy, where it can be turned on again. Tags a project's \
-                         moonglow.toml wants unique are still warned of",
+                        "Turn off the duplicate tags warning (Options › General turns it on again)",
                     )
                     .changed()
                 {
@@ -319,39 +339,40 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             } else {
                 ui.weak("The project's moonglow.toml asks for this warning ([tags]).");
             }
-            ui.separator();
-            ui.horizontal(|ui| {
-                let can = !clash.objects.is_empty();
-                retag_them = ui
-                    .add_enabled(can, egui::Button::new("Retag"))
-                    .on_hover_text(
-                        "Gives each new object its tag with a number (LAMP_2), unique in the \
-                         module: one step to undo",
-                    )
-                    .clicked()
-                    || (can && crate::widgets::enter(ui));
-                if !clash.more.is_empty() {
-                    retag_all = ui
-                        .button("Retag All")
-                        .on_hover_text(
-                            "Retags the copy's objects of the tags only counted too: each copy \
-                             of the area's objects a tag of its own",
-                        )
-                        .clicked();
-                }
-                keep = ui.button("Keep Tags").clicked();
-            });
+            let mut foot = crate::widgets::Foot::new()
+                .main("Retag", !clash.objects.is_empty())
+                .tip("Give each new object a numbered tag, unique in the module (LAMP_2)");
+            if !clash.more.is_empty() {
+                foot = foot
+                    .button("Retag All", true)
+                    .tip("Retag every copied object too, each with a tag of its own");
+            }
+            ((), foot.leave("Keep Tags"))
         });
+    if let Some(f) = footed {
+        retag_them = f.pressed.main();
+        retag_all = f.pressed.clicked("Retag All");
+        keep = f.pressed.cancelled();
+    }
     if retag_them || retag_all {
+        if app.ws.as_ref().map(Workspace::revision) != Some(clash.revision) {
+            app.log.warn(format!(
+                "Retag: the module changed since {} was checked, and the objects may have moved \
+                 in their lists. Nothing was retagged.",
+                clash.what
+            ));
+            return;
+        }
         let edits = retag_edits(app, &clash, retag_all);
         let n = edits
             .iter()
             .filter(|e| matches!(e, Edit::SetField { label, .. } if label == "Tag"))
             .count();
         let links = edits.len() - n;
-        if let Err(e) = app.apply(Command::new("Retag", edits)) {
+        let applied = app.apply_or_ask(Command::new("Retag", edits), None);
+        if let Err(e) = &applied {
             app.log.error(e.to_string());
-        } else {
+        } else if matches!(applied, Ok(true)) {
             let s = |n: usize| if n == 1 { "" } else { "s" };
             let led = match links {
                 0 => String::new(),

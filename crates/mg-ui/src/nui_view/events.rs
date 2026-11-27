@@ -7,7 +7,7 @@
 //! ([`follow_controls`]), and opened at a handler's code ([`open_script`]).
 use super::*;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Target {
     Window,
     Control(String), // JSON pointer in the currently edited layout
@@ -53,7 +53,8 @@ fn write_script(app: &mut Moonglow, key: ResKey, text: String) -> Option<Edit> {
     if let Some(buf) = app.scripts.get_mut(&key).filter(|b| b.is_dirty()) {
         let typed = Some(buf.mark_saved());
         // (In the file's line ends and codepage, as the editor saves it.)
-        buf.text = text;
+        // (Its history let go: its places are the text's before.)
+        buf.set_text(text);
         let data = Some(buf.mark_saved());
         let store =
             Command::new(format!("Edit {key}"), vec![Edit::SetResource { key, data: typed }]);
@@ -250,8 +251,8 @@ pub(super) fn follow_controls(
         // comparison, a JSON string): not every string that spells it.
         text = mg_nui::rename_in_code(&text, old_name, new_name);
     }
-    for (from, to) in &calls {
-        text = text.replace(&format!("{from}("), &format!("{to}("));
+    if !calls.is_empty() {
+        text = mg_nui::rename_calls(&text, &calls);
     }
     // The guards are rebuilt for the new names.
     let text = mg_nui::merge_events(name, &s, Some(&text)).ok()?;
@@ -366,20 +367,28 @@ fn handler_target(handler: &mg_nui::Handler) -> Target {
 }
 
 /// The element a new handler of this target names: the bind for a value's
-/// change, else the control's ID (one made up for it if it has none).
-fn element(target: &Target, event: &str, doc: &mut Value, s: &Settings, state: &State) -> String {
+/// change, else the control's ID; and, for a control that has none, the
+/// ID made up for it, to be written at its path (the one thing the events'
+/// editor writes into the window).
+fn element(
+    target: &Target,
+    event: &str,
+    doc: &Value,
+    s: &Settings,
+    state: &State,
+) -> (String, Option<(String, String)>) {
     if event == "watch"
         && let Some(bind) = node(target, doc, s).and_then(|n| n["value"]["bind"].as_str())
     {
-        return bind.into();
+        return (bind.into(), None);
     }
     match target {
-        Target::Window => String::new(),
-        Target::Id(n) | Target::Bind(n) => n.clone(),
+        Target::Window => (String::new(), None),
+        Target::Id(n) | Target::Bind(n) => (n.clone(), None),
         Target::Control(path) => {
-            let Some(node) = doc.pointer(path) else { return String::new() };
+            let Some(node) = doc.pointer(path) else { return (String::new(), None) };
             if let Some(id) = node["id"].as_str() {
-                return id.into();
+                return (id.into(), None);
             }
             let base = format!("{}_event", node["type"].as_str().unwrap_or("control"));
             let mut ids = mg_nui::element_ids(state.main_doc.as_ref().unwrap_or(doc));
@@ -393,10 +402,7 @@ fn element(target: &Target, event: &str, doc: &mut Value, s: &Settings, state: &
                 id = format!("{base}_{n}");
                 n += 1;
             }
-            if let Some(node) = doc.pointer_mut(path) {
-                node["id"] = json!(id);
-            }
-            id
+            (id.clone(), Some((path.clone(), id)))
         }
     }
 }
@@ -428,14 +434,15 @@ fn insert_menu(ui: &mut Ui, handler: &mg_nui::Handler, s: &Settings) -> Option<S
     let groups: std::collections::BTreeSet<_> =
         s.variants.keys().filter_map(|v| layouts::target_for(s, v)).collect();
     let mut code = None;
-    ui.menu_button("Insert…", |ui| {
-        if ui.button("Close window").clicked() {
+    mg_uikit::menu_button(ui, "Insert…", |ui| {
+        mg_uikit::menu_rows(ui);
+        if ui.button("Close Window").clicked() {
             code = with(mg_nui::Action::Close);
         }
         let submenu =
             |ui: &mut Ui, label: &str, empty: bool, why: &str, add: &mut dyn FnMut(&mut Ui)| {
                 ui.add_enabled_ui(!empty, |ui| {
-                    ui.menu_button(label, |ui| add(ui));
+                    mg_uikit::menu_button(ui, label, |ui| add(ui));
                 })
                 .response
                 .on_disabled_hover_text(why);
@@ -477,7 +484,7 @@ fn insert_menu(ui: &mut Ui, handler: &mg_nui::Handler, s: &Settings) -> Option<S
                     }
                 }
                 for group in &groups {
-                    if ui.button(format!("Initial contents · {group}")).clicked() {
+                    if ui.button(format!("Initial Contents · {group}")).clicked() {
                         let function = mg_nui::initial_function(WINDOW, group);
                         code = Some(format!(
                             "        NuiSetGroupLayout(oPlayer, nToken, {}, {function}());\n",
@@ -497,10 +504,9 @@ pub(super) fn inspector(ui: &mut Ui, doc: &mut Value, s: &mut Settings, state: &
     } else {
         Target::Control(state.selected.clone())
     };
-    egui::CollapsingHeader::new("Events")
-        .default_open(true)
-        .show(ui, |ui| editor(ui, doc, s, state, Some(target)));
-    ui.separator();
+    form::section(ui, "nui-events", "Events", true, None, None, |ui| {
+        editor(ui, doc, s, state, Some(target));
+    });
 }
 
 pub(super) fn editor(
@@ -510,7 +516,40 @@ pub(super) fn editor(
     state: &mut State,
     scope: Option<Target>,
 ) {
-    ui.push_id(("events", format!("{:?}", scope), &state.edit_view.clone()), |ui| {
+    // (A control given a handler has an ID: one is made for it.)
+    if let Some((path, id)) = editor_of(ui, doc, s, state, scope)
+        && let Some(node) = doc.pointer_mut(&path)
+    {
+        node["id"] = json!(id);
+    }
+}
+
+/// [`editor`] for a target that is no control by its place (a bind, the
+/// window, a control by its ID): the window is read, and nothing of it
+/// written, so it needs no copy of it. (The Bindings page copied the
+/// whole window for each bind, every frame, to lend this a `&mut` it
+/// never wrote through.)
+pub(super) fn editor_reading(
+    ui: &mut Ui,
+    doc: &Value,
+    s: &mut Settings,
+    state: &mut State,
+    scope: Option<Target>,
+) {
+    editor_of(ui, doc, s, state, scope);
+}
+
+/// The events' editor; a control to be given an ID (its path, the ID).
+fn editor_of(
+    ui: &mut Ui,
+    doc: &Value,
+    s: &mut Settings,
+    state: &mut State,
+    scope: Option<Target>,
+) -> Option<(String, String)> {
+    let mut new_id = None;
+    let edit_view_id = state.edit_view.as_deref().map(egui::util::hash);
+    ui.push_id(("events", &scope, edit_view_id), |ui| {
         if scope.is_none() {
             widgets::section_heading(ui, "Events");
             ui.weak(
@@ -530,7 +569,7 @@ pub(super) fn editor(
             Some(t) => handler_target(r) == *t,
         };
         let mut remove = None;
-        for (i, handler) in s.handlers.clone().iter().enumerate().filter(|(_, r)| shown(r, doc)) {
+        for (i, handler) in s.handlers.iter().enumerate().filter(|(_, r)| shown(r, doc)) {
             ui.push_id(i, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     widgets::field_label(ui, label(&handler.event));
@@ -538,7 +577,7 @@ pub(super) fn editor(
                         ui.weak(target_name(&handler_target(handler), doc));
                     }
                     let key = mg_nui::handler_key(handler);
-                    if ui.button("Edit code").on_hover_text("Open the event script here").clicked()
+                    if ui.button("Edit Code").on_hover_text("Open the event script here").clicked()
                     {
                         state.event_script = Some(EventScript {
                             settings: s.clone(),
@@ -654,8 +693,9 @@ pub(super) fn editor(
                     }
                 },
             );
-            if ui.button("+ Add handler").on_hover_text(explanation(&event)).clicked() {
-                let element = element(t, &event, doc, s, state);
+            if ui.add(form::plus("Add Handler")).on_hover_text(explanation(&event)).clicked() {
+                let (element, id) = element(t, &event, doc, s, state);
+                new_id = id;
                 s.handlers.push(mg_nui::Handler::new(event.clone(), element, mg_nui::Action::Code));
             }
         });
@@ -668,6 +708,7 @@ pub(super) fn editor(
         }
         ui.ctx().data_mut(|d| d.insert_temp(add_id, (target, event, offered)));
     });
+    new_id
 }
 
 #[cfg(test)]
@@ -706,9 +747,25 @@ mod tests {
         let s = Settings::default();
         let state = State::default();
         let slider = Target::Control("/root/children/0".into());
-        assert_eq!(element(&slider, "watch", &mut doc, &s, &state), "volume");
+        assert_eq!(element(&slider, "watch", &doc, &s, &state), ("volume".into(), None));
         let button = Target::Control("/root/children/1".into());
-        assert_eq!(element(&button, "click", &mut doc, &s, &state), "button_event_2");
-        assert_eq!(doc["root"]["children"][1]["id"], "button_event_2");
+        let made = Some(("/root/children/1".to_string(), "button_event_2".to_string()));
+        assert_eq!(element(&button, "click", &doc, &s, &state), ("button_event_2".into(), made));
+        // A bind's handler names the bind, and writes nothing into the
+        // window: its editor reads it (no copy of it for each bind).
+        let bind = Target::Bind("volume".into());
+        assert_eq!(element(&bind, "watch", &doc, &s, &state), ("volume".into(), None));
+        // The editor writes the ID made, where the control is.
+        let ctx = egui::Context::default();
+        let mut s = Settings::default();
+        let mut state = State::default();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor(ui, &mut doc, &mut s, &mut state, Some(button.clone()));
+                editor_reading(ui, &doc, &mut s, &mut state, Some(bind.clone()));
+            });
+            out.textures_delta.clear();
+        }
+        assert!(doc["root"]["children"][1].get("id").is_none(), "drawn, nothing written");
     }
 }

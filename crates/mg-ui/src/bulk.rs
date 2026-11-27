@@ -3,6 +3,7 @@
 //! Aurora's palette does it for one: every area or the one shown, with the
 //! objects it would change listed to untick.
 
+use mg_uikit::Controls as _;
 use std::collections::HashSet;
 
 use egui::Context;
@@ -42,6 +43,63 @@ pub struct UpdateDraft {
     /// The area shown, offered as the only one.
     pub shown: Option<ResRef>,
     pub objects: Vec<Affected>,
+    /// How many times each listed area's GIT had its lists rewritten as
+    /// the objects were listed (`Workspace::rewrites`): they are held by
+    /// their places in those lists, which are others' once an object is
+    /// put in or taken out.
+    listed_at: Vec<(ResRef, u64)>,
+    /// Which listing it is (counted across the window's life): the rows
+    /// shown of it are kept for it and the area chosen.
+    listing: u64,
+    /// The ticked rows of the area chosen, counted for it as the window
+    /// last changed a tick (`None` once it changes one): not counted
+    /// each frame of 30,000 listed.
+    ticked: Option<(Option<ResRef>, usize)>,
+}
+
+impl UpdateDraft {
+    /// Whether an area's objects were put in or taken out since they
+    /// were listed: a place listed may be another object's now.
+    pub fn stale(&self, ws: &mg_edit::Workspace) -> bool {
+        self.listed_at.iter().any(|(a, n)| ws.rewrites(&ResKey::new(*a, ResType::GIT)) != *n)
+    }
+}
+
+/// What the window and the log say of a list that is no longer the
+/// module's.
+const UPDATE_STALE: &str = "Objects were added to or removed from these areas since they were \
+     listed";
+
+/// The ticked objects of a draft, to ask of each object of an area
+/// whether it is one: the placed objects by area, list and place, and
+/// the items held by area and where. (Asked of every object of every
+/// area listed: looked up in the list itself, Update All Instances of
+/// 30,000 among 90,000 placed took thousands of millions of steps.)
+struct Ticked<'a> {
+    placed: HashSet<(ResRef, &'a str, usize)>,
+    held: HashSet<(ResRef, &'a [(&'static str, usize)])>,
+}
+
+impl<'a> Ticked<'a> {
+    fn of(objects: &'a [Affected]) -> Ticked<'a> {
+        let mut t = Ticked { placed: HashSet::new(), held: HashSet::new() };
+        for o in objects.iter().filter(|o| o.on) {
+            if o.held.is_empty() {
+                t.placed.insert((o.area, o.list, o.index));
+            } else {
+                t.held.insert((o.area, o.held.as_slice()));
+            }
+        }
+        t
+    }
+
+    fn placed(&self, area: ResRef, list: &str, index: usize) -> bool {
+        self.placed.contains(&(area, list, index))
+    }
+
+    fn held(&self, area: ResRef, at: &[(&'static str, usize)]) -> bool {
+        self.held.contains(&(area, at))
+    }
 }
 
 /// The kind of object a GIT list holds, for people.
@@ -56,10 +114,11 @@ impl Moonglow {
     pub fn update_instances_of(&mut self, blueprints: Vec<ResKey>) {
         let Some(ws) = self.ws.as_mut() else { return };
         let wanted: HashSet<ResKey> = blueprints.iter().copied().collect();
+        let restypes: HashSet<ResType> = wanted.iter().map(|k| k.restype).collect();
         let mut objects = Vec::new();
         for area in mg_module::areas::every(&ws.module) {
             let Ok(git) = ws.doc(&ResKey::new(area, ResType::GIT)) else { continue };
-            for restype in wanted.iter().map(|k| k.restype).collect::<HashSet<_>>() {
+            for &restype in &restypes {
                 let Some(kind) = ObjectKind::from_restype(restype) else { continue };
                 let list = kind.list();
                 for (index, s) in git.root.list(list).unwrap_or(&[]).iter().enumerate() {
@@ -101,7 +160,21 @@ impl Moonglow {
             return;
         }
         let shown = self.palette.area;
-        self.update_draft = Some(UpdateDraft { blueprints, only: None, shown, objects });
+        let mut areas: Vec<ResRef> = objects.iter().map(|o| o.area).collect();
+        areas.dedup();
+        let listed_at =
+            areas.into_iter().map(|a| (a, ws.rewrites(&ResKey::new(a, ResType::GIT)))).collect();
+        static LISTINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let listing = LISTINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.update_draft = Some(UpdateDraft {
+            blueprints,
+            only: None,
+            shown,
+            objects,
+            listed_at,
+            listing,
+            ticked: None,
+        });
     }
 
     /// Opens Update Instances for every blueprint of the module (Edit ›
@@ -126,6 +199,12 @@ impl Moonglow {
     /// command; how many.
     pub fn apply_update(&mut self, draft: &UpdateDraft) -> usize {
         let Some(ws) = self.ws.as_mut() else { return 0 };
+        // (Its objects are places in the areas' lists as they were: an
+        // unticked one would be made again in another's place.)
+        if draft.stale(ws) {
+            self.log.warn(format!("Update Instances: {UPDATE_STALE}: nothing updated"));
+            return 0;
+        }
         let wanted: HashSet<ResKey> = draft.blueprints.iter().copied().collect();
         let mut blueprints = std::collections::HashMap::new();
         for k in &wanted {
@@ -146,26 +225,17 @@ impl Moonglow {
             })
             .collect();
         let blueprint = |t: ResType, r: ResRef| blueprints.get(&ResKey::new(r, t)).cloned();
+        let ticked = Ticked::of(&draft.objects);
         // (The items the objects hold, as their editors have them.)
         let made = crate::area_view::placing(self, |placing, _| {
             let mut edits = Vec::new();
             let mut total = 0;
             for (key, git) in &gits {
                 let (key, area) = (*key, key.resref);
-                let which = |list: &str, index: usize| {
-                    draft.objects.iter().any(|o| {
-                        o.area == area
-                            && o.held.is_empty()
-                            && o.list == list
-                            && o.index == index
-                            && o.on
-                    })
-                };
+                let which = |list: &str, index: usize| ticked.placed(area, list, index);
                 // The items held first (where they are is by their places
                 // now), then the placed objects.
-                let held = |at: &[(&'static str, usize)]| {
-                    draft.objects.iter().any(|o| o.area == area && o.held == at && o.on)
-                };
+                let held = |at: &[(&'static str, usize)]| ticked.held(area, at);
                 let item = |r: ResRef| blueprint(ResType::UTI, r);
                 let (with_held, held_n) =
                     update_held(placing, git, &item, &held).unwrap_or_else(|| (git.clone(), 0));
@@ -196,8 +266,10 @@ impl Moonglow {
             };
             self.actions.push(Action::Apply(Command::new(what, edits)));
             self.log.info(format!(
-                "Updated {total} object(s) from {} blueprint(s):",
-                draft.blueprints.len()
+                "Updated {total} {} from {} {}:",
+                if total == 1 { "object" } else { "objects" },
+                draft.blueprints.len(),
+                if draft.blueprints.len() == 1 { "blueprint" } else { "blueprints" },
             ));
             // Which ones, as Aurora's log lists them: the area, the kind,
             // the tag and the blueprint of each (a long list is cut short).
@@ -219,41 +291,97 @@ impl Moonglow {
 pub(crate) fn update_window(app: &mut Moonglow, ctx: &Context) {
     let Some(mut draft) = app.update_draft.take() else { return };
     let mut open = true;
-    let (mut ok, mut cancel) = (false, false);
-    crate::widgets::dialog(ctx, "Update Instances", &mut open).collapsible(false).show(ctx, |ui| {
-        let names: Vec<String> = draft.blueprints.iter().map(|k| k.resref.to_string()).collect();
-        let shown_names = crate::text::some_of(&names, 7);
-        ui.label(format!(
-            "Makes each object placed from {shown_names} again from its blueprint, \
+    let (mut ok, mut cancel, mut again) = (false, false, false);
+    let footed = crate::widgets::dialog(ctx, "Update Instances", &mut open)
+        .collapsible(false)
+        .show_foot(ctx, |ui| {
+            let names: Vec<String> =
+                draft.blueprints.iter().map(|k| k.resref.to_string()).collect();
+            let shown_names = crate::text::some_of(&names, 7);
+            ui.label(format!(
+                "Makes each object placed from {shown_names} again from its blueprint, \
                  where it stands: its tag, name, scripts and variables become the blueprint's."
-        ));
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut draft.only, None, "Every area");
-            if let Some(area) = draft.shown {
-                ui.radio_value(&mut draft.only, Some(area), format!("Only {area}"));
+            ));
+            ui.horizontal(|ui| {
+                ui.radio_choice(&mut draft.only, None, "Every area");
+                if let Some(area) = draft.shown {
+                    ui.radio_choice(&mut draft.only, Some(area), format!("Only {area}"));
+                }
+            });
+            let in_scope = |o: &Affected, only: Option<ResRef>| only.is_none_or(|a| a == o.area);
+            ui.horizontal(|ui| {
+                if ui.small_button("All").clicked() {
+                    draft.objects.iter_mut().for_each(|o| o.on = true);
+                    draft.ticked = None;
+                }
+                if ui.small_button("None").clicked() {
+                    draft.objects.iter_mut().for_each(|o| o.on = false);
+                    draft.ticked = None;
+                }
+            });
+            let only = draft.only;
+            // (The rows in sight alone are laid out: Update All Instances
+            // lists tens of thousands in a large module. Those of the area
+            // chosen, kept for the listing: its objects are listed once.)
+            type ShownKey = (Option<ResRef>, u64);
+            let shown_key: ShownKey = (only, draft.listing);
+            let shown_id = egui::Id::new("bulk-update-shown");
+            let shown: std::sync::Arc<Vec<usize>> = if let Some((was, cached)) =
+                ui.data(|d| d.get_temp::<(ShownKey, std::sync::Arc<Vec<usize>>)>(shown_id))
+                && was == shown_key
+            {
+                cached
+            } else {
+                let list: Vec<usize> = (0..draft.objects.len())
+                    .filter(|&i| in_scope(&draft.objects[i], only))
+                    .collect();
+                let cached = std::sync::Arc::new(list);
+                ui.data_mut(|d| d.insert_temp(shown_id, (shown_key, cached.clone())));
+                cached
+            };
+            let rows = egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]);
+            mg_uikit::show_rows(rows, ui, shown.len(), |ui, range| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                for &i in &shown[range] {
+                    let o = &mut draft.objects[i];
+                    if ui.check_box(&mut o.on, &o.label).changed() {
+                        draft.ticked = None;
+                    }
+                }
+            });
+            let n = match draft.ticked {
+                Some((was, n)) if was == only => n,
+                _ => {
+                    let n = shown.iter().filter(|&&i| draft.objects[i].on).count();
+                    draft.ticked = Some((only, n));
+                    n
+                }
+            };
+            let stale = app.ws.as_ref().is_some_and(|ws| draft.stale(ws));
+            if stale {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("{UPDATE_STALE}."));
             }
+            let mut foot = crate::widgets::Foot::new().main(format!("Update {n}"), n > 0 && !stale);
+            if stale {
+                foot = foot.button("List Again", true);
+            }
+            ((), foot.cancel())
         });
-        let in_scope = |o: &Affected, only: Option<ResRef>| only.is_none_or(|a| a == o.area);
-        ui.horizontal(|ui| {
-            if ui.small_button("All").clicked() {
-                draft.objects.iter_mut().for_each(|o| o.on = true);
-            }
-            if ui.small_button("None").clicked() {
-                draft.objects.iter_mut().for_each(|o| o.on = false);
-            }
-        });
+    if let Some(f) = footed {
+        ok = f.pressed.main();
+        again = f.pressed.clicked("List Again");
+        cancel = f.pressed.cancelled();
+    }
+    if again {
+        // (The same blueprints and scope, everything ticked: what was
+        // unticked is by places that are no more.)
         let only = draft.only;
-        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-            for o in draft.objects.iter_mut().filter(|o| in_scope(o, only)) {
-                ui.checkbox(&mut o.on, &o.label);
-            }
-        });
-        let n = draft.objects.iter().filter(|o| o.on && in_scope(o, only)).count();
-        ui.horizontal(|ui| {
-            ok = ui.add_enabled(n > 0, egui::Button::new(format!("Update {n}"))).clicked();
-            cancel = crate::widgets::cancel(ui);
-        });
-    });
+        app.update_instances_of(draft.blueprints);
+        if let Some(d) = &mut app.update_draft {
+            d.only = only;
+        }
+        return;
+    }
     if ok {
         app.apply_update(&draft);
     } else if open && !cancel {
@@ -261,10 +389,11 @@ pub(crate) fn update_window(app: &mut Moonglow, ctx: &Context) {
     }
 }
 
-/// The Find and Replace Text window (Edit › Find and Replace Text…): the
-/// module's player-facing strings, and where ticked its tags, resrefs,
-/// variables and other text fields (`mg_module::text`), found as typed or
-/// by a regular expression.
+/// Find and Replace Text (Edit › Find and Replace Text…; M4's U28: Search
+/// Results' form and rows, before it a window of its own): the module's
+/// player-facing strings, and where ticked its tags, resrefs, variables
+/// and other text fields (`mg_module::text`), found as typed or by a
+/// regular expression.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextReplace {
     pub find: String,
@@ -275,8 +404,123 @@ pub struct TextReplace {
     pub hits: Vec<(mg_module::text::Hit, bool)>,
     /// What the hits were found for (the text and how).
     pub searched: Option<(String, mg_module::text::Options)>,
-    /// Find again next frame (after a replace is applied).
-    refind: bool,
+    /// The module's revision as they were found, and the resources they
+    /// are in: one changed since may have another struct where a hit's
+    /// path leads.
+    found_at: (u64, Vec<ResKey>),
+    /// Whether they are stale, worked out for the module's revision it
+    /// holds (Search Results' badge and form ask each frame: not every
+    /// resource with a hit looked at each frame).
+    stale_seen: std::cell::Cell<Option<(u64, bool)>>,
+    /// Why the text asked for is not a regular expression, if it is not
+    /// one, and what that was worked out for (not compiled every frame).
+    checked: Option<((String, mg_module::text::Options), Option<String>)>,
+    /// The hit the keys are on (Search Results' rows: Up and Down move it,
+    /// Space ticks it, Enter opens it).
+    pub(crate) current: Option<usize>,
+    /// The hits' rows laid out last frame (those in sight).
+    pub(crate) strings_seen: (usize, usize),
+    /// The ticked hits and the times they hold, counted as the ticks
+    /// change, not each frame.
+    ticked: (usize, usize),
+}
+
+impl TextReplace {
+    /// Whether a resource with a hit in it changed since the hits were
+    /// found.
+    pub fn stale(&self, ws: &mg_edit::Workspace) -> bool {
+        let now = ws.revision();
+        if let Some((seen, stale)) = self.stale_seen.get()
+            && seen == now
+        {
+            return stale;
+        }
+        let (at, keys) = &self.found_at;
+        let stale = keys.iter().any(|k| ws.changed_at(k) > *at);
+        self.stale_seen.set(Some((now, stale)));
+        stale
+    }
+
+    /// Whether the hits are of what is asked now (its text and options).
+    pub(crate) fn asked_now(&self) -> bool {
+        self.searched.as_ref().is_some_and(|(f, o)| *f == self.find && *o == self.options)
+    }
+
+    /// Why Find what is not a regular expression where it is asked to be
+    /// one, worked out again only as the text or the options change.
+    pub(crate) fn regex_problem(&mut self) -> Option<String> {
+        let now = (self.find.clone(), self.options);
+        if !self.checked.as_ref().is_some_and(|(what, _)| *what == now) {
+            let bad = (self.options.regex && !self.find.is_empty())
+                .then(|| mg_module::text::Finder::new(&self.find, self.options).err())
+                .flatten();
+            self.checked = Some((now, bad));
+        }
+        self.checked.as_ref().and_then(|(_, bad)| bad.clone())
+    }
+
+    /// A hit ticked or unticked; the counts follow.
+    pub(crate) fn tick(&mut self, at: usize, on: bool) {
+        if let Some(h) = self.hits.get_mut(at) {
+            h.1 = on;
+        }
+        self.count_ticked();
+    }
+
+    fn count_ticked(&mut self) {
+        let on = self.hits.iter().filter(|h| h.1);
+        self.ticked = on.fold((0, 0), |(n, times), h| (n + 1, times + h.0.count));
+    }
+
+    /// The ticked hits, and how many times the text is in them.
+    pub(crate) fn ticked(&self) -> (usize, usize) {
+        self.ticked
+    }
+
+    /// "6 strings, 5 times" ("1 string, 1 time"): the strings found and the
+    /// times the text is in those ticked.
+    pub(crate) fn count_words(&self) -> String {
+        let strings = self.hits.len();
+        let times = self.ticked.1;
+        format!(
+            "{strings} {}, {times} {}",
+            if strings == 1 { "string" } else { "strings" },
+            if times == 1 { "time" } else { "times" }
+        )
+    }
+
+    /// The strings' rows laid out last frame (for the tests: those in
+    /// sight alone).
+    #[doc(hidden)]
+    pub fn strings_seen(&self) -> (usize, usize) {
+        self.strings_seen
+    }
+
+    /// The hits let go of (the module closed): the form keeps what was
+    /// typed.
+    pub(crate) fn forget_hits(&mut self) {
+        self.hits.clear();
+        self.searched = None;
+        self.found_at = Default::default();
+        self.stale_seen.set(None);
+        self.current = None;
+        self.ticked = (0, 0);
+    }
+
+    /// Hits found, in place of the last search's, all ticked.
+    fn set_hits(
+        &mut self,
+        hits: Vec<mg_module::text::Hit>,
+        at: (u64, Vec<ResKey>),
+        searched: (String, mg_module::text::Options),
+    ) {
+        self.found_at = at;
+        self.stale_seen.set(None);
+        self.hits = hits.into_iter().map(|h| (h, true)).collect();
+        self.searched = Some(searched);
+        self.current = None;
+        self.count_ticked();
+    }
 }
 
 impl Default for TextReplace {
@@ -288,13 +532,29 @@ impl Default for TextReplace {
             kinds: mg_module::text::TextKind::PLAYERS.to_vec(),
             hits: Vec::new(),
             searched: None,
-            refind: false,
+            found_at: Default::default(),
+            stale_seen: Default::default(),
+            checked: None,
+            current: None,
+            strings_seen: (0, 0),
+            ticked: (0, 0),
         }
     }
 }
 
+/// What a find looks for: the module's keys of its hits, its revision as it
+/// began.
+fn found_keys(hits: &[mg_module::text::Hit]) -> Vec<ResKey> {
+    let mut keys: Vec<ResKey> = hits.iter().map(|h| h.key).collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 impl Moonglow {
-    /// Finds the window's text in the module (its unsaved edits included).
+    /// Finds the text of `draft` in the module (its unsaved edits
+    /// included), on this thread: the tests'. The window's Find runs it as
+    /// a job ([`start_find_text`]).
     pub fn find_text(&mut self, draft: &mut TextReplace) {
         let Some(ws) = self.ws.as_mut() else { return };
         if let Err(e) = ws.flush() {
@@ -305,8 +565,8 @@ impl Moonglow {
         let game = self.game.as_deref().map(|g| g.codepage());
         let options = mg_module::text::Options { game, ..draft.options };
         let hits = mg_module::text::find(&ws.module, &draft.find, options, &draft.kinds);
-        draft.hits = hits.into_iter().map(|h| (h, true)).collect();
-        draft.searched = Some((draft.find.clone(), draft.options));
+        let at = (ws.revision(), found_keys(&hits));
+        draft.set_hits(hits, at, (draft.find.clone(), draft.options));
     }
 
     /// Replaces the found text in the ticked strings, as one command; how
@@ -316,6 +576,11 @@ impl Moonglow {
         let game = self.game.as_deref().map(|g| g.codepage());
         let options = mg_module::text::Options { game, ..options };
         let Some(ws) = self.ws.as_mut() else { return 0 };
+        // (A hit is a path in its resource as it was.)
+        if draft.stale(ws) {
+            self.log.warn("Replace: the module changed since the text was found: nothing replaced");
+            return 0;
+        }
         let mut edits = Vec::new();
         let mut total = 0;
         let mut errors = Vec::new();
@@ -345,141 +610,119 @@ impl Moonglow {
         if !edits.is_empty() {
             let what = format!("Replace {find:?} with {:?}", draft.with);
             self.actions.push(Action::Apply(Command::new(what, edits)));
-            self.log.info(format!("Replaced {find:?} {total} time(s)"));
+            self.log.info(format!(
+                "Replaced {find:?} {total} {}",
+                if total == 1 { "time" } else { "times" },
+            ));
         }
         total
     }
 }
 
-/// The Find and Replace Text window.
-pub(crate) fn text_window(app: &mut Moonglow, ctx: &Context) {
-    use mg_module::text::TextKind;
-    let Some(mut draft) = app.text_replace.take() else { return };
-    if std::mem::take(&mut draft.refind) {
-        app.find_text(&mut draft);
+/// Find and Replace Text's Find, as a job (Search Results' Find, Enter in
+/// Find what): the module as it is, a resource at a time, its progress in
+/// the job's window and Cancel there; what it finds into Search Results in
+/// place of the last search's.
+pub(crate) fn start_find_text(app: &mut Moonglow) {
+    let Some(d) = app.text_replace.as_mut() else { return };
+    if d.find.is_empty() || d.regex_problem().is_some() {
+        return;
     }
-    let mut open = true;
-    let (mut find, mut replace, mut go) = (false, false, None);
-    crate::widgets::dialog(ctx, "Find and Replace Text", &mut open).default_width(560.0).show(
-        ctx,
-        |ui| {
-            ui.weak(
-                "The module's names, descriptions, conversation lines and journal, in every \
-                 language they're written in (not the game's talk table); and, ticked, its \
-                 tags, resrefs, variables and other text fields.",
-            );
-            egui::Grid::new("text-replace").num_columns(2).show(ui, |ui| {
-                crate::widgets::field_label(ui, "Find what");
-                let r = ui.add(egui::TextEdit::singleline(&mut draft.find).desired_width(320.0));
-                crate::widgets::autofocus(ui, &r);
-                find = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                ui.end_row();
-                crate::widgets::field_label(ui, "Replace with");
-                ui.add(egui::TextEdit::singleline(&mut draft.with).desired_width(320.0));
-                ui.end_row();
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut draft.options.match_case, "Match case");
-                ui.checkbox(&mut draft.options.whole_word, "Whole words");
-                ui.checkbox(&mut draft.options.regex, "Regular expression").on_hover_text(
-                    "Find what is a regular expression (kz_\\d+, ^wp_(.*)$, (inn|tavern)); \
-                     Replace with may name what its groups found ($1, ${name}). Without \
-                     Match case, letters A to Z in either case",
-                );
-            });
-            let mut tick = |ui: &mut egui::Ui, k: TextKind, hover: Option<&str>| {
-                let mut on = draft.kinds.contains(&k);
-                let r = ui.checkbox(&mut on, k.label());
-                let r = match hover {
-                    Some(h) => r.on_hover_text(h),
-                    None => r,
-                };
-                if r.changed() {
-                    draft.kinds.retain(|x| *x != k);
-                    if on {
-                        draft.kinds.push(k);
-                    }
-                }
-            };
-            ui.horizontal_wrapped(|ui| {
-                for k in TextKind::PLAYERS {
-                    tick(ui, k, None);
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                for k in TextKind::ALL.into_iter().filter(|k| !k.players()) {
-                    let hover = match k {
-                        TextKind::Tag => {
-                            "Objects' and areas' tags: a tag made another's is \
-                                         said, as a paste's is"
-                        }
-                        TextKind::ResRef => {
-                            "Fields that name a script, a blueprint, a \
-                                            conversation…: the resource itself isn't renamed \
-                                            (Rename… does that, and what names it)"
-                        }
-                        TextKind::Variable => "Local variables' names and string values",
-                        _ => "The other text fields (a door's Linked To, a key's tag, comments)",
-                    };
-                    tick(ui, k, Some(hover));
-                }
-            });
-            let bad = (draft.options.regex && !draft.find.is_empty())
-                .then(|| mg_module::text::Finder::new(&draft.find, draft.options).err())
-                .flatten();
-            if let Some(e) = &bad {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    format!("Not a regular expression: {e}"),
-                );
-            }
-            let can = !draft.find.is_empty() && bad.is_none();
-            find &= can;
-            find |= ui.add_enabled(can, egui::Button::new("Find")).clicked();
-            // What was found, if it's still what's asked for.
-            let current = draft.searched.as_ref() == Some(&(draft.find.clone(), draft.options));
-            if current {
-                let times: usize = draft.hits.iter().filter(|h| h.1).map(|h| h.0.count).sum();
-                ui.label(format!("{} string(s), {times} time(s)", draft.hits.len()));
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    for (i, (hit, on)) in draft.hits.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(on, "");
-                            if ui.link(&hit.place).on_hover_text("Open it").clicked() {
-                                go = Some(i);
-                            }
-                        });
-                        let text: String = hit.text.chars().take(120).collect();
-                        ui.indent(("hit", i), |ui| ui.weak(text));
-                    }
-                });
-                let n = draft.hits.iter().filter(|h| h.1).count();
-                replace =
-                    ui.add_enabled(n > 0, egui::Button::new(format!("Replace in {n}"))).clicked();
-            } else if draft.searched.is_some() {
-                ui.weak("Find again for what's asked now.");
-            }
+    let Some(ws) = app.ws.as_ref() else { return };
+    let (find, kinds) = (d.find.clone(), d.kinds.clone());
+    let searched = (d.find.clone(), d.options);
+    let game = app.game.as_deref().map(|g| g.codepage());
+    let options = mg_module::text::Options { game, ..d.options };
+    // (The revision as it begins: the snapshot is of it.)
+    let revision = ws.revision();
+    app.start_job(
+        "Find and Replace Text",
+        move |job| {
+            mg_module::text::find_with(&job.module, &find, options, &kinds, &mut |done, total| {
+                job.progress.step(done, total);
+                !job.progress.cancelled()
+            })
+        },
+        move |app, hits| {
+            let Some(hits) = hits else { return };
+            let Some(d) = app.text_replace.as_mut() else { return };
+            let at = (revision, found_keys(&hits));
+            d.set_hits(hits, at, searched);
+            app.show_search(crate::search_results::Showing::Text);
         },
     );
-    if find && !draft.find.is_empty() {
-        app.find_text(&mut draft);
+}
+
+/// Replace in N: the found text replaced in the ticked strings, as one
+/// step of Undo, then found again (what is left).
+pub(crate) fn replace(app: &mut Moonglow) {
+    let Some(d) = app.text_replace.clone() else { return };
+    if app.replace_text(&d) > 0 {
+        // (Found again once the replace is applied: what's left. The
+        // replace is an action of this frame; the find, a job, comes after
+        // it.)
+        app.text_refind = true;
     }
-    if replace {
-        app.replace_text(&draft);
-        // Found again once applied: what's left.
-        draft.refind = true;
-        ctx.request_repaint();
-    }
-    if let Some(i) = go {
-        let hit = &draft.hits[i].0;
-        let usage = mg_module::rename::Usage {
-            from: hit.key,
-            path: mg_module::refs::Location::Gff(hit.field()),
-            place: hit.place.clone(),
-        };
-        app.go_to_usage(&usage);
-    }
-    if open {
-        app.text_replace = Some(draft);
+}
+
+/// Opens hit `at` (its link, Enter): its resource at the field.
+pub(crate) fn go_to_hit(app: &mut Moonglow, at: usize) {
+    let Some(hit) = app.text_replace.as_ref().and_then(|d| d.hits.get(at)).map(|h| h.0.clone())
+    else {
+        return;
+    };
+    let usage = mg_module::rename::Usage {
+        from: hit.key,
+        path: mg_module::refs::Location::Gff(hit.field()),
+        place: hit.place,
+    };
+    app.go_to_usage(&usage);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The review's A19: the ticked objects are asked for in sets made
+    /// once, and answer as the list itself, scanned, did: by area, list
+    /// and place for the placed, by area and where for the items held,
+    /// the unticked left out.
+    #[test]
+    fn the_ticked_objects_are_found_as_a_scan_of_the_list_finds_them() {
+        let areas = ["a", "b"].map(|a| ResRef::from_str(a).unwrap());
+        let lists = ["Placeable List", "Creature List"];
+        let mut objects = Vec::new();
+        for (n, area) in areas.into_iter().enumerate() {
+            for list in lists {
+                for index in 0..6 {
+                    let on = (index + n) % 3 != 0;
+                    let held = Vec::new();
+                    objects.push(Affected { area, list, index, held, label: String::new(), on });
+                    let held: Held = vec![(list, index), ("ItemList", index % 2)];
+                    let on = (index + n) % 2 == 0;
+                    objects.push(Affected { area, list, index, held, label: String::new(), on });
+                }
+            }
+        }
+        let ticked = Ticked::of(&objects);
+        for area in areas {
+            for list in lists.into_iter().chain(["SoundList"]) {
+                for index in 0..8 {
+                    let scan = objects.iter().any(|o| {
+                        o.area == area
+                            && o.held.is_empty()
+                            && o.list == list
+                            && o.index == index
+                            && o.on
+                    });
+                    assert_eq!(ticked.placed(area, list, index), scan, "{area} {list} {index}");
+                    for slot in 0..2 {
+                        let at: Held = vec![(list, index), ("ItemList", slot)];
+                        let scan = objects.iter().any(|o| o.area == area && o.held == at && o.on);
+                        assert_eq!(ticked.held(area, &at), scan, "{area} {at:?}");
+                    }
+                }
+            }
+        }
     }
 }

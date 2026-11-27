@@ -53,7 +53,9 @@ impl Progress {
     }
 
     /// Whether the job was called off: it should stop at its next step and
-    /// return (what it returns is dropped).
+    /// return (what it returns is dropped, but for a job started with
+    /// [`Moonglow::start_job_to_its_end`], which says itself how far it
+    /// came).
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
@@ -78,17 +80,41 @@ type Finish = Box<dyn FnOnce(&mut Moonglow, Made)>;
 
 /// A job under way.
 pub struct Job {
+    /// What the log calls it (a plugin's: its name and the command's
+    /// title).
     pub title: String,
+    /// A plugin's job: its window's heading (the command's title alone)
+    /// and the plugin's name, shown on hover; its window leaves the
+    /// window behind it as it is, not dimmed, for a color being picked to
+    /// be judged through it.
+    pub(crate) plugin: Option<(String, String)>,
     progress: Arc<Progress>,
     thread: JoinHandle<Made>,
     finish: Finish,
+    /// Its work is handed over when it was called off too
+    /// ([`Moonglow::start_job_to_its_end`]).
+    to_its_end: bool,
     started: Instant,
+    /// The module it works on, where it needs one: [`Moonglow::modules_opened`]
+    /// as it began. Closed or another opened before it ends, what it made
+    /// is let go, not given to the module open then.
+    module_of: Option<u64>,
 }
 
 impl std::fmt::Debug for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Job").field("title", &self.title).finish_non_exhaustive()
     }
+}
+
+/// A job under way as the Status Bar shows it ([`Moonglow::job_shown`]).
+pub(crate) struct JobShown {
+    /// What the log calls it.
+    pub title: String,
+    /// The steps done and their total, where the total is known.
+    pub steps: Option<(usize, usize)>,
+    /// What it is doing now (empty where it has not said).
+    pub note: String,
 }
 
 /// Asks for a frame from a thread of the window's whose work is done (a
@@ -110,11 +136,7 @@ pub(crate) fn wake(ctx: &egui::Context, at_once: bool) {
 
 /// What a thread that panicked said.
 fn panic_text(panic: &Made) -> String {
-    panic
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "it stopped unexpectedly".into())
+    mg_render::guard::panic_message(&**panic).unwrap_or_else(|| "it stopped unexpectedly".into())
 }
 
 impl Moonglow {
@@ -134,7 +156,27 @@ impl Moonglow {
         let soonest = if self.background_jobs { Duration::ZERO } else { Duration::from_secs(1) };
         ctx.request_repaint_after(after.max(soonest));
     }
+}
 
+/// A wait of `secs` seconds worked out from the time (so long, less what
+/// has passed): `None` for one that is over, is not a number or is too
+/// long to be a `Duration`. An odd order of events leaves such waits
+/// behind: Q or E while the selection was dragged asked for a frame 0.6 s
+/// after the key less the time since, which `Duration::from_secs_f64`
+/// refused once the drag went on longer, and 4.1.0 stopped.
+pub(crate) fn wait(secs: f64) -> Option<Duration> {
+    (secs > 0.0).then(|| Duration::try_from_secs_f64(secs).ok()).flatten()
+}
+
+/// Asks for a frame in `secs` seconds ([`wait`]); for none where there is
+/// nothing left to wait for.
+pub(crate) fn repaint_in(ctx: &egui::Context, secs: f64) {
+    if let Some(after) = wait(secs) {
+        ctx.request_repaint_after(after);
+    }
+}
+
+impl Moonglow {
     /// What of the window's own work is under way, to be taken at a later
     /// frame, in a few words (`None`: nothing): a job, a look at the
     /// module's files or the scripts it read to compile, blueprints read
@@ -154,8 +196,17 @@ impl Moonglow {
         if self.thumbnails.waiting() > 0 {
             return Some("pictures to make");
         }
+        if (self.plugins.panels.values()).any(|p| p.drawing() || p.waiting()) {
+            return Some("a plugin's panel being drawn");
+        }
         if self.thumbnails.reading() > 0 {
             return Some("pictures being read");
+        }
+        if self.decodes.busy() {
+            return Some("a picture being decoded");
+        }
+        if self.wide_props_waiting {
+            return Some("the wide layout's Properties waiting for the pointer");
         }
         if self.area_views.values().any(crate::area_view::AreaView::reading) {
             return Some("an area being read");
@@ -168,6 +219,23 @@ impl Moonglow {
         }
         if self.updates.checking() {
             return Some("an update check");
+        }
+        if self.tables.iter().any(crate::table_view::TableDoc::walking) {
+            return Some("a table's description's folder being read");
+        }
+        if self.tables.iter().any(crate::table_view::TableDoc::looking) {
+            return Some("a table's row's references being found");
+        }
+        let mut talk =
+            std::iter::once(&self.talk_view).chain(self.game_talk.as_ref().map(|g| &g.view));
+        if talk.any(crate::talk_view::TalkView::under_way) {
+            return Some("a talk table being looked through, or a line's references found");
+        }
+        if self.script_nav.checking() {
+            return Some("a script being checked");
+        }
+        if self.script_tools.reading_symbols() {
+            return Some("a script's symbols being read");
         }
         None
     }
@@ -182,7 +250,7 @@ impl Moonglow {
         work: impl FnOnce(&Context) -> T + Send + 'static,
         finish: impl FnOnce(&mut Moonglow, T) + 'static,
     ) {
-        self.start_job_on(title.into(), true, work, finish);
+        self.start_job_on(title.into(), true, false, true, work, finish);
     }
 
     /// [`start_job`](Self::start_job) for work that needs no module (a
@@ -193,13 +261,46 @@ impl Moonglow {
         work: impl FnOnce(&Context) -> T + Send + 'static,
         finish: impl FnOnce(&mut Moonglow, T) + 'static,
     ) {
-        self.start_job_on(title.into(), false, work, finish);
+        self.start_job_on(title.into(), false, false, true, work, finish);
+    }
+
+    /// [`start_job_anywhere`](Self::start_job_anywhere) for work that
+    /// changes what the window has to follow (a file it has open, written
+    /// anew): `finish` is called when the job was called off too, and
+    /// what the work made says whether it stopped. A Cancel that comes
+    /// when the work is past its last look at it (the file being flushed
+    /// to the disk and moved into place) left the file written and the
+    /// window not knowing: the log said "canceled".
+    pub(crate) fn start_job_to_its_end<T: Send + 'static>(
+        &mut self,
+        title: impl Into<String>,
+        work: impl FnOnce(&Context) -> T + Send + 'static,
+        finish: impl FnOnce(&mut Moonglow, T) + 'static,
+    ) {
+        self.start_job_on(title.into(), false, true, true, work, finish);
+    }
+
+    /// [`start_job_to_its_end`](Self::start_job_to_its_end) for work that
+    /// reads neither the module nor the game data (a hak written out):
+    /// given neither, the module's layer of the game data is not made
+    /// again for it. Made again, it forgot every list made from the game
+    /// data, and a hak's Save with a large module and its editors open
+    /// took frames of 9 to 18 ms.
+    pub(crate) fn start_job_apart<T: Send + 'static>(
+        &mut self,
+        title: impl Into<String>,
+        work: impl FnOnce(&Context) -> T + Send + 'static,
+        finish: impl FnOnce(&mut Moonglow, T) + 'static,
+    ) {
+        self.start_job_on(title.into(), false, true, false, work, finish);
     }
 
     fn start_job_on<T: Send + 'static>(
         &mut self,
         title: String,
         needs_module: bool,
+        to_its_end: bool,
+        reads_game: bool,
         work: impl FnOnce(&Context) -> T + Send + 'static,
         finish: impl FnOnce(&mut Moonglow, T) + 'static,
     ) {
@@ -207,10 +308,23 @@ impl Moonglow {
             self.log.warn(format!("{title}: waiting for {} to finish", job.title));
             return;
         }
+        // What is typed in a field and not yet set is set first: the job
+        // reads the module with it. (Set later, as the job's window takes
+        // the field's keyboard, it was a step of its own that the job's
+        // write, made from the module before it, then replaced: the typing
+        // was lost.)
+        if needs_module {
+            self.set_held_text();
+        }
         // The module's layer of the game data as the module is now (which
         // changes the game data: before the job shares it).
-        self.refresh_module_layer();
-        let module = match self.ws.as_mut().map(|ws| ws.snapshot()) {
+        if reads_game {
+            self.refresh_module_layer();
+        }
+        // (A job that needs no module is given none: a hak's save copied
+        // the whole module open beside it, unread.)
+        let ws = self.ws.as_mut().filter(|_| needs_module);
+        let module = match ws.map(|ws| ws.snapshot()) {
             Some(Ok(m)) => m,
             Some(Err(e)) => {
                 self.log.error(format!("{title}: {e}"));
@@ -224,7 +338,8 @@ impl Moonglow {
         };
         crate::trace::note(format!("job starts: {title}"));
         let progress = Arc::new(Progress::default());
-        let context = Context { module, game: self.game.clone(), progress: progress.clone() };
+        let game = self.game.clone().filter(|_| reads_game);
+        let context = Context { module, game, progress: progress.clone() };
         // (The context, and its share of the game data, is dropped when
         // the work returns: before `finish` may change the game data.)
         let thread =
@@ -241,6 +356,7 @@ impl Moonglow {
         };
         self.job = Some(Job {
             title,
+            plugin: None,
             progress,
             thread,
             finish: Box::new(move |app, made| {
@@ -248,11 +364,44 @@ impl Moonglow {
                     finish(app, *made);
                 }
             }),
+            to_its_end,
             started: Instant::now(),
+            module_of: needs_module.then_some(self.modules_opened),
         });
         if !self.background_jobs {
             self.finish_job();
         }
+    }
+
+    /// The job under way as the Status Bar shows it.
+    pub(crate) fn job_shown(&self) -> Option<JobShown> {
+        let job = self.job.as_ref()?;
+        let p = &job.progress;
+        let (done, total) = (p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
+        let steps = (total > 0).then_some((done.min(total), total));
+        Some(JobShown { title: job.title.clone(), steps, note: p.note() })
+    }
+
+    /// Starts `work` as a job titled `title` on a thread of its own, run in
+    /// the background whatever [`Moonglow::background_jobs`] says (a test
+    /// holds it there with a channel of its own, says how far it is with
+    /// [`Progress::step`], and lets it end, fail by a panic or be called
+    /// off); done, the log says "`title`: done". For the window's tests
+    /// and pictures of a job under way, a job's timing being the machine's.
+    #[doc(hidden)]
+    pub fn start_job_for_tests(
+        &mut self,
+        title: &str,
+        work: impl FnOnce(&Progress) + Send + 'static,
+    ) {
+        let was = std::mem::replace(&mut self.background_jobs, true);
+        let done = format!("{title}: done");
+        self.start_job_anywhere(
+            title,
+            move |cx| work(&cx.progress),
+            move |app, ()| app.log.info(done),
+        );
+        self.background_jobs = was;
     }
 
     /// Each frame: hands a finished job's work over; else asks to be drawn
@@ -273,8 +422,19 @@ impl Moonglow {
         let Some(job) = self.job.take() else { return };
         crate::trace::note(format!("job ends: {} ({:.0?})", job.title, job.started.elapsed()));
         match job.thread.join() {
-            Ok(_) if job.progress.cancelled() => self.log.info(format!("{}: canceled", job.title)),
-            Ok(made) => (job.finish)(self, made),
+            // (Its module closed, or another opened, while it ran: what it
+            // found is the other module's.)
+            Ok(_) if job.module_of.is_some_and(|m| m != self.modules_opened) => {
+                self.log.info(format!("{}: {MODULE_GONE}", job.title));
+            }
+            Ok(_) if job.progress.cancelled() && !job.to_its_end => {
+                self.log.info(format!("{}: canceled", job.title));
+            }
+            Ok(made) => {
+                (job.finish)(self, made);
+                // (A tileset of the module's its write changed: redrawn.)
+                self.follow_module_sets();
+            }
             Err(panic) => {
                 self.log.error(format!("{} failed: {}", job.title, panic_text(&panic)));
             }
@@ -282,46 +442,131 @@ impl Moonglow {
     }
 }
 
+impl Moonglow {
+    /// Sets what is typed in a field and not yet set (`Moonglow::held_text`)
+    /// now, as leaving the field would: its command applied (a Properties
+    /// window's noted for its Cancel), or its action queued.
+    pub(crate) fn set_held_text(&mut self) {
+        let Some(held) = self.held_text.take() else { return };
+        if let Some(command) = held.command {
+            if let Some(w) = &held.window {
+                let noted = crate::blueprint::but_for(&command, &w.kept);
+                crate::blueprint::note_command(self, &w.tab, &w.targets, &noted);
+            }
+            match held.typed {
+                true => crate::talk_typed::apply(self, command),
+                false => {
+                    if let Err(e) = self.apply(command)
+                        && !std::mem::take(&mut self.claims.held)
+                    {
+                        self.log.error(e.to_string());
+                    }
+                }
+            }
+        } else if let Some(action) = held.action {
+            self.actions.push(action);
+        }
+        self.buffers.remove(&held.id);
+    }
+}
+
+/// What the log says of a job whose module was closed, or another opened,
+/// while it ran.
+pub(crate) const MODULE_GONE: &str =
+    "its module was closed before it was done, and what it found was let go";
+
+impl Moonglow {
+    /// The module is being closed, or another opened: a job on it is
+    /// called off (its thread stops at its next look), and whatever it
+    /// still hands over is let go ([`Job`]'s `module_of`). The window's
+    /// job dialog is modal, so this is what a path round it meets (a file
+    /// handed to the running window, a plugin, a test).
+    pub(crate) fn let_go_of_module_job(&mut self) {
+        self.modules_opened += 1;
+        if let Some(job) = self.job.as_ref().filter(|j| j.module_of.is_some()) {
+            job.progress.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The running job's window: its name, how far it is, and Cancel. Nothing
-/// else takes input while it shows.
+/// else takes input while it shows. A plugin's is headed by its command's
+/// title, and leaves the window behind it undimmed.
 pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some(job) = &app.job else { return };
     let (title, progress, started) = (job.title.clone(), job.progress.clone(), job.started);
+    let plugin = job.plugin.clone();
     let command = crate::project_commands::running(app);
-    egui::Modal::new(egui::Id::new("job")).show(ctx, |ui| {
-        ui.set_width(if command { 640.0 } else { 320.0 });
-        ui.heading(&title);
-        // A plugin waiting on the user shows its question here.
-        if crate::plugins::question_ui(app, ui) {
-            return;
+    let mut modal = crate::widgets::modal_window(ctx, egui::Id::new("job"));
+    if plugin.is_some() {
+        modal = modal.backdrop_color(egui::Color32::TRANSPARENT);
+    }
+    let heading = plugin.as_ref().map_or(title.as_str(), |(heading, _)| heading.as_str());
+    let shown = modal.show(ctx, |ui| {
+        let (asked, pressed, named) = crate::widgets::modal_titled_foot(ui, heading, |ui| {
+            job_body(app, ui, &progress, started, command)
+        });
+        if let Some((_, name)) = &plugin {
+            named.on_hover_text(format!("From the plugin {name}"));
         }
-        // A project's command, its output as it comes (and its input).
-        if command {
-            crate::project_commands::job_ui(app, ui);
-        }
-        let (done, total) =
-            (progress.done.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed));
-        if total > 0 {
-            let bar = egui::ProgressBar::new(done as f32 / total as f32)
-                .text(format!("{done} of {total}"));
-            ui.add(bar);
-        } else {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("{} s", started.elapsed().as_secs()));
-            });
-        }
-        let note = progress.note();
-        if !note.is_empty() {
-            ui.label(note);
-        }
-        ui.add_space(6.0);
-        if progress.cancelled() {
-            ui.weak("Canceling…");
-        } else if ui.button("Cancel").clicked() {
-            progress.cancel.store(true, Ordering::Relaxed);
-        }
+        (asked, pressed)
     });
+    let (asked, pressed) = shown.inner;
+    match asked {
+        Some(question) => crate::plugins::question_answer(app, &question, &pressed),
+        // (Cancel, or Escape: the job is asked to stop, and comes to an end.)
+        None if pressed.cancelled() => progress.cancel.store(true, Ordering::Relaxed),
+        None => {}
+    }
+}
+
+/// The job window's body under its title row: a plugin's question, a
+/// project command's output, the progress; its footer (the question's
+/// buttons, or Cancel) and the question it shows, if one.
+fn job_body(
+    app: &mut Moonglow,
+    ui: &mut egui::Ui,
+    progress: &std::sync::Arc<Progress>,
+    started: std::time::Instant,
+    command: bool,
+) -> (Option<mg_plugin::Question>, crate::widgets::Foot) {
+    ui.set_width(ui.available_width().min(if command { 640.0 } else { 320.0 }));
+    // A plugin waiting on the user shows its question here.
+    if let Some((foot, question)) = crate::plugins::question_ui(app, ui) {
+        return (Some(question), foot);
+    }
+    // A project's command, its output as it comes (and its input).
+    if command {
+        crate::project_commands::job_ui(app, ui);
+    }
+    let (done, total) =
+        (progress.done.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed));
+    if total > 0 {
+        // The bar, and its words ("40 of 312") under it in the body's text
+        // (M4's U27): egui draws a bar's own words in the selection's
+        // light text over both its fill and its track, which in the light
+        // theme left them half unreadable over the light track.
+        ui.add(egui::ProgressBar::new(done as f32 / total as f32));
+        ui.label(progress_words(done, total));
+    } else {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(format!("{} s", started.elapsed().as_secs()));
+        });
+    }
+    let note = progress.note();
+    if !note.is_empty() {
+        ui.label(note);
+    }
+    if progress.cancelled() {
+        ui.weak("Canceling…");
+    }
+    (None, crate::widgets::Foot::new().cancel())
+}
+
+/// A job's progress in words, under its bar.
+fn progress_words(done: usize, total: usize) -> String {
+    format!("{done} of {total}")
 }
 
 #[cfg(test)]
@@ -332,6 +577,24 @@ mod tests {
 
     use super::*;
     use crate::Level;
+
+    /// A wait worked out from the time is one only while some is left: an
+    /// overdue, odd or endless one asks for no frame, and nothing panics.
+    #[test]
+    fn a_wait_from_the_time_is_none_when_over_odd_or_endless() {
+        assert_eq!(wait(0.25), Some(Duration::from_millis(250)));
+        assert_eq!(wait(f64::MIN_POSITIVE), Some(Duration::ZERO), "too short to count");
+        for odd in [0.0, -0.0, -0.1, -1e300, f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+        {
+            assert_eq!(wait(odd), None, "{odd}");
+        }
+        assert_eq!(wait(1e30), None, "longer than a Duration holds");
+        // (And asked of a window: no frame asked for, no panic.)
+        let ctx = egui::Context::default();
+        for secs in [-0.5, f64::NAN, f64::INFINITY, 1e30, 0.1] {
+            repaint_in(&ctx, secs);
+        }
+    }
 
     /// An application with a small module open, its jobs in the background.
     fn app(name: &str) -> Moonglow {
@@ -359,6 +622,74 @@ mod tests {
 
     fn logged(app: &Moonglow, level: Level, what: &str) -> bool {
         app.log.entries.iter().any(|(l, m)| *l == level && m.contains(what))
+    }
+
+    /// A module dropped on the window (or opened by a menu's own keys)
+    /// while a job ran was opened over it, and the job's work was then
+    /// handed to that module; the window's close button quit under it
+    /// (the review of November 2026, S5 and D7).
+    #[test]
+    fn nothing_replaces_the_module_or_closes_the_window_under_a_job() {
+        let mut app = app("ui-job-holds");
+        let other = mg_testkit::scratch_dir("ui-job-holds-other").join("other.mod");
+        Module::new().save_as(&ModuleLocation::Archive(other.clone())).unwrap();
+        let was = app.ws.as_ref().unwrap().module.location.clone();
+        let (go, wait) = mpsc::channel::<()>();
+        app.start_job("Count", move |_| _ = wait.recv(), |app, ()| app.log.info("counted"));
+        assert!(app.busy());
+        app.take_dropped(vec![other.clone()]);
+        app.actions.push(crate::Action::OpenModule(other));
+        app.actions.push(crate::Action::Close);
+        app.actions.push(crate::Action::CloseWindow);
+        app.actions.push(crate::Action::Quit);
+        app.run_actions();
+        assert_eq!(app.ws.as_ref().unwrap().module.location, was, "the module stays");
+        assert!(!app.quit_requested && app.confirm_discard.is_none());
+        assert!(logged(&app, Level::Warning, "Count is still running"));
+        go.send(()).unwrap();
+        until_done(&mut app);
+        assert!(logged(&app, Level::Info, "counted"));
+        // Over: they run again.
+        app.actions.push(crate::Action::Close);
+        app.run_actions();
+        assert!(app.ws.is_none());
+    }
+
+    /// A job apart (a hak's save) is given neither the module nor the game
+    /// data, and the module's layer is not made again for it: the lists
+    /// made from the game data are kept. Another job has the layer made
+    /// again, as the module is now, and the game data with it.
+    #[test]
+    fn a_job_apart_leaves_the_game_data_as_it_is() {
+        let mut app = app("ui-job-apart");
+        let game =
+            GameData::new(mg_resman::ResMan::new(), mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        app.game = Some(Arc::new(game));
+        app.refresh_module_layer();
+        let generation = |app: &Moonglow| app.game.as_ref().unwrap().generation();
+        let before = generation(&app);
+        app.start_job_apart(
+            "Save Hak",
+            |job| (job.game.is_none(), job.module.is_empty()),
+            |app, (no_game, no_module)| {
+                assert!(no_game && no_module, "given nothing");
+                app.log.info("written");
+            },
+        );
+        until_done(&mut app);
+        assert!(logged(&app, Level::Info, "written"));
+        assert_eq!(generation(&app), before, "the game data as it was");
+        app.start_job_anywhere(
+            "Find",
+            |job| job.game.is_some(),
+            |app, game| {
+                assert!(game, "given the game data");
+                app.log.info("found");
+            },
+        );
+        until_done(&mut app);
+        assert!(logged(&app, Level::Info, "found"));
+        assert_ne!(generation(&app), before, "the module's layer made again");
     }
 
     #[test]
@@ -395,6 +726,92 @@ mod tests {
         until_done(&mut app);
         assert!(logged(&app, Level::Info, "counted 1"), "{:?}", app.log.entries);
         assert!(!logged(&app, Level::Info, "another ran"));
+    }
+
+    /// A job on the module whose module is closed (or another opened)
+    /// before it is done is called off, and what it hands over is let go,
+    /// not given to the module open then (M4's U28 review: a search's
+    /// strings landed in the next module's Search Results); one that needs
+    /// no module is left to end.
+    #[test]
+    fn a_job_whose_module_is_closed_hands_nothing_over() {
+        for (module, closed) in [(true, true), (true, false), (false, true)] {
+            let mut app = app(&format!("ui-job-closed-{module}-{closed}"));
+            let (go, wait) = mpsc::channel::<()>();
+            let work = move |_: &Context| {
+                wait.recv().ok();
+            };
+            let finish = |app: &mut Moonglow, ()| app.log.info("handed over");
+            match module {
+                true => app.start_job("Find", work, finish),
+                false => app.start_job_anywhere("Find", work, finish),
+            }
+            let progress = app.job.as_ref().unwrap().progress.clone();
+            if closed {
+                app.close();
+            }
+            go.send(()).unwrap();
+            until_done(&mut app);
+            let handed = logged(&app, Level::Info, "handed over");
+            let gone = logged(&app, Level::Info, &format!("Find: {MODULE_GONE}"));
+            assert_eq!(handed, !(module && closed), "{module} {closed}: {:?}", app.log.entries);
+            assert_eq!(gone, module && closed, "{module} {closed}");
+            assert_eq!(progress.cancelled(), module && closed, "called off where let go");
+        }
+    }
+
+    /// A job that needs no module (a hak's save, an export) is given none,
+    /// a module open or not; one that needs it, the module as it is (a
+    /// hak-only job copied the whole module, unread: the last pass's
+    /// item 17). Their game data is the same, the module layered in.
+    #[test]
+    fn a_job_that_needs_no_module_is_given_none() {
+        let mut app = app("ui-job-no-module");
+        let game = app.game.clone();
+        for anywhere in [false, true] {
+            let work = move |job: &Context| (job.module.len(), job.game.is_some());
+            let finish = |app: &mut Moonglow, (n, game): (usize, bool)| {
+                app.log.info(format!("resources {n}, game {game}"));
+            };
+            match anywhere {
+                false => app.start_job("Count", work, finish),
+                true => app.start_job_anywhere("Count", work, finish),
+            }
+            until_done(&mut app);
+            let n = if anywhere { 0 } else { 1 };
+            let said = format!("resources {n}, game {}", game.is_some());
+            assert!(logged(&app, Level::Info, &said), "{:?}", app.log.entries);
+        }
+    }
+
+    /// A job that changes what the window follows hands its work over
+    /// when it was called off too: a Cancel that came after the work's
+    /// last look at it left a hak written and the editor not knowing.
+    #[test]
+    fn a_job_to_its_end_hands_over_when_called_off() {
+        let mut app = app("ui-job-to-its-end");
+        let (go, wait) = mpsc::channel::<()>();
+        let (looked, look) = mpsc::channel::<()>();
+        app.start_job_to_its_end(
+            "Write",
+            move |job| {
+                // (Its last look at Cancel, then the rest of its work.)
+                let stopped = job.progress.cancelled();
+                looked.send(()).ok();
+                wait.recv().ok();
+                stopped
+            },
+            |app, stopped| app.log.info(format!("handed over, stopped: {stopped}")),
+        );
+        let progress = app.job.as_ref().unwrap().progress.clone();
+        // (Called off once the work has looked: a pause of 50 ms had the
+        // thread, on a busy machine, not started by then.)
+        look.recv_timeout(Duration::from_secs(20)).expect("the work never looked at Cancel");
+        progress.cancel.store(true, Ordering::Relaxed);
+        go.send(()).unwrap();
+        until_done(&mut app);
+        assert!(logged(&app, Level::Info, "handed over, stopped: false"), "{:?}", app.log.entries);
+        assert!(!logged(&app, Level::Info, "Write: canceled"));
     }
 
     #[test]

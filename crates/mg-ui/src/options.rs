@@ -1,20 +1,23 @@
-//! Tools > Options (Aurora's `TdlgOptions`), as pages: Folders (where the
-//! game and the NWN user folder are), General (Build module on save,
-//! Minimize Toolset on test module) and Script Editor (compile on save,
-//! debug information, the code templates folder, font size and colours),
-//! and Moonglow's own (Updates: the daily check for a new release).
+//! Tools › Options (Aurora's `TdlgOptions`), a tab of pages (M4's U23):
+//! Folders (where the game and the NWN user folder are), Area, General,
+//! Script Editor, Conversation Editor, Sounds, Verify, Language and
+//! Keyboard, and Moonglow's own Updates (the daily check for a new
+//! release).
 
-use std::path::PathBuf;
+use mg_uikit::Controls as _;
+use std::path::{Path, PathBuf};
 
 use egui::Ui;
 use mg_resman::GameInstall;
 
 use crate::script_view::Palette;
-use crate::settings::{ModuleFolders, SCRIPT_ELEMENTS, ScriptStyle};
+use crate::settings::{
+    ExistingArchive, FilesThere, MissingFeats, ModuleFolders, SCRIPT_ELEMENTS, ScriptStyle,
+};
 use crate::{Action, Moonglow, Settings};
 
-/// The Options window's pages.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Options' pages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum OptionsPage {
     #[default]
     Folders,
@@ -30,12 +33,19 @@ pub enum OptionsPage {
 }
 
 /// Options › General › Show duplicate tags warning, on hover.
-const DUPLICATE_TAGS_TIP: &str = "Warn when a paste or an area's Copy… puts a tag you set on a \
-     second object (a script finds only one object by a tag). Off as in Aurora, which has no such \
-     warning. A project whose moonglow.toml sets [tags] paste_warning follows that whatever this \
-     says, and tags the project wants unique are warned of either way";
+const DUPLICATE_TAGS_TIP: &str = "Warn when a paste or copy gives a second object a tag you set";
 
-/// The Options window's pages and their names.
+/// Options › General › Closing a window cancels its changes, on hover.
+const CLOSE_CANCELS_TIP: &str = "Closing an editor with OK and Cancel takes back its changes, as \
+                                 Cancel does";
+
+/// The user folders `nwn.ini` may put elsewhere that Moonglow reads or
+/// writes (`GameInstall::user_folder`), said under the user folder where
+/// it does.
+const ALIASED: [&str; 7] =
+    ["hak", "tlk", "override", "development", "modules", "portraits", "patch"];
+
+/// Options' pages and their names.
 pub(crate) const PAGES: [(OptionsPage, &str); 10] = [
     (OptionsPage::Folders, "Folders"),
     (OptionsPage::Area, "Area"),
@@ -54,12 +64,18 @@ pub(crate) const PAGES: [(OptionsPage, &str); 10] = [
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OptionsDraft {
     pub page: OptionsPage,
+    /// The settings the draft was made from ([`OptionsDraft::apply`]).
+    pub opened: Option<Box<Settings>>,
     pub game_root: String,
     pub user_dir: String,
     pub script_style: ScriptStyle,
     pub build_on_save: bool,
     pub mod_beside_folder: bool,
     pub module_folders: ModuleFolders,
+    pub export_existing: ExistingArchive,
+    pub files_there: FilesThere,
+    pub missing_feats: MissingFeats,
+    pub ask_before_delete: bool,
     pub area_names: bool,
     pub categories_by_name: bool,
     pub drag_windows_anywhere: bool,
@@ -69,6 +85,9 @@ pub struct OptionsDraft {
     pub ask_before_closing: bool,
     pub debug_log: bool,
     pub name_resrefs: bool,
+    pub tree_tags: bool,
+    pub tree_extensions: bool,
+    pub appearance_portrait: bool,
     pub palette_cr: bool,
     pub armor_on_woman: bool,
     pub light_theme: bool,
@@ -77,11 +96,17 @@ pub struct OptionsDraft {
     /// as the page shows them, and whether OK forgets them.
     pub graphics_failures: Vec<crate::settings::GraphicsFailure>,
     pub forget_graphics_failures: bool,
-    pub toolbar_icons_only: bool,
+    /// The lit check's notices hidden ([`Settings::graphics_notices_hidden`]),
+    /// and whether OK shows them again.
+    pub graphics_notices_hidden: Vec<crate::settings::GraphicsFailure>,
+    pub show_graphics_notices: bool,
+    /// The area header's controls left out ([`Settings::hidden_area_tools`]).
+    pub hidden_area_tools: Vec<String>,
     /// Per cent.
     pub ui_scale: u16,
+    pub smooth_scrolling: bool,
+    pub colored_icons: bool,
     pub minimize_on_test: bool,
-    pub test_with_steam: bool,
     pub auto_reload: bool,
     pub backups: bool,
     pub autosave: bool,
@@ -94,13 +119,19 @@ pub struct OptionsDraft {
     pub standard_warning: bool,
     pub auto_compile: bool,
     pub live_check: bool,
+    pub symbol_tips: bool,
     pub debug_info: bool,
     pub scripts_external: bool,
     pub scripts_external_only: bool,
     pub scripts_together: bool,
     pub properties_together: bool,
+    /// Open editors: as tabs, or as windows of their own.
+    pub open_editors: crate::settings::OpenEditors,
+    pub close_cancels: bool,
     pub tree_opens_area: bool,
     pub tree_follows_tabs: bool,
+    pub tree_hides_empty: bool,
+    pub palette_hides_empty: bool,
     pub dialogs_together: bool,
     pub dialog_font_size: Option<u8>,
     pub script_templates: String,
@@ -111,9 +142,13 @@ pub struct OptionsDraft {
     pub external_compiler: String,
     pub workshop: bool,
     pub userpatch: bool,
+    /// Follow nwn.ini's folder aliases.
+    pub aliases: bool,
     pub external_compiler_args: String,
     pub dialog_names: bool,
     pub edit_language: Option<u32>,
+    pub talk_typed: bool,
+    pub talk_reuse: crate::settings::TalkReuse,
     pub area_background: Option<[u8; 3]>,
     pub spawn_markers: bool,
     /// Height and Width, tenths of a metre.
@@ -130,7 +165,9 @@ pub struct OptionsDraft {
     pub shadow_quality: crate::settings::ShadowQuality,
     pub texture_limit: Option<u16>,
     pub area_resolution: Option<u8>,
+    pub anti_aliasing: Option<u8>,
     pub animate_unfocused: bool,
+    pub middle_drag_moves: bool,
     pub edit_group_tiles: bool,
     pub turn_ring: bool,
     pub dialog_npc_color: Option<[u8; 3]>,
@@ -147,6 +184,8 @@ pub struct OptionsDraft {
     /// Updates: Check for updates automatically, and the version not to be
     /// reminded about.
     pub update_check: bool,
+    pub update_auto_install: bool,
+    pub update_prereleases: bool,
     pub update_skipped: Option<String>,
     pub keymap: crate::keys::Keymap,
     /// The enabled plugins' commands, listed after the window's: the id
@@ -165,13 +204,19 @@ pub struct OptionsDraft {
 }
 
 /// Whether a word Verify leaves out is one of Options › Verify's
-/// checkboxes (a group, a check, a category of missing references), not
-/// typed in its field.
+/// checkboxes (a group, a check, a category of missing references, a
+/// plugin's check), not typed in its field. What only a player's own
+/// content has (`references:override`, `userpatch`, `workshop` and
+/// `local`, all three) is where a resource is found, as the field's
+/// `override` and haks are: kept in the field, where it is shown and can
+/// be taken out (it had no box, and vanished from the page while it still
+/// applied).
 fn verify_box(word: &str) -> bool {
     use mg_module::doctor::{Check, Group};
+    use mg_module::verify::Category;
     Group::from_id(word).is_some()
         || Check::from_id(word).is_some()
-        || word.starts_with("references:")
+        || word.strip_prefix("references:").is_some_and(|c| Category::from_id(c).is_some())
         || word.contains('/')
 }
 
@@ -189,13 +234,14 @@ fn text(p: &Option<PathBuf>) -> String {
 
 fn path(s: &str) -> Option<PathBuf> {
     let s = s.trim();
-    (!s.is_empty()).then(|| PathBuf::from(s))
+    (!s.is_empty()).then(|| crate::settings::expand_home(Path::new(s)))
 }
 
 impl OptionsDraft {
     pub fn from_settings(s: &Settings) -> OptionsDraft {
         OptionsDraft {
             page: OptionsPage::default(),
+            opened: Some(Box::new(s.clone())),
             keymap: crate::keys::Keymap::new(&s.key_bindings),
             plugin_commands: Vec::new(),
             project_commands: Vec::new(),
@@ -208,6 +254,10 @@ impl OptionsDraft {
             build_on_save: s.build_on_save,
             mod_beside_folder: !s.no_mod_beside_folder,
             module_folders: s.module_folders,
+            export_existing: s.export_existing,
+            files_there: s.files_there,
+            missing_feats: s.missing_feats,
+            ask_before_delete: !s.delete_without_asking,
             area_names: s.area_names,
             categories_by_name: s.categories_by_name,
             drag_windows_anywhere: s.drag_windows_anywhere,
@@ -217,16 +267,22 @@ impl OptionsDraft {
             ask_before_closing: !s.close_without_asking,
             debug_log: !s.no_debug_log,
             name_resrefs: s.name_resrefs,
+            tree_tags: s.tree_tags,
+            tree_extensions: s.tree_extensions,
+            appearance_portrait: s.appearance_portrait,
             palette_cr: !s.palette_no_cr,
             armor_on_woman: s.armor_on_woman,
             light_theme: s.light_theme,
             graphics_backend: s.graphics_backend,
             graphics_failures: s.graphics_failures.clone(),
             forget_graphics_failures: false,
-            toolbar_icons_only: s.toolbar_icons_only,
+            graphics_notices_hidden: s.graphics_notices_hidden.clone(),
+            show_graphics_notices: false,
+            hidden_area_tools: s.hidden_area_tools.clone(),
             ui_scale: s.ui_scale.unwrap_or(100),
+            smooth_scrolling: !s.no_smooth_scrolling,
+            colored_icons: s.colored_icons,
             minimize_on_test: s.minimize_on_test,
-            test_with_steam: !s.test_without_steam,
             auto_reload: !s.no_auto_reload,
             backups: !s.no_backups,
             autosave: !s.no_autosave,
@@ -239,13 +295,18 @@ impl OptionsDraft {
             standard_warning: !s.no_standard_warning,
             auto_compile: s.auto_compile,
             live_check: !s.no_live_check,
+            symbol_tips: !s.no_symbol_tips,
             debug_info: s.debug_info,
             scripts_external: s.scripts_external,
             scripts_external_only: s.scripts_external_only,
             scripts_together: !s.scripts_own_windows,
             properties_together: !s.properties_own_windows,
+            open_editors: s.open_editors,
+            close_cancels: s.close_cancels,
             tree_opens_area: !s.tree_keeps_areas_closed,
             tree_follows_tabs: !s.tree_stays,
+            tree_hides_empty: s.tree_hides_empty,
+            palette_hides_empty: s.palette_hides_empty,
             dialogs_together: !s.dialogs_own_windows,
             dialog_font_size: s.dialog_font_size,
             script_templates: text(&s.script_templates),
@@ -256,9 +317,12 @@ impl OptionsDraft {
             external_compiler: text(&s.external_compiler),
             workshop: s.read_workshop,
             userpatch: s.read_userpatch,
+            aliases: !s.no_nwn_aliases,
             external_compiler_args: s.external_compiler_args.clone(),
             dialog_names: !s.dialog_hide_names,
             edit_language: s.edit_language,
+            talk_typed: s.talk_typed,
+            talk_reuse: s.talk_reuse,
             area_background: s.area_background,
             spawn_markers: !s.no_spawn_markers,
             spawn_marker_size: s.spawn_marker_size.unwrap_or(crate::area_view::SPAWN_MARKER),
@@ -274,7 +338,9 @@ impl OptionsDraft {
             shadow_quality: s.shadow_quality,
             texture_limit: s.texture_limit,
             area_resolution: s.area_resolution,
+            anti_aliasing: s.anti_aliasing,
             animate_unfocused: s.animate_unfocused,
+            middle_drag_moves: s.middle_drag_moves,
             edit_group_tiles: s.edit_group_tiles,
             turn_ring: !s.no_turn_ring,
             dialog_npc_color: s.dialog_npc_color,
@@ -289,12 +355,140 @@ impl OptionsDraft {
             ambient_music: s.ambient_music,
             music_volume: s.music_volume.unwrap_or(crate::area_audio::MUSIC_VOLUME),
             update_check: !s.no_update_check,
+            update_auto_install: s.update_auto_install,
+            update_prereleases: s.update_prereleases,
             update_skipped: s.update_skipped.clone(),
         }
     }
 
-    /// The settings with these options.
+    /// The settings with these options: what the draft changed since it
+    /// was opened, written over the settings as they are now. An option
+    /// left as it was found keeps what it is now: set meanwhile from
+    /// somewhere else (a question's "Always do this", the area view's
+    /// Shadows menu, an update skipped), it was put back by OK, the tab
+    /// being one that stays open, and opens again with the module.
     pub fn apply(&self, s: &Settings) -> Settings {
+        let mut mine = self.written_over(s);
+        let Some(opened) = &self.opened else { return mine };
+        let unchanged = self.written_over(opened);
+        macro_rules! keep {
+            ($($field:ident),* $(,)?) => {
+                $(if unchanged.$field == opened.$field {
+                    mine.$field = s.$field.clone();
+                })*
+            };
+        }
+        keep!(
+            game_root,
+            user_dir,
+            script_style,
+            build_on_save,
+            no_mod_beside_folder,
+            module_folders,
+            export_existing,
+            files_there,
+            missing_feats,
+            delete_without_asking,
+            area_names,
+            categories_by_name,
+            drag_windows_anywhere,
+            no_last_area,
+            no_reopen_tabs,
+            tabs_by_recent,
+            close_without_asking,
+            no_debug_log,
+            name_resrefs,
+            tree_tags,
+            tree_extensions,
+            appearance_portrait,
+            palette_no_cr,
+            armor_on_woman,
+            light_theme,
+            graphics_backend,
+            graphics_failures,
+            graphics_notices_hidden,
+            hidden_area_tools,
+            ui_scale,
+            no_smooth_scrolling,
+            colored_icons,
+            minimize_on_test,
+            no_auto_reload,
+            no_backups,
+            no_autosave,
+            autosave_minutes,
+            no_hak_warning,
+            no_namespace_warning,
+            no_spell_warning,
+            no_inventory_warning,
+            warn_duplicate_tags,
+            no_standard_warning,
+            auto_compile,
+            no_live_check,
+            no_symbol_tips,
+            debug_info,
+            scripts_external,
+            scripts_external_only,
+            scripts_own_windows,
+            properties_own_windows,
+            open_editors,
+            close_cancels,
+            tree_keeps_areas_closed,
+            tree_stays,
+            tree_hides_empty,
+            palette_hides_empty,
+            dialogs_own_windows,
+            dialog_font_size,
+            script_templates,
+            scratch_dir,
+            nwsync_upload,
+            nwsync_upload_input,
+            external_editor,
+            external_compiler,
+            read_workshop,
+            read_userpatch,
+            no_nwn_aliases,
+            external_compiler_args,
+            dialog_hide_names,
+            edit_language,
+            talk_typed,
+            talk_reuse,
+            area_background,
+            no_spawn_markers,
+            spawn_marker_size,
+            no_door_arrows,
+            generated_lights,
+            verify_skip,
+            merchant_signs,
+            shadow_quality,
+            texture_limit,
+            area_resolution,
+            anti_aliasing,
+            animate_unfocused,
+            middle_drag_moves,
+            edit_group_tiles,
+            no_turn_ring,
+            dialog_npc_color,
+            dialog_pc_color,
+            dialog_no_text_popup,
+            dialog_paste_source_to_dest,
+            dialog_drag_dest_to_source,
+            dialog_no_backup,
+            dialog_backup_minutes,
+            no_placed_sounds,
+            ambient_sound,
+            ambient_music,
+            music_volume,
+            key_bindings,
+            no_update_check,
+            update_auto_install,
+            update_prereleases,
+            update_skipped,
+        );
+        mine
+    }
+
+    /// Every option of the draft written over `s`.
+    fn written_over(&self, s: &Settings) -> Settings {
         Settings {
             game_root: path(&self.game_root),
             user_dir: path(&self.user_dir),
@@ -302,6 +496,10 @@ impl OptionsDraft {
             build_on_save: self.build_on_save,
             no_mod_beside_folder: !self.mod_beside_folder,
             module_folders: self.module_folders,
+            export_existing: self.export_existing,
+            files_there: self.files_there,
+            missing_feats: self.missing_feats,
+            delete_without_asking: !self.ask_before_delete,
             area_names: self.area_names,
             categories_by_name: self.categories_by_name,
             drag_windows_anywhere: self.drag_windows_anywhere,
@@ -311,6 +509,9 @@ impl OptionsDraft {
             close_without_asking: !self.ask_before_closing,
             no_debug_log: !self.debug_log,
             name_resrefs: self.name_resrefs,
+            tree_tags: self.tree_tags,
+            tree_extensions: self.tree_extensions,
+            appearance_portrait: self.appearance_portrait,
             palette_no_cr: !self.palette_cr,
             armor_on_woman: self.armor_on_woman,
             light_theme: self.light_theme,
@@ -321,10 +522,17 @@ impl OptionsDraft {
             } else {
                 s.graphics_failures.clone()
             },
-            toolbar_icons_only: self.toolbar_icons_only,
-            ui_scale: (self.ui_scale != 100).then_some(self.ui_scale.clamp(UI_SCALES[0], 300)),
+            graphics_notices_hidden: if self.show_graphics_notices {
+                Vec::new()
+            } else {
+                s.graphics_notices_hidden.clone()
+            },
+            hidden_area_tools: self.hidden_area_tools.clone(),
+            ui_scale: (self.ui_scale != 100)
+                .then_some(self.ui_scale.clamp(UI_SCALES[0], UI_SCALES[UI_SCALES.len() - 1])),
+            no_smooth_scrolling: !self.smooth_scrolling,
+            colored_icons: self.colored_icons,
             minimize_on_test: self.minimize_on_test,
-            test_without_steam: !self.test_with_steam,
             no_auto_reload: !self.auto_reload,
             no_backups: !self.backups,
             no_autosave: !self.autosave,
@@ -338,13 +546,18 @@ impl OptionsDraft {
             no_standard_warning: !self.standard_warning,
             auto_compile: self.auto_compile,
             no_live_check: !self.live_check,
+            no_symbol_tips: !self.symbol_tips,
             debug_info: self.debug_info,
             scripts_external: self.scripts_external,
             scripts_external_only: self.scripts_external_only,
             scripts_own_windows: !self.scripts_together,
             properties_own_windows: !self.properties_together,
+            open_editors: self.open_editors,
+            close_cancels: self.close_cancels,
             tree_keeps_areas_closed: !self.tree_opens_area,
             tree_stays: !self.tree_follows_tabs,
+            tree_hides_empty: self.tree_hides_empty,
+            palette_hides_empty: self.palette_hides_empty,
             dialogs_own_windows: !self.dialogs_together,
             dialog_font_size: self.dialog_font_size,
             script_templates: path(&self.script_templates),
@@ -355,9 +568,12 @@ impl OptionsDraft {
             external_compiler: path(&self.external_compiler),
             read_workshop: self.workshop,
             read_userpatch: self.userpatch,
+            no_nwn_aliases: !self.aliases,
             external_compiler_args: self.external_compiler_args.trim().to_string(),
             dialog_hide_names: !self.dialog_names,
             edit_language: self.edit_language,
+            talk_typed: self.talk_typed,
+            talk_reuse: self.talk_reuse,
             area_background: self.area_background,
             no_spawn_markers: !self.spawn_markers,
             spawn_marker_size: (self.spawn_marker_size != crate::area_view::SPAWN_MARKER)
@@ -375,7 +591,9 @@ impl OptionsDraft {
             shadow_quality: self.shadow_quality,
             texture_limit: self.texture_limit,
             area_resolution: self.area_resolution,
+            anti_aliasing: self.anti_aliasing,
             animate_unfocused: self.animate_unfocused,
+            middle_drag_moves: self.middle_drag_moves,
             edit_group_tiles: self.edit_group_tiles,
             no_turn_ring: !self.turn_ring,
             dialog_npc_color: self.dialog_npc_color,
@@ -394,6 +612,8 @@ impl OptionsDraft {
                 .then_some(self.music_volume.min(127)),
             key_bindings: self.keymap.chosen(),
             no_update_check: !self.update_check,
+            update_auto_install: self.update_auto_install,
+            update_prereleases: self.update_prereleases,
             update_skipped: self.update_skipped.clone(),
             ..s.clone()
         }
@@ -405,14 +625,98 @@ impl OptionsDraft {
             || path(&self.user_dir) != s.user_dir
             || self.workshop != s.read_workshop
             || self.userpatch != s.read_userpatch
+            || self.aliases == s.no_nwn_aliases
     }
 }
 
-/// Options › General › Interface size: the sizes offered, per cent.
-pub(crate) const UI_SCALES: [u16; 7] = [90, 100, 110, 125, 150, 175, 200];
+/// Options › General › Interface size (and View › Interface Size): the
+/// sizes offered, per cent. 250% and 300% for a 4K screen at its usual
+/// scale (5.2.0, a builder's ask): the least window, 420 by 320 points, is
+/// 1260 by 960 pixels there.
+pub const UI_SCALES: [u16; 9] = [90, 100, 110, 125, 150, 175, 200, 250, 300];
 
-/// The Options window's size when first opened.
-pub(crate) const WINDOW_SIZE: [f32; 2] = [780.0, 540.0];
+/// The Options window's size when first opened: wide enough for the
+/// General page's three columns ([`general_columns`]) beside the page
+/// list, where the main window has the room (`Moonglow::open_window`
+/// keeps it within the window).
+pub(crate) const WINDOW_SIZE: [f32; 2] = [1360.0, 780.0];
+
+/// The header's accessible name (the Options board's).
+pub(crate) const HEADER: &str = "Options header";
+
+/// OK's and Cancel's tips (the Options board's).
+pub(crate) const OK_CANCEL_TIPS: [&str; 2] =
+    ["Apply the changes and close Options (Enter)", "Discard changes"];
+
+/// The page list's width (the Options board's `.pages`: 160).
+const PAGE_LIST: f32 = 160.0;
+
+/// The page's margins at its left and right (`.page > .content`:
+/// `padding: 0 16px`).
+const OPTIONS_MARGIN_X: f32 = 16.0;
+
+/// The room under the page's bar (`.pg-h`: `margin-bottom: 12px`).
+const OPTIONS_BAR_GAP: f32 = 12.0;
+
+/// Each page's icon in the page list and on its bar (the Options board's).
+pub(crate) fn page_icon(page: OptionsPage) -> mg_uikit::Icon {
+    use mg_uikit::Icon;
+    match page {
+        OptionsPage::Folders => Icon::Folder,
+        OptionsPage::Area => Icon::Area,
+        OptionsPage::General => Icon::Settings,
+        OptionsPage::ScriptEditor => Icon::Script,
+        OptionsPage::ConversationEditor => Icon::Conversation,
+        OptionsPage::Sounds => Icon::Sound,
+        OptionsPage::Verify => Icon::Verify,
+        OptionsPage::Language => Icon::TalkTable,
+        OptionsPage::Keyboard => Icon::Command,
+        OptionsPage::Updates => Icon::ArrowDown,
+    }
+}
+
+/// What Options › Folders says of a user folder: whether it is there, and
+/// the folders its `nwn.ini` puts elsewhere ([`ALIASED`]), as the game
+/// finds them.
+#[derive(Debug, Clone, PartialEq)]
+struct UserFolder {
+    exists: bool,
+    aliased: Vec<(&'static str, std::path::PathBuf)>,
+}
+
+impl UserFolder {
+    /// Looks at the folder: reads its `nwn.ini` for each of [`ALIASED`].
+    fn look(user: &std::path::Path) -> UserFolder {
+        let gi = mg_resman::GameInstall::new("", Some(user.to_path_buf()), "en");
+        let aliased = (ALIASED.into_iter())
+            .filter_map(|sub| Some((sub, gi.user_folder(sub).filter(|f| *f != user.join(sub))?)))
+            .collect();
+        UserFolder { exists: user.is_dir(), aliased }
+    }
+}
+
+/// How long what was seen of a user folder is shown before it is looked
+/// at again (an `nwn.ini` edited meanwhile shows then).
+const USER_FOLDER_KEPT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a user folder is like ([`UserFolder::look`]), looked at when the
+/// folder typed changes and again every [`USER_FOLDER_KEPT`], not every
+/// frame: seven reads of `nwn.ini` and a look at the folder, which is
+/// often in a synced Documents or on a network share.
+fn user_folder_seen(ui: &Ui, user: &std::path::Path, now: std::time::Instant) -> UserFolder {
+    type Kept = (std::path::PathBuf, std::time::Instant, UserFolder);
+    let id = egui::Id::new("options-user-folder-seen");
+    let kept = ui.data(|d| d.get_temp::<Kept>(id));
+    if let Some((of, at, seen)) = kept
+        && of == user
+        && now.saturating_duration_since(at) < USER_FOLDER_KEPT
+    {
+        return seen;
+    }
+    let seen = UserFolder::look(user);
+    ui.data_mut(|d| d.insert_temp::<Kept>(id, (user.to_path_buf(), now, seen.clone())));
+    seen
+}
 
 enum Browse {
     Game,
@@ -427,15 +731,16 @@ enum Browse {
 /// choose it (`which`, noted in `browse` for after the page is drawn).
 fn path_row(ui: &mut Ui, text: &mut String, browse: &mut Option<Browse>, which: Browse) {
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(text).desired_width(300.0));
+        ui.add(mg_uikit::text_field(text).desired_width(300.0));
         if ui.button("Browse…").clicked() {
             *browse = Some(which);
         }
     });
 }
 
-/// The Options tab: the buttons along the bottom, the pages listed beside,
-/// and the page scrolling in what is left. What is set is a draft until OK.
+/// The Options tab: its header with OK and Cancel at its right end, the
+/// pages listed at the left, and the page scrolling in what is left. What
+/// is set is a draft until OK.
 pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     let Some(draft) = &mut app.options else {
         // (A tab left from before, with nothing to show.)
@@ -443,775 +748,553 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         return;
     };
     let detected = draft.detected.clone();
+    // (The open module's project may turn text typed into the talk table
+    // on or off for everyone: its file's name and its word.)
+    let project_typed = app.ws.as_ref().and_then(|ws| {
+        let pf = &ws.module.project_file;
+        let file = pf.path.as_ref()?.file_name()?.to_string_lossy().into_owned();
+        pf.talk.typed.map(|t| (file, t))
+    });
     let this_run = app.settings.user_dir_this_run.clone();
     let drawing_with = app.drawing_with.clone();
-    let (installer, checked) = (app.updates.installer, app.settings.update_checked);
+    let passes_over = app.renderer_check.passes_over.clone();
+    // (What Anti-aliasing offers: the counts this GPU takes.)
+    let sample_counts = app.viewport.as_ref().map_or(vec![1, 4], |vp| vp.sample_counts().to_vec());
+    let updates_here = app.updates.here(app.settings.update_checked);
     let mut browse = None;
     let mut close = false;
     // Enter is OK while the pointer is over the tab (it is one window among
     // others now).
     let over = ui.rect_contains_pointer(ui.max_rect());
-    {
-        {
-            egui::Panel::bottom("options-buttons").frame(egui::Frame::NONE.inner_margin(6.0)).show(
-                ui,
-                |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("OK").clicked() || (over && crate::widgets::enter(ui)) {
-                            close = true;
-                            // (Updates switched on: the check looks at once.)
-                            app.updates.look_again();
-                            if draft.moves_game(&app.settings)
-                                || draft.edit_language != app.settings.edit_language
-                            {
-                                // (Another language: text is read again in
-                                // it, and the game's data where the install
-                                // has that language's.)
-                                app.actions.push(Action::ApplyOptions(Box::new(draft.clone())));
-                            } else {
-                                // Only looks: no reload.
-                                app.settings = draft.apply(&app.settings);
-                            }
-                        }
-                        // (Escape closes it too, as the window in front:
-                        // `tabs.rs`.)
-                        if ui.button("Cancel").on_hover_text("Discard changes").clicked() {
-                            close = true;
-                        }
-                    });
-                },
-            );
-            egui::Panel::left("options-pages")
-                .resizable(false)
-                .exact_size(160.0)
-                .frame(egui::Frame::NONE.inner_margin(6.0))
-                .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        for (page, name) in PAGES {
-                            ui.selectable_value(&mut draft.page, page, name);
-                        }
-                    });
+    // The header (the Options board's): its title, OK and Cancel at its
+    // right end.
+    let title = crate::blueprint::Title {
+        header: HEADER.into(),
+        icon: mg_uikit::Icon::Settings,
+        name: "Options",
+        sub: "",
+    };
+    let pressed = crate::blueprint::ok_cancel_header(ui, &title, false, OK_CANCEL_TIPS);
+    // (Enter where its hint says so: not while Options › Keyboard waits for
+    // a key, which takes Enter as one, M4's U23 fix.)
+    let enter = over && crate::shell::enter_is_ok(draft.recording.is_some(), ui.ctx());
+    let ok = pressed == Some(crate::blueprint::Pressed::Ok) || (enter && crate::widgets::enter(ui));
+    if ok {
+        close = true;
+        // (Updates switched on: the check looks at once.)
+        app.updates.look_again();
+        if draft.moves_game(&app.settings) || draft.edit_language != app.settings.edit_language {
+            // (Another language: text is read again in it, and the game's
+            // data where the install has that language's.)
+            app.actions.push(Action::ApplyOptions(Box::new(draft.clone())));
+        } else {
+            // Only looks: no reload.
+            app.settings = draft.apply(&app.settings);
+            app.options_applied += 1;
+        }
+    }
+    // (Escape closes it too, as its Cancel: `tabs.rs`.)
+    if pressed == Some(crate::blueprint::Pressed::Cancel) {
+        close = true;
+    }
+    // The pages listed at the left, with their icons; the page chosen
+    // beside them under its bar, scrolling.
+    let room = ui.available_rect_before_wrap();
+    let list_rect = egui::Rect::from_min_size(room.min, egui::vec2(PAGE_LIST, room.height()));
+    let mut list_ui =
+        ui.new_child(egui::UiBuilder::new().id_salt("options-pages").max_rect(list_rect));
+    let mut index = PAGES.iter().position(|p| p.0 == draft.page).unwrap_or(0);
+    let mut list = mg_uikit::pages::PageList::new("options-page-list").width(PAGE_LIST);
+    for (page, name) in PAGES {
+        list = list.page(page_icon(page), name);
+    }
+    if list.show(&mut list_ui, &mut index).changed {
+        draft.page = PAGES[index].0;
+    }
+    let body_rect = egui::Rect::from_min_max(egui::pos2(list_rect.right(), room.top()), room.max);
+    let mut body = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("options-page")
+            .max_rect(body_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    body.set_clip_rect(body_rect.intersect(ui.clip_rect()));
+    ui.advance_cursor_after_rect(room);
+    let ui = &mut body;
+    // (The page's width inside its margins: a scroll that goes sideways
+    // has none of its own.)
+    let margin = mg_uikit::pages::PAGE_MARGIN;
+    let (icon, name) = (page_icon(draft.page), PAGES[index].1);
+    // (Each page its own scroll: one chosen opens where it
+    // was left, at its top the first time, not at another
+    // page's place.)
+    let scroll = egui::ScrollArea::both().id_salt(("options-page", draft.page));
+    scroll.auto_shrink(false).show(ui, |ui| {
+        // (The page's width inside its margins, its scroll bar
+        // aside: nothing wider, so nothing scrolls sideways
+        // where the window has the room.)
+        let page_w = ui.available_width();
+        let width = (page_w - OPTIONS_MARGIN_X * 2.0).max(1.0);
+        ui.scope(|ui| {
+            ui.set_max_width(page_w);
+            mg_uikit::pages::PageBar::new(icon, name).first(true).show(ui);
+        });
+        let inner = egui::Margin {
+            left: OPTIONS_MARGIN_X as i8,
+            right: OPTIONS_MARGIN_X as i8,
+            top: OPTIONS_BAR_GAP as i8,
+            bottom: margin.bottom,
+        };
+        egui::Frame::NONE.inner_margin(inner).show(ui, |ui| match draft.page {
+            OptionsPage::Keyboard => keyboard(ui, draft),
+            OptionsPage::Folders => {
+                crate::widgets::section_heading(ui, "Game Installation");
+                crate::widgets::field_label(ui, "Neverwinter Nights installation");
+                path_row(ui, &mut draft.game_root, &mut browse, Browse::Game);
+                // (Why not, looked at once per folder: it
+                // reads the folder.)
+                let why_not = path(&draft.game_root).map(|p| {
+                    let id = egui::Id::new(("game-folder-why-not", &p));
+                    ui.data(|d| d.get_temp::<Option<String>>(id)).unwrap_or_else(|| {
+                        let why = GameInstall::why_not(&p);
+                        ui.data_mut(|d| d.insert_temp(id, why.clone()));
+                        why
+                    })
                 });
-            egui::CentralPanel::default().frame(egui::Frame::NONE.inner_margin(6.0)).show(
-                ui,
-                |ui| {
-                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| match draft.page {
-                        OptionsPage::Keyboard => keyboard(ui, draft),
-                        OptionsPage::Folders => {
-                            crate::widgets::field_label(ui, "Neverwinter Nights installation");
-                            path_row(ui, &mut draft.game_root, &mut browse, Browse::Game);
-                            // (Why not, looked at once per folder: it
-                            // reads the folder.)
-                            let why_not = path(&draft.game_root).map(|p| {
-                                let id = egui::Id::new(("game-folder-why-not", &p));
-                                ui.data(|d| d.get_temp::<Option<String>>(id)).unwrap_or_else(|| {
-                                    let why = GameInstall::why_not(&p);
-                                    ui.data_mut(|d| d.insert_temp(id, why.clone()));
-                                    why
-                                })
-                            });
-                            match why_not {
-                                Some(None) => ui.weak("A game installation."),
-                                Some(Some(why)) => ui.colored_label(
-                                    ui.visuals().error_fg_color,
-                                    format!("Not a game installation: {why}."),
-                                ),
-                                None => match &detected {
-                                    Some(d) => {
-                                        ui.weak(format!("Empty: found at {}", d.root.display()))
-                                    }
-                                    None => ui.colored_label(
-                                        ui.visuals().warn_fg_color,
-                                        "Empty, and none found.",
-                                    ),
-                                },
-                            };
-                            ui.add_space(8.0);
-                            crate::widgets::field_label(
-                                ui,
-                                "NWN user folder (haks, override, modules)",
-                            );
-                            path_row(ui, &mut draft.user_dir, &mut browse, Browse::User);
-                            if let Some(run) = &this_run {
-                                ui.colored_label(
-                                    ui.visuals().warn_fg_color,
-                                    format!(
-                                        "This run uses {} (--user-dir), not this folder.",
-                                        run.display()
-                                    ),
-                                );
-                            } else if path(&draft.user_dir).is_none() {
-                                match detected.as_ref().and_then(|d| d.user_dir.as_ref()) {
-                                    Some(u) => ui.weak(format!("Empty: {}", u.display())),
-                                    None => ui.weak("Empty: none"),
-                                };
-                            }
-                            ui.add_space(6.0);
-                            crate::widgets::field_label(ui, "Scratch folder (To Scratch)");
-                            path_row(ui, &mut draft.scratch_dir, &mut browse, Browse::Scratch);
-                            ui.weak(
-                                "Where To Scratch copies a script (with its compiled script) or \
+                match why_not {
+                    Some(None) => ui.weak("A game installation."),
+                    Some(Some(why)) => ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Not a game installation: {why}."),
+                    ),
+                    None => match &detected {
+                        Some(d) => ui.weak(format!("Empty: found at {}", d.root.display())),
+                        None => {
+                            ui.colored_label(ui.visuals().warn_fg_color, "Empty, and none found.")
+                        }
+                    },
+                };
+                ui.add_space(8.0);
+                crate::widgets::field_label(ui, "NWN user folder (haks, override, modules)");
+                path_row(ui, &mut draft.user_dir, &mut browse, Browse::User);
+                if let Some(run) = &this_run {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("This run uses {} (--user-dir), not this folder.", run.display()),
+                    );
+                } else if path(&draft.user_dir).is_none() {
+                    match detected.as_ref().and_then(|d| d.user_dir.as_ref()) {
+                        Some(u) => ui.weak(format!("Empty: {}", u.display())),
+                        None => ui.weak("Empty: none"),
+                    };
+                }
+                // The folders its nwn.ini puts elsewhere, as
+                // the game finds them.
+                let user = this_run
+                    .clone()
+                    .or_else(|| path(&draft.user_dir))
+                    .or_else(|| detected.as_ref().and_then(|d| d.user_dir.clone()));
+                // (Looked at once a while for each folder: the
+                // page read nwn.ini seven times a frame.)
+                let seen =
+                    user.as_ref().map(|user| user_folder_seen(ui, user, std::time::Instant::now()));
+                if let (Some(user), Some(seen)) = (&user, &seen)
+                    && !seen.exists
+                {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "{} doesn't exist: no hak, talk table or override is \
+                                         found there.",
+                            user.display()
+                        ),
+                    );
+                }
+                ui.check_box(&mut draft.aliases, "Follow nwn.ini's folder aliases").on_hover_text(
+                    "Find haks, talk tables and override where nwn.ini's [Alias] \
+                                     says, as the game does",
+                );
+                if let Some(seen) = seen.filter(|_| draft.aliases) {
+                    for (sub, f) in &seen.aliased {
+                        ui.weak(format!(
+                            "{sub}: {} (nwn.ini's alias, as the game reads it)",
+                            f.display()
+                        ));
+                    }
+                }
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Game Content");
+                ui.check_box(&mut draft.workshop, "Read Steam Workshop content").on_hover_text(
+                    "Read the Steam Workshop items you subscribe to, and test through Steam",
+                );
+                ui.check_box(&mut draft.userpatch, "Read userpatch.ini's haks").on_hover_text(
+                    "Read the haks userpatch.ini names, such as the HD Pack, as \
+                                     the game does",
+                );
+                ui.check_box(
+                    &mut draft.auto_reload,
+                    "Reload haks, override and development when they change",
+                )
+                .on_hover_text("Show changed haks, 2DAs, models and textures without a restart");
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Sending Files");
+                crate::widgets::field_label(ui, "Scratch folder (To Scratch)");
+                path_row(ui, &mut draft.scratch_dir, &mut browse, Browse::Scratch);
+                ui.weak(
+                    "Where To Scratch copies a script (with its compiled script) or \
                                  an area as loose files: a development folder, a server's, or \
                                  anywhere. Empty: asked for the first time.",
-                            );
-                            ui.add_space(6.0);
-                            crate::widgets::field_label(ui, "NWSync upload command");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut draft.nwsync_upload)
-                                    .desired_width(420.0)
-                                    .font(egui::TextStyle::Monospace)
-                                    .hint_text("rsync -a {part} you@host:/srv/nwsync/"),
-                            );
-                            ui.checkbox(&mut draft.nwsync_upload_input, "It reads what I type")
-                                .on_hover_text(
-                                    "A line under its output takes what you type, as a \
-                                     project's command with input = true",
-                                );
-                            ui.weak(
-                                "What Publish to NWSync's Upload runs to send the repository to \
+                );
+                ui.add_space(6.0);
+                crate::widgets::field_label(ui, "NWSync upload command");
+                ui.add(
+                    mg_uikit::text_field(&mut draft.nwsync_upload)
+                        .desired_width(420.0)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("rsync -a {part} you@host:/srv/nwsync/"),
+                );
+                ui.check_box(&mut draft.nwsync_upload_input, "It reads what I type")
+                    .on_hover_text("Give the command a line under its output to type into");
+                ui.weak(
+                    "What Publish to NWSync's Upload runs to send the repository to \
                                  your web server: once for each part, the data, then the \
                                  manifests, then latest, in the repository's folder ({part} the \
                                  part's name, {folder} the folder). It uses your own tools' \
                                  logins (an SSH key, a cloud tool's profile): Moonglow keeps no \
                                  password. A project's [nwsync] upload is used in its place.",
-                            );
+                );
+            }
+            OptionsPage::General => {
+                general(ui, draft, width, drawing_with.as_deref(), &passes_over);
+            }
+            OptionsPage::Area => {
+                crate::widgets::section_heading(ui, "View");
+                ui.horizontal(|ui| {
+                    crate::widgets::field_label(ui, "Background Color");
+                    let mut custom = draft.area_background.is_some();
+                    if ui.check_box(&mut custom, "Custom").changed() {
+                        draft.area_background = custom.then_some([192, 192, 192]);
+                    }
+                    if let Some(rgb) = &mut draft.area_background {
+                        crate::color_button::edit_srgb(ui, rgb);
+                    } else {
+                        ui.weak("the area's fog");
+                    }
+                });
+                ui.check_box(&mut draft.spawn_markers, "Show Encounter Spawnpoint Markers");
+                ui.add_enabled_ui(draft.spawn_markers, |ui| {
+                    ui.horizontal(|ui| {
+                        crate::widgets::field_label(ui, "Height");
+                        let size = &mut draft.spawn_marker_size;
+                        crate::widgets::spin_draft(ui, &mut size.0, 0..=100, 1.0, |d| d);
+                        crate::widgets::field_label(ui, "Width");
+                        let size = &mut draft.spawn_marker_size;
+                        crate::widgets::spin_draft(ui, &mut size.1, 0..=100, 1.0, |d| d);
+                        ui.weak("(tenths of a meter)");
+                    });
+                });
+                ui.check_box(&mut draft.door_arrows, "Show Door Orientation Arrows");
+                ui.check_box(&mut draft.merchant_signs, "Show stores as $ signs")
+                    .on_hover_text("Show the game's store marker, not an arrow along its facing");
+                ui.check_box(
+                    &mut draft.turn_ring,
+                    "Show the turning and tilt rings around selected objects",
+                )
+                .on_hover_text(
+                    "A ring to turn the selection. With Shift, rings to tilt it and \
+                                 arrows to move it.",
+                );
+                ui.check_box(&mut draft.middle_drag_moves, "Middle drag moves the view")
+                    .on_hover_text(
+                        "Move the camera with a middle drag, as with Ctrl + drag, \
+                                     and turn it with Alt + middle drag.",
+                    );
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Graphics");
+                ui.horizontal(|ui| {
+                    crate::widgets::field_label(ui, "Shadows quality");
+                    shadow_quality_choice(ui, &mut draft.shadow_quality);
+                });
+                texture_limit_choice(ui, &mut draft.texture_limit);
+                area_resolution_choice(ui, &mut draft.area_resolution);
+                anti_aliasing_choice(ui, &mut draft.anti_aliasing, &sample_counts);
+                ui.check_box(&mut draft.animate_unfocused, "Keep animating behind other windows")
+                    .on_hover_text(
+                        "Keep playing animations while another program has the focus. Off \
+                                 spares the GPU.",
+                    );
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Editing");
+                ui.check_box(
+                    &mut draft.generated_lights,
+                    "Lights of any color and reach, written into a hak",
+                )
+                .on_hover_text(
+                    "Offer Custom Light…, which writes a light model and a 2DA row \
+                                 into a hak",
+                );
+                ui.check_box(
+                    &mut draft.edit_group_tiles,
+                    "Allow editing tiles of groups and features",
+                )
+                .on_hover_text(
+                    "Change a group's or feature's tiles one by one. Hard to put right \
+                                 later.",
+                );
+                if draft.edit_group_tiles {
+                    let warn = ui.visuals().warn_fg_color;
+                    let text = egui::RichText::new(
+                        "Tiles of groups and features can be changed one by one: a \
+                                     group half changed stays so.",
+                    )
+                    .color(warn);
+                    mg_uikit::icon_label(ui, mg_uikit::Icon::Warning, Some(warn), text);
+                }
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Header");
+                ui.weak(
+                    "The controls the area's header shows, on its row and in its \
+                                 popovers (right-click the header for the same).",
+                );
+                crate::area_view::toolbar_menu(ui, &mut draft.hidden_area_tools, true);
+            }
+            OptionsPage::Verify => verify(ui, draft),
+            OptionsPage::Updates => crate::updates::options_page(
+                ui,
+                crate::updates::UpdateOptions {
+                    check: &mut draft.update_check,
+                    auto_install: &mut draft.update_auto_install,
+                    prereleases: &mut draft.update_prereleases,
+                    skipped: &mut draft.update_skipped,
+                },
+                &updates_here,
+            ),
+            OptionsPage::Language => {
+                ui.label("The language text is shown and edited in:");
+                let mut default = draft.edit_language.is_none();
+                if ui.radio_choice(&mut default, true, "Use Default Language: English").clicked() {
+                    draft.edit_language = None;
+                }
+                if ui.radio_choice(&mut default, false, "Specified Language:").clicked()
+                    && draft.edit_language.is_none()
+                {
+                    draft.edit_language = Some(0);
+                }
+                ui.add_enabled_ui(!default, |ui| {
+                    mg_uikit::list_rows(ui);
+                    for l in mg_core::Language::EE {
+                        let name = l.name().unwrap_or("?");
+                        if ui.selectable_label(draft.edit_language == Some(l.0), name).clicked() {
+                            draft.edit_language = Some(l.0);
                         }
-                        OptionsPage::General => {
-                            // Aurora's order and groups.
-                            ui.checkbox(&mut draft.backups, "Create backups of modules")
-                                .on_hover_text(
-                                    "Keep the module as it was as <name>.BackupMod at each save",
-                                );
-                            ui.checkbox(&mut draft.build_on_save, "Build module on save")
-                                .on_hover_text(
-                                    "Run Build Module (with its defaults) before saving",
-                                );
-                            ui.checkbox(
-                                &mut draft.mod_beside_folder,
-                                "Write a .mod beside a module folder on save",
-                            )
-                            .on_hover_text(
-                                "A module opened as a folder is saved into the folder, and as \
-                                 <folder>.mod next to it as well, as Aurora saves a module \
-                                 directory: the game loads the .mod. (A nasher project has \
-                                 Build › Pack for its module file.)",
-                            );
-                            ui.horizontal(|ui| {
-                                crate::widgets::field_label(ui, "A .mod with its folder beside it");
-                                let name = |c: &ModuleFolders| match c {
-                                    ModuleFolders::Ask => "Ask which to open",
-                                    ModuleFolders::Folder => "Open the folder",
-                                    ModuleFolders::Module => "Open the .mod",
-                                };
-                                let all = [
-                                    ModuleFolders::Ask,
-                                    ModuleFolders::Folder,
-                                    ModuleFolders::Module,
-                                ];
-                                crate::widgets::dropdown("module-folders")
-                                    .selected_text(name(&draft.module_folders))
-                                    .show(ui, &mut draft.module_folders, &all, name)
-                                    .on_hover_text(
-                                        "A module opened as name.mod, with a folder named name \
-                                         beside it (a module directory, as Aurora keeps one): \
-                                         asked, as Aurora asks, or always the folder (Aurora's \
-                                         Always open module directories), or always the .mod",
-                                    );
-                            });
-                            ui.checkbox(
-                                &mut draft.minimize_on_test,
-                                "Minimize Toolset on test module",
-                            );
-                            ui.checkbox(
-                                &mut draft.test_with_steam,
-                                "Start a Steam copy of the game through Steam for a test",
-                            )
-                            .on_hover_text(
-                                "On: the game reaches Steam (its overlay, your Workshop content), \
-                                 as when started from Steam. Off: the game's program is started \
-                                 on its own, without Steam",
-                            );
-                            ui.horizontal(|ui| {
-                                crate::widgets::field_label(ui, "Interface size");
-                                crate::widgets::dropdown("ui-scale")
-                                    .selected_text(format!("{}%", draft.ui_scale))
-                                    .show(ui, &mut draft.ui_scale, &UI_SCALES, |s| format!("{s}%"))
-                                    .on_hover_text(
-                                        "The whole interface, text and all, larger or smaller \
-                                         (set when you choose OK)",
-                                    );
-                            });
-                            ui.checkbox(&mut draft.light_theme, "Light theme");
-                            toolbar_buttons(ui, draft);
-                            graphics_backend(ui, draft, drawing_with.as_deref());
-                            ui.checkbox(
-                                &mut draft.last_area,
-                                "Open a module on the area opened last",
-                            )
-                            .on_hover_text(
-                                "The first time, on the first area the module tree lists",
-                            );
-                            ui.checkbox(
-                                &mut draft.reopen_tabs,
-                                "Open a module with the tabs it had when it was closed",
-                            )
-                            .on_hover_text(
-                                "Its areas, scripts, blueprints, conversations and tools, in \
-                                 their order and their places, the one in front in front \
-                                 (kept in Moonglow's data folder, not in the module)",
-                            );
-                            ui.checkbox(
-                                &mut draft.ask_before_closing,
-                                "Ask before the window is closed",
-                            )
-                            .on_hover_text(
-                                "The window's close button asks first, where there are no \
-                                 unsaved changes to ask about (File › Exit does not)",
-                            );
-                            ui.checkbox(
-                                &mut draft.tree_opens_area,
-                                "Show the object selected in an area in the module tree",
-                            )
-                            .on_hover_text(
-                                "An object selected in an area's view opens its area out in the \
-                                 module tree and goes to it there, as Aurora does; off, the tree \
-                                 goes to it only where its area is opened out already",
-                            );
-                            ui.checkbox(
-                                &mut draft.tree_follows_tabs,
-                                "Show the tab chosen in the module tree",
-                            )
-                            .on_hover_text(
-                                "A tab chosen (clicked, reached by Ctrl+Tab, or opened) marks its \
-                                 script, conversation, blueprint or area in the module tree, its \
-                                 group opened and the row brought into view, the keys left with \
-                                 the tab; off, the tree stays where it is and marks the area in \
-                                 front only, as Aurora does",
-                            );
-                            ui.checkbox(
-                                &mut draft.properties_together,
-                                "Open Properties as tabs of one window",
-                            )
-                            .on_hover_text(
-                                "A blueprint's or a placed object's Properties open as a tab of \
-                                 the window Properties are open in already; off, each in a \
-                                 window of its own. (A tab dragged out is a window of its own \
-                                 again)",
-                            );
-                            ui.checkbox(
-                                &mut draft.drag_windows_anywhere,
-                                "Move windows by dragging anywhere in them",
-                            )
-                            .on_hover_text(
-                                "A window of tabs (Properties, conversations, scripts…) moves \
-                                 when dragged by any part that is not a control; off, only by \
-                                 its tab bar, so that a click that misses a control doesn't \
-                                 move it",
-                            );
-                            ui.checkbox(
-                                &mut draft.tabs_by_recent,
-                                "Ctrl+Tab goes to the tab used last",
-                            )
-                            .on_hover_text(
-                                "Next Tab and Previous Tab go through a pane's tabs in the \
-                                 order they were last used, for as long as Ctrl is held; off, \
-                                 to the next tab as they lie",
-                            );
-                            let log = crate::trace::path()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default();
-                            ui.checkbox(&mut draft.debug_log, "Write a debug log").on_hover_text(
-                                format!(
-                                    "What Moonglow does, step by step, to send with a report of \
-                                     something that fails without a word, each line with its \
-                                     time: {log} (a new one each time Moonglow starts, the last \
-                                     five kept, a few megabytes each at most). On unless you \
-                                     switch it off: after a crash, what led to it is there to send"
-                                ),
-                            );
-                            ui.checkbox(&mut draft.area_names, "List areas and blueprints by name")
-                                .on_hover_text(
-                                    "In the module tree, by their names rather than their ResRefs \
-                                 (in the names' order; the ResRef shows on hover)",
-                                );
-                            ui.checkbox(
-                                &mut draft.categories_by_name,
-                                "List a blueprint's categories alphabetically",
-                            )
-                            .on_hover_text(
-                                "A blueprint's Category list in alphabetical order; off, in the \
-                                 palette's (Palette › Categories… sets it)",
-                            );
-                            ui.checkbox(&mut draft.name_resrefs, "Show ResRefs beside names")
-                                .on_hover_text(
-                                    "Name (resref) in the module tree's lists by name and in \
-                                     the palettes: for telling apart blueprints of one name",
-                                );
-                            ui.checkbox(
-                                &mut draft.palette_cr,
-                                "Show challenge ratings in the creature palette",
-                            );
-                            ui.checkbox(
-                                &mut draft.armor_on_woman,
-                                "Show armor and cloaks on a woman",
-                            )
-                            .on_hover_text(
-                                "An armor's or a cloak's model on a woman's body, and an \
-                                 armor's inventory icon as a woman's inventory shows it, in \
-                                 inventories, the palette and the item's Properties (whose \
-                                 Shown on changes it too); off, a man's",
-                            );
-                            ui.checkbox(&mut draft.workshop, "Read Steam Workshop content")
-                                .on_hover_text(
-                                    "The Steam Workshop items you are subscribed to (overrides, \
-                                     haks, talk tables), as the game started through Steam \
-                                     reads them. Off, as in Aurora: an item subscribed to for \
-                                     play is not the module's. Changing this reads the game's \
-                                     data again",
-                                );
-                            ui.checkbox(&mut draft.userpatch, "Read userpatch.ini's haks")
-                                .on_hover_text(
-                                    "The haks your userpatch.ini names (the HD Pack and the \
-                                     like), from the patch folder, under the module and its haks \
-                                     and over override, as the game reads them. Off, as in \
-                                     Aurora. Verify warns of what only they provide: players \
-                                     without them won't have it. Changing this reads the game's \
-                                     data again",
-                                );
-                            ui.checkbox(
-                                &mut draft.auto_reload,
-                                "Reload haks, override and development when they change",
-                            )
-                            .on_hover_text(
-                                "Changed haks, 2DAs, models and textures show without a restart; \
-                                 a nasher project's files changed by another program are read \
-                                 again",
-                            );
-                            ui.horizontal(|ui| {
-                                ui.checkbox(
-                                    &mut draft.autosave,
-                                    "Keep a recovery copy of unsaved work every",
-                                )
-                                .on_hover_text(
-                                    "In Moonglow's data folder; offered back after a crash \
-                                     (Recover Unsaved Work)",
-                                );
-                                ui.add_enabled_ui(draft.autosave, |ui| {
-                                    let minutes = &mut draft.autosave_minutes;
-                                    crate::widgets::spin_draft(ui, minutes, 1..=120, 1.0, |d| d);
-                                });
-                                ui.label("minutes");
-                            });
-                            ui.add_space(8.0);
-                            ui.checkbox(
-                                &mut draft.namespace_warning,
-                                "Show reserved Blueprint ResRef namespace warning",
-                            )
-                            .on_hover_text(
-                                "Warn about a blueprint named like the game's (nw_, x0_ to x3_)",
-                            );
-                            ui.checkbox(
-                                &mut draft.standard_warning,
-                                "Show standard resource overwrite warning",
-                            )
-                            .on_hover_text("Warn when the module adds a resource the game has");
-                            ui.checkbox(&mut draft.hak_warning, "Show resource in Hak Pak warning")
-                            .on_hover_text(
-                                "Warn when a hak has a resource the module adds (the hak's wins)",
-                            );
-                            ui.checkbox(
-                                &mut draft.duplicate_tags_warning,
-                                "Show duplicate tags warning after a paste or a copy",
-                            )
-                            .on_hover_text(DUPLICATE_TAGS_TIP);
-                            ui.add_space(8.0);
-                            ui.checkbox(
-                                &mut draft.spell_warning,
-                                "Show invalid creature spell assignment warning",
-                            )
-                            .on_hover_text(
-                                "On a creature's Spells page: spells too high for its level or \
-                             ability, or more than it may have",
-                            );
-                            ui.checkbox(
-                                &mut draft.inventory_warning,
-                                "Show creature inventory warning",
-                            )
-                            .on_hover_text(
-                                "On a creature's Inventory page: the game may unequip what its \
-                                 feats or level do not allow",
-                            );
-                        }
-                        OptionsPage::Area => {
-                            ui.horizontal(|ui| {
-                                crate::widgets::field_label(ui, "Background Color");
-                                let mut custom = draft.area_background.is_some();
-                                if ui.checkbox(&mut custom, "Custom").changed() {
-                                    draft.area_background = custom.then_some([192, 192, 192]);
-                                }
-                                if let Some(rgb) = &mut draft.area_background {
-                                    crate::color_button::edit_srgb(ui, rgb);
-                                } else {
-                                    ui.weak("the area's fog");
-                                }
-                            });
-                            ui.checkbox(
-                                &mut draft.spawn_markers,
-                                "Show Encounter Spawnpoint Markers",
-                            );
-                            ui.add_enabled_ui(draft.spawn_markers, |ui| {
-                                ui.horizontal(|ui| {
-                                    crate::widgets::field_label(ui, "Height");
-                                    let size = &mut draft.spawn_marker_size;
-                                    crate::widgets::spin_draft(
-                                        ui,
-                                        &mut size.0,
-                                        0..=100,
-                                        1.0,
-                                        |d| d,
-                                    );
-                                    crate::widgets::field_label(ui, "Width");
-                                    let size = &mut draft.spawn_marker_size;
-                                    crate::widgets::spin_draft(
-                                        ui,
-                                        &mut size.1,
-                                        0..=100,
-                                        1.0,
-                                        |d| d,
-                                    );
-                                    ui.weak("(tenths of a meter)");
-                                });
-                            });
-                            ui.checkbox(&mut draft.door_arrows, "Show Door Orientation Arrows");
-                            ui.checkbox(
-                                &mut draft.turn_ring,
-                                "Show the turning and tilt rings around selected objects",
-                            )
-                            .on_hover_text(
-                                "A ring around the selection: drag it round to turn the objects. \
-                                 With Shift held, two rings that tilt their models \
-                                 and arrows that move them along one axis",
-                            );
-                            ui.checkbox(
-                                &mut draft.generated_lights,
-                                "Lights of any color and reach, written into a hak",
-                            )
-                            .on_hover_text(
-                                "On, Add Light Here and the palette's Lights offer Custom \
-                                 Light…: a light of the color, reach and shadows you choose, \
-                                 made as content (a model and a placeables.2da row) written \
-                                 into a hak you choose, which the module's players must have. \
-                                 Off, nothing is ever written into a hak for a light. A \
-                                 project's moonglow.toml ([lights] generated) wins over this",
-                            );
-                            ui.checkbox(&mut draft.merchant_signs, "Show stores as $ signs")
-                                .on_hover_text(
-                                    "The game's marker for a store, as Aurora shows them, \
-                                 rather than an arrow along the store's facing",
-                                );
-                            ui.horizontal(|ui| {
-                                crate::widgets::field_label(ui, "Shadows quality");
-                                shadow_quality_choice(ui, &mut draft.shadow_quality);
-                            });
-                            texture_limit_choice(ui, &mut draft.texture_limit);
-                            area_resolution_choice(ui, &mut draft.area_resolution);
-                            ui.checkbox(
-                                &mut draft.animate_unfocused,
-                                "Keep animating behind other windows",
-                            )
-                            .on_hover_text(
-                                "The area views and the model viewer go on playing their \
-                                 animations while another program's window has the focus. \
-                                 Off, they hold still there until Moonglow's window has it \
-                                 again, which spares the GPU",
-                            );
-                            ui.checkbox(
-                                &mut draft.edit_group_tiles,
-                                "Allow editing tiles of groups and features",
-                            )
-                            .on_hover_text(
-                                "Off, a group or feature is one thing: its tiles don't turn, \
-                                 change appearance or take terrain, no group goes over another, \
-                                 and the Eraser or Delete takes it away whole. On, each tile of \
-                                 one can be changed alone, which leaves the rest of it standing: \
-                                 hard to see and to put right later (Undo does)",
-                            );
-                            if draft.edit_group_tiles {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "⚠ Tiles of groups and features can be changed one by \
-                                         one: a group half changed stays so.",
-                                    )
-                                    .color(ui.visuals().warn_fg_color),
-                                );
-                            }
-                        }
-                        OptionsPage::Verify => verify(ui, draft),
-                        OptionsPage::Updates => crate::updates::options_page(
-                            ui,
-                            &mut draft.update_check,
-                            &mut draft.update_skipped,
-                            installer,
-                            checked,
-                        ),
-                        OptionsPage::Language => {
-                            ui.label("The language text is shown and edited in:");
-                            let mut default = draft.edit_language.is_none();
-                            if ui
-                                .radio_value(&mut default, true, "Use Default Language: English")
-                                .clicked()
-                            {
-                                draft.edit_language = None;
-                            }
-                            if ui.radio_value(&mut default, false, "Specified Language:").clicked()
-                                && draft.edit_language.is_none()
-                            {
-                                draft.edit_language = Some(0);
-                            }
-                            ui.add_enabled_ui(!default, |ui| {
-                                for l in mg_core::Language::EE {
-                                    let name = l.name().unwrap_or("?");
-                                    if ui
-                                        .selectable_label(draft.edit_language == Some(l.0), name)
-                                        .clicked()
-                                    {
-                                        draft.edit_language = Some(l.0);
-                                    }
-                                }
-                            });
-                        }
-                        OptionsPage::ConversationEditor => {
-                            ui.checkbox(
-                                &mut draft.dialog_text_popup,
-                                "Show popup when creating a new text entry",
-                            );
-                            ui.checkbox(&mut draft.dialog_names, "Show speaker name before text");
-                            ui.checkbox(
-                                &mut draft.dialogs_together,
-                                "Open conversations as tabs of one window",
-                            )
-                            .on_hover_text(
-                                "A conversation opens as a tab of the window one is open in \
-                                 already; off, each in a window of its own",
-                            );
-                            ui.horizontal(|ui| {
-                                crate::widgets::field_label(ui, "Font size");
-                                let usual = egui::TextStyle::Body.resolve(ui.style()).size;
-                                let mut size =
-                                    draft.dialog_font_size.unwrap_or(usual.round() as u8);
-                                let field = egui::DragValue::new(&mut size).range(6..=48);
-                                if ui.add(field).changed() {
-                                    draft.dialog_font_size = Some(size);
-                                }
-                                if draft.dialog_font_size.is_some()
-                                    && ui.small_button("Default").clicked()
-                                {
-                                    draft.dialog_font_size = None;
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "The size of the conversation editor's text: its lines and the \
+                    }
+                });
+                talk_typed(ui, draft, project_typed.as_ref());
+            }
+            OptionsPage::ConversationEditor => {
+                crate::widgets::section_heading(ui, "Editing");
+                ui.check_box(
+                    &mut draft.dialog_text_popup,
+                    "Show popup when creating a new text entry",
+                );
+                ui.check_box(&mut draft.dialog_names, "Show speaker name before text");
+                ui.check_box(
+                    &mut draft.dialogs_together,
+                    "Open conversations as tabs of one window",
+                )
+                .on_hover_text(
+                    "Open each conversation as a tab of one window. Off, each in its \
+                                 own.",
+                );
+                ui.horizontal(|ui| {
+                    ui.check_box(
+                        &mut draft.dialog_backup,
+                        "Automatically backup the conversation files",
+                    )
+                    .on_hover_text(
+                        "Copy each open conversation with unsaved changes into the \
+                                     data folder's conversation-backups",
+                    );
+                    ui.add_enabled_ui(draft.dialog_backup, |ui| {
+                        let minutes = &mut draft.dialog_backup_minutes;
+                        crate::widgets::spin_draft(ui, minutes, 1..=180, 1.0, |d| d);
+                    });
+                    ui.label("minutes");
+                });
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Text");
+                ui.horizontal(|ui| {
+                    crate::widgets::field_label(ui, "Font size");
+                    let usual = egui::TextStyle::Body.resolve(ui.style()).size;
+                    let mut size = draft.dialog_font_size.unwrap_or(usual.round() as u8);
+                    let field = egui::DragValue::new(&mut size).range(6..=48);
+                    if ui.add(field).changed() {
+                        draft.dialog_font_size = Some(size);
+                    }
+                    if draft.dialog_font_size.is_some() && ui.small_button("Default").clicked() {
+                        draft.dialog_font_size = None;
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "The size of the conversation editor's text: its lines and the \
                                  fields under them",
-                            );
-                            // (The defaults of the theme the window shows.)
-                            let (npc, pc) =
-                                crate::dialog_view::default_colors(ui.visuals().dark_mode);
-                            for (label, color, default) in [
-                                ("NPC Text Color", &mut draft.dialog_npc_color, npc),
-                                ("Player Text Color", &mut draft.dialog_pc_color, pc),
-                            ] {
-                                ui.horizontal(|ui| {
-                                    crate::widgets::field_label(ui, label);
-                                    let mut rgb = color.unwrap_or(default);
-                                    if crate::color_button::edit_srgb(ui, &mut rgb).changed() {
-                                        *color = Some(rgb);
-                                    }
-                                    if color.is_some() && ui.small_button("Default").clicked() {
-                                        *color = None;
-                                    }
-                                });
-                            }
-                            ui.add_space(6.0);
-                            ui.horizontal_top(|ui| {
-                                for (title, source_to_dest) in [
-                                    ("Paste Link Options", &mut draft.dialog_paste_source_to_dest),
-                                    ("Drag Link Options", &mut draft.dialog_drag_source_to_dest),
-                                ] {
-                                    ui.group(|ui| {
-                                        ui.vertical(|ui| {
-                                            crate::widgets::section_heading(ui, title);
-                                            ui.radio_value(
-                                                source_to_dest,
-                                                true,
-                                                "Link Source To Destination",
-                                            );
-                                            ui.radio_value(
-                                                source_to_dest,
-                                                false,
-                                                "Link Destination To Source",
-                                            );
-                                        });
-                                    });
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                ui.checkbox(
-                                    &mut draft.dialog_backup,
-                                    "Automatically backup the conversation files",
-                                )
-                                .on_hover_text(
-                                    "Every few minutes, a copy of each open conversation with \
-                                 unsaved changes, in the temporary folder's moonglow-backups",
-                                );
-                                ui.add_enabled_ui(draft.dialog_backup, |ui| {
-                                    let minutes = &mut draft.dialog_backup_minutes;
-                                    crate::widgets::spin_draft(ui, minutes, 1..=180, 1.0, |d| d);
-                                });
-                                ui.label("minutes");
-                            });
+                );
+                // (The defaults of the theme the window shows.)
+                let (npc, pc) = crate::dialog_view::default_colors(ui.visuals().dark_mode);
+                for (label, color, default) in [
+                    ("NPC Text Color", &mut draft.dialog_npc_color, npc),
+                    ("Player Text Color", &mut draft.dialog_pc_color, pc),
+                ] {
+                    ui.horizontal(|ui| {
+                        crate::widgets::field_label(ui, label);
+                        let mut rgb = color.unwrap_or(default);
+                        if crate::color_button::edit_srgb(ui, &mut rgb).changed() {
+                            *color = Some(rgb);
                         }
-                        OptionsPage::Sounds => {
-                            ui.checkbox(
-                                &mut draft.placed_sounds,
-                                "Play placed sound objects in area",
-                            );
-                            ui.checkbox(&mut draft.ambient_sound, "Play ambient sound in area");
-                            ui.checkbox(&mut draft.ambient_music, "Play ambient music in area");
-                            ui.horizontal(|ui| {
-                                crate::widgets::field_label(ui, "Ambient music volume");
-                                ui.add(egui::Slider::new(&mut draft.music_volume, 0..=127));
-                            });
-                            ui.weak(
-                                "Placed sounds are heard from where the area view looks, at full \
-                             volume within their Max Volume Distance and fading out at their \
-                             Cutoff Distance.",
-                            );
-                        }
-                        OptionsPage::ScriptEditor => {
-                            crate::widgets::field_label(ui, "Code Templates Directory");
-                            path_row(
-                                ui,
-                                &mut draft.script_templates,
-                                &mut browse,
-                                Browse::Templates,
-                            );
-                            ui.weak("Listed with the game's (data/scr) and scripttemplates.");
-                            ui.checkbox(
-                                &mut draft.auto_compile,
-                                "Automatically Compile Scripts on Save",
-                            );
-                            ui.checkbox(
-                                &mut draft.debug_info,
-                                "Generate Debug Information When Compiling Scripts",
-                            )
-                            .on_hover_text("Store a .ndb with each compiled script, for debuggers");
-                            ui.checkbox(&mut draft.live_check, "Check for errors as you type")
-                                .on_hover_text(
-                                    "Compile the script a moment after typing stops and show \
-                                     its first error under the toolbar, its line underlined",
-                                );
-                            ui.horizontal(|ui| {
-                                crate::widgets::field_label(ui, "Indent with");
-                                let style = &mut draft.script_style;
-                                ui.radio_value(&mut style.indent_tabs, false, "Spaces");
-                                ui.radio_value(&mut style.indent_tabs, true, "Tabs");
-                                ui.add_space(12.0);
-                                crate::widgets::field_label(ui, "Indent width");
-                                ui.add(egui::DragValue::new(&mut style.indent_width).range(1..=16))
-                                    .on_hover_text(
-                                        "The spaces Tab puts in (to the next multiple of it), \
-                                         and Shift+Tab takes off",
-                                    );
-                            });
-                            ui.checkbox(
-                                &mut draft.scripts_together,
-                                "Open scripts as tabs of one window",
-                            )
-                            .on_hover_text(
-                                "A script opens as a tab of the window scripts are open in \
-                                 already; off, each in a window of its own. (A tab dragged out \
-                                 is a window of its own again, and scripts docked in the \
-                                 middle open there either way)",
-                            );
-                            crate::widgets::field_label(ui, "External Script Editor");
-                            path_row(ui, &mut draft.external_editor, &mut browse, Browse::Editor);
-                            ui.add_enabled(
-                                !draft.external_editor.trim().is_empty(),
-                                egui::Checkbox::new(
-                                    &mut draft.scripts_external,
-                                    "Open scripts in the external editor",
-                                ),
-                            )
-                            .on_hover_text(
-                                "A script opened from the module tree opens in the external \
-                                 editor too; what it saves comes back into Moonglow's editor",
-                            )
-                            .on_disabled_hover_text("Choose an external script editor first");
-                            ui.add_enabled(
-                                draft.scripts_external && !draft.external_editor.trim().is_empty(),
-                                egui::Checkbox::new(
-                                    &mut draft.scripts_external_only,
-                                    "…and not in Moonglow's editor",
-                                ),
-                            )
-                            .on_hover_text(
-                                "Only the external editor opens, for a script kept as a file \
-                                 of its own (a nasher project's, a module folder's), whose \
-                                 saves Moonglow reads as it does files changed outside. A \
-                                 script in a .mod file still opens in Moonglow's editor too: \
-                                 that is how what the external editor saves comes back",
-                            )
-                            .on_disabled_hover_text("With Open scripts in the external editor");
-                            crate::widgets::field_label(ui, "External Script Compiler");
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut draft.external_compiler)
-                                        .hint_text("the built-in compiler")
-                                        .desired_width(300.0),
-                                )
-                                .on_hover_text(
-                                    "A compiler program (nwn_script_comp, nwnsc) for Compile, \
-                                     Compile All Scripts and the build, in place of the one \
-                                     built in (the game's and Aurora's own). Empty: the \
-                                     built-in one. Errors as you type are always the built-in \
-                                     compiler's",
-                                );
-                                if ui.button("Browse…").clicked() {
-                                    browse = Some(Browse::Compiler);
-                                }
-                            });
-                            let external = draft.external_compiler.trim();
-                            if !external.is_empty() {
-                                use mg_module::external_compiler::{ExternalCompiler, PLACES};
-                                let usual = ExternalCompiler::default_arguments(
-                                    std::path::Path::new(external),
-                                    draft.debug_info,
-                                );
-                                crate::widgets::field_label(ui, "Its arguments");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut draft.external_compiler_args)
-                                        .hint_text(usual.clone())
-                                        .desired_width(460.0),
-                                )
-                                .on_hover_ui(|ui| {
-                                    ui.label(format!(
-                                        "Empty, the usual for this program:\n{usual}"
-                                    ));
-                                    ui.add_space(4.0);
-                                    for (place, what) in PLACES {
-                                        ui.label(format!("{place}  {what}"));
-                                    }
-                                });
-                            }
-                            ui.add_space(6.0);
-                            script_style(ui, &mut draft.script_style);
+                        if color.is_some() && ui.small_button("Default").clicked() {
+                            *color = None;
                         }
                     });
-                },
-            );
-        }
-    }
+                }
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Links");
+                ui.horizontal_top(|ui| {
+                    for (title, source_to_dest) in [
+                        ("Paste Link Options", &mut draft.dialog_paste_source_to_dest),
+                        ("Drag Link Options", &mut draft.dialog_drag_source_to_dest),
+                    ] {
+                        ui.group(|ui| {
+                            ui.vertical(|ui| {
+                                crate::widgets::table_heading(ui, title);
+                                ui.radio_choice(source_to_dest, true, "Link Source To Destination");
+                                ui.radio_choice(
+                                    source_to_dest,
+                                    false,
+                                    "Link Destination To Source",
+                                );
+                            });
+                        });
+                    }
+                });
+            }
+            OptionsPage::Sounds => {
+                ui.check_box(&mut draft.placed_sounds, "Play placed sound objects in area");
+                ui.check_box(&mut draft.ambient_sound, "Play ambient sound in area");
+                ui.check_box(&mut draft.ambient_music, "Play ambient music in area");
+                ui.horizontal(|ui| {
+                    crate::widgets::field_label(ui, "Ambient music volume");
+                    mg_uikit::slider(ui, egui::Slider::new(&mut draft.music_volume, 0..=127));
+                });
+                ui.weak(
+                    "Placed sounds are heard from where the area view looks, at full \
+                             volume within their Max Volume Distance and fading out at their \
+                             Cutoff Distance.",
+                );
+            }
+            OptionsPage::ScriptEditor => {
+                crate::widgets::section_heading(ui, "Compiling");
+                ui.check_box(&mut draft.auto_compile, "Automatically Compile Scripts on Save");
+                ui.check_box(
+                    &mut draft.debug_info,
+                    "Generate Debug Information When Compiling Scripts",
+                )
+                .on_hover_text("Store a .ndb with each compiled script, for debuggers");
+                ui.check_box(&mut draft.live_check, "Check for errors as you type").on_hover_text(
+                    "Compile the script as you type and show its first error in the Status Bar",
+                );
+                crate::widgets::field_label(ui, "External Script Compiler");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        mg_uikit::text_field(&mut draft.external_compiler)
+                            .hint_text("the built-in compiler")
+                            .desired_width(300.0),
+                    )
+                    .on_hover_text(
+                        "A compiler program to use in place of the built-in one. \
+                                     Empty: built-in.",
+                    );
+                    if ui.button("Browse…").clicked() {
+                        browse = Some(Browse::Compiler);
+                    }
+                });
+                let external = draft.external_compiler.trim();
+                if !external.is_empty() {
+                    use mg_module::external_compiler::{ExternalCompiler, PLACES};
+                    let usual = ExternalCompiler::default_arguments(
+                        std::path::Path::new(external),
+                        draft.debug_info,
+                    );
+                    crate::widgets::field_label(ui, "Its arguments");
+                    ui.add(
+                        mg_uikit::text_field(&mut draft.external_compiler_args)
+                            .hint_text(usual.clone())
+                            .desired_width(460.0),
+                    )
+                    .on_hover_ui(|ui| {
+                        ui.label(format!("Empty, the usual for this program:\n{usual}"));
+                        ui.add_space(4.0);
+                        for (place, what) in PLACES {
+                            ui.label(format!("{place}  {what}"));
+                        }
+                    });
+                }
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Editing");
+                crate::widgets::field_label(ui, "Code Templates Directory");
+                path_row(ui, &mut draft.script_templates, &mut browse, Browse::Templates);
+                ui.weak("Listed with the game's (data/scr) and scripttemplates.");
+                ui.horizontal(|ui| {
+                    crate::widgets::field_label(ui, "Indent with");
+                    let style = &mut draft.script_style;
+                    ui.radio_choice(&mut style.indent_tabs, false, "Spaces");
+                    ui.radio_choice(&mut style.indent_tabs, true, "Tabs");
+                    ui.add_space(12.0);
+                    crate::widgets::field_label(ui, "Indent width");
+                    ui.add(egui::DragValue::new(&mut style.indent_width).range(1..=16))
+                        .on_hover_text("The spaces Tab puts in and Shift+Tab takes off");
+                });
+                ui.check_box(&mut draft.scripts_together, "Open scripts as tabs of one window")
+                    .on_hover_text(
+                        "Open each script as a tab of one window. Off, each in its own.",
+                    );
+                ui.check_box(&mut draft.symbol_tips, "Show declarations in tips").on_hover_text(
+                    "Show a name's declaration and first comment line under the pointer or cursor",
+                );
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "External Editor");
+                crate::widgets::field_label(ui, "External Script Editor");
+                path_row(ui, &mut draft.external_editor, &mut browse, Browse::Editor);
+                ui.add_enabled(
+                    !draft.external_editor.trim().is_empty(),
+                    mg_uikit::Checkbox::new(
+                        &mut draft.scripts_external,
+                        "Open scripts in the external editor",
+                    ),
+                )
+                .on_hover_text(
+                    "Also open scripts in the external editor. Its saves come back \
+                                 into Moonglow's.",
+                )
+                .on_disabled_hover_text("Choose an external script editor first");
+                ui.add_enabled(
+                    draft.scripts_external && !draft.external_editor.trim().is_empty(),
+                    mg_uikit::Checkbox::new(
+                        &mut draft.scripts_external_only,
+                        "…and not in Moonglow's editor",
+                    ),
+                )
+                .on_hover_text(
+                    "Open only the external editor, for scripts kept as files of their \
+                                 own",
+                )
+                .on_disabled_hover_text("With Open scripts in the external editor");
+                ui.add_space(crate::widgets::SECTION_GAP);
+                crate::widgets::section_heading(ui, "Font and Colors");
+                script_style(ui, &mut draft.script_style);
+            }
+        });
+    });
     if let Some(which @ (Browse::Editor | Browse::Compiler)) = &browse {
         if let Some(p) = app.dialogs.open_file(crate::dialogs::FileKind::Any, None) {
             let field = match which {
@@ -1238,7 +1321,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
             let suggested = std::path::Path::new("moonglow-keys.json");
             if let Some(p) = app.dialogs.save_file(crate::dialogs::FileKind::Keys, Some(suggested))
             {
-                match std::fs::write(&p, draft.keymap.to_file()) {
+                match mg_module::write_replacing(&p, draft.keymap.to_file().as_bytes()) {
                     Ok(()) => app.log.info(format!("Keys written to {}", p.display())),
                     Err(e) => app.log.error(format!("{}: {e}", p.display())),
                 }
@@ -1266,8 +1349,6 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     }
 }
 
-/// Options › General › Toolbar buttons: Icons and text, or Icons only
-/// (the main toolbar's and the area view's, at once).
 /// The shadows' quality, Fast or High, to choose (Options › Area and the
 /// area view's Shadows menu): whether it changed.
 pub(crate) fn shadow_quality_choice(
@@ -1275,13 +1356,11 @@ pub(crate) fn shadow_quality_choice(
     quality: &mut crate::settings::ShadowQuality,
 ) -> bool {
     use crate::settings::ShadowQuality;
-    let fast = ui.radio_value(quality, ShadowQuality::Fast, "Fast").on_hover_text(
-        "A shadow map stands in for the game's shadows: cheap in every area, its edges stepped \
-         where seen up close",
-    );
-    let high = ui.radio_value(quality, ShadowQuality::High, "High").on_hover_text(
-        "Stencil shadow volumes, as the game casts them: edges as sharp as the picture's, \
-         smoothed with it; dearer in the largest areas",
+    let fast = ui
+        .radio_choice(quality, ShadowQuality::Fast, "Fast")
+        .on_hover_text("A shadow map: cheap in every area, its edges stepped up close");
+    let high = ui.radio_choice(quality, ShadowQuality::High, "High").on_hover_text(
+        "Stencil shadow volumes, as sharp as the game's. Slower in the largest areas.",
     );
     fast.changed() || high.changed()
 }
@@ -1302,14 +1381,7 @@ fn texture_limit_choice(ui: &mut Ui, limit: &mut Option<u16>) {
         crate::widgets::dropdown("texture-limit")
             .selected_text(name(limit))
             .show(ui, limit, &TEXTURE_LIMITS, name)
-            .on_hover_text(
-                "For a GPU with little memory (an integrated one, or 2 to 4 GB): the areas, \
-                 models and pictures draw a texture larger than this at this size, its larger \
-                 levels left out as the game's lower texture quality leaves them. Each halving \
-                 takes a quarter of the memory: The Domains of Dread's woods, whose textures \
-                 are 1024 pixels, take 870 MB of them as they are and 240 MB at 512. Stock \
-                 textures are mostly 512 or less",
-            );
+            .on_hover_text("For a GPU with little memory: draw larger textures at this size");
     });
 }
 
@@ -1330,86 +1402,169 @@ fn area_resolution_choice(ui: &mut Ui, resolution: &mut Option<u8>) {
             .selected_text(name(resolution))
             .show(ui, resolution, &AREA_RESOLUTIONS, name)
             .on_hover_text(
-                "For a GPU that draws the areas slowly (an integrated one): the area views \
-                 draw their pictures at this share of the screen's pixels each way, stretched \
-                 to the view, softer for it; what is drawn over them (outlines, handles, the \
-                 map) stays sharp. A picture takes about as long as its pixels: at 50% a \
-                 quarter of the time and of the memory its targets take",
+                "For a slow GPU: draw the area views at this share of the screen's pixels",
             );
     });
 }
 
-fn toolbar_buttons(ui: &mut Ui, draft: &mut OptionsDraft) {
-    let name = |icons_only: &bool| if *icons_only { "Icons only" } else { "Icons and text" };
+/// The samples a pixel Options › Area › Anti-aliasing draws the 3D views
+/// with (`None`: four), as `offered` takes them: the most of those
+/// offered up to the count chosen.
+pub(crate) fn samples_drawn(chosen: Option<u8>, offered: &[u32]) -> u32 {
+    let wanted = chosen.map_or(4, u32::from);
+    offered.iter().copied().filter(|&n| n <= wanted).max().unwrap_or(1)
+}
+
+/// Options › Area › Anti-aliasing: the samples a pixel the 3D views draw
+/// with, of those the GPU takes (`offered`), for a GPU that draws them
+/// slowly.
+fn anti_aliasing_choice(ui: &mut Ui, samples: &mut Option<u8>, offered: &[u32]) {
+    let name = |s: &Option<u8>| match s.map_or(4, u32::from) {
+        1 => "Off".to_string(),
+        n => format!("{n}×"),
+    };
+    let choices: Vec<Option<u8>> = offered.iter().map(|&n| (n != 4).then_some(n as u8)).collect();
+    // (What is drawn, not what was chosen: 4×, the default, on a GPU that
+    // takes one sample alone shows Off.)
+    let drawn = samples_drawn(*samples, offered);
+    let shown = (drawn != 4).then_some(drawn as u8);
     ui.horizontal(|ui| {
-        crate::widgets::field_label(ui, "Toolbar buttons");
-        crate::widgets::dropdown("toolbar-buttons")
-            .selected_text(name(&draft.toolbar_icons_only))
-            .show(ui, &mut draft.toolbar_icons_only, &[false, true], name)
-            .on_hover_text(
-                "The buttons of the main toolbar and of the area view's toolbar: each with its \
-                 icon and its name, or, to save room, with its icon alone and its name in the \
-                 tip shown when the pointer rests on it (as in Aurora). Buttons without an icon \
-                 keep their names",
-            );
+        crate::widgets::field_label(ui, "Anti-aliasing");
+        crate::widgets::dropdown("anti-aliasing")
+            .selected_text(name(&shown))
+            .show(ui, samples, &choices, name)
+            .on_hover_text("For a slow GPU: smooth the 3D views' edges less, or not at all");
     });
 }
 
 /// Options › General › Graphics backend: Automatic and the backends of
 /// this platform, from the next start; what this run draws with
-/// (`drawing_with`), and whether `WGPU_BACKEND` decides instead.
-fn graphics_backend(ui: &mut Ui, draft: &mut OptionsDraft, drawing_with: Option<&str>) {
+/// (`drawing_with`), and whether `WGPU_BACKEND` decides instead; then the
+/// backends recorded as drawing wrong, those Automatic passes over
+/// (`passes_over`: as this run found) told from those it draws with all
+/// the same.
+fn graphics_backend(
+    ui: &mut Ui,
+    draft: &mut OptionsDraft,
+    drawing_with: Option<&str>,
+    passes_over: &[wgpu::Backend],
+) {
     use crate::settings::GraphicsBackend;
-    ui.horizontal(|ui| {
-        crate::widgets::field_label(ui, "Graphics backend");
+    labelled(ui, LABEL_W, "Graphics backend", |ui| {
         let offered = GraphicsBackend::offered(mg_render::backend::Platform::current());
-        crate::widgets::dropdown("graphics-backend")
+        let r = crate::widgets::dropdown("graphics-backend")
+            .width(150.0)
             .selected_text(draft.graphics_backend.name())
             .show(ui, &mut draft.graphics_backend, &offered, |b| b.name())
             .on_hover_text(
-                "What the area view, the previews and the window draw with. Automatic: the \
-                 graphics library's choice, except that an AMD GPU on Windows draws through \
-                 Direct3D 12 rather than Vulkan; checked as Moonglow starts, and where it draws \
-                 nothing, the GPU's other backend is taken. A backend with no adapter here \
-                 falls back to Automatic. A backend chosen here is kept even where the check \
-                 finds it draws nothing (a notice says so)",
+                "What Moonglow draws with. Automatic picks one and checks it as Moonglow starts.",
             );
+        say_name(&r, "Graphics backend");
     });
+    // (The notes in the value column, under the dropdown: the board's.)
+    under_label(ui, LABEL_W, |ui| graphics_notes(ui, draft, drawing_with, passes_over));
+}
+
+/// What Options › General says under Graphics backend: when it takes
+/// effect and what this run draws with, the notice hidden, the backends
+/// passed over.
+fn graphics_notes(
+    ui: &mut Ui,
+    draft: &mut OptionsDraft,
+    drawing_with: Option<&str>,
+    passes_over: &[wgpu::Backend],
+) {
     let mut note = "Takes effect the next time Moonglow starts.".to_string();
     if let Some(now) = drawing_with {
         note.push_str(&format!(" This run draws with {now}."));
     }
-    if std::env::var_os("WGPU_BACKEND").is_some_and(|v| !v.is_empty()) {
+    if mg_render::backend::backends_from_env().0.is_some() {
         note.push_str(" WGPU_BACKEND is set, and decides over this.");
     }
-    ui.weak(note);
+    ui.add(
+        egui::Label::new(egui::RichText::new(note).color(mg_uikit::tokens(ui.ctx()).text_3)).wrap(),
+    );
+    // The lit check's notice, hidden where the game's shaders draw wrong.
+    if !draft.graphics_notices_hidden.is_empty() && !draft.show_graphics_notices {
+        ui.horizontal_wrapped(|ui| {
+            let each: Vec<String> = draft
+                .graphics_notices_hidden
+                .iter()
+                .map(|f| format!("{} on {} (driver {})", f.backend, f.adapter, f.driver))
+                .collect();
+            ui.weak(format!(
+                "The notice that the game's shaders draw wrong, and that Moonglow draws with its \
+                 own, is hidden on {}.",
+                each.join(", ")
+            ));
+            if ui
+                .button("Show Again")
+                .on_hover_text(
+                    "Show the notice that the game's shaders draw wrong again, from the next start",
+                )
+                .clicked()
+            {
+                draft.show_graphics_notices = true;
+            }
+        });
+    }
     // The backends found drawing wrong here, which Automatic passes over.
     if draft.graphics_failures.is_empty() || draft.forget_graphics_failures {
         return;
     }
     ui.horizontal_wrapped(|ui| {
-        let each: Vec<String> = draft
-            .graphics_failures
-            .iter()
-            .map(|f| format!("{} on {} (driver {})", f.backend, f.adapter, f.driver))
-            .collect();
-        ui.weak(format!(
-            "Automatic passes over {}: it drew nothing here ({}).",
-            each.join(", "),
-            draft.graphics_failures.iter().map(|f| f.what.as_str()).collect::<Vec<_>>().join(", ")
-        ));
+        ui.weak(graphics_failures_said(&draft.graphics_failures, passes_over));
         if ui
             .button("Try Again")
-            .on_hover_text(
-                "Forgets these when you choose OK: from the next start Automatic takes its \
-                 usual backend again (checked as Moonglow starts). A driver update tries it \
-                 again by itself",
-            )
+            .on_hover_text("Forget the backends passed over, from the next start")
             .clicked()
         {
             draft.forget_graphics_failures = true;
         }
     });
+}
+
+/// What Options says of the backends recorded as drawing wrong: those
+/// Automatic passes over (`passes_over`: their names' backends, as this
+/// run found), and those it draws with all the same, as no other backend
+/// is left (one backend on the platform, or every one recorded).
+pub(crate) fn graphics_failures_said(
+    failures: &[crate::settings::GraphicsFailure],
+    passes_over: &[wgpu::Backend],
+) -> String {
+    let passed = |f: &crate::settings::GraphicsFailure| {
+        passes_over.iter().any(|b| mg_render::backend::backend_name(*b) == f.backend)
+    };
+    let each = |passed_over: bool| -> (Vec<String>, Vec<String>) {
+        failures
+            .iter()
+            .filter(|f| passed(f) == passed_over)
+            .map(|f| {
+                let found = crate::recovery::age(f.when);
+                let name = format!("{} on {} (driver {})", f.backend, f.adapter, f.driver);
+                (name, format!("{}, {found}", f.what))
+            })
+            .unzip()
+    };
+    let mut said = Vec::new();
+    let (names, whats) = each(true);
+    if !names.is_empty() {
+        said.push(format!(
+            "Automatic passes over {}: it drew wrong here ({}).",
+            names.join(", "),
+            whats.join("; ")
+        ));
+    }
+    let (names, whats) = each(false);
+    if !names.is_empty() {
+        said.push(format!(
+            "{} drew wrong here ({}); Automatic draws with it all the same, where no other \
+             backend is left.",
+            names.join(", "),
+            whats.join("; ")
+        ));
+    }
+    said.join(" ")
 }
 
 /// The script editor's font size and a colour per syntax element (the
@@ -1424,7 +1579,7 @@ fn script_style(ui: &mut Ui, style: &mut ScriptStyle) {
         for (i, name) in SCRIPT_ELEMENTS.iter().enumerate() {
             crate::widgets::field_label(ui, *name);
             let mut custom = style.colors[i].is_some();
-            if ui.checkbox(&mut custom, "Custom").changed() {
+            if ui.check_box(&mut custom, "Custom").changed() {
                 style.colors[i] = custom.then(|| {
                     let c = defaults[i];
                     [c.r(), c.g(), c.b()]
@@ -1441,7 +1596,7 @@ fn script_style(ui: &mut Ui, style: &mut ScriptStyle) {
         let ground = ui.visuals().text_edit_bg_color();
         crate::widgets::field_label(ui, "Background");
         let mut custom = style.background.is_some();
-        if ui.checkbox(&mut custom, "Custom").changed() {
+        if ui.check_box(&mut custom, "Custom").changed() {
             style.background = custom.then(|| [ground.r(), ground.g(), ground.b()]);
         }
         if let Some(rgb) = &mut style.background {
@@ -1451,7 +1606,7 @@ fn script_style(ui: &mut Ui, style: &mut ScriptStyle) {
         }
         ui.end_row();
     });
-    if ui.button("Reset to defaults").clicked() {
+    if ui.button("Reset to Defaults").clicked() {
         // (The colors and the size: the indentation is not a look.)
         let (indent_tabs, indent_width) = (style.indent_tabs, style.indent_width);
         *style = ScriptStyle { indent_tabs, indent_width, ..ScriptStyle::default() };
@@ -1460,8 +1615,60 @@ fn script_style(ui: &mut Ui, style: &mut ScriptStyle) {
     let palette = Palette::for_ui(style, ui);
     let fill = palette.background.unwrap_or_else(|| ui.visuals().text_edit_bg_color());
     egui::Frame::group(ui.style()).fill(fill).show(ui, |ui| {
-        ui.label(crate::script_view::highlight(preview, &palette));
+        // (Its lines as the editor lays them out: its pitch.)
+        ui.label(crate::script_view::highlight_galley(ui, preview, &palette));
     });
+}
+
+/// Options › Language › Talk Table: text typed into a field put in the
+/// module's custom talk table (`crate::talk_typed`), and what is done
+/// where the table has the text already.
+/// `project`: the open module's project's word (`[talk] typed`) and its
+/// file's name, which wins over the switch for that module.
+fn talk_typed(ui: &mut Ui, draft: &mut OptionsDraft, project: Option<&(String, bool)>) {
+    use crate::settings::TalkReuse;
+    ui.add_space(crate::widgets::SECTION_GAP);
+    crate::widgets::section_heading(ui, "Talk Table");
+    // (The project's word is shown in the box while its module is open,
+    // and the builder's own kept for other modules.)
+    let mut shown = project.map_or(draft.talk_typed, |p| p.1);
+    let target = if project.is_some() { &mut shown } else { &mut draft.talk_typed };
+    ui.add_enabled(
+        project.is_none(),
+        mg_uikit::Checkbox::new(target, "Put text typed into the talk table"),
+    )
+    .on_hover_text("Put names, descriptions and lines you type into the module's talk table")
+    .on_disabled_hover_text("The project's moonglow.toml sets this for everyone ([talk] typed)");
+    if let Some((file, on)) = project {
+        let mine = if draft.talk_typed { "on" } else { "off" };
+        ui.weak(format!(
+            "The open module's project turns it {} for everyone ({file}: [talk] typed = {on}); \
+             your own switch ({mine}) is kept for modules whose project doesn't say.",
+            if *on { "on" } else { "off" }
+        ));
+    }
+    ui.add_enabled_ui(project.map_or(draft.talk_typed, |p| p.1), |ui| {
+        ui.label("When the talk table has the text already:");
+        ui.indent("talk-reuse", |ui| {
+            for (value, label, tip) in [
+                (TalkReuse::Ask, "Ask", "Use that line, add another, or keep the text in the file"),
+                (TalkReuse::Use, "Use that line", "The field names the line the table has"),
+                (TalkReuse::Add, "Add a line", "A new line with the same text"),
+                (
+                    TalkReuse::File,
+                    "Keep it in the file",
+                    "The text is the field's own, as Aurora writes it",
+                ),
+            ] {
+                ui.radio_choice(&mut draft.talk_reuse, value, label).on_hover_text(tip);
+            }
+        });
+    });
+    ui.weak(
+        "Text typed in another language than the talk table's, or into a string with text in \
+         another language too (which the game shows before a line), stays the field's own; so \
+         does every text where the module has no custom talk table.",
+    );
 }
 
 /// Options › Verify: what Build › Verify Module reports, by group, each
@@ -1475,7 +1682,7 @@ fn verify(ui: &mut Ui, draft: &mut OptionsDraft) {
     // A word's checkbox: on while it isn't left out.
     fn word(ui: &mut Ui, skip: &mut Vec<String>, id: &str, label: &str, tip: &str) {
         let mut on = !skip.iter().any(|w| w == id);
-        let response = ui.checkbox(&mut on, label);
+        let response = ui.check_box(&mut on, label);
         let response = if tip.is_empty() { response } else { response.on_hover_text(tip) };
         if response.changed() {
             skip.retain(|w| w != id);
@@ -1484,70 +1691,89 @@ fn verify(ui: &mut Ui, draft: &mut OptionsDraft) {
             }
         }
     }
-    ui.label("What Verify Module reports (a group's \u{25B8} shows its checks):");
-    for group in Group::ALL {
-        let checks: Vec<Check> = Check::ALL.into_iter().filter(|c| c.group() == group).collect();
-        let tip = match group {
-            Group::References => {
-                "Scripts, conversations, blueprints, areas and other resources the module names \
-                 that neither it, its haks nor the game has"
-                    .to_string()
-            }
-            Group::Plugins => "The checks of the enabled plugins".to_string(),
-            _ => {
-                let about: Vec<&str> = checks.iter().map(|c| c.about()).collect();
-                format!("That {}", about.join("; that "))
-            }
-        };
-        let id = ui.make_persistent_id(("verify-group", group.id()));
-        let whole = draft.verify_skip.iter().any(|w| w == group.id());
-        // (Open at first where some of its checks are left out.)
-        let some = match group {
-            Group::References => draft.verify_skip.iter().any(|w| w.starts_with("references:")),
-            Group::Plugins => draft.verify_skip.iter().any(|w| w.contains('/')),
-            _ => checks.iter().any(|c| draft.verify_skip.iter().any(|w| w == c.id())),
-        };
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, some)
-            .show_header(ui, |ui| {
-                word(ui, &mut draft.verify_skip, group.id(), group.title(), &tip);
-            })
-            .body(|ui| {
-                ui.add_enabled_ui(!whole, |ui| match group {
-                    Group::References => {
-                        for c in Category::ALL {
-                            let id = format!("references:{}", c.id());
-                            let label = format!("Of {}", c.id());
-                            let tip =
-                                format!("Missing references made by the module's {}", { c.id() });
-                            word(ui, &mut draft.verify_skip, &id, &label, &tip);
+    ui.label("What Verify Module reports (a group's arrow shows its checks):");
+    // (A tree of check boxes: rows 22 apart.)
+    mg_uikit::with_rows(ui, |ui| {
+        for group in Group::ALL {
+            let checks: Vec<Check> =
+                Check::ALL.into_iter().filter(|c| c.group() == group).collect();
+            let tip = match group {
+                Group::References => {
+                    "Resources the module names that neither it, its haks nor the game has"
+                        .to_string()
+                }
+                Group::Plugins => "The checks of the enabled plugins".to_string(),
+                _ => {
+                    format!("{} checks, listed under its arrow", checks.len())
+                }
+            };
+            let id = ui.make_persistent_id(("verify-group", group.id()));
+            let whole = draft.verify_skip.iter().any(|w| w == group.id());
+            // (Open at first where some of its checks are left out.)
+            let some = match group {
+                Group::References => draft.verify_skip.iter().any(|w| w.starts_with("references:")),
+                Group::Plugins => draft.verify_skip.iter().any(|w| w.contains('/')),
+                _ => checks.iter().any(|c| draft.verify_skip.iter().any(|w| w == c.id())),
+            };
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, some)
+                .show_header(ui, |ui| {
+                    word(ui, &mut draft.verify_skip, group.id(), group.title(), &tip);
+                })
+                .body(|ui| {
+                    ui.add_enabled_ui(!whole, |ui| match group {
+                        Group::References => {
+                            for c in Category::ALL {
+                                let id = format!("references:{}", c.id());
+                                let label = format!("Of {}", c.id());
+                                let tip = format!("Missing references made by the module's {}", {
+                                    c.id()
+                                });
+                                word(ui, &mut draft.verify_skip, &id, &label, &tip);
+                            }
                         }
-                    }
-                    Group::Plugins if draft.plugin_checks.is_empty() => {
-                        ui.weak("No enabled plugin has checks.");
-                    }
-                    Group::Plugins => {
-                        for (id, name) in draft.plugin_checks.clone() {
-                            word(ui, &mut draft.verify_skip, &id, &name, &id);
+                        Group::Plugins => {
+                            for (id, name) in draft.plugin_checks.clone() {
+                                word(ui, &mut draft.verify_skip, &id, &name, &id);
+                            }
+                            // (A check left out of a plugin not enabled now:
+                            // kept, so shown, and while Options is open,
+                            // ticked again or not.)
+                            let opened = draft.opened.as_ref().map(|s| &s.verify_skip);
+                            let mut gone: Vec<String> = (opened.into_iter().flatten())
+                                .chain(&draft.verify_skip)
+                                .filter(|w| w.contains('/'))
+                                .filter(|w| !draft.plugin_checks.iter().any(|(id, _)| id == *w))
+                                .cloned()
+                                .collect();
+                            gone.sort();
+                            gone.dedup();
+                            for id in &gone {
+                                let tip = "A check of a plugin not enabled now";
+                                word(ui, &mut draft.verify_skip, id, id, tip);
+                            }
+                            if draft.plugin_checks.is_empty() && gone.is_empty() {
+                                ui.weak("No enabled plugin has checks.");
+                            }
                         }
-                    }
-                    _ => {
-                        for c in &checks {
-                            word(ui, &mut draft.verify_skip, c.id(), c.id(), c.about());
+                        _ => {
+                            for c in &checks {
+                                word(ui, &mut draft.verify_skip, c.id(), c.id(), c.about());
+                            }
                         }
-                    }
+                    });
                 });
-            });
-    }
+        }
+    });
     ui.add_space(6.0);
     crate::widgets::field_label(ui, "Also leave out");
     ui.add(
-        egui::TextEdit::singleline(&mut draft.verify_more)
+        mg_uikit::text_field(&mut draft.verify_more)
             .hint_text("tdod_tiles01.hak, ttr01.set, override")
             .desired_width(f32::INFINITY),
     )
     .on_hover_text(
-        "Haks (NAME.hak), the override or development folder, and resources (a tileset, \
-         ttr01.set, with its tiles' models; a 2DA; a model), separated by commas",
+        "Haks, override or development, resources (ttr01.set, a 2DA, a model) or \
+         references:override, separated by commas",
     );
     let wrong: Vec<String> = (verify_words(&draft.verify_more).into_iter())
         .filter(|w| mg_module::doctor::Skip::parse(&[w]).is_err())
@@ -1599,7 +1825,10 @@ fn keyboard(ui: &mut Ui, draft: &mut OptionsDraft) {
             }
         }
     }
-    ui.label("Click + and press the keys to add them; × takes a key away.");
+    ui.label("Click the plus and press the keys to add them. A key's cross takes it away.");
+    // (As Apply will have it: Quick Open without a key another command
+    // was given, no conflict over it.)
+    draft.keymap.give_way();
     let conflicts = draft.keymap.conflicts();
     for (k, a, b) in &conflicts {
         ui.colored_label(
@@ -1639,6 +1868,7 @@ fn keyboard(ui: &mut Ui, draft: &mut OptionsDraft) {
         needle.finds_in(&[&mg_core::text::fold(name), &mg_core::text::fold(group.name())])
     });
     egui::ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
+        mg_uikit::list_rows(ui);
         let mut group = None;
         egui::Grid::new("keys").num_columns(3).striped(true).show(ui, |ui| {
             for (in_group, id, name) in &rows {
@@ -1652,8 +1882,10 @@ fn keyboard(ui: &mut Ui, draft: &mut OptionsDraft) {
                     let mut keys = draft.keymap.keys_of(id);
                     let mut remove = None;
                     for (i, k) in keys.iter().enumerate() {
-                        if ui
-                            .small_button(format!("{} ×", shown(k, mac)))
+                        let key = shown(k, mac);
+                        let named = format!("Remove {key} from {name}");
+                        let close = mg_uikit::Icon::Close;
+                        if crate::widgets::text_then_icon(ui, &key, close, &named)
                             .on_hover_text("Take this key away")
                             .clicked()
                         {
@@ -1665,8 +1897,14 @@ fn keyboard(ui: &mut Ui, draft: &mut OptionsDraft) {
                         draft.keymap.set_of(id, keys);
                     }
                     let recording = draft.recording.as_ref() == Some(id);
-                    let label = if recording { "press a key…" } else { "+" };
-                    let add = ui.small_button(label).on_hover_text("Add a key (Escape: none)");
+                    let add = match recording {
+                        true => ui.small_button("press a key…"),
+                        false => {
+                            let add = format!("Add a key for {name}");
+                            ui.add(crate::widgets::icon_only(mg_uikit::Icon::Plus, &add))
+                        }
+                    };
+                    let add = add.on_hover_text("Add a key (Escape: none)");
                     add.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
@@ -1676,6 +1914,12 @@ fn keyboard(ui: &mut Ui, draft: &mut OptionsDraft) {
                     });
                     if add.clicked() {
                         draft.recording = if recording { None } else { Some(id.clone()) };
+                    }
+                    // (Quick Open's Ctrl+P, given way to another command.)
+                    let gave = Cmd::from_id(id).and_then(|c| draft.keymap.gave_way_to(c));
+                    if let Some((k, to)) = gave {
+                        let to = crate::commands::name_of(&to);
+                        ui.weak(format!("No key while {to} has {}", shown(&k, mac)));
                     }
                 });
                 let own = draft.keymap.defaults_of(id);
@@ -1716,9 +1960,581 @@ fn keys_file_id() -> egui::Id {
     egui::Id::new("options-keys-file")
 }
 
+/// The width of a label column of the General page (the Options board's
+/// `.form`: `--lbl-w: 112px`), and of Questions' (`.form.q`: 186).
+const LABEL_W: f32 = 112.0;
+const QUESTION_LABEL_W: f32 = 186.0;
+
+/// The General page's columns as the board draws them (`.cols3`: 380,
+/// 336 and the rest, 24 apart; its widest row, Keep a recovery copy …
+/// minutes, fits 380 with the minutes field as the board's, without
+/// arrows: M4's U23 fix); the third at least [`THIRD_LEAST`] (Questions'
+/// labels over their dropdowns where both do not fit beside: [`question`]).
+const GENERAL_COLUMNS: [f32; 2] = [380.0, 336.0];
+const GENERAL_GAP: f32 = 24.0;
+
+/// The recovery copy's minutes field (the board's `.options .inline .num`).
+const MINUTES_W: f32 = 44.0;
+const THIRD_LEAST: f32 = 340.0;
+
+/// How many columns the General page stands in, `width` wide inside its
+/// margins: the board's three where the third has its least, two (the
+/// first, then the second and the third one over the other) where the
+/// first and a column of its least fit, else one.
+pub(crate) fn general_columns(width: f32) -> usize {
+    let [first, second] = GENERAL_COLUMNS;
+    if width >= first + second + THIRD_LEAST + 2.0 * GENERAL_GAP {
+        3
+    } else if width >= first + THIRD_LEAST + GENERAL_GAP {
+        2
+    } else {
+        1
+    }
+}
+
+/// The General page's sections, in the order they are drawn (the board's
+/// columns, top to bottom, left to right) and their columns' groups.
+const GENERAL_SECTIONS: [&str; 10] = [
+    "Editors",
+    "Saving and Exporting",
+    "Opening Modules",
+    "Testing",
+    "Windows and Tabs",
+    "Module Tree and Palettes",
+    "Appearance",
+    "Questions",
+    "Warnings",
+    "Troubleshooting",
+];
+
+/// Where each of the board's three columns begins in [`GENERAL_SECTIONS`].
+const GENERAL_GROUPS: [std::ops::Range<usize>; 3] = [0..4, 4..7, 7..10];
+
+/// A row of a form with a label column `label_w` wide (the board's
+/// `.lbl`, cut with an ellipsis where it has not the room, whole in its
+/// tip) and what `add` puts beside it.
+fn labelled<R>(ui: &mut Ui, label_w: f32, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        let height = mg_uikit::metrics::CONTROL_HEIGHT;
+        let text = egui::RichText::new(label).color(mg_uikit::tokens(ui.ctx()).text);
+        let left = egui::Layout::left_to_right(egui::Align::Center);
+        let column = egui::vec2(label_w, height);
+        let shown = ui.allocate_ui_with_layout(column, left, |ui| {
+            ui.set_min_size(column);
+            ui.add(egui::Label::new(text).truncate())
+        });
+        let shown = shown.inner;
+        shown.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
+        add(ui)
+    })
+    .inner
+}
+
+/// A row with nothing in the label column (the board's empty `<span>`):
+/// what `add` puts in the value column.
+fn under_label<R>(ui: &mut Ui, label_w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal_top(|ui| {
+        ui.add_space(label_w + ui.spacing().item_spacing.x);
+        ui.vertical(add).inner
+    })
+    .inner
+}
+
+/// Options › General › Editors (the Options board's first section): Open
+/// editors, As Tabs or As Floating Windows, with its note; under
+/// "Floating windows", the three settings of editors' windows (kept in
+/// either mode: a kind moved to a window is one in As Tabs too).
+fn editors(ui: &mut Ui, draft: &mut OptionsDraft) {
+    use crate::settings::OpenEditors;
+    crate::widgets::section_heading(ui, "Editors");
+    labelled(ui, LABEL_W, "Open editors", |ui| {
+        let choices = [
+            (OpenEditors::Tabs, "As Tabs", "Open editors as tabs of the editor area"),
+            (
+                OpenEditors::Floating,
+                "As Floating Windows",
+                "Open editors as windows of their own over the area",
+            ),
+        ];
+        mg_uikit::segmented(ui, "Open editors", &mut draft.open_editors, &choices);
+    });
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Areas always open as tabs. A kind of editor you have moved opens where you last \
+                 put one, until View › Reset Layout. A new installation starts with tabs.",
+            )
+            .color(mg_uikit::tokens(ui.ctx()).text_3),
+        )
+        .wrap(),
+    );
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Floating windows").color(mg_uikit::tokens(ui.ctx()).text_2));
+    ui.check_box(&mut draft.properties_together, "Open Properties as tabs of one window")
+        .on_hover_text("Open each Properties as a tab of one window. Off, each in its own.");
+    ui.check_box(&mut draft.close_cancels, "Closing a window cancels its changes (as Aurora)")
+        .on_hover_text(CLOSE_CANCELS_TIP);
+    ui.check_box(&mut draft.drag_windows_anywhere, "Move windows by dragging anywhere in them")
+        .on_hover_text(
+            "Move a window by dragging any part that isn't a control. Off, by its tab bar.",
+        );
+}
+
+/// Options › General, in sections: Aurora's options first in each, in its
+/// order, then Moonglow's; the sections in the board's three columns
+/// (Editors to Testing; Windows and Tabs to Appearance; Questions to
+/// Troubleshooting) where `width` (inside the page's margins) has the
+/// room, else in two or one ([`general_columns`]), in the same order.
+fn general(
+    ui: &mut Ui,
+    draft: &mut OptionsDraft,
+    width: f32,
+    drawing_with: Option<&str>,
+    passes_over: &[wgpu::Backend],
+) {
+    let columns = general_columns(width);
+    let [first, second] = GENERAL_COLUMNS;
+    // Each column's sections and its width.
+    let laid: Vec<(std::ops::Range<usize>, f32)> = match columns {
+        3 => vec![
+            (GENERAL_GROUPS[0].clone(), first),
+            (GENERAL_GROUPS[1].clone(), second),
+            (GENERAL_GROUPS[2].clone(), width - first - second - 2.0 * GENERAL_GAP),
+        ],
+        2 => vec![(GENERAL_GROUPS[0].clone(), first), (4..10, width - first - GENERAL_GAP)],
+        _ => vec![(0..10, width.max(first))],
+    };
+    let origin = ui.cursor().min;
+    let (mut x, mut bottom) = (origin.x, origin.y);
+    for (sections, column_w) in laid {
+        let room =
+            egui::Rect::from_min_size(egui::pos2(x, origin.y), egui::vec2(column_w, f32::INFINITY));
+        let mut column = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("options-general-column", sections.start))
+                .max_rect(room)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        column.set_max_width(column_w);
+        for s in sections.clone() {
+            if s != sections.start {
+                column.add_space(crate::widgets::SECTION_GAP);
+            }
+            // (Each section in a scope of its own name: its widgets keep
+            // their ids when the columns fold.)
+            column.push_id(GENERAL_SECTIONS[s], |ui| {
+                general_section(ui, draft, s, drawing_with, passes_over);
+            });
+        }
+        bottom = bottom.max(column.min_rect().bottom());
+        x += column_w + GENERAL_GAP;
+    }
+    let right = (x - GENERAL_GAP).max(origin.x + width);
+    ui.advance_cursor_after_rect(egui::Rect::from_min_max(origin, egui::pos2(right, bottom)));
+}
+
+/// The General page's section `s` ([`GENERAL_SECTIONS`]).
+fn general_section(
+    ui: &mut Ui,
+    draft: &mut OptionsDraft,
+    s: usize,
+    drawing_with: Option<&str>,
+    passes_over: &[wgpu::Backend],
+) {
+    let heading = GENERAL_SECTIONS[s];
+    if s != 0 {
+        crate::widgets::section_heading(ui, heading);
+    }
+    match heading {
+        "Editors" => editors(ui, draft),
+        "Saving and Exporting" => {
+            ui.check_box(&mut draft.backups, "Create backups of modules")
+                .on_hover_text("Keep the module as it was as <name>.BackupMod at each save");
+            ui.check_box(&mut draft.build_on_save, "Build module on save")
+                .on_hover_text("Run Build Module (with its defaults) before saving");
+            ui.check_box(
+                &mut draft.mod_beside_folder,
+                "Write a .mod beside a module folder on save",
+            )
+            .on_hover_text(
+                "Also save a module folder as <folder>.mod beside it, which the game loads",
+            );
+            ui.horizontal(|ui| {
+                ui.check_box(&mut draft.autosave, "Keep a recovery copy of unsaved work every")
+                    .on_hover_text("Kept in Moonglow's data folder and offered back after a crash");
+                ui.add_enabled_ui(draft.autosave, |ui| {
+                    // (A number field without arrows, 44 wide, as the
+                    // board's `.inline .num`: Up and Down still step it.
+                    // The kit's other number fields keep theirs.)
+                    ui.spacing_mut().interact_size.x = MINUTES_W;
+                    let minutes = &mut draft.autosave_minutes;
+                    let (typed, _, r) =
+                        crate::widgets::drag_number_shown(ui, *minutes, |d| d.range(1..=120));
+                    if let Some(v) = typed {
+                        *minutes = v;
+                    }
+                    let name = "Minutes between recovery copies";
+                    ui.ctx().accesskit_node_builder(r.id, |n| n.set_label(name));
+                });
+                ui.label("minutes");
+            });
+        }
+        "Opening Modules" => {
+            ui.check_box(&mut draft.last_area, "Open a module on the area opened last")
+                .on_hover_text("The first time, on the first area the module tree lists");
+            ui.check_box(
+                &mut draft.reopen_tabs,
+                "Open a module with the tabs it had when it was closed",
+            )
+            .on_hover_text("Reopen its areas, scripts, blueprints and other tabs where they were");
+        }
+        "Testing" => {
+            ui.check_box(&mut draft.minimize_on_test, "Minimize Toolset on test module");
+        }
+        "Windows and Tabs" => {
+            ui.check_box(&mut draft.tabs_by_recent, "Ctrl+Tab goes to the tab used last")
+                .on_hover_text("Next Tab and Previous Tab follow the order tabs were last used");
+        }
+        "Module Tree and Palettes" => {
+            ui.check_box(
+                &mut draft.tree_opens_area,
+                "Show the object selected in an area in the module tree",
+            )
+            .on_hover_text(
+                "Open the selected object's area in the module tree and go to it, as Aurora does",
+            );
+            ui.check_box(&mut draft.tree_follows_tabs, "Show the tab chosen in the module tree")
+                .on_hover_text("Mark the tab in front's resource in the module tree");
+            ui.check_box(&mut draft.area_names, "List areas and blueprints by name")
+                .on_hover_text("List them in the module tree by name rather than ResRef");
+            ui.check_box(&mut draft.name_resrefs, "Show ResRefs beside names").on_hover_text(
+                "Show a ResRef after each name, dimmed in the module tree, Name (resref) in \
+                     the palettes",
+            );
+            ui.check_box(&mut draft.tree_tags, "Show tags beside names in the module tree")
+                .on_hover_text(
+                    "Show the tags of blueprints and placed objects dimmed after their names",
+                );
+            ui.check_box(&mut draft.tree_extensions, "Show file extensions in the module tree")
+                .on_hover_text("Show guard.utc rather than guard for blueprints and other files");
+            ui.check_box(&mut draft.tree_hides_empty, "Hide empty groups in the module tree")
+                .on_hover_text("Leave groups with nothing in them out of the module tree");
+            ui.check_box(&mut draft.palette_hides_empty, "Hide empty categories in the palettes")
+                .on_hover_text("Leave categories with no blueprints out of the palettes");
+            ui.check_box(
+                &mut draft.categories_by_name,
+                "List a blueprint's categories alphabetically",
+            )
+            .on_hover_text(
+                "Sort a blueprint's Category list alphabetically. Off, in the palette's order.",
+            );
+            ui.check_box(&mut draft.palette_cr, "Show challenge ratings in the creature palette");
+            ui.check_box(&mut draft.armor_on_woman, "Show armor and cloaks on a woman")
+                .on_hover_text(
+                    "Show armor and cloak models and icons on a woman's body. Off, a man's.",
+                );
+            ui.check_box(
+                &mut draft.appearance_portrait,
+                "Set a creature's portrait with its appearance",
+            )
+            .on_hover_text(
+                "Give a creature the portrait its new appearance names in appearance.2da",
+            );
+        }
+        "Appearance" => {
+            labelled(ui, LABEL_W, "Interface size", |ui| {
+                // (Sizes the screen has no room for not offered, as in View ›
+                // Interface Size; a larger size saved stays as saved.)
+                let largest = ui
+                    .data(|d| d.get_temp::<u16>(crate::commands::largest_ui_scale_id()))
+                    .unwrap_or(UI_SCALES[UI_SCALES.len() - 1]);
+                let saved = draft.ui_scale;
+                let offered = |s: u16| s <= largest || s == saved;
+                let r = crate::widgets::dropdown("ui-scale")
+                    .width(96.0)
+                    .selected_text(format!("{}%", draft.ui_scale))
+                    .show_with(
+                        ui,
+                        &mut draft.ui_scale,
+                        || UI_SCALES.into_iter().filter(|&s| offered(s)).collect(),
+                        |ui, current| {
+                            for s in UI_SCALES {
+                                let row = egui::Button::selectable(*current == s, format!("{s}%"));
+                                let r = ui.add_enabled(offered(s), row);
+                                if r.on_disabled_hover_text(crate::commands::NO_ROOM_FOR_SIZE)
+                                    .clicked()
+                                {
+                                    *current = s;
+                                }
+                            }
+                        },
+                    )
+                    .on_hover_text(
+                        "Make the whole interface larger or smaller (set when you choose OK)",
+                    );
+                say_name(&r, "Interface size");
+            });
+            under_label(ui, LABEL_W, |ui| ui.check_box(&mut draft.light_theme, "Light theme"));
+            under_label(ui, LABEL_W, |ui| {
+                ui.check_box(&mut draft.smooth_scrolling, "Smooth scrolling")
+                    .on_hover_text("Ease the mouse wheel's scrolling and jumps over a moment")
+            });
+            under_label(ui, LABEL_W, |ui| {
+                ui.check_box(&mut draft.colored_icons, "Colored icons").on_hover_text(
+                    "Give each object kind its own color in the module tree, Outliner and palette.",
+                )
+            });
+            graphics_backend(ui, draft, drawing_with, passes_over);
+        }
+        "Questions" => questions(ui, draft),
+        "Warnings" => {
+            ui.check_box(
+                &mut draft.namespace_warning,
+                "Show reserved Blueprint ResRef namespace warning",
+            )
+            .on_hover_text("Warn about a blueprint named like the game's (nw_, x0_ to x3_)");
+            ui.check_box(&mut draft.standard_warning, "Show standard resource overwrite warning")
+                .on_hover_text("Warn when the module adds a resource the game has");
+            ui.check_box(&mut draft.hak_warning, "Show resource in Hak Pak warning")
+                .on_hover_text("Warn when a hak has a resource the module adds (the hak's wins)");
+            ui.check_box(
+                &mut draft.duplicate_tags_warning,
+                "Show duplicate tags warning after a paste or a copy",
+            )
+            .on_hover_text(DUPLICATE_TAGS_TIP);
+            ui.check_box(
+                &mut draft.spell_warning,
+                "Show invalid creature spell assignment warning",
+            )
+            .on_hover_text(
+                "Spells on a creature's Spells page too high for its level, or too many",
+            );
+            ui.check_box(&mut draft.inventory_warning, "Show creature inventory warning")
+                .on_hover_text(
+                    "Items on a creature's Inventory page that its feats or level don't allow",
+                );
+        }
+        _ => {
+            let log = crate::trace::path().map(|p| p.display().to_string()).unwrap_or_default();
+            ui.check_box(&mut draft.debug_log, "Write a debug log").on_hover_text(format!(
+                "What Moonglow does, step by step, for a bug report: {log}"
+            ));
+        }
+    }
+}
+
+/// The choices of Questions' dropdowns, each as its dropdown shows it.
+const QUESTION_CHOICES: [&str; 12] = [
+    "Ask which to open",
+    "Open the folder",
+    "Open the .mod",
+    "Ask: append or overwrite",
+    "Append to it",
+    "Overwrite it",
+    "Ask: replace or skip them",
+    "Replace them",
+    "Skip them",
+    "Ask, as Aurora",
+    "Add the feats",
+    "Don't equip it",
+];
+
+/// The Questions' labels, in their order.
+const QUESTION_LABELS: [&str; 4] = [
+    "A .mod with its folder beside it",
+    "Exporting to an archive there",
+    "Files there already",
+    "Equipping without the feats",
+];
+
+/// How wide a question's dropdown must be for its longest choice to show
+/// whole: the text in the body font, the box's padding and its chevron
+/// (M4's U23 fix: measured, not a guess, so the labels stand beside their
+/// dropdowns wherever the column holds both).
+fn question_least(ui: &Ui) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let widest = (QUESTION_CHOICES.iter())
+        .map(|c| {
+            ui.fonts_mut(|f| f.layout_no_wrap(c.to_string(), font.clone(), egui::Color32::WHITE))
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    let s = ui.spacing();
+    (widest + 2.0 * s.button_padding.x + s.icon_width + s.icon_spacing).ceil()
+}
+
+/// A Questions row: `label` in the label column `label_w` wide and the
+/// dropdown `add` puts beside it, where the column has the room for both
+/// (the board's); else, where it truly has not (its longest choice would
+/// be cut: [`question_least`]), the label over the dropdown, which then
+/// has the column's width.
+fn question<R>(
+    ui: &mut Ui,
+    (label_w, least): (f32, f32),
+    label: &str,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    if ui.available_width() >= label_w + ui.spacing().item_spacing.x + least {
+        return labelled(ui, label_w, label, add);
+    }
+    let text = egui::RichText::new(label).color(mg_uikit::tokens(ui.ctx()).text);
+    ui.add(egui::Label::new(text).wrap());
+    ui.horizontal(add).inner
+}
+
+/// Gives a dropdown its label as its accessible name (the label is
+/// drawn beside it, not in it).
+fn say_name(r: &egui::Response, label: &str) {
+    r.ctx.accesskit_node_builder(r.id, |n| n.set_label(label));
+}
+
+/// Options › General › Questions: what Moonglow asks, each a dropdown in
+/// the value column of a label column 186 wide (the board's `.form.q`),
+/// then the two asked before deleting and closing.
+fn questions(ui: &mut Ui, draft: &mut OptionsDraft) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "What Moonglow asks, answered here once for all: each question's \"Always do \
+                 this\" sets it too.",
+            )
+            .color(mg_uikit::tokens(ui.ctx()).text_3),
+        )
+        .wrap(),
+    );
+    // (The dropdowns fill the value column, as the board's `.combo.grow`.)
+    let grow = |ui: &Ui| (ui.available_width()).max(120.0);
+    // (The label column, and the least a dropdown needs: measured once.
+    // The column is the board's 186 where that leaves the dropdowns their
+    // least, else as narrow as the longest label, before any label goes
+    // over its dropdown.)
+    let least = question_least(ui);
+    let room = ui.available_width() - ui.spacing().item_spacing.x - least;
+    let label_w = if room >= QUESTION_LABEL_W {
+        QUESTION_LABEL_W
+    } else {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let width = |l: &&str| {
+            let shown = ui
+                .fonts_mut(|f| f.layout_no_wrap(l.to_string(), font.clone(), egui::Color32::WHITE));
+            shown.size().x
+        };
+        QUESTION_LABELS.iter().map(width).fold(0.0, f32::max).ceil()
+    };
+    let q = (label_w, least);
+    question(ui, q, QUESTION_LABELS[0], |ui| {
+        let name = |c: &ModuleFolders| match c {
+            ModuleFolders::Ask => "Ask which to open",
+            ModuleFolders::Folder => "Open the folder",
+            ModuleFolders::Module => "Open the .mod",
+        };
+        let all = [ModuleFolders::Ask, ModuleFolders::Folder, ModuleFolders::Module];
+        let r = crate::widgets::dropdown("module-folders")
+            .width(grow(ui))
+            .selected_text(name(&draft.module_folders))
+            .show(ui, &mut draft.module_folders, &all, name)
+            .on_hover_text("Which to open when a .mod has a folder of its name beside it");
+        say_name(&r, "A .mod with its folder beside it");
+    });
+    question(ui, q, QUESTION_LABELS[1], |ui| {
+        let name = |c: &ExistingArchive| match c {
+            ExistingArchive::Ask => "Ask: append or overwrite",
+            ExistingArchive::Append => "Append to it",
+            ExistingArchive::Overwrite => "Overwrite it",
+        };
+        let all = [ExistingArchive::Ask, ExistingArchive::Append, ExistingArchive::Overwrite];
+        let r = crate::widgets::dropdown("export-existing")
+            .width(grow(ui))
+            .selected_text(name(&draft.export_existing))
+            .show(ui, &mut draft.export_existing, &all, name)
+            .on_hover_text("What File › Export… does with an .erf that is there already");
+        say_name(&r, "Exporting to an archive there");
+    });
+    question(ui, q, QUESTION_LABELS[2], |ui| {
+        let name = |c: &FilesThere| match c {
+            FilesThere::Ask => "Ask: replace or skip them",
+            FilesThere::Replace => "Replace them",
+            FilesThere::Skip => "Skip them",
+        };
+        let all = [FilesThere::Ask, FilesThere::Replace, FilesThere::Skip];
+        let r = crate::widgets::dropdown("files-there")
+            .width(grow(ui))
+            .selected_text(name(&draft.files_there))
+            .show(ui, &mut draft.files_there, &all, name)
+            .on_hover_text("What to do with files of the same names where Moonglow writes");
+        say_name(&r, "Files there already");
+    });
+    question(ui, q, QUESTION_LABELS[3], |ui| {
+        let name = |c: &MissingFeats| match c {
+            MissingFeats::Ask => "Ask, as Aurora",
+            MissingFeats::Add => "Add the feats",
+            MissingFeats::Refuse => "Don't equip it",
+        };
+        let all = [MissingFeats::Ask, MissingFeats::Add, MissingFeats::Refuse];
+        let r = crate::widgets::dropdown("missing-feats")
+            .width(grow(ui))
+            .selected_text(name(&draft.missing_feats))
+            .show(ui, &mut draft.missing_feats, &all, name)
+            .on_hover_text("Equipping a creature with an item it lacks the feats for");
+        say_name(&r, "Equipping without the feats");
+    });
+    ui.check_box(&mut draft.ask_before_delete, "Ask before deleting from the module")
+        .on_hover_text("Delete… in the module tree asks first. Off, only when something names it.");
+    ui.check_box(&mut draft.ask_before_closing, "Ask before the window is closed")
+        .on_hover_text("Ask before closing Moonglow, even with nothing unsaved");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Anti-aliasing draws the most samples the GPU takes at or under the
+    /// choice: OpenGL (one alone) draws Off whatever is chosen; 2× on a
+    /// GPU without it draws Off, not more than asked.
+    #[test]
+    fn the_samples_drawn_are_the_most_offered_at_or_under_the_choice() {
+        for (chosen, offered, drawn) in [
+            (None, &[1, 2, 4][..], 4),
+            (Some(2), &[1, 2, 4], 2),
+            (Some(1), &[1, 2, 4], 1),
+            (None, &[1, 4], 4),
+            (Some(2), &[1, 4], 1),
+            (None, &[1], 1),
+            (Some(2), &[1], 1),
+            (None, &[], 1),
+        ] {
+            assert_eq!(samples_drawn(chosen, offered), drawn, "{chosen:?} of {offered:?}");
+        }
+    }
+
+    /// Options' OK wrote back every setting as it was when the tab was
+    /// opened: one set since from somewhere else (a question's "Always do
+    /// this", an update skipped) was put back (the review of November
+    /// 2026, S13). What the draft changed is written; the rest stays as
+    /// it is now.
+    #[test]
+    fn ok_writes_what_the_draft_changed_and_leaves_the_rest_as_it_is_now() {
+        let s = Settings::default();
+        let mut d = OptionsDraft::from_settings(&s);
+        // Set elsewhere while the tab is open.
+        let mut now = s.clone();
+        now.files_there = crate::settings::FilesThere::Replace;
+        now.update_skipped = Some("9.9.9".into());
+        now.scratch_dir = Some("/tmp/scratch".into());
+        // Changed in the tab.
+        d.build_on_save = !d.build_on_save;
+        let t = d.apply(&now);
+        assert_eq!(t.build_on_save, d.build_on_save);
+        assert_eq!(t.files_there, crate::settings::FilesThere::Replace);
+        assert_eq!(t.update_skipped.as_deref(), Some("9.9.9"));
+        assert_eq!(t.scratch_dir, now.scratch_dir);
+        // An option changed in the tab wins over one set elsewhere.
+        d.files_there = crate::settings::FilesThere::Skip;
+        assert_eq!(d.apply(&now).files_there, crate::settings::FilesThere::Skip);
+        // Nothing changed in the tab: the settings as they are.
+        assert_eq!(OptionsDraft::from_settings(&s).apply(&now), now);
+    }
 
     #[test]
     fn looks_alone_do_not_reload_the_game() {
@@ -1731,6 +2547,45 @@ mod tests {
         assert_eq!(d.apply(&s).dialog_font_size, Some(18));
         d.game_root = "/games/nwn".into();
         assert!(d.moves_game(&s));
+    }
+
+    /// What Options › Folders says of a user folder is what a look at it
+    /// finds (it is there, and where its `nwn.ini` puts `hak` and `tlk`),
+    /// kept for a while: read again when another folder is typed and
+    /// when the time is up, not every frame.
+    #[test]
+    fn the_user_folder_is_looked_at_once_a_while() {
+        let user = mg_testkit::scratch_dir("ui-options-user-folder");
+        let other = user.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let ini = user.join("nwn.ini");
+        std::fs::write(&ini, "[Alias]\nHAK=haks-elsewhere\nTLK=/srv/nwn/tlk\n").unwrap();
+        let aliased = vec![
+            ("hak", user.join("haks-elsewhere")),
+            ("tlk", std::path::PathBuf::from("/srv/nwn/tlk")),
+        ];
+        let looked = UserFolder::look(&user);
+        if cfg!(not(windows)) {
+            assert_eq!(looked, UserFolder { exists: true, aliased });
+        }
+        let gone = user.join("not-there");
+        assert_eq!(UserFolder::look(&gone), UserFolder { exists: false, aliased: Vec::new() });
+        egui::__run_test_ui(|ui| {
+            let now = std::time::Instant::now();
+            assert_eq!(user_folder_seen(ui, &user, now), looked);
+            // (Kept: the file gone is not seen yet.)
+            std::fs::remove_file(&ini).unwrap();
+            let soon = now + USER_FOLDER_KEPT / 2;
+            assert_eq!(user_folder_seen(ui, &user, soon), looked);
+            // Another folder typed: looked at at once; and back.
+            assert_eq!(user_folder_seen(ui, &gone, soon), UserFolder::look(&gone));
+            let plain = UserFolder { exists: true, aliased: Vec::new() };
+            assert_eq!(user_folder_seen(ui, &user, soon), plain);
+            // The time up: looked at again.
+            std::fs::write(&ini, "[Alias]\nHAK=haks-elsewhere\nTLK=/srv/nwn/tlk\n").unwrap();
+            assert_eq!(user_folder_seen(ui, &user, soon + USER_FOLDER_KEPT / 2), plain);
+            assert_eq!(user_folder_seen(ui, &user, soon + USER_FOLDER_KEPT), looked);
+        });
     }
 
     /// Options › Language alone, OK: applied as a language is (text fields
@@ -1770,6 +2625,7 @@ mod tests {
         (d.area_names, d.categories_by_name, d.drag_windows_anywhere) = (true, true, true);
         d.ui_scale = 125;
         (d.name_resrefs, d.palette_cr, d.light_theme) = (true, false, true);
+        (d.tree_tags, d.appearance_portrait, d.tree_extensions) = (true, true, true);
         d.armor_on_woman = true;
         d.script_templates = " /tmp/templates ".into();
         d.scratch_dir = "/tmp/scratch".into();
@@ -1777,14 +2633,21 @@ mod tests {
         d.nwsync_upload_input = true;
         assert!(d.live_check, "checked as you type unless asked");
         d.live_check = false;
+        assert!(d.symbol_tips, "declarations in tips unless asked");
+        d.symbol_tips = false;
         let t = d.apply(&s);
         assert!(t.no_live_check);
+        assert!(t.no_symbol_tips && !OptionsDraft::from_settings(&t).symbol_tips, "and kept");
         assert!(t.build_on_save && t.minimize_on_test && t.auto_compile && t.debug_info);
         assert!(t.area_names && !s.area_names, "areas by ResRef unless asked");
         assert!(t.categories_by_name && !s.categories_by_name, "the palette's order unless asked");
         assert!(t.drag_windows_anywhere && !s.drag_windows_anywhere, "by the tab bar unless asked");
         assert_eq!((t.ui_scale, s.ui_scale), (Some(125), None), "the usual size unless asked");
         assert!(t.name_resrefs && t.palette_no_cr && t.light_theme);
+        assert!(t.tree_tags && !s.tree_tags, "names alone unless asked");
+        assert!(t.tree_extensions && !s.tree_extensions, "without extensions unless asked");
+        assert!(OptionsDraft::from_settings(&t).tree_extensions, "and kept");
+        assert!(t.appearance_portrait && !s.appearance_portrait, "the portrait kept unless asked");
         assert!(t.armor_on_woman && !s.armor_on_woman, "on a man unless asked");
         assert!(OptionsDraft::from_settings(&t).armor_on_woman, "and kept");
         use crate::settings::GraphicsBackend;
@@ -1793,10 +2656,6 @@ mod tests {
         let g = d.apply(&s);
         assert_eq!(g.graphics_backend, GraphicsBackend::Direct3d12);
         assert_eq!(OptionsDraft::from_settings(&g).graphics_backend, GraphicsBackend::Direct3d12);
-        assert!(!s.toolbar_icons_only, "icons and text unless asked");
-        d.toolbar_icons_only = true;
-        let icons = d.apply(&s);
-        assert!(icons.toolbar_icons_only && OptionsDraft::from_settings(&icons).toolbar_icons_only);
         // Unless asked: names alone, challenge ratings shown, the dark theme.
         let plain = OptionsDraft::from_settings(&s);
         assert!(!plain.name_resrefs && plain.palette_cr && !plain.light_theme);
@@ -1820,6 +2679,8 @@ mod tests {
         assert!(!d.merchant_signs, "stores are arrows unless asked");
         assert!(!d.edit_group_tiles, "groups are one thing unless asked");
         assert!(d.turn_ring, "the turning ring shows unless switched off");
+        assert!(!d.middle_drag_moves, "a middle drag turns the view unless asked");
+        d.middle_drag_moves = true;
         assert_eq!(d.area_background, None, "the fog color by default");
         use crate::settings::ShadowQuality;
         assert_eq!(d.shadow_quality, ShadowQuality::Fast, "the shadow map unless asked");
@@ -1830,11 +2691,15 @@ mod tests {
         d.texture_limit = Some(512);
         assert_eq!(d.area_resolution, None, "every pixel unless asked");
         d.area_resolution = Some(75);
+        assert_eq!(d.anti_aliasing, None, "four samples unless asked");
+        d.anti_aliasing = Some(2);
         let t = d.apply(&s);
+        assert_eq!(t.anti_aliasing, Some(2));
         assert_eq!(t.shadow_quality, ShadowQuality::High);
         assert_eq!((t.texture_limit, t.area_resolution), (Some(512), Some(75)));
         assert!(t.no_spawn_markers && !t.no_door_arrows);
         assert!(t.edit_group_tiles && OptionsDraft::from_settings(&t).edit_group_tiles);
+        assert!(t.middle_drag_moves && OptionsDraft::from_settings(&t).middle_drag_moves);
         assert_eq!(d.spawn_marker_size, (12, 4), "Aurora's Height and Width");
         let mut d = OptionsDraft::from_settings(&t);
         d.spawn_marker_size = (20, 6);
@@ -1890,6 +2755,41 @@ mod tests {
         assert!(d.apply(&s).warn_duplicate_tags);
     }
 
+    /// Closing a window by its tab's × keeps what it changed unless asked
+    /// otherwise (a builder's report: Aurora's close button is its
+    /// Cancel), and the choice is kept.
+    #[test]
+    fn open_editors_is_drafted_and_kept() {
+        use crate::settings::OpenEditors;
+        for (was, now) in
+            [(OpenEditors::Floating, OpenEditors::Tabs), (OpenEditors::Tabs, OpenEditors::Floating)]
+        {
+            let s = Settings { open_editors: was, ..Settings::default() };
+            let mut d = OptionsDraft::from_settings(&s);
+            assert_eq!(d.open_editors, was);
+            d.open_editors = now;
+            let t = d.apply(&s);
+            assert_eq!(t.open_editors, now);
+            assert!(!d.moves_game(&s), "no reload for it");
+            // Left as found, set meanwhile from elsewhere: kept as it is.
+            let d = OptionsDraft::from_settings(&s);
+            let meanwhile = Settings { open_editors: now, ..s.clone() };
+            assert_eq!(d.apply(&meanwhile).open_editors, now);
+        }
+    }
+
+    #[test]
+    fn closing_a_window_keeps_its_changes_until_asked_otherwise() {
+        let s = Settings::default();
+        let mut d = OptionsDraft::from_settings(&s);
+        assert!(!d.close_cancels && !s.close_cancels);
+        d.close_cancels = true;
+        let t = d.apply(&s);
+        assert!(t.close_cancels);
+        assert!(OptionsDraft::from_settings(&t).close_cancels, "and kept");
+        assert!(!d.moves_game(&s), "no reload for it");
+    }
+
     #[test]
     fn the_editing_language_applies() {
         let s = Settings::default();
@@ -1932,8 +2832,9 @@ mod tests {
     }
 
     /// Options › Verify: groups, checks and categories are checkboxes,
-    /// the rest (haks, folders, resources) its field; what isn't
-    /// something to leave out is dropped when applied.
+    /// the rest (haks, folders, resources, and what only a player's own
+    /// content has, which has no box) its field; what isn't something to
+    /// leave out is dropped when applied.
     #[test]
     fn verify_s_checkboxes_and_field_apply() {
         let s = Settings {
@@ -1943,7 +2844,9 @@ mod tests {
                 "set-hole".into(),
                 "ttr01.set".into(),
                 "references:creatures".into(),
+                "references:override".into(),
                 "example.tags/tag-case".into(),
+                "references:local".into(),
             ],
             ..Settings::default()
         };
@@ -1952,7 +2855,10 @@ mod tests {
             d.verify_skip,
             ["tilesets", "set-hole", "references:creatures", "example.tags/tag-case"]
         );
-        assert_eq!(d.verify_more, "tdod_tiles01.hak, ttr01.set");
+        assert_eq!(
+            d.verify_more,
+            "tdod_tiles01.hak, ttr01.set, references:override, references:local"
+        );
         d.verify_more = "tdod_tiles01.hak,ttr01.set  override, tilesetz".into();
         d.verify_skip.retain(|w| w != "tilesets");
         let t = d.apply(&s);

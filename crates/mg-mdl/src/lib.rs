@@ -22,6 +22,7 @@ pub mod binary;
 pub mod binary_write;
 pub mod compile;
 pub mod ctrl;
+pub mod facts;
 pub mod keywords;
 pub mod lint;
 pub mod outline;
@@ -106,6 +107,29 @@ impl Model {
     /// A node by name (case-insensitive).
     pub fn node(&self, name: &str) -> Option<usize> {
         self.nodes.iter().position(|n| n.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The model under another name: its own name, and its root node's,
+    /// its animations' roots and their nodes that go by the old name (any
+    /// case). The rest, its supermodel among them, stays as it is.
+    pub fn renamed(&self, to: &str) -> Model {
+        let mut m = self.clone();
+        let from = std::mem::replace(&mut m.name, to.to_string());
+        let rename = |n: &mut String| {
+            if n.eq_ignore_ascii_case(&from) {
+                *n = to.to_string();
+            }
+        };
+        for n in &mut m.nodes {
+            rename(&mut n.name);
+        }
+        for a in &mut m.animations {
+            rename(&mut a.animroot);
+            for n in &mut a.nodes {
+                rename(&mut n.name);
+            }
+        }
+        m
     }
 
     /// An animation by name (case-insensitive).
@@ -428,6 +452,28 @@ impl Mesh {
         let faces = if self.drawn.is_empty() { self.faces.as_slice() } else { &[] };
         self.drawn.iter().copied().chain(faces.iter().map(|f| f.vertices))
     }
+
+    /// A square `side` across about the origin, flat at height `z` and
+    /// facing up (two faces), drawn in `color` (diffuse and ambient), with
+    /// no texture and no shadow: the renderer's probe's quads and the model
+    /// viewer's ground.
+    pub fn square(side: f32, z: f32, color: Vec3) -> Mesh {
+        let h = side / 2.0;
+        Mesh {
+            diffuse: color,
+            ambient: color,
+            render: true,
+            vertices: vec![[-h, -h, z], [h, -h, z], [h, h, z], [-h, h, z]],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+            uvs: [vec![[0.0, 0.0]; 4], vec![], vec![], vec![]],
+            faces: vec![
+                Face { vertices: [0, 1, 2], material: 0 },
+                Face { vertices: [0, 2, 3], material: 0 },
+            ],
+            source: vec![0, 1, 2, 3],
+            ..Default::default()
+        }
+    }
 }
 
 /// What a mesh adds.
@@ -532,20 +578,54 @@ pub fn animations(
     model: &std::sync::Arc<Model>,
     load: &dyn Fn(&str) -> Option<std::sync::Arc<Model>>,
 ) -> Vec<(String, std::sync::Arc<Model>)> {
-    let mut out: Vec<(String, std::sync::Arc<Model>)> = Vec::new();
+    animations_scaled(model, load).into_iter().map(|(n, m, _)| (n, m)).collect()
+}
+
+/// [`animations`], each with the scale the model plays its positions at:
+/// 1 for the model's own; for a supermodel's, the `setanimationscale` of
+/// the model times that of each supermodel between it and the one whose
+/// animation it is, not counting that one's own (the client: a model of
+/// 2 on one of 3 plays the owner's animation at 6, the owner's scale,
+/// 0.5 or 1, alike; `batch6_supermodel_chain`). A scale that isn't a
+/// positive number counts as 1.
+///
+/// The chain is walked to its end, however long: a builder's skeleton
+/// whose animations were split into 23 supermodels lost those past the
+/// 17th when the walk stopped there. It stops where a model comes back
+/// (a chain that loops) or after [`SUPERMODEL_CHAIN_LIMIT`] links.
+pub fn animations_scaled(
+    model: &std::sync::Arc<Model>,
+    load: &dyn Fn(&str) -> Option<std::sync::Arc<Model>>,
+) -> Vec<(String, std::sync::Arc<Model>, f32)> {
+    let mut out: Vec<(String, std::sync::Arc<Model>, f32)> = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(model.name.to_ascii_lowercase());
     let mut current = Some(model.clone());
-    let mut depth = 0;
+    let mut scale = 1.0;
     while let Some(m) = current {
         for a in &m.animations {
-            if !out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&a.name)) {
-                out.push((a.name.clone(), m.clone()));
+            if names.insert(a.name.to_ascii_lowercase()) {
+                out.push((a.name.clone(), m.clone(), scale));
             }
         }
-        depth += 1;
-        current = if depth > 16 { None } else { m.supermodel.as_deref().and_then(load) };
+        if m.animation_scale.is_finite() && m.animation_scale > 0.0 {
+            scale *= m.animation_scale;
+        }
+        // (Each loaded by name: a chain that loops names one again.)
+        current = m
+            .supermodel
+            .as_deref()
+            .filter(|s| seen.len() <= SUPERMODEL_CHAIN_LIMIT && seen.insert(s.to_ascii_lowercase()))
+            .and_then(load);
     }
     out
 }
+
+/// The most supermodels a chain is followed through ([`animations_scaled`]):
+/// far past any builder's (23 in the longest seen), a stop for a chain
+/// that never ends.
+pub const SUPERMODEL_CHAIN_LIMIT: usize = 256;
 
 /// `a` less `b`.
 pub(crate) fn sub(a: Vec3, b: Vec3) -> Vec3 {
@@ -598,6 +678,114 @@ mod tests {
         assert!((x[0] - 0.5f32.sin()).abs() < 1e-6 && (x[3] - 0.5f32.cos()).abs() < 1e-6);
         assert_eq!(x[1..3], [0.0, 0.0]);
         assert_eq!(axis_angle([0.0, 0.0, 0.0], 0.0), IDENTITY);
+    }
+
+    /// The classification byte as the game's compiler writes it
+    /// (nwn-mdl-spec MDL-ASCII-021, its classification table): any word
+    /// but these four leaves the byte 0, `gui` and `item` among them (as
+    /// 323 and 126 of the game's text models declare), and only `effects`
+    /// has a plural. A compiled model's byte reads back the same way.
+    #[test]
+    fn a_classification_the_game_does_not_know_is_other() {
+        let known = [
+            ("effect", Classification::Effect),
+            ("Effects", Classification::Effect),
+            ("TILE", Classification::Tile),
+            ("character", Classification::Character),
+            ("door", Classification::Door),
+        ];
+        for (word, class) in known {
+            assert_eq!(Classification::from_name(word), class, "{word}");
+        }
+        for word in ["gui", "GUI", "item", "other", "tiles", "characters", "doors", "placeable"] {
+            assert_eq!(Classification::from_name(word), Classification::Other, "{word}");
+        }
+        let bytes = [
+            (0, Classification::Other),
+            (1, Classification::Effect),
+            (2, Classification::Tile),
+            (4, Classification::Character),
+            (8, Classification::Door),
+        ];
+        for (byte, class) in bytes {
+            assert_eq!(Classification::from_byte(byte), class, "{byte}");
+        }
+    }
+
+    /// The client's chain of scaled supermodels (`batch6_supermodel_chain`):
+    /// a model of 2 on one of 3 plays the owner's animation at 6, the
+    /// supermodel's own at 2, its own at 1; the owner's scale (0.5) not
+    /// counted; a scale of 0 counts as 1.
+    #[test]
+    fn a_chain_of_supermodels_scales_by_each_link_but_the_owner() {
+        use std::sync::Arc;
+        let model = |name: &str, scale: f32, sup: Option<&str>, anims: &[&str]| {
+            Arc::new(Model {
+                name: name.into(),
+                animation_scale: scale,
+                supermodel: sup.map(Into::into),
+                animations: anims
+                    .iter()
+                    .map(|a| Animation { name: (*a).into(), ..Default::default() })
+                    .collect(),
+                ..Default::default()
+            })
+        };
+        let owner = model("owner", 0.5, None, &["walk", "run"]);
+        let middle = model("middle", 3.0, Some("owner"), &["run", "sit"]);
+        let zero = model("zero", 0.0, Some("middle"), &[]);
+        let load = |n: &str| match n {
+            "owner" => Some(owner.clone()),
+            "middle" => Some(middle.clone()),
+            "zero" => Some(zero.clone()),
+            _ => None,
+        };
+        let top = model("top", 2.0, Some("middle"), &["idle"]);
+        let got: Vec<(String, String, f32)> = animations_scaled(&top, &load)
+            .into_iter()
+            .map(|(n, m, s)| (n, m.name.clone(), s))
+            .collect();
+        let want = [("idle", "top", 1.0), ("run", "middle", 2.0), ("sit", "middle", 2.0)];
+        let want: Vec<(String, String, f32)> =
+            want.iter().map(|(a, b, s)| (a.to_string(), b.to_string(), *s)).collect();
+        assert_eq!(got[..3], want[..]);
+        assert_eq!(got[3], ("walk".into(), "owner".into(), 6.0));
+        let on_zero = model("on_zero", 1.0, Some("zero"), &[]);
+        let walk = animations_scaled(&on_zero, &load).into_iter().find(|a| a.0 == "walk");
+        assert_eq!(walk.map(|a| a.2), Some(3.0));
+        assert_eq!(animations(&top, &load).len(), 4);
+    }
+
+    /// A builder's skeleton has its animations in a chain of 23
+    /// supermodels (a builder's report, 2026-11-04): those of the 18th and
+    /// on were lost where the walk stopped at 17. Every link's are found;
+    /// a chain that loops back ends where it comes back.
+    #[test]
+    fn a_long_chain_of_supermodels_is_followed_to_its_end() {
+        use std::sync::Arc;
+        let link = |i: usize, sup: Option<String>| {
+            Arc::new(Model {
+                name: format!("link{i}"),
+                animation_scale: 1.0,
+                supermodel: sup,
+                animations: vec![Animation { name: format!("anim{i}"), ..Default::default() }],
+                ..Default::default()
+            })
+        };
+        let chain: Vec<Arc<Model>> =
+            (0..30).map(|i| link(i, (i < 29).then(|| format!("link{}", i + 1)))).collect();
+        let load = |n: &str| {
+            let i: usize = n.strip_prefix("link")?.parse().ok()?;
+            chain.get(i).cloned()
+        };
+        let found = animations(&chain[0], &load);
+        assert_eq!(found.len(), 30);
+        assert_eq!(found[29].0, "anim29");
+        // (link2 → link0: back to the start.)
+        let looped: Vec<Arc<Model>> =
+            (0..3).map(|i| link(i, Some(format!("link{}", (i + 1) % 3)))).collect();
+        let load = |n: &str| looped.get(n.strip_prefix("link")?.parse::<usize>().ok()?).cloned();
+        assert_eq!(animations(&looped[0], &load).len(), 3);
     }
 
     /// A plane whose `faces` list says `count` and has `rows`.

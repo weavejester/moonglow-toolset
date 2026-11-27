@@ -24,7 +24,7 @@ use mg_edit::fix::Fix;
 use mg_edit::{Command, Workspace};
 use mg_module::ModuleLocation;
 use mg_plugin::{
-    EVENT_BUDGET, Event, EventKind, Host, Input, Plugin, PluginError, Question, Selected, run_event,
+    Event, EventKind, Host, Input, Plugin, PluginError, Question, Selected, run_event,
 };
 use mg_resman::ResKey;
 
@@ -48,6 +48,21 @@ impl Made {
     /// Resources made by `by`.
     pub fn resources(by: &'static str, resources: Vec<ResKey>) -> Made {
         Made { by, resources, objects: Vec::new(), pasted: false }
+    }
+
+    /// The resources `cmd` makes (those it writes that the module of `ws`
+    /// lacks), made by `by`.
+    pub fn new_in(ws: &mg_edit::Workspace, cmd: &Command, by: &'static str) -> Made {
+        let mut made = Vec::new();
+        for e in &cmd.edits {
+            if let mg_edit::Edit::SetResource { key, data: Some(_) } = e
+                && !ws.module.contains(key)
+                && !made.contains(key)
+            {
+                made.push(*key);
+            }
+        }
+        Made::resources(by, made)
     }
 
     /// Objects placed (or `pasted`) by `by`.
@@ -98,7 +113,7 @@ pub struct Held {
 pub struct SaveState {
     pub held: Option<Held>,
     /// Save Anyway: the next save is not held again.
-    cleared: bool,
+    pub(crate) cleared: bool,
 }
 
 /// A host for a handler that runs at once: nobody is asked (a question is
@@ -143,7 +158,7 @@ fn run_at_once(
     let host = Rc::new(AtOnce::default());
     let input = Input {
         settings: Some(settings),
-        budget: Some(EVENT_BUDGET),
+        budget: Some(app.plugin_event_budget()),
         ..Input::new(module, app.game.clone())
     };
     let made = run_event(plugin, id, event, input, host.clone());
@@ -343,78 +358,91 @@ pub(crate) fn queue_saved(app: &mut Moonglow, was: Option<&mg_module::Module>) {
 pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some(held) = app.plugins.save.held.clone() else { return };
     let refused = held.heard.iter().any(|h| h.refused);
-    let (mut anyway, mut close, mut fixed) = (false, false, None);
-    let modal = egui::Modal::new(egui::Id::new("plugin-save")).show(ctx, |ui| {
-        ui.set_width(540.0);
-        ui.heading(if refused { "Not saved" } else { "Before saving" });
-        ui.add_space(4.0);
-        ui.label(if refused {
+    let mut fixed = None;
+    let modal = crate::widgets::modal_window(ctx, egui::Id::new("plugin-save")).show(ctx, |ui| {
+        crate::widgets::modal_titled_foot(
+            ui,
+            if refused { "Not Saved" } else { "Before Saving" },
+            |ui| {
+                // (Never past the application's window: the modal holds it.)
+                ui.set_width(ui.available_width().min(540.0));
+                ui.label(if refused {
             "A plugin refuses what the save would write. Nothing was written; change it (or \
              make the fix offered), then save again."
         } else {
             "The plugins have warnings about what the save would write. Nothing is written yet."
         });
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-            for (i, h) in held.heard.iter().enumerate() {
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    let (word, color) = match h.refused {
-                        true => ("Refused", ui.visuals().error_fg_color),
-                        false => ("Warning", ui.visuals().warn_fg_color),
-                    };
-                    ui.colored_label(color, egui::RichText::new(word).strong());
-                    ui.label(egui::RichText::new(&h.plugin).strong());
-                    if let Some(r) = &h.resource {
-                        ui.weak(r.to_string());
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (i, h) in held.heard.iter().enumerate() {
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            let (word, color) = match h.refused {
+                                true => ("Refused", ui.visuals().error_fg_color),
+                                false => ("Warning", ui.visuals().warn_fg_color),
+                            };
+                            ui.colored_label(color, egui::RichText::new(word).strong());
+                            ui.label(egui::RichText::new(&h.plugin).strong());
+                            if let Some(r) = &h.resource {
+                                ui.weak(r.to_string());
+                            }
+                        });
+                        ui.label(&h.text);
+                        if let Some(fix) = &h.fix
+                            && ui
+                                .button(&fix.label)
+                                .on_hover_text(
+                                    "Make this change (Edit › Undo takes it back), and save again",
+                                )
+                                .clicked()
+                        {
+                            fixed = Some(i);
+                        }
                     }
                 });
-                ui.label(&h.text);
-                if let Some(fix) = &h.fix
-                    && ui
-                        .button(&fix.label)
-                        .on_hover_text(
-                            "Make this change (Edit › Undo takes it back), and save again",
-                        )
-                        .clicked()
-                {
-                    fixed = Some(i);
-                }
-            }
-        });
-        ui.separator();
-        ui.weak(
-            "Plugins check a save as their manifests declare (Plugins › Manage Plugins lists \
-             what each does, and disables one).",
+                ui.separator();
+                ui.weak(
+            "Plugins check a save as their manifests declare (the Plugins tab lists what each \
+             does, and disables one).",
         );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if !refused {
-                anyway =
-                    ui.button("Save Anyway").on_hover_text("Write the module as it is").clicked();
-            }
-            close = ui.button(if refused { "Close" } else { "Cancel" }).clicked();
-        });
+                let foot = crate::widgets::Foot::new();
+                let foot = match refused {
+                    true => foot.leave("Close"),
+                    false => foot
+                        .main("Save Anyway", true)
+                        .tip("Write the module as it is")
+                        .no_enter()
+                        .cancel(),
+                };
+                ((), foot)
+            },
+        )
+        .1
     });
+    let (stop, pressed) = (modal.should_close(), modal.inner);
+    let (anyway, close) = (pressed.main(), pressed.cancelled());
     if let Some(i) = fixed {
         let fix = held.heard[i].fix.clone().expect("a fix was clicked");
         app.plugins.save.held = None;
-        match app.apply(fix.command()) {
-            Ok(()) => {
-                app.log.info(format!("{}: fixed: {}", held.heard[i].plugin, fix.label));
-                // (Asked again: the plugins read the module as it now is.)
-                app.actions.push(held.then);
-            }
-            Err(e) => app.log.error(format!("{}: {}: {e}", held.heard[i].plugin, fix.label)),
-        }
+        apply_save_fix(
+            app,
+            held.heard[i].plugin.clone(),
+            fix.label.clone(),
+            fix.command(),
+            held.then,
+        );
     } else if anyway {
         app.plugins.save.held = None;
         app.plugins.save.cleared = true;
         // (The claims were asked before the plugins, and the module is as
-        // it was then: not asked again.)
-        app.claims.cleared = true;
+        // it was then: not asked again. Of a Save As they are not asked,
+        // so nothing takes the flag there: it would answer the next
+        // Save's question unasked.)
+        if matches!(held.then, Action::Save | Action::SaveThen(_)) {
+            app.claims.cleared = true;
+        }
         app.actions.push(held.then);
-    } else if close || modal.should_close() {
+    } else if close || stop {
         app.plugins.save.held = None;
         app.log.said(
             if refused { Level::Warning } else { Level::Info },
@@ -430,5 +458,31 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                 format!("{}: {at}{}", h.plugin, h.text),
             );
         }
+    }
+}
+
+/// Applies a quick-fix offered by a save warning, holding for the Protected
+/// Area prompt when needed so `claims.held` is never left unconsumed.
+pub(crate) fn apply_save_fix(
+    app: &mut Moonglow,
+    plugin: String,
+    label: String,
+    cmd: mg_edit::Command,
+    then: Action,
+) {
+    let retry = Action::ApplySaveFix {
+        plugin: plugin.clone(),
+        label: label.clone(),
+        cmd: cmd.clone(),
+        then: Box::new(then.clone()),
+    };
+    match app.apply_or_ask(cmd, Some(retry)) {
+        Ok(true) => {
+            app.log.info(format!("{plugin}: fixed: {label}"));
+            // (Asked again: the plugins read the module as it now is.)
+            app.actions.push(then);
+        }
+        Ok(false) => {}
+        Err(e) => app.log.error(format!("{plugin}: {label}: {e}")),
     }
 }

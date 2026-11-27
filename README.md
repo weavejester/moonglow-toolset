@@ -20,14 +20,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/jadzziaa/moonglow-toolset/releases/latest"><img src="https://img.shields.io/github/v/release/jadzziaa/moonglow-toolset?label=release" alt="Latest release"></a>
-  <a href="https://github.com/jadzziaa/moonglow-toolset/actions/workflows/ci.yml"><img src="https://github.com/jadzziaa/moonglow-toolset/actions/workflows/ci.yml/badge.svg?branch=develop" alt="CI"></a>
+  <a href="https://github.com/weavejester/moonglow-toolset/releases/latest"><img src="https://img.shields.io/github/v/release/weavejester/moonglow-toolset?label=release" alt="Latest release"></a>
+  <a href="https://github.com/weavejester/moonglow-toolset/actions/workflows/ci.yml"><img src="https://github.com/weavejester/moonglow-toolset/actions/workflows/ci.yml/badge.svg?branch=moonscar" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="License: GPL-3.0"></a>
   <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS-555" alt="Linux, Windows, macOS">
 </p>
 
 <p align="center">
-  <a href="https://github.com/jadzziaa/moonglow-toolset/releases/latest"><strong>Download</strong></a> ·
+  <a href="https://github.com/weavejester/moonglow-toolset/releases/latest"><strong>Download</strong></a> ·
   <a href="docs/manual/README.md"><strong>User manual</strong></a> ·
   <a href="docs/manual/14-coming-from-aurora.md"><strong>Coming from Aurora</strong></a>
 </p>
@@ -113,7 +113,7 @@ Moonglow's later work follows what builders have long asked of Aurora
 - **Plugins (experimental):** a team's own commands and checks, written
   in Luau and run in a sandbox; their edits are one step of Undo, and
   their checks run with Verify Module, in the window and in a build
-  pipeline. The plugin API is at 0.3 and may still change.
+  pipeline. The plugin API is at 0.9 and may still change.
 
 ![The script editor with a script from the original campaign](docs/images/script.png)
 

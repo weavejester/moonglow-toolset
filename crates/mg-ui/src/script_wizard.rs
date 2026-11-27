@@ -3,6 +3,7 @@
 //! do), fill a page for each, name the script. Finish writes the source,
 //! compiles it and sets it on the line, in one undoable command.
 
+use mg_uikit::Controls as _;
 use std::sync::Arc;
 
 use egui::Ui;
@@ -125,9 +126,59 @@ pub struct ScriptWizard {
     pub filter: String,
     pub name: String,
     pub open_editor: bool,
+    /// The conversation as it was when the wizard opened: `path` is a place
+    /// in it, and the wizard is a window over a live editor, so its line
+    /// is found again at Finish ([`ScriptWizard::field_now`]).
+    pub(crate) was: Option<Arc<mg_gff::Gff>>,
 }
 
 impl ScriptWizard {
+    /// Where the wizard's field is in the conversation as it is `now`:
+    /// `path` while nothing changed; else its line found again (lines are
+    /// numbered by their place, so a line deleted or put back before it
+    /// while the wizard was up left `path` on another line), and, for a
+    /// condition, its link found again among its parent's. `None` when the
+    /// line or the link is no longer there, or can't be told from others.
+    pub(crate) fn field_now(&self, now: &mg_gff::Gff) -> Option<GffPath> {
+        use mg_edit::Step;
+        use mg_module::dialog::{Kind, Renumbering, is_link, link_index};
+        let mut path = self.path.clone();
+        let Some(was) = self.was.as_deref().filter(|was| *was != now) else {
+            return path.get(&now.root).map(|_| path);
+        };
+        let map = Renumbering::by_lines(was, now);
+        // The line: the action's own, or the one a condition's link is on.
+        if let Some(Step::Item(list, i)) = path.0.first_mut()
+            && let Some(kind) = [Kind::Entry, Kind::Reply].into_iter().find(|k| k.list() == list)
+        {
+            *i = map.line(kind, u32::try_from(*i).ok()?)? as usize;
+        }
+        if !self.condition {
+            return path.get(&now.root).map(|_| path);
+        }
+        // The link: the one that leads to the same line, where it is now
+        // among its parent's.
+        let link = self.path.get(&was.root)?;
+        let (links, at) = match path.0.pop()? {
+            Step::Item(links, at) => (links, at),
+            Step::Field(_) => return None,
+        };
+        let child = if links == Kind::Entry.links() { Kind::Reply } else { Kind::Entry };
+        let to = map.line(child, link_index(link))?;
+        let same = |l: &mg_gff::Struct| link_index(l) == to && is_link(l) == is_link(link);
+        let list = path.get(&now.root)?.list(&links)?;
+        let at = if list.get(at).is_some_and(same) { at } else { list.iter().position(same)? };
+        path.0.push(Step::Item(links, at));
+        Some(path)
+    }
+
+    /// The wizard, opened on conversation `g` as it is now: what its line
+    /// is found again by at Finish.
+    pub fn opened_on(mut self, g: &mg_gff::Gff) -> ScriptWizard {
+        self.was = Some(Arc::new(g.clone()));
+        self
+    }
+
     pub fn new(
         dialog: ResKey,
         path: GffPath,
@@ -180,6 +231,7 @@ impl ScriptWizard {
             filter: String::new(),
             name,
             open_editor: false,
+            was: None,
         }
     }
 
@@ -238,7 +290,8 @@ impl ScriptWizard {
     /// The action from the pages ticked.
     pub fn to_action(&self) -> ActionScript {
         let on = |i| self.on(i);
-        let amount = |s: &str| s.trim().parse::<u32>().ok().filter(|&n| n > 0);
+        // (From 1 to what a script's `int` holds.)
+        let amount = mg_module::script_wizard::amount;
         let rewards = on(0);
         let take = on(1);
         ActionScript {
@@ -277,7 +330,7 @@ impl Moonglow {
         condition: bool,
     ) {
         let Some(game) = &self.game else {
-            self.log.error("The Script Wizard needs the game data (Tools > Options)");
+            self.log.error("The Script Wizard needs the game data (Tools › Options)");
             return;
         };
         let lists = Arc::new(mg_module::script_wizard::Lists::load(game));
@@ -290,7 +343,12 @@ impl Moonglow {
                     .any(|&t| ResKey::parse(n, t).is_some_and(|k| m.contains(&k)))
             })
         });
-        self.script_wizard = Some(ScriptWizard::new(dialog, path, label, condition, lists, name));
+        let wizard = ScriptWizard::new(dialog, path, label, condition, lists, name);
+        let now = self.ws.as_mut().and_then(|ws| ws.doc(&dialog).ok());
+        self.script_wizard = Some(match now {
+            Some(g) => wizard.opened_on(g),
+            None => wizard,
+        });
     }
 }
 
@@ -308,26 +366,21 @@ fn pick_list(
         ui.set_min_size(size.into());
         ui.set_max_width(size[0]);
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt(id)
-                .max_height(size[1])
-                .auto_shrink(false)
-                .show_rows(
-                    ui,
-                    ui.text_style_height(&egui::TextStyle::Body),
-                    rows.len(),
-                    |ui, range| {
-                        for &(row, text) in &rows[range] {
-                            let r = ui.selectable_label(*selected == Some((list, row)), text);
-                            if r.clicked() {
-                                *selected = Some((list, row));
-                            }
-                            if r.double_clicked() {
-                                chosen = Some(row);
-                            }
-                        }
-                    },
-                );
+            let area =
+                egui::ScrollArea::vertical().id_salt(id).max_height(size[1]).auto_shrink(false);
+            // (Each row a selectable label, 22 high: the rows were given
+            // the text's height, and drifted from where the list put them.)
+            mg_uikit::show_rows(area, ui, rows.len(), |ui, range| {
+                for &(row, text) in &rows[range] {
+                    let r = ui.selectable_label(*selected == Some((list, row)), text);
+                    if r.clicked() {
+                        *selected = Some((list, row));
+                    }
+                    if r.double_clicked() {
+                        chosen = Some(row);
+                    }
+                }
+            });
         });
     });
     chosen
@@ -335,61 +388,139 @@ fn pick_list(
 
 /// Two lists with -> and <- between them (Feats, Skills, Race): moves rows
 /// between `chosen` and the rest of `all`.
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone)]
+struct CachedMoveLists {
+    key: (u64, u64, String),
+    left: Vec<usize>,
+    right: Vec<usize>,
+}
+
+struct MoveLists<'a> {
+    id: &'a str,
+    all: &'a [Entry],
+    titles: [&'a str; 2],
+    lists: [u8; 2],
+    filter: Option<&'a str>,
+    height: f32,
+}
+
 fn move_lists(
     ui: &mut Ui,
-    id: &str,
-    all: &[Entry],
+    spec: MoveLists<'_>,
     chosen: &mut Vec<usize>,
-    titles: [&str; 2],
     selected: &mut Option<(u8, usize)>,
-    lists: [u8; 2],
-    filter: Option<&str>,
-    height: f32,
 ) {
-    let filter = mg_core::text::Needle::new(filter.unwrap_or_default());
-    let left: Vec<(usize, &str)> = all
-        .iter()
-        .filter(|e| !chosen.contains(&e.row))
-        .filter(|e| filter.finds(&e.name))
-        .map(|e| (e.row, e.name.as_str()))
-        .collect();
+    let filter_str = spec.filter.unwrap_or_default();
+    let cache_id = egui::Id::new(("wizard-move-lists", spec.id));
+    // (Keyed by the list's rows themselves, not its length alone: another
+    // list as long (another 2DA's, a wizard of another kind) took the
+    // rows of the one before: review D9.)
+    let all = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for e in spec.all {
+            (e.row, &e.name).hash(&mut h);
+        }
+        h.finish()
+    };
+    let key = (all, egui::epaint::util::hash(chosen.as_slice()), filter_str.to_string());
+    let cached = ui.ctx().data_mut(|d| {
+        let slot = d.get_temp_mut_or_insert_with(cache_id, || CachedMoveLists {
+            key: (u64::MAX, 0, String::new()),
+            left: Vec::new(),
+            right: Vec::new(),
+        });
+        if slot.key != key {
+            let needle = mg_core::text::Needle::new(filter_str);
+            let chosen_set: std::collections::HashSet<usize> = chosen.iter().copied().collect();
+            slot.left.clear();
+            slot.right.clear();
+            for (i, e) in spec.all.iter().enumerate() {
+                if chosen_set.contains(&e.row) {
+                    slot.right.push(i);
+                } else if needle.finds(&e.name) {
+                    slot.left.push(i);
+                }
+            }
+            slot.key = key;
+        }
+        slot.clone()
+    });
+    let left: Vec<(usize, &str)> =
+        cached.left.iter().map(|&i| (spec.all[i].row, spec.all[i].name.as_str())).collect();
     let right: Vec<(usize, &str)> =
-        all.iter().filter(|e| chosen.contains(&e.row)).map(|e| (e.row, e.name.as_str())).collect();
+        cached.right.iter().map(|&i| (spec.all[i].row, spec.all[i].name.as_str())).collect();
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
-            ui.label(titles[0]);
-            if let Some(row) =
-                pick_list(ui, &format!("{id}-l"), &left, lists[0], selected, [200.0, height])
-            {
+            ui.label(spec.titles[0]);
+            if let Some(row) = pick_list(
+                ui,
+                &format!("{}-l", spec.id),
+                &left,
+                spec.lists[0],
+                selected,
+                [200.0, spec.height],
+            ) {
                 chosen.push(row);
             }
         });
         ui.vertical(|ui| {
             ui.add_space(40.0);
-            if ui.button("->").on_hover_text(format!("Move to {}", titles[1])).clicked()
+            let to = format!("Move to {}", spec.titles[1]);
+            if crate::widgets::icon_button(ui, mg_uikit::Icon::ChevronRight, &to, "").clicked()
                 && let Some((l, row)) = *selected
-                && l == lists[0]
+                && l == spec.lists[0]
                 && !chosen.contains(&row)
             {
                 chosen.push(row);
             }
-            if ui.button("<-").on_hover_text(format!("Move to {}", titles[0])).clicked()
+            let to = format!("Move to {}", spec.titles[0]);
+            if crate::widgets::icon_button(ui, mg_uikit::Icon::ChevronLeft, &to, "").clicked()
                 && let Some((l, row)) = *selected
-                && l == lists[1]
+                && l == spec.lists[1]
             {
                 chosen.retain(|&r| r != row);
             }
         });
         ui.vertical(|ui| {
-            ui.label(titles[1]);
-            if let Some(row) =
-                pick_list(ui, &format!("{id}-r"), &right, lists[1], selected, [200.0, height])
-            {
+            ui.label(spec.titles[1]);
+            if let Some(row) = pick_list(
+                ui,
+                &format!("{}-r", spec.id),
+                &right,
+                spec.lists[1],
+                selected,
+                [200.0, spec.height],
+            ) {
                 chosen.retain(|&r| r != row);
             }
         });
     });
+}
+
+/// Inserts `tag` into `items` (if absent), sorting when `sorted` is set while
+/// preserving which item `selected` points to in list `0`.
+fn insert_list_item(
+    items: &mut Vec<String>,
+    tag: String,
+    sorted: bool,
+    selected: &mut Option<(u8, usize)>,
+) {
+    if items.contains(&tag) {
+        return;
+    }
+    let keep = if sorted {
+        selected.and_then(|(l, i)| (l == 0).then(|| items.get(i).cloned()).flatten())
+    } else {
+        None
+    };
+    items.push(tag);
+    if sorted {
+        items.sort_by_cached_key(|s| (s.to_lowercase(), s.clone()));
+        if let Some(keep) = keep {
+            *selected = items.iter().position(|s| *s == keep).map(|i| (0, i));
+        }
+    }
 }
 
 /// A text field with Add (and "…" for the item picker), and the list it
@@ -405,18 +536,13 @@ fn add_list(
 ) -> bool {
     let mut pick = false;
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(entry).desired_width(200.0).id_salt(id));
+        ui.add(mg_uikit::text_field(entry).desired_width(200.0).id_salt(id));
         if picker {
             pick = ui.small_button("…").on_hover_text("Select an item blueprint").clicked();
         }
         let tag = entry.trim().to_string();
-        if ui.add_enabled(!tag.is_empty(), egui::Button::new("Add")).clicked()
-            && !items.contains(&tag)
-        {
-            items.push(tag);
-            if sorted {
-                items.sort_by_cached_key(|s| (s.to_lowercase(), s.clone()));
-            }
+        if ui.add_enabled(!tag.is_empty(), egui::Button::new("Add")).clicked() {
+            insert_list_item(items, tag, sorted, selected);
         }
     });
     let rows: Vec<(usize, &str)> = items.iter().enumerate().map(|(i, s)| (i, s.as_str())).collect();
@@ -452,7 +578,7 @@ fn local_draft(ui: &mut Ui, w: &mut ScriptWizard, condition: bool) -> Option<(St
     let d = &mut w.local;
     egui::Grid::new("wiz-local").num_columns(2).show(ui, |ui| {
         combo(ui, "wiz-local-type", &mut d.ty, &VarType::ALL, |t| t.label().to_string());
-        ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("variable name"));
+        ui.add(mg_uikit::text_field(&mut d.name).hint_text("variable name"));
         ui.end_row();
         if condition {
             if !d.ty.comparisons().contains(&d.compare) {
@@ -467,7 +593,7 @@ fn local_draft(ui: &mut Ui, w: &mut ScriptWizard, condition: bool) -> Option<(St
         combo(ui, "wiz-local-src", &mut d.variable, &[false, true], |v| {
             format!("{} {ty}", if v { "variable" } else { "constant" })
         });
-        ui.add(egui::TextEdit::singleline(&mut d.value).hint_text(if d.variable {
+        ui.add(mg_uikit::text_field(&mut d.value).hint_text(if d.variable {
             "variable name"
         } else {
             "value"
@@ -489,7 +615,7 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
             egui::Grid::new("wiz-abilities").num_columns(3).show(ui, |ui| {
                 for (i, (name, _)) in ABILITIES.iter().enumerate() {
                     let (on, cmp, value) = &mut w.abilities[i];
-                    ui.checkbox(on, *name);
+                    ui.check_box(on, *name);
                     ui.add_enabled_ui(*on, |ui| {
                         combo(ui, &format!("wiz-ab-{i}"), cmp, &Compare::ALL, |c| {
                             c.label().to_string()
@@ -511,9 +637,9 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
                     std::iter::once(None).chain((0..lists.classes.len()).map(Some)).collect();
                 combo(ui, "wiz-class", &mut w.class, &options, name);
                 ui.vertical(|ui| {
-                    ui.radio_value(&mut w.specific_level, false, "Any level");
+                    ui.radio_choice(&mut w.specific_level, false, "Any level");
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut w.specific_level, true, "Specific level");
+                        ui.radio_choice(&mut w.specific_level, true, "Specific level");
                         ui.add_enabled_ui(w.specific_level, |ui| {
                             crate::widgets::spin_draft(ui, &mut w.level, 1..=60, 1.0, |d| d);
                         });
@@ -536,6 +662,7 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_size([280.0, 100.0].into());
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        mg_uikit::list_rows(ui);
                         egui::Grid::new("wiz-classes").num_columns(2).striped(true).show(
                             ui,
                             |ui| {
@@ -565,12 +692,12 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
                 w.selected = None;
             }
             ui.add_enabled_ui(w.classes.len() > 1, |ui| {
-                ui.radio_value(
+                ui.radio_choice(
                     &mut w.all_classes,
                     false,
                     "The player needs to meet only one of the restrictions",
                 );
-                ui.radio_value(
+                ui.radio_choice(
                     &mut w.all_classes,
                     true,
                     "The player needs to meet all of the restrictions",
@@ -580,6 +707,7 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
         2 => {
             ui.label("Select required genders");
             egui::Frame::group(ui.style()).show(ui, |ui| {
+                mg_uikit::list_rows(ui);
                 for e in &lists.genders {
                     let on = w.genders.contains(&e.row);
                     if ui.selectable_label(on, &e.name).clicked() {
@@ -600,24 +728,26 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
                 let titles = ["Rejected", "Accepted"];
                 move_lists(
                     ui,
-                    &format!("wiz-race-{title}"),
-                    list,
+                    MoveLists {
+                        id: &format!("wiz-race-{title}"),
+                        all: list,
+                        titles,
+                        lists: ids,
+                        filter: None,
+                        height: 95.0,
+                    },
                     &mut w.races,
-                    titles,
                     &mut w.selected,
-                    ids,
-                    None,
-                    95.0,
                 );
             }
         }
         4 => {
             for (i, (name, _)) in GOOD_EVIL.iter().enumerate() {
-                ui.checkbox(&mut w.alignment.good_evil[i], *name);
+                ui.check_box(&mut w.alignment.good_evil[i], *name);
             }
             ui.add_space(8.0);
             for (i, (name, _)) in LAW_CHAOS.iter().enumerate() {
-                ui.checkbox(&mut w.alignment.law_chaos[i], *name);
+                ui.check_box(&mut w.alignment.law_chaos[i], *name);
             }
         }
         5 => {
@@ -634,27 +764,31 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
             });
             move_lists(
                 ui,
-                "wiz-feats",
-                &lists.feats,
+                MoveLists {
+                    id: "wiz-feats",
+                    all: &lists.feats,
+                    titles: ["All Feats", "Required Feats"],
+                    lists: [0, 1],
+                    filter: Some(&w.filter),
+                    height: 200.0,
+                },
                 &mut w.feats,
-                ["All Feats", "Required Feats"],
                 &mut w.selected,
-                [0, 1],
-                Some(&w.filter),
-                200.0,
             );
         }
         6 => {
             move_lists(
                 ui,
-                "wiz-skills",
-                &lists.skills_by_name(),
+                MoveLists {
+                    id: "wiz-skills",
+                    all: &lists.skills_by_name(),
+                    titles: ["All Skills", "Required Skills"],
+                    lists: [0, 1],
+                    filter: None,
+                    height: 220.0,
+                },
                 &mut w.skills,
-                ["All Skills", "Required Skills"],
                 &mut w.selected,
-                [0, 1],
-                None,
-                220.0,
             );
         }
         7 => {
@@ -668,9 +802,11 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
                 });
                 ui.vertical(|ui| {
                     crate::widgets::field_label(ui, "Difficulty");
-                    ui.horizontal(|ui| {
+                    // (Wrapped, and Remove under the list, where the page
+                    // is narrow: the step list beside it, the least window.)
+                    ui.horizontal_wrapped(|ui| {
                         for d in Difficulty::ALL {
-                            ui.radio_value(&mut w.difficulty, d, d.label());
+                            ui.radio_choice(&mut w.difficulty, d, d.label());
                         }
                     });
                     let skill = w.selected.filter(|s| s.0 == 0).map(|s| s.1);
@@ -694,8 +830,14 @@ fn condition_page(ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
                         .collect();
                     let rows: Vec<(usize, &str)> =
                         checks.iter().enumerate().map(|(i, s)| (i, s.as_str())).collect();
-                    ui.horizontal_top(|ui| {
-                        pick_list(ui, "wiz-checks", &rows, 1, &mut w.selected, [260.0, 100.0]);
+                    let list_w = 260.0_f32.min(ui.available_width() - 8.0);
+                    let beside = ui.available_width() >= list_w + 90.0;
+                    let layout = match beside {
+                        true => egui::Layout::left_to_right(egui::Align::Min),
+                        false => egui::Layout::top_down(egui::Align::Min),
+                    };
+                    ui.with_layout(layout, |ui| {
+                        pick_list(ui, "wiz-checks", &rows, 1, &mut w.selected, [list_w, 100.0]);
                         if ui
                             .add_enabled(
                                 w.selected.is_some_and(|s| s.0 == 1),
@@ -772,7 +914,7 @@ fn local_list<T>(
 
 fn action_page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard, page: usize) {
     let number = |ui: &mut Ui, s: &mut String, id: &str| {
-        ui.add(egui::TextEdit::singleline(s).desired_width(70.0).id_salt(id));
+        ui.add(mg_uikit::text_field(s).desired_width(70.0).id_salt(id));
         s.retain(|c| c.is_ascii_digit());
     };
     match page {
@@ -781,12 +923,12 @@ fn action_page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard, page: usiz
                 ui.vertical(|ui| {
                     crate::widgets::field_label(ui, "Give gold");
                     number(ui, &mut w.give_gold, "wiz-give-gold");
-                    ui.checkbox(&mut w.gold_to_party, "To Party");
+                    ui.check_box(&mut w.gold_to_party, "To Party");
                 });
                 ui.vertical(|ui| {
                     crate::widgets::field_label(ui, "Give XP");
                     number(ui, &mut w.give_xp, "wiz-give-xp");
-                    ui.checkbox(&mut w.xp_to_party, "To Party");
+                    ui.check_box(&mut w.xp_to_party, "To Party");
                 });
                 ui.vertical(|ui| {
                     let id = egui::Id::new("wiz-give-item-pick");
@@ -813,8 +955,8 @@ fn action_page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard, page: usiz
                 ui.vertical(|ui| {
                     crate::widgets::field_label(ui, "Take gold");
                     number(ui, &mut w.take_gold, "wiz-take-gold");
-                    ui.radio_value(&mut w.destroy_gold, true, "Destroy");
-                    ui.radio_value(&mut w.destroy_gold, false, "Keep");
+                    ui.radio_choice(&mut w.destroy_gold, true, "Destroy");
+                    ui.radio_choice(&mut w.destroy_gold, false, "Keep");
                     ui.add_space(12.0);
                     crate::widgets::field_label(ui, "Take XP");
                     number(ui, &mut w.take_xp, "wiz-take-xp");
@@ -830,8 +972,8 @@ fn action_page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard, page: usiz
                         &mut w.selected,
                         false,
                     );
-                    ui.radio_value(&mut w.destroy_items, true, "Destroy");
-                    ui.radio_value(&mut w.destroy_items, false, "Keep");
+                    ui.radio_choice(&mut w.destroy_items, true, "Destroy");
+                    ui.radio_choice(&mut w.destroy_items, false, "Keep");
                 });
             });
         }
@@ -856,13 +998,13 @@ fn action_page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard, page: usiz
         _ => {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 let store = matches!(w.perform, Perform::Store { .. });
-                if ui.radio(w.perform == Perform::Nothing, "No Action").clicked() {
+                if ui.radio_button(w.perform == Perform::Nothing, "No Action").clicked() {
                     w.perform = Perform::Nothing;
                 }
-                if ui.radio(w.perform == Perform::Attack, "Attack").clicked() {
+                if ui.radio_button(w.perform == Perform::Attack, "Attack").clicked() {
                     w.perform = Perform::Attack;
                 }
-                if ui.radio(store, "Open a Store").clicked() && !store {
+                if ui.radio_button(store, "Open a Store").clicked() && !store {
                     w.perform = Perform::Store { tag: String::new(), appraise: true };
                 }
                 let (mut tag, mut appraise) = match &w.perform {
@@ -871,9 +1013,9 @@ fn action_page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard, page: usiz
                 };
                 ui.add_enabled_ui(store, |ui| {
                     ui.indent("wiz-store", |ui| {
-                        ui.checkbox(&mut appraise, "Use appraise checks");
+                        ui.check_box(&mut appraise, "Use appraise checks");
                         crate::widgets::field_label(ui, "Script Tag");
-                        ui.add(egui::TextEdit::singleline(&mut tag).id_salt("wiz-store-tag"));
+                        ui.add(mg_uikit::text_field(&mut tag).id_salt("wiz-store-tag"));
                     });
                 });
                 if store {
@@ -887,7 +1029,7 @@ fn action_page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard, page: usiz
                 ui.horizontal(|ui| {
                     crate::widgets::field_label(ui, "Modify Faction");
                     ui.spacing_mut().slider_width = 320.0;
-                    ui.add(egui::Slider::new(&mut faction, -100..=100).step_by(10.0));
+                    mg_uikit::slider(ui, egui::Slider::new(&mut faction, -100..=100).step_by(10.0));
                 });
             });
             if !attack {
@@ -897,87 +1039,170 @@ fn action_page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard, page: usiz
     }
 }
 
+/// The icon of each condition page's bar, in `CONDITION_PAGES`' order.
+const CONDITION_ICONS: [mg_uikit::Icon; 11] = [
+    mg_uikit::Icon::Ability,
+    mg_uikit::Icon::Class,
+    mg_uikit::Icon::Creature,
+    mg_uikit::Icon::Faction,
+    mg_uikit::Icon::Compass,
+    mg_uikit::Icon::Feat,
+    mg_uikit::Icon::Skill,
+    mg_uikit::Icon::Dice,
+    mg_uikit::Icon::Inventory,
+    mg_uikit::Icon::Variables,
+    mg_uikit::Icon::Bolt,
+];
+
+/// The icon of each action page's bar, in `ACTION_PAGES`' order.
+const ACTION_ICONS: [mg_uikit::Icon; 4] = [
+    mg_uikit::Icon::Item,
+    mg_uikit::Icon::Inventory,
+    mg_uikit::Icon::Variables,
+    mg_uikit::Icon::Play,
+];
+
+/// The page bar's icon and its title: the page's question.
+fn page_bar_of(w: &ScriptWizard) -> (mg_uikit::Icon, &'static str) {
+    let pages = w.page_list();
+    match w.step {
+        Step::Choose if w.condition => {
+            (mg_uikit::Icon::Wizard, "What conditions would you like to test for?")
+        }
+        Step::Choose => (mg_uikit::Icon::Wizard, "What actions would you like to perform?"),
+        Step::Page(i) => {
+            let icons: &[mg_uikit::Icon] =
+                if w.condition { &CONDITION_ICONS } else { &ACTION_ICONS };
+            (icons[i], pages[i].1)
+        }
+        Step::Name => (mg_uikit::Icon::Script, "Congratulations!"),
+    }
+}
+
+/// The step list: Choose, a step for each page (Off where the first page did
+/// not tick it), and the name.
+fn steps(ui: &mut Ui, w: &ScriptWizard) {
+    use mg_uikit::dialog::{StepList, StepState};
+    let pages = w.page_list();
+    let total = pages.len() + 2;
+    let at = match w.step {
+        Step::Choose => 0,
+        Step::Page(i) => i + 1,
+        Step::Name => total - 1,
+    };
+    let mut list = StepList::new(format!("Step {} of {}", at + 1, total));
+    let state = |i: usize, on: bool| match (i.cmp(&at), on) {
+        (_, false) => StepState::Off,
+        (std::cmp::Ordering::Less, _) => StepState::Done,
+        (std::cmp::Ordering::Equal, _) => StepState::Current,
+        (std::cmp::Ordering::Greater, _) => StepState::ToCome,
+    };
+    list = list.step("Choose", state(0, true));
+    for (i, (name, _)) in pages.iter().enumerate() {
+        list = list.step(*name, state(i + 1, w.on(i)));
+    }
+    list = list.step("Name", state(total - 1, true));
+    let _ = list.show(ui);
+}
+
+/// The page shown, in its scroll area.
+fn page(app: &mut Moonglow, ui: &mut Ui, w: &mut ScriptWizard) {
+    let pages = w.page_list();
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        match w.step {
+            Step::Choose => {
+                ui.columns(2, |cols| {
+                    let half = if w.condition { 8 } else { pages.len() };
+                    for (i, (label, _)) in pages.iter().enumerate() {
+                        let col = usize::from(i >= half);
+                        cols[col].check_box(&mut w.pages[i], *label);
+                    }
+                });
+            }
+            Step::Page(i) if w.condition => condition_page(ui, w, i),
+            Step::Page(i) => action_page(app, ui, w, i),
+            Step::Name => {
+                ui.label("Enter the script name");
+                let field = ui.add(
+                    crate::widgets::resref_edit(&mut crate::widgets::ResRefText(&mut w.name))
+                        .id_salt("wiz-name"),
+                );
+                crate::widgets::autofocus(ui, &field);
+                let exists = ResRef::from_str(w.name.trim()).ok().is_some_and(|r| {
+                    app.ws
+                        .as_ref()
+                        .is_some_and(|ws| ws.module.contains(&ResKey::new(r, ResType::NSS)))
+                });
+                if exists {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "The module has a script of this name; it will be replaced.",
+                    );
+                }
+                ui.check_box(&mut w.open_editor, "Start the script editor");
+            }
+        }
+        crate::widgets::focus_in_sight(ui);
+    });
+}
+
 /// Draws the Script Wizard, if open.
 pub(crate) fn window(app: &mut Moonglow, ui: &mut Ui) {
     let Some(mut w) = app.script_wizard.take() else { return };
     let ctx = ui.ctx().clone();
     let mut close = false;
     let mut finish = false;
-    crate::widgets::modal(&ctx, "Script Wizard").show(&ctx, |ui| {
-        ui.set_min_width(520.0);
-        let pages = w.page_list();
-        let question = match w.step {
-            Step::Choose if w.condition => "What conditions would you like to test for?",
-            Step::Choose => "What actions would you like to perform?",
-            Step::Page(i) => pages[i].1,
-            Step::Name => "Congratulations!",
-        };
-        ui.heading(question);
-        ui.separator();
-        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-            ui.set_min_height(300.0);
-            match w.step {
-                Step::Choose => {
-                    ui.columns(2, |cols| {
-                        let half = if w.condition { 8 } else { pages.len() };
-                        for (i, (label, _)) in pages.iter().enumerate() {
-                            let col = usize::from(i >= half);
-                            cols[col].checkbox(&mut w.pages[i], *label);
-                        }
-                    });
+    let valid_name = ResRef::from_str(w.name.trim()).ok().is_some_and(|r| !r.is_empty());
+    let last = w.step == Step::Name;
+    let footed = crate::widgets::modal(&ctx, "Script Wizard")
+        .resizable(true)
+        .default_size([720.0, 500.0])
+        .min_size([560.0, 420.0])
+        .flush()
+        .show_foot(&ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if crate::widgets::step_list_fits(ui) {
+                    steps(ui, &w);
                 }
-                Step::Page(i) if w.condition => condition_page(ui, &mut w, i),
-                Step::Page(i) => action_page(app, ui, &mut w, i),
-                Step::Name => {
-                    ui.label("Enter the script name");
-                    let field = ui.add(
-                        egui::TextEdit::singleline(&mut w.name).char_limit(16).id_salt("wiz-name"),
-                    );
-                    crate::widgets::autofocus(ui, &field);
-                    let exists = ResRef::from_str(w.name.trim()).ok().is_some_and(|r| {
-                        app.ws
-                            .as_ref()
-                            .is_some_and(|ws| ws.module.contains(&ResKey::new(r, ResType::NSS)))
-                    });
-                    if exists {
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            "The module has a script of this name; it will be replaced.",
-                        );
-                    }
-                    ui.checkbox(&mut w.open_editor, "Start the script editor");
-                }
-            }
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let (icon, title) = page_bar_of(&w);
+                    mg_uikit::dialog::page_bar(ui, Some(icon), title);
+                    let pad = mg_uikit::dialog::PAGE_PADDING;
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(pad.x as i8, pad.y as i8))
+                        .show(ui, |ui| {
+                            ui.set_min_size(ui.available_size());
+                            page(app, ui, &mut w);
+                        });
+                });
+            });
+            (
+                (),
+                crate::blueprint_wizard::finish_foot(
+                    w.step != Step::Choose,
+                    !last,
+                    last,
+                    valid_name,
+                ),
+            )
         });
-        ui.separator();
-        ui.horizontal(|ui| {
-            let valid_name = ResRef::from_str(w.name.trim()).ok().is_some_and(|r| !r.is_empty());
-            if ui.add_enabled(w.step != Step::Choose, egui::Button::new("< Back")).clicked() {
-                w.step = w.back();
-                w.selected = None;
-                w.entry.clear();
-            }
-            if ui.add_enabled(w.step != Step::Name, egui::Button::new("Next >")).clicked()
-                || (w.step != Step::Name && crate::widgets::enter(ui))
-            {
-                w.step = w.next();
-                w.selected = None;
-                w.entry.clear();
-            }
-            if ui
-                .add_enabled(w.step == Step::Name && valid_name, egui::Button::new("Finish"))
-                .clicked()
-                || (w.step == Step::Name && valid_name && crate::widgets::enter(ui))
-            {
-                finish = true;
-            }
-            if crate::widgets::cancel(ui) {
-                close = true;
-            }
-        });
-    });
-    if finish {
-        finish_wizard(app, &w);
+    if let Some(f) = footed {
+        if f.pressed.clicked("< Back") {
+            w.step = w.back();
+            w.selected = None;
+            w.entry.clear();
+        } else if f.pressed.main() && !last {
+            w.step = w.next();
+            w.selected = None;
+            w.entry.clear();
+        }
+        finish = last && f.pressed.main();
+        close = f.pressed.cancelled();
+    }
+    // (One that could not finish stays, with its pages.)
+    if finish && finish_wizard(app, &w) {
         close = true;
     }
     if !close {
@@ -985,16 +1210,27 @@ pub(crate) fn window(app: &mut Moonglow, ui: &mut Ui) {
     }
 }
 
-/// Writes, compiles and sets the script.
-fn finish_wizard(app: &mut Moonglow, w: &ScriptWizard) {
-    let Ok(name) = ResRef::from_str(w.name.trim()) else { return };
+/// Writes, compiles and sets the script on the line the wizard was opened
+/// for, where that is now. Whether it is done with: not where the line is
+/// gone or the command was refused, which the log says.
+fn finish_wizard(app: &mut Moonglow, w: &ScriptWizard) -> bool {
+    let Ok(name) = ResRef::from_str(w.name.trim()) else { return false };
+    let now = app.ws.as_mut().and_then(|ws| ws.doc(&w.dialog).ok());
+    let Some(path) = now.and_then(|now| w.field_now(now)) else {
+        app.log.error(format!(
+            "Script Wizard: the line this script was for is no longer in {} as it was. Undo the \
+             change to the conversation and finish again, or cancel the wizard.",
+            w.dialog
+        ));
+        return false;
+    };
     let source = w.source(&mg_core::time::today());
     let nss = ResKey::new(name, ResType::NSS);
     let mut edits = vec![
         Edit::SetResource { key: nss, data: Some(crate::text::encode_script(&source)) },
         Edit::SetField {
             key: w.dialog,
-            path: w.path.clone(),
+            path,
             label: w.label.clone(),
             value: Some(Value::resref(name)),
         },
@@ -1005,16 +1241,77 @@ fn finish_wizard(app: &mut Moonglow, w: &ScriptWizard) {
         }
         Err(e) => app.log.error(e.message),
     }
-    app.actions.push(crate::Action::Apply(Command::new(format!("Script Wizard: {name}"), edits)));
+    // (Made by a wizard: the plugins' resource-created handlers see it.)
+    let cmd = Command::new(format!("Script Wizard: {name}"), edits);
+    let made = match &app.ws {
+        Some(ws) => crate::plugin_events::Made::new_in(ws, &cmd, "wizard"),
+        None => crate::plugin_events::Made::resources("wizard", Vec::new()),
+    };
+    // Applied here, not as the frame ends: what the log says of it is said
+    // once it is done (it said "wrote" of a command that then failed).
+    let cmd = crate::plugin_events::with_plugins(app, cmd, &made);
+    if let Err(e) = app.apply(cmd) {
+        // (One held for an answer says so in its window, and is applied
+        // by the answer.)
+        let held = std::mem::take(&mut app.claims.held);
+        if !held {
+            app.log.error(format!("Script Wizard: {e}"));
+        }
+        return held;
+    }
     app.log.info(format!("Script Wizard: wrote {nss}"));
     if w.open_editor {
         app.actions.push(crate::Action::OpenResource(nss));
     }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two lists are worked out again for another list as long as the
+    /// one before (another wizard's, another 2DA's): kept by length alone,
+    /// they had the rows of the one before (review D9).
+    #[test]
+    fn move_lists_follow_the_rows_not_their_count() {
+        let entry = |row: usize, name: &str| mg_module::script_wizard::Entry {
+            row,
+            name: name.into(),
+            constant: String::new(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |all: &[mg_module::script_wizard::Entry], chosen: &mut Vec<usize>| {
+            let mut selected = None;
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let spec = MoveLists {
+                    id: "feats",
+                    all,
+                    titles: ["Feats", "Has"],
+                    lists: [0, 1],
+                    filter: None,
+                    height: 100.0,
+                };
+                move_lists(ui, spec, chosen, &mut selected);
+            });
+            { out }.textures_delta.clear();
+            let id = egui::Id::new(("wizard-move-lists", "feats"));
+            let kept: CachedMoveLists = ctx.data(|d| d.get_temp(id)).unwrap();
+            let names = |l: &[usize]| l.iter().map(|&i| all[i].name.clone()).collect::<Vec<_>>();
+            (names(&kept.left), names(&kept.right))
+        };
+        let mut chosen = vec![2];
+        let feats = [entry(1, "Alertness"), entry(2, "Dodge"), entry(3, "Mobility")];
+        let (left, right) = frame(&feats, &mut chosen);
+        assert_eq!(
+            (left, right),
+            (vec!["Alertness".into(), "Mobility".into()], vec!["Dodge".into()])
+        );
+        let skills = [entry(7, "Hide"), entry(8, "Listen"), entry(9, "Spot")];
+        let (left, right) = frame(&skills, &mut chosen);
+        assert_eq!(left, ["Hide", "Listen", "Spot"]);
+        assert!(right.is_empty(), "{right:?}");
+    }
 
     #[test]
     fn the_date_is_iso() {
@@ -1022,6 +1319,79 @@ mod tests {
         assert_eq!(d.len(), 10);
         assert!(d.starts_with("20"));
         assert_eq!(&d[4..5], "-");
+    }
+
+    /// The wizard's field is where its line is at Finish, not where it was
+    /// when the wizard opened: with a reply deleted before the one it was
+    /// opened on (in the conversation behind it), Finish set the script on
+    /// the reply that had taken its number.
+    #[test]
+    fn the_wizard_s_field_follows_its_line() {
+        use mg_module::dialog::{self, Kind, Parent};
+        let key = ResKey::parse("d", ResType::DLG).unwrap();
+        let mut g = dialog::new_dialog();
+        let hello = dialog::add_node(&mut g, Parent::Root, "Hello.");
+        let replies: Vec<u32> = ["One.", "Two.", "Three.", "Four."]
+            .iter()
+            .map(|text| dialog::add_node(&mut g, Parent::Node(Kind::Entry, hello), text))
+            .collect();
+        let wizard = |g: &mg_gff::Gff, path: GffPath, condition: bool| {
+            let label = if condition { "Active" } else { "Script" };
+            let lists = Arc::new(Lists::default());
+            ScriptWizard::new(key, path, label, condition, lists, "sc_001".into()).opened_on(g)
+        };
+        let line = |i: u32| GffPath::root().item("ReplyList", i as usize);
+        let link = |pos: usize| GffPath::root().item("EntryList", 0).item("RepliesList", pos);
+        let text_at = |g: &mg_gff::Gff, path: &GffPath| {
+            let at = path.get(&g.root).expect("a struct");
+            // (A link's line, for a condition's.)
+            let at = match at.dword("Index") {
+                Some(i) => dialog::node(g, Kind::Reply, i).unwrap(),
+                None => at,
+            };
+            dialog::text(at)
+        };
+        // An action on "Three.", a condition on the link to "Three." too.
+        let action = wizard(&g, line(replies[2]), false);
+        let condition = wizard(&g, link(2), true);
+        assert_eq!(action.field_now(&g), Some(line(replies[2])), "nothing changed");
+        assert_eq!(condition.field_now(&g), Some(link(2)));
+        // "Two." deleted behind the wizard: every later reply has another
+        // number, and every later link another place. Where the wizard
+        // was opened is "Four." now.
+        let mut after = g.clone();
+        dialog::remove(&mut after, Parent::Node(Kind::Entry, hello), 1);
+        assert_eq!(text_at(&after, &line(replies[2])), "Four.");
+        assert_eq!(text_at(&after, &link(2)), "Four.");
+        let now = action.field_now(&after).expect("found again");
+        assert_eq!(text_at(&after, &now), "Three.");
+        let now = condition.field_now(&after).expect("found again");
+        assert_eq!(text_at(&after, &now), "Three.");
+        assert_eq!(now, link(1));
+        // Its text changed: the same line.
+        let mut typed = g.clone();
+        let reply = dialog::node_mut(&mut typed, Kind::Reply, replies[2]).unwrap();
+        *reply = dialog::new_node(Kind::Reply, "Three, said otherwise.");
+        assert_eq!(action.field_now(&typed), Some(line(replies[2])));
+        assert_eq!(condition.field_now(&typed), Some(link(2)));
+        // The line itself deleted: nowhere, and Finish refuses.
+        let mut gone = g.clone();
+        dialog::remove(&mut gone, Parent::Node(Kind::Entry, hello), 2);
+        assert_eq!(action.field_now(&gone), None);
+        assert_eq!(condition.field_now(&gone), None);
+        // The starting line's condition, with another start before it.
+        let mut two = g.clone();
+        dialog::add_node(&mut two, Parent::Root, "Later.");
+        let start = wizard(&two, GffPath::root().item("StartingList", 1), true);
+        let mut after = two.clone();
+        dialog::remove(&mut after, Parent::Root, 0);
+        assert_eq!(start.field_now(&after), Some(GffPath::root().item("StartingList", 0)));
+        // A wizard made without the conversation (as the pictures' is)
+        // keeps its path where there is such a place.
+        let mut plain = wizard(&g, line(replies[2]), false);
+        plain.was = None;
+        assert_eq!(plain.field_now(&g), Some(line(replies[2])));
+        assert_eq!(plain.field_now(&dialog::new_dialog()), None);
     }
 
     #[test]
@@ -1045,5 +1415,20 @@ mod tests {
         assert_eq!(w.back(), Step::Page(2));
         w.step = Step::Name;
         assert_eq!(w.back(), Step::Page(8));
+    }
+
+    #[test]
+    fn insert_list_item_preserves_selected_item_across_sorted_insert() {
+        let mut items = vec!["beta".to_string(), "gamma".to_string()];
+        let mut selected = Some((0u8, 0usize));
+        insert_list_item(&mut items, "alpha".into(), true, &mut selected);
+        assert_eq!(items, ["alpha", "beta", "gamma"]);
+        assert_eq!(selected, Some((0, 1)));
+
+        let mut unsorted = vec!["beta".to_string(), "gamma".to_string()];
+        let mut unsorted_sel = Some((0u8, 0usize));
+        insert_list_item(&mut unsorted, "alpha".into(), false, &mut unsorted_sel);
+        assert_eq!(unsorted, ["beta", "gamma", "alpha"]);
+        assert_eq!(unsorted_sel, Some((0, 0)));
     }
 }

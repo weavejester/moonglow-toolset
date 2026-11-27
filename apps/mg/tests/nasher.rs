@@ -106,3 +106,95 @@ fn a_talk_tables_target_builds_as_nasher_builds_it() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no mytlk.tlk.json"));
 }
+
+/// `mg verify` on a project, whose tree holds its scripts as sources
+/// alone (their compiled scripts are build output): a source that
+/// compiles satisfies what names it, as the window compiles them as it
+/// opens a project; one that doesn't is said not compiled, an error.
+#[test]
+fn verify_takes_a_project_s_sources_that_compile() {
+    let root = mg_testkit::corpus!();
+    let module = root.join("data/mod/Neverwinter Chess.mod");
+    if !module.is_file() {
+        eprintln!("skipped: {} not found", module.display());
+        return;
+    }
+    let dir = mg_testkit::scratch_dir("mg-nasher-verify");
+    let project = dir.join("chess");
+    let out = crate::mg().arg("init").arg(&module).arg(&project).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let verify = || -> serde_json::Value {
+        let out = crate::mg_on(&root, None)
+            .args(["--json", "verify"])
+            .arg(&project)
+            .env("MOONGLOW_DATA_DIR", dir.join("data"))
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let uncompiled = |v: &serde_json::Value| -> Vec<String> {
+        let missing = v["missing"].as_array().unwrap();
+        let mut out: Vec<String> = missing
+            .iter()
+            .filter(|m| m["uncompiled"] == true)
+            .map(|m| m["target"].as_str().unwrap().to_string())
+            .collect();
+        out.dedup();
+        out
+    };
+    // The project holds sources alone, which its scripts name.
+    let m = Module::open(&project).unwrap();
+    let named = mg_module::verify::module_references(&m)
+        .into_iter()
+        .filter(|r| r.kind == mg_module::refs::RefKind::Script)
+        .map(|r| r.target)
+        .find(|t| m.contains(&ResKey::new(*t, ResType::NSS)))
+        .expect("a script named and kept as its source");
+    assert!(!m.contains(&ResKey::new(named, ResType::NCS)), "the tree holds no compiled script");
+    assert_eq!(uncompiled(&verify()), Vec::<String>::new());
+    // One that doesn't compile: said not compiled.
+    std::fs::write(project.join(format!("src/{named}.nss")), "void main() { nonsense }\n").unwrap();
+    assert_eq!(uncompiled(&verify()), [named.to_string()]);
+}
+
+/// A build that fails says its notes too, with `--json` or without: a hak
+/// the machine lacks is often why the scripts that include from it do not
+/// compile, and the one line that said so was dropped.
+#[test]
+fn a_build_that_fails_says_its_notes() {
+    use mg_module::ModuleLocation;
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("mg-build-fails");
+    let mut m = Module::new();
+    let mut info = mg_gff::Gff::new(*b"IFO ");
+    info.root.set("Mod_HakList", mg_module::attach::hak_list(&info.root, &["tdod_core".into()]));
+    m.set_info(&info).unwrap();
+    let source = b"#include \"core_inc\"\nvoid main() { Core(); }\n".to_vec();
+    m.set(ResKey::parse("uses_core", ResType::NSS).unwrap(), source);
+    let project = dir.join("project");
+    m.save_as(&ModuleLocation::Project { root: project.clone(), target: "default".into() })
+        .unwrap();
+    let built = dir.join("built.mod");
+    let build = |json: &[&str]| {
+        let user = dir.join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        crate::mg_on(&root, Some(&user))
+            .args(json)
+            .args(["build", project.to_str().unwrap(), "-o", built.to_str().unwrap()])
+            .env("MOONGLOW_DATA_DIR", dir.join("data"))
+            .output()
+            .unwrap()
+    };
+    let out = build(&[]);
+    let (printed, said) =
+        (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success() && !built.exists(), "{printed}{said}");
+    assert!(printed.contains("uses_core"), "the compiler's message: {printed}");
+    assert!(said.contains("warning: hak tdod_core not found"), "{said}");
+    assert!(said.trim_end().ends_with("mg: 1 of 1 scripts failed to compile"), "{said}");
+    let out = build(&["--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!out.status.success() && json["packed"].is_null(), "{json}");
+    assert_eq!(json["compiled"]["failed"], 1, "{json}");
+    assert!(json["notes"].to_string().contains("hak tdod_core not found"), "{json}");
+}

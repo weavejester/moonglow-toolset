@@ -115,8 +115,10 @@ pub fn find(rm: &ResMan, tlk_dirs: &[PathBuf], name: &str) -> Option<Found> {
         };
         return Some(Found { source, data: data.into_owned() });
     }
+    // (A name with a folder in it is no file's in these: not found.)
+    let file = mg_resman::named_file(name, "tlk")?;
     tlk_dirs.iter().find_map(|d| {
-        let path = d.join(mg_resman::named_file(name, "tlk"));
+        let path = d.join(&file);
         let data = std::fs::read(&path).ok()?;
         Some(Found { source: Source::File(path), data })
     })
@@ -281,6 +283,10 @@ struct Change {
     /// Changes made as one (an import's): undone and redone together.
     /// 0: on its own.
     batch: u64,
+    /// The table's length before, where the change put a line past its
+    /// end (the lines between are empty): its undo cuts the table back to
+    /// it.
+    grew_from: Option<usize>,
 }
 
 /// A talk table open for editing: its file (and the feminine table's, if
@@ -299,6 +305,72 @@ pub struct Table {
     /// The game's codepage, where the open module has its own table
     /// (`encoding.2da`): the game reads the talk tables by it too.
     pub game: Option<mg_core::Codepage>,
+    /// Lines put in or taken back for the module's fields ([`Typed`])
+    /// since the table was saved: they are the module's changes, outside
+    /// the table's own history, and make it unsaved.
+    typed_unsaved: bool,
+    /// The last change, made by typing, may take the next typed into the
+    /// same field of the same line ([`Table::set_line`]): ended by
+    /// [`Table::end_typing`], an undo or redo, a save.
+    typing_open: bool,
+    /// The game's number of its first line: a custom table's from
+    /// [`CUSTOM`] (16777216), the game's own `dialog.tlk` from 0
+    /// ([`Table::of_game`]). Find by number takes the table's own.
+    first_strref: u32,
+    /// The lines as they are now ([`Table::revision`]).
+    revision: u64,
+}
+
+/// A number no table has had as its [`Table::revision`].
+fn next_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What [`Table::find`] looks for: the words, lowered, and the number
+/// typed, if it is one.
+struct Sought {
+    number: Option<u64>,
+    words: Vec<String>,
+    ascii: bool,
+}
+
+impl Sought {
+    fn new(query: &str) -> Sought {
+        let query = query.trim();
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let ascii = words.iter().all(|w| w.is_ascii());
+        Sought { number: query.parse().ok(), words, ascii }
+    }
+}
+
+fn contains_ascii_ci(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    let Some((&first, rest)) = needle_lower.split_first() else {
+        return true;
+    };
+    let Some(limit) = haystack.len().checked_sub(needle_lower.len()) else {
+        return false;
+    };
+    for i in 0..=limit {
+        if haystack[i].to_ascii_lowercase() == first
+            && haystack[i + 1..i + 1 + rest.len()].eq_ignore_ascii_case(rest)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// A line put in the table for a field's text typed
+/// ([`Table::put_typed`]): what the line was and is, to take it back
+/// with the module's step that set the field, and put it back again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Typed {
+    pub row: usize,
+    before: Entries,
+    after: Entries,
+    /// The table's length before (it grows to reach a line past its end).
+    len_before: usize,
 }
 
 /// Talk tables are numbered from here in the game's StrRefs.
@@ -322,13 +394,22 @@ impl Table {
             redo: Vec::new(),
             saved: Some(0),
             game: None,
+            typed_unsaved: false,
+            typing_open: false,
+            first_strref: CUSTOM,
+            revision: next_revision(),
         })
     }
 
     /// A new, empty table in `dir` (the user's `tlk/` folder), not yet
-    /// saved.
+    /// saved. (A name that is no file's, [`mg_resman::is_file_name`], which
+    /// the windows that make tables don't give: `unnamed.tlk`, never a
+    /// file outside `dir`.)
     pub fn create(name: &str, dir: &Path, language: Language, feminine: bool) -> Table {
-        let file = |n: &str| Source::File(dir.join(mg_resman::named_file(n, "tlk")));
+        let file = |n: &str| {
+            let file = mg_resman::named_file(n, "tlk").unwrap_or_else(|| "unnamed.tlk".into());
+            Source::File(dir.join(file))
+        };
         Table {
             name: name.to_string(),
             source: file(name),
@@ -338,6 +419,10 @@ impl Table {
             redo: Vec::new(),
             saved: None,
             game: None,
+            typed_unsaved: false,
+            typing_open: false,
+            first_strref: CUSTOM,
+            revision: next_revision(),
         }
     }
 
@@ -357,6 +442,15 @@ impl Table {
         self.source.writable() && self.feminine.as_ref().is_none_or(|f| f.0.writable())
     }
 
+    /// A number that changes whenever a line of the table does (set,
+    /// typed, taken back, undone, read again from its file), and that no
+    /// other table has had: what is worked out from its lines (which are
+    /// free, where the next one goes) can be kept by it. (A change made by
+    /// writing [`Table::tlk`] directly does not move it.)
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn len(&self) -> usize {
         self.tlk.entries.len()
     }
@@ -366,7 +460,26 @@ impl Table {
     }
 
     pub fn is_dirty(&self) -> bool {
+        self.saved != Some(self.undo.len()) || self.typed_unsaved
+    }
+
+    /// Whether lines put in or taken back for the module's fields are
+    /// not saved yet: the module's save waits on the table's.
+    pub fn has_typed_unsaved(&self) -> bool {
+        self.typed_unsaved
+    }
+
+    /// Whether changes made in the table's own editor are not saved yet
+    /// (not counting the lines typed for the module's fields): what its
+    /// Cancel's Don't Save takes back ([`Table::drop_own_changes`]).
+    pub fn has_own_unsaved(&self) -> bool {
         self.saved != Some(self.undo.len())
+    }
+
+    /// How many steps it has to undo and to redo: what is worked out from
+    /// its lines (a search through them) is kept while these stay.
+    pub fn steps(&self) -> (usize, usize) {
+        (self.undo.len(), self.redo.len())
     }
 
     /// Reads the table (and the feminine table) again from its files,
@@ -401,6 +514,7 @@ impl Table {
             changed = true;
         }
         if changed {
+            self.revision = next_revision();
             self.undo.clear();
             self.redo.clear();
             self.saved = Some(0);
@@ -427,7 +541,10 @@ impl Table {
             feminine: self.feminine.as_ref().map(|(_, f)| self.decode(f.entries.get(row))),
             sound: e
                 .filter(|e| e.flags & FLAG_SOUND != 0)
-                .map(|e| String::from_utf8_lossy(&e.sound).trim_end_matches('\0').to_string())
+                // (As the game reads the field: up to its first NUL. What a
+                // file has after it was shown as part of the name, which
+                // then was no sound's name, and the line could not be set.)
+                .map(|e| String::from_utf8_lossy(e.sound_name()).into_owned())
                 .unwrap_or_default(),
             sound_length: e.map_or(0.0, shown_length),
         }
@@ -482,14 +599,23 @@ impl Table {
         )
     }
 
-    /// Puts entries at a row: `None` removes the row (the last one), and
-    /// the feminine table is padded with copies of the table's lines to
-    /// reach it.
+    /// Puts entries at a row: `None` removes the row where it is the last
+    /// (one before the last is emptied: the lines after keep their
+    /// numbers), a row past the end is reached with empty lines, and the
+    /// feminine table is padded with copies of the table's lines to reach
+    /// it.
     fn put(&mut self, row: usize, (m, f): Entries) {
+        self.revision = next_revision();
+        let last = self.tlk.entries.len().saturating_sub(1);
         match m {
-            Some(m) if row < self.tlk.entries.len() => self.tlk.entries[row] = m,
-            Some(m) => self.tlk.entries.push(m),
-            None => self.tlk.entries.truncate(row),
+            Some(m) => {
+                if row >= self.tlk.entries.len() {
+                    self.tlk.entries.resize(row + 1, TlkEntry::default());
+                }
+                self.tlk.entries[row] = m;
+            }
+            None if row >= last => self.tlk.entries.truncate(row),
+            None => self.tlk.entries[row] = TlkEntry::default(),
         }
         if let Some((_, fem)) = &mut self.feminine {
             match f {
@@ -503,9 +629,112 @@ impl Table {
                         fem.entries.push(f);
                     }
                 }
-                None => fem.entries.truncate(row),
+                None if row + 1 >= fem.entries.len() || row >= self.tlk.entries.len() => {
+                    fem.entries.truncate(row.min(fem.entries.len()))
+                }
+                None => fem.entries[row] = TlkEntry::default(),
             }
         }
+    }
+
+    /// Whether a line is empty: past the end, or with no text and no
+    /// sound (in the feminine table either).
+    pub fn is_blank(&self, row: usize) -> bool {
+        let blank = |e: Option<&TlkEntry>| {
+            e.is_none_or(|e| {
+                e.flags & (FLAG_TEXT | FLAG_SOUND) == 0 || (e.text.is_empty() && e.sound.is_empty())
+            })
+        };
+        blank(self.tlk.entries.get(row))
+            && self.feminine.as_ref().is_none_or(|(_, f)| blank(f.entries.get(row)))
+    }
+
+    /// The first line with `text` (with its text flag), and in the
+    /// feminine table `feminine` (`text` where `None`): a line a field's
+    /// text typed may name instead of a new one.
+    pub fn find_text(&self, text: &str, feminine: Option<&str>) -> Option<usize> {
+        let codepage = self.codepage();
+        let bytes = codepage.encode(text)?;
+        let fem = codepage.encode(feminine.unwrap_or(text))?;
+        let has = |e: Option<&TlkEntry>, b: &[u8]| {
+            e.is_some_and(|e| e.flags & FLAG_TEXT != 0 && e.text.as_slice() == b)
+        };
+        (0..self.len()).find(|&row| {
+            has(self.tlk.entries.get(row), &bytes)
+                && self.feminine.as_ref().is_none_or(|(_, f)| {
+                    // (A feminine table shorter than the table: its line is
+                    // the table's, as the save pads it.)
+                    match f.entries.get(row) {
+                        Some(_) => has(f.entries.get(row), &fem),
+                        None => *fem == *bytes,
+                    }
+                })
+        })
+    }
+
+    /// Puts `line` at `row` for a field's text typed: outside the table's
+    /// own history (the module's Undo takes it back, [`take_back`]), the
+    /// table reaching it with empty lines where it is past the end.
+    ///
+    /// [`take_back`]: Self::take_back
+    pub fn put_typed(&mut self, row: usize, line: &Line) -> Result<Typed, String> {
+        let after = self.entries(line, row)?;
+        let typed =
+            Typed { row, before: self.current(row), after: after.clone(), len_before: self.len() };
+        self.put(row, after);
+        self.typed_unsaved = true;
+        Ok(typed)
+    }
+
+    /// Takes a typed line back, as it was before: whether it was as it was
+    /// put (one changed since in the editor is left as it is).
+    pub fn take_back(&mut self, typed: &Typed) -> bool {
+        if self.current(typed.row) != typed.after {
+            return false;
+        }
+        self.put(typed.row, typed.before.clone());
+        // (The empty lines it was reached with go too, where nothing came
+        // after it.)
+        if self.len() > typed.len_before && (typed.len_before..self.len()).all(|r| self.is_blank(r))
+        {
+            self.tlk.entries.truncate(typed.len_before);
+            if let Some((_, f)) = &mut self.feminine {
+                f.entries.truncate(typed.len_before.min(f.entries.len()));
+            }
+        }
+        self.typed_unsaved = true;
+        true
+    }
+
+    /// Whether a typed line taken back can be put back: its row empty.
+    pub fn can_put_back(&self, typed: &Typed) -> bool {
+        self.is_blank(typed.row)
+    }
+
+    /// Puts a typed line taken back in again (the module's Redo).
+    pub fn put_back(&mut self, typed: &Typed) -> Result<(), String> {
+        if !self.can_put_back(typed) {
+            return Err(format!(
+                "line {} of the talk table ({}) has been given another text since",
+                typed.row,
+                Self::strref(typed.row).0
+            ));
+        }
+        self.put(typed.row, typed.after.clone());
+        self.typed_unsaved = true;
+        Ok(())
+    }
+
+    /// Takes back the changes made in the table's editor since it was
+    /// last saved (its Cancel), keeping the lines typed for the module's
+    /// fields: whether it could (not where the saved state is gone).
+    pub fn drop_own_changes(&mut self) -> bool {
+        let Some(saved) = self.saved.filter(|s| *s <= self.undo.len()) else { return false };
+        while self.undo.len() > saved {
+            self.undo();
+        }
+        self.redo.clear();
+        self.undo.len() == saved
     }
 
     fn apply(&mut self, change: Change) {
@@ -530,6 +759,7 @@ impl Table {
         }
         let depth = self.undo.len();
         if let Some(last) = self.undo.last_mut()
+            && self.typing_open
             && typing.is_some()
             && last.typing == typing
             && last.row == row
@@ -541,16 +771,43 @@ impl Table {
             return Ok(());
         }
         let before = self.current(row);
-        self.apply(Change { row, before, after, typing, batch: 0 });
+        self.apply(Change { row, before, after, typing, batch: 0, grew_from: None });
+        self.typing_open = typing.is_some();
         Ok(())
+    }
+
+    /// Ends a burst of typing: what is typed next is a step of its own,
+    /// even into the same field of the same line (another line chosen
+    /// meanwhile, the field left).
+    pub fn end_typing(&mut self) {
+        self.typing_open = false;
     }
 
     /// Adds a line at the end; returns its row.
     pub fn add_line(&mut self, line: &Line) -> Result<usize, String> {
         let row = self.len();
         let after = self.entries(line, row)?;
-        self.apply(Change { row, before: (None, None), after, typing: None, batch: 0 });
+        self.apply(Change {
+            row,
+            before: (None, None),
+            after,
+            typing: None,
+            batch: 0,
+            grew_from: None,
+        });
         Ok(row)
+    }
+
+    /// Puts a line at `row` (past the end: the table reaches it with empty
+    /// lines), in the table's history: Move to Talk Table's line in the
+    /// project's range. One step of the history however far the row is,
+    /// which its undo takes back with the empty lines it was reached by.
+    pub fn put_line(&mut self, row: usize, line: &Line) -> Result<(), String> {
+        let after = self.entries(line, row)?;
+        let before = self.current(row);
+        let grew_from = (row > self.len()).then_some(self.len());
+        self.apply(Change { row, before, after, typing: None, batch: 0, grew_from });
+        Ok(())
     }
 
     /// Removes the last line (only the last: removing another would
@@ -558,7 +815,14 @@ impl Table {
     pub fn remove_last(&mut self) {
         let Some(row) = self.len().checked_sub(1) else { return };
         let before = self.current(row);
-        self.apply(Change { row, before, after: (None, None), typing: None, batch: 0 });
+        self.apply(Change {
+            row,
+            before,
+            after: (None, None),
+            typing: None,
+            batch: 0,
+            grew_from: None,
+        });
     }
 
     pub fn can_undo(&self) -> bool {
@@ -570,8 +834,21 @@ impl Table {
     }
 
     pub fn undo(&mut self) {
+        // (Typing after an undo begins a step of its own: it never joins
+        // the step now last.)
+        self.typing_open = false;
         while let Some(c) = self.undo.pop() {
             self.put(c.row, c.before.clone());
+            // (The empty lines it was reached with go too, unless a line
+            // typed for a field has been put among them since.)
+            if let Some(len) =
+                c.grew_from.filter(|len| (*len..self.len()).all(|r| self.is_blank(r)))
+            {
+                self.tlk.entries.truncate(len);
+                if let Some((_, f)) = &mut self.feminine {
+                    f.entries.truncate(len);
+                }
+            }
             let batch = c.batch;
             self.redo.push(c);
             // (The rest of an import with it.)
@@ -582,6 +859,7 @@ impl Table {
     }
 
     pub fn redo(&mut self) {
+        self.typing_open = false;
         while let Some(c) = self.redo.pop() {
             self.put(c.row, c.after.clone());
             let batch = c.batch;
@@ -754,21 +1032,13 @@ impl Table {
     }
 
     /// Sets the lines given by their places in the table as one undoable
-    /// step, adding lines (empty ones between) for those past its end:
-    /// all, or none if one is not a line the table can hold. Returns how
-    /// many changed and how many were added.
-    /// Sets the lines given, by row (the table grows to hold them): all
-    /// or nothing, one undo; the lines changed and added are returned.
+    /// step, the table growing to hold those past its end (the lines
+    /// between empty): all, or none if one is not a line the table can
+    /// hold. Returns how many changed and how many were added.
     pub fn import(
         &mut self,
         lines: std::collections::BTreeMap<usize, Line>,
     ) -> Result<(usize, usize), String> {
-        let empty = Line {
-            text: String::new(),
-            feminine: self.feminine.as_ref().map(|_| String::new()),
-            sound: String::new(),
-            sound_length: 0.0,
-        };
         // Every line must be one the table can hold, before any is set.
         for (row, line) in &lines {
             self.entries(line, *row)
@@ -778,15 +1048,15 @@ impl Table {
         let from = self.undo.len();
         let (mut changed, mut added) = (0, 0);
         for (row, line) in lines {
-            while self.len() < row {
-                self.add_line(&empty)?;
-            }
             if row < self.len() {
                 let before = self.undo.len();
                 self.set_line(row, &line, None)?;
                 changed += usize::from(self.undo.len() > before);
             } else {
-                self.add_line(&line)?;
+                // (A row far past the end is one step, as any other: a
+                // step for each empty line between was millions of them
+                // for one mistyped StrRef.)
+                self.put_line(row, &line)?;
                 added += 1;
             }
         }
@@ -799,21 +1069,80 @@ impl Table {
     /// The lines whose text (either table's) has every word, ignoring case,
     /// or whose StrRef or row number is the query.
     pub fn find(&self, query: &str) -> Vec<usize> {
-        let query = query.trim();
-        let number: Option<u64> = query.parse().ok();
-        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        (0..self.len())
-            .filter(|&row| {
-                if let Some(n) = number
-                    && (n == row as u64 || n == u64::from(Self::strref(row).0))
-                {
-                    return true;
-                }
-                let l = self.line(row);
-                let text = format!("{}\n{}", l.text, l.feminine.unwrap_or_default()).to_lowercase();
-                words.iter().all(|w| text.contains(w.as_str()))
-            })
-            .collect()
+        self.find_in(0..self.len(), query)
+    }
+
+    /// [`find`](Self::find) among the lines `rows` alone: a long table
+    /// looked through a part at a time (the talk table editor's Find, a
+    /// slice a frame).
+    pub fn find_in(&self, rows: std::ops::Range<usize>, query: &str) -> Vec<usize> {
+        let sought = Sought::new(query);
+        let rows = rows.start.min(self.len())..rows.end.min(self.len());
+        rows.filter(|&row| self.has(row, &sought)).collect()
+    }
+
+    /// A table only looked at (`dialog.tlk`, as the game data read it): its
+    /// lines `tlk`, its source `source` (a layer's, which no Save writes).
+    pub fn of_game(name: &str, source: Source, tlk: Tlk) -> Table {
+        Table {
+            name: name.to_string(),
+            source,
+            tlk,
+            feminine: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            saved: Some(0),
+            game: None,
+            typed_unsaved: false,
+            typing_open: false,
+            first_strref: 0,
+            revision: next_revision(),
+        }
+    }
+
+    /// Whether line `row` is one [`find`](Self::find) finds for `query`:
+    /// for what was found to be kept up with one line changed, without
+    /// looking through them all again.
+    pub fn finds(&self, row: usize, query: &str) -> bool {
+        row < self.len() && self.has(row, &Sought::new(query))
+    }
+
+    fn has(&self, row: usize, sought: &Sought) -> bool {
+        if let Some(n) = sought.number
+            && (n == row as u64 || n == u64::from(self.first_strref) + row as u64)
+        {
+            return true;
+        }
+        if sought.words.is_empty() {
+            return true;
+        }
+        let m =
+            self.tlk.entries.get(row).filter(|e| e.flags & FLAG_TEXT != 0 && !e.text.is_empty());
+        let f = self
+            .feminine
+            .as_ref()
+            .and_then(|(_, f)| f.entries.get(row))
+            .filter(|e| e.flags & FLAG_TEXT != 0 && !e.text.is_empty());
+        if m.is_none() && f.is_none() {
+            return false;
+        }
+        if sought.ascii
+            && m.is_none_or(|e| e.text.is_ascii())
+            && f.is_none_or(|e| e.text.is_ascii())
+        {
+            return sought.words.iter().all(|w| {
+                let wb = w.as_bytes();
+                m.is_some_and(|e| contains_ascii_ci(&e.text, wb))
+                    || f.is_some_and(|e| contains_ascii_ci(&e.text, wb))
+            });
+        }
+        let cp = self.codepage();
+        let m_low = m.map(|e| cp.decode(&e.text).to_lowercase());
+        let f_low = f.map(|e| cp.decode(&e.text).to_lowercase());
+        sought.words.iter().all(|w| {
+            m_low.as_deref().is_some_and(|s| s.contains(w.as_str()))
+                || f_low.as_deref().is_some_and(|s| s.contains(w.as_str()))
+        })
     }
 
     /// Writes the table (and the feminine table) to their files: a
@@ -854,32 +1183,55 @@ impl Table {
             }
             let path = source.file().ok_or_else(|| format!("{source} is read-only here"))?;
             let data = tlk.to_bytes().map_err(|e| e.to_string())?;
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            }
-            // Written beside it, then moved over it: never half a table.
-            let tmp = path.with_extension("tlk.part");
-            std::fs::write(&tmp, data)
-                .and_then(|()| std::fs::rename(&tmp, path))
-                .map_err(|e| format!("{}: {e}", path.display()))
+            // (Beside it, then moved over it: never half a table.)
+            crate::write_replacing(path, &data).map_err(|e| format!("{}: {e}", path.display()))
         };
         if let Some((source, fem)) = &self.feminine {
             write(source, fem)?;
         }
         write(&self.source, &self.tlk)?;
         self.saved = Some(self.undo.len());
+        self.typed_unsaved = false;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Typing into a line is one step a burst: ended by `end_typing` (another
+    /// line chosen, the field left) and by an undo or a redo, so that what is
+    /// typed after is a step of its own, never joined to an older one.
+    #[test]
+    fn a_burst_of_typing_ends_where_it_is_ended() {
+        let dir = mg_testkit::scratch_dir("talk-bursts");
+        let mut t = Table::create("bursts", &dir, Language::ENGLISH, false);
+        let line = |text: &str| Line {
+            text: text.into(),
+            feminine: None,
+            sound: String::new(),
+            sound_length: 0.0,
+        };
+        t.add_line(&line("")).unwrap();
+        let steps = t.steps().0;
+        t.set_line(0, &line("a"), Some(0)).unwrap();
+        t.set_line(0, &line("ab"), Some(0)).unwrap();
+        assert_eq!(t.steps().0, steps + 1, "one burst, one step");
+        t.end_typing();
+        t.set_line(0, &line("abc"), Some(0)).unwrap();
+        assert_eq!(t.steps().0, steps + 2, "ended: a step of its own");
+        t.undo();
+        assert_eq!(t.line(0).text, "ab");
+        t.set_line(0, &line("abd"), Some(0)).unwrap();
+        t.undo();
+        assert_eq!(t.line(0).text, "ab", "typed after an undo: not joined to the older step");
+    }
+
     use super::*;
     use mg_resman::{LayerClass, MemContainer, priority};
 
     #[test]
     fn csv_goes_out_and_comes_back_as_one_undoable_import() {
-        let dir = std::env::temp_dir();
+        let dir = mg_testkit::test_output();
         let mut t = Table::create("csv", &dir, Language::ENGLISH, true);
         let line = |text: &str, feminine: &str, sound: &str| Line {
             text: text.into(),
@@ -916,6 +1268,36 @@ mod tests {
         assert!(t.import_csv("StrRef,Text\n1,ok\nx,bad\n").is_err());
         assert!(t.import_csv("Text\nno strref\n").is_err());
         assert_eq!(t.to_csv(), before);
+    }
+
+    /// A row far past the table's end is one step of the history, not one
+    /// for each empty line between (millions of them, and gigabytes, for
+    /// one mistyped StrRef), and one undo takes it and the lines between
+    /// back.
+    #[test]
+    fn an_import_far_past_the_end_is_one_step() {
+        let dir = mg_testkit::test_output();
+        for feminine in [false, true] {
+            let mut t = Table::create("far", &dir, Language::ENGLISH, feminine);
+            assert_eq!(t.import_csv("StrRef,Text\n500000,x\n500003,y\n"), Ok((0, 2)));
+            assert_eq!((t.undo.len(), t.len()), (2, 500_004));
+            assert_eq!((t.line(500_000).text.as_str(), t.line(500_003).text.as_str()), ("x", "y"));
+            assert!(t.is_blank(499_999) && t.is_blank(500_001));
+            if let Some((_, f)) = &t.feminine {
+                assert_eq!(f.entries.len(), 500_004);
+            }
+            t.undo();
+            assert_eq!((t.undo.len(), t.len()), (0, 0), "one undo empties it");
+            assert!(t.feminine.as_ref().is_none_or(|(_, f)| f.entries.is_empty()));
+            t.redo();
+            assert_eq!((t.len(), t.line(500_003).text.as_str()), (500_004, "y"));
+            // Move to Talk Table's line, the same.
+            let mut t = Table::create("far", &dir, Language::ENGLISH, feminine);
+            let line = Line { text: "z".into(), ..t.line(0) };
+            t.put_line(1000, &line).unwrap();
+            t.undo();
+            assert_eq!(t.len(), 0);
+        }
     }
 
     #[test]
@@ -1020,7 +1402,7 @@ mod tests {
     /// save; one of a hak's is not edited here.
     #[test]
     fn a_module_s_table_is_saved_into_it() {
-        let dir = std::env::temp_dir().join(format!("mg-talk-module-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-talk-module");
         let mut t = Table::create("mine", &dir, Language::ENGLISH, true);
         t.source = Source::Module;
         assert!(t.editable());
@@ -1059,7 +1441,7 @@ mod tests {
 
     #[test]
     fn haks_then_the_module_then_the_folder() {
-        let dir = std::env::temp_dir().join(format!("mg-talk-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-talk");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("mine.tlk"), b"folder").unwrap();
         std::fs::write(dir.join("minef.tlk"), b"folder f").unwrap();
@@ -1113,6 +1495,27 @@ mod tests {
         assert_eq!(t.tlk.entries[0].flags & FLAG_SOUND, 0);
     }
 
+    /// A sound field with bytes after its NUL (a file's junk) is the name
+    /// before it, as the game reads it: shown so, and the line's text can
+    /// be set (the whole field was the name, NUL and all, which no line
+    /// could be written with).
+    #[test]
+    fn a_sound_is_the_field_up_to_its_first_nul() {
+        let entry = TlkEntry {
+            flags: FLAG_TEXT | FLAG_SOUND,
+            text: b"Hi".to_vec(),
+            sound: b"vs_hi\0junk\0\0".to_vec(),
+            ..Default::default()
+        };
+        let tlk = Tlk { language: Language::ENGLISH, entries: vec![entry] };
+        let found = Found { source: Source::Module, data: tlk.to_bytes().unwrap() };
+        let mut t = Table::open("mine", found, None).unwrap();
+        let read = t.line(0);
+        assert_eq!(read.sound, "vs_hi");
+        t.set_line(0, &Line { text: "Hello".into(), ..read }, None).unwrap();
+        assert_eq!((t.line(0).text.as_str(), t.line(0).sound.as_str()), ("Hello", "vs_hi"));
+    }
+
     /// A project's table (JSON) with a line that has a length and no
     /// sound, as `nwn_tlk` keeps one: the editor shows the length, and a
     /// change to the line's text keeps it, in the file written back.
@@ -1155,7 +1558,7 @@ mod tests {
 
     #[test]
     fn a_new_table_edited_undone_and_saved() {
-        let dir = std::env::temp_dir().join(format!("mg-talk-edit-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-talk-edit");
         let mut t = Table::create("mine", &dir, Language::ENGLISH, true);
         assert!(t.editable() && t.is_dirty());
         assert_eq!(t.add_line(&line("Hello")).unwrap(), 0);
@@ -1199,5 +1602,89 @@ mod tests {
         back.undo();
         assert!(!back.is_dirty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn text_line(text: &str) -> Line {
+        Line { text: text.into(), feminine: None, sound: String::new(), sound_length: 0.0 }
+    }
+
+    /// A line typed for a field: outside the table's history, making it
+    /// unsaved; taken back and put back as the module's Undo and Redo do,
+    /// the table reaching a line past its end with empty lines and losing
+    /// them again.
+    #[test]
+    fn a_typed_line_is_taken_back_and_put_back_outside_the_history() {
+        let mut t = Table::create("typed", &mg_testkit::test_output(), Language::ENGLISH, true);
+        t.add_line(&text_line("Own")).unwrap();
+        t.saved = Some(t.undo.len());
+        assert!(!t.is_dirty());
+        let typed = t.put_typed(10, &text_line("Sword")).unwrap();
+        assert!(t.is_dirty() && t.has_typed_unsaved() && t.can_undo());
+        assert_eq!((t.len(), t.line(10).text.as_str()), (11, "Sword"));
+        assert_eq!(t.line(10).feminine.as_deref(), Some("Sword"), "the feminine table too");
+        assert!(t.is_blank(5) && !t.is_blank(10) && !t.is_blank(0));
+        assert_eq!(t.find_text("Sword", None), Some(10));
+        assert_eq!(t.find_text("Sword", Some("Other")), None);
+        assert_eq!(t.find_text("sword", None), None);
+        // The editor's Undo is its own: the typed line stays.
+        t.undo();
+        assert_eq!(t.len(), 11, "row 0 emptied, not the lines after it taken");
+        assert!(t.is_blank(0));
+        t.redo();
+        assert_eq!(t.line(0).text, "Own");
+        // The module's Undo and Redo.
+        assert!(t.take_back(&typed));
+        assert_eq!(t.len(), 1, "the empty lines it was reached with go too");
+        assert!(t.can_put_back(&typed));
+        t.put_back(&typed).unwrap();
+        assert_eq!(t.line(10).text, "Sword");
+        // Changed in the editor since: left as it is, and not put back.
+        t.set_line(10, &text_line("Blade"), None).unwrap();
+        assert!(!t.take_back(&typed));
+        assert_eq!(t.line(10).text, "Blade");
+        assert!(t.put_back(&typed).unwrap_err().contains("another text"));
+        // Saved: no longer unsaved; the editor's Cancel keeps typed lines.
+        t.saved = None;
+        let dir = mg_testkit::scratch_dir("talk-typed");
+        t.source = Source::File(dir.join("typed.tlk"));
+        t.feminine.as_mut().unwrap().0 = Source::File(dir.join("typedf.tlk"));
+        t.save().unwrap();
+        assert!(!t.is_dirty());
+        let again = t.put_typed(11, &text_line("Shield")).unwrap();
+        t.set_line(0, &text_line("Changed"), None).unwrap();
+        assert!(t.drop_own_changes());
+        assert_eq!((t.line(0).text.as_str(), t.line(11).text.as_str()), ("Own", "Shield"));
+        assert!(t.is_dirty(), "the typed line is still to be saved");
+        assert!(t.take_back(&again));
+        assert_eq!(t.len(), 11);
+    }
+
+    #[test]
+    fn find_in_matches_ascii_non_ascii_feminine_and_numbers() {
+        let dir = mg_testkit::scratch_dir("talk-find-in");
+        let mut t = Table::create("findtest", &dir, Language::ENGLISH, true);
+        t.add_line(&Line {
+            text: "Hello Brave World".into(),
+            feminine: Some("Hello Brave Heroine".into()),
+            sound: "vo_hello".into(),
+            sound_length: 1.0,
+        })
+        .unwrap();
+        t.add_line(&Line {
+            text: "Café à la carte".into(),
+            feminine: None,
+            sound: String::new(),
+            sound_length: 0.0,
+        })
+        .unwrap();
+        t.add_line(&text_line("")).unwrap();
+
+        assert_eq!(t.find_in(0..t.len(), "brave world"), vec![0]);
+        assert_eq!(t.find_in(0..t.len(), "world heroine"), vec![0]);
+        assert_eq!(t.find_in(0..t.len(), "heroine cafe"), Vec::<usize>::new());
+        assert_eq!(t.find_in(0..t.len(), "café"), vec![1]);
+        assert_eq!(t.find_in(0..t.len(), "1"), vec![1]);
+        assert_eq!(t.find_in(0..t.len(), &CUSTOM.to_string()), vec![0]);
+        assert_eq!(t.find_in(0..t.len(), "vo_hello"), Vec::<usize>::new());
     }
 }

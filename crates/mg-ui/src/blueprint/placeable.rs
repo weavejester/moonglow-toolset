@@ -1,20 +1,22 @@
-//! Placeable Object Properties (`TdlgPlaceableEdit`): Basic, Lock, Trap,
-//! Scripts, Advanced, Description, Comments; and the placeable's inventory
-//! (Aurora's Inventory… dialog) as its own page.
+//! Placeable Object Properties (`TdlgPlaceableEdit`): Basic, Inventory
+//! (Aurora's Inventory… dialog), Lock, Trap, Scripts, Advanced, Variables,
+//! Visuals, Description, Comments.
 
 use egui::Ui;
 use mg_gff::{FieldType, Struct};
 use mg_module::palette::BlueprintKind;
+use mg_uikit::Controls as _;
 
 use super::{Form, inventory, situated};
 
-pub(super) const PAGES: [&str; 9] = [
+pub(super) const PAGES: [&str; 10] = [
     "Basic",
     "Inventory",
     "Lock",
     "Trap",
     "Scripts",
     "Advanced",
+    "Variables",
     "Visuals",
     "Description",
     "Comments",
@@ -30,12 +32,9 @@ const STATES: [(i64, &str); 6] = [
     (5, "Deactivated"),
 ];
 
-/// The width of the Basic page's fields beside the model.
-const BASIC_SIDE: f32 = 440.0;
-
 pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
     match page {
-        "Basic" => situated::beside_model(f, ui, BASIC_SIDE, |f, ui, _| basic(f, ui)),
+        "Basic" => basic(f, ui),
         "Inventory" => contents(f, ui),
         "Lock" => situated::lock(f, ui),
         "Trap" => situated::trap(f, ui),
@@ -59,7 +58,10 @@ pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
             ],
         ),
         "Advanced" => situated::advanced(f, ui, &STATES, advanced),
-        "Visuals" => super::visuals::page(f, ui, true),
+        "Visuals" => {
+            super::tint::section(f, ui);
+            super::visuals::page(f, ui, true);
+        }
         "Description" => f.locstring_memo(ui, "Description", "Description"),
         _ => f.memo(ui, "Comments", "Comment"),
     }
@@ -67,16 +69,11 @@ pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
 
 fn basic(f: &mut Form<'_>, ui: &mut Ui) {
     let appearances = f.choices("placeables", Some("StrRef"), Some("Label"));
-    let appearances = f.appearance_rows(mg_rules::ObjectKind::Placeable, &appearances);
-    egui::Grid::new(("utp-basic", f.key)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        crate::widgets::field_label(ui, "Name");
-        f.locstring(ui, "Name", "LocName");
-        ui.end_row();
-        crate::widgets::field_label(ui, "Tag");
-        f.tag(ui, "Tag", "Tag");
-        ui.end_row();
-        crate::widgets::field_label(ui, "Appearance Type");
-        ui.horizontal(|ui| {
+    let appearances = f.appearance_rows(ui.ctx(), mg_rules::ObjectKind::Placeable, &appearances);
+    super::form_grid(ui, ("utp-basic", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+        f.name_and_tag(ui, "LocName");
+        crate::widgets::field_label(ui, "Appearance type");
+        super::row(ui, |ui| {
             f.appearance_choice(ui, "Appearance", &appearances, FieldType::Dword, false);
             f.gallery_button(ui, crate::appearance_gallery::Kind::Placeable);
         });
@@ -93,22 +90,17 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
             f.check_taking(ui, "Static", "Static", &mg_module::areas::VISUAL_TRANSFORM_FIELDS);
         ui.end_row();
         crate::widgets::field_label(ui, "");
-        ui.add_enabled_ui(!fixed, |ui| f.check(ui, "Useable", "Useable"));
+        f.check_if(ui, !fixed, "Useable", "Useable");
         ui.end_row();
         crate::widgets::field_label(ui, "");
-        ui.horizontal(|ui| {
-            let has =
-                ui.add_enabled_ui(!fixed, |ui| f.check(ui, "Has Inventory", "HasInventory")).inner;
-            // (Several edited together: an inventory is one's own.)
-            let one = f.also.is_empty();
+        let has = f.check_if(ui, !fixed, "Has inventory", "HasInventory");
+        ui.end_row();
+        // (Inventory… on a row of its own, as the boards draw it.)
+        crate::widgets::field_label(ui, "");
+        ui.vertical(|ui| {
             let button = ui
-                .add_enabled(has && one, egui::Button::new("Inventory…"))
+                .add_enabled(has, egui::Button::new("Inventory…"))
                 .on_hover_text("Edit inventory contents");
-            let button = if one {
-                button
-            } else {
-                button.on_disabled_hover_text("Inventories are edited one at a time")
-            };
             if button.clicked() {
                 f.app.blueprint_pages.insert((f.key, f.path.clone()), "Inventory");
             }
@@ -131,7 +123,7 @@ fn basic(f: &mut Form<'_>, ui: &mut Ui) {
 fn advanced(f: &mut Form<'_>, ui: &mut Ui) {
     let bags = f.choices("bodybag", Some("Name"), Some("LABEL"));
     let has = f.int("HasInventory") != 0;
-    ui.add_enabled_ui(has, |ui| ui.label("Treasure Model"));
+    ui.add_enabled_ui(has, |ui| ui.label("Treasure model"));
     ui.add_enabled_ui(has, |ui| f.choice(ui, "Treasure model", "BodyBag", &bags, FieldType::Byte));
     ui.end_row();
     illumination(f, ui);
@@ -152,20 +144,13 @@ fn illumination(f: &mut Form<'_>, ui: &mut Ui) {
     crate::widgets::field_label(ui, "");
     f.mark_mixed(ui, LIGHT_STATE);
     let mut on = illuminated(&f.root);
-    let r = ui.checkbox(&mut on, "Illuminated");
+    let r = ui.check_box(&mut on, "Illuminated");
     let r = if lit {
         r.on_hover_text(
-            "Whether the placeable's light (placeables.2da LightColor) is on when the game \
-             loads it (GetPlaceableIllumination; scripts turn it on and off with \
-             SetPlaceableIllumination). The model's own light nodes stay on either way. \
-             Aurora doesn't show this field.",
+            "Whether the placeable's light (placeables.2da LightColor) is on when the game loads it",
         )
     } else {
-        r.on_hover_text(
-            "Its appearance has no light (placeables.2da LightColor), so the game doesn't \
-             light it; this is kept for when the appearance's row gains one. On unless \
-             unticked. Aurora doesn't show this field.",
-        )
+        r.on_hover_text("Its appearance has no light, so this is kept for when its row gains one")
     };
     if r.changed() {
         f.set_int("Illumination", LIGHT_STATE, i64::from(on), FieldType::Byte);
@@ -176,16 +161,25 @@ fn illumination(f: &mut Form<'_>, ui: &mut Ui) {
 /// The items the placeable holds.
 fn contents(f: &mut Form<'_>, ui: &mut Ui) {
     let base = f.path.clone();
+    // (Several: those without an inventory are left, and said.)
+    if f.several() {
+        super::inventory_together::page(f, ui, super::inventory_together::Holder::Placeable);
+        return;
+    }
     if f.int("HasInventory") == 0 {
-        ui.weak("The placeable has no inventory (Basic › Has Inventory).");
+        ui.weak("The placeable has no inventory (Basic › Has inventory).");
         return;
     }
     let key = f.key;
-    let items: Vec<Struct> = f.root.list("ItemList").unwrap_or(&[]).to_vec();
+    let root = std::mem::replace(&mut f.root, mg_gff::Struct::new(0));
+    let items = root.list("ItemList").unwrap_or(&[]);
     let names = f.blueprint_names(BlueprintKind::Item);
     let mut add = None;
-    let (mut adds, mut taken) = (Vec::new(), Vec::new());
+    let mut incoming = inventory::Incoming::default();
     let mut edits = Vec::new();
+    // (Ctrl and Shift select several, to drag, copy or cut together.)
+    let chosen_id = egui::Id::new(("item-rows-selected", key, base.to_string()));
+    let selected = inventory::selected_rows(ui, chosen_id, items.len());
     crate::widgets::two_columns(ui, 300.0, |ui, col| {
         if col == 0 {
             add = f.item_picker(ui, "Add Item");
@@ -197,18 +191,27 @@ fn contents(f: &mut Form<'_>, ui: &mut Ui) {
         let look = inventory::ItemLook {
             row: &mut row,
             infinite: false,
-            selected: &[],
+            selected: &selected,
+            also: &[],
             equip: false,
             copied,
             palette: &names,
         };
-        let mut out = inventory::item_list(ui, key, &base, &items, look);
+        let mut out = inventory::item_list(ui, key, &base, items, look);
         // Pasted, dragged from the palette, or dragged out of another
         // object's inventory: added here.
         let whose = inventory::owner(key, &base);
-        (adds, taken) = f.list_events(ui, &items, &mut out, whose, &base);
+        // (A move within the list keeps its length: the places selected
+        // then hold other items.)
+        inventory::select_rows(ui, chosen_id, items.len(), out.clicked, !out.moved.is_empty());
+        incoming = f.list_events(ui, items, &mut out, whose, &base);
         edits = out.edits;
     });
-    adds.extend(add.map(inventory::Added::Blueprint));
-    f.apply_list(&base, &items, adds, taken, edits);
+    f.root = root;
+    incoming.adds.extend(add.map(inventory::Added::Blueprint));
+    let items = match incoming.adds.is_empty() {
+        true => Vec::new(),
+        false => f.root.list("ItemList").unwrap_or(&[]).to_vec(),
+    };
+    f.apply_list(&base, &items, incoming, edits);
 }

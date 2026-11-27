@@ -1,9 +1,9 @@
 ---
 type: Manual Page
 title: Writing plugins
-description: Writing plugins - a first plugin, how a plugin runs (events too, a resource's own around a save and the after-create hook), the manifest, reading and editing the module, commands on what is selected, the game's data, talking to the user, settings (ctx.settings, their scopes and where each is kept), files and haks outside the module, areas and terrain, checks and the fixes of their findings, several files, trying and testing (a plugin's own tests, mg plugin test), editor types, versions, sharing, and a project's own plugins.
+description: Writing plugins - a first plugin, how a plugin runs (events too, a resource's own around a save and the after-create hook), the manifest, reading and editing the module, commands on what is selected, the game's data, talking to the user, settings (ctx.settings, their scopes and where each is kept), files and haks outside the module, areas and terrain, exporters and importers, wizards, panels, checks and the fixes of their findings, several files, trying and testing (a plugin's own tests, mg plugin test), editor types, versions, sharing, and a project's own plugins.
 tags: [manual, plugins, luau]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-28T11:25:06Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-25T08:44:46Z }
 ---
 
 # Writing plugins
@@ -17,12 +17,13 @@ plugin can call. What plugins are to the people who use them is in
 
 You need a text editor and Moonglow. Nothing is compiled or built.
 
-The plugin API is **experimental** (version 0.4): it may change in a
+The plugin API is **experimental** (version 0.10): it may change in a
 later release, and Versions, below, says what that means for a plugin.
 
 ## A first plugin
 
-Open **Plugins › Manage Plugins…** and press **Open Folder**. In the
+Open **Plugins › Manage Plugins**, which opens the **Plugins** tab, and
+press **Open Folder** there. In the
 plugins folder, make a folder `hello` with two files. The manifest,
 `plugin.cfg`:
 
@@ -53,9 +54,9 @@ mg.command("count", function(ctx)
 end)
 ```
 
-Back in Manage Plugins press **Reload**, tick **Hello**, and with a
-module open choose **Plugins › Count Creatures**. The log says how many
-there are.
+Back on the Plugins tab press **Reload**, check **Hello**, and with a
+module open choose **Plugins › Count Creatures**. The log (the **Log**
+tab of the Bottom Dock) says how many there are.
 
 What happened: the manifest declared a command, so Moonglow could list it
 without running anything. When you chose it, Moonglow ran `main.luau`,
@@ -89,7 +90,7 @@ mg.command("stamp", function(ctx)
 end)
 ```
 
-**Reload**, and run it (Plugins menu, the Command Palette, or
+**Reload**, and run it (Plugins menu, Quick Open, or
 Ctrl+Alt+H). It asks, shows its progress, and the log says what it
 changed. **Edit › Undo Stamp creature comments** takes all of it back at
 once.
@@ -125,7 +126,7 @@ has no other way to change anything.
 are no files of its own choosing, no network, no other programs, and the
 libraries can't be replaced. What it reaches outside the module, the
 user hands it: a file or a folder they choose for it to read, and a hak
-or that folder if they allow it to write ([Outside the module](#outside-the-module)). `print` writes to the log. A job may use 256 MB of memory.
+or that folder if they allow it to write ([Outside the module](#outside-the-module)). `print` writes to the log. A job may use 256 MB of memory, and Moonglow holds up to 512 MB more for it (its tables, pictures, edits and files to write: [Limits](17-plugin-api.md#limits)).
 **Cancel** stops it between any two steps, even in a loop that never
 ends; `pcall` does not catch that.
 
@@ -145,7 +146,8 @@ module then has unsaved changes again: an event that edits should have
 little to say. `resource-saved` only reads. Where such a handler asks
 for a folder (`ctx.ui:open_folder`) or for leave to write (a hak, a
 folder), the user is asked once and the answer is kept for that
-plugin's events; a form is asked every time.
+plugin's events while its code stays as it is: an edit of its files
+asks again, as a new version does; a form is asked every time.
 
 ```lua
 mg.on("emit", function(ctx)
@@ -233,9 +235,9 @@ running the plugin, to list what it adds.
 | `id` | Needed. The plugin's name for programs, the same wherever it is installed: `author.plugin-name`, in lower-case letters, digits, `.`, `-` and `_`. Settings and keys are kept under it, so don't change it between versions. |
 | `name` | Needed. Its name for people. |
 | `version` | Needed. The plugin's own version, as you number it. |
-| `api` | Needed. The plugin API it was written for: `"0.4"`, or an earlier one (`"0.3"`, `"0.2"`, `"0.1"`) for a plugin that uses nothing added since (it then runs in older versions of Moonglow too). |
+| `api` | Needed. The plugin API it was written for: `"0.10"`, or an earlier one (`"0.9"`, `"0.8"`, `"0.7"`, `"0.6"`, `"0.5"`, `"0.4"`, `"0.3"`, `"0.2"`, `"0.1"`) for a plugin that uses nothing added since (it then runs in older versions of Moonglow too). |
 | `license` | Needed. Its license, as an [SPDX](https://spdx.org/licenses/) name. Moonglow is GPL-3.0, and a plugin runs inside it: choose a license compatible with the GPL (`GPL-3.0-or-later`, `MIT`, `Apache-2.0`…). |
-| `description` | One or two sentences on what it does, shown in Manage Plugins. |
+| `description` | One or two sentences on what it does, shown on the Plugins tab. |
 | `author` | Who wrote it. Repeat the line for each author. |
 | `entry` | The script that registers the handlers; `main.luau` unless given. A file of the plugin's folder. |
 
@@ -247,7 +249,8 @@ running the plugin, to list what it adds.
 | `title` | Needed. Its name in the Plugins menu, written as menu commands are (`Fix Creature Tags`; with `…` at the end if it asks before it acts). |
 | `hint` | What its tip says. |
 | `key` | A key it has until the user chooses another: `Ctrl+Alt+T` (`Ctrl`, `Alt`, `Shift` and a key's name; Ctrl is Cmd on macOS). A key something else has already is reported as a conflict in Options › Keyboard, so choose an unusual one, or none. |
-| `for` | What it is for (since API 0.4): kinds of object, `creature`, `door`, `encounter`, `item`, `placeable`, `sound`, `store`, `trigger`, `waypoint`, and `area`, as a list (`"placeable, creature"`) or one to a line. It is then in their right-click menus too, and runs on what was clicked ([Commands on what is selected](#commands-on-what-is-selected)). |
+| `for` | What it is for (since API 0.4): kinds of object, `creature`, `door`, `encounter`, `item`, `placeable`, `sound`, `store`, `trigger`, `waypoint`, and `area`, as a list (`"placeable, creature"`) or one to a line; since API 0.5 also a kind's placed objects alone (`"placed creature"`) or its blueprints alone (`"creature blueprint"`), `tile`, and another resource's type (`nss`, `dlg`, `ifo`, `fac`, `jrl`, `2da`, `gui`, `jui`). It is then in their right-click menus too, and runs on what was clicked ([Commands on what is selected](#commands-on-what-is-selected)). |
+| `menu` | The submenu it is in (since API 0.7), in every menu it is in (the right-click menus and the Plugins menu): `"Make"`, or nested with `›` (or `>`) between the names, `"Make › Crafting"`. Each submenu is made once, where the first command naming it is, and holds the commands that name it in the manifest's order; the title is then the command's name within it (`Workbench…`). Quick Open, Options › Keyboard and `mg plugin list` name it by the whole path, `Make › Crafting › Workbench`, so it is still found by name. Left out, the command is in the menu itself, as before. |
 
 `[check]`, once for each check:
 
@@ -264,7 +267,7 @@ running the plugin, to list what it adds.
 | `id` | Needed. The id the code registers it under (`mg.on`). |
 | `on` | Needed. What it waits for: `"module-opened"`, `"module-saved"` and, since API 0.4, `"resource-saving"`, `"resource-saved"`, `"object-placed"`, `"object-pasted"` or `"resource-created"` ([the events](17-plugin-api.md#ctxevent)). |
 | `types` | For `resource-saving` and `resource-saved` (API 0.4): the types of resource it is for, as a list (`"are, git"`); left out, every one. |
-| `for` | For `object-placed`, `object-pasted` and `resource-created` (API 0.4): the kinds of object, or `area`, it is for, as a command's `for`; left out, every one. |
+| `for` | For `object-placed`, `object-pasted` and `resource-created` (API 0.4): the kinds of object, or `area`, it is for, as a command's `for`; left out, every one. Since API 0.5 `"placed creature"` for objects placed or pasted, and `"creature blueprint"` or a resource's type (`nss`) for what is made. |
 
 `[setting]`, once for each value the plugin keeps (since API 0.4;
 [Settings](#settings)):
@@ -272,13 +275,54 @@ running the plugin, to list what it adds.
 | Key | |
 | --- | --- |
 | `id` | Needed. Its name as the plugin reads it, `ctx.settings.<id>`: lower-case letters, digits and `_`, from a letter (not `set`). |
-| `type` | `"string"` (as when left out), `"int"` (a whole number), `"bool"`, `"choice"` or `"path"` (a file's or a folder's path, as text). |
-| `default` | Its value until one is set: text, a whole number, `true` or `false`, or one of the choices. Left out: empty text, 0 (or `min`), false, the first choice. |
+| `type` | `"string"` (as when left out), `"int"` (a whole number), `"float"` (a number with a fraction), `"bool"`, `"choice"`, `"list"` (texts), `"color"` (`#rrggbb`) or `"path"` (a file's or a folder's path, as text). `float`, `list` and `color` since API 0.5. |
+| `default` | Its value until one is set: text, a number, `true` or `false`, one of the choices, a list's texts separated by commas (`"door, placeable"`), a color (`"#336699"`). Left out: empty text, 0 (or `min`), false, the first choice, an empty list, black. |
 | `label` | What the settings' form calls it; else its id. |
 | `help` | What the form's tip says of it. |
 | `scope` | Where its value is kept, and who shares it: `"user"` (as when left out), `"project"` or `"user-project"` (below). |
-| `choices` | A choice's options, as a list: `"creatures, placeables"`. Needed for one. |
-| `min`, `max` | An int's limits. |
+| `choices` | A choice's options, as a list: `"creatures, placeables"`. Needed for one. A list's (since API 0.5): what each of its texts may be; left out, any text. |
+| `min`, `max` | An int's or a float's limits. |
+| `pattern` | For a string (since API 0.5): a regular expression the whole of its text matches (`"[A-Z]{2,4}_"`); the form says, as it is typed, where a value doesn't. |
+| `pick` | For a path (since API 0.5): `"file"` (as when left out) or `"folder"`, what the form's Choose… picks. |
+
+`[exporter]`, once for each exporter (since API 0.6; [Exporters and
+importers](#exporters-and-importers)):
+
+| Key | |
+| --- | --- |
+| `id` | Needed. The id the code registers it under (`mg.exporter`). |
+| `title` | Needed. Its name in File › Export (`Creatures as CSV…`). |
+| `hint` | What its tip says. |
+| `to` | `"file"` (as when left out) or `"folder"`: what the user chooses for it to write. |
+| `extension` | For a file: its extension, without the dot (`"csv"`), the save dialog's filter and the name it suggests; left out, any. |
+| `for` | What it exports, as a command's `for` names kinds: it exports what is selected, and is offered only when what is selected is all of those kinds. Left out, it exports the module. |
+
+`[importer]`, once for each importer (since API 0.6):
+
+| Key | |
+| --- | --- |
+| `id` | Needed. The id the code registers it under (`mg.importer`). |
+| `title` | Needed. Its name in File › Import (`Creatures from CSV…`). |
+| `hint` | What its tip says. |
+| `from` | `"file"` (as when left out) or `"folder"`: what the user chooses for it to read. |
+| `extensions` | For a file: the extensions of the files it reads, as a list (`"csv, txt"`), the open dialog's filter; a file of another is refused. Left out, any. |
+
+`[wizard]`, once for each wizard (since API 0.6; [Wizards](#wizards)):
+
+| Key | |
+| --- | --- |
+| `id` | Needed. The id the code registers it under (`mg.wizard`). |
+| `title` | Needed. Its name in the Wizards menu (`Shop Wizard…`). |
+| `hint` | What its tip says. |
+
+`[panel]`, once for each panel (since API 0.6; [Panels](#panels)):
+
+| Key | |
+| --- | --- |
+| `id` | Needed. The id the code registers it under (`mg.panel`). |
+| `title` | Needed. Its name in Plugins › Panels and its tab's (or window's) title. |
+| `hint` | What its tip says. |
+| `refresh` | When it is drawn again besides when it opens, by its Refresh and after a job of the plugin's: `"edits"` (each change of the module), `"selection"` (what is selected changes), both (`"edits, selection"`) or, left out, neither. |
 
 A key or a section Moonglow doesn't know is an error (a misspelled one,
 most likely), and so is a command declared but not registered, or
@@ -346,16 +390,27 @@ for = "creature, door, encounter, item, placeable, sound, store, trigger, waypoi
   an area and their blueprints: the area view's menu on them (all the
   objects selected must be of the kinds the command is for), the module
   tree's rows of an area's objects and of blueprints, and a palette's
-  rows. `area` is an area: the module tree's row of it, and the area
-  view's menu when nothing is selected.
+  rows. Since API 0.5, `placed placeable` is the placed objects alone and
+  `placeable blueprint` the blueprints alone. `area` is an area: the
+  module tree's row of it, and the area view's menu (with objects
+  selected, in its submenu **The Area**).
+- Since API 0.5 also: `tile`, the tiles selected in an area's view (its
+  tile menu; each entry's `x`, `y` and `index`); a resource's type
+  (`nss`), the script editor's menu and its tab's; a palette's category
+  and a group of the module tree (`Creatures`), whose menus run the
+  command on every one of them; a Properties window's tab (of what it
+  edits; several edited together, each); and the rows of Find
+  References and of Advanced Search (there, the checked ones, where the
+  row is one of them).
 - In each menu the plugins' commands come together, after the menu's
   own, above Variables and Properties (which end a menu, as in Aurora).
 - The handler gets what the menu was opened on as `ctx.selection`: every
   object selected in the area view, every blueprint chosen in a palette
   (Ctrl+click chooses several), or the one row. Chosen from the Plugins
-  menu, the Command Palette or a key, it gets the objects selected in
-  the area view, else the blueprints selected in the palette; it should
-  say so when that is nothing.
+  menu, Quick Open or a key, it gets what is chosen in the
+  pane last clicked in (the module tree, a palette, an area's view),
+  else the objects selected in the area view, else the blueprints
+  selected in the palette; it should say so when that is nothing.
 
 Each entry of `ctx.selection` says what it is and where, as `ctx.edit`
 takes it: `resource` is the area's GIT for a placed object (and `path`
@@ -375,12 +430,14 @@ end)
 ```
 
 `ctx.open` is the area or editor in front, an entry of the same shape
-(or nil): a command for the area in view can use it. The
+(or nil): a command for the area in view can use it. Where several are
+edited together (a Properties window of several blueprints), it is the
+first, and `ctx.open.together` lists them all. The
 [reference](17-plugin-api.md#ctxselection-ctxopen) lists every field;
 the example plugin `set-local` (in `docs/plugins/examples`) sets a local
 variable on what was clicked and counts an area's objects. With `mg
 plugin run`, `--select guard.utc --select "tavern.git/Placeable List[3]"`
-gives the selection and `--open tavern.are` what is open.
+(a tile: `--select "tavern.are/Tile_List[5]"`) gives the selection and `--open tavern.are` what is open.
 
 A plugin reads the selection as it reads the module: no question is
 asked. Its edits are one undoable step, as any command's.
@@ -516,8 +573,8 @@ the command's title.
 A plugin keeps values of its own as **settings** (plugin API 0.4): a
 team's prefix, the builder's code, how strict a check is. The manifest
 declares each (`[setting]`), and Moonglow keeps their values, shows them
-in a form (Manage Plugins › **Settings…**) and hands them to every job.
-The `builder-tags` example has five:
+in a form (**Settings…** beside the plugin on the Plugins tab) and hands
+them to every job. The `builder-tags` example has five:
 
 ```ini
 [setting]
@@ -561,7 +618,7 @@ Each setting's **scope** says where its value is kept, and who shares it:
 
 | Scope | Whose | Kept in |
 | --- | --- | --- |
-| `user` | The user's, for every module | Moonglow's settings (`mg` keeps none: a run takes the default, or `--setting`) |
+| `user` | The user's, for every module | Moonglow's own folder (`plugin-settings.json`), which the window and `mg` share (since Moonglow 3.3.0; `mg plugin run` reads and keeps them too) |
 | `project` | The team's, for the project | The project's `moonglow.toml`, `[plugins."<plugin id>"]`: committed with the project, so every builder has it |
 | `user-project` | The user's own, for the project | The project's `.moonglow/user.toml`, `[plugins."<plugin id>"]`: never committed |
 
@@ -569,11 +626,13 @@ The two project scopes need a project: a module folder or a nasher
 project, whose files they are kept in. With a module kept in one file
 (`.mod`) they read their defaults, and can't be set. A team can write its
 values into `moonglow.toml` by hand, as
-[the project file](03-modules.md#the-project-file) shows.
+[the project file](03-modules.md#the-project-file-moonglowtoml) shows.
 
 The plugin reads them as `ctx.settings`, each by its id; `for id, value
 in ctx.settings` goes through them in the manifest's order. A value is
-text (a string, a choice, a path), a whole number or true or false:
+text (a string, a choice, a path, a color as `"#rrggbb"`), a whole number
+(an int), a number (a float), true or false, or a list of texts (a list,
+from 1):
 
 ```lua
 local function wanted(ctx): string
@@ -608,12 +667,17 @@ A value kept that is not of its setting's kind (`max_length = "long"`),
 or kept in the other file, is said in the log when the project is
 opened, and the setting has its default; one for a setting the plugin
 doesn't declare (an older version's) is said and left where it is.
-Moonglow writes only the values it sets, and keeps the rest of each file
-as it is written.
+The settings' form says so too, with **Tidy Up**, which takes out what
+is not of its kind or of no setting and moves what is in the other file
+where its scope keeps it; `mg plugin tidy PROJECT` does the same from a
+terminal. Tables of plugins not installed are left alone (another
+builder's). Moonglow writes only the values it sets or tidies, and keeps
+the rest of each file as it is written.
 
-A `path` is text to the plugin: the form has a button to choose it, but
-the plugin reads no file by it (the sandbox). It still asks for a file
-with `ctx.ui:open_file`.
+A `path` is text to the plugin: the form has a button to choose it (a
+file, or with `pick = "folder"` a folder), but the plugin reads no file
+by it (the sandbox: a team's value comes with the checkout, not from the
+user). It asks for a file with `ctx.ui:open_file`.
 
 ## Outside the module
 
@@ -655,11 +719,19 @@ same names (no copy is kept, and Undo does not take them back). A name
 is a name: not a path into a folder of the folder, nothing above it,
 nothing hidden.
 
-The hak is written when the handler returns. Resources are added to a
-hak that is already there, and a copy of it is kept as `my_tiles.hak.bak`.
-Unlike the module's edits, a hak is not undone by Undo: say what the
-command writes in its title or its form. `folder:to_hak` copies a file
-whatever its size; `ctx.hak:write` is for what the plugin computed.
+The hak is written when the handler returns, before its edits go in (they
+may name it). Resources are added to a hak that is already there, and a
+copy of it is kept as `my_tiles.hak.bak`. The hak goes with the
+command's edits (since Moonglow 3.3.0): if they can't go in, the hak is
+taken back at once, and Undo takes it back with them (as it was, or gone
+if the command made it), Redo writes it again. A hak changed since (the
+hak editor saved it, another command wrote it) is left as it is, and
+the log says so. A command that writes a hak and edits nothing has no
+step of Undo: say what it writes in its title or its form.
+`folder:to_hak` copies a file whatever its size; `ctx.hak:write` is for
+what the plugin computed (past 64 MB of it, all of a job's haks
+together, what it writes waits in a scratch file rather than in memory
+until the hak is written).
 
 ## Areas and terrain
 
@@ -685,10 +757,226 @@ steps (`area.step` metres each), and neighbors are never more than a
 step apart, so raising one corner by two lifts the corners around it by
 one.
 
+Each stroke reads the area's tiles and puts the ones it chose in. A
+plugin that paints much of an area does it in a batch (since API 0.5),
+which reads the tiles once and puts in those that changed when its
+function returns, as a handful of edits, not thousands:
+
+```lua
+area:batch(function()
+    for y = 0, area.height do
+        for x = 0, area.width do
+            area:paint(x, y, ground(x, y))  -- what it reads back is what the strokes left
+        end
+    end
+end)
+```
+
+If the function fails, none of its strokes go in.
+
 A tileset the job is putting into a hak can be used at once, before the
 hak exists: `tileset-import` in the examples takes a folder of tileset
 files (as NWN Mapper exports them), puts them into a hak, and makes an
 area of one of the tileset's groups.
+
+## Exporters and importers
+
+An exporter writes a file, or files into a folder, that the user
+chooses: File › Export becomes a menu of Moonglow's own Export… and the
+enabled plugins' exporters (since API 0.6). The user chooses where in
+the save dialog before any of the plugin's code runs, and that choice is
+their leave: the exporter writes there with `out:write`, and is asked
+nothing more. It only reads the module; its files are written when it
+has returned, and Undo has nothing to take back. The `creature-sheet`
+example writes the module's creature blueprints as a spreadsheet's
+rows, through a CSV writer of its own (`csv.luau`):
+
+```lua
+mg.exporter("creatures-csv", function(ctx, out)
+    local rows = { HEADER }
+    local names = ctx.module:resources("utc")
+    for i, name in names do
+        ctx.progress(i, #names, name)
+        table.insert(rows, row(name, ctx.module:gff(name)))
+    end
+    out:write(csv.write(rows))
+    return `{#names} creatures written to {out.name}`
+end)
+```
+
+With `for = "creature blueprint"` in its manifest, its `selected-csv`
+exports what is selected instead (`ctx.selection`), and File › Export
+offers it only then. An exporter with `to = "folder"` writes each file
+by name: `out:write("guard.txt", text)`.
+
+An importer reads a file, or a folder, that the user chooses in File ›
+Import, and edits; its edits are one step of Undo. A file it reads is
+`{ name, bytes }`, as `ctx.ui:open_file` gives one; a folder is as
+`ctx.ui:open_folder` gives one. The example's reads such a sheet back:
+
+```lua
+mg.importer("creatures-csv", function(ctx, file)
+    local rows = csv.read(file.bytes)
+    local header = table.remove(rows, 1) or {}
+```
+
+and sets each row's tag and name on the blueprint of its resref,
+returning `{ label = "Import 2 creatures" }` for Undo. From the command
+line, `mg plugin export MODULE PLUGIN ID OUT` writes OUT (a folder for
+an exporter to a folder, made if it isn't there) and `mg plugin import
+MODULE PLUGIN ID SOURCE` reads SOURCE and saves, as `mg plugin run` does
+(`--select`, `--answer`, `--setting`, `--yes`, `--hak-dir`,
+`--dry-run`).
+
+## Wizards
+
+A wizard asks page by page, with **< Back**, **Next >** and **Finish**,
+each page seeing what the pages before were given, and edits at the end
+(since API 0.6). It is in the Wizards menu, under Moonglow's own, and runs
+as a job whose window shows its pages. The `store-wizard` example makes a
+store: a page for its name and kind (whose `check` keeps the page until it
+has a name), a page of prices made from the kind chosen (a function of the
+answers so far), and, for a smith or an alchemist, a page of what it buys,
+which a general store skips (its function returns nil):
+
+```lua
+mg.wizard("new-store", {
+    pages = {
+        {
+            id = "store",
+            title = "The store",
+            text = "What the store is called, and what kind of goods it keeps.",
+            fields = {
+                { id = "name", label = "Name", default = "General Store" },
+                { id = "kind", label = "Kind", type = "choice", choices = { "General", "Smith", "Alchemist" } },
+            },
+            check = function(ctx, answers)
+                if string.match(answers.name, "^%s*$") then
+                    return "A store needs a name."
+                end
+                return nil
+            end,
+        },
+```
+
+Its Finish makes the blueprint with `ctx.edit:write_gff`, named by
+`ctx.module:new_name`:
+
+```lua
+    finish = function(ctx, answers)
+        local name = ctx.module:new_name(answers.name, "utm")
+```
+
+`answers` holds every page's values by field id, so each field's id is
+its own across the pages. Back keeps what was typed; the pages and their
+checks only read, and Cancel makes nothing. `mg plugin wizard MODULE
+PLUGIN ID` answers each page from `--answers FILE` (a JSON object of
+values by field id, `{ "name": "Iron Hand", "kind": "Smith" }`) and
+`--answer ID=VALUE`, the rest by their defaults; a page whose check
+objects is an error, and nothing is saved.
+
+## Panels
+
+A panel is a tab of its own, or a window of its own, as Options ›
+General › Open editors opens editors (either may be docked beside the
+area): Plugins › Panels shows and hides it (since API 0.6). Its
+code returns what it shows, a list of elements (headings, text, values,
+separators, buttons that run the plugin's commands, and lists whose
+items open what they name), and Moonglow draws them. It runs when the
+panel opens, by its Refresh, after a job of the plugin's ends, and as
+its manifest's `refresh` says. The `module-overview` example's manifest
+has
+
+```ini
+[panel]
+id = "overview"
+title = "Module Overview"
+hint = "What the module has, and what is selected"
+refresh = "edits, selection"
+```
+
+and its code shows the module's counts, its areas (each opened by a
+click), and the tags of what is selected, with a button for those not
+upper case:
+
+```lua
+mg.panel("overview", function(ctx)
+    local areas = ctx.module:resources("are")
+    local shown = {
+        { type = "heading", text = "The module" },
+        { type = "value", label = "Areas", text = tostring(#areas) },
+```
+
+```lua
+        table.insert(shown, {
+            type = "button",
+            text = "Upper-Case Their Tags",
+            hint = "Upper-Case Selected Tags, on what is selected",
+            command = "upper-tags",
+        })
+```
+
+A button runs one of the plugin's own commands (one its manifest
+declares), on what is selected or on its `on`; the command edits, with
+its own step of Undo, and the panel is drawn again after it. A panel
+only reads, and runs beside the window, never in a frame: Moonglow
+shows what it returned last until it returns again, gives it 250
+milliseconds, and shows at most 2,000 elements ([the
+reference](17-plugin-api.md#exporters-importers-wizards-and-panels)). A
+panel is not in `mg`; its tests (`panel = "overview"`, `shows = […]`)
+run with `mg plugin test`.
+
+### Fields
+
+A panel may have fields, as a form's (since API 0.9), that stay open:
+a tint picked beside the area, following what is selected, rather than
+in a form that closes on OK. The `tint-panel` example shows the tint
+(The Domains of Dread's `tdod_tint`) of the placeable selected:
+
+```ini
+[panel]
+id = "tint"
+title = "Tint"
+hint = "The tint of the placed placeables selected"
+refresh = "edits, selection"
+```
+
+```lua
+        {
+            type = "field",
+            kind = "color",
+            id = "tint",
+            label = "Tint",
+            value = tint,
+            variable = VARIABLE,
+            command = "set-tint",
+        },
+```
+
+A field's `type` is `"field"`, and its `kind` is what a form's field's
+`type` is (`"text"`, `"number"`, `"check"`, `"choice"`, `"color"`); its
+`value` is what it shows. Moonglow keeps what the user sets in it, by
+its id, while the panel is drawn again; when the handler gives another
+`value` than the last time (another placeable selected, of another
+tint), the field takes that. While the color's picker is open, the
+placeables selected are drawn with `variable` set to it, as a form's
+color field draws them. When the user sets the field (here, the picker
+closes on another color), its `command` runs, with every field's value
+in `ctx.values`, by id:
+
+```lua
+mg.command("set-tint", function(ctx)
+    local chosen = placeables(ctx)
+    if not ctx.values.tint then
+```
+
+Run from anywhere else (the Plugins menu, a key), `ctx.values` is
+empty. The command's edits are its own step of Undo, and the panel is
+drawn again after it, showing the tint as it is now. A choice's options
+may carry a color, a swatch drawn before each (`{ text = "Crimson",
+color = "#a01010" }`; a form's too); its value is still the text. A
+command's test gives it the panel's values with `values = { tint =
+"#ff8000" }`.
 
 ## Checks
 
@@ -721,13 +1009,13 @@ does that.
 
 ### A fix for a finding
 
-A finding may carry a **fix**: edits that put it right, offered beside
-the finding in Verify Module's report as a button, and made only when
-the user clicks it (since API 0.4). `ctx.fix(label)` makes one: its
-`label` is what the button says, and it has `ctx.edit`'s methods
-(`set`, `remove`, `insert`, `remove_item`, `write`…), which record the
-edits and make none. The `tag-conventions` example gives each finding
-the fix of its own tag:
+A finding may carry a **fix**: edits that put it right, offered beside the
+finding in the log, where Verify Module writes it, and in Problems, as a
+button, and made only when the user clicks it (since API 0.4).
+`ctx.fix(label)` makes one: its `label` is what the button says, and it
+has `ctx.edit`'s methods (`set`, `remove`, `insert`, `remove_item`,
+`write`…), which record the edits and make none. The `tag-conventions`
+example gives each finding the fix of its own tag:
 
 ```lua
 mg.check("tag-case", function(ctx)
@@ -759,12 +1047,19 @@ end)
   those resources, the user is told to verify again. Fixes of one Verify
   that only set fields can be made one after another in one resource.
 - Give the label words that say what it does to this finding ("Retag
-  this store", "Set tdod_lit"). For a fix that needs a choice, offer a
-  command instead: a fix asks nothing.
+  this store", "Set tdod_lit").
+- A fix that needs a choice asks (since API 0.5): `ctx.fix("Retag…", {
+  command = "retag" })` is a button that runs the plugin's command
+  `retag` on the finding's resource (or `on = s`, an entry of the
+  selection's shape, for an object placed in an area), and the command
+  asks with its form. It records no edits of its own.
+- Undo of a fix offers its button again; **Fix All** beside the first of
+  a check's fixes makes every one of them as one step of Undo.
 - On the command line, `mg verify --fix CHECK` makes a check's fixes
   (`--dry-run` says what it would make), and `mg verify --json` gives
   each finding's fix as an edit file
-  ([Command-line tools](11-command-line.md)).
+  ([Command-line tools](11-command-line.md)). A fix that asks is not
+  made there (nobody to ask): run its command with `mg plugin run`.
 
 ## More than one file
 
@@ -784,9 +1079,9 @@ return rules
 
 ## Trying and testing
 
-- **The console** (Manage Plugins) runs a few lines on the open module
+- **The console** (on the Plugins tab) runs a few lines on the open module
   with `mg` and `ctx` at hand: the quickest way to try a call.
-- **Reload** in Manage Plugins reads the manifest again. The code is
+- **Reload** on the Plugins tab reads the manifest again. The code is
   read anew each time a command runs, so after changing only `main.luau`
   just run the command again.
 - **An error** names the script and the line, in the log; nothing was
@@ -796,7 +1091,8 @@ return rules
   declares. It is a good first step in a plugin's own tests. Given an
   archive (`mg plugin check hello.zip`), it checks what the installer
   would, and the code as it is in the archive: do that before you send
-  one to anybody.
+  one to anybody. The code has 5 seconds to load: past them the check
+  fails, saying it ran out of time.
 - **`mg plugin run MODULE DIR COMMAND --dry-run`** prints the edits a
   command would make, as an edit file
   ([Command-line tools](11-command-line.md)), and changes nothing: run it
@@ -809,13 +1105,18 @@ Try a new plugin on a copy of your module first.
 
 ### A plugin's own tests
 
-A plugin's tests are files `tests/*.toml` in its folder (plugin API
-0.4). Each names a **fixture**, a small module made for the tests, and
-lists what to run on it and what is to come of it.
-`mg plugin test DIR` runs them all: a line a test (`ok`, or `FAIL` and
-what was not as wanted), a summary, and an exit that fails if one test
-does (or there are none), so that a build pipeline can run it. The
-`tag-conventions` example has one file, `tests/tags.toml`:
+A plugin's tests are files `tests/*.toml` in its folder (plugin API 0.4).
+Each names a **fixture**, a small module made for the tests, and lists
+what to run on it and what is to come of it. `mg plugin test DIR` runs
+them all: a line a test (`ok`, or `FAIL` and what was not as wanted), a
+summary, and an exit that fails if one test does (or there are none), so
+that a build pipeline can run it. DIR may be a folder of plugins: each
+one's tests run, its lines under its id (since Moonglow 3.3.0). `mg plugin
+check` reads the test files too, without running them: a file that doesn't
+read, a test of a check, command or event the manifest lacks, a fixture
+that isn't there. In the Plugins tab (Plugins › Manage Plugins), **Run
+Tests** beside a plugin with tests runs them, the log saying what each
+came to. The `tag-conventions` example has one file, `tests/tags.toml`:
 
 ```toml
 module = "module"
@@ -1016,17 +1317,19 @@ custom talk table the test's data has not (the game may well find it in
 your `tlk/` folder), and the test is told so: in a note, of a test that
 runs them as part of more (`"all"`), and as a problem, of one that names
 `2da-strref`, or `custom-tlk` with its table not there, since that test
-can't test what it is for. Since Moonglow 2.13.0; before, they found
-every custom string missing.
+can't test what it is for.
 
 A test (`[[test]]`) has a `name` and runs one thing:
 
 | Key | |
 | --- | --- |
 | `check`, `command` or `event` | The id of what is run, as the manifest declares it. |
+| `export`, `import`, `wizard` or `panel` | An exporter's, an importer's, a wizard's or a panel's id (since API 0.6). An import reads the first of `files`; a wizard's pages are answered from `answers` by field id, each going on to the next (a page's check that objects fails it, with what it said, for `error`). |
+| `to` | For an export: the name of the file or the folder it writes to (`out.name`), from the test file's folder; nothing is written. |
 | `builtin` | One of Moonglow's own checks, by its id (`tag-unique`), in place of the plugin's (since Moonglow 2.3.0); several, in a list, or `"all"` (since Moonglow 2.13.0). |
 | `select`, `open` | What a command is run on and what is open (`ctx.selection`, `ctx.open`), named as `mg plugin run --select` names them: `guard.utc`, `tavern.are`, `tavern.git/Placeable List[0]`. For objects placed or pasted, the objects (`ctx.event.objects`). |
 | `answers` | A form's values by field id (`answers = { sell = 200 }`); the other fields take their defaults. |
+| `values` | For a command: its `ctx.values`, as the fields of the panel it is run from would give them (`values = { tint = "#ff8000" }`; since API 0.9). |
 | `yes` | The answer to `ctx.ui:confirm` (else no). |
 | `files` | The files and folders the plugin gets where it asks for one, in order, from the test file's folder. |
 | `changed` | An event's resources: those a module saved changed, those a save writes, or those made (`resource-created`, which needs them). None: all of the fixture's (of a save with `was`: those that differ). |
@@ -1045,6 +1348,10 @@ and says what is to come of it (each key may be left out):
 | `left` | How many findings the check makes once the fixes are made: on the module as fixed, which the game's data has too (a fixed 2DA of the module's is read so through `ctx.game`, and by Moonglow's checks; since Moonglow 2.13.0). |
 | `[[test.field]]` | A field after the edits: `resource`, `field` (its path, as `ctx.edit` takes it) and `value` (text, a number, a localized string's English text), or `absent = true`. `field` may be a list's item (`Equip_ItemList[2]`, `/VarTable[0]`; since Moonglow 2.2.0): it is there, or with `absent = true` it is not; an item has no `value`. |
 | `edits`, `resources` | How many edits there were, and which resources they change. |
+| `haks` | What the job puts into haks, by hak, every resource in any order (since Moonglow 3.3.0): `haks = { tiles = ["tiles.set", "grass.tga"] }`. Nothing is written. |
+| `written` | The files the job writes into folders the user chose (`folder:write`, or an export's `out:write`), by their names, every one in any order (since 3.3.0). Nothing is written. |
+| `content` | For an export: what the files it writes have, by name, each text part of the file (`content = { "creatures.csv" = ["guard,gate_guard"] }`; since API 0.6). |
+| `shows` | For a panel: texts it shows, each part of one of its texts (a value's as `Areas: 1`, a button's, a list item's; since API 0.6; a field's as its label and the value it is given, `Tint: #2a4d8f`, since API 0.9). |
 | `log` | Lines the log must have: each is part of one. |
 | `error` | The job fails, saying this (part of what it says). |
 | `set` | The settings the command or event sets (`ctx.settings:set`), each with the value it ends with: `set = { code = "cd" }`. |
@@ -1052,11 +1359,11 @@ and says what is to come of it (each key may be left out):
 
 Without a game, and with no game folder of its own, a test's
 `ctx.game` is the fixture alone, as Moonglow's is the game with the
-module over it (since Moonglow 2.13.0; before, it was empty): a
+module over it: a
 pipeline with no game runs the tests of a plugin that reads only the
 module (through `ctx.module` or `ctx.game`), and those whose tests bring
 what they read of the game. Haks and folders the plugin writes are not written, nor
-held to anything yet. `mg plugin pack` leaves the `tests` folder out of the
+checked. `mg plugin pack` leaves the `tests` folder out of the
 archive: the tests and their fixtures are the author's.
 
 ## Types in your editor
@@ -1105,16 +1412,22 @@ mg plugin pack hello
 writes `example.hello-0.1.0.zip` (the plugin's id and version; `-o FILE`
 names it otherwise). The plugin is checked first, as `mg plugin check`
 does, and hidden files (`.git`, `.luaurc`) are left out. Whoever gets
-the file installs it with **Plugins › Install Plugin from File…**.
+the file installs it with **Plugins › Install Plugin from File**.
 
 A zip made any other way installs too, if it has what the installer
 looks for:
 
 - `plugin.cfg` at the archive's top, or in the one folder at its top
   (what zipping the folder gives, and a repository's download when the
-  plugin is at the repository's top). One plugin to an archive.
-- At most 500 files and 16 MB unpacked: a plugin is scripts and a little
-  data.
+  plugin is at the repository's top).
+- Several plugins in one archive (since Moonglow 3.3.0): each in a
+  folder at the archive's top (`tags/plugin.cfg`, `names/plugin.cfg`),
+  or in the folders of the one folder at its top (a repository's
+  download of `plugins/tags`, `plugins/names`), each of its own id. Each
+  is installed into its own folder; one at fault refuses the archive. At
+  most 50 plugins, 64 MB unpacked in all.
+- At most 500 files and 16 MB unpacked a plugin: a plugin is scripts and
+  a little data.
 - File names every system can have: no `:`, `*`, `?`, `"`, `<`, `>` or
   `|`, none that end in a dot or a space, none of Windows's device names
   (`aux.luau`), and no two that differ only in case.

@@ -1,8 +1,8 @@
 //! Plugins run on a module made here: what a command hands back, what a
 //! check finds, and what the sandbox keeps a plugin from.
 
-use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -12,10 +12,12 @@ use mg_gff::{Gff, Struct, Value};
 use mg_module::Module;
 use mg_module::doctor::Severity;
 use mg_plugin::{
-    Answer, FieldKind, Host, Input, Level, Plugin, PluginError, Question, discover, inspect,
-    run_check, run_command,
+    Answer, FieldKind, Input, Level, Plugin, PluginError, Question, discover, inspect, run_check,
+    run_command,
 };
 use mg_resman::ResKey;
+
+use crate::common::TestHost;
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -46,39 +48,6 @@ fn module() -> Module {
     }
     m.set(key("old.nss"), b"void main() { }".to_vec());
     m
-}
-
-/// A host that keeps the log, answers from a list, and may call the job
-/// off after so many looks.
-#[derive(Default)]
-struct TestHost {
-    log: RefCell<Vec<(Level, String)>>,
-    answers: RefCell<VecDeque<Option<Answer>>>,
-    asked: RefCell<Vec<Question>>,
-    /// Looks at `cancelled` left before it says yes (`None`: never).
-    cancel_after: Cell<Option<u32>>,
-}
-
-impl Host for TestHost {
-    fn log(&self, level: Level, text: &str) {
-        self.log.borrow_mut().push((level, text.to_string()));
-    }
-
-    fn cancelled(&self) -> bool {
-        match self.cancel_after.get() {
-            None => false,
-            Some(0) => true,
-            Some(n) => {
-                self.cancel_after.set(Some(n - 1));
-                false
-            }
-        }
-    }
-
-    fn ask(&self, question: &Question) -> Option<Answer> {
-        self.asked.borrow_mut().push(question.clone());
-        self.answers.borrow_mut().pop_front().flatten()
-    }
 }
 
 fn run(
@@ -247,6 +216,153 @@ fn a_check_s_fixes_are_recorded_apart() {
     assert!(e.contains("made with ctx.fix(label)"), "{e}");
 }
 
+/// A check that gives every finding a fix makes one copy of the module
+/// for them all, not one a fix: 2,000 fixes on a module of 20,000
+/// resources take a moment (four seconds and more, with a copy each), each
+/// still from the module as it is, whatever the order their edits are
+/// made in.
+#[test]
+fn many_fixes_share_one_copy_of_the_module() {
+    let dir = mg_testkit::scratch_dir("plugin-many-fixes");
+    let manifest = "[plugin]\nid = \"test.many\"\nname = \"Many\"\nversion = \"1.0.0\"\napi = \"0.4\"\nlicense = \"MIT\"\ndescription = \"d\"\n\n[check]\nid = \"tags\"\ntitle = \"Tags\"\n";
+    std::fs::write(dir.join("plugin.cfg"), manifest).unwrap();
+    let code = r#"
+        local mg = require("@moonglow")
+        mg.check("tags", function(ctx)
+            local found, fixes = {}, {}
+            for i = 1, 2000 do
+                local name = `c{i}.utc`
+                local fix = ctx.fix("Upper-case this tag")
+                fix:set(name, "Tag", `TAG{i}`)
+                fixes[i] = fix
+                table.insert(found, { resource = name, message = "lower case", fix = fix })
+            end
+            -- Back to earlier ones, turn about: each has its own edits
+            -- only (the list it adds to has its own item, not the other's).
+            for round = 1, 2 do
+                for _, i in { 1, 2 } do
+                    local at = fixes[i]:insert("c1.utc", "/ClassList", { __struct_id = 2 })
+                    assert(at == round - 1, `fix {i}, round {round}: at {at}`)
+                end
+            end
+            assert(ctx.module:gff("c1.utc").Tag == "tag")
+            return found
+        end)
+    "#;
+    std::fs::write(dir.join("main.luau"), code).unwrap();
+    let p = Plugin::load(&dir).unwrap();
+    let mut m = Module::new();
+    m.set_info(&Gff::new(*b"IFO ")).unwrap();
+    let mut g = Gff::new(*b"UTC ");
+    g.root.set("Tag", Value::String(b"tag".to_vec()));
+    let bytes = g.to_bytes().unwrap();
+    for i in 1..=20_000 {
+        m.set(key(&format!("c{i}.utc")), bytes.clone());
+    }
+    let host = Rc::new(TestHost::default());
+    let started = std::time::Instant::now();
+    let found = run_check(&p, "tags", Input::new(m.clone(), None), host).unwrap();
+    let took = started.elapsed();
+    assert_eq!(found.len(), 2000);
+    let edits = |n: usize| found[n].fix.as_ref().unwrap().edits.clone();
+    assert_eq!((edits(0).len(), edits(1).len(), edits(2).len()), (3, 3, 1));
+    assert!(matches!(&edits(1)[0], Edit::SetField { key: k, .. } if *k == key("c2.utc")));
+    assert!(
+        matches!(&edits(1)[2], Edit::InsertItem { key: k, index: 1, .. } if *k == key("c1.utc"))
+    );
+    // Each applies to the module as it is.
+    for n in [0, 1, 1999] {
+        let mut ws = Workspace::new(m.clone());
+        ws.apply(found[n].fix.as_ref().unwrap().command()).unwrap();
+    }
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+}
+
+/// A plugin's test holds what the job writes outside the module (the
+/// haks it puts resources into, the files it writes into a folder),
+/// writing none of it.
+#[test]
+fn a_plugin_s_test_holds_what_it_writes_outside_the_module() {
+    let dir = mg_testkit::scratch_dir("plugin-test-outside");
+    std::fs::write(
+        dir.join("plugin.cfg"),
+        "[plugin]\nid = \"test.outside\"\nname = \"Outside\"\nversion = \"1\"\napi = \"0.5\"\nlicense = \"MIT\"\n\n[command]\nid = \"out\"\ntitle = \"Out\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.luau"),
+        r#"local mg = require("@moonglow")
+mg.command("out", function(ctx)
+    ctx.hak:write("tiles", "a.txt", "a")
+    ctx.hak:write("tiles", "b.txt", "b")
+    local folder = ctx.ui:open_folder({ title = "Where" })
+    folder:write("notes.txt", "hello")
+end)
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("tests/fixture")).unwrap();
+    std::fs::create_dir_all(dir.join("tests/out")).unwrap();
+    module().save_as(&mg_module::ModuleLocation::Folder(dir.join("tests/fixture"))).unwrap();
+    let test = |haks: &str, written: &str| {
+        std::fs::write(
+            dir.join("tests/out.toml"),
+            format!(
+                "module = \"fixture\"\n[[test]]\nname = \"writes\"\ncommand = \"out\"\nyes = true\n\
+                 files = [\"out\"]\nwritten = [{written}]\n[test.haks]\ntiles = [{haks}]\n"
+            ),
+        )
+        .unwrap();
+        let p = Plugin::load(&dir).unwrap();
+        mg_plugin::run_tests(&p, None, &|_, _| Ok(None)).remove(0).problems
+    };
+    assert_eq!(test("\"b.txt\", \"A.TXT\"", "\"notes.txt\""), Vec::<String>::new());
+    let wrong = test("\"a.txt\"", "\"other.txt\"");
+    assert_eq!(wrong.len(), 2, "{wrong:?}");
+    assert!(
+        wrong[0].contains("into haks, not") && wrong[1].contains("into folders, not"),
+        "{wrong:?}"
+    );
+    assert!(!dir.join("tests/out/notes.txt").exists(), "nothing written");
+    assert!(mg_plugin::test_faults(&Plugin::load(&dir).unwrap()).is_empty());
+}
+
+/// A fix that asks (API 0.5): `ctx.fix(label, { command = … })` runs a
+/// command of the plugin's on what the finding is about (or `on`), when
+/// the user clicks it; a command the manifest lacks, or edits of its own,
+/// are faults.
+#[test]
+fn a_fix_that_asks_runs_a_command() {
+    let dir = mg_testkit::scratch_dir("plugin-fix-asks");
+    let manifest = "[plugin]\nid = \"test.asks\"\nname = \"Asks\"\nversion = \"1\"\napi = \"0.5\"\nlicense = \"MIT\"\n\n[check]\nid = \"ask\"\ntitle = \"Ask\"\n\n[check]\nid = \"bad\"\ntitle = \"Bad\"\n\n[command]\nid = \"retag\"\ntitle = \"Retag…\"\n";
+    std::fs::write(dir.join("plugin.cfg"), manifest).unwrap();
+    let code = r#"
+        local mg = require("@moonglow")
+        mg.check("ask", function(ctx)
+            return {
+                { resource = "guard.utc", message = "a", fix = ctx.fix("Retag…", { command = "retag" }) },
+                { resource = "guard.utc", message = "b", fix = ctx.fix("There", {
+                    command = "retag", on = { resource = "tavern.git", path = "/Placeable List[1]" } }) },
+            }
+        end)
+        mg.check("bad", function(ctx)
+            return { { resource = "guard.utc", message = "x", fix = ctx.fix("Gone", { command = "nope" }) } }
+        end)
+        mg.command("retag", function(ctx) end)
+    "#;
+    std::fs::write(dir.join("main.luau"), code).unwrap();
+    let p = Plugin::load(&dir).unwrap();
+    let host = Rc::new(TestHost::default());
+    let found = run_check(&p, "ask", Input::new(module(), None), host.clone()).unwrap();
+    let asks = |i: usize| found[i].fix.as_ref().unwrap().asks.clone().unwrap();
+    assert_eq!((asks(0).plugin.as_str(), asks(0).command.as_str()), ("test.asks", "retag"));
+    assert_eq!(asks(0).on, [(key("guard.utc"), mg_edit::GffPath::root())]);
+    assert_eq!(asks(1).on[0].1.to_string(), "/Placeable List[1]");
+    assert!(found[0].fix.as_ref().unwrap().edits.is_empty());
+    let e = run_check(&p, "bad", Input::new(module(), None), host).unwrap_err().to_string();
+    assert!(e.contains("declares no command \"nope\""), "{e}");
+}
+
 #[test]
 fn the_sandbox_has_no_way_out() {
     let host = Rc::new(TestHost::default());
@@ -282,13 +398,77 @@ fn memory_has_a_limit() {
     assert!(e.contains("ran out of the 256 MB"), "{e}");
 }
 
+/// What a job makes the host hold for it (a talk table's lines, the edits
+/// it makes) has a limit of its own, which Luau's does not see: a call
+/// that would go past it fails before the memory is taken, and what the
+/// plugin let go of does not count.
+#[test]
+fn what_the_host_holds_for_a_job_has_a_limit() {
+    use mg_plugin::run_console;
+    let run = |code: &str| {
+        let host = Rc::new(TestHost::default());
+        run_console(code, Input::new(module(), None), host).map(|_| ()).map_err(|e| e.to_string())
+    };
+    // One call: a gigabyte of empty lines.
+    let started = std::time::Instant::now();
+    let e = run("mg.tlk.new():set(16777215, \"x\")").unwrap_err();
+    assert!(e.contains("hold more than the 512 MB a job may"), "{e}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    // A table within it is made, and tables let go of are given back:
+    // these are 768 MB one after another, never two at once.
+    run("local t = mg.tlk.new() t:set(100000, 'x') assert(t.lines == 100001)").unwrap();
+    run("for i = 1, 12 do local t = mg.tlk.new() t:set(999999, 'x') end").unwrap();
+    // Edits are kept until the job is done: each of these is held twice.
+    let e = run("local big = string.rep('x', 100 * 1024 * 1024)\n\
+                 for i = 1, 5 do ctx.edit:write_bytes(`big{i}.txt`, big) end")
+    .unwrap_err();
+    assert!(e.contains("hold more than the 512 MB a job may"), "{e}");
+    // And what it caught the error of is still refused.
+    let e = run("local t = mg.tlk.new()\n\
+                 pcall(function() t:set(16777215, 'x') end)\n\
+                 assert(t.lines == 0)\n\
+                 t:set(16777215, 'x')")
+    .unwrap_err();
+    assert!(e.contains("hold more than the 512 MB a job may"), "{e}");
+}
+
+/// A new resource's name is one a file can have: `a/b.nss` could be
+/// written into an archive, and a module kept as files then could not be
+/// saved at all. A resource an archive already has under such a name is
+/// still read and written.
+#[test]
+fn a_new_resource_has_a_name_a_file_can_have() {
+    use mg_plugin::run_console;
+    let run = |module: Module, code: &str| {
+        let host = Rc::new(TestHost::default());
+        run_console(code, Input::new(module, None), host).map_err(|e| e.to_string())
+    };
+    for write in [
+        "ctx.edit:write('a/b.nss', 'void main() {}')",
+        "ctx.edit:write_bytes('a\\\\b.nss', 'x')",
+        "ctx.edit:write_bytes('c:b.nss', 'x')",
+        "ctx.edit:write_gff('../b.utc', { __data_type = 'UTC ' })",
+    ] {
+        let e = run(module(), write).unwrap_err();
+        assert!(e.contains("can't be a new resource's name"), "{write}: {e}");
+    }
+    let made = run(module(), "ctx.edit:write('fine.nss', 'void main() {}')").unwrap();
+    assert_eq!(made.edits.len(), 1);
+    // One the module has: an archive's, oddly named.
+    let mut odd = module();
+    odd.set(key("a/b.nss"), b"void main() { }".to_vec());
+    let code = "ctx.edit:write('a/b.nss', ctx.module:text('a/b.nss') .. '// read')";
+    let made = run(odd, code).unwrap();
+    assert!(matches!(&made.edits[0], Edit::SetResource { key: k, .. } if *k == key("a/b.nss")));
+}
+
 #[test]
 fn a_bad_edit_fails_where_it_is_made() {
     let host = Rc::new(TestHost::default());
     let p = plugin("hostile");
     let outcome = run(&p, "bad-edits", &host).unwrap();
     assert!(outcome.edits.is_empty(), "{:?}", outcome.edits);
-    let log: Vec<String> = host.log.borrow().iter().map(|(_, m)| m.clone()).collect();
+    let log: Vec<String> = host.log_texts();
     let said = |what: &str, why: &str| {
         log.iter().any(|l| l.starts_with(&format!("{what}: ")) && l.contains(why))
     };
@@ -389,7 +569,7 @@ fn the_console_runs_what_is_typed() {
     "#;
     let outcome = run_console(code, input(), host.clone()).unwrap();
     assert_eq!(outcome.edits.len(), 1);
-    let log: Vec<String> = host.log.borrow().iter().map(|(_, m)| m.clone()).collect();
+    let log: Vec<String> = host.log_texts();
     assert_eq!(log, ["{\"captain.utc\", \"guard.utc\"}", "\"FROM_CONSOLE\"", "4"]);
     // A fault says where; no file can be required.
     let e = run_console("local x = nil\nreturn x.y", input(), host.clone()).unwrap_err();
@@ -526,14 +706,20 @@ fn a_struct_s_id_is_read_beside_its_fields() {
 
 /// The game's own data, where there is an install: a 2DA's cells by row
 /// and column, a talk-table string, a resource the game would load.
+fn shared_base_tlk(install: &mg_resman::GameInstall) -> std::sync::Arc<mg_tlk::Tlk> {
+    static TLK: mg_testkit::Shared<(std::path::PathBuf, String), std::sync::Arc<mg_tlk::Tlk>> =
+        mg_testkit::Shared::new();
+    let key = (install.root.clone(), install.language.clone());
+    TLK.get(&key, || std::sync::Arc::new(mg_rules::GameData::open_tlk(install).unwrap()))
+}
+
 #[test]
 fn the_game_s_data_is_read() {
-    let Some(root) = mg_testkit::nwn_root() else {
-        eprintln!("skipped: no game install");
-        return;
-    };
+    let root = mg_testkit::corpus!();
     let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = std::sync::Arc::new(mg_rules::GameData::open(&install).unwrap());
+    let rm = mg_testkit::shared_resman(&install).unwrap();
+    let tlk = shared_base_tlk(&install);
+    let game = std::sync::Arc::new(mg_rules::GameData::with_shared_tlk(rm, tlk));
     let dir = mg_testkit::scratch_dir("plugin-game");
     std::fs::write(
         dir.join("plugin.cfg"),
@@ -573,12 +759,11 @@ fn the_game_s_data_is_read() {
 #[test]
 fn a_layer_s_copy_is_open_and_read() {
     use mg_plugin::{Selected, Selection, run_console};
-    let Some(root) = mg_testkit::nwn_root() else {
-        eprintln!("skipped: no game install");
-        return;
-    };
+    let root = mg_testkit::corpus!();
     let install = mg_resman::GameInstall::new(&root, None, "en");
-    let game = std::sync::Arc::new(mg_rules::GameData::open(&install).unwrap());
+    let rm = mg_testkit::shared_resman(&install).unwrap();
+    let tlk = shared_base_tlk(&install);
+    let game = std::sync::Arc::new(mg_rules::GameData::with_shared_tlk(rm, tlk));
     let rm = &game.resman;
     // A blueprint of which a lower layer has another copy.
     let (copy, layers) = rm
@@ -605,10 +790,10 @@ fn a_layer_s_copy_is_open_and_read() {
             tostring(select(2, pcall(function() return ctx.module:bytes(o.resource, o.layer) end)))
     "#;
     let host = Rc::new(TestHost::default());
-    let selection = Selection { selected: Vec::new(), open: Some(open) };
+    let selection = Selection { open: Some(open), ..Default::default() };
     let input = Input { selection, ..Input::new(module(), Some(game.clone())) };
     run_console(code, input, host.clone()).unwrap();
-    let said: Vec<String> = host.log.borrow().iter().map(|(_, t)| t.clone()).collect();
+    let said: Vec<String> = host.log_texts();
     // (Strings said as written, quoted.)
     let ext = format!("{:?}", copy.restype.extension().unwrap());
     let expected = [ext, format!("{label:?}"), "\"false\"".into(), lower.len().to_string()];
@@ -642,7 +827,7 @@ fn tables_are_made_and_written() {
             mg.twoda.kinds("spells").ImpactScript, mg.twoda.kinds("vfx_persistent").ONENTER
     "#;
     run_console(code, input(), host.clone()).unwrap();
-    let log: Vec<String> = host.log.borrow().iter().map(|(_, m)| m.clone()).collect();
+    let log: Vec<String> = host.log_texts();
     assert_eq!(
         log,
         [
@@ -680,7 +865,7 @@ fn tables_are_made_and_written() {
             again:get(3).sound_length
     "#;
     run_console(code, input(), host.clone()).unwrap();
-    let log: Vec<String> = host.log.borrow().iter().map(|(_, m)| m.clone()).collect();
+    let log: Vec<String> = host.log_texts();
     assert_eq!(log, ["0", "4", "\"Cleave\"", "nil", "\"vs_hide\"", "1.5"]);
     // A sound is named by the rule the talk-table editor and `mg tlk`
     // hold one to (`ResRef::new_name`): one they refuse, a plugin can't
@@ -726,7 +911,7 @@ fn tables_know_more_kinds_keep_their_layout_and_have_a_language() {
             same, t:write()
     "#;
     run_console(code, Input::new(module(), Some(game.clone())), host.clone()).unwrap();
-    let log: Vec<String> = host.log.borrow().iter().map(|(_, m)| m.clone()).collect();
+    let log: Vec<String> = host.log_texts();
     assert_eq!(
         log,
         [
@@ -763,7 +948,7 @@ fn tables_know_more_kinds_keep_their_layout_and_have_a_language() {
         return again.language, again:get(0).text, english.language, ok, bad
     "#;
     run_console(code, Input::new(module(), None), host.clone()).unwrap();
-    let log: Vec<String> = host.log.borrow().iter().map(|(_, m)| m.clone()).collect();
+    let log: Vec<String> = host.log_texts();
     assert_eq!(log, ["\"pl\"", "\"Łódź\"", "\"fr\"", "false", "false"]);
 }
 
@@ -799,7 +984,7 @@ table = "places"
             table.concat(said, "; "), #d:faults(t), ok, tostring(err):find("no kind") ~= nil
     "#;
     run_console(code, input(), host.clone()).unwrap();
-    let log: Vec<String> = host.log.borrow().iter().map(|(_, m)| m.clone()).collect();
+    let log: Vec<String> = host.log_texts();
     assert_eq!(
         log,
         [
@@ -849,6 +1034,7 @@ fn a_plugin_reads_what_is_selected_and_open() {
             Selected::Area(area),
         ],
         open: Some(Selected::Resource(key("old.nss"))),
+        together: Vec::new(),
     };
     let code = r#"
         local function line(s)
@@ -876,7 +1062,7 @@ fn a_plugin_reads_what_is_selected_and_open() {
         "area | tavern.are |  | false | true | tavern | nil | TAVERN | tavern",
         "open: nss | old.nss |  | false | true | nil | nil | nil | old",
     ];
-    let said: Vec<String> = host.log.borrow().iter().map(|(_, t)| t.clone()).collect();
+    let said: Vec<String> = host.log_texts();
     assert_eq!(said, [format!("{:?}", lines.join("\n"))]);
     let mut ws = Workspace::new(m);
     ws.apply(Command::new("plugin", outcome.edits)).unwrap();
@@ -890,8 +1076,46 @@ fn a_plugin_reads_what_is_selected_and_open() {
     let code = "return #ctx.selection, ctx.open == nil";
     let host = Rc::new(TestHost::default());
     mg_plugin::run_console(code, Input::new(module(), None), host.clone()).unwrap();
-    let said: Vec<String> = host.log.borrow().iter().map(|(_, t)| t.clone()).collect();
+    let said: Vec<String> = host.log_texts();
     assert_eq!(said, ["0", "true"]);
+
+    // Tiles (API 0.5): each its place in the tile list, and its column
+    // and row by the area's width; and several open together, each as
+    // `ctx.open.together` lists them, the first being `ctx.open`.
+    let mut m = module();
+    let mut are = Gff::new(*b"ARE ");
+    are.root.set("Width", Value::Int(4));
+    are.root.set("Tile_List", Value::List(vec![Struct::new(1); 8]));
+    m.set_gff(key("yard.are"), &are).unwrap();
+    let yard = ResRef::from_str("yard").unwrap();
+    let selection = Selection {
+        selected: vec![Selected::Tile { area: yard, index: 6 }],
+        open: Some(Selected::Blueprint(key("guard.utc"))),
+        together: vec![Selected::Blueprint(key("guard.utc")), Selected::Blueprint(key("cook.utc"))],
+    };
+    let code = r#"
+        local t = ctx.selection[1]
+        local names = {}
+        for _, s in ipairs(ctx.open.together) do table.insert(names, s.resource) end
+        return t.kind, t.resource, t.path, t.x, t.y, t.index, t.area, table.concat(names, ",")
+    "#;
+    let host = Rc::new(TestHost::default());
+    let input = Input { selection, ..Input::new(m, None) };
+    mg_plugin::run_console(code, input, host.clone()).unwrap();
+    let said: Vec<String> = host.log_texts();
+    assert_eq!(
+        said,
+        [
+            "\"tile\"",
+            "\"yard.are\"",
+            "\"/Tile_List[6]\"",
+            "2",
+            "1",
+            "6",
+            "\"yard\"",
+            "\"guard.utc,cook.utc\""
+        ]
+    );
 }
 
 /// What `mg plugin run --select` takes: a resource's name, and for an
@@ -904,12 +1128,27 @@ fn a_selection_is_named_as_a_resource_and_a_path() {
     let tavern = ResRef::from_str("tavern").unwrap();
     let chest = Selected::parse("tavern.git/Placeable List[3]").unwrap();
     assert_eq!(chest, Selected::Object { area: tavern, kind: ObjectKind::Placeable, index: 3 });
-    assert_eq!(chest.target(), Some(Target::Object(ObjectKind::Placeable)));
+    assert_eq!(chest.target(), Some(Target::Placed(ObjectKind::Placeable)));
+    assert!(chest.fits(&[Target::Object(ObjectKind::Placeable)]));
+    assert!(!chest.fits(&[Target::Blueprint(ObjectKind::Placeable)]));
     assert_eq!(chest.place().1.to_string(), "/Placeable List[3]");
     assert_eq!(Selected::parse("tavern.are").unwrap(), Selected::Area(tavern));
     assert_eq!(Selected::parse("guard.utc").unwrap(), Selected::Blueprint(key("guard.utc")));
     assert_eq!(Selected::parse("old.nss").unwrap(), Selected::Resource(key("old.nss")));
-    assert_eq!(Selected::parse("old.nss").unwrap().target(), None);
+    assert_eq!(
+        Selected::parse("old.nss").unwrap().target(),
+        Some(Target::Resource(mg_core::ResType::NSS))
+    );
+    assert_eq!(
+        Selected::parse("guard.utc").unwrap().target(),
+        Some(Target::Blueprint(ObjectKind::Creature))
+    );
+    // A tile: its area's ARE and its place in the tile list.
+    let tile = Selected::parse("tavern.are/Tile_List[5]").unwrap();
+    assert_eq!(tile, Selected::Tile { area: tavern, index: 5 });
+    assert_eq!((tile.kind(), tile.target()), ("tile".to_string(), Some(Target::Tile)));
+    assert_eq!(tile.place().1.to_string(), "/Tile_List[5]");
+    assert!(Selected::parse("tavern.are/Tile_List").is_err());
     for (bad, says) in [
         ("tavern", "is not a resource's name"),
         ("tavern.git", "its place in a list"),

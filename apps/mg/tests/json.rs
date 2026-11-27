@@ -13,22 +13,51 @@ fn run(root: &Path, user: &Path, args: &[&str]) -> (bool, Value) {
     (ok, json)
 }
 
-#[test]
-fn every_command_answers_in_json() {
-    let root = mg_testkit::corpus!();
-    let dir = mg_testkit::scratch_dir("mg-json");
-    let user = dir.join("user");
-    std::fs::create_dir_all(&user).unwrap();
-    let chess = dir.join("chess.mod");
-    std::fs::copy(root.join("data/mod/Neverwinter Chess.mod"), &chess).unwrap();
-    let c = chess.to_str().unwrap();
-    let at = |name: &str| dir.join(name).to_str().unwrap().to_string();
-    let ok = |args: &[&str]| -> Value {
-        let (success, json) = run(&root, &user, args);
+struct JsonCase {
+    root: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    user: std::path::PathBuf,
+    chess: std::path::PathBuf,
+}
+
+impl JsonCase {
+    fn new(name: &str) -> Option<Self> {
+        let Some(root) = mg_testkit::nwn_root() else {
+            assert!(
+                !mg_testkit::corpus_required(),
+                "MOONGLOW_REQUIRE_CORPUS is set but no game install was found"
+            );
+            return None;
+        };
+        let dir = mg_testkit::scratch_dir(name);
+        let user = dir.join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let chess = dir.join("chess.mod");
+        std::fs::copy(root.join("data/mod/Neverwinter Chess.mod"), &chess).unwrap();
+        Some(Self { root, dir, user, chess })
+    }
+
+    fn c(&self) -> &str {
+        self.chess.to_str().unwrap()
+    }
+
+    fn at(&self, name: &str) -> String {
+        self.dir.join(name).to_str().unwrap().to_string()
+    }
+
+    fn ok(&self, args: &[&str]) -> Value {
+        let (success, json) = run(&self.root, &self.user, args);
         assert!(success, "{args:?}: {json}");
         assert!(json.get("error").is_none(), "{args:?}: {json}");
         json
-    };
+    }
+}
+
+#[test]
+fn archive_and_resource_commands_answer_in_json() {
+    let _ = mg_testkit::corpus!();
+    let g = JsonCase::new("mg-json-archives").unwrap();
+    let (c, at, ok) = (g.c(), |n: &str| g.at(n), |a: &[&str]| g.ok(a));
 
     // Archives and files.
     let ls = ok(&["ls", c]);
@@ -45,7 +74,27 @@ fn every_command_answers_in_json() {
     assert_eq!(ok(&["which", "classes.2da"])["resource"], "classes.2da");
     assert!(ok(&["cat", "classes.2da"])["text"].as_str().unwrap().starts_with("2DA"));
     assert!(ok(&["layers"])["layers"].as_array().unwrap().len() > 3);
+    let many = ok(&["cat", "classes.2da", "racialtypes.2da", "--to", &at("many"), "--hak", c]);
+    assert_eq!(many["missing"], serde_json::json!([]));
+    assert!(ok(&["ls", c, "--sha256"])["resources"][0]["sha256"].is_string());
+    assert!(ok(&["model", "info", "plc_a01"])["faces_rendered"].as_u64() > Some(0));
+    let table = at("many/classes.2da");
+    let set = ok(&["2da-set", &table, "--row", "0", "Label=MgFighter", "--dry-run"]);
+    assert_eq!(set["cells"][0]["to"], "MgFighter");
     assert_eq!(ok(&["tlk", "12"])["strings"][0]["text"], "Paladin");
+
+    // Failure.
+    let (success, json) = run(&g.root, &g.user, &["which", "nothing_at_all.2da"]);
+    assert!(!success);
+    assert!(json["error"].as_str().unwrap().contains("not found"));
+}
+
+#[test]
+fn module_and_model_commands_answer_in_json() {
+    let _ = mg_testkit::corpus!();
+    let g = JsonCase::new("mg-json-modules").unwrap();
+    let (c, at, ok) = (g.c(), |n: &str| g.at(n), |a: &[&str]| g.ok(a));
+    ok(&["unpack", c, &at("unpacked")]);
 
     // Modules.
     assert_eq!(ok(&["verify", c])["errors"], 0);
@@ -61,8 +110,10 @@ fn every_command_answers_in_json() {
     let listed = ok(&["model-files", "plc_a01", &at("files"), "--dry-run"]);
     assert_eq!(listed["files"], files["files"]);
     ok(&["model-files", "plc_a01", &at("files"), "--force"]);
-    let refused =
-        crate::mg_on(&root, None).args(["model-files", "plc_a01", &at("files")]).output().unwrap();
+    let refused = crate::mg_on(&g.root, None)
+        .args(["model-files", "plc_a01", &at("files")])
+        .output()
+        .unwrap();
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--force"));
     // (What it names and the game lacks: the armoire's emitter names a
@@ -106,6 +157,19 @@ fn every_command_answers_in_json() {
     assert!(names.iter().any(|n| n.ends_with(".set")), "{names:?}");
     assert!(names.iter().any(|n| n.ends_with(".wok")), "{names:?}");
     assert!(names.iter().filter(|n| n.ends_with(".mdl")).count() > 5, "{names:?}");
+    let map = ok(&["minimap", c, "chess", &at("map.png")]);
+    assert!(map["width"].as_u64().unwrap() > 0);
+    let set = ok(&["cat", "tcn01.set"])["text"].as_str().unwrap().to_string();
+    std::fs::write(g.dir.join("tcn01.set"), set).unwrap();
+    let pal = ok(&["tileset-palette", &at("tcn01.set")]);
+    assert!(pal["groups"].as_u64().unwrap() > 10 && g.dir.join("tcn01palstd.itp").is_file());
+}
+
+#[test]
+fn editing_and_plugin_commands_answer_in_json() {
+    let _ = mg_testkit::corpus!();
+    let g = JsonCase::new("mg-json-editing").unwrap();
+    let (c, at, ok) = (g.c(), |n: &str| g.at(n), |a: &[&str]| g.ok(a));
     // Plugins: the plugin host's own fixture, listed, checked, run and
     // its checks counted.
     let plugins = concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/mg-plugin/tests/fixtures");
@@ -138,7 +202,7 @@ fn every_command_answers_in_json() {
     assert_eq!(info["name"], "Neverwinter Chess");
     let dlg = info["resources"]["dlg"].as_u64().unwrap();
     assert!(dlg > 0);
-    let m = mg_module::Module::open(&chess).unwrap();
+    let m = mg_module::Module::open(&g.chess).unwrap();
     let conversation = m.keys_of(mg_core::ResType::DLG).next().unwrap().resref.to_string();
     ok(&["dialog-export", c, &format!("{conversation}.dlg"), &at("talk.ink")]);
     let imported = ok(&["dialog-import", c, &at("talk.ink"), "--name", "mg_talk"]);
@@ -153,21 +217,26 @@ fn every_command_answers_in_json() {
         serde_json::json!(["module.ifo"])
     );
     assert!(ok(&["update-instances", c])["updated"].is_number());
+    // (Chess has no project file: nothing baked, and why, as JSON.)
+    let (baked, json) =
+        run(&g.root, &g.user, &["bake-walkmesh", c, "--area", "chess", "--object", "0"]);
+    assert!(!baked && json["error"].as_str().unwrap().contains("[bake]"), "{json}");
     let init = ok(&["init", c, &at("project")]);
     assert_eq!(init["target"], "default");
     let built = ok(&["build", &at("project"), "-o", &at("built.mod")]);
     assert_eq!(built["compiled"]["failed"], 0);
     let imported = ok(&["import", c, &at("pawn.erf")]);
     assert_eq!(imported["stamp"], exported["stamp"], "the stamp reads back");
-    let hak = dir.join("mg_json.hak");
+    let hak = g.dir.join("mg_json.hak");
     std::fs::write(&hak, mg_erf::ErfWriter::new(*b"HAK ").to_bytes().unwrap()).unwrap();
     assert_eq!(ok(&["attach", c, hak.to_str().unwrap()])["haks"][0], "mg_json");
-    let map = ok(&["minimap", c, "chess", &at("map.png")]);
-    assert!(map["width"].as_u64().unwrap() > 0);
-    let set = ok(&["cat", "tcn01.set"])["text"].as_str().unwrap().to_string();
-    std::fs::write(dir.join("tcn01.set"), set).unwrap();
-    let pal = ok(&["tileset-palette", &at("tcn01.set")]);
-    assert!(pal["groups"].as_u64().unwrap() > 10 && dir.join("tcn01palstd.itp").is_file());
+}
+
+#[test]
+fn nui_and_nwsync_commands_answer_in_json() {
+    let _ = mg_testkit::corpus!();
+    let g = JsonCase::new("mg-json-nwsync").unwrap();
+    let (c, at, ok) = (g.c(), |n: &str| g.at(n), |a: &[&str]| g.ok(a));
     // A NUI window: added, checked, its scripts written.
     assert_eq!(ok(&["nui", "new", c, "mg_window"])["saved"], true);
     assert_eq!(ok(&["nui", "validate", c, "mg_window"])["errors"], 0);
@@ -186,7 +255,7 @@ fn every_command_answers_in_json() {
     // Uploaded by a stand-in command (nothing goes anywhere but this
     // folder): each part in turn, in the repository's folder, its output
     // kept off the JSON.
-    let order = dir.join("order.txt");
+    let order = g.dir.join("order.txt");
     let _ = std::fs::remove_file(&order);
     let stand_in = format!("echo {{part}}>> {}", mg_module::nwsync::shell_quoted(&order));
     let sent = || -> Vec<String> {
@@ -201,18 +270,13 @@ fn every_command_answers_in_json() {
     assert_eq!(sent()[3..], ["manifests", "data"]);
     // A part that fails: what came after it isn't sent, and mg fails.
     let (success, json) =
-        run(&root, &user, &["nwsync", c, &at("repo"), "--with-module", "--upload", "exit 3"]);
+        run(&g.root, &g.user, &["nwsync", c, &at("repo"), "--with-module", "--upload", "exit 3"]);
     assert!(!success);
     let error = json["error"].as_str().unwrap();
     assert!(error.contains("failed sending data") && error.contains("nothing was sent"), "{error}");
     // No command given, and the module's project names none.
-    let (success, json) = run(&root, &user, &["nwsync", c, &at("repo"), "--upload"]);
+    let (success, json) = run(&g.root, &g.user, &["nwsync", c, &at("repo"), "--upload"]);
     assert!(!success && json["error"].as_str().unwrap().contains("no upload command"));
-
-    // A failure.
-    let (success, json) = run(&root, &user, &["which", "nothing_at_all.2da"]);
-    assert!(!success);
-    assert!(json["error"].as_str().unwrap().contains("not found"));
 }
 
 #[test]
@@ -247,4 +311,128 @@ fn find_and_info() {
     let white = find(&["--blueprints", "--tag", "*_w", "--where", "Appearance_Type"]);
     assert_eq!(white.len(), 6, "{white:?}");
     assert!(find(&["--tag", "no_such_tag"]).is_empty());
+}
+
+/// `mg --json gff` prints the GFF's JSON and nothing else: what there is
+/// to say of the module it was read with (here, that the `.mod` has its
+/// module folder beside it) goes to standard error, not among the GFF's
+/// fields as `"notes"`, and what was printed reads back as the GFF.
+#[test]
+fn a_gff_s_json_has_no_notes_among_its_fields() {
+    use mg_gff::{Gff, Value as Field};
+    let dir = mg_testkit::scratch_dir("mg-gff-notes");
+    let mut m = mg_module::Module::new();
+    m.set_info(&Gff::new(*b"IFO ")).unwrap();
+    let castle = dir.join("castle.mod");
+    m.save_as(&mg_module::ModuleLocation::Archive(castle.clone())).unwrap();
+    m.save_as(&mg_module::ModuleLocation::Folder(dir.join("castle"))).unwrap();
+    let mut guard = Gff::new(*b"UTC ");
+    guard.root.set("Tag", Field::String(b"guard".to_vec()));
+    let file = dir.join("guard.utc");
+    std::fs::write(&file, guard.to_bytes().unwrap()).unwrap();
+    let (f, c) = (file.to_str().unwrap(), castle.to_str().unwrap());
+
+    for json in [&["--json"][..], &[][..]] {
+        let out = crate::mg_alone().args(json).args(["gff", f, "--module", c]).output().unwrap();
+        assert!(out.status.success(), "{json:?}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(said.contains("has its module folder beside it"), "{json:?}: {said}");
+        let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(printed.get("notes").is_none(), "{json:?}: {printed}");
+        // It reads back, with `mg gff` and as the GFF it was.
+        let written = dir.join("guard.json");
+        std::fs::write(&written, &out.stdout).unwrap();
+        let back = dir.join("back.utc");
+        let args = ["gff", written.to_str().unwrap(), "-o", back.to_str().unwrap()];
+        let made = crate::mg_alone().args(args).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        assert_eq!(Gff::read(&std::fs::read(&back).unwrap()).unwrap(), guard);
+    }
+    // A report still carries them.
+    let (ok, info) = crate::json_out(crate::mg_alone().args(["--json", "info", c]));
+    assert!(ok && info["notes"][0].as_str().unwrap().contains("module folder beside it"), "{info}");
+}
+
+/// `mg gff` writes its JSON in neverwinter.nim's notation, as `nwn_gff -p`
+/// does: floats as Nim spells them (2.5e-7 and 1.5e16 as FLOATs, single
+/// precision, are `0.0000002499999993688107` and `15000000408846336.0`, where
+/// serde wrote `2.499999993688107e-7` and `1.5000000408846336e16`), the
+/// same values (the review's Z4, the owner's call). `--json` gives the
+/// value itself.
+#[test]
+fn mg_gff_writes_json_in_neverwinter_nim_s_notation() {
+    use mg_gff::{Gff, Value as Field};
+    let dir = mg_testkit::scratch_dir("mg-gff-notation");
+    let mut g = Gff::new(*b"UTP ");
+    g.root.set("Small", Field::Float(2.5e-7));
+    g.root.set("Large", Field::Float(1.5e16));
+    g.root.set("Tag", Field::String(b"a\x01b".to_vec()));
+    let file = dir.join("thing.utp");
+    std::fs::write(&file, g.to_bytes().unwrap()).unwrap();
+    let f = file.to_str().unwrap();
+    let out = crate::mg_alone().args(["gff", f]).output().unwrap();
+    assert!(out.status.success());
+    let printed = String::from_utf8(out.stdout).unwrap();
+    let file_out = dir.join("thing.json");
+    let wrote = crate::mg_alone().args(["gff", f, "-o", file_out.to_str().unwrap()]).output();
+    assert!(wrote.unwrap().status.success());
+    let written = std::fs::read_to_string(&file_out).unwrap();
+    assert_eq!(written, printed, "the file and the print alike");
+    for spelled in ["0.0000002499999993688107", "15000000408846336.0"] {
+        assert!(written.contains(spelled), "{spelled} in {written}");
+    }
+    assert!(!written.contains("e-7") && !written.contains("e16"), "{written}");
+    // As nwn_gff writes it, where it is installed (its field order aside:
+    // compared as values, and its floats' spelling).
+    if let Some(nwn_gff) = mg_testkit::nwn_tool("nwn_gff") {
+        let theirs = std::process::Command::new(nwn_gff)
+            .args(["-i", f, "-k", "json", "-p"])
+            .output()
+            .unwrap();
+        if theirs.status.success() {
+            let theirs = String::from_utf8_lossy(&theirs.stdout).into_owned();
+            for spelled in ["0.0000002499999993688107", "15000000408846336.0"] {
+                assert!(theirs.contains(spelled), "nwn_gff: {spelled} in {theirs}");
+            }
+            let (a, b): (Value, Value) =
+                (serde_json::from_str(&theirs).unwrap(), serde_json::from_str(&written).unwrap());
+            assert_eq!(a, b);
+        }
+    } else {
+        eprintln!("nwn_gff not found: its spelling is not compared");
+    }
+    // --json: the value.
+    let (ok, value) = crate::json_out(crate::mg_alone().args(["--json", "gff", f]));
+    assert!(ok && value["Small"]["value"].as_f64() == Some(2.5e-7f32 as f64), "{value}");
+}
+
+/// `mg tlk-import --json` says `saved` when the table was written, not
+/// whenever it was not a dry run: a table's own export changes no line,
+/// and a pipeline that commits or signs what was saved has nothing to.
+#[test]
+fn tlk_import_says_whether_the_table_was_written() {
+    let dir = mg_testkit::scratch_dir("mg-tlk-import-saved");
+    let at = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let (table, lines) = (at("words.tlk"), at("words.json"));
+    let mut tlk = mg_tlk::Tlk::new(mg_core::Language::ENGLISH);
+    tlk.entries.push(mg_tlk::TlkEntry::text("Hello"));
+    std::fs::write(&table, tlk.to_bytes().unwrap()).unwrap();
+    let mg = |args: &[&str]| crate::quiet_json_out(crate::mg_alone().arg("--json").args(args));
+    assert!(mg(&["tlk-export", &table, &lines]).0);
+    let written = || std::fs::metadata(&table).unwrap().modified().unwrap();
+    let before = (std::fs::read(&table).unwrap(), written());
+    let (ok, r) = mg(&["tlk-import", &table, &lines]);
+    assert!(ok && r["changed"] == 0 && r["added"] == 0, "{r}");
+    assert_eq!(r["saved"], false, "{r}");
+    assert_eq!((std::fs::read(&table).unwrap(), written()), before, "not written again");
+    // A line changed: saved, but for a dry run.
+    let changed = std::fs::read_to_string(&lines).unwrap().replace("Hello", "Hello there");
+    std::fs::write(&lines, changed).unwrap();
+    let (ok, r) = mg(&["tlk-import", &table, &lines, "--dry-run"]);
+    assert!(ok && r["changed"] == 1 && r["saved"] == false, "{r}");
+    let (ok, r) = mg(&["tlk-import", &table, &lines]);
+    assert!(ok && r["changed"] == 1 && r["saved"] == true, "{r}");
+    // A table the import makes is saved, lines or none.
+    let (ok, r) = mg(&["tlk-import", &at("new.tlk"), &lines]);
+    assert!(ok && r["saved"] == true && dir.join("new.tlk").is_file(), "{r}");
 }

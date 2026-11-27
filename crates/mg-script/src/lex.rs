@@ -145,6 +145,10 @@ pub fn tokenize(src: &[u8]) -> Vec<Token> {
             let mut terminated = false;
             while i < n {
                 match src[i] {
+                    // (An escape steps over the backslash and the byte after
+                    // it; the rest of a character of more bytes is passed by
+                    // the last arm, as none of its bytes is a quote, a
+                    // backslash or a line end.)
                     b'\\' if i + 1 < n && src[i + 1] != b'\n' => i += 2,
                     b'"' => {
                         i += 1;
@@ -359,5 +363,20 @@ mod tests {
         let names: Vec<&str> =
             includes(src.as_bytes()).iter().map(|i| &src[i.name.clone()]).collect();
         assert_eq!(names, ["d", "e"]);
+    }
+
+    /// A string's escape of a character of more than one byte: the
+    /// string's span ends on the character's boundary (its other bytes are
+    /// passed byte by byte, none of them a quote). Not a fix's test: the
+    /// lexer always did so (review A of the adversarial branch).
+    #[test]
+    fn escaped_multibyte_char_in_string_keeps_utf8_boundaries() {
+        let src = "\"\\é\" x";
+        let toks = tokenize(src.as_bytes());
+        let joined: String = toks.iter().map(|t| &src[t.span.clone()]).collect();
+        assert_eq!(joined, src);
+        assert_eq!(toks[0].kind, TokenKind::String { terminated: true });
+        assert_eq!(&src[toks[0].span.clone()], "\"\\é\"");
+        assert_eq!(toks[2].kind, TokenKind::Ident);
     }
 }

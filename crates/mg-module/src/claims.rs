@@ -19,14 +19,29 @@
 //! `Area` and `Builder` are needed; `Status`, `Date` and `Tag` are read
 //! where the table has them, and any other column (a team's `World`) is
 //! kept as it is. Claim and Release change one row's line, or add one at
-//! the end, and leave every other line as written: two builders claiming
-//! two areas at once make two changes git merges by itself.
+//! the end, and leave every other line as written: two builders changing
+//! two rows the table has make two changes git merges by itself. Two who
+//! each add a row add it at the same place, under the same number, which
+//! git calls a conflict: both lines kept resolve it, as the table is read
+//! by its `Area` column and not by its rows' numbers, and [`merge`] (`mg
+//! merge-claims`, git's merge driver) merges the table by area itself.
 
 use std::path::{Path, PathBuf};
 
 use mg_core::ResRef;
 
 use crate::project_file::Patterns;
+
+/// Length of a leading `\r\n` or `\n` line ending in `s` (`0` if none).
+fn line_ending_len(s: &str) -> usize {
+    if s.starts_with("\r\n") {
+        2
+    } else if s.starts_with('\n') {
+        1
+    } else {
+        0
+    }
+}
 
 /// The columns a table Moonglow makes has.
 pub const COLUMNS: [&str; 5] = ["Area", "Builder", "Status", "Date", "Tag"];
@@ -204,7 +219,9 @@ impl<'a> Standing<'a> {
     pub fn of(claims: &'a Claims, area: ResRef, code: Option<&str>) -> Standing<'a> {
         match claims.of(area) {
             Some(c) => match c.builder.as_deref() {
-                Some(b) if Some(b) == code => Standing::Mine(c),
+                Some(b) if code.is_some_and(|mine| b.eq_ignore_ascii_case(mine)) => {
+                    Standing::Mine(c)
+                }
                 Some(_) => Standing::Others(c),
                 None => Standing::Free(Some(c)),
             },
@@ -303,6 +320,7 @@ pub fn change(
     let merged = row.is_some_and(Claim::merged);
     let (builder, status) = match change {
         Change::Claim(code) => {
+            let code = code.to_ascii_lowercase();
             if let Some(other) = holder.filter(|h| *h != code && !force) {
                 return Err(format!(
                     "{area} is claimed by {other}{}: they release it first",
@@ -313,6 +331,7 @@ pub fn change(
             (Some(code), if merged { "merged" } else { "claimed" })
         }
         Change::Release(code) => {
+            let code = code.to_ascii_lowercase();
             match holder {
                 None => return Err(format!("{area} is not claimed")),
                 Some(h) if h != code && !force => {
@@ -323,6 +342,8 @@ pub fn change(
             (None, if merged { "merged" } else { "free" })
         }
         Change::Hand { from, to } => {
+            let from = from.to_ascii_lowercase();
+            let to = to.to_ascii_lowercase();
             match holder {
                 None if !force => return Err(format!("{area} is not claimed")),
                 Some(h) if h != from && !force => {
@@ -333,7 +354,7 @@ pub fn change(
             (Some(to), if merged { "merged" } else { "claimed" })
         }
     };
-    let mut set: Vec<(usize, Option<String>)> = vec![(table.builder, builder.map(String::from))];
+    let mut set: Vec<(usize, Option<String>)> = vec![(table.builder, builder)];
     set.extend(table.status.map(|c| (c, Some(status.to_string()))));
     set.extend(table.date.map(|c| (c, Some(date.to_string()))));
     match row {
@@ -354,7 +375,7 @@ pub fn write_change(path: &Path, area: ResRef, how: Change, force: bool) -> Resu
 /// A claims table's text: UTF-8 where it is that, else Windows-1252 (a
 /// table saved by a Windows editor: "José" read as UTF-8 was written back
 /// as "Jos\u{fffd}" for good).
-pub(crate) fn decode(bytes: &[u8]) -> (std::borrow::Cow<'_, str>, bool) {
+pub fn decode(bytes: &[u8]) -> (std::borrow::Cow<'_, str>, bool) {
     match std::str::from_utf8(bytes) {
         Ok(text) => (text.into(), true),
         Err(_) => (mg_core::Codepage::WINDOWS_1252.decode(bytes), false),
@@ -374,13 +395,110 @@ fn rewrite(path: &Path, f: impl FnOnce(&str) -> Result<String, String>) -> Resul
     let out = f(&text)?;
     let out =
         if utf8 { out.into_bytes() } else { mg_core::Codepage::WINDOWS_1252.encode_lossy(&out) };
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::write_replacing(path, &out).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Which side a conflict of [`merge`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Ours,
+    Theirs,
+}
+
+/// An area both sides changed, each its own way: its row's cells as each
+/// has it (`None`: no row), laid out as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub area: String,
+    pub base: Option<String>,
+    pub ours: Option<String>,
+    pub theirs: Option<String>,
+}
+
+/// What [`merge`] made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merge {
+    /// Ours with what theirs changed (and, of a conflict, the side
+    /// preferred).
+    pub text: String,
+    pub conflicts: Vec<Conflict>,
+}
+
+/// Two claims tables made from `base` merged, row by row by their Area
+/// (git's merge driver: `mg merge-claims`). What one side changed of an
+/// area's row (claimed, released, handed on, merged, taken out) is taken;
+/// both sides' new areas are kept, theirs added after ours, numbered on;
+/// an area both changed, each its own way, or both added differently, is
+/// a conflict, which `prefer` settles. Ours's lines are kept as written
+/// where theirs changed nothing of them, theirs's laid out under ours's
+/// columns. The three tables are to have the same columns. (Two builders
+/// each adding a claim add a line under the same number at the same
+/// place, which git's own merge can't settle.)
+pub fn merge(base: &str, ours: &str, theirs: &str, prefer: Side) -> Result<Merge, String> {
+    let empty = new_table();
+    let base_made = base.trim().is_empty();
+    let base = if base_made { empty.as_str() } else { base };
+    let (b, o, t) = (Table::read(base)?, Table::read(ours)?, Table::read(theirs)?);
+    let same = |x: &Table<'_>| {
+        x.names.len() == o.names.len()
+            && x.names.iter().zip(&o.names).all(|(a, b)| a.eq_ignore_ascii_case(b))
+    };
+    // (A base made up, for a table both sides added, has the usual
+    // columns: taken as theirs's.)
+    if !same(&t) || (!base_made && !same(&b)) {
+        return Err("the tables' columns differ: merge them by hand".into());
     }
-    let tmp = crate::sibling(path, ".moonglow-tmp");
-    std::fs::write(&tmp, out)
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    let (bs, os, ts) = (b.by_area(), o.by_area(), t.by_area());
+    let bm: std::collections::HashMap<&str, &Vec<Option<String>>> =
+        bs.iter().map(|(a, c)| (a.as_str(), *c)).collect();
+    let om: std::collections::HashMap<&str, &Vec<Option<String>>> =
+        os.iter().map(|(a, c)| (a.as_str(), *c)).collect();
+    let tm: std::collections::HashMap<&str, &Vec<Option<String>>> =
+        ts.iter().map(|(a, c)| (a.as_str(), *c)).collect();
+    let shown = |table: &Table<'_>, cells: Option<&Vec<Option<String>>>| {
+        cells.and_then(|c| table.line_of("", c).ok()).map(|l| l.trim().to_string())
+    };
+    // What theirs did to each area, in theirs's order, then the areas it
+    // took out.
+    let ts_areas: std::collections::HashSet<&str> = ts.iter().map(|(a, _)| a.as_str()).collect();
+    let mut areas: Vec<String> = ts.iter().map(|(a, _)| a.clone()).collect();
+    areas.extend(bs.iter().filter(|(a, _)| !ts_areas.contains(a.as_str())).map(|(a, _)| a.clone()));
+    let mut text = ours.to_string();
+    let mut conflicts = Vec::new();
+    for area in areas {
+        let k = area.as_str();
+        let bc = if base_made { None } else { bm.get(k).copied() };
+        let oc = om.get(k).copied();
+        let tc = tm.get(k).copied();
+        if tc == bc || oc == tc {
+            continue;
+        }
+        if oc != bc {
+            conflicts.push(Conflict {
+                area: area.clone(),
+                base: shown(&b, bc),
+                ours: shown(&o, oc),
+                theirs: shown(&t, tc),
+            });
+            if prefer == Side::Ours {
+                continue;
+            }
+        }
+        let now = Table::read(&text)?;
+        let row = now.rows.iter().position(|c| {
+            c.get(now.area).cloned().flatten().is_some_and(|a| a.eq_ignore_ascii_case(&area))
+        });
+        let all = |cells: &[Option<String>]| -> Vec<(usize, Option<String>)> {
+            cells.iter().cloned().enumerate().collect()
+        };
+        text = match (row, tc) {
+            (Some(r), Some(cells)) => now.with_row(r, &all(cells))?,
+            (None, Some(cells)) => now.with_new_row(&all(cells))?,
+            (Some(r), None) => now.without_row(r)?,
+            (None, None) => continue,
+        };
+    }
+    Ok(Merge { text, conflicts })
 }
 
 /// A table's text with an area marked merged (in the game from now on),
@@ -436,6 +554,8 @@ struct Table<'t> {
     /// The header's line, and where each column's name begins in it.
     header: usize,
     starts: Vec<usize>,
+    /// The columns' names.
+    names: Vec<String>,
     /// The first row's line.
     first: usize,
     rows: Vec<Vec<Option<String>>>,
@@ -518,6 +638,7 @@ impl<'t> Table<'t> {
         let (Some(area), Some(builder)) = (column("Area"), column("Builder")) else {
             return Err("its columns are to have Area and Builder".into());
         };
+        let (status, date, tag) = (column("Status"), column("Date"), column("Tag"));
         let mut first = header + 1;
         while first < lines.len() && line(first).trim().is_empty() {
             first += 1;
@@ -537,13 +658,14 @@ impl<'t> Table<'t> {
             text,
             header,
             starts,
+            names,
             first,
             rows,
             area,
             builder,
-            status: column("Status"),
-            date: column("Date"),
-            tag: column("Tag"),
+            status,
+            date,
+            tag,
             newline,
             lines,
         })
@@ -602,6 +724,29 @@ impl<'t> Table<'t> {
         Ok(format!("{}{line}{}", &self.text[..a], &self.text[b..]))
     }
 
+    /// The text without row `row`'s line.
+    fn without_row(&self, row: usize) -> Result<String, String> {
+        let l = self.data_line(row).ok_or("no such row")?;
+        let (a, b) = self.lines[l];
+        let ending = line_ending_len(&self.text[b..]);
+        Ok(format!("{}{}", &self.text[..a], &self.text[b + ending..]))
+    }
+
+    /// Each row with an Area, by its Area (lower case): the first of an
+    /// area's rows, as [`Claims::parse`] reads it.
+    fn by_area(&self) -> Vec<(String, &Vec<Option<String>>)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<(String, &Vec<Option<String>>)> = Vec::new();
+        for cells in &self.rows {
+            let Some(Some(area)) = cells.get(self.area) else { continue };
+            let area = area.to_ascii_lowercase();
+            if seen.insert(area.clone()) {
+                out.push((area, cells));
+            }
+        }
+        out
+    }
+
     /// The text with a row added after the last (its cells `set`, the rest
     /// empty).
     fn with_new_row(&self, set: &[(usize, Option<String>)]) -> Result<String, String> {
@@ -619,14 +764,7 @@ impl<'t> Table<'t> {
             n => self.data_line(n - 1).unwrap_or(self.header),
         };
         let end = self.lines[after].1;
-        let rest = &self.text[end..];
-        let ending = if rest.starts_with("\r\n") {
-            2
-        } else if rest.starts_with('\n') {
-            1
-        } else {
-            0
-        };
+        let ending = line_ending_len(&self.text[end..]);
         let (head, tail) = self.text.split_at(end + ending);
         let lead = if ending == 0 { self.newline } else { "" };
         Ok(format!("{head}{lead}{line}{}{tail}", self.newline))
@@ -866,6 +1004,96 @@ mod tests {
         assert_eq!(e, "the table has no Status column");
     }
 
+    /// What each side changed, merged by area: two new claims (git's own
+    /// merge calls them a conflict, both a line under number 3 at the
+    /// end) are both kept, numbered on; one side's change to an area
+    /// taken; ours's lines kept as written.
+    #[test]
+    fn two_new_claims_and_a_release_merge_by_area() {
+        let claim = |text: &str, area: &str, how| change(text, r(area), how, "2026-11-06", false);
+        let ours = claim(TABLE, "kz_inn", Change::Claim("ab")).unwrap();
+        let theirs = claim(TABLE, "kz_mill", Change::Claim("cd")).unwrap();
+        let theirs = claim(&theirs, "kz_square", Change::Release("ab")).unwrap();
+        let m = merge(TABLE, &ours, &theirs, Side::Ours).unwrap();
+        assert_eq!(m.conflicts, []);
+        let (c, w) = read(&m.text);
+        assert_eq!(w, Vec::<String>::new());
+        assert_eq!(c.of(r("kz_inn")).unwrap().builder.as_deref(), Some("ab"));
+        assert_eq!(c.of(r("kz_mill")).unwrap().builder.as_deref(), Some("cd"));
+        assert_eq!(c.of(r("kz_square")).unwrap().holder(), None, "released by theirs");
+        let lines: Vec<&str> = m.text.lines().collect();
+        assert!(lines[6].starts_with("3   kz_inn"), "{}", m.text);
+        assert!(lines[7].starts_with("4   kz_mill"), "{}", m.text);
+        // Ours's lines as written but the one theirs changed.
+        for (a, b) in TABLE.lines().zip(&lines).skip(4) {
+            assert_eq!(a, *b);
+        }
+        // The other way round: the same areas, theirs's new one after ours's.
+        let back = merge(TABLE, &theirs, &ours, Side::Ours).unwrap();
+        let (c, _) = read(&back.text);
+        assert_eq!(c.rows.len(), 5);
+        assert!(back.text.lines().nth(7).unwrap().starts_with("4   kz_inn"), "{}", back.text);
+    }
+
+    /// An area both sides changed, each its own way (or both added it
+    /// differently), is a conflict, which the side preferred settles; the
+    /// same change on both is none.
+    #[test]
+    fn an_area_both_changed_is_a_conflict_unless_alike() {
+        let claim = |text: &str, area: &str, how| change(text, r(area), how, "2026-11-06", true);
+        let ours = claim(TABLE, "kz_square", Change::Hand { from: "ab", to: "ef" }).unwrap();
+        let theirs = claim(TABLE, "kz_square", Change::Release("ab")).unwrap();
+        let m = merge(TABLE, &ours, &theirs, Side::Ours).unwrap();
+        assert_eq!(m.conflicts.len(), 1);
+        assert_eq!(m.conflicts[0].area, "kz_square");
+        assert!(m.conflicts[0].ours.as_deref().unwrap().contains("ef"), "{:?}", m.conflicts);
+        assert_eq!(m.text, ours, "ours kept");
+        let m = merge(TABLE, &ours, &theirs, Side::Theirs).unwrap();
+        assert_eq!(m.text, theirs, "theirs taken");
+        assert_eq!(merge(TABLE, &ours, &ours, Side::Ours).unwrap().conflicts, []);
+        // Both added it, to two builders.
+        let ours = claim(TABLE, "kz_inn", Change::Claim("ab")).unwrap();
+        let theirs = claim(TABLE, "kz_inn", Change::Claim("cd")).unwrap();
+        let m = merge(TABLE, &ours, &theirs, Side::Ours).unwrap();
+        assert_eq!((m.conflicts.len(), m.conflicts[0].base.clone()), (1, None));
+    }
+
+    /// A row theirs took out goes, unless ours changed it; a table both
+    /// sides added (no base) is their union; line endings are ours's; the
+    /// tables' columns are to be the same.
+    #[test]
+    fn rows_taken_out_tables_added_and_columns_differing() {
+        let gone = TABLE.replace(
+            "2   kz_bridge        cd       merged   2026-10-20  KZ_BRIDGE      ****\n",
+            "",
+        );
+        let m = merge(TABLE, TABLE, &gone, Side::Ours).unwrap();
+        assert_eq!(m.text, gone);
+        let ours = change(TABLE, r("kz_bridge"), Change::Claim("ab"), "2026-11-06", true).unwrap();
+        assert_eq!(merge(TABLE, &ours, &gone, Side::Ours).unwrap().conflicts.len(), 1);
+        // Added by both.
+        let ours = change("", r("kz_inn"), Change::Claim("ab"), "2026-11-06", false).unwrap();
+        let theirs = change("", r("kz_mill"), Change::Claim("cd"), "2026-11-06", false).unwrap();
+        let m = merge("", &ours, &theirs, Side::Ours).unwrap();
+        let (c, _) = read(&m.text);
+        assert_eq!(
+            c.rows.iter().map(|c| c.area.to_string()).collect::<Vec<_>>(),
+            ["kz_inn", "kz_mill"]
+        );
+        // CRLF kept.
+        let crlf = |t: &str| t.replace('\n', "\r\n");
+        let ours =
+            change(&crlf(TABLE), r("kz_inn"), Change::Claim("ab"), "2026-11-06", false).unwrap();
+        let theirs =
+            change(&crlf(TABLE), r("kz_mill"), Change::Claim("cd"), "2026-11-06", false).unwrap();
+        let m = merge(&crlf(TABLE), &ours, &theirs, Side::Ours).unwrap();
+        assert!(!m.text.replace("\r\n", "").contains('\n'), "{:?}", m.text);
+        assert!(m.text.contains("kz_mill"));
+        // Columns differing.
+        let fewer = TABLE.replace("Tag            World", "Tag");
+        assert!(merge(TABLE, TABLE, &fewer, Side::Ours).unwrap_err().contains("columns differ"));
+    }
+
     #[test]
     fn every_cut_of_a_table_reads_without_a_panic() {
         for end in (0..=TABLE.len()).filter(|&i| TABLE.is_char_boundary(i)) {
@@ -878,5 +1106,32 @@ mod tests {
         }
         let mut w = Vec::new();
         let _ = Claims::parse("claims.2da", "2DA V2.0\n\"\n\"\"\"", &mut w);
+    }
+
+    #[test]
+    fn uppercase_builder_codes_match_and_store_lowercased() {
+        let claimed =
+            change(TABLE, r("kz_mill"), Change::Claim("XY"), "2026-11-23", false).unwrap();
+        let (c, _) = read(&claimed);
+        assert!(matches!(Standing::of(&c, r("kz_mill"), Some("XY")), Standing::Mine(_)));
+        assert_eq!(c.of(r("kz_mill")).unwrap().builder.as_deref(), Some("xy"));
+
+        // Re-claiming, handing off, and releasing with uppercase codes all succeed.
+        let again =
+            change(&claimed, r("kz_mill"), Change::Claim("XY"), "2026-11-23", false).unwrap();
+        let handed = change(
+            &again,
+            r("kz_mill"),
+            Change::Hand { from: "XY", to: "CD" },
+            "2026-11-23",
+            false,
+        )
+        .unwrap();
+        let (c2, _) = read(&handed);
+        assert_eq!(c2.of(r("kz_mill")).unwrap().builder.as_deref(), Some("cd"));
+        let released =
+            change(&handed, r("kz_mill"), Change::Release("CD"), "2026-11-23", false).unwrap();
+        let (c3, _) = read(&released);
+        assert_eq!(c3.of(r("kz_mill")).unwrap().builder, None);
     }
 }

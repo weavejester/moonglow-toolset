@@ -97,12 +97,26 @@ pub struct View {
     pub shadows: bool,
     /// Creatures cast the sun's or moon's shadows too.
     pub creature_shadows: bool,
-    /// Point lights flagged `shadow` cast shadows (`mg_render::LightShadows`).
+    /// Point lights flagged `shadow` cast shadows (`mg_render::LightShadows`),
+    /// where [`View::creature_shadows`] are on too ([`View::light_shadows_cast`]).
     pub light_shadows: bool,
     /// The tile border is drawn past the area's edge, as the game client
     /// draws it ([`crate::border`]), the fog's color past it; else nothing
     /// is, as in Aurora.
     pub border: bool,
+    /// How far the game's camera stands from the player it looks at,
+    /// metres, as the client keeps it: the distance a script's
+    /// `SetCameraFacing(direction, distance, pitch)` gives (or the
+    /// player's zoom sets), not the eye a picture is drawn from. The fog
+    /// starts as much nearer than at the game's own [`GAME_CAMERA`]
+    /// ([`fog_from`]). [`View::of`] gives that.
+    ///
+    /// A client passes its camera's distance as it has it (the Shard's
+    /// `SetCameraFacing(90, 5.5, 84)`: 5.5), whatever eye it fits for
+    /// `mg_render::Camera::game` (5.0 m for that one in
+    /// `night_fog.rs`, 11 m for 12 in `armourer.rs`): the client's fog
+    /// was read back against the script's distance.
+    pub camera: f32,
 }
 
 impl View {
@@ -122,6 +136,7 @@ impl View {
             creature_shadows: true,
             light_shadows: true,
             border: false,
+            camera: GAME_CAMERA,
         }
     }
 
@@ -142,19 +157,29 @@ impl View {
         })
     }
 
+    /// Whether lights cast shadows with Creature Shadows `creature_shadows`
+    /// and Light Shadows `light_shadows`: only where both are on, as the
+    /// client's Creature Shadow Detail Off takes the lights' shadows away
+    /// too (`docs/research/notes_shaders.md`, the lights' reading of
+    /// 2026-10-28). The one rule the scene ([`View::light_shadows_of`]) and
+    /// the area view's Shadows menu (Light Shadows grayed out) read.
+    pub const fn light_shadows_cast(creature_shadows: bool, light_shadows: bool) -> bool {
+        creature_shadows && light_shadows
+    }
+
     /// The lights' shadows an area lit as `l` shows in this view: where
-    /// [`View::light_shadows`] asks for them and the area has no sun or moon
+    /// [`View::light_shadows`] asks for them, [`View::creature_shadows`] are
+    /// on ([`View::light_shadows_cast`]) and the area has no sun or moon
     /// shadows at the time (as the client: each creature then casts one
     /// from the nearest light that casts them, `mg_render::PointLight::casts_shadows`;
     /// with the sun's or moon's, it casts that alone), as opaque as its
     /// Shadow Opacity (measured in `shadows_look`).
     pub fn light_shadows_of(&self, l: &Lighting) -> Option<mg_render::SunShadows> {
         let sky = l.sky(self.night).shadows;
-        (self.light_shadows && self.lit && !sky && l.shadow_opacity > 0).then(|| {
-            mg_render::SunShadows {
-                opacity: f32::from(l.shadow_opacity) / 100.0,
-                fade_limit: l.fog_clip,
-            }
+        let asked = Self::light_shadows_cast(self.creature_shadows, self.light_shadows);
+        (asked && self.lit && !sky && l.shadow_opacity > 0).then(|| mg_render::SunShadows {
+            opacity: f32::from(l.shadow_opacity) / 100.0,
+            fade_limit: l.fog_clip,
         })
     }
 
@@ -183,22 +208,27 @@ struct Loaded {
 }
 
 impl Loaded {
-    fn new(gpu: Arc<GpuModel>, anims: Vec<(String, Arc<Model>)>) -> Loaded {
+    /// `anims`: [`anim::animations_scaled`]'s, each at the scale it plays
+    /// at through the chain of supermodels; `resref`: the resource the
+    /// model was read from (a tile's source lights are nodes named after
+    /// it or after the model: [`crate::source_light_node`]).
+    fn new(resref: &str, gpu: Arc<GpuModel>, anims: Vec<(String, Arc<Model>, f32)>) -> Loaded {
         let model = &gpu.model;
         let at: Vec<Option<usize>> = (anims.iter())
-            .map(|(name, owner)| {
+            .map(|(name, owner, _)| {
                 owner.animations.iter().position(|a| a.name.eq_ignore_ascii_case(name))
             })
             .collect();
-        let found = anims.iter().zip(&at).filter_map(|((_, owner), i)| owner.animations.get((*i)?));
-        let mut bindings = anim::Binding::all(model, found).into_iter();
+        let found = anims
+            .iter()
+            .zip(&at)
+            .filter_map(|((_, owner, scale), i)| Some((owner.animations.get((*i)?)?, *scale)));
+        let mut bindings = anim::Binding::all_scaled(model, found).into_iter();
         let bound = at.iter().map(|i| Some(((*i)?, bindings.next()?))).collect();
+        let anims: Vec<(String, Arc<Model>)> = anims.into_iter().map(|(n, m, _)| (n, m)).collect();
         let tile =
             TILE_ANIMATIONS.map(|t| anims.iter().position(|(n, _)| n.eq_ignore_ascii_case(t)));
-        let sources = [1, 2].map(|slot| {
-            let suffix = format!("sl{slot}");
-            model.nodes.iter().position(|n| n.name.to_ascii_lowercase().ends_with(&suffix))
-        });
+        let sources = [1, 2].map(|slot| crate::source_light_node(model, resref, slot));
         Loaded { gpu, anims, bound, tile, sources }
     }
 
@@ -255,6 +285,173 @@ struct Shown {
     stance: mg_preview::compose::Stance,
 }
 
+/// How many of the scene's updates a look that no object has any more is
+/// kept for (the blueprint about to be placed, the color a picker was at
+/// a moment ago), before its models are let go.
+const LOOKS_KEPT: u64 = 8;
+
+/// A look made once: what is drawn (`None`: nothing could be), and the
+/// models it names that could not be loaded.
+#[derive(Debug)]
+struct Kept<T> {
+    look: Option<Arc<T>>,
+    missing: Arc<Vec<String>>,
+    /// The update it was last asked for in.
+    used: u64,
+}
+
+/// The looks of an area's objects (their GPU models), by what they are
+/// made from, so that objects that look the same share theirs. A look is
+/// kept while an object holds it (its `Arc`, or that of its missing
+/// models) and for [`LOOKS_KEPT`] updates after: every color a picker
+/// passed over a placeable, every appearance tried in a creature's
+/// Properties and every blueprint hovered was one more, kept until the
+/// area's tab closed.
+#[derive(Debug)]
+struct Looks<T> {
+    kept: HashMap<String, Kept<T>>,
+    /// How many updates there were ([`Looks::sweep`]).
+    clock: u64,
+}
+
+impl<T> Default for Looks<T> {
+    fn default() -> Self {
+        Looks { kept: HashMap::new(), clock: 0 }
+    }
+}
+
+/// A look as its object holds it: what is drawn and what is missing.
+type Held<T> = (Option<Arc<T>>, Arc<Vec<String>>);
+
+impl<T> Looks<T> {
+    /// The look of `key`, made by `make` (the look and its missing
+    /// models) if it is not kept.
+    fn get(&mut self, key: String, make: impl FnOnce() -> (Option<T>, Vec<String>)) -> Held<T> {
+        let clock = self.clock;
+        let kept = self.kept.entry(key).or_insert_with(|| {
+            let (look, missing) = make();
+            Kept { look: look.map(Arc::new), missing: Arc::new(missing), used: clock }
+        });
+        kept.used = clock;
+        (kept.look.clone(), kept.missing.clone())
+    }
+
+    /// One update on: the looks no object holds and none asked for of
+    /// late are let go. Where they were (their addresses), for what is
+    /// kept by them.
+    fn sweep(&mut self) -> Vec<usize> {
+        self.clock += 1;
+        let clock = self.clock;
+        let mut gone = Vec::new();
+        self.kept.retain(|_, k| {
+            let held = Arc::strong_count(&k.missing) > 1
+                || k.look.as_ref().is_some_and(|l| Arc::strong_count(l) > 1);
+            let keep = held || clock - k.used <= LOOKS_KEPT;
+            if !keep {
+                gone.extend(k.look.as_ref().map(|l| Arc::as_ptr(l) as usize));
+            }
+            keep
+        });
+        gone
+    }
+}
+
+/// The chunk models (`chunkname`) the emitters of `of` name, lower case.
+fn chunk_names<'a>(
+    of: impl Iterator<Item = &'a Arc<GpuModel>>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for gm in of {
+        for n in &gm.model.nodes {
+            if let mg_mdl::NodeKind::Emitter(e) = &n.kind
+                && let Some(c) = &e.chunk
+            {
+                names.insert(c.to_ascii_lowercase());
+            }
+        }
+    }
+    names
+}
+
+/// The models an area names that could not be loaded, each once, in
+/// order: its tiles' (each tile's model and whether it is loaded) and
+/// its objects' (what each one's look is missing). Of what the area has
+/// now: a model no tile or object names any more is not among them.
+fn missing_models<'a>(
+    tiles: impl Iterator<Item = (Option<&'a String>, bool)>,
+    objects: &[Option<Arc<Vec<String>>>],
+) -> Vec<String> {
+    let tiles = tiles.filter(|(_, loaded)| !loaded).filter_map(|(model, _)| model.cloned());
+    let objects = objects.iter().flatten().flat_map(|m| m.iter().cloned());
+    let mut missing: Vec<String> = tiles.chain(objects).collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// Which tiles are `hidden` (by index), of `tiles`: looked up once a tile,
+/// not the list gone through for each (a brush's preview over a 32 by 32
+/// area hides a thousand of a thousand). Empty where none is.
+fn hidden_tiles(tiles: usize, hidden: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; if hidden.is_empty() { 0 } else { tiles }];
+    for &i in hidden {
+        if let Some(slot) = mask.get_mut(i) {
+            *slot = true;
+        }
+    }
+    mask
+}
+
+/// The most objects a list is taken to have, for [`object_place`].
+const OBJECT_PLACES: usize = 1 << 24;
+
+/// A placed object as its particles are kept by: its kind and its place
+/// in its own list. (Not its place in the area's objects, every kind in
+/// a row: a creature placed moved every placeable's, and each candle of a
+/// tavern started its flame again.)
+fn object_place(o: &AreaObject) -> usize {
+    o.kind.index() * OBJECT_PLACES + o.index.min(OBJECT_PLACES - 1)
+}
+
+/// Gives `key` (an object's place and its model) the particles kept for
+/// the same model at another place of the same kind's list that nothing
+/// shown now is at (`wanted`: the keys of what is): an object before it
+/// in its list was deleted or placed, and its particles go on rather
+/// than start again.
+/// The key of the particles of `source` (an [`mg_preview::compose::Emitting`]'s:
+/// 0 the base, then its parts) of the object at `place` shown as `shown`
+/// in [`AreaScene::particles`]' simulations: its place, a part's put
+/// above every object's ([`carry_over`] takes one's particles only to
+/// another place of the same kind and source), and its shown models'
+/// address.
+fn source_key(place: usize, shown: &Arc<Shown>, source: usize) -> (usize, usize) {
+    (place + (source << SOURCE_SHIFT), Arc::as_ptr(shown) as usize)
+}
+
+/// Where [`source_key`] puts a part's number: above every object's
+/// place ([`OBJECT_PLACES`] a kind), below the tiles' keys (counted down
+/// from the top and the middle).
+const SOURCE_SHIFT: u32 = 40;
+
+fn carry_over<T>(
+    sims: &mut HashMap<(usize, usize), T>,
+    key: (usize, usize),
+    wanted: &std::collections::HashSet<(usize, usize)>,
+) {
+    if sims.contains_key(&key) {
+        return;
+    }
+    let kind = |place: usize| place / OBJECT_PLACES;
+    let from = (sims.keys())
+        .filter(|k| k.1 == key.1 && kind(k.0) == kind(key.0) && !wanted.contains(k))
+        // (The nearest place: the one it most likely was.)
+        .min_by_key(|k| k.0.abs_diff(key.0))
+        .copied();
+    if let Some(sim) = from.and_then(|k| sims.remove(&k)) {
+        sims.insert(key, sim);
+    }
+}
+
 /// What an area's loaded models use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
@@ -277,9 +474,20 @@ pub struct AreaScene {
     border: Vec<Option<Arc<Loaded>>>,
     /// By object (as in [`AreaModel::objects`]).
     objects: Vec<Option<Arc<Shown>>>,
+    /// By object, the models its look names that could not be loaded.
+    object_missing: Vec<Option<Arc<Vec<String>>>>,
     tile_cache: HashMap<String, Option<Arc<Loaded>>>,
-    object_cache: HashMap<String, Option<Arc<Shown>>>,
+    object_cache: Looks<Shown>,
+    /// The models read so far, by name (`None`: not there, or not
+    /// readable), while something drawn is made of them: a new look's
+    /// models and their supermodels (a creature's animations) are not
+    /// read from the resources again for each look.
+    parsed: HashMap<String, Option<Arc<Model>>>,
     flame: Option<Option<Loaded>>,
+    /// The models chunk emitters throw (`chunkName`), by name, lower
+    /// case (`None`: not there, or not readable): those of the emitters
+    /// of the tiles' and objects' models, loaded as they are.
+    chunk_models: HashMap<String, Option<Arc<GpuModel>>>,
     /// The skybox's day and night models, and its skyboxes.2da row.
     sky: [Option<Arc<GpuModel>>; 2],
     sky_box: Option<u32>,
@@ -287,7 +495,8 @@ pub struct AreaScene {
     sky_fade: Option<Arc<GpuModel>>,
     /// lightcolor.2da colours by row.
     colors: Vec<Vec3>,
-    /// Models named by tiles or previews that could not be loaded.
+    /// Models named by the area's tiles or its objects' previews that
+    /// could not be loaded: of what it has now ([`missing_models`]).
     pub missing: Vec<String>,
     /// Of those, the tiles' models that were read and then broke what
     /// builds them (a panic, caught): a renderer that fails every model
@@ -301,12 +510,12 @@ pub struct AreaScene {
     arrow: Option<Arc<GpuModel>>,
     /// Stores as the game's marker for one (a $) rather than as arrows.
     pub merchant_signs: bool,
-    /// The game's marker for an encounter's spawn point (`spawnpoint`).
-    spawn_point: Option<Arc<GpuModel>>,
-    /// Encounters' spawn points are marked (Options › Area).
-    pub spawn_markers: bool,
     /// By tile index, the grass it grows ([`crate::grass::tufts`]).
     tile_grass: Vec<Option<Arc<TileGrass>>>,
+    /// Precomputed per-tile grown grass descriptors and generation bumped when rebuilt.
+    grown_tiles: Vec<Grown>,
+    grass_gen: u64,
+    grass_sight_cache: RefCell<Option<(u64, Sight, Vec<GrassDraw>)>>,
     /// What grows (by material) that the grass was made for, and the
     /// grass of each tile model, by name.
     grass_for: Vec<(u32, GrassLook)>,
@@ -349,9 +558,59 @@ impl AreaScene {
     pub fn new(gpu: &Gpu, game: &GameData, area: &AreaModel) -> AreaScene {
         let mut scene = AreaScene { colors: light_colors(game), ..Default::default() };
         scene.update(gpu, game, area);
-        let models = Models { game, cache: RefCell::new(HashMap::new()) };
+        let models = scene.models(game);
         scene.load_sky(gpu, &models, game, area);
+        scene.keep(models);
         scene
+    }
+
+    /// What loads models for this scene, with those it has read so far
+    /// (taken out of the scene while it is at work: [`AreaScene::keep`]
+    /// puts them back).
+    fn models<'a>(&mut self, game: &'a GameData) -> Models<'a> {
+        Models { game, cache: RefCell::new(std::mem::take(&mut self.parsed)) }
+    }
+
+    /// Puts back the models read ([`AreaScene::models`]).
+    fn keep(&mut self, models: Models<'_>) {
+        self.parsed = models.cache.into_inner();
+    }
+
+    /// After an update: lets go of the looks no object has any more
+    /// ([`Looks::sweep`]) with what was noted of them, and of the models
+    /// read that nothing drawn is made of; and says what is missing of
+    /// what `area` has now.
+    fn settle(&mut self, area: &AreaModel) {
+        let mut gone = self.object_cache.sweep();
+        let active_tiles: std::collections::HashSet<&str> =
+            area.tiles.iter().filter_map(|t| t.model.as_deref()).collect();
+        let loaded_tiles: std::collections::HashSet<&str> = active_tiles
+            .iter()
+            .copied()
+            .chain(area.border.iter().map(|b| b.model.as_str()))
+            .collect();
+        self.tile_cache.retain(|name, loaded| {
+            let keep = loaded_tiles.contains(name.as_str());
+            if !keep && let Some(l) = loaded {
+                gone.push(Arc::as_ptr(l) as usize);
+            }
+            keep
+        });
+        if !gone.is_empty() {
+            self.failed.borrow_mut().retain(|ptr| !gone.contains(ptr));
+        }
+        self.broken.retain(|name| active_tiles.contains(name.as_str()));
+        self.walkmesh_cache.retain(|name, _| active_tiles.contains(name.as_str()));
+        self.grass_cache.retain(|(name, _), _| active_tiles.contains(name.as_str()));
+        let active_chunks: std::collections::HashSet<(i32, i32)> =
+            area.tiles.iter().map(|t| crate::grass_view::chunk_of(t.position)).collect();
+        self.chunk_grass.retain(|k, _| active_chunks.contains(k));
+        let active_chunk_models = chunk_names(self.active_gpu_models());
+        self.chunk_models.retain(|k, _| active_chunk_models.contains(k));
+        self.parsed.retain(|_, m| m.as_ref().is_none_or(|m| Arc::strong_count(m) > 1));
+        let tiles =
+            area.tiles.iter().zip(&self.tiles).map(|(t, l)| (t.model.as_ref(), l.is_some()));
+        self.missing = missing_models(tiles, &self.object_missing);
     }
 
     /// Loads the skybox's day and night models (skyboxes.2da), unless it
@@ -399,17 +658,23 @@ impl AreaScene {
     /// Follows `area` after an edit: loads the models of tiles and objects
     /// not seen before.
     pub fn update(&mut self, gpu: &Gpu, game: &GameData, area: &AreaModel) {
+        let models = self.models(game);
         if self.arrow.is_none() {
             self.arrow = Some(Arc::new(GpuModel::new(gpu, Arc::new(crate::marker::arrow()))));
-            self.spawn_point = Models { game, cache: RefCell::new(HashMap::new()) }
-                .load("spawnpoint")
-                .map(|m| Arc::new(GpuModel::new(gpu, m)));
         }
-        let models = Models { game, cache: RefCell::new(HashMap::new()) };
         // A skybox chosen anew (Area Properties).
         if self.sky_box.is_some() {
             self.load_sky(gpu, &models, game, area);
         }
+        self.update_with(gpu, area, &models);
+        self.keep(models);
+        self.settle(area);
+        self.update_grass(gpu, game, area, &area.grass);
+    }
+
+    /// [`AreaScene::update`]'s tiles and objects, their models read by
+    /// `models`.
+    fn update_with(&mut self, gpu: &Gpu, area: &AreaModel, models: &Models<'_>) {
         let load = |name: &str| models.load(name);
         // (A model that is read and then breaks what builds it is left out,
         // as a missing one is: the toolset carries on.)
@@ -417,12 +682,11 @@ impl AreaScene {
         let built = |name: &str| -> Option<Option<Loaded>> {
             mg_render::guard::guarded(name, || {
                 let model = load(name)?;
-                let anims = anim::animations(&model, &load);
-                Some(Loaded::new(Arc::new(GpuModel::new(gpu, model)), anims))
+                let anims = anim::animations_scaled(&model, &load);
+                Some(Loaded::new(name, Arc::new(GpuModel::new(gpu, model)), anims))
             })
         };
         let loaded = |name: &str| built(name).flatten();
-        let mut missing = Vec::new();
         let tile_cache = &mut self.tile_cache;
         let broken = &mut self.broken;
         self.tiles = area
@@ -437,11 +701,7 @@ impl AreaScene {
                         if b.is_none() {
                             broken.insert(name.clone());
                         }
-                        let l = b.flatten().map(Arc::new);
-                        if l.is_none() {
-                            missing.push(name.clone());
-                        }
-                        l
+                        b.flatten().map(Arc::new)
                     })
                     .clone()
             })
@@ -460,16 +720,123 @@ impl AreaScene {
             .collect();
         // Objects that look the same share their models.
         let object_cache = &mut self.object_cache;
-        self.objects =
-            area.objects.iter().map(|o| shown(gpu, object_cache, o, &load, &mut missing)).collect();
+        (self.objects, self.object_missing) =
+            area.objects.iter().map(|o| shown(gpu, object_cache, o, &load)).unzip();
         let needs_flame = area.tiles.iter().any(|t| t.source_lights.iter().any(|&s| s > 0));
         if needs_flame && self.flame.is_none() {
             self.flame = Some(loaded("fx_flame01"));
         }
-        self.missing.extend(missing);
-        self.missing.sort();
-        self.missing.dedup();
-        self.update_grass(gpu, game, area, &area.grass);
+        self.load_chunks(gpu, models);
+    }
+
+    /// Loads the models the chunk emitters of the tiles' and objects'
+    /// models throw, those not loaded yet. (Most models have none: a
+    /// look at each one's emitters.)
+    fn active_gpu_models(&self) -> impl Iterator<Item = &Arc<GpuModel>> {
+        let tiles = self.tiles.iter().chain(&self.border).flatten().map(|l| &l.gpu);
+        let flame = self.flame.iter().flatten().map(|l| &l.gpu);
+        let emitting = self.objects.iter().flatten().filter(|s| s.composed.emits());
+        let objects = emitting.flat_map(|s| s.composed.models());
+        tiles.chain(flame).chain(objects)
+    }
+
+    fn load_chunks(&mut self, gpu: &Gpu, models: &Models<'_>) {
+        let names: Vec<String> = chunk_names(self.active_gpu_models())
+            .into_iter()
+            .filter(|c| !self.chunk_models.contains_key(c))
+            .collect();
+        self.load_chunk_models(gpu, models, names);
+    }
+
+    /// [`AreaScene::load_chunks`] of the objects at `at` alone (the tiles'
+    /// and the others' loaded already).
+    fn load_object_chunks(&mut self, gpu: &Gpu, models: &Models<'_>, at: &[usize]) {
+        let shown = at.iter().filter_map(|&i| self.objects.get(i)?.as_ref());
+        let emitting = shown.filter(|s| s.composed.emits());
+        let names = self.chunks_of(emitting.flat_map(|s| s.composed.models()));
+        self.load_chunk_models(gpu, models, names);
+    }
+
+    fn chunks_of<'a>(&self, of: impl Iterator<Item = &'a Arc<GpuModel>>) -> Vec<String> {
+        chunk_names(of).into_iter().filter(|c| !self.chunk_models.contains_key(c)).collect()
+    }
+
+    /// Loads the chunk models `names`.
+    fn load_chunk_models(&mut self, gpu: &Gpu, models: &Models<'_>, names: Vec<String>) {
+        for name in names {
+            let built = models
+                .load(&name)
+                .and_then(|m| mg_render::guard::guarded(&name, || Arc::new(GpuModel::new(gpu, m))));
+            self.chunk_models.insert(name, built);
+        }
+    }
+
+    /// The objects at `at` (their places in `area.objects`) shown anew,
+    /// and those `area` has past the ones shown (put at the end of its
+    /// objects), the rest as they were: after an edit of those alone
+    /// ([`crate::AreaModel::read_objects`]), a look changed or objects
+    /// added. [`AreaScene::update`] shows every object and tile anew.
+    ///
+    /// For a game client, whose objects come, move, change and go every
+    /// frame (`crates/mg-area/examples/client_objects.rs` shows it):
+    ///
+    /// - **moved**: nothing to do here. The scene ([`AreaScene::scene`])
+    ///   draws each object where [`crate::AreaObject::model_transform`]
+    ///   puts it as it is made; [`crate::AreaObject::move_to`] moves one.
+    /// - **its look changed** (its `preview`): its place in `at`. A look
+    ///   seen before (by any object, or by this one within the last few
+    ///   updates) is shown again from what was loaded; a new one loads its
+    ///   models, each read once while anything shows it.
+    /// - **added**: pushed onto `area.objects` (with
+    ///   [`crate::AreaObject::from_values`]), then this, `at` empty or not.
+    /// - **taken out**: `area.objects.remove(i)`, then
+    ///   [`AreaScene::remove_object`]`(area, i)`. The scene pairs each
+    ///   object with what it shows by place: one taken out of `area` alone
+    ///   would have the objects after it drawn with their neighbors' looks
+    ///   until the next update of the objects, which, finding fewer
+    ///   objects than it shows, shows them all anew; and for good, were
+    ///   another pushed before it (as many objects again: nothing tells).
+    ///   So each one taken out is told here before any is added.
+    ///
+    /// Objects added are taken to be at the end: the area's model read
+    /// whole again (its objects in the GIT's order, by kind) is shown with
+    /// [`AreaScene::update`].
+    ///
+    /// None of these loads a model already loaded, or builds a tile again.
+    /// An object's `index` (its place among those of its kind) keys its
+    /// particles from one scene to the next: a client gives each object of
+    /// a kind its own, under 2^24.
+    pub fn update_objects(&mut self, gpu: &Gpu, game: &GameData, area: &AreaModel, at: &[usize]) {
+        let had = self.objects.len();
+        if area.objects.len() < had || self.object_missing.len() != had {
+            self.update(gpu, game, area);
+            return;
+        }
+        self.objects.resize(area.objects.len(), None);
+        self.object_missing.resize(area.objects.len(), None);
+        let models = self.models(game);
+        let load = |name: &str| models.load(name);
+        let fresh: Vec<usize> =
+            (at.iter().copied()).filter(|&i| i < had).chain(had..area.objects.len()).collect();
+        for &i in &fresh {
+            (self.objects[i], self.object_missing[i]) =
+                shown(gpu, &mut self.object_cache, &area.objects[i], &load);
+        }
+        self.load_object_chunks(gpu, &models, &fresh);
+        self.keep(models);
+        self.settle(area);
+    }
+
+    /// Takes out what is shown of object `i`, after it was taken out of
+    /// `area` (`area.objects.remove(i)`): the objects after it keep what
+    /// they show, one place on, and the models no object shows any more
+    /// are let go after a few updates. Nothing is loaded or read.
+    pub fn remove_object(&mut self, area: &AreaModel, i: usize) {
+        if i < self.objects.len() && i < self.object_missing.len() {
+            self.objects.remove(i);
+            self.object_missing.remove(i);
+        }
+        self.settle(area);
     }
 
     /// Grows `growing` (what grows on each surface material: the area's
@@ -487,6 +854,9 @@ impl AreaScene {
             self.grass_for = growing.to_vec();
             self.grass_cache.clear();
             self.chunk_grass.clear();
+            if let Some(worker) = &mut self.chunk_worker {
+                worker.reset();
+            }
         }
         let (grass, walkmeshes) = (&mut self.grass_cache, &mut self.walkmesh_cache);
         self.tile_grass = area
@@ -509,6 +879,18 @@ impl AreaScene {
                     .clone()
             })
             .collect();
+        self.grown_tiles = area
+            .tiles
+            .iter()
+            .zip(&self.tile_grass)
+            .enumerate()
+            .filter_map(|(i, (t, g))| {
+                let g = g.as_ref()?;
+                Some((i, t.position, t.transform().transform_point3(g.centre), g.radius))
+            })
+            .collect();
+        self.grass_gen = self.grass_gen.wrapping_add(1);
+        *self.grass_sight_cache.borrow_mut() = None;
     }
 
     /// What grows that the grass shown was made for.
@@ -516,15 +898,30 @@ impl AreaScene {
         &self.grass_for
     }
 
-    /// What `sight` sees of the grass of `area` ([`crate::grass_chosen`]).
+    /// What `sight` sees of the grass of `area` ([`crate::grass_chosen`]),
+    /// cached across frames while both the grown grass generation and
+    /// `sight` remain unchanged.
     fn grass_in_sight(&self, area: &AreaModel, sight: &Sight) -> Vec<GrassDraw> {
-        let grown: Vec<Grown> = (area.tiles.iter().zip(&self.tile_grass).enumerate())
-            .filter_map(|(i, (t, g))| {
-                let g = g.as_ref()?;
-                Some((i, t.position, t.transform().transform_point3(g.centre), g.radius))
-            })
-            .collect();
-        crate::grass_chosen(&grown, sight)
+        let mut cache = self.grass_sight_cache.borrow_mut();
+        if let Some((cached_gen, cached_sight, draws)) = cache.as_ref()
+            && *cached_gen == self.grass_gen
+            && *cached_sight == *sight
+        {
+            return draws.clone();
+        }
+        let draws = if area.tiles.len() == self.tile_grass.len() {
+            crate::grass_chosen(&self.grown_tiles, sight)
+        } else {
+            let grown: Vec<Grown> = (area.tiles.iter().zip(&self.tile_grass).enumerate())
+                .filter_map(|(i, (t, g))| {
+                    let g = g.as_ref()?;
+                    Some((i, t.position, t.transform().transform_point3(g.centre), g.radius))
+                })
+                .collect();
+            crate::grass_chosen(&grown, sight)
+        };
+        *cache = Some((self.grass_gen, *sight, draws.clone()));
+        draws
     }
 
     /// What the grass of chunk `tiles` (by index) is made of now: each
@@ -593,10 +990,9 @@ impl AreaScene {
         time: f32,
         opacity: f32,
     ) -> (Vec<Instance>, (Vec3, Vec3)) {
-        let models = Models { game, cache: RefCell::new(HashMap::new()) };
-        let load = |name: &str| models.load(name);
-        let mut missing = Vec::new();
-        let shown = shown(gpu, &mut self.object_cache, object, &load, &mut missing);
+        let models = self.models(game);
+        let (shown, _) = shown(gpu, &mut self.object_cache, object, &|name| models.load(name));
+        self.keep(models);
         if self.as_arrow(object, shown.as_ref()) {
             let arrow = self.arrow_instance(object.model_transform());
             let out = arrow.into_iter().map(|i| Instance { opacity, ..i }).collect();
@@ -625,7 +1021,20 @@ impl AreaScene {
         view: &View,
         opacity: f32,
     ) -> Vec<Instance> {
-        let models = Models { game, cache: RefCell::new(HashMap::new()) };
+        let models = self.models(game);
+        let out = self.preview_tiles_with(gpu, &models, tiles, view, opacity);
+        self.keep(models);
+        out
+    }
+
+    fn preview_tiles_with(
+        &mut self,
+        gpu: &Gpu,
+        models: &Models<'_>,
+        tiles: &[AreaTile],
+        view: &View,
+        opacity: f32,
+    ) -> Vec<Instance> {
         let load = |name: &str| models.load(name);
         let (mut out, mut lights) = (Vec::new(), Vec::new());
         let mut shared = Shared::default();
@@ -637,8 +1046,12 @@ impl AreaScene {
                 .or_insert_with(|| {
                     mg_render::guard::guarded(name, || {
                         let model = load(name)?;
-                        let anims = anim::animations(&model, &load);
-                        Some(Arc::new(Loaded::new(Arc::new(GpuModel::new(gpu, model)), anims)))
+                        let anims = anim::animations_scaled(&model, &load);
+                        Some(Arc::new(Loaded::new(
+                            name,
+                            Arc::new(GpuModel::new(gpu, model)),
+                            anims,
+                        )))
                     })
                     .flatten()
                 })
@@ -666,10 +1079,22 @@ impl AreaScene {
         }
     }
 
+    /// Object `i`'s models' box in its own space, as [`AreaScene::bounds`]
+    /// has it, where a model of its own is drawn: `None` for one drawn as
+    /// an arrow or a marker, a light too small to see, or a model not
+    /// loaded yet.
+    pub fn model_bounds(&self, area: &AreaModel, i: usize) -> Option<(Vec3, Vec3)> {
+        let shown = self.objects.get(i).and_then(Option::as_ref);
+        if self.as_arrow(area.objects.get(i)?, shown) {
+            return None;
+        }
+        shown.map(|s| s.bounds).filter(|b| !bare(*b))
+    }
+
     /// Whether object `i` is only a light: a placeable with a model too
     /// small to see whose appearance has a light (placeables.2da's
     /// `LightColor`), as the game's "Light, White" has, or whose model has
-    /// the light node of a light Moonglow made (`mg_module::lights`). Its
+    /// the light node of a light Moonglow made (`mg_rules::lights`). Its
     /// light, if so.
     pub fn bare_light(&self, area: &AreaModel, i: usize) -> Option<BareLight> {
         let shown = self.objects.get(i).and_then(Option::as_ref)?;
@@ -688,11 +1113,31 @@ impl AreaScene {
         }
         // (A builder's own small lamp model is drawn as it is: a light
         // Moonglow made is nothing else.)
-        if !mg_module::lights::is_generated(&o.preview.as_ref()?.base.model) {
+        if !mg_rules::lights::is_generated(&o.preview.as_ref()?.base.model) {
             return None;
         }
         let lamp = shown.composed.point_lights(glam::Mat4::IDENTITY).into_iter().next()?;
         Some(BareLight { color: lamp.color, on: true, reach: lamp.cutoff, stock: false })
+    }
+
+    /// Object `i`'s model as shown, the inverse of where it stands, and
+    /// `ray`'s origin and direction in the model's own space; `None` for an
+    /// object without a model to meet (see [`AreaScene::ray_hit`]).
+    fn ray_in_model(
+        &self,
+        area: &AreaModel,
+        i: usize,
+        ray: &crate::pick::Ray,
+    ) -> Option<(&Arc<Shown>, glam::Mat4, Vec3, Vec3)> {
+        let shown = self.objects.get(i).and_then(Option::as_ref)?;
+        let o = area.objects.get(i)?;
+        if self.as_arrow(o, Some(shown)) || !shown.composed.has_meshes() {
+            return None;
+        }
+        let inverse = o.model_transform().inverse();
+        let (origin, dir) =
+            (inverse.transform_point3(ray.origin), inverse.transform_vector3(ray.dir));
+        Some((shown, inverse, origin, dir))
     }
 
     /// How far along `ray` it meets object `i`'s model itself (its
@@ -706,24 +1151,40 @@ impl AreaScene {
         i: usize,
         ray: &crate::pick::Ray,
     ) -> Option<Option<f32>> {
-        let shown = self.objects.get(i).and_then(Option::as_ref)?;
-        let o = area.objects.get(i)?;
-        if self.as_arrow(o, Some(shown)) || !shown.composed.has_meshes() {
-            return None;
-        }
-        let inverse = o.model_transform().inverse();
-        let (origin, dir) =
-            (inverse.transform_point3(ray.origin), inverse.transform_vector3(ray.dir));
+        let (shown, _, origin, dir) = self.ray_in_model(area, i, ray)?;
         Some(shown.composed.ray_hit_in(&shown.stance, origin, dir))
+    }
+
+    /// Every place `ray` crosses object `i`'s model (its triangles, as it
+    /// stands), as [`AreaScene::ray_hit`] meets it: how far along, and the
+    /// triangle's unit normal there in the area's space (up is `+Z`).
+    /// `None`: the object has no model to cross.
+    pub fn ray_crossings(
+        &self,
+        area: &AreaModel,
+        i: usize,
+        ray: &crate::pick::Ray,
+    ) -> Option<Vec<(f32, Vec3)>> {
+        let (shown, inverse, origin, dir) = self.ray_in_model(area, i, ray)?;
+        let out_of = inverse.transpose();
+        let crossings = shown.composed.ray_crossings_in(&shown.stance, origin, dir);
+        Some(
+            crossings
+                .into_iter()
+                .map(|(t, n)| (t, out_of.transform_vector3(n).normalize_or_zero()))
+                .collect(),
+        )
     }
 
     /// The particles of the placed objects with emitters (a campfire's
     /// flames, a portal, sparks: placeables that are nothing else show
     /// nothing without them), moved on by `dt` seconds and drawn for a
     /// camera with the view matrix `camera`. `sims` keeps each object's
-    /// particles from frame to frame, by its place in the area's list and
-    /// its model; those of objects no longer shown are dropped. The
-    /// tiles' emitters follow.
+    /// particles from frame to frame, by its kind and place in its own
+    /// list ([`object_place`]) and its model; an object whose place moved
+    /// (one before it in its list deleted or placed) takes its particles
+    /// with it ([`carry_over`]), and those of objects no longer shown are
+    /// dropped. The tiles' emitters follow.
     pub fn particles(
         &self,
         area: &AreaModel,
@@ -732,56 +1193,130 @@ impl AreaScene {
         dt: f32,
         camera: Mat4,
     ) -> Vec<mg_render::particles::ParticleBatch> {
+        self.particles_and_chunks(area, view, sims, dt, camera).0
+    }
+
+    /// [`AreaScene::particles`], and the models their chunk emitters
+    /// throw (a placeable's rubble, `chunkName`), where they are, to draw
+    /// with the rest.
+    pub fn particles_and_chunks(
+        &self,
+        area: &AreaModel,
+        view: &View,
+        sims: &mut HashMap<(usize, usize), mg_render::particles::Particles>,
+        dt: f32,
+        camera: Mat4,
+    ) -> (Vec<mg_render::particles::ParticleBatch>, Vec<Instance>) {
         let mut out = Vec::new();
-        let mut seen = Vec::new();
+        let mut chunks = Vec::new();
+        let chunk = |c: mg_render::particles::Chunk| {
+            let gm = self.chunk_models.get(&c.model)?.clone()?;
+            Some(Instance::new(gm, c.transform))
+        };
+        let mut seen = std::collections::HashSet::new();
         // The objects with emitters, those nearest the view first: past
         // [`MAX_PARTICLE_OBJECTS`] the far ones go without.
         let eye = camera.inverse().w_axis.truncate();
         let emits = |n: &mg_mdl::Node| matches!(n.kind, mg_mdl::NodeKind::Emitter(_));
+        // (Whether one emits is found once, as it is loaded: an area full
+        // of creatures without emitters costs nothing more.)
         let emitting = (area.objects.iter().zip(&self.objects).enumerate())
             .filter(|(_, (o, shown))| {
-                view.shows(o.kind)
-                    && shown
-                        .as_ref()
-                        .is_some_and(|s| s.composed.base().model.nodes.iter().any(emits))
+                view.shows(o.kind) && shown.as_ref().is_some_and(|s| s.composed.emits())
             })
             .map(|(i, (o, _))| (i, o.position));
-        for i in nearest(emitting, eye, MAX_PARTICLE_OBJECTS) {
+        let chosen = nearest(emitting, eye, MAX_PARTICLE_OBJECTS);
+        // An object's simulations, one a model of it that emits (its base,
+        // a tail, a held torch), by its place and its shown models' and
+        // the model's number among them ([`source_key`]).
+        let wanted: std::collections::HashSet<(usize, usize)> = chosen
+            .iter()
+            .filter_map(|&i| {
+                let shown = self.objects[i].as_ref()?;
+                let place = object_place(&area.objects[i]);
+                Some(shown.composed.emitting_sources().map(move |s| source_key(place, shown, s)))
+            })
+            .flatten()
+            .collect();
+        for i in chosen {
             let (o, Some(shown)) = (&area.objects[i], &self.objects[i]) else { continue };
-            let key = (i, Arc::as_ptr(shown) as usize);
-            if self.failed.borrow().contains(&key.1) {
+            let object = Arc::as_ptr(shown) as usize;
+            if self.failed.borrow().contains(&object) {
                 continue;
             }
             let c = &shown.composed;
             let name = o.preview.as_ref().map_or("an object", |p| p.base.model.as_str());
             let transform = o.model_transform();
+            let place = object_place(o);
             let drawn = mg_render::guard::guarded(name, || {
-                let (model, playing, pose) = c.emitters(c.idle.as_deref(), view.time)?;
-                let new = !sims.contains_key(&key);
-                let sim =
-                    sims.entry(key).or_insert_with(|| mg_render::particles::Particles::new(model));
-                sim.ground = o.position.z;
-                if new {
-                    let mut ahead = 0.0;
-                    while ahead < PARTICLES_AHEAD {
-                        let step = PARTICLES_AHEAD_STEP;
-                        sim.update(model, playing, view.time, step, &pose, transform);
-                        ahead += step;
+                let (mut batches, mut thrown) = (Vec::new(), Vec::new());
+                let mut keys = Vec::new();
+                for e in c.emitting(c.idle.as_deref(), view.time) {
+                    let key = source_key(place, shown, e.source);
+                    carry_over(sims, key, &wanted);
+                    let (model, playing) = (e.model, e.animation);
+                    let t = e.held_at.unwrap_or(view.time);
+                    let (pose, at) = (&e.pose, transform * e.transform);
+                    let new = !sims.contains_key(&key);
+                    // (Each its own random numbers, by its number: emitters
+                    // of one model side by side are no copies of one
+                    // another.)
+                    let seed = key.0 as u64;
+                    let sim = sims.entry(key).or_insert_with(|| {
+                        mg_render::particles::Particles::new_seeded(model, seed)
+                    });
+                    sim.ground = o.position.z;
+                    if new {
+                        let mut ahead = 0.0;
+                        while ahead < PARTICLES_AHEAD {
+                            let step = PARTICLES_AHEAD_STEP;
+                            sim.update(model, playing, t, step, pose, at);
+                            ahead += step;
+                        }
                     }
+                    sim.update(model, playing, t, dt, pose, at);
+                    batches.extend(sim.batches(model, playing, t, pose, at, camera));
+                    thrown.extend(
+                        sim.chunks(model, playing, t, pose, at).into_iter().filter_map(chunk),
+                    );
+                    keys.push(key);
                 }
-                sim.update(model, playing, view.time, dt, &pose, transform);
-                Some(sim.batches(model, playing, view.time, &pose, transform, camera))
+                (batches, thrown, keys)
             });
             match drawn {
-                Some(Some(batches)) => {
-                    seen.push(key);
+                Some((batches, thrown, keys)) => {
+                    seen.extend(keys);
                     out.extend(batches);
+                    chunks.extend(thrown);
                 }
-                Some(None) => {}
                 None => {
-                    self.failed.borrow_mut().insert(key.1);
+                    self.failed.borrow_mut().insert(object);
                 }
             }
+        }
+        // Cache tile poses keyed by `(loaded ptr, anim_loops)` across both
+        // emitting tiles and source-light tiles for this frame.
+        let mut tile_poses: HashMap<(usize, [bool; 3]), Arc<Vec<Mat4>>> = HashMap::new();
+        fn tile_pose<'a>(
+            cache: &mut HashMap<(usize, [bool; 3]), Arc<Vec<Mat4>>>,
+            tile: &AreaTile,
+            loaded: &'a Arc<Loaded>,
+            view: &View,
+        ) -> (Vec<(&'a Animation, &'a anim::Binding)>, Arc<Vec<Mat4>>) {
+            let cache_key = (Arc::as_ptr(loaded) as usize, tile.anim_loops);
+            let model = &*loaded.gpu.model;
+            let layers = AreaScene::tile_layers(tile, loaded, view);
+            let pose = cache
+                .entry(cache_key)
+                .or_insert_with(|| {
+                    if layers.is_empty() {
+                        Arc::new(loaded.gpu.rest.clone())
+                    } else {
+                        Arc::new(anim::Playing::new(model, &layers, view.time).pose(model))
+                    }
+                })
+                .clone();
+            (layers, pose)
         }
         // The tiles' own: a fountain's water, a forge's sparks. They emit
         // as the animations playing on the tile have them (its animation
@@ -802,12 +1337,7 @@ impl AreaScene {
             let name = tile.model.as_deref().unwrap_or("a tile");
             let transform = tile.transform();
             let drawn = mg_render::guard::guarded(name, || {
-                let layers = self.tile_layers(tile, loaded, view);
-                let pose = if layers.is_empty() {
-                    loaded.gpu.rest.clone()
-                } else {
-                    anim::Playing::new(model, &layers, view.time).pose(model)
-                };
+                let (layers, pose) = tile_pose(&mut tile_poses, tile, loaded, view);
                 // One animation of the emitters' keys, the later layer's
                 // first (the one that has its say).
                 let keys = (!layers.is_empty()).then(|| Animation {
@@ -827,8 +1357,11 @@ impl AreaScene {
                     ..Animation::default()
                 });
                 let new = !sims.contains_key(&key);
-                let sim =
-                    sims.entry(key).or_insert_with(|| mg_render::particles::Particles::new(model));
+                // (Each its own random numbers, by its number: emitters of
+                // one model side by side are no copies of one another.)
+                let sim = sims.entry(key).or_insert_with(|| {
+                    mg_render::particles::Particles::new_seeded(model, key.0 as u64)
+                });
                 sim.ground = transform.w_axis.z;
                 // (Run ahead as an object's: a forge's fire was dark for
                 // its first seconds.)
@@ -841,12 +1374,14 @@ impl AreaScene {
                     }
                 }
                 sim.update(model, keys.as_ref(), view.time, dt, &pose, transform);
-                sim.batches(model, keys.as_ref(), view.time, &pose, transform, camera)
+                let thrown = sim.chunks(model, keys.as_ref(), view.time, &pose, transform);
+                (sim.batches(model, keys.as_ref(), view.time, &pose, transform, camera), thrown)
             });
             match drawn {
-                Some(batches) => {
-                    seen.push(key);
+                Some((batches, thrown)) => {
+                    seen.insert(key);
                     out.extend(batches);
+                    chunks.extend(thrown.into_iter().filter_map(chunk));
                 }
                 None => {
                     self.failed.borrow_mut().insert(key.1);
@@ -861,29 +1396,31 @@ impl AreaScene {
             let mut burning: Vec<(f32, usize, usize, u8, Mat4)> = Vec::new();
             for (i, (tile, loaded)) in area.tiles.iter().zip(&self.tiles).enumerate() {
                 let Some(loaded) = loaded else { continue };
-                if tile.source_lights.iter().all(|&v| v == 0) {
+                let any_lit = tile.source_lights.iter().enumerate().any(|(slot, &v)| {
+                    v > 0 && loaded.sources.get(slot).copied().flatten().is_some()
+                });
+                if !any_lit {
                     continue;
                 }
-                let layers = self.tile_layers(tile, loaded, view);
-                let posed;
-                let pose: &[Mat4] = if layers.is_empty() {
-                    &loaded.gpu.rest
-                } else {
-                    let model = &loaded.gpu.model;
-                    posed = anim::Playing::new(model, &layers, view.time).pose(model);
-                    &posed
-                };
+                let (_, pose) = tile_pose(&mut tile_poses, tile, loaded, view);
                 let transform = tile.transform();
                 for (slot, &value) in tile.source_lights.iter().enumerate() {
                     let node = loaded.sources.get(slot).copied().flatten();
                     let Some(node) = node.filter(|_| value > 0) else { continue };
-                    let at = transform * Mat4::from_translation(anim::node_position(pose, node));
+                    let at = transform * Mat4::from_translation(anim::node_position(&pose, node));
                     let d = at.w_axis.truncate().distance_squared(eye);
                     burning.push((d, i, slot, value, at));
                 }
             }
             burning.sort_by(|a, b| a.0.total_cmp(&b.0));
             burning.truncate(MAX_PARTICLE_OBJECTS);
+            enum FlamePose<'a> {
+                Missing,
+                Failed,
+                Ready(&'a Animation, Vec<Mat4>),
+            }
+            // Pose `fx_flame01` at most once per active intensity value.
+            let mut flame_poses: HashMap<u8, FlamePose<'_>> = HashMap::new();
             for (_, i, slot, value, at) in burning {
                 // (Told apart from the tiles' by counting down from the
                 // middle: two a tile.)
@@ -891,27 +1428,44 @@ impl AreaScene {
                 if self.failed.borrow().contains(&key.1) {
                     continue;
                 }
-                let Some(playing) = flame.animation(&value.to_string()) else { continue };
+                let entry = flame_poses.entry(value).or_insert_with(|| {
+                    let Some(playing) = flame.animation(&value.to_string()) else {
+                        return FlamePose::Missing;
+                    };
+                    match mg_render::guard::guarded("fx_flame01", || {
+                        anim::pose(model, playing, view.time)
+                    }) {
+                        Some(pose) => FlamePose::Ready(playing, pose),
+                        None => FlamePose::Failed,
+                    }
+                });
+                let (playing, pose) = match entry {
+                    FlamePose::Missing => continue,
+                    FlamePose::Failed => {
+                        self.failed.borrow_mut().insert(key.1);
+                        continue;
+                    }
+                    FlamePose::Ready(playing, pose) => (*playing, pose),
+                };
                 let drawn = mg_render::guard::guarded("fx_flame01", || {
-                    let pose = anim::pose(model, playing, view.time);
                     let new = !sims.contains_key(&key);
-                    let sim = sims
-                        .entry(key)
-                        .or_insert_with(|| mg_render::particles::Particles::new(model));
+                    let sim = sims.entry(key).or_insert_with(|| {
+                        mg_render::particles::Particles::new_seeded(model, key.0 as u64)
+                    });
                     sim.ground = at.w_axis.z - 2.0;
                     if new {
                         let mut ahead = 0.0;
                         while ahead < 2.0 {
-                            sim.update(model, Some(playing), view.time, 0.1, &pose, at);
+                            sim.update(model, Some(playing), view.time, 0.1, pose, at);
                             ahead += 0.1;
                         }
                     }
-                    sim.update(model, Some(playing), view.time, dt, &pose, at);
-                    sim.batches(model, Some(playing), view.time, &pose, at, camera)
+                    sim.update(model, Some(playing), view.time, dt, pose, at);
+                    sim.batches(model, Some(playing), view.time, pose, at, camera)
                 });
                 match drawn {
                     Some(batches) => {
-                        seen.push(key);
+                        seen.insert(key);
                         out.extend(batches);
                     }
                     None => {
@@ -921,14 +1475,13 @@ impl AreaScene {
             }
         }
         sims.retain(|k, _| seen.contains(k));
-        out
+        (out, chunks)
     }
 
     /// The animations playing on a tile, later ones over earlier: its
     /// default, day or night, and the animation loops switched on.
     /// Each with its binding to the tile's model, as it was loaded.
     fn tile_layers<'a>(
-        &self,
         tile: &AreaTile,
         loaded: &'a Loaded,
         view: &View,
@@ -957,11 +1510,12 @@ impl AreaScene {
     /// are not.
     pub fn failed_tiles(&self, area: &AreaModel, hidden: &[usize]) -> Vec<Vec3> {
         let failed = self.failed.borrow();
+        let hidden = hidden_tiles(area.tiles.len(), hidden);
         area.tiles
             .iter()
             .zip(&self.tiles)
             .enumerate()
-            .filter(|(i, _)| !hidden.contains(i))
+            .filter(|(i, _)| hidden.get(*i) != Some(&true))
             .filter(|(_, (tile, loaded))| match loaded {
                 Some(l) => failed.contains(&(Arc::as_ptr(l) as usize)),
                 None => tile.model.as_ref().is_some_and(|m| self.broken.contains(m)),
@@ -977,8 +1531,13 @@ impl AreaScene {
         // What fails while it is posed is drawn no more (once noted), so
         // that it doesn't fail again every frame.
         let failed = |key: usize| self.failed.borrow().contains(&key);
+        // (Each tile asked once whether it is hidden, of a list of flags:
+        // a preview over every tile was the list gone through for each
+        // tile, three times a frame.)
+        let hidden = hidden_tiles(area.tiles.len(), hidden);
+        let is_hidden = |i: usize| hidden.get(i) == Some(&true);
         for (i, (tile, loaded)) in area.tiles.iter().zip(&self.tiles).enumerate() {
-            let Some(loaded) = loaded.as_ref().filter(|_| !hidden.contains(&i)) else { continue };
+            let Some(loaded) = loaded.as_ref().filter(|_| !is_hidden(i)) else { continue };
             let key = Arc::as_ptr(loaded) as usize;
             if failed(key) {
                 continue;
@@ -1019,8 +1578,15 @@ impl AreaScene {
                 poses.push((nodes, local, pose.clone()));
                 pose
             };
+            // (A tile that failed is left out with its grass: its ground
+            // isn't drawn, and the tufts would stand over nothing.)
+            let tile_failed = |i: usize| match self.tiles.get(i) {
+                Some(Some(l)) => failed(Arc::as_ptr(l) as usize),
+                _ => area.tiles[i].model.as_ref().is_some_and(|m| self.broken.contains(m)),
+            };
+            let left_out = |i: usize| is_hidden(i) || tile_failed(i);
             let tile = |i: usize, level: usize| {
-                let grass = self.tile_grass[i].as_ref().filter(|_| !hidden.contains(&i))?;
+                let grass = self.tile_grass[i].as_ref().filter(|_| !left_out(i))?;
                 let model = grass.levels[level.min(grass.levels.len() - 1)].clone();
                 let transform = area.tiles[i].transform();
                 let pose = (sway != Vec3::ZERO).then(|| swayed(&model, transform));
@@ -1033,7 +1599,7 @@ impl AreaScene {
                     // else its tiles at the same level, the same tufts.)
                     GrassDraw::Chunk(key, tiles) => {
                         let whole = self.chunk_made(area, key, &tiles);
-                        match whole.filter(|_| !tiles.iter().any(|i| hidden.contains(i))) {
+                        match whole.filter(|_| !tiles.iter().any(|&i| left_out(i))) {
                             Some(c) => instances.push(Instance {
                                 grass: true,
                                 ..Instance::new(c.model.clone(), c.at)
@@ -1048,24 +1614,9 @@ impl AreaScene {
             }
         }
         let lit_shadows = view.light_shadows_of(&area.lighting).is_some();
-        for (o, shown) in area.objects.iter().zip(&self.objects) {
+        for (n, (o, shown)) in area.objects.iter().zip(&self.objects).enumerate() {
             if !view.shows(o.kind) {
                 continue;
-            }
-            // An encounter's spawn points: the game's marker at each,
-            // turned the way what spawns there faces.
-            if let (true, Some(marker)) = (self.spawn_markers, &self.spawn_point) {
-                for (p, facing) in o.spawn_points.iter().zip(&o.spawn_facings) {
-                    let turn = Mat4::from_rotation_z(facing - std::f32::consts::FRAC_PI_2);
-                    let at = Mat4::from_translation(*p) * turn;
-                    // (See-through: a prism as tall as a creature, which
-                    // would hide what stands behind it.)
-                    instances.push(Instance {
-                        unlit: true,
-                        opacity: SPAWN_POINT_OPACITY,
-                        ..Instance::new(marker.clone(), at)
-                    });
-                }
             }
             let transform = o.model_transform();
             if self.as_arrow(o, shown.as_ref()) {
@@ -1082,14 +1633,19 @@ impl AreaScene {
             if failed(key) {
                 continue;
             }
-            let name = o.preview.as_ref().map_or("an object", |p| p.base.model.as_str());
-            let posed = mg_render::guard::guarded(name, || {
-                let idle = c.idle.as_deref();
-                (c.instances(idle, time, transform), c.point_lights_at(idle, time, transform))
-            });
-            let Some((drawn, lit)) = posed else {
-                self.failed.borrow_mut().insert(key);
-                continue;
+            let idle = c.idle.as_deref();
+            let drawn = c.instances(idle, time, transform);
+            let lit = if view.lit {
+                let name = o.preview.as_ref().map_or("an object", |p| p.base.model.as_str());
+                let Some(lit) =
+                    mg_render::guard::guarded(name, || c.point_lights_at(idle, time, transform))
+                else {
+                    self.failed.borrow_mut().insert(key);
+                    continue;
+                };
+                lit
+            } else {
+                Vec::new()
             };
             // The sun's shadows: cast by static placeables with the tiles;
             // by what moves (creatures, dynamic placeables, doors) where
@@ -1108,6 +1664,8 @@ impl AreaScene {
                 unlit,
                 casts_shadows: casts && i.casts_shadows,
                 casts_light_shadows: from_lights && i.casts_shadows,
+                // (Its parts are one object: one shadow from a light.)
+                object: Some(n as u32),
                 receives_shadows: o.is_static,
                 ..i
             }));
@@ -1134,7 +1692,7 @@ impl AreaScene {
                 });
             }
         }
-        let fog = view.fog.then(|| fog(l, view.night));
+        let fog = view.fog.then(|| fog_from(l, view.night, view.camera));
         // What lies past everything drawn: the fog's color, as the client
         // clears to it (an area without a skybox shows it past its tile
         // border, whatever its fog amount: `notes_tile_border.md`), where
@@ -1166,7 +1724,7 @@ impl AreaScene {
             // (Water ripples whether or not the objects' animations play,
             // as the tiles' animations go on.)
             time: view.time,
-            environment: mg_render::Environment::from_are(l.flags, l.wind_power),
+            environment: environment(l),
             shadows: view.shadows_of(l),
             light_shadows: view.light_shadows_of(l),
         }
@@ -1174,9 +1732,9 @@ impl AreaScene {
 
     /// A tile's model as `view` shows it playing the tile's animations:
     /// what every tile of the model playing the same shares.
-    fn posed_tile(&self, tile: &AreaTile, loaded: &Loaded, view: &View) -> PosedTile {
+    fn posed_tile(tile: &AreaTile, loaded: &Loaded, view: &View) -> PosedTile {
         let model = &loaded.gpu.model;
-        let layers = self.tile_layers(tile, loaded, view);
+        let layers = Self::tile_layers(tile, loaded, view);
         // (The animations' keys gathered once, for the pose, the lights
         // and the meshes.)
         let playing = anim::Playing::new(model, &layers, view.time);
@@ -1188,7 +1746,8 @@ impl AreaScene {
         // Source lights: the flame at the tile's `sl1`/`sl2` node.
         let sources = loaded.sources;
         let mut state = (!layers.is_empty()).then(|| playing.mesh_state(&loaded.gpu));
-        // Fade Geometry: the fading meshes aren't drawn.
+        // Fade Geometry: the fading meshes aren't drawn, but cast their
+        // shadows (as the game's faded roofs still do).
         if view.fade {
             let fades = |m: &mg_render::model::GpuMesh| {
                 matches!(&model.nodes[m.node].kind,
@@ -1198,7 +1757,7 @@ impl AreaScene {
                 let s = state.get_or_insert_with(|| mg_render::scene::MeshState::new(&loaded.gpu));
                 for (o, m) in s.meshes.iter_mut().zip(&loaded.gpu.meshes) {
                     if fades(m) {
-                        o.alpha = Some(0.0);
+                        o.hidden = true;
                     }
                 }
             }
@@ -1220,7 +1779,7 @@ impl AreaScene {
         let posed = match shared.tiles.get(&key) {
             Some(posed) => posed.clone(),
             None => {
-                let posed = Arc::new(self.posed_tile(tile, loaded, view));
+                let posed = Arc::new(Self::posed_tile(tile, loaded, view));
                 shared.tiles.insert(key, posed.clone());
                 posed
             }
@@ -1330,36 +1889,44 @@ pub struct BareLight {
 /// loaded them (what could not be loaded named in `missing`).
 fn shown(
     gpu: &Gpu,
-    cache: &mut HashMap<String, Option<Arc<Shown>>>,
+    cache: &mut Looks<Shown>,
     o: &AreaObject,
     load: &dyn Fn(&str) -> Option<Arc<Model>>,
-    missing: &mut Vec<String>,
-) -> Option<Arc<Shown>> {
-    let p = o.preview.as_ref()?;
-    cache
-        .entry(format!("{p:?}"))
-        .or_insert_with(|| {
-            let c = Composed::new(gpu, p, load);
-            match &c {
-                Some(c) => missing.extend(c.missing.iter().cloned()),
-                None => missing.push(p.base.model.clone()),
-            }
-            c.map(|composed| {
-                // As it stands in the area: in its pause (a dragon at
-                // rest lies stretched out, wings spread).
-                let stance = composed.stance(composed.idle.as_deref(), 0.0);
-                let bounds = composed.bounds_of(&stance);
-                // (A model of nothing drawn is the size of what it holds
-                // undrawn, where that is something: the invisible
-                // object's box, as Aurora outlines it.)
-                let hidden =
-                    composed.hidden_bounds().filter(|_| !composed.has_meshes() || bare(bounds));
-                let bounds =
-                    hidden.filter(|h| h.0.is_finite() && h.1.is_finite()).unwrap_or(bounds);
-                Arc::new(Shown { composed, bounds, stance })
-            })
-        })
-        .clone()
+) -> (Option<Arc<Shown>>, Option<Arc<Vec<String>>>) {
+    let Some(p) = o.preview.as_ref() else { return (None, None) };
+    let (shown, missing) = cache.get(format!("{p:?}"), || {
+        let c = Composed::new(gpu, p, load);
+        let missing = match &c {
+            Some(c) => c.missing.clone(),
+            None => vec![p.base.model.clone()],
+        };
+        let shown = c.map(|composed| {
+            // As it stands in the area: in its pause (a dragon at
+            // rest lies stretched out, wings spread).
+            let stance = composed.stance(composed.idle.as_deref(), 0.0);
+            let bounds = composed.bounds_of(&stance);
+            // (A model of nothing drawn is the size of what it holds
+            // undrawn, where that is something: the invisible
+            // object's box, as Aurora outlines it.)
+            let hidden =
+                composed.hidden_bounds().filter(|_| !composed.has_meshes() || bare(bounds));
+            let bounds = hidden.filter(|h| h.0.is_finite() && h.1.is_finite()).unwrap_or(bounds);
+            Shown { composed, bounds, stance }
+        });
+        (shown, missing)
+    });
+    (shown, Some(missing))
+}
+
+/// What the game's shaders read of the area: its flags and wind, and
+/// the wallpaper's tint its script sets (strength 0 without one, as it
+/// sets for an area without its local).
+pub(crate) fn environment(l: &Lighting) -> mg_render::Environment {
+    let mut e = mg_render::Environment::from_are(l.flags, l.wind_power);
+    if let Some(c) = l.wallpaper {
+        e.scriptable[mg_rules::tint::WALLPAPER_UNIFORM] = mg_rules::tint::uniform(c);
+    }
+    e
 }
 
 /// lightcolor.2da's colours (RED, GREEN, BLUE) by row.
@@ -1383,9 +1950,6 @@ fn area_light(sky: crate::Sky, direction: Option<Vec3>, lit: bool) -> AreaLight 
     }
 }
 
-/// How opaque an encounter's spawn point markers are.
-const SPAWN_POINT_OPACITY: f32 = 0.35;
-
 /// The light of a view with the area's lighting off: bright and white
 /// from everywhere, with enough from the sun's side to show shapes.
 fn working_light() -> AreaLight {
@@ -1402,14 +1966,37 @@ fn sun_direction() -> Vec3 {
     Vec3::new(4000.0, 4500.0, 7000.0).normalize()
 }
 
-/// The area's fog, as the client sets it (its fog uniforms read back in
-/// `client_render.rs`): always on, ending at `FogClipDist` and starting
-/// `FogAmount` metres nearer than 30 m (so past 30 it starts behind the
-/// camera), at most 1 m before its end; its colour as stored (gamma space).
+/// How far the game's camera stands from the player as a player enters
+/// an area (its distance as the client keeps it, metres, in the terms of
+/// `SetCameraFacing`'s distance; the eye Moonglow draws that camera from
+/// is `mg_render::Camera::GAME_ENTRY`'s 19 m): the camera the fog's start
+/// is given for by [`fog`].
+pub const GAME_CAMERA: f32 = 20.0;
+
+/// The area's fog as the client sets it for its camera at [`GAME_CAMERA`]
+/// ([`fog_from`]).
 pub fn fog(l: &Lighting, night: bool) -> Fog {
+    fog_from(l, night, GAME_CAMERA)
+}
+
+/// The area's fog as the client sets it for its camera `camera` metres
+/// from the player (its fog uniforms read back in `client_render.rs`'s
+/// `fog_uniforms_match_the_client` and `night_fog::fog_start_follows_the_camera`):
+/// always on, by day and at night, ending at `FogClipDist` and starting
+/// `FogAmount` metres nearer than 30 m less the camera's distance short
+/// of 20 m (so a camera zoomed in to 5.5 m with an amount of 12 has it
+/// start 3.5 m off, and past 30 it starts behind the camera), at most
+/// 1 m before its end; its colour as stored (gamma space).
+///
+/// `camera` is the distance as the client keeps it: a script's
+/// `SetCameraFacing` distance (what the readings were taken against), not
+/// the eye distance fitted to draw that camera with
+/// `mg_render::Camera::game` (5.0 m for the script's 5.5, 11 for 12, 19
+/// for the entry camera's 20: no rule turns one into the other yet).
+pub fn fog_from(l: &Lighting, night: bool, camera: f32) -> Fog {
     let sky = l.sky(night);
     let end = l.fog_clip;
-    let start = (30.0 - f32::from(sky.fog_amount)).min(end - 1.0);
+    let start = (30.0 - f32::from(sky.fog_amount) + camera - GAME_CAMERA).min(end - 1.0);
     let c = sky.fog_color;
     let ch = |shift: u32| ((c >> shift) & 0xFF) as f32 / 255.0;
     Fog { start, end, color: Vec3::new(ch(0), ch(8), ch(16)) }
@@ -1453,6 +2040,123 @@ mod tests {
         assert!(bare((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN))), "no vertex");
     }
 
+    /// A look is kept while an object has it and a few updates after:
+    /// fifty colors passed over one placeable leave a handful, not fifty
+    /// (each was a set of GPU buffers, kept until the tab closed).
+    #[test]
+    fn looks_no_object_has_are_let_go() {
+        let mut looks: Looks<u32> = Looks::default();
+        // Two objects that keep their looks, and one that changes its own.
+        let fixed = [looks.get("chair".into(), || (Some(1), vec![])), {
+            looks.get("ghost".into(), || (None, vec!["c_ghost99".into()]))
+        }];
+        let mut made = 0;
+        let mut held = looks.get("tint 0".into(), || (Some(100), vec![]));
+        let mut gone = 0;
+        for color in 1..=50u32 {
+            let was = held.0.as_ref().map(|l| Arc::as_ptr(l) as usize);
+            held = looks.get(format!("tint {color}"), || {
+                made += 1;
+                (Some(100 + color), vec![])
+            });
+            let swept = looks.sweep();
+            assert!(!swept.contains(&was.unwrap()), "let go no sooner than a few updates on");
+            assert!(looks.kept.len() <= 3 + LOOKS_KEPT as usize, "{}", looks.kept.len());
+            gone += swept.len();
+        }
+        assert_eq!(made, 50);
+        assert_eq!(gone, 51 - LOOKS_KEPT as usize, "the rest let go, each once");
+        // What objects have stays, the one that draws nothing by its
+        // missing models; and the same look asked for again is the same.
+        assert!(looks.kept.contains_key("chair") && looks.kept.contains_key("ghost"));
+        let again = looks.get("tint 50".into(), || unreachable!("kept"));
+        assert!(Arc::ptr_eq(again.0.as_ref().unwrap(), held.0.as_ref().unwrap()));
+        // Once no object has them, they go too; one asked for meanwhile
+        // (the blueprint about to be placed, each frame) stays.
+        drop((fixed, held, again));
+        for _ in 0..=LOOKS_KEPT {
+            looks.get("chair".into(), || unreachable!("kept"));
+            looks.sweep();
+        }
+        assert_eq!(looks.kept.keys().collect::<Vec<_>>(), ["chair"]);
+    }
+
+    /// What is missing is what the area's tiles and objects name now and
+    /// could not be loaded: an object given another appearance, or
+    /// deleted, takes its missing model off the list (the status line
+    /// said "1 missing" until the tab was opened again).
+    #[test]
+    fn missing_models_are_those_named_now() {
+        let (a, b) = ("tst01_a01".to_string(), "tst01_b02".to_string());
+        let tiles = [(Some(&a), true), (Some(&b), false), (None, false), (Some(&b), false)];
+        let none: Arc<Vec<String>> = Arc::default();
+        let gone = Arc::new(vec!["plc_x99".to_string()]);
+        let parts = Arc::new(vec!["pmh0_head300".to_string(), "plc_x99".to_string()]);
+        let objects = [Some(none.clone()), None, Some(gone), Some(parts)];
+        assert_eq!(
+            missing_models(tiles.into_iter(), &objects),
+            ["plc_x99", "pmh0_head300", "tst01_b02"]
+        );
+        // The placeable gone and the creature's head found: the tile's alone.
+        let objects = [Some(none.clone()), None, Some(none)];
+        assert_eq!(missing_models(tiles.into_iter(), &objects), ["tst01_b02"]);
+        assert!(missing_models([(Some(&a), true)].into_iter(), &[]).is_empty());
+    }
+
+    /// The tiles a preview hides as flags by tile, the same tiles as the
+    /// list names (those past the area's last are none of its).
+    #[test]
+    fn hidden_tiles_are_flags_by_tile() {
+        assert!(hidden_tiles(1024, &[]).is_empty(), "nothing hidden: nothing made");
+        let mask = hidden_tiles(6, &[4, 1, 4, 9]);
+        assert_eq!(mask, [false, true, false, false, true, false]);
+        let every: Vec<usize> = (0..1024).collect();
+        assert!(hidden_tiles(1024, &every).iter().all(|h| *h));
+    }
+
+    /// Particles are kept by an object's kind and place in its own list:
+    /// a creature placed moves no placeable's, and a placeable deleted
+    /// before others leaves theirs going, each with its own model's.
+    #[test]
+    fn particles_stay_with_their_objects_when_places_move() {
+        use std::collections::HashSet;
+        let object = |kind: ObjectKind, index: usize| {
+            AreaObject::placed(kind, index, &mg_gff::Struct::new(0))
+        };
+        // (Kinds apart, whatever their places.)
+        let candle = object_place(&object(ObjectKind::Placeable, 3));
+        assert_ne!(candle, object_place(&object(ObjectKind::Creature, 3)));
+        assert_eq!(candle, object_place(&object(ObjectKind::Placeable, 3)));
+        assert!(object_place(&object(ObjectKind::Store, usize::MAX)) < usize::MAX / 4);
+        // A hundred placeables with emitters, each of its own model (its
+        // address); the particles of each are its number.
+        let place = |i: usize| object_place(&object(ObjectKind::Placeable, i));
+        let mut sims: HashMap<(usize, usize), usize> =
+            (0..100).map(|i| ((place(i), 1000 + i), i)).collect();
+        // Placeable 3 is deleted: those after it are one place up.
+        let now: Vec<((usize, usize), usize)> = (0..100)
+            .filter(|i| *i != 3)
+            .map(|i| ((place(if i > 3 { i - 1 } else { i }), 1000 + i), i))
+            .collect();
+        let wanted: HashSet<(usize, usize)> = now.iter().map(|(k, _)| *k).collect();
+        for (key, _) in &now {
+            carry_over(&mut sims, *key, &wanted);
+        }
+        for (key, was) in &now {
+            assert_eq!(sims.get(key), Some(was), "its own particles, not begun again");
+        }
+        // A creature of the same model at a placeable's old place takes
+        // none of theirs.
+        let creature = (object_place(&object(ObjectKind::Creature, 98)), 1099);
+        carry_over(&mut sims, creature, &wanted);
+        assert!(!sims.contains_key(&creature));
+        // Of several of one model (candles), the one left over is taken.
+        let mut same: HashMap<(usize, usize), usize> = (0..5).map(|i| ((place(i), 7), i)).collect();
+        let wanted: HashSet<(usize, usize)> = (0..4).map(|i| (place(i), 7)).collect();
+        carry_over(&mut same, (place(2), 7), &wanted);
+        assert_eq!(same.len(), 5, "what is where it was stays");
+    }
+
     /// The emitters given particles are the nearest the camera, objects'
     /// and tiles' alike: a large area's tiles with emitters were the
     /// first 128 listed, the south-west's, wherever the camera was.
@@ -1487,12 +2191,86 @@ mod tests {
             creature_shadows: false,
             light_shadows: false,
             border: false,
+            camera: GAME_CAMERA,
         };
         assert_eq!(object_time(ObjectKind::Placeable, true, &view), 0.0);
         assert_eq!(object_time(ObjectKind::Placeable, false, &view), 7.5);
         assert_eq!(object_time(ObjectKind::Creature, false, &view), 7.5);
         let still = View { animate: false, ..view };
         assert_eq!(object_time(ObjectKind::Creature, false, &still), 0.0);
+    }
+
+    /// The fog's start follows the game's camera: the client's fog
+    /// uniforms read back (`client_render.rs`'s `night_fog` readings,
+    /// 2026-11-19, game 89.8193.37) for its camera that far from the
+    /// player, by day and at night alike: (fog amount, clip, camera) and
+    /// the client's start and end.
+    #[test]
+    fn the_fog_starts_nearer_for_a_nearer_camera() {
+        let client = [
+            // The Shard of The Domains of Dread at night, its camera
+            // (SetCameraFacing(90, 5.5, 84)), and nearer and farther.
+            (12, 22.0, 5.5, 3.5, 22.0),
+            (12, 22.0, 8.0, 6.0, 22.0),
+            (12, 22.0, 12.0, 10.0, 22.0),
+            (12, 22.0, 20.0, 18.0, 22.0),
+            (12, 45.0, 8.0, 6.0, 45.0),
+            // Past the clip, at most a metre before it.
+            (12, 22.0, 25.0, 21.0, 22.0),
+            (0, 45.0, 5.5, 15.5, 45.0),
+            (0, 45.0, 12.0, 22.0, 45.0),
+            (0, 45.0, 20.0, 30.0, 45.0),
+            // Past the entry camera's 20 m it goes on moving back.
+            (0, 45.0, 25.0, 35.0, 45.0),
+            (0, 60.0, 25.0, 35.0, 60.0),
+            (12, 45.0, 16.0, 14.0, 45.0),
+            (30, 45.0, 8.0, -12.0, 45.0),
+            // The camera as a player enters (fog_uniforms_match_the_client).
+            (10, 45.0, GAME_CAMERA, 20.0, 45.0),
+            (0, 25.0, GAME_CAMERA, 24.0, 25.0),
+        ];
+        for (amount, clip, camera, start, end) in client {
+            for night in [false, true] {
+                let sky =
+                    crate::Sky { fog_amount: amount, fog_color: 0x0040_3020, ..Default::default() };
+                let l = Lighting {
+                    sun: sky,
+                    moon: sky,
+                    is_night: night,
+                    day_night_cycle: false,
+                    fog_clip: clip,
+                    sky_box: 0,
+                    env_map: None,
+                    shadow_opacity: 0,
+                    flags: 1,
+                    wind_power: 0,
+                    sun_direction: None,
+                    moon_direction: None,
+                    wallpaper: None,
+                };
+                let f = fog_from(&l, night, camera);
+                let what = format!("amount {amount}, clip {clip}, camera {camera}");
+                assert!((f.start - start).abs() < 0.01 && f.end == end, "{what}: {f:?}");
+                assert_eq!(f.color, Vec3::new(0x20 as f32, 0x30 as f32, 0x40 as f32) / 255.0);
+            }
+        }
+        // `fog` is the fog for the camera as a player enters.
+        let l = Lighting {
+            sun: crate::Sky { fog_amount: 12, ..Default::default() },
+            moon: crate::Sky { fog_amount: 12, ..Default::default() },
+            is_night: true,
+            day_night_cycle: false,
+            fog_clip: 22.0,
+            sky_box: 0,
+            env_map: None,
+            shadow_opacity: 0,
+            flags: 1,
+            wind_power: 0,
+            sun_direction: None,
+            moon_direction: None,
+            wallpaper: None,
+        };
+        assert_eq!(fog(&l, true), fog_from(&l, true, GAME_CAMERA));
     }
 
     #[test]
@@ -1528,6 +2306,7 @@ mod tests {
             wind_power: 0,
             sun_direction: None,
             moon_direction: None,
+            wallpaper: None,
         };
         let day = View {
             time: 0.0,
@@ -1542,6 +2321,7 @@ mod tests {
             creature_shadows: true,
             light_shadows: false,
             border: false,
+            camera: GAME_CAMERA,
         };
         let s = day.shadows_of(&l).unwrap();
         assert_eq!((s.opacity, s.fade_limit), (0.3, 60.0));
@@ -1568,5 +2348,121 @@ mod tests {
         assert_eq!((s.opacity, s.fade_limit), (0.3, 60.0));
         assert!(lamps.light_shadows_of(&moonlit).is_some());
         assert_eq!(View { lit: false, ..lamps }.light_shadows_of(&moonlit), None);
+    }
+
+    /// Light Shadows are cast only where Creature Shadows are on, as the
+    /// client's Creature Shadow Detail Off takes the lights' shadows away
+    /// too (the review's R4, the owner's decision): with Creature Shadows
+    /// off, no scene asks for them and no creature casts one, Light
+    /// Shadows left as they were.
+    #[test]
+    fn light_shadows_are_on_only_where_creature_shadows_are() {
+        for (creature, light, cast) in
+            [(true, true, true), (true, false, false), (false, true, false), (false, false, false)]
+        {
+            assert_eq!(View::light_shadows_cast(creature, light), cast, "{creature} {light}");
+        }
+        let l = Lighting {
+            sun: crate::Sky::default(),
+            moon: crate::Sky::default(),
+            is_night: true,
+            day_night_cycle: false,
+            fog_clip: 60.0,
+            sky_box: 0,
+            env_map: None,
+            shadow_opacity: 50,
+            flags: 0,
+            wind_power: 0,
+            sun_direction: None,
+            moon_direction: None,
+            wallpaper: None,
+        };
+        let both = View {
+            time: 0.0,
+            night: true,
+            fog: false,
+            lit: true,
+            show: [true; 9],
+            animate: false,
+            fade: false,
+            grass: None,
+            shadows: true,
+            creature_shadows: true,
+            light_shadows: true,
+            border: false,
+            camera: GAME_CAMERA,
+        };
+        assert!(both.light_shadows_of(&l).is_some());
+        let lights_alone = View { creature_shadows: false, ..both };
+        assert_eq!(lights_alone.light_shadows_of(&l), None);
+        assert!(lights_alone.light_shadows, "kept as the builder left it");
+    }
+
+    #[test]
+    fn settle_evicts_removed_tile_walkmesh_grass_and_chunk_caches() {
+        let mut scene = AreaScene::default();
+        scene.tile_cache.insert("keep_tile".into(), None);
+        scene.tile_cache.insert("keep_border".into(), None);
+        scene.tile_cache.insert("old_tile".into(), None);
+        scene.broken.insert("old_tile".into());
+        scene.broken.insert("keep_tile".into());
+        scene.walkmesh_cache.insert("keep_tile".into(), None);
+        scene.walkmesh_cache.insert("old_tile".into(), None);
+        scene.grass_cache.insert(("keep_tile".into(), 0), None);
+        scene.grass_cache.insert(("old_tile".into(), 0), None);
+        scene.chunk_models.insert("old_chunk".into(), None);
+
+        let tile = |model: &str| AreaTile {
+            index: 0,
+            column: 0,
+            row: 0,
+            id: 0,
+            model: Some(model.into()),
+            height: 0,
+            orientation: 0,
+            main_lights: [0; 2],
+            source_lights: [0; 2],
+            anim_loops: [false; 3],
+            replace_texture: None,
+            position: Vec3::ZERO,
+        };
+        let area = AreaModel {
+            tileset: None,
+            width: 1,
+            height: 1,
+            height_step: 5.0,
+            tiles: vec![tile("keep_tile")],
+            objects: Vec::new(),
+            hooks: Vec::new(),
+            lighting: crate::Lighting {
+                sun: crate::Sky::default(),
+                moon: crate::Sky::default(),
+                is_night: false,
+                day_night_cycle: false,
+                fog_clip: 45.0,
+                sky_box: 0,
+                env_map: None,
+                shadow_opacity: 0,
+                flags: 0,
+                wind_power: 0,
+                sun_direction: None,
+                moon_direction: None,
+                wallpaper: None,
+            },
+            grass: Vec::new(),
+            border: vec![crate::border::BorderTile {
+                model: "keep_border".into(),
+                transform: Mat4::IDENTITY,
+            }],
+            problems: Vec::new(),
+        };
+        scene.settle(&area);
+        assert!(scene.tile_cache.contains_key("keep_tile"));
+        assert!(scene.tile_cache.contains_key("keep_border"));
+        assert!(!scene.tile_cache.contains_key("old_tile"));
+        assert!(!scene.broken.contains("old_tile") && scene.broken.contains("keep_tile"));
+        assert!(!scene.walkmesh_cache.contains_key("old_tile"));
+        assert!(!scene.grass_cache.contains_key(&("old_tile".into(), 0)));
+        assert!(!scene.chunk_models.contains_key("old_chunk"));
     }
 }

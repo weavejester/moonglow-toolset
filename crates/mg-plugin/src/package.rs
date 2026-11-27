@@ -29,6 +29,13 @@ const MAX_ENTRIES: usize = 4000;
 /// The biggest archive read, in bytes.
 pub const MAX_ARCHIVE: u64 = 64 << 20;
 
+/// The most plugins one archive may hold.
+pub const MAX_PLUGINS: usize = 50;
+
+/// The most an archive of several plugins may unpack to, all of them
+/// together, in bytes.
+pub const MAX_ALL: u64 = 64 << 20;
+
 /// In a folder an archive was installed to, the file that says so: only a
 /// folder with it is replaced by installing again.
 pub const MARKER: &str = ".moonglow-installed";
@@ -123,11 +130,36 @@ impl Package {
         Package::read(&std::fs::read(path).map_err(io)?)
     }
 
+    /// Reads the archive in the file at `path` ([`Package::read_all`]):
+    /// each plugin it holds.
+    pub fn open_all(path: &std::path::Path) -> Result<Vec<Package>, PluginError> {
+        let io = |e: std::io::Error| PluginError::Package(e.to_string());
+        if std::fs::metadata(path).map_err(io)?.len() > MAX_ARCHIVE {
+            return fault(format!("it is over {} MB", MAX_ARCHIVE >> 20));
+        }
+        Package::read_all(&std::fs::read(path).map_err(io)?)
+    }
+
     /// Reads a plugin's archive: a zip with `plugin.cfg` at its top, or
     /// in the one folder at its top that has one (as zipping a folder, or
     /// a repository's download, makes it). What is outside the plugin's
-    /// folder is ignored.
+    /// folder is ignored. An archive of several plugins is refused:
+    /// [`Package::read_all`] reads those.
     pub fn read(bytes: &[u8]) -> Result<Package, PluginError> {
+        let mut all = Package::read_all(bytes)?;
+        if all.len() > 1 {
+            let ids: Vec<&str> = all.iter().map(|p| p.manifest.id.as_str()).collect();
+            return fault(format!("it holds several plugins ({})", ids.join(", ")));
+        }
+        Ok(all.remove(0))
+    }
+
+    /// Reads an archive of one plugin or of several: `plugin.cfg` at its
+    /// top (one plugin, the whole archive), or in folders at its top (each
+    /// such folder a plugin), or, where its top is one folder alone (a
+    /// repository's download), in folders of that one. Each plugin is held
+    /// to the limits of one archive, and two of one id are refused.
+    pub fn read_all(bytes: &[u8]) -> Result<Vec<Package>, PluginError> {
         if bytes.len() as u64 > MAX_ARCHIVE {
             return fault(format!("it is over {} MB", MAX_ARCHIVE >> 20));
         }
@@ -159,33 +191,61 @@ impl Package {
             }
         }
 
-        // The plugin's folder in it: the top, or the one folder with a
-        // manifest.
+        // The plugins' folders in it: the top, or the folders at its top
+        // with a manifest, or those of the one folder at its top.
         let is_manifest = |p: &[String]| p.last().is_some_and(|n| n == "plugin.cfg");
-        let root: Vec<String> = if entries.iter().any(|(_, p)| p.len() == 1 && is_manifest(p)) {
-            Vec::new()
-        } else {
-            let folders: BTreeSet<&str> = entries
-                .iter()
-                .filter(|(_, p)| p.len() == 2 && is_manifest(p))
-                .map(|(_, p)| p[0].as_str())
-                .collect();
-            match folders.len() {
-                0 => return fault("it has no plugin.cfg at its top, or in a folder at its top"),
-                1 => vec![folders.into_iter().next().unwrap_or_default().to_string()],
-                _ => {
-                    return fault(format!(
-                        "it holds several plugins ({}): install each from an archive of its own",
-                        folders.into_iter().collect::<Vec<_>>().join(", ")
-                    ));
-                }
-            }
+        let at_depth = |depth: usize| -> BTreeSet<Vec<String>> {
+            (entries.iter())
+                .filter(|(_, p)| p.len() == depth && is_manifest(p))
+                .map(|(_, p)| p[..depth - 1].to_vec())
+                .collect()
         };
-        let inside: Vec<(usize, String)> = entries
-            .into_iter()
-            .filter(|(_, p)| p.len() > root.len() && p[..root.len()] == root[..])
-            .map(|(i, p)| (i, p[root.len()..].join("/")))
-            .collect();
+        let tops: BTreeSet<&str> = entries.iter().map(|(_, p)| p[0].as_str()).collect();
+        let roots: Vec<Vec<String>> = if !at_depth(1).is_empty() {
+            vec![Vec::new()]
+        } else if !at_depth(2).is_empty() {
+            at_depth(2).into_iter().collect()
+        } else if tops.len() == 1 && !at_depth(3).is_empty() {
+            at_depth(3).into_iter().collect()
+        } else {
+            return fault("it has no plugin.cfg at its top, or in a folder at its top");
+        };
+        if roots.len() > MAX_PLUGINS {
+            return fault(format!("it holds over {MAX_PLUGINS} plugins"));
+        }
+        let mut out: Vec<Package> = Vec::new();
+        let mut all_left = MAX_ALL;
+        for root in &roots {
+            let inside: Vec<(usize, String)> = (entries.iter())
+                .filter(|(_, p)| p.len() > root.len() && p[..root.len()] == root[..])
+                .map(|(i, p)| (*i, p[root.len()..].join("/")))
+                .collect();
+            let package =
+                Package::unpack(&mut zip, inside, &mut all_left).map_err(|e| match e {
+                    // (Which of them, where there are several.)
+                    PluginError::Package(m) if roots.len() > 1 => {
+                        PluginError::Package(format!("{}: {m}", root.join("/")))
+                    }
+                    e => e,
+                })?;
+            if let Some(twin) = out.iter().find(|p| p.manifest.id == package.manifest.id) {
+                return fault(format!(
+                    "it holds the plugin {} twice ({} and {})",
+                    package.manifest.id, twin.manifest.version, package.manifest.version
+                ));
+            }
+            out.push(package);
+        }
+        Ok(out)
+    }
+
+    /// One plugin's files of the archive (each entry's index, and its
+    /// path in the plugin's folder) read and its manifest checked.
+    fn unpack(
+        zip: &mut ZipArchive<Cursor<&[u8]>>,
+        inside: Vec<(usize, String)>,
+        all_left: &mut u64,
+    ) -> Result<Package, PluginError> {
         if inside.len() > MAX_FILES {
             return fault(format!("it has over {MAX_FILES} files"));
         }
@@ -209,7 +269,8 @@ impl Package {
 
         // Its data, to the limit: by what is read, not by what it says.
         let mut files = Vec::new();
-        let mut left = MAX_BYTES;
+        let mut left = MAX_BYTES.min(*all_left);
+        let limit = if left < MAX_BYTES { MAX_ALL } else { MAX_BYTES };
         for (i, path) in inside {
             let entry = match zip.by_index(i) {
                 Ok(entry) => entry,
@@ -220,9 +281,10 @@ impl Package {
                 return fault(format!("{path:?} does not unpack: {e}"));
             }
             if data.len() as u64 > left {
-                return fault(format!("it unpacks to over {} MB", MAX_BYTES >> 20));
+                return fault(format!("it unpacks to over {} MB", limit >> 20));
             }
             left -= data.len() as u64;
+            *all_left -= data.len() as u64;
             files.push((path, data));
         }
         files.sort();
@@ -406,8 +468,28 @@ pub fn pack(plugin: &Plugin) -> Result<Vec<u8>, PluginError> {
 /// author's: `mg plugin test` runs them from the folder); within the
 /// limits of an archive.
 pub(crate) fn files_of(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, PluginError> {
+    files_read(dir, &mut |path, most| {
+        // (No more than it had when it was measured.)
+        let mut data = Vec::new();
+        std::fs::File::open(path)?.take(most).read_to_end(&mut data)?;
+        Ok(data)
+    })
+}
+
+/// [`files_of`], its files read by `read` (a file, and the most bytes to
+/// read of it). Nothing is read before the folder is known to be within
+/// the limits by its files' number and sizes: a project's `plugins/`
+/// folder comes with its checkout, and is read before anybody allowed it.
+fn files_read(
+    dir: &Path,
+    read: &mut dyn FnMut(&Path, u64) -> std::io::Result<Vec<u8>>,
+) -> Result<Vec<(String, Vec<u8>)>, PluginError> {
     fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
+            // (Past the limit, the rest is not gone through.)
+            if out.len() > MAX_FILES {
+                return Ok(());
+            }
             let entry = entry?;
             let (path, kind) = (entry.path(), entry.file_type()?);
             if entry.file_name().to_string_lossy().starts_with('.') || kind.is_symlink() {
@@ -436,16 +518,89 @@ pub(crate) fn files_of(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, PluginError
     if files.len() > MAX_FILES {
         return fault(format!("the plugin has over {MAX_FILES} files"));
     }
+    let over = || fault(format!("the plugin is over {} MB", MAX_BYTES >> 20));
+    let mut sizes: u64 = 0;
+    for (name, path) in &files {
+        parts(name).map_err(PluginError::Package)?;
+        let size = std::fs::metadata(path).map_err(|e| io(path, e))?.len();
+        sizes = sizes.saturating_add(size);
+        if sizes > MAX_BYTES {
+            return over();
+        }
+    }
     let mut out = Vec::new();
     let mut total = 0;
     for (name, path) in files {
-        parts(&name).map_err(PluginError::Package)?;
-        let data = std::fs::read(&path).map_err(|e| io(&path, e))?;
+        // (One byte more than is left tells a file that grew since.)
+        let data = read(&path, MAX_BYTES - total + 1).map_err(|e| io(&path, e))?;
         total += data.len() as u64;
         if total > MAX_BYTES {
-            return fault(format!("the plugin is over {} MB", MAX_BYTES >> 20));
+            return over();
         }
         out.push((name, data));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plugin's folder past the limits is refused by its files' sizes
+    /// and number, with none of them read: a file of gigabytes left in a
+    /// project's `plugins/` was read whole to say the plugin is over 16
+    /// MB, at every command on the project.
+    #[test]
+    fn a_folder_past_the_limits_is_refused_before_it_is_read() {
+        let dir = mg_testkit::scratch_dir("mg-plugin-package-limits");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("main.luau"), "-- code").unwrap();
+        std::fs::write(dir.join("data/small.txt"), "small").unwrap();
+        let mut reads = 0;
+        let mut read = |path: &Path, most: u64| {
+            reads += 1;
+            let mut data = Vec::new();
+            std::fs::File::open(path)?.take(most).read_to_end(&mut data)?;
+            Ok(data)
+        };
+        let files = files_read(&dir, &mut read).unwrap();
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["data/small.txt", "main.luau"]);
+        assert_eq!(files[0].1, b"small");
+        // A file of 16 MB and a byte, of which nothing is on the disk.
+        let big = std::fs::File::create(dir.join("data/export.bin")).unwrap();
+        big.set_len(MAX_BYTES + 1).unwrap();
+        drop(big);
+        let mut reads = 0;
+        let e = files_read(&dir, &mut |_, _| {
+            reads += 1;
+            Ok(Vec::new())
+        });
+        assert_eq!(e.unwrap_err().to_string(), files_of(&dir).unwrap_err().to_string());
+        assert!(files_of(&dir).unwrap_err().to_string().contains("the plugin is over 16 MB"));
+        assert_eq!(reads, 0, "nothing was read");
+        // A file that grew after it was measured is not read past the
+        // limit.
+        std::fs::remove_file(dir.join("data/export.bin")).unwrap();
+        let mut asked = Vec::new();
+        let e = files_read(&dir, &mut |_, most| {
+            asked.push(most);
+            Ok(vec![0; most as usize])
+        });
+        assert!(e.unwrap_err().to_string().contains("the plugin is over 16 MB"));
+        assert_eq!(asked, [MAX_BYTES + 1]);
+        // More files than a plugin has: told, and not gone through.
+        for n in 0..=MAX_FILES {
+            std::fs::write(dir.join(format!("data/{n}.txt")), "x").unwrap();
+        }
+        let mut reads = 0;
+        let e = files_read(&dir, &mut |_, _| {
+            reads += 1;
+            Ok(Vec::new())
+        });
+        assert!(e.unwrap_err().to_string().contains("the plugin has over 500 files"));
+        assert_eq!(reads, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

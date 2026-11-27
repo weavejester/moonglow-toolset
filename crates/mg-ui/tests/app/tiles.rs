@@ -64,7 +64,12 @@ fn undo_over_a_tileset_editor_is_the_tileset_s() {
         "A table",
         vec![mg_edit::Edit::SetResource { key, data: Some(SMALL_TABLE.to_vec()) }],
     )));
-    let mut h = harness(app, 1300.0, 900.0);
+    // (Wide enough for the tileset's window, with its Preview and
+    // Outliner beside its page since M4's U20, to stand clear of the
+    // module tree hovered below.)
+    let mut h = harness(app, 1800.0, 900.0);
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
     h.run();
     mg_ui::tileset_view::new_tileset(h.state_mut());
     h.run();
@@ -95,7 +100,7 @@ fn undo_over_a_tileset_editor_is_the_tileset_s() {
     assert_eq!(terrains(&h), 1, "redone");
     // From the Edit menu: plain Undo, the tileset's.
     over(&mut h);
-    h.get_by_label("Edit").click();
+    menu(&h, "Edit").click();
     h.run();
     // (The menu's entry is the one with its key: the editor's own button
     // and the toolbar's say "Undo" with no more, or after a glyph.)
@@ -157,7 +162,7 @@ fn tileset_made_edited_saved_with_its_palette() {
     };
     let mut app = game_app_with(&root, None, dialogs);
     app.open_module(&sample_module(&dir));
-    app.open_palette = false;
+    app.palette_dock = false;
     let mut h = harness(app, 1300.0, 900.0);
     h.run();
     mg_ui::tileset_view::new_tileset(h.state_mut());
@@ -185,33 +190,33 @@ fn tileset_made_edited_saved_with_its_palette() {
     h.run();
     h.get_by_label("Add Tile").click();
     h.run();
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run();
     h.get_by_label("Add Group").click();
     h.run();
-    h.get_by_label("Undo").click();
+    tool(&h, "Undo").click();
     h.run();
     assert!(h.state().tilesets[0].tileset().unwrap().groups.is_empty());
-    h.get_by_label("Redo").click();
+    tool(&h, "Redo").click();
     h.run();
     let t = h.state().tilesets[0].tileset().unwrap().clone();
     assert_eq!((t.tiles.len(), t.groups.len()), (1, 1));
     assert_eq!(t.tiles[0].corners[0].0, "Grass");
 
     // Saved, its palette made, checked.
-    h.get_by_label("Save").click();
+    tileset_tool(&mut h, "Save").click();
     h.run();
     let saved =
         mg_set::Tileset::parse(&std::fs::read(&set_path).unwrap(), mg_core::Codepage::default())
             .unwrap();
     assert_eq!(saved.groups.len(), 1);
-    h.get_by_label("Make Palette").click();
+    tileset_tool(&mut h, "Make Palette").click();
     h.run();
     let pal = mg_gff::Gff::read(&std::fs::read(dir.join("zzz01palstd.itp")).unwrap()).unwrap();
     assert_eq!(pal.file_type, *b"ITP ");
-    h.get_by_label("Check").click();
+    tileset_tool(&mut h, "Check").click();
     h.run();
-    let findings = h.state().tilesets[0].findings.clone().unwrap();
+    let findings = tileset_problems(&h, &set_path);
     assert!(
         findings.iter().any(|f| f.message.contains("zzz01_a01_01")),
         "the tile's model is missing: {findings:?}"
@@ -249,12 +254,12 @@ fn a_tileset_s_terrain_and_crosser_are_renamed_where_its_tiles_name_them() {
     let mut app = game_app_with(&root, None, dialogs);
     app.set_render_state(rs.clone());
     app.open_module(&sample_module(&dir));
-    app.open_palette = false;
+    app.palette_dock = false;
     let mut h = gpu_harness(app, rs, 1300.0, 900.0);
     h.run_steps(3);
     mg_ui::tileset_view::open(h.state_mut());
     h.run_steps(3);
-    h.get_by_label("Make Palette").click();
+    tileset_tool(&mut h, "Make Palette").click();
     h.run_steps(3);
     let palette = |h: &Harness<'_, Moonglow>| -> Vec<String> {
         let path = h.state().tilesets[0].palette_path();
@@ -281,8 +286,10 @@ fn a_tileset_s_terrain_and_crosser_are_renamed_where_its_tiles_name_them() {
     assert!(named > 100, "{named}");
     h.get_by_label("Terrains and Crossers").click();
     h.run_steps(3);
-    let shots = mg_testkit::scratch_dir("ui-tileset-rename-shots");
-    h.render().unwrap().save(shots.join("before.png")).unwrap();
+    let shots = shot_dir("ui-tileset-rename-shots");
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("before.png")).unwrap();
+    }
     // Rename…: the field; a name taken, then one with a space, refused.
     h.get_all_by_label("Rename…").nth(grass).expect("its row's button").click();
     h.run_steps(3);
@@ -296,17 +303,21 @@ fn a_tileset_s_terrain_and_crosser_are_renamed_where_its_tiles_name_them() {
     }
     h.state_mut().tilesets[0].renaming.as_mut().unwrap().2 = "Meadow".into();
     h.run_steps(3);
-    h.render().unwrap().save(shots.join("renaming.png")).unwrap();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("renaming.png")).unwrap();
+    }
     h.get_by_label("Rename").click();
     h.run_steps(3);
     let t = h.state().tilesets[0].tileset().unwrap().clone();
     assert_eq!(t.terrains[grass].name, "Meadow");
     assert_eq!((corners(&t, "Meadow"), corners(&t, "Grass")), (named, 0), "every tile followed");
     assert!(t.warnings.is_empty(), "nothing undeclared: {:?}", t.warnings);
-    h.render().unwrap().save(shots.join("after.png")).unwrap();
-    h.get_by_label("Check").click();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("after.png")).unwrap();
+    }
+    tileset_tool(&mut h, "Check").click();
     h.run_steps(3);
-    let findings = h.state().tilesets[0].findings.clone().unwrap();
+    let findings = tileset_problems(&h, &path);
     assert!(
         !findings.iter().any(|f| f.message.contains("Meadow") || f.message.contains("Grass")),
         "{findings:?}"
@@ -324,7 +335,7 @@ fn a_tileset_s_terrain_and_crosser_are_renamed_where_its_tiles_name_them() {
     let t = h.state().tilesets[0].tileset().unwrap().clone();
     assert_eq!((t.crossers[road].name.as_str(), edges(&t, "Lane")), ("Lane", roads));
     // Saved: the palette follows both.
-    h.get_by_label("Save").click();
+    tileset_tool(&mut h, "Save").click();
     h.run_steps(3);
     let p = palette(&h);
     assert!(p.contains(&"meadow".into()) && p.contains(&"lane".into()), "{p:?}");
@@ -335,10 +346,10 @@ fn a_tileset_s_terrain_and_crosser_are_renamed_where_its_tiles_name_them() {
     assert_eq!(saved.terrains[grass].name, "Meadow");
     // Undone, one step each, and saved: as it was, the palette too.
     for _ in 0..2 {
-        h.get_by_label("Undo").click();
+        tool(&h, "Undo").click();
         h.run_steps(3);
     }
-    h.get_by_label("Save").click();
+    tileset_tool(&mut h, "Save").click();
     h.run_steps(3);
     assert_eq!(std::fs::read(&path).unwrap(), ttr, "the file as it was, byte for byte");
     let p = palette(&h);
@@ -354,7 +365,7 @@ fn a_tileset_group_s_name_is_typed() {
     let dialogs = NoDialogs { save: vec![set_path.clone()], ..Default::default() };
     let mut app = Moonglow::new(None, Box::new(dialogs));
     app.open_module(&sample_module(&dir));
-    app.open_palette = false;
+    app.palette_dock = false;
     let mut h = harness(app, 1300.0, 900.0);
     h.run();
     mg_ui::tileset_view::new_tileset(h.state_mut());
@@ -369,7 +380,7 @@ fn a_tileset_group_s_name_is_typed() {
     h.run();
     h.get_by_label("Add Tile").click();
     h.run();
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run();
     h.get_by_label("Add Group").click();
     h.run();
@@ -388,13 +399,34 @@ fn a_tileset_group_s_name_is_typed() {
     h.key_press(egui::Key::Tab);
     h.run();
     assert_eq!(group(&h).name, "Bridge");
-    // What Check found is of the file as it was: an undo or a redo, like
-    // any change, clears it.
-    for step in [mg_ui::tileset_view::TilesetDoc::undo, mg_ui::tileset_view::TilesetDoc::redo] {
-        h.state_mut().tilesets[0].findings = Some(Vec::new());
+    // What Check found is of the text checked (M4's U20: Problems): an
+    // undo makes it stale, a redo back to that text current again, a
+    // second undo stale again.
+    use mg_ui::problems::{Source, Stale};
+    let id = h.state().tilesets[0].id;
+    let source = Source::Tileset(set_path.clone());
+    let finding = mg_module::doctor::Finding {
+        severity: mg_module::doctor::Severity::Warning,
+        check: "set-transition".into(),
+        source: "tileset".into(),
+        resource: ResKey::parse("zzz02", ResType::SET).unwrap(),
+        at: "[GENERAL] Transition".into(),
+        message: "Transition is 0".into(),
+    };
+    mg_ui::tileset_view::record_check(h.state_mut(), id, &[finding]);
+    h.run();
+    let stale = |h: &Harness<'_, Moonglow>| h.state().problems.of(&source).unwrap().stale;
+    assert_eq!(stale(&h), None, "checked");
+    for (step, want) in [
+        (mg_ui::tileset_view::TilesetDoc::undo as fn(&mut _), Some(Stale::Changed)),
+        (mg_ui::tileset_view::TilesetDoc::redo, None),
+        (mg_ui::tileset_view::TilesetDoc::undo, Some(Stale::Changed)),
+    ] {
         step(&mut h.state_mut().tilesets[0]);
-        assert!(h.state().tilesets[0].findings.is_none());
+        h.run();
+        assert_eq!(stale(&h), want);
     }
+    mg_ui::tileset_view::TilesetDoc::redo(&mut h.state_mut().tilesets[0]);
     assert_eq!(group(&h).name, "Bridge");
 }
 
@@ -409,7 +441,7 @@ fn a_tileset_s_rules_and_doors_are_edited() {
     let dialogs = NoDialogs { save: vec![set_path.clone()], ..Default::default() };
     let mut app = Moonglow::new(None, Box::new(dialogs));
     app.open_module(&sample_module(&dir));
-    app.open_palette = false;
+    app.palette_dock = false;
     let mut h = harness(app, 1300.0, 900.0);
     h.run();
     mg_ui::tileset_view::new_tileset(h.state_mut());
@@ -437,7 +469,7 @@ fn a_tileset_s_rules_and_doors_are_edited() {
     assert_eq!(h.query_all(combo.clone()).filter(grass).count(), 3, "Placed, Adjacent, Changed");
     h.query_all(combo).filter(grass).nth(2).expect("the rule's Changed").click();
     h.run();
-    h.get_by_label("Water").click();
+    click_in_sight(&mut h, "Water");
     h.run();
     assert_eq!(set(&h).primary_rules[0].changed, "Water");
     h.get_all_by_label("Add Rule").nth(1).expect("the secondary rules' Add Rule").click();
@@ -481,13 +513,13 @@ fn a_tileset_s_rules_and_doors_are_edited() {
 fn the_crosser_cursor_lies_on_raised_ground_under_the_pointer() {
     use glam::Vec3;
     let Some((mut h, area)) = area_harness("crosser-cursor") else { return };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
     // Corners (1, 1) and (1, 2) raised twice: ground well above the tiles'
     // own corners nearby.
-    h.get_by_label("↕ Raise/Lower").click();
+    h.get_by_label("Raise/Lower").click();
     h.run_steps(2);
     for corner in [(10.0, 10.0), (10.0, 20.0)] {
         for _ in 0..2 {
@@ -498,7 +530,7 @@ fn the_crosser_cursor_lies_on_raised_ground_under_the_pointer() {
             h.run_steps(3);
         }
     }
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     // Wherever the pointer rests on raised ground, the quarter drawn for it
     // lies on that ground.
@@ -510,8 +542,7 @@ fn the_crosser_cursor_lies_on_raised_ground_under_the_pointer() {
             h.hover_at(at);
             h.run_steps(3);
             let view = &h.state().area_views[&area];
-            let (Some(pointer), [(triangle, _)]) = (view.pointer, view.brush_cursor.as_slice())
-            else {
+            let (Some(pointer), [(triangle, _)]) = (view.pointer, &*view.brush_cursor) else {
                 continue;
             };
             if pointer.z < 4.0 {
@@ -557,13 +588,18 @@ fn area_viewer_paints_terrain() {
     let water = index.terrain("Water").unwrap();
 
     // The Tiles palette: the area's tileset, its Terrain branch open.
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Water").click();
+    click_in_sight(&mut h, "Water");
     h.run_steps(2);
-    h.get_by_label_contains("Water: click a corner");
+    // (The Status Bar's hints: the brush in hand, what a click does.)
+    let said = h.state().status_said().to_vec();
+    let has = |w: &str| said.iter().any(|s| s == w);
+    assert!(has("In hand: Water") && has("Click: Paint a corner"), "{said:?}");
+    let bar = h.get_by_label("Status Bar");
+    assert!(bar.query_by_label("Click: Paint a corner").is_some(), "shown in the bar");
 
     // Water at corner (2, 2): the four tiles around it are a pond.
     click(&mut h, Vec3::new(20.5, 19.5, 0.0));
@@ -576,7 +612,7 @@ fn area_viewer_paints_terrain() {
 
     // Shift + click with Grass on a grass corner: the four tiles around it
     // step to their next variants; the terrain stays.
-    h.get_by_label("Grass").click();
+    click_in_sight(&mut h, "Grass");
     h.run_steps(2);
     let tiles = |h: &mut Harness<'_, Moonglow>| {
         let ws = h.state_mut().ws.as_mut().unwrap();
@@ -598,7 +634,7 @@ fn area_viewer_paints_terrain() {
     assert!(moved > 0, "the tiles step to their next variants");
 
     // Raise and lower a corner.
-    h.get_by_label("↕ Raise/Lower").click();
+    h.get_by_label("Raise/Lower").click();
     h.run_steps(2);
     click(&mut h, Vec3::new(10.0, 30.0, 0.0));
     assert_eq!(lattice(&mut h).corner(1, 3).height, 1);
@@ -607,7 +643,7 @@ fn area_viewer_paints_terrain() {
 
     // A road dragged from tile (0, 0) to (2, 0), starting in the east
     // quarter of the first: on the two edges crossed.
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     let from = screen(&h, area, Vec3::new(7.0, 5.0, 0.0));
     h.hover_at(from);
@@ -628,7 +664,7 @@ fn area_viewer_paints_terrain() {
     assert_eq!(edges[2], [None, None, None, Some(road)]);
 
     // Trees beside the straight road: no tile has that, nothing changes.
-    h.get_by_label("Trees").click();
+    click_in_sight(&mut h, "Trees");
     h.run_steps(2);
     let before = lattice(&mut h);
     click(&mut h, Vec3::new(20.0, 10.0, 0.0));
@@ -639,7 +675,7 @@ fn area_viewer_paints_terrain() {
     assert!(!refused.0.is_empty());
 
     // The Eraser on the road's middle tile takes the road away.
-    h.get_by_label("🗑 Eraser").click();
+    h.get_by_label("Eraser").click();
     h.run_steps(2);
     click(&mut h, Vec3::new(15.0, 5.0, 0.0));
     let l = lattice(&mut h);
@@ -647,9 +683,9 @@ fn area_viewer_paints_terrain() {
 
     // A group (Barn 1: tiles 145, 147 / 144, 146 from the south-west),
     // turned a quarter by a right click, its first tile where clicked.
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
-    h.get_by_label("Barn 1 2x2").click();
+    click_in_sight(&mut h, "Barn 1 2x2");
     h.run_steps(2);
     button(&mut h, Vec3::new(25.0, 15.0, 0.0), egui::PointerButton::Secondary);
     click(&mut h, Vec3::new(25.0, 15.0, 0.0));
@@ -675,7 +711,7 @@ fn tile_properties_choose_a_variant_by_picture() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         are.root.list("Tile_List").unwrap()[i].clone()
     };
-    h.get_by_label("⛶ Select Tiles").click();
+    area_click(&mut h, "Select Tiles");
     h.run_steps(2);
     let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
     h.hover_at(at);
@@ -691,26 +727,26 @@ fn tile_properties_choose_a_variant_by_picture() {
         });
     }
     h.run_steps(2);
-    h.get_by_label("Tile Properties…").click();
+    popup_item(&h, "Tile Properties").click();
     h.run_steps(2);
     // Its variants: the tiles that fit there, the one there now among
     // them; another chosen is put there at once, the window staying.
     let props = h.state().tile_props.clone().expect("the window is open");
     assert_eq!(props.tiles, [5]);
-    let (cell, variants) = props.variants.clone().expect("one tile: its variants");
-    assert_eq!(cell, (1, 1));
+    let (cells, variants) = props.variants.clone().expect("one tile: its variants");
+    assert_eq!(cells, [(1, 1)]);
     let now = props.variant.unwrap();
     assert!(variants.len() > 1 && variants.iter().any(|(p, _)| *p == now), "{variants:?}");
-    h.render().unwrap().save(mg_testkit::scratch_dir("ui-tile-variants").join("a.png")).unwrap();
+    if let Some(dir) = shot_dir("ui-tile-variants") {
+        h.render().unwrap().save(dir.join("a.png")).unwrap();
+    }
     let other = variants.iter().find(|(p, _)| p.tile != now.tile).unwrap();
     h.get_by_label_contains(&format!("Variant ({} fit here)", variants.len()));
     let before_undo = h.state().ws.as_ref().unwrap().can_undo().map(str::to_string);
-    // (A picture has no name of its own: the one over its model's name.)
+    // (A picture is the kit's cell, named by its model and turn.)
     let turn = ["", " ↺90°", " ↺180°", " ↺270°"][usize::from(other.0.orientation % 4)];
-    let picture = h
-        .query_all_by_label(&format!("{}{turn}", other.1))
-        .next()
-        .map(|n| n.rect().center_top() - egui::vec2(0.0, 40.0));
+    let picture =
+        h.query_all_by_label(&format!("{}{turn}", other.1)).next().map(|n| n.rect().center());
     if let Some(at) = picture {
         h.hover_at(at);
         press(&h, at, true, egui::Modifiers::NONE);
@@ -723,11 +759,7 @@ fn tile_properties_choose_a_variant_by_picture() {
         let after = h.state().tile_props.clone().expect("the window stays");
         assert_eq!(after.variant.map(|p| i64::from(p.tile)), Some(id));
         assert_ne!(after.variant, Some(now), "another than the one that was there");
-        assert_eq!(
-            after.base[0].integer("Tile_ID"),
-            Some(id),
-            "taken up: the window is the new tile's"
-        );
+        assert_eq!(after.first_id, id, "read again: the panel is the new tile's");
         h.state_mut().ws.as_mut().unwrap().undo().unwrap();
         h.state_mut().tile_props = Some(props);
         h.run_steps(2);
@@ -735,6 +767,71 @@ fn tile_properties_choose_a_variant_by_picture() {
     } else {
         panic!("no variant pictures");
     }
+}
+
+/// Tile Properties of several tiles shows the tiles that fit every one of
+/// them as pictures; a click puts that one in each, turned as it fits
+/// there, in one step.
+#[test]
+fn tile_properties_choose_a_variant_for_several_tiles() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("tile-variants-many") else { return };
+    let id_of = |h: &mut Harness<'_, Moonglow>, (x, y): (u32, u32)| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
+        let w = are.root.integer("Width").unwrap() as usize;
+        are.root.list("Tile_List").unwrap()[y as usize * w + x as usize].integer("Tile_ID").unwrap()
+    };
+    let (a, b) = ((1, 1), (2, 1));
+    area_click(&mut h, "Select Tiles");
+    h.run_steps(2);
+    let south = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
+    let north = screen(&h, area, Vec3::new(25.0, 15.0, 0.0));
+    click_pos(&h, south);
+    h.run_steps(2);
+    h.hover_at(north);
+    press(&h, north, true, egui::Modifiers::COMMAND);
+    press(&h, north, false, egui::Modifiers::COMMAND);
+    h.run_steps(2);
+    assert_eq!(h.state().area_views[&area].tile_selection, [a, b]);
+    tile_properties_at(&mut h, north);
+    let props = h.state().tile_props.clone().expect("the window is open");
+    let shots = shot_dir("ui-tile-variants-many");
+    if let Some(dir) = &shots {
+        h.render().unwrap().save(dir.join("a.png")).unwrap();
+    }
+    let (cells, variants) = props.variants.clone().expect("several tiles: their variants");
+    assert_eq!(cells, [a, b]);
+    assert!(variants.len() > 1, "{variants:?}");
+    h.get_by_label_contains(&format!("Variant ({} fit every tile chosen)", variants.len()));
+    let before_undo = h.state().ws.as_ref().unwrap().can_undo().map(str::to_string);
+    let (now_south, now_north) = (id_of(&mut h, a), id_of(&mut h, b));
+    let other = variants
+        .iter()
+        .find(|(p, _)| i64::from(p.tile) != now_south || i64::from(p.tile) != now_north)
+        .expect("a tile other than one there now");
+    let turn = ["", " ↺90°", " ↺180°", " ↺270°"][usize::from(other.0.orientation % 4)];
+    let at = h
+        .query_all_by_label(&format!("{}{turn}", other.1))
+        .next()
+        .map(|n| n.rect().center())
+        .expect("its picture");
+    h.hover_at(at);
+    press(&h, at, true, egui::Modifiers::NONE);
+    press(&h, at, false, egui::Modifiers::NONE);
+    h.run_steps(4);
+    // (Pictures of one model under two turns are not told apart here.)
+    let (south_id, north_id) = (id_of(&mut h, a), id_of(&mut h, b));
+    assert_eq!(south_id, north_id, "one tile put in each");
+    assert!(variants.iter().any(|(p, _)| i64::from(p.tile) == south_id), "tile {south_id}");
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Tile variant"));
+    if let Some(dir) = &shots {
+        h.render().unwrap().save(dir.join("b.png")).unwrap();
+    }
+    h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+    h.run_steps(2);
+    assert_eq!((id_of(&mut h, a), id_of(&mut h, b)), (now_south, now_north), "one step");
+    assert_eq!(h.state().ws.as_ref().unwrap().can_undo().map(str::to_string), before_undo);
 }
 
 #[test]
@@ -757,7 +854,7 @@ fn area_viewer_selects_tiles_and_sets_their_properties() {
     let set = mg_edit::Command::new("Replacement texture", vec![set]);
     h.state_mut().actions.push(mg_ui::Action::Apply(set));
     h.run_steps(2);
-    h.get_by_label("⛶ Select Tiles").click();
+    area_click(&mut h, "Select Tiles");
     h.run_steps(2);
     // The room in the middle: tile (1, 1), index 5.
     let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
@@ -778,7 +875,7 @@ fn area_viewer_selects_tiles_and_sets_their_properties() {
         });
     }
     h.run_steps(2);
-    h.get_by_label("Tile Properties…").click();
+    popup_item(&h, "Tile Properties").click();
     h.run_steps(2);
     let props = h.state().tile_props.clone().expect("the window is open");
     assert_eq!(props.tiles, [5]);
@@ -786,12 +883,12 @@ fn area_viewer_selects_tiles_and_sets_their_properties() {
     // it is opened from, at once. (Opened again, it came up behind it for
     // a frame, and with nothing to draw another, stayed there: the click
     // looked to do nothing.)
-    let picker = egui::LayerId::new(egui::Order::Middle, egui::Id::new(Some("Select A Color")));
+    let picker = egui::LayerId::new(egui::Order::Middle, egui::Id::new(Some("Select a Color")));
     let on_top = |h: &Harness<'_, Moonglow>| {
         h.ctx.memory(|m| m.areas().top_layer_id(egui::Order::Middle)) == Some(picker)
     };
     for time in 0..2 {
-        h.get_by_label("Main Light 1 Color").click();
+        h.get_by_label("Main light 1 color").click();
         // (The frames the application asks for, and no more: nothing else
         // draws another.)
         h.run();
@@ -803,7 +900,7 @@ fn area_viewer_selects_tiles_and_sets_their_properties() {
         h.key_press(egui::Key::Escape);
         h.run_steps(2);
         assert!(h.state().tile_props.as_ref().unwrap().picking.is_none());
-        let beside = h.get_by_label("Main Light 2 Color").rect().center() + egui::vec2(-60.0, 0.0);
+        let beside = h.get_by_label("Main light 2 color").rect().center() + egui::vec2(-60.0, 0.0);
         h.hover_at(beside);
         press(&h, beside, true, egui::Modifiers::NONE);
         press(&h, beside, false, egui::Modifiers::NONE);
@@ -814,10 +911,9 @@ fn area_viewer_selects_tiles_and_sets_their_properties() {
     h.state_mut().tile_props.as_mut().unwrap().loops = [false, false, false];
     // (No tic01 tile has a replace_tex texture: Replacement Texture is
     // greyed out, and the file's value kept.)
-    assert!(h.get_by_label("Replacement Texture").accesskit_node().is_disabled());
-    h.run_steps(1);
-    h.get_by_label("OK").click();
-    h.run_steps(2);
+    assert!(h.get_by_label("Replacement texture").accesskit_node().is_disabled());
+    // (Written at once, as they are changed: no OK.)
+    h.run_steps(3);
     let t = tile(&mut h, 5);
     assert_eq!(t.integer("Tile_ReplaceTex"), Some(1), "the file's field kept");
     if props.has_main[0] {
@@ -826,8 +922,8 @@ fn area_viewer_selects_tiles_and_sets_their_properties() {
     if props.has_loops[0] {
         assert_eq!(t.integer("Tile_AnimLoop1"), Some(0));
     }
-    assert!(h.state().tile_props.is_none());
-    // Undone in one step.
+    assert!(h.state().tile_props.is_some(), "the panel shows the tile still");
+    // Undone in one step (both changed in one frame).
     h.state_mut().ws.as_mut().unwrap().undo().unwrap();
     h.run_steps(1);
     assert_eq!(tile(&mut h, 5), original);
@@ -848,9 +944,13 @@ fn set_tile_id(h: &mut Harness<'_, Moonglow>, area: ResRef, index: usize, id: i3
 
 /// In Select Tiles, clicks the tiles at `points` (Ctrl + click after the
 /// first) and opens Tile Properties from the tile menu.
-fn tile_properties_of(h: &mut Harness<'_, Moonglow>, area: ResRef, points: &[glam::Vec3]) {
+pub(crate) fn tile_properties_of(
+    h: &mut Harness<'_, Moonglow>,
+    area: ResRef,
+    points: &[glam::Vec3],
+) {
     if !h.state().area_views[&area].tile_mode {
-        h.get_by_label("⛶ Select Tiles").click();
+        area_click(h, "Select Tiles");
         h.run_steps(2);
     }
     for (i, p) in points.iter().enumerate() {
@@ -871,7 +971,7 @@ fn tile_properties_of(h: &mut Harness<'_, Moonglow>, area: ResRef, points: &[gla
         });
     }
     h.run_steps(2);
-    h.get_by_label("Tile Properties…").click();
+    popup_item(h, "Tile Properties").click();
     h.run_steps(3);
 }
 
@@ -901,19 +1001,21 @@ fn tile_properties_enable_only_the_tile_s_lights_and_loops() {
     let disabled = |h: &Harness<'_, Moonglow>, label: &str| {
         h.get_by_label(label).accesskit_node().is_disabled()
     };
-    assert!(!disabled(&h, "Main Light 1 Color"));
-    for label in ["Main Light 2 Color", "Source Light 1 Color", "Source Light 2 Color"] {
+    assert!(!disabled(&h, "Main light 1 color"));
+    for label in ["Main light 2 color", "Source light 1 color", "Source light 2 color"] {
         assert!(disabled(&h, label), "{label}");
     }
     for k in 1..=3 {
-        let label = format!("Animation Loop {k}");
+        let label = format!("Animation loop {k}");
         let node = h.get_by_label(&label);
 
         assert!(node.accesskit_node().is_disabled());
         assert_eq!(node.accesskit_node().toggled(), Some(egui::accesskit::Toggled::False));
     }
-    let dir = mg_testkit::scratch_dir("ui-tile-lights");
-    h.render().unwrap().save(dir.join("one-light.png")).unwrap();
+    let dir = shot_dir("ui-tile-lights");
+    if let Some(ref dir) = dir {
+        h.render().unwrap().save(dir.join("one-light.png")).unwrap();
+    }
     h.state_mut().tile_props = None;
     h.run_steps(2);
 
@@ -923,8 +1025,10 @@ fn tile_properties_enable_only_the_tile_s_lights_and_loops() {
     let props = h.state().tile_props.clone().expect("the window is open");
     assert_eq!((props.has_main, props.has_source), ([true, true], [false, false]));
     assert_eq!(props.has_loops, [true; 3]);
-    assert!(!h.get_by_label("Animation Loop 3").accesskit_node().is_disabled());
-    h.render().unwrap().save(dir.join("lights-and-loops.png")).unwrap();
+    assert!(!h.get_by_label("Animation loop 3").accesskit_node().is_disabled());
+    if let Some(ref dir) = dir {
+        h.render().unwrap().save(dir.join("lights-and-loops.png")).unwrap();
+    }
     h.state_mut().tile_props = None;
     h.run_steps(2);
 
@@ -945,9 +1049,7 @@ fn tile_properties_enable_only_the_tile_s_lights_and_loops() {
         // first tile shows, and goes to every tile that has it.)
         p.touched[..4].fill(true);
     }
-    h.run_steps(1);
-    h.get_by_label("OK").click();
-    h.run_steps(2);
+    h.run_steps(3);
     let (t5, t6) = (tile(&mut h, 5), tile(&mut h, 6));
     assert_eq!(t5.integer("Tile_MainLight1"), Some(7));
     for label in ["Tile_MainLight2", "Tile_SrcLight1", "Tile_SrcLight2", "Tile_AnimLoop1"] {
@@ -959,86 +1061,6 @@ fn tile_properties_enable_only_the_tile_s_lights_and_loops() {
         [Some(7), Some(9), Some(3), Some(4)]
     );
     assert_eq!(t6.get("Tile_AnimLoop1"), was6.get("Tile_AnimLoop1"), "no loops: kept");
-}
-
-/// Tile Properties closed with changes not applied (Escape, its tab's X)
-/// asks Save, Don't Save or Cancel, as a side editor's tab does; with
-/// none, it closes; its Cancel button discards. (Jasperre's tile
-/// feedback: Aurora's X discards without asking.)
-#[test]
-fn tile_properties_ask_before_closing_with_changes() {
-    use glam::Vec3;
-    let Some((mut h, area)) = area_harness("tile-props-close") else { return };
-    let tile = |h: &mut Harness<'_, Moonglow>| {
-        let ws = h.state_mut().ws.as_mut().unwrap();
-        let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
-        are.root.list("Tile_List").unwrap()[5].clone()
-    };
-    let undo_label =
-        |h: &Harness<'_, Moonglow>| h.state().ws.as_ref().unwrap().can_undo().map(str::to_string);
-    let at = Vec3::new(15.0, 15.0, 0.0);
-    let was = tile(&mut h);
-    let before = undo_label(&h);
-    let change = |h: &mut Harness<'_, Moonglow>| {
-        let p = h.state_mut().tile_props.as_mut().expect("the window is open");
-        assert!(p.has_main[0], "ttr01's tiles have main light 1");
-        p.main[0] = (p.main[0] + 5) % 32;
-        h.run_steps(1);
-    };
-    // Unchanged: Escape closes it at once.
-    tile_properties_of(&mut h, area, &[at]);
-    h.key_press(egui::Key::Escape);
-    h.run_steps(3);
-    assert!(h.state().tile_props.is_none(), "closed: nothing to ask");
-    // Changed: Escape asks; Cancel keeps the window and its change.
-    tile_properties_of(&mut h, area, &[at]);
-    change(&mut h);
-    assert_ne!(tile(&mut h), was, "the change in the area at once");
-    h.key_press(egui::Key::Escape);
-    h.run_steps(3);
-    h.get_by_label("Save changes to Tile Properties?");
-    h.render()
-        .unwrap()
-        .save(mg_testkit::scratch_dir("ui-tile-props-close").join("ask.png"))
-        .unwrap();
-    let cancel = h.get_all_by_label("Cancel").last().unwrap().rect().center();
-    h.hover_at(cancel);
-    press(&h, cancel, true, egui::Modifiers::NONE);
-    press(&h, cancel, false, egui::Modifiers::NONE);
-    h.run_steps(3);
-    let p = h.state().tile_props.clone().expect("Cancel: the window stays");
-    assert!(!p.closing && p.changed());
-    assert!(h.query_by_label("Save changes to Tile Properties?").is_none());
-    // Closed as its tab's X closes it: asked; Don't Save takes the change back.
-    h.state_mut().actions.push(mg_ui::Action::CloseTabs(vec![Tab::TileProperties]));
-    h.run_steps(3);
-    h.get_by_label("Don't Save").click();
-    h.run_steps(3);
-    assert!(h.state().tile_props.is_none());
-    assert!(h.state().dock.find_tab(&Tab::TileProperties).is_none(), "its tab goes");
-    assert_eq!(tile(&mut h), was);
-    assert_eq!(undo_label(&h), before, "nothing left of it");
-    assert_eq!(h.state().ws.as_ref().unwrap().can_redo(), None, "nor to redo");
-    // Again, and Save: applied, as OK does.
-    tile_properties_of(&mut h, area, &[at]);
-    change(&mut h);
-    h.state_mut().actions.push(mg_ui::Action::CloseTabs(vec![Tab::TileProperties]));
-    h.run_steps(3);
-    h.get_by_label("Save").click();
-    h.run_steps(3);
-    assert!(h.state().tile_props.is_none());
-    assert_ne!(tile(&mut h).integer("Tile_MainLight1"), was.integer("Tile_MainLight1"));
-    assert_eq!(undo_label(&h).as_deref(), Some("Tile Properties"));
-    // Its Cancel button: discarded without asking.
-    tile_properties_of(&mut h, area, &[at]);
-    change(&mut h);
-    let cancel = h.get_all_by_label("Cancel").last().unwrap().rect().center();
-    h.hover_at(cancel);
-    press(&h, cancel, true, egui::Modifiers::NONE);
-    press(&h, cancel, false, egui::Modifiers::NONE);
-    h.run_steps(3);
-    assert!(h.state().tile_props.is_none());
-    assert!(h.query_by_label("Save changes to Tile Properties?").is_none());
 }
 
 /// A group or feature is one thing (Jasperre's tile feedback): Next Tile
@@ -1077,14 +1099,14 @@ fn groups_and_features_change_only_whole() {
     };
     // (The status line's text.)
     let says = |h: &Harness<'_, Moonglow>, text: &str| h.query_by_label_contains(text).is_some();
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
     // A barn, its first tile in (1, 1).
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
-    h.get_by_label("Barn 1 2x2").click();
+    click_in_sight(&mut h, "Barn 1 2x2");
     h.run_steps(2);
     click(&mut h, Vec3::new(15.0, 15.0, 0.0), egui::Modifiers::NONE);
     let barn = vec![(1, 1), (2, 1), (1, 2), (2, 2)];
@@ -1100,16 +1122,18 @@ fn groups_and_features_change_only_whole() {
     whole.sort();
     assert_eq!(red, whole);
     // (The cursor over it is red, as Aurora's outline turns.)
-    h.render().unwrap().save(mg_testkit::scratch_dir("ui-group-locked").join("over.png")).unwrap();
+    if let Some(dir) = shot_dir("ui-group-locked") {
+        h.render().unwrap().save(dir.join("over.png")).unwrap();
+    }
     // (The groups closed: the tools above in view.)
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
     // The tile tools on one of its tiles: refused, saying why.
     let east = Vec3::new(25.0, 15.0, 0.0);
     for (tool, label) in [
-        ("⏭ Next Tile Appearance", "Next tile appearance"),
-        ("↺ Rotate Tile", "Rotate tile"),
-        ("🔁 Refine Tile", "Refine tile"),
+        ("Next Tile Appearance", "Next tile appearance"),
+        ("Rotate Tile", "Rotate tile"),
+        ("Refine Tile", "Refine tile"),
     ] {
         h.get_by_label(tool).click();
         h.run_steps(2);
@@ -1121,7 +1145,7 @@ fn groups_and_features_change_only_whole() {
     h.run_steps(2);
     // Shift + right click in Select Tiles; and Tile Properties offers no
     // variants.
-    h.get_by_label("⛶ Select Tiles (F10)").click();
+    apart(&h, "Select Tiles").click();
     h.run_steps(2);
     let at = screen(&h, area, east);
     h.hover_at(at);
@@ -1143,11 +1167,15 @@ fn groups_and_features_change_only_whole() {
     let props = h.state().tile_props.clone().expect("the window is open");
     assert!(props.grouped && props.variants.is_none(), "no variants for a group's tile");
     h.get_by_label_contains("A tile of a group or a feature");
+    // (One of the barn's tiles alone: its Height grayed, and why, shown.)
+    assert!(props.height_locked);
+    assert!(h.get_by_label("Raise Height").accesskit_node().is_disabled());
+    h.get_by_label(mg_ui::tile_select::HEIGHT_LOCKED);
     h.state_mut().tile_props = None;
     h.run_steps(2);
     // Out of Select Tiles, the area's own menu on the ground: Rotate Tile
     // refused, the log saying why (the status line is the objects').
-    h.get_by_label("⛶ Select Tiles").click();
+    area_click(&mut h, "Select Tiles");
     h.run_steps(2);
     assert!(!h.state().area_views[&area].tile_mode);
     for pressed in [true, false] {
@@ -1159,25 +1187,26 @@ fn groups_and_features_change_only_whole() {
         });
     }
     h.run_steps(3);
-    h.get_by_label("Rotate Tile").click();
+    // (The menu's: the palette has a Rotate Tile button too.)
+    popup_item(&h, "Rotate Tile").click();
     h.run_steps(3);
     assert_eq!(grid(&mut h), placed, "the ground menu's Rotate Tile: nothing changed");
     assert!(says(&h, "Rotate tile: tiles of a group or feature"));
 
     // Allowed: the next appearance is put there, with a warning.
     h.state_mut().settings.edit_group_tiles = true;
-    h.get_by_label("⏭ Next Tile Appearance").click();
+    apart(&h, "Next Tile Appearance").click();
     h.run_steps(2);
     click(&mut h, east, egui::Modifiers::NONE);
     assert_ne!(grid(&mut h).tile(2, 1), placed.tile(2, 1), "allowed: changed");
-    assert!(says(&h, "⚠ Next tile appearance: a group or feature left part changed"));
+    assert!(says(&h, "Next tile appearance: a group or feature left part changed"));
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
     h.run_steps(3);
     assert_eq!(grid(&mut h), placed, "undone");
     // A barn over its east half: the first goes whole.
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
-    h.get_by_label("Barn 1 2x2").click();
+    click_in_sight(&mut h, "Barn 1 2x2");
 
     h.run_steps(2);
     click(&mut h, east, egui::Modifiers::NONE);
@@ -1191,7 +1220,7 @@ fn groups_and_features_change_only_whole() {
     // Not allowed: Delete on one of its tiles takes the whole barn.
     h.state_mut().settings.edit_group_tiles = false;
     if !h.state().area_views[&area].tile_mode {
-        h.get_by_label("⛶ Select Tiles").click();
+        area_click(&mut h, "Select Tiles");
         h.run_steps(2);
     }
     click(&mut h, east, egui::Modifiers::NONE);
@@ -1221,7 +1250,7 @@ fn resize_and_rotate_area_from_the_edit_menu() {
         (are.root.integer("Width").unwrap(), are.root.integer("Height").unwrap(), tiles)
     };
     assert_eq!(size(&mut h), (4, 4, 16));
-    h.get_by_label("Edit").click();
+    menu(&h, "Edit").click();
     h.run_steps(2);
     h.get_by_label("Resize Area…").click();
     h.run_steps(2);
@@ -1244,7 +1273,7 @@ fn resize_and_rotate_area_from_the_edit_menu() {
     };
     assert_eq!(waypoints(&mut h).len(), 2);
     // A quarter turn counter-clockwise: 3 by 6, (20, 20) to (10, 20).
-    h.get_by_label("Edit").click();
+    menu(&h, "Edit").click();
     h.run_steps(2);
     h.get_by_label("Rotate Area…").click();
     h.run_steps(2);
@@ -1261,7 +1290,7 @@ fn resize_and_rotate_area_from_the_edit_menu() {
     // At the south and west edges: two columns come at the west, a row
     // goes at the south, and the waypoints keep their places against the
     // north and east edges: (20, 20) to (40, 10).
-    h.get_by_label("Edit").click();
+    menu(&h, "Edit").click();
     h.run_steps(2);
     h.get_by_label("Resize Area…").click();
     h.run_steps(2);
@@ -1280,10 +1309,63 @@ fn resize_and_rotate_area_from_the_edit_menu() {
     assert!((w[0].0 - 20.0).abs() < 1e-3 && (w[0].1 - 20.0).abs() < 1e-3, "{w:?}");
 }
 
+/// Change Tileset from the Edit menu (an area of the rural tileset laid
+/// in the city's, as one step): its tiles are the city's, every one of
+/// them fitting its neighbors; its waypoints stay where they were, and
+/// the view draws the new tiles. Undone, it is the rural area again.
+#[test]
+fn change_tileset_from_the_edit_menu() {
+    let Some((mut h, area)) = area_harness("change-tileset") else { return };
+    let are = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.doc(&ResKey::new(area, ResType::ARE)).unwrap().root.clone()
+    };
+    let before = are(&mut h);
+    menu(&h, "Edit").click();
+    h.run_steps(2);
+    h.get_by_label("Change Tileset…").click();
+    h.run_steps(2);
+    let city = ResRef::from_str("tcn01").unwrap();
+    let d = h.state_mut().change_tileset.as_mut().expect("the window is open");
+    assert_eq!(d.from.to_string(), "ttr01");
+    d.to = city;
+    h.run_steps(2);
+    let d = h.state().change_tileset.as_ref().unwrap();
+    let mapping = d.mapping.as_ref().expect("the mapping for tcn01");
+    assert!(mapping.terrains.iter().any(|(from, _)| from == "grass"), "{mapping:?}");
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let after = are(&mut h);
+    assert_eq!(after.resref("Tileset"), Some(city));
+    let set = h.state().tileset(city).unwrap();
+    let index = mg_tiles::TileIndex::new(&set);
+    let grid = mg_area::terrain::grid(&after, &index).expect("the city's tiles");
+    let seams = mg_tiles::seams(&index, 4, 4, &grid.tiles);
+    assert_eq!(seams.area.len() + seams.groups.len(), 0);
+    let ws = h.state_mut().ws.as_mut().unwrap();
+    let git = ws.doc(&ResKey::new(area, ResType::GIT)).unwrap();
+    assert_eq!(git.root.list("WaypointList").unwrap().len(), 2, "the waypoints stay");
+    assert!(
+        h.state().log.entries.iter().any(|(_, m)| m.starts_with("Change Tileset:")),
+        "{:?}",
+        h.state().log.entries
+    );
+    h.run_steps(6);
+    let view = &h.state().area_views[&area];
+    assert_eq!(view.model.as_ref().unwrap().tiles.len(), 16);
+    if std::env::var_os("MG_SHOT").is_some() {
+        let dir = mg_testkit::scratch_dir("ui-change-tileset");
+        h.render().unwrap().save(dir.join("after.png")).unwrap();
+    }
+    h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+    h.run_steps(1);
+    assert_eq!(are(&mut h), before, "undone, the rural area as it was");
+}
+
 /// Resize Area from the Edit menu to `columns` by `rows` (the new ground
 /// at the north and east), the camera then over all of it.
 fn resize_area_to(h: &mut Harness<'_, Moonglow>, area: ResRef, columns: u32, rows: u32) {
-    h.get_by_label("Edit").click();
+    menu(h, "Edit").click();
     h.run_steps(2);
     h.get_by_label("Resize Area…").click();
     h.run_steps(2);
@@ -1306,12 +1388,12 @@ fn area_are(h: &mut Harness<'_, Moonglow>, area: ResRef) -> mg_gff::Struct {
 }
 
 /// The Tiles palette open on the area's tileset, brush `brush` chosen.
-fn choose_tile_brush(h: &mut Harness<'_, Moonglow>, brush: &str) {
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+pub(crate) fn choose_tile_brush(h: &mut Harness<'_, Moonglow>, brush: &str) {
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(h, "🗻", "Tiles");
+    palette_type(h, "Tiles");
     h.run_steps(2);
-    h.get_by_label(brush).click();
+    click_in_sight(h, brush);
     h.run_steps(2);
 }
 
@@ -1370,7 +1452,7 @@ fn a_terrain_drag_across_an_undo_of_resize_area_paints_nothing() {
     use glam::Vec3;
     let Some((mut h, area)) = area_harness("terrain-drag-undo-resize") else { return };
     let before = area_are(&mut h, area);
-    choose_tile_brush(&mut h, "↕ Raise/Lower");
+    choose_tile_brush(&mut h, "Raise/Lower");
     resize_area_to(&mut h, area, 4, 8);
     let (from, to) = (
         screen(&h, area, Vec3::new(20.0, 50.0, 0.0)),
@@ -1399,7 +1481,7 @@ fn a_terrain_drag_across_an_undo_of_resize_area_paints_nothing() {
     assert_eq!(area_are(&mut h, area), before, "letting go paints nothing");
 }
 
-/// The tile menu's Tile Properties… on the tiles selected, the menu opened
+/// The tile menu's Tile Properties on the tiles selected, the menu opened
 /// at `at`.
 fn tile_properties_at(h: &mut Harness<'_, Moonglow>, at: egui::Pos2) {
     for pressed in [true, false] {
@@ -1408,7 +1490,7 @@ fn tile_properties_at(h: &mut Harness<'_, Moonglow>, at: egui::Pos2) {
         h.event(egui::Event::PointerButton { pos: at, button, pressed, modifiers: m });
     }
     h.run_steps(2);
-    h.get_by_label("Tile Properties…").click();
+    popup_item(h, "Tile Properties").click();
     h.run_steps(3);
 }
 
@@ -1423,7 +1505,7 @@ fn tiles_selected_on_ground_an_undo_took_away_are_dropped() {
     let before = area_are(&mut h, area);
     resize_area_to(&mut h, area, 4, 8);
     if !h.state().area_views[&area].tile_mode {
-        h.get_by_label("⛶ Select Tiles").click();
+        area_click(&mut h, "Select Tiles");
         h.run_steps(2);
     }
     let south = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
@@ -1464,7 +1546,7 @@ fn tiles_selected_across_rotate_area_are_dropped() {
     use glam::Vec3;
     use mg_edit::Command;
     let Some((mut h, area)) = area_harness("tiles-rotate") else { return };
-    h.get_by_label("⛶ Select Tiles").click();
+    area_click(&mut h, "Select Tiles");
     h.run_steps(2);
     // (Where tile (0, 0) is on screen: Tile Properties' pane takes room.)
     let at = |h: &Harness<'_, Moonglow>| screen(h, area, Vec3::new(5.0, 5.0, 0.0));
@@ -1521,7 +1603,7 @@ fn tiles_copy_and_paste() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         are.root.list("Tile_List").unwrap()[i].clone()
     };
-    h.get_by_label("⛶ Select Tiles").click();
+    area_click(&mut h, "Select Tiles");
     h.run_steps(2);
     let click = |h: &mut Harness<'_, Moonglow>, p: Vec3| {
         let at = screen(h, area, p);
@@ -1530,6 +1612,17 @@ fn tiles_copy_and_paste() {
         press(h, at, false, egui::Modifiers::NONE);
         h.run_steps(2);
     };
+    // (Its Replacement Texture row 4, and another on the tile it will be
+    // pasted over: the review's A9, the pasted tile took the old one's.)
+    let replace = |i: usize, row: u8| mg_edit::Edit::SetField {
+        key: ResKey::new(area, ResType::ARE),
+        path: mg_edit::GffPath::root().item("Tile_List", i),
+        label: "Tile_ReplaceTex".into(),
+        value: Some(mg_gff::Value::Byte(row)),
+    };
+    let rows = mg_edit::Command::new("Rows", vec![replace(5, 4), replace(0, 2)]);
+    h.state_mut().actions.push(mg_ui::Action::Apply(rows));
+    h.run_steps(3);
     // Tile (1, 1): the room's south-west quarter, a Stone corner at its
     // north-east. Copied, pasted with its south-west tile at (0, 0).
     click(&mut h, Vec3::new(15.0, 15.0, 0.0));
@@ -1548,6 +1641,7 @@ fn tiles_copy_and_paste() {
     {
         assert_eq!(pasted.get(label), copied.get(label), "{label}");
     }
+    assert_eq!(pasted.integer("Tile_ReplaceTex"), Some(4), "the copied tile's row");
     // The tiles around fit it: the area's tiles make one lattice.
     let game = h.state().game.as_deref().unwrap();
     let set = mg_area::tileset(game, ResRef::from_str("tic01").unwrap()).unwrap();
@@ -1574,11 +1668,11 @@ fn a_terrain_brush_paints_every_corner_it_is_dragged_across() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         mg_area::terrain::grid(&are.root, &index).unwrap().lattice
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Water").click();
+    click_in_sight(&mut h, "Water");
     h.run_steps(2);
     let before = lattice(&mut h);
     // Dragged from corner (1, 2) to corner (3, 2), 10 m apart each, then
@@ -1637,16 +1731,16 @@ fn cursors_that_only_choose_tiles_again_are_blue() {
     use glam::Vec3;
     use mg_ui::terrain_mode::CYCLE;
     let Some((mut h, area)) = area_harness("cycle-cursor") else { return };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
     let colors = |h: &Harness<'_, Moonglow>| -> Vec<egui::Color32> {
         h.state().area_views[&area].brush_cursor.iter().map(|(_, c)| *c).collect()
     };
     // A crosser over grass: a drag from there lays it, green.
     let green = egui::Color32::from_rgb(80, 220, 80);
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     let at = screen(&h, area, Vec3::new(13.0, 15.0, 0.0));
     h.hover_at(at);
@@ -1669,7 +1763,7 @@ fn cursors_that_only_choose_tiles_again_are_blue() {
     assert_eq!(colors(&h), [CYCLE]);
     // The Eraser erases, and with Shift steps the tile through those that
     // fit: blue then.
-    h.get_by_label("🗑 Eraser").click();
+    h.get_by_label("Eraser").click();
     h.run_steps(2);
     h.hover_at(at);
     h.run_steps(3);
@@ -1682,7 +1776,7 @@ fn cursors_that_only_choose_tiles_again_are_blue() {
     // A terrain brush on a corner of its own terrain adds none, it chooses
     // the tiles again: blue; elsewhere it paints. (Corner (3, 3), clear of
     // the road.)
-    h.get_by_label("Water").click();
+    click_in_sight(&mut h, "Water");
     h.run_steps(2);
     let corner = screen(&h, area, Vec3::new(30.0, 30.0, 0.0));
     h.hover_at(corner);
@@ -1694,6 +1788,136 @@ fn cursors_that_only_choose_tiles_again_are_blue() {
     }
     h.run_steps(3);
     assert_eq!(colors(&h), [CYCLE], "water on water");
+}
+
+#[test]
+fn a_crosser_click_lays_it_on_the_edge_of_the_quarter_clicked() {
+    // A doorway in a wall is a click near the tile's side, as in Aurora
+    // (`aurora_terrain`'s clicks); the cursor, that quarter, is red where
+    // no tile fits it, and a click there changes nothing.
+    use glam::Vec3;
+    use mg_tiles::{EAST, TileIndex, WEST};
+    let Some((mut h, area)) = area_harness_on("crosser-click", "tic01", None) else { return };
+    let index = {
+        let game = h.state().game.as_deref().unwrap();
+        TileIndex::new(&mg_area::tileset(game, ResRef::from_str("tic01").unwrap()).unwrap())
+    };
+    let grid = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
+        mg_area::terrain::grid(&are.root, &index).unwrap()
+    };
+    let click = |h: &mut Harness<'_, Moonglow>, p: Vec3| {
+        let at = screen(h, area, p);
+        h.hover_at(at);
+        h.run_steps(3);
+        let colors: Vec<egui::Color32> =
+            h.state().area_views[&area].brush_cursor.iter().map(|(_, c)| *c).collect();
+        press(h, at, true, egui::Modifiers::NONE);
+        press(h, at, false, egui::Modifiers::NONE);
+        h.run_steps(3);
+        colors
+    };
+    show_palette(h.state_mut());
+    h.run_steps(3);
+    palette_type(&mut h, "Tiles");
+    h.run_steps(2);
+    click_in_sight(&mut h, "Doorway");
+    h.run_steps(2);
+    let doorway = index.crosser("Doorway").expect("tic01's Doorway");
+    let (green, red) = (egui::Color32::from_rgb(80, 220, 80), egui::Color32::from_rgb(230, 60, 60));
+
+    // Near the east side of tile (0, 1): a doorway between it and (1, 1).
+    let before = grid(&mut h);
+    assert_eq!(click(&mut h, Vec3::new(8.0, 15.0, 0.0)), [green]);
+    let l = grid(&mut h).lattice;
+    assert_eq!(l.cell(0, 1).edges[EAST], Some(doorway));
+    assert_eq!(l.cell(1, 1).edges[WEST], Some(doorway));
+    let changed: Vec<(u32, u32)> = (0..4)
+        .flat_map(|y| (0..4).map(move |x| (x, y)))
+        .filter(|&(x, y)| l.cell(x, y) != before.lattice.cell(x, y))
+        .collect();
+    assert_eq!(changed, [(0, 1), (1, 1)], "only the two tiles either side");
+    // One undo takes it back.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+    assert_eq!(grid(&mut h).lattice, before.lattice);
+
+    // A quarter no tile fits a doorway at (beside the area's stone room):
+    // red, and the click is refused.
+    let g = grid(&mut h);
+    let refused = (0..4u32)
+        .flat_map(|y| (0..4u32).flat_map(move |x| (0..4usize).map(move |e| ((x, y), e))))
+        .find(|&q| g.draw_crosser(&index, &[q], &[], doorway).is_none());
+    let ((x, y), e) = refused.expect("a quarter that refuses a doorway");
+    // That quarter's middle, a metre and a half in from its edge.
+    let (dx, dy) = [(0.0, -3.5), (3.5, 0.0), (0.0, 3.5), (-3.5, 0.0)][e];
+    let p = Vec3::new(x as f32 * 10.0 + 5.0 + dx, y as f32 * 10.0 + 5.0 + dy, 0.0);
+    assert_eq!(click(&mut h, p), [red], "quarter {e} of ({x}, {y})");
+    assert_eq!(grid(&mut h).lattice, before.lattice);
+}
+
+#[test]
+fn a_crosser_drag_lays_what_fits_and_passes_over_the_rest() {
+    // As Aurora's brush (aurora_terrain's drags): a doorway dragged along
+    // the row of the area's stone room, which takes none on two of its
+    // sides. Refused whole before; now the rest is laid, and the quarters
+    // passed over are red while the drag lasts.
+    use glam::Vec3;
+    use mg_tiles::TileIndex;
+    let Some((mut h, area)) = area_harness_on("crosser-lay", "tic01", None) else { return };
+    let index = {
+        let game = h.state().game.as_deref().unwrap();
+        TileIndex::new(&mg_area::tileset(game, ResRef::from_str("tic01").unwrap()).unwrap())
+    };
+    let grid = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
+        mg_area::terrain::grid(&are.root, &index).unwrap()
+    };
+    show_palette(h.state_mut());
+    h.run_steps(3);
+    palette_type(&mut h, "Tiles");
+    h.run_steps(2);
+    click_in_sight(&mut h, "Doorway");
+    h.run_steps(2);
+    let doorway = index.crosser("Doorway").expect("tic01's Doorway");
+    let red = egui::Color32::from_rgb(230, 60, 60);
+    let before = grid(&mut h);
+
+    let from = screen(&h, area, Vec3::new(5.0, 15.0, 0.0));
+    h.hover_at(from);
+    h.run_steps(2);
+    press(&h, from, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    let mut x = 7.0;
+    while x <= 35.0 {
+        h.hover_at(screen(&h, area, Vec3::new(x, 15.0, 0.0)));
+        h.run_steps(1);
+        x += 2.0;
+    }
+    h.run_steps(2);
+    let view = &h.state().area_views[&area];
+    let quarters = view.crossing.clone();
+    let colors: Vec<egui::Color32> = view.brush_cursor.iter().map(|(_, c)| *c).collect();
+    let (whole, (laid, passed)) = (
+        before.draw_crosser(&index, &quarters, &[], doorway),
+        before.lay_crosser(&index, &quarters, &[], doorway),
+    );
+    assert!(whole.is_none(), "the drag is refused as a whole: {quarters:?}");
+    let laid = laid.expect("some of it fits");
+    assert!(!passed.is_empty());
+    assert!(colors.contains(&red), "the quarters passed over red: {colors:?}");
+    let to = screen(&h, area, Vec3::new(35.0, 15.0, 0.0));
+    press(&h, to, false, egui::Modifiers::NONE);
+    h.run_steps(3);
+    let l = grid(&mut h).lattice;
+    assert_ne!(l, before.lattice, "something laid");
+    for y in 0..4 {
+        for x in 0..4 {
+            assert_eq!(l.cell(x, y).edges, laid.lattice.cell(x, y).edges, "({x}, {y})");
+        }
+    }
 }
 
 #[test]
@@ -1722,11 +1946,11 @@ fn the_eraser_erases_every_tile_it_is_dragged_across() {
         press(h, screen(h, area, path[path.len() - 1]), false, egui::Modifiers::NONE);
         h.run_steps(2);
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     // Two roads, along the first row and the third.
     for y in [5.0, 25.0] {
@@ -1739,7 +1963,7 @@ fn the_eraser_erases_every_tile_it_is_dragged_across() {
     assert!(road(&roads, 0) && road(&roads, 2), "two roads drawn");
 
     // One Eraser drag down across both: each is erased.
-    h.get_by_label("🗑 Eraser").click();
+    h.get_by_label("Eraser").click();
     h.run_steps(2);
     let path: Vec<Vec3> =
         [5.0, 10.0, 15.0, 20.0, 25.0].iter().map(|&y| Vec3::new(15.0, y, 0.0)).collect();
@@ -1780,11 +2004,11 @@ fn a_right_click_with_a_crosser_on_its_own_tile_erases_it() {
         }
         h.run_steps(2);
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     // A road along the first row.
     let from = screen(&h, area, Vec3::new(7.0, 5.0, 0.0));
@@ -1828,12 +2052,12 @@ fn a_right_click_with_a_crosser_on_its_own_tile_erases_it() {
         h.run_steps(2);
     };
     right_click(&mut h, Vec3::new(18.0, 5.0, 0.0));
-    h.get_by_label("Stream").click();
+    click_in_sight(&mut h, "Stream");
     h.run_steps(2);
     let along: Vec<Vec3> =
         [3.0, 8.0, 14.0, 20.0, 26.0, 32.0, 37.0].iter().map(|&x| Vec3::new(x, 15.0, 0.0)).collect();
     drag(&mut h, &along);
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     let up: Vec<Vec3> =
         [3.0, 8.0, 14.0, 20.0, 26.0, 32.0, 37.0].iter().map(|&y| Vec3::new(15.0, y, 0.0)).collect();
@@ -1861,12 +2085,12 @@ fn refine_tile_steps_a_tile_through_those_that_fit_and_paints_nothing() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         mg_area::terrain::grid(&are.root, &index).unwrap()
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
     // (Its place among the tools: `tile_tools_change_a_tile_s_appearance_and_turn_it`.)
-    h.get_by_label("🔁 Refine Tile").click();
+    apart(&h, "Refine Tile").click();
     h.run_steps(2);
     let before = grid(&mut h);
     let next = mg_tiles::paint::next_fit(&index, &before.lattice.cell(1, 1), before.tile(1, 1))
@@ -1897,8 +2121,10 @@ fn refine_tile_steps_a_tile_through_those_that_fit_and_paints_nothing() {
 
 /// A right click on a tile opens the tile's items without Select Tiles
 /// (a builder's tile feedback): on the ground with no object there, the
-/// area's menu has them (as Aurora's has Tile Properties for a tile); on
-/// an object, not. With a terrain brush, the tile menu, the brush kept.
+/// area's menu has them (as Aurora's has Tile Properties for a tile;
+/// since M4's U5 its Tile Properties takes Select Tiles with that tile
+/// selected, the Right Dock's panel showing it); on an object, not. With
+/// a terrain brush, the tile menu, the brush kept.
 #[test]
 fn a_right_click_on_a_tile_opens_its_menu_without_select_tiles() {
     use glam::Vec3;
@@ -1920,20 +2146,23 @@ fn a_right_click_on_a_tile_opens_its_menu_without_select_tiles() {
     let ground = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
     right_click(&mut h, ground);
     let items = menu_items(&h, "Set Start Location Here");
-    let dir = mg_testkit::scratch_dir("ui-tile-menu-ground");
-    h.render().unwrap().save(dir.join("ground.png")).unwrap();
+    if let Some(dir) = shot_dir("ui-tile-menu-ground") {
+        h.render().unwrap().save(dir.join("ground.png")).unwrap();
+    }
     assert_eq!(
         items[..4],
-        ["Next Tile Appearance", "Previous Tile Appearance", "Rotate Tile", "Tile Properties…"],
+        ["Next Tile Appearance", "Previous Tile Appearance", "Rotate Tile", "Tile Properties"],
         "{items:?}"
     );
-    h.get_by_label("Tile Properties…").click();
+    popup_item(&h, "Tile Properties").click();
     h.run_steps(2);
-    let props = h.state().tile_props.clone().expect("Tile Properties is open");
+    let props = h.state().tile_props.clone().expect("Tile Properties shows the tile");
     assert_eq!(props.tiles, [5]);
-    assert!(!h.state().area_views[&area].tile_mode, "still working on objects");
-    h.state_mut().tile_props = None;
+    assert!(h.state().area_views[&area].tile_mode, "Select Tiles taken");
+    assert_eq!(h.state().area_views[&area].tile_selection, [(1, 1)]);
+    area_click(&mut h, "Select Objects");
     h.run_steps(2);
+    assert!(!h.state().area_views[&area].tile_mode);
     // A waypoint: its menu, no tile's items.
     let waypoint = screen(&h, area, Vec3::new(20.0, 20.0, 0.0));
     right_click(&mut h, waypoint);
@@ -1942,14 +2171,14 @@ fn a_right_click_on_a_tile_opens_its_menu_without_select_tiles() {
     h.key_press(egui::Key::Escape);
     h.run_steps(3);
     // Painting Grass: a right click is the tile menu, and Grass stays.
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Grass").click();
+    click_in_sight(&mut h, "Grass");
     h.run_steps(2);
     right_click(&mut h, ground);
-    let items = menu_items(&h, "Tile Properties…");
+    let items = menu_items(&h, "Tile Properties");
     assert_eq!(
         items,
         [
@@ -1957,24 +2186,25 @@ fn a_right_click_on_a_tile_opens_its_menu_without_select_tiles() {
             "Next Tile Appearance",
             "Previous Tile Appearance",
             "Rotate Tile",
-            "Tile Properties…"
+            "Tile Properties"
         ]
     );
     assert!(h.state().palette.tile_brush.is_some(), "the brush kept");
-    let dir = mg_testkit::scratch_dir("ui-tile-menu");
-    h.render().unwrap().save(dir.join("painting.png")).unwrap();
+    if let Some(dir) = shot_dir("ui-tile-menu") {
+        h.render().unwrap().save(dir.join("painting.png")).unwrap();
+    }
     h.get_by_label("Put Down Grass").click();
     h.run_steps(2);
     assert!(h.state().palette.tile_brush.is_none());
     // The palette's Select Tiles: the view's tile mode, the brush let go.
-    h.get_by_label("↕ Raise/Lower").click();
+    h.get_by_label("Raise/Lower").click();
     h.run_steps(2);
-    h.get_by_label("⛶ Select Tiles (F10)").click();
+    apart(&h, "Select Tiles").click();
     h.run_steps(2);
     assert!(h.state().area_views[&area].tile_mode);
     assert!(h.state().palette.tile_brush.is_none());
     // A brush chosen: out of tile mode.
-    h.get_by_label("Grass").click();
+    click_in_sight(&mut h, "Grass");
     h.run_steps(2);
     assert!(!h.state().area_views[&area].tile_mode);
 }
@@ -2005,27 +2235,27 @@ fn tile_tools_change_a_tile_s_appearance_and_turn_it() {
     };
     let undo_label =
         |h: &Harness<'_, Moonglow>| h.state().ws.as_ref().unwrap().can_undo().map(str::to_string);
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
     // The tools, in order: Select Tiles, the Eraser, Refine Tile, the
     // three, Raise/Lower; then the terrains (Rural's Grass, Road, Water…).
-    let top = |h: &Harness<'_, Moonglow>, label: &str| h.get_by_label(label).rect().top();
+    let top = |h: &Harness<'_, Moonglow>, label: &str| apart(h, label).rect().top();
     let order = [
-        "⛶ Select Tiles (F10)",
-        "🗑 Eraser",
-        "🔁 Refine Tile",
-        "⏭ Next Tile Appearance",
-        "⏮ Previous Tile Appearance",
-        "↺ Rotate Tile",
-        "↕ Raise/Lower",
+        "Select Tiles",
+        "Eraser",
+        "Refine Tile",
+        "Next Tile Appearance",
+        "Previous Tile Appearance",
+        "Rotate Tile",
+        "Raise/Lower",
     ];
     for pair in order.windows(2) {
         assert!(top(&h, pair[0]) < top(&h, pair[1]), "{} above {}", pair[0], pair[1]);
     }
     for terrain in ["Grass", "Road", "Water"] {
-        assert!(top(&h, "↕ Raise/Lower") < top(&h, terrain), "Raise/Lower is above {terrain}");
+        assert!(top(&h, "Raise/Lower") < top(&h, terrain), "Raise/Lower is above {terrain}");
     }
     let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
     let click = |h: &mut Harness<'_, Moonglow>| {
@@ -2039,7 +2269,7 @@ fn tile_tools_change_a_tile_s_appearance_and_turn_it() {
     let cell = before.lattice.cell(1, 1);
     let now = before.tile(1, 1);
     // Next, then Previous: another tile, then back.
-    h.get_by_label("⏭ Next Tile Appearance").click();
+    apart(&h, "Next Tile Appearance").click();
     h.run_steps(2);
     click(&mut h);
     let next = step_appearance(&index, &cell, now, false).expect("Rural's grass has others");
@@ -2048,7 +2278,7 @@ fn tile_tools_change_a_tile_s_appearance_and_turn_it() {
     assert_eq!(g.tile(1, 1), next);
     assert_eq!(g.lattice, before.lattice, "no terrain painted");
     assert_eq!(undo_label(&h).as_deref(), Some("Next tile appearance"));
-    h.get_by_label("⏮ Previous Tile Appearance").click();
+    apart(&h, "Previous Tile Appearance").click();
     h.run_steps(2);
     click(&mut h);
     assert_eq!(grid(&mut h).tile(1, 1), now, "a step back");
@@ -2065,7 +2295,7 @@ fn tile_tools_change_a_tile_s_appearance_and_turn_it() {
             .map(|l| t.integer(l))
     };
     let was = tile(&mut h);
-    h.get_by_label("↺ Rotate Tile").click();
+    apart(&h, "Rotate Tile").click();
     h.run_steps(2);
     click(&mut h);
     let turned = turn_fit(&index, &cell, now, false).expect("grass turns");
@@ -2079,7 +2309,7 @@ fn tile_tools_change_a_tile_s_appearance_and_turn_it() {
     // The tile menu's, in tile mode: on the tile selected.
     h.key_press(egui::Key::Escape);
     h.run_steps(2);
-    h.get_by_label("⛶ Select Tiles (F10)").click();
+    apart(&h, "Select Tiles").click();
     h.run_steps(2);
     click(&mut h);
     assert_eq!(h.state().area_views[&area].tile_selection, [(1, 1)]);
@@ -2092,7 +2322,7 @@ fn tile_tools_change_a_tile_s_appearance_and_turn_it() {
         });
     }
     h.run_steps(3);
-    h.get_by_label("Rotate Tile").click();
+    popup_item(&h, "Rotate Tile").click();
     h.run_steps(3);
     assert_eq!(grid(&mut h).tile(1, 1), turned);
     assert_eq!(undo_label(&h).as_deref(), Some("Rotate tile"));
@@ -2105,7 +2335,7 @@ fn tile_tools_change_a_tile_s_appearance_and_turn_it() {
         });
     }
     h.run_steps(3);
-    h.get_by_label("Next Tile Appearance").click();
+    popup_item(&h, "Next Tile Appearance").click();
     h.run_steps(3);
     let other = step_appearance(&index, &cell, turned, false).unwrap();
     assert_eq!(grid(&mut h).tile(1, 1), other);
@@ -2155,16 +2385,18 @@ fn palette_tile_tools_step_the_selected_tiles() {
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
         h.run_steps(3);
     };
-    let shots = mg_testkit::scratch_dir("ui-tile-tools-selected");
+    let shots = shot_dir("ui-tile-tools-selected");
     let shot = |h: &mut Harness<'_, Moonglow>, name: &str| {
         h.run_steps(10);
-        h.render().unwrap().save(shots.join(format!("{name}.png"))).unwrap();
+        if let Some(ref shots) = shots {
+            h.render().unwrap().save(shots.join(format!("{name}.png"))).unwrap();
+        }
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("⛶ Select Tiles (F10)").click();
+    apart(&h, "Select Tiles").click();
     h.run_steps(2);
     let (a, b) = (Vec3::new(15.0, 15.0, 0.0), Vec3::new(25.0, 15.0, 0.0));
     click(&mut h, a, egui::Modifiers::NONE);
@@ -2178,7 +2410,7 @@ fn palette_tile_tools_step_the_selected_tiles() {
     // Next: the selected tile steps, the selection stays; again, a step
     // further; each one step to undo.
     shot(&mut h, "one-before");
-    h.get_by_label("⏭ Next Tile Appearance").click();
+    apart(&h, "Next Tile Appearance").click();
     h.run_steps(3);
     shot(&mut h, "one-next");
     let next = step_appearance(&index, &cell((1, 1)), now, false).expect("grass has others");
@@ -2188,7 +2420,7 @@ fn palette_tile_tools_step_the_selected_tiles() {
     assert_eq!(selecting(&h), (true, one.clone(), true), "Select Tiles and the selection kept");
     assert_eq!(undo_label(&h).as_deref(), Some("Next tile appearance"));
     only_changed(&list, &tiles(&mut h), &[5]);
-    h.get_by_label("⏭ Next Tile Appearance").click();
+    apart(&h, "Next Tile Appearance").click();
     h.run_steps(3);
     let further = step_appearance(&index, &cell((1, 1)), next, false).unwrap();
     assert_eq!(grid(&mut h).tile(1, 1), further, "a second click: a step further");
@@ -2199,7 +2431,7 @@ fn palette_tile_tools_step_the_selected_tiles() {
     assert_eq!(tiles(&mut h), list);
 
     // Previous: a step back.
-    h.get_by_label("⏮ Previous Tile Appearance").click();
+    apart(&h, "Previous Tile Appearance").click();
     h.run_steps(3);
     let back = step_appearance(&index, &cell((1, 1)), now, true).unwrap();
     assert_eq!(grid(&mut h).tile(1, 1), back);
@@ -2210,7 +2442,7 @@ fn palette_tile_tools_step_the_selected_tiles() {
 
     // Rotate: the same tile a quarter round, its lights kept; with Shift,
     // the other way.
-    h.get_by_label("↺ Rotate Tile").click();
+    apart(&h, "Rotate Tile").click();
     h.run_steps(3);
     let turned = turn_fit(&index, &cell((1, 1)), now, false).expect("grass turns");
     assert_eq!(grid(&mut h).tile(1, 1), turned);
@@ -2223,7 +2455,7 @@ fn palette_tile_tools_step_the_selected_tiles() {
     assert_eq!(undo_label(&h).as_deref(), Some("Rotate tile"));
     undo(&mut h);
     assert_eq!(tiles(&mut h), list, "undone");
-    h.get_by_label("↺ Rotate Tile").click_modifiers(egui::Modifiers::SHIFT);
+    apart(&h, "Rotate Tile").click_modifiers(egui::Modifiers::SHIFT);
     h.run_steps(3);
     let clockwise = turn_fit(&index, &cell((1, 1)), now, true).unwrap();
     assert_eq!(grid(&mut h).tile(1, 1), clockwise, "Shift: clockwise");
@@ -2237,17 +2469,17 @@ fn palette_tile_tools_step_the_selected_tiles() {
     assert_eq!(selecting(&h), (true, two.clone(), true));
     shot(&mut h, "two-before");
     for (tool, label) in [
-        ("⏭ Next Tile Appearance", "Next tile appearance"),
-        ("⏮ Previous Tile Appearance", "Previous tile appearance"),
-        ("↺ Rotate Tile", "Rotate tile"),
+        ("Next Tile Appearance", "Next tile appearance"),
+        ("Previous Tile Appearance", "Previous tile appearance"),
+        ("Rotate Tile", "Rotate tile"),
     ] {
-        h.get_by_label(tool).click();
+        apart(&h, tool).click();
         h.run_steps(3);
         let g = grid(&mut h);
         for c in [(1, 1), (2, 1)] {
             let was = before.tile(c.0, c.1);
             let made = match tool {
-                "↺ Rotate Tile" => turn_fit(&index, &cell(c), was, false),
+                "Rotate Tile" => turn_fit(&index, &cell(c), was, false),
                 _ => step_appearance(&index, &cell(c), was, tool.contains("Previous")),
             };
             assert_eq!(g.tile(c.0, c.1), made.unwrap(), "{tool}: tile {c:?} on its own");
@@ -2265,25 +2497,25 @@ fn palette_tile_tools_step_the_selected_tiles() {
 
     // A group's tile: refused, saying why, the group in red; the
     // selection kept.
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
-    h.get_by_label("Barn 1 2x2").click();
+    click_in_sight(&mut h, "Barn 1 2x2");
     h.run_steps(2);
     click(&mut h, a, egui::Modifiers::NONE);
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
     let placed = grid(&mut h);
     assert!(index.is_grouped(placed.tile(2, 1).tile), "the barn placed");
-    h.get_by_label("⛶ Select Tiles (F10)").click();
+    apart(&h, "Select Tiles").click();
     h.run_steps(2);
     click(&mut h, b, egui::Modifiers::NONE);
     let east = vec![(2, 1)];
     assert_eq!(selecting(&h), (true, east.clone(), true));
     for (tool, label) in
-        [("⏭ Next Tile Appearance", "Next tile appearance"), ("↺ Rotate Tile", "Rotate tile")]
+        [("Next Tile Appearance", "Next tile appearance"), ("Rotate Tile", "Rotate tile")]
     {
         h.state_mut().area_views.get_mut(&area).unwrap().refused = None;
-        h.get_by_label(tool).click();
+        apart(&h, tool).click();
         h.run_steps(3);
         assert_eq!(grid(&mut h), placed, "{tool}: nothing changed");
         let says = format!("{label}: tiles of a group or feature");
@@ -2298,7 +2530,7 @@ fn palette_tile_tools_step_the_selected_tiles() {
     // No selection: the tool is chosen, as ever, Select Tiles let go.
     h.state_mut().area_views.get_mut(&area).unwrap().tile_selection.clear();
     h.run_steps(2);
-    h.get_by_label("⏭ Next Tile Appearance").click();
+    apart(&h, "Next Tile Appearance").click();
     h.run_steps(2);
     let brush = h.state().palette.tile_brush.clone().map(|b| b.brush);
     assert_eq!(brush, Some(mg_area::terrain::Brush::Appearance { back: false }));
@@ -2352,12 +2584,12 @@ fn refine_eraser_and_the_tile_tools_keys_act_on_the_selected_tiles() {
         h.key_press_modifiers(m, k);
         h.run_steps(3);
     };
-    let shots = mg_testkit::scratch_dir("ui-tile-tools-keys");
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    let shots = shot_dir("ui-tile-tools-keys");
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("⛶ Select Tiles (F10)").click();
+    apart(&h, "Select Tiles").click();
     h.run_steps(2);
     let (a, b) = (Vec3::new(15.0, 15.0, 0.0), Vec3::new(25.0, 15.0, 0.0));
     click(&mut h, a, egui::Modifiers::NONE);
@@ -2369,7 +2601,7 @@ fn refine_eraser_and_the_tile_tools_keys_act_on_the_selected_tiles() {
 
     // Refine Tile: the first the next that fits, the second (grass too)
     // the same tile.
-    h.get_by_label("🔁 Refine Tile").click();
+    apart(&h, "Refine Tile").click();
     h.run_steps(3);
     let first = next_fit(&index, &cell((1, 1)), before.tile(1, 1)).expect("grass has others");
     let g = grid(&mut h);
@@ -2411,23 +2643,23 @@ fn refine_eraser_and_the_tile_tools_keys_act_on_the_selected_tiles() {
 
     // A barn: the Eraser on one of its tiles takes it all, as Delete; X
     // the same.
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
-    h.get_by_label("Barn 1 2x2").click();
+    click_in_sight(&mut h, "Barn 1 2x2");
     h.run_steps(2);
     click(&mut h, a, egui::Modifiers::NONE);
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
     let placed = grid(&mut h);
     assert!(index.is_grouped(placed.tile(2, 1).tile), "the barn placed");
-    h.get_by_label("⛶ Select Tiles (F10)").click();
+    apart(&h, "Select Tiles").click();
     h.run_steps(2);
     click(&mut h, b, egui::Modifiers::NONE);
     let east = vec![(2, 1)];
     assert_eq!(selecting(&h), (true, east.clone(), true));
     // Refine Tile on a barn's tile: refused, the reason first on the line.
     h.state_mut().area_views.get_mut(&area).unwrap().refused = None;
-    h.get_by_label("🔁 Refine Tile").click();
+    apart(&h, "Refine Tile").click();
     h.run_steps(3);
     assert_eq!(grid(&mut h), placed, "refused");
     let says = "Refine tiles: tiles of a group or feature";
@@ -2437,12 +2669,14 @@ fn refine_eraser_and_the_tile_tools_keys_act_on_the_selected_tiles() {
     red.sort();
     assert_eq!(red, [(1, 1), (1, 2), (2, 1), (2, 2)], "the barn in red");
     h.run_steps(10);
-    h.render().unwrap().save(shots.join("refused.png")).unwrap();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("refused.png")).unwrap();
+    }
     let erased = |h: &mut Harness<'_, Moonglow>| {
         let g = grid(h);
         [(1, 1), (2, 1), (1, 2), (2, 2)].iter().all(|&(x, y)| !index.is_grouped(g.tile(x, y).tile))
     };
-    h.get_by_label("🗑 Eraser").click();
+    h.get_by_label("Eraser").click();
     h.run_steps(3);
     assert!(erased(&mut h), "the barn gone whole");
     assert_eq!(undo_label(&h).as_deref(), Some("Delete tiles"));
@@ -2470,7 +2704,9 @@ fn refine_eraser_and_the_tile_tools_keys_act_on_the_selected_tiles() {
         // (Its row in the palette shows it chosen.)
         if brush == mg_area::terrain::Brush::Eraser {
             h.run_steps(5);
-            h.render().unwrap().save(shots.join("eraser-chosen.png")).unwrap();
+            if let Some(ref shots) = shots {
+                h.render().unwrap().save(shots.join("eraser-chosen.png")).unwrap();
+            }
         }
     }
     key(&mut h, egui::Modifiers::NONE, egui::Key::N);
@@ -2491,11 +2727,11 @@ fn the_eraser_s_key_chooses_the_palette_s_eraser() {
     h.run_steps(3);
     let brush = h.state().palette.tile_brush.clone().expect("chosen");
     assert_eq!(brush.brush, mg_area::terrain::Brush::Eraser);
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    let name = format!("🗑 {}", brush.label);
+    let name = brush.label.to_string();
     let row = h.get_by_label(&name);
     let chosen = Some(egui::accesskit::Toggled::True);
     assert_eq!(row.accesskit_node().toggled(), chosen, "its row shows it chosen");
@@ -2508,6 +2744,11 @@ fn the_eraser_s_key_chooses_the_palette_s_eraser() {
 fn tile_variant_pictures_take_the_size_set() {
     use glam::Vec3;
     let Some((mut h, area)) = area_harness("tile-variant-size") else { return };
+    // (The Right Dock wide enough for two pictures of 200 across: the
+    // panel is its lower section.)
+    wide_window(&mut h);
+    right_dock_width(&mut h, 640.0);
+    settle(&mut h);
     h.state_mut().settings.tile_variant_side = Some(200);
     let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
     h.hover_at(at);
@@ -2520,7 +2761,7 @@ fn tile_variant_pictures_take_the_size_set() {
         });
     }
     h.run_steps(3);
-    h.get_by_label("Tile Properties…").click();
+    popup_item(&h, "Tile Properties").click();
     h.run_steps(2);
     let (_, variants) = h.state().tile_props.clone().unwrap().variants.unwrap();
     // (The pictures made, to look at.)
@@ -2530,33 +2771,58 @@ fn tile_variant_pictures_take_the_size_set() {
             break;
         }
     }
-    // How far apart the first two are, across (their names, under them).
+    // (The variants in sight in the panel's scroll: only the rows in sight
+    // are drawn.)
+    h.get_by_label_contains("fit here)").scroll_to_me();
+    h.run_steps(3);
+    // How far apart the first two are, across: their cells (the kit's small
+    // variant, 6 apart).
+    let rect = |h: &Harness<'_, Moonglow>, k: usize| {
+        let (p, model): &(mg_tiles::Placement, String) = &variants[k];
+        let turn = ["", " ↺90°", " ↺180°", " ↺270°"][usize::from(p.orientation % 4)];
+        h.get_by_label(&format!("{model}{turn}")).rect()
+    };
     let apart = |h: &Harness<'_, Moonglow>| {
-        let rect = |k: usize| {
-            let (p, model) = &variants[k];
-            let turn = ["", " ↺90°", " ↺180°", " ↺270°"][usize::from(p.orientation % 4)];
-            h.get_by_label(&format!("{model}{turn}")).rect()
-        };
-        let (a, b) = (rect(0), rect(1));
+        let (a, b) = (rect(h, 0), rect(h, 1));
         assert_eq!(a.top(), b.top(), "on one row");
         b.left() - a.left()
     };
-    assert!((apart(&h) - 214.0).abs() < 1.0, "200 points and the gaps: {}", apart(&h));
+    let fits = |h: &Harness<'_, Moonglow>, side: f32| {
+        let want = side + mg_uikit::gallery::SMALL_GAP;
+        (apart(h) - want).abs() < 1.0 && (rect(h, 0).width() - side).abs() < 1.0
+    };
+    assert!(fits(&h, 200.0), "200 points and the gap: {}", apart(&h));
     h.get_by_label("Size");
-    let dir = mg_testkit::scratch_dir("ui-tile-variant-size");
-    h.render().unwrap().save(dir.join("large.png")).unwrap();
+    let dir = shot_dir("ui-tile-variant-size");
+    if let Some(ref dir) = dir {
+        h.render().unwrap().save(dir.join("large.png")).unwrap();
+    }
     // The usual size, unless set.
     h.state_mut().settings.tile_variant_side = None;
     h.run_steps(3);
-    assert!((apart(&h) - 98.0).abs() < 1.0, "{}", apart(&h));
-    // Small, a picture under the pointer shows at its largest beside it.
-    let (p, model) = &variants[1];
-    let turn = ["", " ↺90°", " ↺180°", " ↺270°"][usize::from(p.orientation % 4)];
-    let name = h.get_by_label(&format!("{model}{turn}")).rect();
-    h.hover_at(name.center_top() - egui::vec2(0.0, 40.0));
+    assert!(fits(&h, 84.0), "84 points and the gap: {}", apart(&h));
+    // Small, a picture under the pointer shows at its largest beside the
+    // panel, not over the cell it tells of.
+    let cell = rect(&h, 1);
+    h.hover_at(cell.center());
     h.run_steps(60);
-    h.render().unwrap().save(dir.join("hovered.png")).unwrap();
-    h.render().unwrap().save(dir.join("usual.png")).unwrap();
+    let title = format!("Tile {}: ", variants[1].0.tile);
+    h.get_by_label_contains(&title);
+    // (The whole enlargement, its title and picture: the tooltip layer's
+    // areas, not its title's label alone, which stands over the picture.)
+    let tips: Vec<egui::Rect> = h.ctx.memory(|m| {
+        (m.layer_ids())
+            .filter(|l| l.order == egui::Order::Tooltip && m.areas().is_visible(l))
+            .filter_map(|l| m.area_rect(l.id))
+            .collect()
+    });
+    assert!(!tips.is_empty(), "no enlargement");
+    for tip in tips {
+        assert!(!tip.intersects(cell), "the enlargement {tip:?} over its cell {cell:?}");
+    }
+    if let Some(ref dir) = dir {
+        h.render().unwrap().save(dir.join("hovered.png")).unwrap();
+    }
 }
 
 /// The model of tile `tile` of the test area's tileset (Rural): its
@@ -2600,9 +2866,9 @@ fn a_tile_chosen_in_the_gallery_is_painted_along_a_drag() {
     });
     let tile = *all_grass.iter().find(|t| **t != before.tile(1, 1).tile).expect("grass variants");
     h.state_mut().settings.palette_gallery = true;
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(3);
     // (Scrolled to: the pictures under the headings above take the
     // pane's height.)
@@ -2639,7 +2905,8 @@ fn a_tile_chosen_in_the_gallery_is_painted_along_a_drag() {
 /// The area view as it is now, and seen from the south-west, a little
 /// above: saved as `path` (`-top.png` and `-angled.png`), the camera put
 /// back after.
-fn area_shots(h: &mut Harness<'_, Moonglow>, area: ResRef, path: &std::path::Path) {
+fn area_shots(h: &mut Harness<'_, Moonglow>, area: ResRef, path: Option<std::path::PathBuf>) {
+    let Some(path) = path else { return };
     h.hover_at(egui::pos2(960.0, 610.0));
     h.run_steps(20);
     h.render().unwrap().save(path.with_extension("top.png")).unwrap();
@@ -2673,6 +2940,45 @@ fn only_changed(before: &[mg_gff::Struct], after: &[mg_gff::Struct], changed: &[
     }
 }
 
+/// Shift + right click on the ground steps the tile there to the next
+/// that fits in object mode too, as Aurora's does (a builder's ask: it
+/// took Select Tiles): that tile alone, one step of Undo, and no menu;
+/// a right click without Shift opens the menu as before.
+#[test]
+fn shift_and_a_right_click_steps_a_tile_in_object_mode() {
+    use glam::Vec3;
+    let Some((mut h, area)) = area_harness("shift-right-tile") else { return };
+    settle(&mut h);
+    assert!(!h.state().area_views[&area].tile_mode, "object mode");
+    let list = tile_list(&mut h, area);
+    let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
+    h.hover_at(at);
+    h.run_steps(2);
+    let right = |h: &mut Harness<'_, Moonglow>, modifiers: egui::Modifiers| {
+        for pressed in [true, false] {
+            h.event_modifiers(
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers,
+                },
+                modifiers,
+            );
+        }
+        h.run_steps(3);
+    };
+    right(&mut h, egui::Modifiers::SHIFT);
+    assert_eq!(undo_label(&h).as_deref(), Some("Next tile"));
+    only_changed(&list, &tile_list(&mut h, area), &[5]);
+    assert!(h.query_by_label_contains("Tile Properties").is_none(), "no menu");
+    // Without Shift: the menu, the tile as it is.
+    let stepped = tile_list(&mut h, area);
+    right(&mut h, egui::Modifiers::NONE);
+    assert!(h.query_by_label_contains("Tile Properties").is_some(), "the menu");
+    assert_eq!(tile_list(&mut h, area), stepped);
+}
+
 /// The tiles palette's Exact tile switch (#29): shown beside List and
 /// Gallery, off at first and remembered; on, a tile chosen in the Gallery
 /// goes in alone where it is clicked (or dragged), as it is, turned as the
@@ -2703,19 +3009,19 @@ fn an_exact_tile_goes_in_alone() {
         })
         .first()
         .expect("Rural has wall ends");
-    let shots = mg_testkit::scratch_dir("ui-exact-tile");
+    let shots = shot_dir("ui-exact-tile");
     let away = egui::pos2(960.0, 610.0);
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(3);
-    // Not shown with the List and no tile chosen; beside the Gallery's
-    // switch with it.
-    assert!(h.query_by_label("📌 Exact tile").is_none());
-    h.get_by_label("🖼").click();
+    // Grayed with the List and no tile chosen (the AreaTiles board);
+    // beside the Gallery's switch with it.
+    assert!(h.get_by_label("Exact Tile").accesskit_node().is_disabled(), "grayed in the List");
+    h.get_by_label("Gallery").click();
     h.run_steps(2);
     assert!(!h.state().settings.exact_tiles, "off at first");
-    h.get_by_label("📌 Exact tile").click();
+    h.get_by_label("Exact Tile").click();
     h.run_steps(2);
     assert!(h.state().settings.exact_tiles, "on, and remembered");
     let picture = index_model(&h, tile);
@@ -2726,15 +3032,19 @@ fn an_exact_tile_goes_in_alone() {
     h.run_steps(2);
     h.hover_at(away);
     h.run_steps(30);
-    h.render().unwrap().save(shots.join("palette.png")).unwrap();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("palette.png")).unwrap();
+    }
     let before = grid(&mut h);
     let list = tile_list(&mut h, area);
-    area_shots(&mut h, area, &shots.join("before"));
+    area_shots(&mut h, area, shots.as_deref().map(|d| d.join("before")));
     // A click in tile (1, 1): that tile there, its neighbors untouched.
     let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
     h.hover_at(at);
     h.run_steps(2);
-    h.render().unwrap().save(shots.join("preview.png")).unwrap();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("preview.png")).unwrap();
+    }
     // (The preview shows that tile alone.)
     let view = &h.state().area_views[&area];
     let shown = view.tile_preview.clone();
@@ -2750,9 +3060,9 @@ fn an_exact_tile_goes_in_alone() {
     only_changed(&list, &tile_list(&mut h, area), &[5]);
     assert_eq!(
         h.state().ws.as_ref().unwrap().can_undo(),
-        Some(format!("Exact tile {picture}").as_str())
+        Some(format!("Exact Tile {picture}").as_str())
     );
-    area_shots(&mut h, area, &shots.join("after"));
+    area_shots(&mut h, area, shots.as_deref().map(|d| d.join("after")));
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
     h.run_steps(3);
     assert_eq!(tile_list(&mut h, area), list, "one step");
@@ -2787,7 +3097,7 @@ fn an_exact_tile_goes_in_alone() {
     h.run_steps(3);
     assert_eq!(tile_list(&mut h, area), list, "the drag: one step");
     // Off: the same tile is fitted in, as before, or refused where it can't.
-    h.get_by_label("📌 Exact tile").click();
+    h.get_by_label("Exact Tile").click();
     h.run_steps(2);
     assert!(!h.state().settings.exact_tiles);
 }
@@ -2808,8 +3118,8 @@ fn tile_properties_raise_one_tile_alone() {
         let w = git.root.list("WaypointList").unwrap();
         w.iter().map(|s| s.float("ZPosition").unwrap_or(0.0)).collect()
     };
-    let shots = mg_testkit::scratch_dir("ui-tile-height");
-    area_shots(&mut h, area, &shots.join("before"));
+    let shots = shot_dir("ui-tile-height");
+    area_shots(&mut h, area, shots.as_deref().map(|d| d.join("before")));
     // Tile (2, 2), under the waypoint at (20, 20); the one at (30, 20) is
     // on its neighbor.
     tile_properties_of(&mut h, area, &[Vec3::new(25.0, 25.0, 0.0)]);
@@ -2822,13 +3132,14 @@ fn tile_properties_raise_one_tile_alone() {
     h.get_by_label("Raise Height").click();
     h.run_steps(2);
     assert_eq!(h.state().tile_props.as_ref().unwrap().height, Some(was + 2));
-    h.render().unwrap().save(shots.join("window.png")).unwrap();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("window.png")).unwrap();
+    }
     h.get_by_label("Lower Height").click();
     h.run_steps(2);
     h.get_by_label("Raise Height").click();
-    h.run_steps(2);
-    h.get_by_label("OK").click();
     h.run_steps(4);
+    // (Each click a step of its own: no OK.)
     let now = tile_list(&mut h, area);
     assert_eq!(now[10].integer("Tile_Height"), Some(i64::from(was + 2)));
     only_changed(&list, &now, &[10]);
@@ -2836,39 +3147,37 @@ fn tile_properties_raise_one_tile_alone() {
     let shown = &h.state().area_views[&area].model.as_ref().unwrap().tiles[10];
     assert_eq!(shown.position.z, (was + 2) as f32 * step, "drawn at its height");
     assert_eq!(waypoints(&mut h), [2.0 * step, 0.0], "what stands on it rises with it");
-    h.get_by_label("⛶ Select Tiles").click();
-    area_shots(&mut h, area, &shots.join("after"));
+    area_click(&mut h, "Select Tiles");
+    area_shots(&mut h, area, shots.as_deref().map(|d| d.join("after")));
     // Its walkmesh with it: the ground the game walks on (green).
     h.state_mut().area_views.get_mut(&area).unwrap().walkmesh = true;
-    area_shots(&mut h, area, &shots.join("walkmesh"));
+    area_shots(&mut h, area, shots.as_deref().map(|d| d.join("walkmesh")));
     h.state_mut().area_views.get_mut(&area).unwrap().walkmesh = false;
-    h.get_by_label("⛶ Select Tiles").click();
+    area_click(&mut h, "Select Tiles");
     h.run_steps(2);
     assert_eq!(h.state().ws.as_ref().unwrap().can_undo(), Some("Tile Properties"));
-    // Two tiles of different heights: mixed; Escape with it set asks.
+    // Two tiles of different heights: mixed; raised, both from the first
+    // tile's height.
     tile_properties_of(&mut h, area, &[Vec3::new(25.0, 25.0, 0.0), Vec3::new(35.0, 25.0, 0.0)]);
-    let props = h.state().tile_props.clone().expect("the window is open");
+    let props = h.state().tile_props.clone().expect("the panel shows them");
     assert_eq!(props.height, None, "mixed");
-    assert!(!props.changed());
     h.get_by_label("Raise Height").click();
-    h.run_steps(2);
+    h.run_steps(3);
     let p = h.state().tile_props.clone().unwrap();
-    assert_eq!(p.height, Some(was + 3), "from the first tile's");
-    assert!(p.changed());
-    h.state_mut().tile_props.as_mut().unwrap().closing = true;
-    h.run_steps(2);
-    h.get_by_label("Save changes to Tile Properties?");
-    h.get_by_label("Don't Save").click();
-    h.run_steps(2);
-    assert!(h.state().tile_props.is_none());
-    // Undone: as it was.
-    h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+    assert_eq!(p.height, Some(was + 3), "from the first tile's, both");
+    let now = tile_list(&mut h, area);
+    assert_eq!(now[11].integer("Tile_Height"), Some(i64::from(was + 3)));
+    // Undone, a step for each click (four and one): as it was.
+    for _ in 0..5 {
+        assert_eq!(undo_label(&h).as_deref(), Some("Tile Properties"));
+        h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+    }
     h.run_steps(3);
     assert_eq!(tile_list(&mut h, area), list);
     assert_eq!(waypoints(&mut h), [0.0, 0.0]);
 }
 
-/// Tile Properties' All tiles (ignore fit) (#29): off at first, the
+/// Tile Properties' All Tiles (Ignore Fit) (#29): off at first, the
 /// variants that fit as ever; on, every tile of the tileset as pictures
 /// (drawn as they come into sight), and one clicked goes in the tile
 /// chosen as it is, turned as chosen, though it fits nothing there: no
@@ -2898,8 +3207,9 @@ fn tile_properties_put_any_tile_alone() {
     let start = std::time::Instant::now();
     h.run_steps(20);
     eprintln!("20 frames of every tile's pictures: {:?}", start.elapsed());
-    let shots = mg_testkit::scratch_dir("ui-tile-all");
-    h.render().unwrap().save(shots.join("all-tiles.png")).unwrap();
+    if let Some(shots) = shot_dir("ui-tile-all") {
+        h.render().unwrap().save(shots.join("all-tiles.png")).unwrap();
+    }
     // A tile in sight that doesn't fit there, clicked by its picture.
     let props = h.state().tile_props.clone().unwrap();
     let (id, model) = props
@@ -2911,8 +3221,7 @@ fn tile_properties_put_any_tile_alone() {
     let rows = props.every.len();
     let drawn = h.query_all_by_label_contains(" ↺90°").count();
     assert!(drawn < rows, "only the rows in sight are drawn: {drawn} of {rows}");
-    let at = h.get_all_by_label(&format!("{model} ↺90°")).next().unwrap().rect().center_top()
-        - egui::vec2(0.0, 40.0);
+    let at = h.get_all_by_label(&format!("{model} ↺90°")).next().unwrap().rect().center();
     h.hover_at(at);
     press(&h, at, true, egui::Modifiers::NONE);
     press(&h, at, false, egui::Modifiers::NONE);
@@ -2951,7 +3260,7 @@ fn tile_properties_all_tiles_search_by_model_or_number() {
     let every = h.state().tile_props.as_ref().unwrap().every.clone();
     let all = every.len();
     h.get_by_label(&format!("All tiles ({all} in the tileset)"));
-    let shots = mg_testkit::scratch_dir("ui-tile-all-search");
+    let shots = shot_dir("ui-tile-all-search");
     // A model's name, in part: those tiles alone.
     type_into_hint(&mut h, mg_ui::tile_select::ALL_TILES_SEARCH, "a04");
     h.run_steps(20);
@@ -2964,14 +3273,14 @@ fn tile_properties_all_tiles_search_by_model_or_number() {
         // (Not the window's own lines: the tile's, its model's textures.)
         .filter(|l| !l.starts_with("Tile ") && !l.starts_with("Textures of "))
         .collect();
-    h.render().unwrap().save(shots.join("found.png")).unwrap();
     assert!(!shown.is_empty());
     assert!(shown.iter().all(|l| l.contains("a04")), "only the tiles found: {shown:?}");
-    h.render().unwrap().save(shots.join("found.png")).unwrap();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("found.png")).unwrap();
+    }
     // One found, put in by its picture.
     let (id, model) = found[0].clone();
-    let at = h.get_all_by_label(&model).next().expect("its picture").rect().center_top()
-        - egui::vec2(0.0, 40.0);
+    let at = h.get_all_by_label(&model).next().expect("its picture").rect().center();
     h.hover_at(at);
     press(&h, at, true, egui::Modifiers::NONE);
     press(&h, at, false, egui::Modifiers::NONE);
@@ -3061,15 +3370,19 @@ fn tile_properties_all_tiles_on_a_large_hak_tileset() {
     let each: Vec<String> =
         frames.iter().map(|d| format!("{:.1}", d.as_secs_f64() * 1e3)).collect();
     eprintln!("  each frame (ms): {}", each.join(" "));
-    let shots = mg_testkit::scratch_dir("ui-tile-all-hak");
-    h.render().unwrap().save(shots.join("all.png")).unwrap();
+    let shots = shot_dir("ui-tile-all-hak");
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("all.png")).unwrap();
+    }
     type_into_hint(&mut h, mg_ui::tile_select::ALL_TILES_SEARCH, "tkc02_a01");
     h.run_steps(10);
     let every = h.state().tile_props.as_ref().unwrap().every.clone();
     let found = every.iter().filter(|(_, m)| m.to_lowercase().contains("tkc02_a01")).count();
     assert!(found > 0 && found < all, "{found} of {all}");
     h.get_by_label(&format!("All tiles ({found} of {all})"));
-    h.render().unwrap().save(shots.join("found.png")).unwrap();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("found.png")).unwrap();
+    }
 }
 
 /// The area's GIT root, as the workspace has it.
@@ -3078,13 +3391,10 @@ fn git_root(h: &mut Harness<'_, Moonglow>, area: ResRef) -> mg_gff::Struct {
     ws.doc(&ResKey::new(area, ResType::GIT)).unwrap().root.clone()
 }
 
-/// Tile Properties' window moved over the palettes, so that the pictures
-/// show the area beside it.
+/// Tile Properties beside the area, so that the pictures show the area:
+/// the Right Dock's panel (M4's U5) is beside it already.
 fn props_aside(h: &mut Harness<'_, Moonglow>) {
-    let path = h.state().dock.find_tab(&Tab::TileProperties).expect("Tile Properties is open");
-    if let Some(w) = h.state_mut().dock.get_window_state_mut(path.surface) {
-        w.set_position(egui::pos2(842.0, 60.0)).set_size(egui::vec2(255.0, 600.0));
-    }
+    assert!(h.state().tile_props.is_some(), "the Right Dock's Tile Properties shows tiles");
     h.run_steps(3);
 }
 
@@ -3095,8 +3405,9 @@ fn shots_beside(
     h: &mut Harness<'_, Moonglow>,
     area: ResRef,
     at: glam::Vec3,
-    path: &std::path::Path,
+    path: Option<std::path::PathBuf>,
 ) {
+    let Some(path) = path else { return };
     h.hover_at(egui::pos2(960.0, 610.0));
     h.run_steps(20);
     h.render().unwrap().save(path.with_extension("top.png")).unwrap();
@@ -3120,25 +3431,30 @@ fn undo_label(h: &Harness<'_, Moonglow>) -> Option<String> {
 /// Tile Properties' changes show in the area as they are made (the
 /// owner's report: Height and the lights waited for OK): a tile raised
 /// with + stands raised in the area's Tile_List and its model at once,
-/// what stands on it with it, the window still open; more raising, a
-/// height dragged frame by frame and a light are one step to undo, which
-/// OK keeps.
+/// what stands on it with it; each change after (a raise, a height
+/// typed, a light, Defaults) is a step of its own, and Undo takes them
+/// back to the area as it was, byte for byte (M4's U5: no OK).
 #[test]
 fn tile_properties_changes_show_at_once() {
     use glam::Vec3;
     let Some((mut h, area)) = area_harness("tile-live") else { return };
     let (list, git, before) = (tile_list(&mut h, area), git_root(&mut h, area), undo_label(&h));
-    let shots = mg_testkit::scratch_dir("ui-tile-live");
+    let shots = shot_dir("ui-tile-live");
     // Tile (2, 2), index 10, under the waypoint at (20, 20).
     tile_properties_of(&mut h, area, &[Vec3::new(25.0, 25.0, 0.0)]);
     let props = h.state().tile_props.clone().expect("the window is open");
     let was = props.height.expect("one tile: its height");
     props_aside(&mut h);
-    shots_beside(&mut h, area, glam::Vec3::new(25.0, 25.0, 0.0), &shots.join("height-before"));
+    shots_beside(
+        &mut h,
+        area,
+        glam::Vec3::new(25.0, 25.0, 0.0),
+        shots.as_deref().map(|d| d.join("height-before")),
+    );
     h.get_by_label("Raise Height").click();
     h.run_steps(2);
-    // At once, before OK: in the area's file and in its view.
-    assert!(h.state().tile_props.is_some(), "the window stays open");
+    // At once: in the area's file and in its view.
+    assert!(h.state().tile_props.is_some(), "the panel shows the tile still");
     let now = tile_list(&mut h, area);
     assert_eq!(now[10].integer("Tile_Height"), Some(i64::from(was + 1)));
     only_changed(&list, &now, &[10]);
@@ -3152,14 +3468,21 @@ fn tile_properties_changes_show_at_once() {
     };
     assert_eq!(point(&mut h), [step, 0.0], "what stands on it with it");
     assert_eq!(undo_label(&h).as_deref(), Some("Tile Properties"));
-    shots_beside(&mut h, area, glam::Vec3::new(25.0, 25.0, 0.0), &shots.join("height-raised"));
-    // More: raised again, then a height dragged through frame by frame,
-    // and a light chosen. One step for all.
+    shots_beside(
+        &mut h,
+        area,
+        glam::Vec3::new(25.0, 25.0, 0.0),
+        shots.as_deref().map(|d| d.join("height-raised")),
+    );
+    // More: raised again, then a height typed frame by frame, and a light
+    // chosen.
     h.get_by_label("Raise Height").click();
     h.run_steps(2);
     for k in 3..=6 {
         h.state_mut().tile_props.as_mut().unwrap().height = Some(was + k);
-        h.run_steps(1);
+        // (Written, then read again: the next frame's change on what is
+        // read.)
+        h.run_steps(2);
         assert_eq!(tile_list(&mut h, area)[10].integer("Tile_Height"), Some(i64::from(was + k)));
     }
     h.state_mut().tile_props.as_mut().unwrap().height = Some(was + 3);
@@ -3181,9 +3504,7 @@ fn tile_properties_changes_show_at_once() {
     // Defaults: at once too, every control the tile has.
     h.get_by_label("Defaults").click();
     h.run_steps(2);
-    let p = h.state().tile_props.clone().expect("the window stays");
-    // (Not the replacement texture, which Aurora's Defaults hasn't got.)
-    assert_eq!(p.touched, [true, true, true, true, true, true, true, false]);
+    let p = h.state().tile_props.clone().expect("the panel shows the tile still");
     let now = tile_list(&mut h, area);
     for (k, label) in mg_ui::tile_select::FIELDS.iter().enumerate().take(7) {
         let (has, value) = match k {
@@ -3196,125 +3517,24 @@ fn tile_properties_changes_show_at_once() {
         }
     }
     assert_eq!(now[10].integer("Tile_Height"), Some(i64::from(was + 3)), "the height stays");
-    // OK keeps them: one step, which Undo takes back whole.
-    h.get_by_label("OK").click();
-    h.run_steps(3);
-    assert!(h.state().tile_props.is_none());
-    assert_eq!(tile_list(&mut h, area), now, "kept");
-    assert_eq!(undo_label(&h).as_deref(), Some("Tile Properties"));
-    h.state_mut().ws.as_mut().unwrap().undo().unwrap();
-    h.run_steps(3);
-    assert_eq!(tile_list(&mut h, area), list, "one step");
-    assert_eq!(git_root(&mut h, area), git);
-    assert_eq!(undo_label(&h), before);
-}
-
-/// Tile Properties' Cancel takes back what the window changed, byte for
-/// byte, nothing left to redo: while its step is the last command, by
-/// taking it back; after a variant put in from the pictures (its own
-/// step, under the window's), the variant stays and the window's height
-/// and light are taken off it; after a command made elsewhere, by a
-/// step of its own that leaves that command's change.
-#[test]
-fn tile_properties_cancel_takes_the_changes_back() {
-    use glam::Vec3;
-    let Some((mut h, area)) = area_harness("tile-live-cancel") else { return };
-    let (list, git, before) = (tile_list(&mut h, area), git_root(&mut h, area), undo_label(&h));
-    let at = Vec3::new(25.0, 25.0, 0.0);
-    let cancel = |h: &mut Harness<'_, Moonglow>| {
-        let c = h.get_all_by_label("Cancel").last().unwrap().rect().center();
-        h.hover_at(c);
-        press(h, c, true, egui::Modifiers::NONE);
-        press(h, c, false, egui::Modifiers::NONE);
-        h.run_steps(3);
-        assert!(h.state().tile_props.is_none(), "closed");
-    };
-    let set_light = |h: &mut Harness<'_, Moonglow>| {
-        let p = h.state_mut().tile_props.as_mut().unwrap();
-        assert!(p.has_main[0], "ttr01's tiles have main light 1");
-        p.main[0] = (p.main[0] + 7) % 32;
-        p.touched[0] = true;
-        h.run_steps(2);
-    };
-    // Raised twice and a light: Cancel, and the area is as it was.
-    tile_properties_of(&mut h, area, &[at]);
-    let was = h.state().tile_props.as_ref().unwrap().height.unwrap();
-    for _ in 0..2 {
-        h.get_by_label("Raise Height").click();
-        h.run_steps(2);
+    // Each a step of its own: undone, the area as it was.
+    let mut steps = 0;
+    while undo_label(&h).as_deref() == Some("Tile Properties") {
+        h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+        steps += 1;
     }
-    set_light(&mut h);
-    assert_ne!(tile_list(&mut h, area), list, "shown at once");
-    assert_ne!(git_root(&mut h, area), git);
-    cancel(&mut h);
-    assert_eq!(tile_list(&mut h, area), list, "the tiles byte for byte");
-    assert_eq!(git_root(&mut h, area), git, "what stands on them too");
-    assert_eq!(undo_label(&h), before);
-    assert_eq!(h.state().ws.as_ref().unwrap().can_redo(), None, "nothing to redo");
-
-    // Raised and a light, then a variant put in: the variant goes in at
-    // the window's height and light (its step under the window's), and
-    // Cancel takes them off it, the variant staying.
-    tile_properties_of(&mut h, area, &[at]);
-    h.get_by_label("Raise Height").click();
-    h.run_steps(2);
-    set_light(&mut h);
-    let light = tile_list(&mut h, area)[10].integer("Tile_MainLight1");
-    let props = h.state().tile_props.clone().unwrap();
-    let (_, variants) = props.variants.clone().expect("one tile: its variants");
-    let now = props.variant.unwrap();
-    let other = variants.iter().find(|(p, _)| p.tile != now.tile).expect("another fits").clone();
-    let turn = ["", " ↺90°", " ↺180°", " ↺270°"][usize::from(other.0.orientation % 4)];
-    let picture = h
-        .get_all_by_label(&format!("{}{turn}", other.1))
-        .next()
-        .map(|n| n.rect().center_top() - egui::vec2(0.0, 40.0))
-        .expect("its picture");
-    h.hover_at(picture);
-    press(&h, picture, true, egui::Modifiers::NONE);
-    press(&h, picture, false, egui::Modifiers::NONE);
-    h.run_steps(4);
-    let t = tile_list(&mut h, area)[10].clone();
-    let id = t.integer("Tile_ID").unwrap();
-    assert_ne!(id, list[10].integer("Tile_ID").unwrap(), "the variant is in");
-    assert_eq!(t.integer("Tile_Height"), Some(i64::from(was + 1)), "at the window's height");
-    assert_eq!(t.integer("Tile_MainLight1"), light, "with the window's light");
-    assert_eq!(undo_label(&h).as_deref(), Some("Tile Properties"), "the window's step on top");
-    let p = h.state().tile_props.clone().expect("the window stays");
-    assert_eq!(p.base[0].integer("Tile_ID"), Some(id), "the window of the tile put in");
-    cancel(&mut h);
-    let t = tile_list(&mut h, area)[10].clone();
-    assert_eq!(t.integer("Tile_ID"), Some(id), "the variant stays");
-    assert_eq!(t.integer("Tile_Height"), list[10].integer("Tile_Height"), "its height back");
-    assert_eq!(git_root(&mut h, area), git);
-    assert_eq!(undo_label(&h).as_deref(), Some("Tile variant"));
-    h.state_mut().ws.as_mut().unwrap().undo().unwrap();
     h.run_steps(3);
-    assert_eq!(tile_list(&mut h, area), list);
-    assert_eq!(undo_label(&h), before);
-
-    // Raised, then a tile changed elsewhere (the window's step no longer
-    // the last): Cancel puts the height back in a step of its own, the
-    // other change staying.
-    tile_properties_of(&mut h, area, &[at]);
-    h.get_by_label("Raise Height").click();
-    h.run_steps(2);
-    let elsewhere = list[0].integer("Tile_ID").unwrap() as i32 + 1;
-    set_tile_id(&mut h, area, 0, elsewhere);
-    assert!(h.state().tile_props.is_some());
-    cancel(&mut h);
-    let now = tile_list(&mut h, area);
-    assert_eq!(now[10], list[10], "the window's tile as it was");
-    assert_eq!(now[0].integer("Tile_ID"), Some(i64::from(elsewhere)), "the other change stays");
+    assert_eq!(steps, 8, "two raises, four heights, the light with one, Defaults");
+    assert_eq!(tile_list(&mut h, area), list, "byte for byte");
     assert_eq!(git_root(&mut h, area), git);
-    assert_eq!(undo_label(&h).as_deref(), Some("Cancel Tile Properties"));
+    assert_eq!(undo_label(&h), before);
 }
 
-/// Undo in the module (Ctrl+Z) while Tile Properties is open (the
-/// owner's report): the window's step goes and the window reads the
-/// tiles again, showing them as they are; a change in it after writes
-/// that change alone (it wrote its old values again with it). Redo
-/// (Ctrl+Y) brings its step back as its own, which Cancel takes back.
+/// Undo in the module (Ctrl+Z) while Tile Properties shows tiles (the
+/// owner's report): a change's step goes and the panel reads the tiles
+/// again, showing them as they are; a change in it after writes that
+/// change alone (it wrote its old values again with it). Redo (Ctrl+Y)
+/// brings the step back, which Ctrl+Z takes back again.
 #[test]
 fn tile_properties_read_the_tiles_again_after_an_undo() {
     use glam::Vec3;
@@ -3340,18 +3560,27 @@ fn tile_properties_read_the_tiles_again_after_an_undo() {
     assert_eq!(tile_list(&mut h, area)[10].integer("Tile_Height"), Some(i64::from(was + 1)));
     assert_eq!(undo_label(&h).as_deref(), Some("Tile Properties"));
     props_aside(&mut h);
-    let shots = mg_testkit::scratch_dir("ui-tile-live-undo");
-    h.render().unwrap().save(shots.join("changed.png")).unwrap();
+    let shots = shot_dir("ui-tile-live-undo");
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("changed.png")).unwrap();
+    }
 
-    // Ctrl+Z: the tiles as they were, and the window shows them so.
+    // Ctrl+Z: the light taken back, the height still raised (each change
+    // a step of its own); again: the tiles as they were, and the panel
+    // shows them so.
+    key(&mut h, egui::Key::Z);
+    let p = h.state().tile_props.clone().expect("the panel shows the tile");
+    assert_eq!((p.height, p.main[0]), (Some(was + 1), light), "the light alone undone");
     key(&mut h, egui::Key::Z);
     assert_eq!(tile_list(&mut h, area), list, "undone");
-    let p = h.state().tile_props.clone().expect("the window stays open");
-    assert_eq!((p.height, p.main[0]), (Some(was), light), "the window read them again");
+    let p = h.state().tile_props.clone().expect("the panel shows the tile");
+    assert_eq!((p.height, p.main[0]), (Some(was), light), "the panel read them again");
     assert!(!p.draft().set.iter().any(|s| *s) && p.draft().height.is_none(), "nothing set");
     h.run_steps(3);
     assert_eq!(tile_list(&mut h, area), list, "and wrote nothing again");
-    h.render().unwrap().save(shots.join("undone.png")).unwrap();
+    if let Some(ref shots) = shots {
+        h.render().unwrap().save(shots.join("undone.png")).unwrap();
+    }
 
     // A light chosen now: that light alone, the height left as it is.
     let other = (light + 9) % 32;
@@ -3367,15 +3596,13 @@ fn tile_properties_read_the_tiles_again_after_an_undo() {
     only_changed(&list, &now, &[10]);
     assert_eq!(git_root(&mut h, area), git, "nothing moved");
     assert_eq!(undo_label(&h).as_deref(), Some("Tile Properties"));
-    // Cancel: as the window opened, one step taken back.
-    h.get_by_label("Cancel").click();
-    h.run_steps(3);
-    assert!(h.state().tile_props.is_none());
+    // Ctrl+Z: one step taken back.
+    key(&mut h, egui::Key::Z);
     assert_eq!(tile_list(&mut h, area), list);
     assert_eq!(undo_label(&h), before);
 
-    // Raised, Ctrl+Z, Ctrl+Y: the window shows the height again, its step
-    // its own, which Cancel takes back with nothing left to redo.
+    // Raised, Ctrl+Z, Ctrl+Y: the panel shows the height again, its step
+    // as it was, which Ctrl+Z takes back.
     tile_properties_of(&mut h, area, &[at]);
     h.get_by_label("Raise Height").click();
     h.run_steps(2);
@@ -3384,12 +3611,10 @@ fn tile_properties_read_the_tiles_again_after_an_undo() {
     key(&mut h, egui::Key::Y);
     assert_eq!(tile_list(&mut h, area)[10].integer("Tile_Height"), Some(i64::from(was + 1)));
     assert_eq!(h.state().tile_props.as_ref().unwrap().height, Some(was + 1), "read again");
-    h.get_by_label("Cancel").click();
-    h.run_steps(3);
-    assert_eq!(tile_list(&mut h, area), list, "Cancel took the redone step back");
+    key(&mut h, egui::Key::Z);
+    assert_eq!(tile_list(&mut h, area), list, "Ctrl+Z took the redone step back");
     assert_eq!(git_root(&mut h, area), git);
     assert_eq!(undo_label(&h), before);
-    assert_eq!(h.state().ws.as_ref().unwrap().can_redo(), None, "nothing to redo");
 }
 
 /// All tiles' Turn turns the tiles chosen at once, each its own tile (its
@@ -3403,7 +3628,7 @@ fn tile_properties_turn_turns_the_tiles_at_once() {
     set_tile_id(&mut h, area, 5, 0);
     let list = tile_list(&mut h, area);
     let before = undo_label(&h);
-    let shots = mg_testkit::scratch_dir("ui-tile-live-turn");
+    let shots = shot_dir("ui-tile-live-turn");
     tile_properties_of(&mut h, area, &[Vec3::new(15.0, 15.0, 0.0)]);
     h.get_by_label(mg_ui::tile_select::ALL_TILES).click();
     h.run_steps(3);
@@ -3412,7 +3637,12 @@ fn tile_properties_turn_turns_the_tiles_at_once() {
     let to = (o + 2) % 4;
     let name = ["0°", "↺90°", "↺180°", "↺270°"][to as usize];
     props_aside(&mut h);
-    shots_beside(&mut h, area, glam::Vec3::new(15.0, 15.0, 0.0), &shots.join("turn-before"));
+    shots_beside(
+        &mut h,
+        area,
+        glam::Vec3::new(15.0, 15.0, 0.0),
+        shots.as_deref().map(|d| d.join("turn-before")),
+    );
     h.get_by_label_contains("in the tileset)").scroll_to_me();
     h.get_by_label(name).click();
     h.run_steps(3);
@@ -3429,11 +3659,28 @@ fn tile_properties_turn_turns_the_tiles_at_once() {
     let p = h.state().tile_props.clone().expect("the window stays");
     assert!(p.all_tiles && i64::from(p.turn) == to, "the pictures turned so");
     assert!(h.query_all_by_label_contains(&format!(" {name}")).next().is_some(), "shown so");
-    shots_beside(&mut h, area, glam::Vec3::new(15.0, 15.0, 0.0), &shots.join("turn-after"));
+    shots_beside(
+        &mut h,
+        area,
+        glam::Vec3::new(15.0, 15.0, 0.0),
+        shots.as_deref().map(|d| d.join("turn-after")),
+    );
     h.state_mut().ws.as_mut().unwrap().undo().unwrap();
     h.run_steps(3);
     assert_eq!(tile_list(&mut h, area), list, "one step");
     assert_eq!(undo_label(&h), before);
+}
+
+/// An edit of the area (a waypoint's tag), which its view reads.
+fn set_waypoint_tag(h: &mut Harness<'_, Moonglow>, area: ResRef) {
+    let edit = mg_edit::Edit::SetField {
+        key: ResKey::new(area, ResType::GIT),
+        path: mg_edit::GffPath::root().item("WaypointList", 0),
+        label: "Tag".into(),
+        value: Some(mg_gff::Value::String(b"MG_READ".to_vec())),
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Tag", vec![edit])));
+    h.run_steps(3);
 }
 
 /// The tile selection's outline on a tile that isn't flat (the owner's
@@ -3456,12 +3703,37 @@ fn the_tile_selection_s_outline_follows_a_cliff_tile() {
     };
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Turn", vec![turn])));
     h.run_steps(3);
-    h.get_by_label("⛶ Select Tiles").click();
+    area_click(&mut h, "Select Tiles");
     h.run_steps(2);
     let at = screen(&h, area, Vec3::new(15.0, 15.0, 0.0));
     click_pos(&h, at);
     h.run_steps(3);
     assert_eq!(h.state().area_views[&area].tile_selection, [(1, 1)]);
+    // (The review's A24: the outline is laid along the ground once, and
+    // put on screen each frame; laid again when the ground changes.)
+    let laid = h.state().area_views[&area].outlines_laid();
+    assert!(laid > 0);
+    h.run_steps(8);
+    assert_eq!(h.state().area_views[&area].outlines_laid(), laid, "not every frame");
+    set_waypoint_tag(&mut h, area);
+    assert!(h.state().area_views[&area].outlines_laid() > laid, "laid again for the area read");
+    // (Their lines on screen kept while the camera, the area and the tiles
+    // selected rest; made again when one changes.)
+    let made = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].tile_lines_made.get();
+    h.run_steps(2);
+    let was = made(&h);
+    h.run_steps(6);
+    assert_eq!(made(&h), was, "kept at rest");
+    h.state_mut().area_views.get_mut(&area).unwrap().orbit.as_mut().unwrap().yaw += 0.1;
+    h.run_steps(2);
+    assert!(made(&h) > was, "made again for the camera turned");
+    let was = made(&h);
+    h.state_mut().area_views.get_mut(&area).unwrap().tile_selection.push((2, 1));
+    h.run_steps(2);
+    assert!(made(&h) > was, "made again for a tile more");
+    h.state_mut().area_views.get_mut(&area).unwrap().tile_selection.pop();
+    h.state_mut().area_views.get_mut(&area).unwrap().orbit.as_mut().unwrap().yaw -= 0.1;
+    h.run_steps(3);
     // Along the ground in half-metre steps, from the plateau down into the
     // corner and back; a flat tile, its four corners.
     let view = &h.state().area_views[&area];
@@ -3474,18 +3746,20 @@ fn the_tile_selection_s_outline_follows_a_cliff_tile() {
     let (low, high) = cliff.iter().fold((f32::MAX, f32::MIN), |(l, h), p| (l.min(p.z), h.max(p.z)));
     assert!(high - low > 3.0, "down the cliff: {low} to {high}");
     assert_eq!(view.tile_outline(0.0, 0.0, 0.0).len(), 4, "a flat tile");
-    let shots = mg_testkit::scratch_dir("ui-tile-outline-cliff");
-    let was = h.state().area_views[&area].orbit;
-    for yaw in [-120, -30, 60, 150] {
-        if let Some(o) = h.state_mut().area_views.get_mut(&area).and_then(|v| v.orbit.as_mut()) {
-            o.target = Vec3::new(15.0, 15.0, 0.0);
-            (o.distance, o.pitch, o.yaw) = (30.0, 0.55, (yaw as f32).to_radians());
+    if let Some(shots) = shot_dir("ui-tile-outline-cliff") {
+        let was = h.state().area_views[&area].orbit;
+        for yaw in [-120, -30, 60, 150] {
+            if let Some(o) = h.state_mut().area_views.get_mut(&area).and_then(|v| v.orbit.as_mut())
+            {
+                o.target = Vec3::new(15.0, 15.0, 0.0);
+                (o.distance, o.pitch, o.yaw) = (30.0, 0.55, (yaw as f32).to_radians());
+            }
+            h.hover_at(egui::pos2(960.0, 610.0));
+            h.run_steps(20);
+            h.render().unwrap().save(shots.join(format!("yaw{yaw}.png"))).unwrap();
         }
-        h.hover_at(egui::pos2(960.0, 610.0));
-        h.run_steps(20);
-        h.render().unwrap().save(shots.join(format!("yaw{yaw}.png"))).unwrap();
+        h.state_mut().area_views.get_mut(&area).unwrap().orbit = was;
     }
-    h.state_mut().area_views.get_mut(&area).unwrap().orbit = was;
 }
 
 /// Refine Tile dragged: the first tile steps to the next that fits, and
@@ -3519,11 +3793,11 @@ fn refine_tile_dragged_makes_tiles_of_a_kind_alike() {
         h.run_steps(3);
     };
     h.state_mut().settings.palette_gallery = true;
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(3);
-    h.get_by_label("🔁 Refine Tile").click();
+    apart(&h, "Refine Tile").click();
     h.run_steps(2);
     let before = grid(&mut h);
     let next = mg_tiles::paint::next_fit(&index, &before.lattice.cell(0, 2), before.tile(0, 2))
@@ -3553,9 +3827,9 @@ fn refine_tile_dragged_makes_tiles_of_a_kind_alike() {
     // (The search cleared: it found the tile alone.)
     h.state_mut().palette.filter.clear();
     h.run_steps(3);
-    h.get_by_label_contains("Refine Tile →").scroll_to_me();
+    h.get_by_label_contains("Refine Tile ->").scroll_to_me();
     h.run_steps(3);
-    h.get_by_label_contains("Refine Tile →").click();
+    h.get_by_label_contains("Refine Tile ->").click();
     h.run_steps(2);
     assert_eq!(h.state().palette.tile_brush.as_ref().unwrap().target, Some(tile));
     drag(&mut h, 5.0);
@@ -3584,9 +3858,9 @@ fn the_tile_gallery_searches_opens_a_tile_and_drops_one_in_the_area() {
         mg_area::terrain::grid(&are.root, &index).unwrap()
     };
     h.state_mut().settings.palette_gallery = true;
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(3);
     // Headings closed at first: no picture shows.
     let grass = index.terrain("Grass").unwrap();
@@ -3654,9 +3928,9 @@ fn the_tile_gallery_s_groups_are_pictures_to_choose_and_drop() {
         mg_area::terrain::grid(&are.root, &index).unwrap()
     };
     h.state_mut().settings.palette_gallery = true;
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     open_tile_heading(&mut h, "well");
     // Rural's Well: a group of one tile (117), its picture named.
     let well = h.get_all_by_label_contains("Well").next().expect("its picture").rect().center();
@@ -3692,9 +3966,9 @@ fn the_tile_search_finds_a_group_by_its_tiles_models() {
     let one_item = |h: &Harness<'_, Moonglow>, when: &str| {
         assert!(h.query_all_by_value("1 item").next().is_some(), "{when}: the count, 1 item");
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(3);
     let model = "tcm02_s01_05";
     h.state_mut().palette.filter = model.into();
@@ -3731,11 +4005,11 @@ fn a_terrain_drag_with_shift_fills_its_rectangle() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         mg_area::terrain::grid(&are.root, &index).unwrap().lattice
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Water").click();
+    click_in_sight(&mut h, "Water");
     h.run_steps(2);
     let before = lattice(&mut h);
     // Corner (1, 1) diagonally to (3, 2), Shift held.
@@ -3783,11 +4057,11 @@ fn a_crosser_drag_with_shift_follows_its_rectangle_s_outline() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         mg_area::terrain::grid(&are.root, &index).unwrap().lattice
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     let before = lattice(&mut h);
     // Tile (0, 0) diagonally to tile (2, 2), Shift held.
@@ -3830,11 +4104,11 @@ fn a_crosser_drag_with_shift_follows_its_rectangle_s_outline() {
 #[test]
 fn painting_with_shift_held_the_camera_still_zooms_and_turns() {
     let Some((mut h, area)) = area_harness("shift-camera") else { return };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     let orbit = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].orbit.unwrap();
     let at = screen(&h, area, glam::Vec3::new(20.0, 10.0, 0.0));
@@ -3888,9 +4162,9 @@ fn a_tile_brush_previews_the_tiles_its_click_makes() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         mg_area::terrain::grid(&are.root, &index).unwrap()
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
     // What the preview shows is what the click puts down.
     let check = |h: &mut Harness<'_, Moonglow>, at: Vec3| {
@@ -3905,7 +4179,7 @@ fn a_tile_brush_previews_the_tiles_its_click_makes() {
         }
         h.run_steps(3);
         let g = grid(h);
-        for t in &shown {
+        for t in shown.iter() {
             let placed = g.tile(t.column, t.row);
             assert_eq!(
                 (i64::from(placed.tile), placed.orientation, placed.height),
@@ -3918,12 +4192,12 @@ fn a_tile_brush_previews_the_tiles_its_click_makes() {
     };
     // Water on a corner (its four tiles, chosen at random among those that
     // fit), and a barn.
-    h.get_by_label("Water").click();
+    click_in_sight(&mut h, "Water");
     h.run_steps(2);
     check(&mut h, Vec3::new(20.0, 20.0, 0.0));
-    h.get_by_label("Groups").click();
+    click_in_sight(&mut h, "Groups");
     h.run_steps(2);
-    h.get_by_label("Barn 1 2x2").click();
+    click_in_sight(&mut h, "Barn 1 2x2");
     h.run_steps(2);
     check(&mut h, Vec3::new(5.0, 5.0, 0.0));
 }
@@ -3942,9 +4216,9 @@ fn a_drag_previews_the_tiles_letting_go_paints() {
         let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
         mg_area::terrain::grid(&are.root, &index).unwrap()
     };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
     // Dragged along `path` (metres): before it is let go, the preview; let
     // go, those very tiles.
@@ -3966,7 +4240,7 @@ fn a_drag_previews_the_tiles_letting_go_paints() {
         press(h, to, false, egui::Modifiers::NONE);
         h.run_steps(3);
         let g = grid(h);
-        for t in &shown {
+        for t in shown.iter() {
             let placed = g.tile(t.column, t.row);
             assert_eq!(
                 (i64::from(placed.tile), placed.orientation, placed.height),
@@ -3977,10 +4251,10 @@ fn a_drag_previews_the_tiles_letting_go_paints() {
             );
         }
     };
-    h.get_by_label("Water").click();
+    click_in_sight(&mut h, "Water");
     h.run_steps(2);
     check(&mut h, &[10.0, 15.0, 20.0, 25.0, 30.0].map(|x| Vec3::new(x, 20.0, 0.0)));
-    h.get_by_label("Road").click();
+    click_in_sight(&mut h, "Road");
     h.run_steps(2);
     check(&mut h, &[7.0, 12.0, 18.0, 24.0, 25.0].map(|x| Vec3::new(x, 5.0, 0.0)));
 }
@@ -4022,7 +4296,7 @@ fn a_right_drag_back_to_where_it_began_is_not_a_right_click() {
         h.run_steps(3);
     };
     let yaw = |h: &Harness<'_, Moonglow>| h.state().area_views[&area].orbit.as_ref().unwrap().yaw;
-    choose_tile_brush(&mut h, "↕ Raise/Lower");
+    choose_tile_brush(&mut h, "Raise/Lower");
     let before = area_are(&mut h, area);
     let was = yaw(&h);
     right(&mut h, true);
@@ -4032,12 +4306,12 @@ fn a_right_drag_back_to_where_it_began_is_not_a_right_click() {
     right(&mut h, false);
     assert!(area_are(&mut h, area) != before, "a right click lowers");
     // A terrain: its right click is the tile menu, a right drag back isn't.
-    h.get_by_label("Grass").click();
+    click_in_sight(&mut h, "Grass");
     h.run_steps(2);
     right(&mut h, true);
-    assert!(h.query_by_label("Tile Properties…").is_none(), "no tile menu");
+    assert!(h.query_by_label("Tile Properties").is_none(), "no tile menu");
     right(&mut h, false);
-    assert!(h.query_by_label("Tile Properties…").is_some(), "a right click's tile menu");
+    assert!(h.query_by_label("Tile Properties").is_some(), "a right click's tile menu");
 }
 
 /// With a terrain brush in hand, a right click is the brush's (Raise/
@@ -4047,11 +4321,11 @@ fn a_right_drag_back_to_where_it_began_is_not_a_right_click() {
 fn a_right_click_with_a_terrain_brush_is_the_brush_s_over_an_object() {
     use glam::Vec3;
     let Some((mut h, area)) = area_harness("brush-over-object") else { return };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("↕ Raise/Lower").click();
+    h.get_by_label("Raise/Lower").click();
     h.run_steps(2);
     // (On the waypoint at 20, 20.)
     let at = screen(&h, area, Vec3::new(20.0, 20.0, 0.02));
@@ -4066,7 +4340,7 @@ fn a_right_click_with_a_terrain_brush_is_the_brush_s_over_an_object() {
         });
     }
     h.run_steps(3);
-    assert!(h.query_by_label("Properties").is_none(), "no object menu");
+    assert!(apart_all(&h, "Properties").next().is_none(), "no object menu");
     assert!(h.query_by_label("Go To").is_none());
     assert!(h.state().palette.tile_brush.is_some(), "the brush stays in hand");
     // A right click where no ground of the area is under the pointer (off
@@ -4112,7 +4386,7 @@ fn a_right_click_with_a_terrain_brush_is_the_brush_s_over_an_object() {
         h.run_steps(if round % 4 == 0 { 1 } else { 2 });
         assert!(sel(&h).is_empty(), "round {round}: selected {:?}", sel(&h));
         assert!(h.query_by_label("Go To").is_none(), "round {round}: the object's menu");
-        assert!(h.query_by_label("Properties").is_none(), "round {round}: the object's menu");
+        assert!(apart_all(&h, "Properties").next().is_none(), "round {round}: the object's menu");
         assert!(h.state().palette.tile_brush.is_some(), "round {round}: the brush dropped");
     }
 }
@@ -4164,12 +4438,16 @@ fn a_tile_s_emitters_burn_from_the_first_frame() {
     });
     h.run_steps(2);
     let first = h.state().area_views[&area].particles_shown;
-    let dir = mg_testkit::scratch_dir("ui-tile-emitters");
-    h.render().expect("render").save(dir.join("first.png")).unwrap();
+    let dir = shot_dir("ui-tile-emitters");
+    if let Some(ref dir) = dir {
+        h.render().expect("render").save(dir.join("first.png")).unwrap();
+    }
     // (Eight seconds on: the fire as it burns.)
     h.run_steps(8 * 60);
     let going = h.state().area_views[&area].particles_shown;
-    h.render().expect("render").save(dir.join("going.png")).unwrap();
+    if let Some(ref dir) = dir {
+        h.render().expect("render").save(dir.join("going.png")).unwrap();
+    }
     assert!(going > 20, "the forge burns: {going} particles");
     assert!(first * 10 >= going * 8, "at first {first} particles, going {going}");
 }
@@ -4298,8 +4576,9 @@ fn an_area_of_a_tileset_with_holes_draws_its_other_tiles() {
         return;
     };
     h.run_steps(10);
-    let dir = mg_testkit::output_dir("tileset-holes");
-    h.render().expect("render").save(dir.join("area.png")).unwrap();
+    if let Some(dir) = shot_dir("tileset-holes") {
+        h.render().expect("render").save(dir.join("area.png")).unwrap();
+    }
     let view = &h.state().area_views[&area];
     let model = view.model.as_ref().unwrap();
     let models: Vec<Option<&str>> = model.tiles.iter().map(|t| t.model.as_deref()).collect();
@@ -4384,7 +4663,8 @@ fn a_tile_s_textures_show_where_the_tile_is_looked_at() {
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Tile", vec![edit])));
     h.run_steps(4);
     h.get_by_label_contains(&format!("Textures of {} (", other.1.to_lowercase()));
-    h.get_by_label("Cancel").click();
+    // (Out of Select Tiles: the panel goes with it.)
+    area_click(&mut h, "Select Tiles");
     h.run_steps(2);
 
     // The tile's view.
@@ -4409,14 +4689,32 @@ fn a_tile_s_textures_show_where_the_tile_is_looked_at() {
         d.change(|f| f.set("TILE10", "Model", "mg_tex"));
     }
     h.run_steps(4);
-    h.get_by_label_contains("Textures of mg_tex (");
+    // (In its Textures panel since M4's U20: the count in its header, a row
+    // a texture, what it is in its tip.)
+    h.get_by_label_contains("of mg_tex (");
     h.get_by_label_contains("1 missing)");
-    assert_eq!(h.query_all_by_label("ttr01_grass02").count(), 2, "its name and its picture");
-    assert_eq!(h.query_all_by_label("mg_gone").count(), 1, "missing: its name, no picture");
-    h.get_by_label("Missing: no DDS, TGA or PLT of the name in the load order");
-    h.get_by_label("diffuse of sign");
-    let shots = mg_testkit::scratch_dir("ui-tile-textures");
-    h.render().unwrap().save(shots.join("tileset-editor.png")).unwrap();
+    let rows = h.get_by_label(mg_ui::tileset_view::TEXTURE_ROWS);
+    assert_eq!(rows.query_all_by_label("ttr01_grass02").count(), 1, "its name");
+    // (Its picture in its row's tip, where the tile's page drew it beside
+    // the name: its name and its picture, named by it, in the tip.)
+    let grass = rows.get_by_label("ttr01_grass02").rect();
+    let tip = tip_at(&mut h, grass).expect("its tip");
+    assert!(tip.contains("DDS 512×512"), "its file in the tip: {tip}");
+    // (The picture is made a frame or more after the tip shows: waited
+    // for, by a deadline.)
+    let started = std::time::Instant::now();
+    while h.query_all_by_label("ttr01_grass02").count() < 3 {
+        assert!(started.elapsed().as_secs() < 20, "its picture in the tip, named by it");
+        h.run_steps(1);
+    }
+    let rows = h.get_by_label(mg_ui::tileset_view::TEXTURE_ROWS);
+    let gone = rows.get_by_label("mg_gone").rect();
+    let tip = tip_at(&mut h, gone).expect("its tip");
+    assert!(tip.contains("Missing: no DDS, TGA or PLT of the name in the load order"), "{tip}");
+    assert!(tip.contains("diffuse of sign"), "{tip}");
+    if let Some(shots) = shot_dir("ui-tile-textures") {
+        h.render().unwrap().save(shots.join("tileset-editor.png")).unwrap();
+    }
 }
 
 /// A 4 by 4 tms01 area whose tile 5 (tile 0 of the tileset) is the game's
@@ -4475,17 +4773,19 @@ fn tile_properties_set_a_tile_s_replacement_texture() {
         are.root.list("Tile_List").unwrap()[i].clone()
     };
     let replace = |h: &mut Harness<'_, Moonglow>, i: usize| tile(h, i).integer("Tile_ReplaceTex");
-    let dir = mg_testkit::scratch_dir("ui-tile-replace");
+    let dir = shot_dir("ui-tile-replace");
     let (one, two) = (Vec3::new(15.0, 15.0, 0.0), Vec3::new(25.0, 15.0, 0.0));
     tile_properties_of(&mut h, area, &[one]);
     h.run_steps(20);
-    h.render().unwrap().save(dir.join("tile-properties.png")).unwrap();
+    if let Some(ref dir) = dir {
+        h.render().unwrap().save(dir.join("tile-properties.png")).unwrap();
+    }
     // Value 2: row 1, shown; the table's rows offered, each written as its
     // number plus one.
     let props = h.state().tile_props.clone().expect("the window is open");
     assert!(props.has_replace);
     assert_eq!(props.replace, 2);
-    assert!(!h.get_by_label("Replacement Texture").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("Replacement texture").accesskit_node().is_disabled());
     h.get_by_value("1: mgr_row1").click();
     h.run_steps(2);
     h.get_by_label("2: mgr_row2").click();
@@ -4494,12 +4794,20 @@ fn tile_properties_set_a_tile_s_replacement_texture() {
     h.get_by_label("Defaults").click();
     h.run_steps(2);
     assert_eq!(replace(&mut h, 5), Some(3), "Defaults leaves it as it is");
-    h.get_by_label("OK").click();
     h.run_steps(20);
-    h.render().unwrap().save(dir.join("row-2-chosen.png")).unwrap();
-    // One step to undo.
-    h.state_mut().ws.as_mut().unwrap().undo().unwrap();
-    h.run_steps(2);
+    if let Some(ref dir) = dir {
+        h.render().unwrap().save(dir.join("row-2-chosen.png")).unwrap();
+    }
+    // The row chosen and Defaults each a step of their own (Defaults one
+    // where the tile has lights or loops to set): undone, row 1 again.
+    for _ in 0..2 {
+        if replace(&mut h, 5) == Some(2) {
+            break;
+        }
+        assert_eq!(undo_label(&h).as_deref(), Some("Tile Properties"));
+        h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+        h.run_steps(2);
+    }
     assert_eq!(replace(&mut h, 5), Some(2));
 
     // With tile 6 (no replace_tex): each tile is written only what its
@@ -4513,16 +4821,14 @@ fn tile_properties_set_a_tile_s_replacement_texture() {
         let p = h.state_mut().tile_props.as_mut().unwrap();
         p.replace = 1;
     }
-    h.run_steps(1);
-    h.get_by_label("OK").click();
-    h.run_steps(2);
+    h.run_steps(3);
     assert_eq!(replace(&mut h, 5), Some(1), "row 0");
     assert_eq!(tile(&mut h, 6), was6, "tile 6 has no replace_tex: kept as it was");
 
     // Tile 6 alone: not enabled.
     tile_properties_of(&mut h, area, &[two]);
     assert!(!h.state().tile_props.as_ref().unwrap().has_replace);
-    assert!(h.get_by_label("Replacement Texture").accesskit_node().is_disabled());
+    assert!(h.get_by_label("Replacement texture").accesskit_node().is_disabled());
     h.state_mut().tile_props = None;
     h.run_steps(2);
 
@@ -4541,10 +4847,11 @@ fn tile_properties_set_a_tile_s_replacement_texture() {
         tile_properties_of(&mut h, area, &[one]);
         h.get_by_value(&format!("{bad}: no row"));
         h.get_by_label("crashes the game as the area loads");
-        if bad == 0 {
+        if bad == 0
+            && let Some(ref dir) = dir
+        {
             h.render().unwrap().save(dir.join("crash-value.png")).unwrap();
         }
-        h.get_by_label("OK").click();
         h.run_steps(2);
         assert_eq!(replace(&mut h, 5), Some(i64::from(bad)), "kept: nothing chosen");
     }
@@ -4566,13 +4873,20 @@ fn a_brush_s_tiles_are_drawn_by_the_game_s_shaders() {
     app.settings.game_shaders = Some(true);
     let mut h = area_gpu_harness(app, rs, 1100.0, 800.0);
     h.run_steps(3);
-    // The models the game's programs draw, once they are all made.
+    // The models the game's programs draw, once they are all made (for at
+    // most half a minute: on a loaded machine they are made later, and a
+    // count of frames gave up on them).
     let drawn = |h: &mut Harness<'_, Moonglow>| -> std::collections::BTreeSet<String> {
-        for _ in 0..40 {
+        let started = std::time::Instant::now();
+        loop {
             h.state_mut().viewport.as_mut().unwrap().renderer.wait_for_game_programs();
             h.step();
             let r = &h.state().viewport.as_ref().unwrap().renderer;
-            if r.drawn.game_pending == 0 && r.drawn.textures_pending == 0 {
+            let made = r.game_programs.iter().flatten().next().is_some();
+            if made && r.drawn.game_pending == 0 && r.drawn.textures_pending == 0 {
+                break;
+            }
+            if started.elapsed().as_secs() >= 30 {
                 break;
             }
         }
@@ -4583,11 +4897,11 @@ fn a_brush_s_tiles_are_drawn_by_the_game_s_shaders() {
     h.state_mut().viewport.as_mut().unwrap().renderer.game_programs = Some(Vec::new());
     let area_alone = drawn(&mut h);
     assert!(!area_alone.is_empty(), "the area's tiles, by the game's programs");
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    h.get_by_label("Tiles").click();
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
-    h.get_by_label("Water").click();
+    click_in_sight(&mut h, "Water");
     h.run_steps(2);
     h.hover_at(screen(&h, area, Vec3::new(20.0, 20.0, 0.0)));
     h.run_steps(3);
@@ -4637,7 +4951,7 @@ fn drag_with(
 fn select_tiles_harness(name: &str) -> Option<(Harness<'static, Moonglow>, ResRef)> {
     let (mut h, area) = area_harness(name)?;
     if !h.state().area_views[&area].tile_mode {
-        h.get_by_label("⛶ Select Tiles").click();
+        area_click(&mut h, "Select Tiles");
         h.run_steps(2);
     }
     assert!(h.state().area_views[&area].tile_mode);
@@ -4722,4 +5036,937 @@ fn select_tiles_shift_adds_to_the_selection() {
     let (from, to) = (tile(&h, 0, 0), tile(&h, 1, 0));
     drag_with(&mut h, from, to, none);
     assert_eq!(selection(&h), [(0, 0), (1, 0)]);
+}
+
+/// The tiles palette with a search typed: what it finds is opened out as
+/// it is typed, and its headings close and open again by a click (a
+/// builder's report: with text in the Filter no branch could be closed),
+/// in the list (a folder) and in the Gallery (a terrain's tiles).
+#[test]
+fn the_tile_palette_s_headings_close_while_a_search_is_typed() {
+    let Some((mut h, _)) = area_harness("tile-search-folds") else { return };
+    show_palette(h.state_mut());
+    h.run_steps(3);
+    palette_type(&mut h, "Tiles");
+    h.state_mut().palette.filter = "water".into();
+    h.run_steps(3);
+    assert!(h.query_by_label("Water").is_some(), "found, its folder opened out");
+    // The folder closed by a click: closed, and kept so.
+    click_in_sight(&mut h, "Terrain");
+    h.run_steps(5);
+    assert!(h.query_by_label("Water").is_none(), "the folder closed");
+    click_in_sight(&mut h, "Terrain");
+    h.run_steps(5);
+    assert!(h.query_by_label("Water").is_some(), "opened again");
+    // In the Gallery, the terrain's heading: its tiles, closed by its arrow.
+    h.state_mut().settings.palette_gallery = true;
+    h.run_steps(5);
+    let tiles = |h: &Harness<'_, Moonglow>| h.query_all_by_label_contains("ttr01_").count();
+    assert!(tiles(&h) > 0, "the heading opened out with its tiles");
+    let row = h.get_by_label("Water").rect();
+    let arrow = egui::pos2(row.left() - 0.5 * row.height(), row.center().y);
+    h.hover_at(arrow);
+    press(&h, arrow, true, egui::Modifiers::NONE);
+    press(&h, arrow, false, egui::Modifiers::NONE);
+    h.run_steps(5);
+    assert_eq!(tiles(&h), 0, "the heading closed, and kept so");
+    // Typed again: what it finds opened out anew.
+    h.state_mut().palette.filter = "wate".into();
+    h.run_steps(5);
+    assert!(tiles(&h) > 0, "opened out as it is typed");
+}
+
+/// Exact Tile with a group (vicky.bat's report: in Fort Interior the
+/// staircase, a group of one tile, could be neither put in among the
+/// walls nor replaced): a group's picture chosen with the switch on goes
+/// in as it is, nothing around fitted to it, and over a staircase already
+/// there it replaces it, one step to undo each; Tile Properties offer the
+/// staircase All Tiles, as any tile.
+#[test]
+fn an_exact_group_goes_in_as_it_is_and_replaces_a_staircase() {
+    use glam::Vec3;
+    use mg_tiles::TileIndex;
+    // Fort Interior, the up staircase (tile 40, alone in its group) at (1, 1).
+    let Some((mut h, area)) = area_harness_on("exact-group", "twc03", Some(40)) else { return };
+    let twc03 = ResRef::from_str("twc03").unwrap();
+    let (set, index, palette) = {
+        let game = h.state().game.as_deref().unwrap();
+        let set = mg_area::tileset(game, twc03).unwrap();
+        let index = TileIndex::new(&set);
+        let palette = mg_area::terrain::TilesetPalette::read(game, twc03, &set, &index);
+        (set, index, palette)
+    };
+    // Each staircase's tile, and its picture's name in the palette.
+    let group = |name: &str| {
+        let g = set.groups.iter().position(|g| g.name == name).unwrap();
+        let label =
+            palette.brushes().into_iter().find(|(_, b)| *b == mg_area::terrain::Brush::Group(g));
+        (set.groups[g].tiles[0].unwrap(), label.expect("in the palette").0.to_string())
+    };
+    let ((up, up_name), (down, down_name)) = (group("Stairway_up"), group("Stairway_down"));
+    assert!(index.is_grouped(up) && index.is_grouped(down));
+    let grid = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let are = ws.doc(&ResKey::new(area, ResType::ARE)).unwrap();
+        mg_area::terrain::grid(&are.root, &index).unwrap()
+    };
+    let shots = shot_dir("ui-exact-group");
+    let before = grid(&mut h);
+    assert_eq!(before.tile(1, 1).tile, up);
+    let list = tile_list(&mut h, area);
+    area_shots(&mut h, area, shots.as_deref().map(|d| d.join("before")));
+    show_palette(h.state_mut());
+    h.run_steps(3);
+    palette_type(&mut h, "Tiles");
+    h.run_steps(3);
+    h.get_by_label("Gallery").click();
+    h.run_steps(2);
+    h.get_by_label("Exact Tile").click();
+    // (Small pictures: the palette finds three for "stairs up", and a
+    // picture out of sight is not laid out to be found.)
+    h.state_mut().settings.gallery_tile = Some(64);
+    h.run_steps(2);
+    let choose = |h: &mut Harness<'_, Moonglow>, name: &str| {
+        open_tile_heading(h, name);
+        h.get_all_by_label(name).next().expect("its picture").scroll_to_me();
+        h.run_steps(3);
+        h.get_all_by_label(name).next().unwrap().click();
+        h.run_steps(2);
+    };
+    let click = |h: &mut Harness<'_, Moonglow>, x: f32, y: f32| {
+        let at = screen(h, area, Vec3::new(x, y, 0.0));
+        h.hover_at(at);
+        h.run_steps(2);
+        press(h, at, true, egui::Modifiers::NONE);
+        press(h, at, false, egui::Modifiers::NONE);
+        h.run_steps(3);
+    };
+    // The up staircase among the walls at (2, 0): there, as it is, and no
+    // other tile changed (without the switch the fit rules refuse it).
+    choose(&mut h, &up_name);
+    click(&mut h, 25.0, 5.0);
+    let after = grid(&mut h);
+    let height = before.tile(2, 0).height;
+    assert_eq!(after.tile(2, 0), mg_tiles::Placement { tile: up, orientation: 0, height });
+    only_changed(&list, &tile_list(&mut h, area), &[2]);
+    assert_eq!(
+        h.state().ws.as_ref().unwrap().can_undo(),
+        Some(format!("Exact {up_name}").as_str())
+    );
+    area_shots(&mut h, area, shots.as_deref().map(|d| d.join("placed")));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+    assert_eq!(tile_list(&mut h, area), list, "one step");
+    // The down staircase over the up one at (1, 1): it replaces it.
+    choose(&mut h, &down_name);
+    click(&mut h, 15.0, 15.0);
+    let after = grid(&mut h);
+    assert_eq!(after.tile(1, 1).tile, down);
+    only_changed(&list, &tile_list(&mut h, area), &[5]);
+    area_shots(&mut h, area, shots.as_deref().map(|d| d.join("replaced")));
+    // Off: the group is placed by the fit rules, which refuse it here.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+    h.get_by_label("Exact Tile").click();
+    h.run_steps(2);
+    choose(&mut h, &up_name);
+    click(&mut h, 25.0, 5.0);
+    assert_eq!(tile_list(&mut h, area), list, "refused, as before");
+    // Tile Properties on the staircase: All Tiles offered, and its Turn
+    // turns it, as any tile's.
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    tile_properties_of(&mut h, area, &[Vec3::new(15.0, 15.0, 0.0)]);
+    assert!(!h.state().tile_props.as_ref().expect("open").grouped, "a group of one tile");
+    h.get_by_label(mg_ui::tile_select::ALL_TILES).click();
+    h.run_steps(3);
+    h.get_by_label_contains("in the tileset)").scroll_to_me();
+    h.get_by_label("↺90°").click();
+    h.run_steps(3);
+    let turned = grid(&mut h).tile(1, 1);
+    assert_eq!((turned.tile, turned.orientation), (up, 1));
+}
+
+// The tile and group brushes and the area's objects (the owner's rulings
+// of 2026-11-11, for Exact Tile, and 2026-11-12, for a plain tile and the
+// groups too): with one in hand, a press on an object picks the object
+// and a drag from it moves it; a press on bare ground places as ever.
+
+/// The chest (`plc_chest1`) at Placeable List index `i`, where the view
+/// has it.
+fn chest_at(h: &Harness<'_, Moonglow>, area: ResRef, i: usize) -> glam::Vec3 {
+    let model = h.state().area_views[&area].model.as_ref().unwrap();
+    model.object(mg_area::ObjectKind::Placeable, i).expect("the chest").position
+}
+
+/// Chests put in at `at`, after the area's placeables, through the
+/// workspace (one step, "Setup").
+fn put_chests(h: &mut Harness<'_, Moonglow>, area: ResRef, at: &[glam::Vec3]) {
+    use mg_module::instances::{Placement, Placing, instance};
+    let first = {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        let git = ws.doc(&ResKey::new(area, ResType::GIT)).unwrap();
+        git.root.list("Placeable List").map_or(0, |l| l.len())
+    };
+    let edits = {
+        let game = h.state().game.as_deref().unwrap();
+        let key = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+        let bp = Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        (at.iter().enumerate())
+            .map(|(i, p)| {
+                let placement = Placement { position: p.to_array(), rotation: 0.0 };
+                mg_edit::Edit::InsertItem {
+                    key: ResKey::new(area, ResType::GIT),
+                    path: mg_edit::GffPath::root(),
+                    list: "Placeable List".into(),
+                    index: first + i,
+                    item: instance(&placing, ResType::UTP, &bp, placement, &[]).unwrap(),
+                }
+            })
+            .collect()
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", edits)));
+    h.run_steps(3);
+    settle(h);
+}
+
+/// Rural's end of a wall: it fits nowhere in open grass.
+fn wall_end_tile(h: &Harness<'_, Moonglow>) -> u32 {
+    use mg_tiles::TileIndex;
+    let index = {
+        let game = h.state().game.as_deref().unwrap();
+        TileIndex::new(&mg_area::tileset(game, ResRef::from_str("ttr01").unwrap()).unwrap())
+    };
+    let (wall, grass) = (index.crosser("Wall1").unwrap(), index.terrain("Grass").unwrap());
+    *index
+        .tiles_where(|c| {
+            c.edges.iter().filter(|e| **e == Some(wall)).count() == 1
+                && c.corners.iter().all(|k| k.terrain == grass && k.height == 0)
+        })
+        .first()
+        .expect("Rural has wall ends")
+}
+
+/// The tile and group brushes, with which a press on an object picks the
+/// object (the owner's rulings of 2026-11-11 and 2026-11-12): each chosen
+/// from its picture in the tiles palette's Gallery.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Hand {
+    /// Rural's wall end with Exact Tile on.
+    ExactTile,
+    /// The same tile with Exact Tile off: it fits its neighbors to it.
+    PlainTile,
+    /// Rural's first group (Ant Hill, one tile).
+    Group,
+    /// The group with Exact Tile on.
+    ExactGroup,
+}
+
+pub(crate) const HANDS: [Hand; 4] =
+    [Hand::ExactTile, Hand::PlainTile, Hand::Group, Hand::ExactGroup];
+
+/// Runs `case` with each brush in hand, every one even after one fails
+/// (each its own pictures), then fails naming those that did.
+fn each_hand(case: fn(Hand)) {
+    let failed: Vec<Hand> = HANDS
+        .into_iter()
+        .filter(|&hand| std::panic::catch_unwind(|| case(hand)).is_err())
+        .collect();
+    assert!(failed.is_empty(), "failed with {failed:?} in hand");
+}
+
+impl Hand {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Hand::ExactTile => "exact-tile",
+            Hand::PlainTile => "plain-tile",
+            Hand::Group => "group",
+            Hand::ExactGroup => "exact-group",
+        }
+    }
+
+    fn group(self) -> bool {
+        matches!(self, Hand::Group | Hand::ExactGroup)
+    }
+
+    fn exact(self) -> bool {
+        matches!(self, Hand::ExactTile | Hand::ExactGroup)
+    }
+}
+
+/// What a brush in hand is: its picture's name and the step a placement
+/// with it is named by.
+pub(crate) struct InHand {
+    picture: String,
+    step: String,
+}
+
+/// Chooses `hand`'s picture in the tiles palette's Gallery, Exact Tile
+/// switched as it says.
+pub(crate) fn choose_hand(h: &mut Harness<'_, Moonglow>, hand: Hand) -> InHand {
+    let picture = match hand.group() {
+        true => first_group_name(h),
+        false => index_model(h, wall_end_tile(h)),
+    };
+    show_palette(h.state_mut());
+    h.run_steps(3);
+    palette_type(h, "Tiles");
+    h.run_steps(3);
+    h.get_by_label("Gallery").click();
+    h.run_steps(2);
+    if h.state().settings.exact_tiles != hand.exact() {
+        h.get_by_label("Exact Tile").click();
+        h.run_steps(2);
+    }
+    assert_eq!(h.state().settings.exact_tiles, hand.exact());
+    open_tile_heading(h, &picture);
+    h.get_all_by_label(&picture).next().expect("its picture").scroll_to_me();
+    h.run_steps(3);
+    h.get_all_by_label(&picture).next().unwrap().click();
+    h.run_steps(2);
+    assert!(h.state().palette.tile_brush.is_some(), "{hand:?} chosen");
+    let step = match hand {
+        Hand::ExactTile => format!("Exact Tile {picture}"),
+        Hand::PlainTile => format!("Paint {picture}"),
+        Hand::Group => format!("Place {picture}"),
+        Hand::ExactGroup => format!("Exact {picture}"),
+    };
+    InHand { picture, step }
+}
+
+/// The test area with a chest at (15, 15) (tile (1, 1)) and `hand` in
+/// hand, the pointer away from the view.
+fn brush_chest_harness(
+    name: &str,
+    hand: Hand,
+) -> Option<(Harness<'static, Moonglow>, ResRef, InHand)> {
+    let (mut h, area) = area_harness(&format!("{name}-{}", hand.name()))?;
+    put_chests(&mut h, area, &[glam::Vec3::new(15.0, 15.0, 0.0)]);
+    let in_hand = choose_hand(&mut h, hand);
+    h.hover_at(egui::pos2(960.0, 610.0));
+    h.run_steps(3);
+    Some((h, area, in_hand))
+}
+
+/// The indices of the tiles that differ between two Tile_Lists.
+fn tiles_changed(before: &[mg_gff::Struct], after: &[mg_gff::Struct]) -> Vec<usize> {
+    (0..after.len()).filter(|i| before[*i] != after[*i]).collect()
+}
+
+/// What the Status Bar says (its hints and counts, joined by " · "), if
+/// one of them says `part` and is shown (a node of the bar: not dropped
+/// for room).
+fn status_line(h: &Harness<'_, Moonglow>, part: &str) -> Option<String> {
+    let said = h.state().status_said();
+    let shown = h.get_by_label("Status Bar").query_all_by_label_contains(part).next().is_some();
+    (shown && said.iter().any(|s| s.contains(part))).then(|| said.join(" · "))
+}
+
+/// The status line's words over an object a press would pick.
+const GOES_TO_OBJECT: &str = "goes to the object";
+
+/// A press at `from` led to `to` in ten steps, a frame each, and let go
+/// there, `modifiers` held; then a few frames.
+fn press_drag(h: &mut Harness<'_, Moonglow>, from: egui::Pos2, to: egui::Pos2, m: egui::Modifiers) {
+    h.event(egui::Event::ModifiersChanged(m));
+    h.hover_at(from);
+    h.run_steps(1);
+    press(h, from, true, m);
+    h.run_steps(1);
+    for k in 1..=10 {
+        h.hover_at(from + (to - from) * (k as f32 / 10.0));
+        h.run_steps(1);
+    }
+    press(h, to, false, m);
+    h.run_steps(3);
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(2);
+}
+
+/// Undo, from the keyboard.
+fn undo_key(h: &mut Harness<'_, Moonglow>) {
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+}
+
+/// With a tile or a group in hand, the pointer over a placeable promises
+/// nothing (no ghost, no cursor, a status line that names the brush and
+/// says the press goes to the object); a click on it selects it and
+/// changes no tile, adding no step; a drag from it moves it and leaves
+/// the tiles alone, one step that Undo takes back; the brush stays chosen
+/// throughout. Pictures of the hover, the click and the drag in
+/// `target/test-output/brush-press/`.
+#[test]
+fn a_press_on_an_object_picks_it_with_a_tile_or_group_in_hand() {
+    each_hand(press_on_an_object_picks_it);
+}
+
+fn press_on_an_object_picks_it(hand: Hand) {
+    use glam::Vec3;
+    use mg_area::ObjectKind::Placeable;
+    let Some((mut h, area, in_hand)) = brush_chest_harness("brush-press", hand) else { return };
+    let shots = shot_dir("brush-press");
+    let shot = |h: &mut Harness<'_, Moonglow>, what: &str| {
+        if let Some(ref shots) = shots {
+            let path = shots.join(format!("{}-{what}.png", hand.name()));
+            h.render().unwrap().save(path).unwrap();
+        }
+    };
+    let list = tile_list(&mut h, area);
+    let chest = chest_at(&h, area, 0);
+    // (Aimed at the chest's middle, a little above its foot.)
+    let on_chest = screen(&h, area, chest + Vec3::Z * 0.3);
+    assert!(h.state().area_views[&area].pick(on_chest).is_some(), "set-up: on it");
+    h.hover_at(on_chest);
+    h.run_steps(4);
+    shot(&mut h, "hover");
+    let ghost = h.state().area_views[&area].tile_preview.len();
+    let cursor = h.state().area_views[&area].brush_cursor.len();
+    let status = status_line(&h, GOES_TO_OBJECT);
+    click_with(&mut h, on_chest, egui::Modifiers::NONE);
+    shot(&mut h, "click");
+    let clicked_tiles = tile_list(&mut h, area);
+    let clicked_selection = h.state().area_views[&area].selection.clone();
+    let clicked_undo = undo_label(&h);
+    let to = screen(&h, area, Vec3::new(25.0, 15.0, 0.0));
+    press_drag(&mut h, on_chest, to, egui::Modifiers::NONE);
+    shot(&mut h, "drag");
+    let moved = chest_at(&h, area, 0);
+    eprintln!(
+        "{hand:?} hover: ghost {ghost}, cursor {cursor}, status {status:?}; click: selection \
+         {clicked_selection:?}, undo {clicked_undo:?}; drag: {chest} to {moved}, undo {:?}",
+        undo_label(&h)
+    );
+    assert_eq!(ghost, 0, "{hand:?}: no tile ghost over the chest");
+    assert_eq!(cursor, 0, "{hand:?}: no brush cursor over the chest");
+    let status = status.unwrap_or_else(|| panic!("{hand:?}: the status line says it"));
+    let named = format!("In hand: {}", in_hand.picture);
+    assert!(status.starts_with(&named), "{hand:?}: names the brush: {status}");
+    assert_eq!(status.contains("Exact Tile"), hand.exact(), "{hand:?}: {status}");
+    assert_eq!(clicked_tiles, list, "{hand:?}: a click on the chest changes no tile");
+    assert_eq!(clicked_selection, [(Placeable, 0)], "{hand:?}: a click selects it");
+    assert_eq!(clicked_undo.as_deref(), Some("Setup"), "{hand:?}: a click adds no step");
+    assert_eq!(tile_list(&mut h, area), list, "{hand:?}: a drag from it changes no tile");
+    assert!((moved - Vec3::new(25.0, 15.0, moved.z)).length() < 0.6, "{hand:?} moved: {moved}");
+    assert_eq!(undo_label(&h).as_deref(), Some("Move"));
+    assert!(h.state().palette.tile_brush.is_some(), "{hand:?}: the brush still chosen");
+    undo_key(&mut h);
+    assert!((chest_at(&h, area, 0) - chest).length() < 1e-3, "{hand:?}: Undo puts it back");
+    assert_eq!(undo_label(&h).as_deref(), Some("Setup"));
+}
+
+/// With a tile or a group in hand, a press on bare ground places as ever
+/// (the plain tile with its neighbors fitted to it); a drag begun on the
+/// ground and led over a placeable stays the brush's (a tile brush paints
+/// every tile it passes, the chest's too; a group's drag places nothing)
+/// and moves nothing. Undo after a placement, a drag of a chest and
+/// another placement goes back in order.
+#[test]
+fn a_press_on_ground_places_and_a_stroke_from_it_stays_the_brush_s() {
+    each_hand(press_on_ground_places);
+}
+
+fn press_on_ground_places(hand: Hand) {
+    use glam::Vec3;
+    let Some((mut h, area, in_hand)) = brush_chest_harness("brush-ground", hand) else { return };
+    let list = tile_list(&mut h, area);
+    let chest = chest_at(&h, area, 0);
+    // A click on bare ground, tile (2, 2).
+    let ground = screen(&h, area, Vec3::new(25.0, 25.0, 0.0));
+    assert!(h.state().area_views[&area].pick(ground).is_none(), "set-up: bare ground");
+    click_with(&mut h, ground, egui::Modifiers::NONE);
+    let changed = tiles_changed(&list, &tile_list(&mut h, area));
+    assert!(changed.contains(&10), "{hand:?}: placed in the tile clicked: {changed:?}");
+    if hand == Hand::PlainTile {
+        assert!(changed.len() > 1, "the plain tile's neighbors fitted to it: {changed:?}");
+    }
+    assert_eq!(undo_label(&h), Some(in_hand.step.clone()), "{hand:?}");
+    let placed = tile_list(&mut h, area);
+    // Begun on the ground west of the chest, led over it and on east.
+    let from = screen(&h, area, Vec3::new(5.0, 15.0, 0.0));
+    let to = screen(&h, area, Vec3::new(25.0, 15.0, 0.0));
+    press_drag(&mut h, from, to, egui::Modifiers::NONE);
+    let now = tile_list(&mut h, area);
+    if hand.group() {
+        assert_eq!(now, placed, "{hand:?}: a drag places nothing");
+        assert_eq!(undo_label(&h), Some(in_hand.step.clone()), "{hand:?}: no step");
+    } else {
+        let changed = tiles_changed(&placed, &now);
+        for i in [4, 5, 6] {
+            assert!(changed.contains(&i), "{hand:?}: tile {i} painted: {changed:?}");
+        }
+    }
+    assert_eq!(chest_at(&h, area, 0), chest, "{hand:?}: the chest not moved");
+    assert!(h.state().area_views[&area].selection.is_empty(), "{hand:?}: nothing selected");
+    let after_first = tile_list(&mut h, area);
+    // Another chest (in tile (3, 0), which nothing here passes: the one
+    // painted over may stand in the wall's ground) dragged, then a
+    // placement on row 3.
+    put_chests(&mut h, area, &[Vec3::new(35.0, 5.0, 0.0)]);
+    let other = chest_at(&h, area, 1);
+    let on_chest = screen(&h, area, other + Vec3::Z * 0.3);
+    let to = screen(&h, area, Vec3::new(35.0, 25.0, 0.0));
+    press_drag(&mut h, on_chest, to, Default::default());
+    let moved = chest_at(&h, area, 1);
+    let near = (moved.truncate() - glam::Vec2::new(35.0, 25.0)).length() < 0.6;
+    assert!(near, "{hand:?} moved: {moved}");
+    let at = screen(&h, area, Vec3::new(5.0, 35.0, 0.0));
+    click_with(&mut h, at, egui::Modifiers::NONE);
+    assert!(tiles_changed(&after_first, &tile_list(&mut h, area)).contains(&12), "{hand:?}");
+    // Undo: the placement, the move, then the rest.
+    undo_key(&mut h);
+    assert_eq!(tile_list(&mut h, area), after_first, "{hand:?}: the placement undone");
+    assert!((chest_at(&h, area, 1) - moved).length() < 1e-3);
+    undo_key(&mut h);
+    assert!((chest_at(&h, area, 1) - other).length() < 1e-3, "{hand:?}: the move undone");
+    assert_eq!(tile_list(&mut h, area), after_first);
+    // (The second chest's Setup too.)
+    for _ in 0..8 {
+        if tile_list(&mut h, area) == list {
+            break;
+        }
+        undo_key(&mut h);
+    }
+    assert_eq!(tile_list(&mut h, area), list, "{hand:?}: all undone");
+    assert_eq!(chest_at(&h, area, 0), chest);
+}
+
+/// The ray from the camera through a point of the area's view, as the
+/// view casts it (`AreaView::ray`).
+fn ray_through(h: &Harness<'_, Moonglow>, area: ResRef, pos: egui::Pos2) -> mg_area::pick::Ray {
+    let view = &h.state().area_views[&area];
+    let camera = view.camera().expect("a camera");
+    let r = view.rect;
+    let aspect = (r.width() / r.height().max(1.0)).max(1e-3);
+    let at = glam::Vec2::new((pos.x - r.min.x) / r.width(), (pos.y - r.min.y) / r.height());
+    mg_area::pick::Ray::from_screen(&camera, aspect, at)
+}
+
+/// With a tile or a group in hand, a press over a placeable no press
+/// could pick places as ever: one of a kind hidden (Placeables off), one
+/// locked, and one behind a tile (the tile's ground nearer the eye under
+/// the pointer). In object mode a click there does pick the chest behind
+/// the tile (`AreaView::pick` weighs objects alone): only the brush's
+/// press looks at what is seen.
+#[test]
+fn hidden_locked_and_hidden_behind_objects_take_no_press() {
+    each_hand(not_pickable_objects_take_no_press);
+}
+
+fn not_pickable_objects_take_no_press(hand: Hand) {
+    use glam::Vec3;
+    use mg_area::ObjectKind::Placeable;
+    let Some((mut h, area, _)) = brush_chest_harness("brush-not-pickable", hand) else { return };
+    let git = ResKey::new(area, ResType::GIT);
+    let chest = chest_at(&h, area, 0);
+    let on_chest = screen(&h, area, chest + Vec3::Z * 0.3);
+    let list = tile_list(&mut h, area);
+    let placed = |h: &mut Harness<'_, Moonglow>| tiles_changed(&list, &tile_list(h, area));
+    // Placeables hidden.
+    h.state_mut().area_views.get_mut(&area).unwrap().show[Placeable.index()] = false;
+    h.run_steps(2);
+    click_with(&mut h, on_chest, egui::Modifiers::NONE);
+    assert!(placed(&mut h).contains(&5), "{hand:?} hidden: placed there");
+    assert!(h.state().area_views[&area].selection.is_empty());
+    undo_key(&mut h);
+    h.state_mut().area_views.get_mut(&area).unwrap().show[Placeable.index()] = true;
+    // Locked.
+    let lock = mg_edit::Edit::SetField {
+        key: git,
+        path: mg_edit::GffPath::root().item("Placeable List", 0),
+        label: mg_area::LOCKED.into(),
+        value: Some(mg_gff::Value::Byte(1)),
+    };
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Lock", vec![lock])));
+    h.run_steps(3);
+    click_with(&mut h, on_chest, egui::Modifiers::NONE);
+    assert!(placed(&mut h).contains(&5), "{hand:?} locked: placed there");
+    assert!(h.state().area_views[&area].selection.is_empty());
+    undo_key(&mut h);
+    undo_key(&mut h);
+    // Behind a tile: the three tiles south-west of it a step up, seen low
+    // from the south-west (higher, the ray would pass under their
+    // walkmesh, a raised tile having no cliff face).
+    let raise = [0, 1, 4]
+        .map(|i| mg_edit::Edit::SetField {
+            key: ResKey::new(area, ResType::ARE),
+            path: mg_edit::GffPath::root().item("Tile_List", i),
+            label: "Tile_Height".into(),
+            value: Some(mg_gff::Value::Int(1)),
+        })
+        .to_vec();
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Raise", raise)));
+    h.run_steps(3);
+    settle(&mut h);
+    if let Some(o) = h.state_mut().area_views.get_mut(&area).and_then(|v| v.orbit.as_mut()) {
+        o.target = chest;
+        // (Not straight along the tiles' diagonal, which their ground's
+        // faces are split along: a ray down it met the raised tile's
+        // corner or passed by it, as the view's height made it.)
+        (o.distance, o.pitch, o.yaw) = (45.0, 0.3, (-130f32).to_radians());
+    }
+    h.run_steps(5);
+    let behind = screen(&h, area, chest + Vec3::Z * 0.3);
+    let ground = {
+        let game = h.state().game.as_deref().unwrap();
+        let model = h.state().area_views[&area].model.as_ref().unwrap();
+        mg_area::walk::Ground::new(game, model)
+    };
+    let ray = ray_through(&h, area, behind);
+    let hit = ground.hit(&ray).expect("set-up: the ray meets a raised tile");
+    assert!(
+        (hit - ray.origin).length() < (chest - ray.origin).length() - 1.0,
+        "set-up: the raised tile's ground ({hit}) is nearer than the chest"
+    );
+    assert!(h.state().area_views[&area].pick(behind).is_some(), "pick sees the chest behind it");
+    let before = tile_list(&mut h, area);
+    click_with(&mut h, behind, egui::Modifiers::NONE);
+    assert!(h.state().area_views[&area].selection.is_empty(), "{hand:?} behind: not picked");
+    assert_ne!(tile_list(&mut h, area), before, "{hand:?}: placed on the tile seen");
+    assert_eq!(chest_at(&h, area, 0), chest);
+}
+
+/// With a tile or a group in hand, what is not a plain press on an object
+/// is as before: Ctrl + drag and Alt + drag from it move the view and
+/// change nothing; Ctrl + click on it toggles it in the selection, as in
+/// object mode (the owner's answer of 2026-11-12); a right click on it
+/// turns the tile or group a quarter (the next placed is turned) and
+/// selects nothing; Escape over it puts the brush down.
+#[test]
+fn camera_presses_right_click_and_escape_stay_with_a_tile_or_group_in_hand() {
+    each_hand(camera_right_click_and_escape);
+}
+
+fn camera_right_click_and_escape(hand: Hand) {
+    use glam::Vec3;
+    use mg_area::ObjectKind::Placeable;
+    let Some((mut h, area, _)) = brush_chest_harness("brush-unchanged", hand) else { return };
+    let list = tile_list(&mut h, area);
+    let chest = chest_at(&h, area, 0);
+    let on_chest = screen(&h, area, chest + Vec3::Z * 0.3);
+    let to = screen(&h, area, Vec3::new(25.0, 25.0, 0.0));
+    for m in [egui::Modifiers::COMMAND, egui::Modifiers::ALT] {
+        let orbit = h.state().area_views[&area].orbit.unwrap();
+        press_drag(&mut h, on_chest, to, m);
+        let now = h.state().area_views[&area].orbit.unwrap();
+        assert!((now.target - orbit.target).length() > 1.0, "{hand:?} {m:?} + drag: the view");
+        assert_eq!(tile_list(&mut h, area), list, "{hand:?} {m:?} + drag: no tile changed");
+        assert_eq!(chest_at(&h, area, 0), chest, "{hand:?} {m:?} + drag: the chest stays");
+        assert_eq!(undo_label(&h).as_deref(), Some("Setup"));
+        h.state_mut().area_views.get_mut(&area).unwrap().orbit = Some(orbit);
+        h.run_steps(3);
+    }
+    click_with(&mut h, on_chest, egui::Modifiers::COMMAND);
+    assert_eq!(h.state().area_views[&area].selection, [(Placeable, 0)], "{hand:?}: Ctrl + click");
+    // (Past a double click's time: a double click keeps the object
+    // selected, to show it in the Properties panel, ruling Q1.)
+    let apart = h.ctx.options(|o| o.input_options.max_double_click_delay);
+    let clicked = h.ctx.input(|i| i.time);
+    while h.ctx.input(|i| i.time) - clicked <= apart {
+        h.step();
+    }
+    click_with(&mut h, on_chest, egui::Modifiers::COMMAND);
+    assert!(h.state().area_views[&area].selection.is_empty(), "{hand:?}: Ctrl + click again");
+    assert_eq!(tile_list(&mut h, area), list);
+    assert_eq!(undo_label(&h).as_deref(), Some("Setup"));
+    // A right click on the chest: turned, nothing selected. (What the
+    // tile clicked is turned to without it first, then undone.)
+    let turn = |h: &mut Harness<'_, Moonglow>| tile_list(h, area)[10].integer("Tile_Orientation");
+    click_with(&mut h, to, egui::Modifiers::NONE);
+    let unturned = turn(&mut h).unwrap_or(0);
+    undo_key(&mut h);
+    h.hover_at(on_chest);
+    h.run_steps(1);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: on_chest,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        });
+    }
+    h.run_steps(3);
+    assert!(h.state().area_views[&area].selection.is_empty(), "{hand:?}: a right click");
+    click_with(&mut h, to, egui::Modifiers::NONE);
+    let turned = turn(&mut h).unwrap_or(0);
+    assert_ne!(turned, unturned, "{hand:?}: placed turned");
+    // Escape over the chest: the brush put down.
+    h.hover_at(on_chest);
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().palette.tile_brush.is_none(), "{hand:?}: Escape puts the brush down");
+}
+
+/// With a tile or a group in hand, its Gallery picture dropped on a
+/// placeable places it there, as ever (`drop_tile`).
+#[test]
+fn a_tile_or_group_picture_dropped_on_an_object_places_it() {
+    each_hand(picture_dropped_on_an_object);
+}
+
+fn picture_dropped_on_an_object(hand: Hand) {
+    use glam::Vec3;
+    let Some((mut h, area, in_hand)) = brush_chest_harness("brush-drop", hand) else { return };
+    let list = tile_list(&mut h, area);
+    let chest = chest_at(&h, area, 0);
+    let from = h.get_all_by_label(&in_hand.picture).next().expect("its picture").rect().center();
+    let to = screen(&h, area, chest + Vec3::Z * 0.3);
+    h.hover_at(from);
+    press(&h, from, true, egui::Modifiers::NONE);
+    for k in 1..=10 {
+        h.hover_at(from + (to - from) * (k as f32 / 10.0));
+        h.run_steps(1);
+    }
+    press(&h, to, false, egui::Modifiers::NONE);
+    h.run_steps(3);
+    let changed = tiles_changed(&list, &tile_list(&mut h, area));
+    assert!(changed.contains(&5), "{hand:?}: placed under the chest: {changed:?}");
+    assert_eq!(chest_at(&h, area, 0), chest);
+}
+
+/// With a tile or a group in hand: several selected, a drag from one
+/// moves them all; Shift + drag from one moves it as in object mode
+/// (Shift's rectangle is a stroke's, begun on the ground); the
+/// selection's turn ring, led, turns it and places nothing.
+#[test]
+fn several_selected_move_and_the_selection_s_handles_are_its() {
+    each_hand(several_and_handles);
+}
+
+fn several_and_handles(hand: Hand) {
+    use glam::Vec3;
+    use mg_area::ObjectKind::Placeable;
+    let Some((mut h, area, _)) = brush_chest_harness("brush-several", hand) else { return };
+    put_chests(&mut h, area, &[Vec3::new(15.0, 35.0, 0.0)]);
+    let list = tile_list(&mut h, area);
+    let (a0, b0) = (chest_at(&h, area, 0), chest_at(&h, area, 1));
+    h.state_mut().area_views.get_mut(&area).unwrap().selection =
+        vec![(Placeable, 0), (Placeable, 1)];
+    h.run_steps(3);
+    let on_a = screen(&h, area, a0 + Vec3::Z * 0.3);
+    let to = screen(&h, area, Vec3::new(25.0, 15.0, 0.0));
+    press_drag(&mut h, on_a, to, Default::default());
+    let (a1, b1) = (chest_at(&h, area, 0), chest_at(&h, area, 1));
+    assert!(((a1 - a0) - (b1 - b0)).truncate().length() < 0.05, "{hand:?}: {a1} {b1}");
+    assert!((a1 - a0).truncate().length() > 9.0, "{hand:?} moved: {a0} to {a1}");
+    assert_eq!(tile_list(&mut h, area), list);
+    // Shift + drag from one: it alone moves (as in object mode).
+    h.state_mut().area_views.get_mut(&area).unwrap().selection = vec![(Placeable, 0)];
+    h.run_steps(3);
+    let on_a = screen(&h, area, a1 + Vec3::Z * 0.3);
+    let to = screen(&h, area, Vec3::new(25.0, 25.0, 0.0));
+    press_drag(&mut h, on_a, to, egui::Modifiers::SHIFT);
+    let a2 = chest_at(&h, area, 0);
+    assert!((a2.truncate() - glam::Vec2::new(25.0, 25.0)).length() < 0.6, "{hand:?}: {a2}");
+    assert_eq!(tile_list(&mut h, area), list, "{hand:?}: Shift + drag places nothing");
+    // The turn ring, led a quarter round.
+    let radius = h.state().area_views[&area].handle_radius_at(a2).unwrap();
+    let ring = |a: f32| a2 + Vec3::new(a.cos(), a.sin(), 0.0) * radius;
+    let from = screen(&h, area, ring(0.0));
+    h.hover_at(from);
+    h.run_steps(2);
+    if hand == Hand::ExactTile
+        && let Some(shots) = shot_dir("brush-press")
+    {
+        let shot = h.render().unwrap();
+        shot.save(shots.join("handles.png")).unwrap();
+    }
+    press(&h, from, true, egui::Modifiers::NONE);
+    h.run_steps(1);
+    for k in 1..=8 {
+        h.hover_at(screen(&h, area, ring(std::f32::consts::FRAC_PI_2 * k as f32 / 8.0)));
+        h.run_steps(1);
+    }
+    press(&h, screen(&h, area, ring(std::f32::consts::FRAC_PI_2)), false, Default::default());
+    h.run_steps(3);
+    assert_eq!(undo_label(&h).as_deref(), Some("Rotate"), "{hand:?}: the ring turned it");
+    assert_eq!(tile_list(&mut h, area), list, "{hand:?}: the ring places nothing");
+}
+
+/// A read-only area with a tile or a group in hand: a press on its chest
+/// selects it, a drag moves nothing and nothing is placed.
+#[test]
+fn a_read_only_area_selects_and_changes_nothing_with_a_tile_or_group_in_hand() {
+    each_hand(read_only);
+}
+
+fn read_only(hand: Hand) {
+    use glam::Vec3;
+    use mg_area::ObjectKind::Placeable;
+    let name = format!("brush-read-only-{}", hand.name());
+    let Some((mut h, area)) = read_only_area_harness(&name) else { return };
+    choose_hand(&mut h, hand);
+    h.hover_at(egui::pos2(960.0, 610.0));
+    h.run_steps(3);
+    let list = tile_list(&mut h, area);
+    let chest = chest_at(&h, area, 0);
+    let on_chest = screen(&h, area, chest + Vec3::Z * 0.3);
+    click_with(&mut h, on_chest, egui::Modifiers::NONE);
+    assert_eq!(h.state().area_views[&area].selection, [(Placeable, 0)], "{hand:?}");
+    let to = screen(&h, area, Vec3::new(25.0, 25.0, 0.0));
+    press_drag(&mut h, on_chest, to, Default::default());
+    assert_eq!(chest_at(&h, area, 0), chest, "{hand:?}");
+    assert_eq!(tile_list(&mut h, area), list, "{hand:?}");
+}
+
+/// The first group's name in Rural's tiles palette.
+fn first_group_name(h: &Harness<'_, Moonglow>) -> String {
+    use mg_tiles::TileIndex;
+    let game = h.state().game.as_deref().unwrap();
+    let ttr01 = ResRef::from_str("ttr01").unwrap();
+    let set = mg_area::tileset(game, ttr01).unwrap();
+    let index = TileIndex::new(&set);
+    let palette = mg_area::terrain::TilesetPalette::read(game, ttr01, &set, &index);
+    let brushes = palette.brushes();
+    let group = brushes.iter().find(|(_, b)| matches!(b, mg_area::terrain::Brush::Group(_)));
+    group.expect("Rural has groups").0.to_string()
+}
+
+/// What the painting brushes (and Select Tiles and Paint, to compare) do
+/// with a click on a placeable and a press-drag from it to the next tile
+/// north-east: the tiles changed, what is selected, where the chest is
+/// and the step added. They take every press (the owner's answer of
+/// 2026-11-12: the tile and group brushes pick the object, these stay
+/// as they are). The table is printed.
+#[test]
+fn other_brushes_on_an_object_today() {
+    use glam::Vec3;
+    let modes = [
+        "Terrain (Water)",
+        "Raise/Lower",
+        "Eraser",
+        "Refine Tile",
+        "Crosser (Road)",
+        "Next Tile Appearance",
+        "Previous Tile Appearance",
+        "Rotate Tile",
+        "Select Tiles",
+        "Paint (placeables)",
+    ];
+    let mut table = Vec::new();
+    for mode in modes {
+        let Some((mut h, area)) = area_harness("other-brushes") else { return };
+        put_chests(&mut h, area, &[Vec3::new(15.0, 15.0, 0.0)]);
+        match mode {
+            "Terrain (Water)" => choose_tile_brush(&mut h, "Water"),
+            "Crosser (Road)" => choose_tile_brush(&mut h, "Road"),
+            "Select Tiles" => {
+                area_click(&mut h, "Select Tiles");
+                h.run_steps(2);
+            }
+            "Paint (placeables)" => {
+                let shrub = ResKey::parse("plc_shrub", ResType::UTP).unwrap();
+                let app = h.state_mut();
+                app.palette.tiles = false;
+                app.palette.kind = mg_module::palette::BlueprintKind::Placeable;
+                app.palette.selected = Some(shrub);
+                app.palette.chosen = vec![shrub];
+                app.paint = true;
+                h.run_steps(2);
+            }
+            label => choose_tile_brush(&mut h, label),
+        }
+        h.hover_at(egui::pos2(960.0, 610.0));
+        h.run_steps(3);
+        let list = tile_list(&mut h, area);
+        let count = |h: &mut Harness<'_, Moonglow>| {
+            let ws = h.state_mut().ws.as_mut().unwrap();
+            let git = ws.doc(&ResKey::new(area, ResType::GIT)).unwrap();
+            git.root.list("Placeable List").map_or(0, |l| l.len())
+        };
+        let chest = chest_at(&h, area, 0);
+        let on_chest = screen(&h, area, chest + Vec3::Z * 0.3);
+        let changed = |h: &mut Harness<'_, Moonglow>| -> Vec<usize> {
+            let now = tile_list(h, area);
+            (0..now.len()).filter(|i| now[*i] != list[*i]).collect()
+        };
+        let outcome = |h: &mut Harness<'_, Moonglow>| {
+            let moved = (chest_at(h, area, 0) - chest).truncate().length() > 0.5;
+            // (How many the placeable brush lays is its own chance: some
+            // or none is what is pinned.)
+            let added = if count(h) > 1 { "some" } else { "none" };
+            // (Which tiles besides the chest's a brush changes is a
+            // variant's chance (one may come out as it was) and where a
+            // drag's steps fall: whether the chest's is among them is what
+            // is pinned.)
+            let changed = changed(h);
+            let tiles = match (changed.contains(&5), changed.len()) {
+                (_, 0) => "none",
+                (true, _) => "the chest's among them",
+                (false, _) => "others",
+            };
+            format!(
+                "tiles {tiles}, selected {}, chest {}, placeables added {added}, step {:?}",
+                !h.state().area_views[&area].selection.is_empty(),
+                if moved { "moved" } else { "stays" },
+                undo_label(h).filter(|l| l != "Setup")
+            )
+        };
+        click_with(&mut h, on_chest, egui::Modifiers::NONE);
+        // (The Eraser on a tile with nothing to erase chooses its tile
+        // again among those that fit: about one click in 20 comes out as
+        // the tile there, changing nothing. Each click chooses afresh.)
+        for _ in 0..5 {
+            if mode != "Eraser" || !changed(&mut h).is_empty() {
+                break;
+            }
+            click_with(&mut h, on_chest, egui::Modifiers::NONE);
+        }
+        let click = outcome(&mut h);
+        while undo_label(&h).is_some_and(|l| l != "Setup") {
+            h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+            h.run_steps(3);
+        }
+        h.state_mut().area_views.get_mut(&area).unwrap().selection.clear();
+        h.run_steps(2);
+        // (Where the chest and the drag's end are on the screen, taken
+        // again once the window's own work is done before each drag: the
+        // view's camera or the chest's place, settled late on a busy
+        // machine, would have every drag start beside the chest.)
+        let ends = |h: &mut Harness<'_, Moonglow>| {
+            settle(h);
+            let on = screen(h, area, chest_at(h, area, 0) + Vec3::Z * 0.3);
+            (on, screen(h, area, Vec3::new(25.0, 25.0, 0.0)))
+        };
+        let (on, to) = ends(&mut h);
+        press_drag(&mut h, on, to, egui::Modifiers::NONE);
+        // (So may the Eraser's drag choose the chest's tile as it was:
+        // undone and dragged again.)
+        let mut tries = vec![changed(&mut h)];
+        for _ in 0..5 {
+            if mode != "Eraser" || changed(&mut h).contains(&5) {
+                break;
+            }
+            while undo_label(&h).is_some_and(|l| l != "Setup") {
+                h.state_mut().ws.as_mut().unwrap().undo().unwrap();
+                h.run_steps(3);
+            }
+            let (on, to) = ends(&mut h);
+            press_drag(&mut h, on, to, egui::Modifiers::NONE);
+            tries.push(changed(&mut h));
+        }
+        if mode == "Eraser" && !changed(&mut h).contains(&5) {
+            // (Said when it fails: the tiles each drag changed.)
+            eprintln!("Eraser drags from the chest's tile 5, the tiles each changed: {tries:?}");
+        }
+        let drag = outcome(&mut h);
+        table.push(format!("{mode} | click: {click} | press-drag: {drag}"));
+    }
+    eprintln!("{}", table.join("\n"));
+    let pinned: &[&str] = &[
+        "Terrain (Water) | click: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Paint Water\") | press-drag: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Paint Water\")",
+        "Raise/Lower | click: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Raise terrain\") | press-drag: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Raise terrain\")",
+        "Eraser | click: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Erase tile\") | press-drag: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Erase tile\")",
+        "Refine Tile | click: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Refine tile\") | press-drag: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Refine tiles\")",
+        "Crosser (Road) | click: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Paint Road\") | press-drag: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Paint Road\")",
+        "Next Tile Appearance | click: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Next tile appearance\") | press-drag: tiles none, selected false, chest stays, placeables added none, step None",
+        "Previous Tile Appearance | click: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Previous tile appearance\") | press-drag: tiles none, selected false, chest stays, placeables added none, step None",
+        "Rotate Tile | click: tiles the chest's among them, selected false, chest stays, placeables added none, step Some(\"Rotate tile\") | press-drag: tiles none, selected false, chest stays, placeables added none, step None",
+        "Select Tiles | click: tiles none, selected true, chest stays, placeables added none, step None | press-drag: tiles none, selected true, chest moved, placeables added none, step Some(\"Move\")",
+        "Paint (placeables) | click: tiles none, selected false, chest stays, placeables added some, step Some(\"Paint Placeables\") | press-drag: tiles none, selected false, chest stays, placeables added some, step Some(\"Paint Placeables\")",
+    ];
+    assert_eq!(table, pinned, "what the other brushes do on an object, as pinned");
 }

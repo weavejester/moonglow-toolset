@@ -61,6 +61,38 @@ fn again(h: &Harness<'_, Moonglow>) -> std::time::Duration {
     out.get(&egui::ViewportId::ROOT).map_or(std::time::Duration::MAX, |v| v.repaint_delay)
 }
 
+/// An area's clock set (`AreaView::set_clock`, `frame_perf`'s
+/// `FRAME_SHOTS`) draws its picture anew at that time whatever came
+/// before: the same picture after a second more of frames.
+#[test]
+fn an_area_s_clock_set_draws_the_same_picture_whatever_came_before() {
+    let Some((mut h, area)) = area_harness("area-clock") else { return };
+    settle(&mut h);
+    let shot = |h: &mut Harness<'_, Moonglow>| {
+        let pictures = h.state().area_views[&area].pictures;
+        h.state_mut().area_views.get_mut(&area).unwrap().set_clock(10.0);
+        h.run_steps(1);
+        assert!(h.state().area_views[&area].pictures > pictures, "drawn anew");
+        let rect = h.state().area_views[&area].rect;
+        let img = h.render().unwrap();
+        let ppp = h.ctx.pixels_per_point();
+        let px = |x: f32, y: f32| *img.get_pixel((x * ppp) as u32, (y * ppp) as u32);
+        (0..8)
+            .flat_map(|i| (0..8).map(move |j| (i, j)))
+            .map(|(i, j)| {
+                let (x, y) = (
+                    rect.left() + rect.width() * (i as f32 + 0.5) / 8.0,
+                    rect.top() + rect.height() * (j as f32 + 0.5) / 8.0,
+                );
+                px(x, y)
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = shot(&mut h);
+    h.run_steps(60);
+    assert_eq!(shot(&mut h), first);
+}
+
 /// An area's view steps its animations 25 times a second while the window
 /// has the focus; behind another program's window it asks for no frame
 /// (its picture kept as it is), and steps again once it has the focus.
@@ -127,8 +159,79 @@ fn the_area_view_resolution_draws_the_picture_at_a_share_of_its_pixels() {
     assert_eq!(size(&h), (w, hh));
 }
 
+/// Options › Area › Anti-aliasing: the area's picture drawn with one
+/// sample a pixel (no resolve: wgpu refuses one on a single sample), the
+/// renderer made anew for it and the picture drawn again, its edges
+/// stepped where four smooth them; four again once 4× is chosen. (Two,
+/// where the adapter takes it, in `mg-render`'s `render.rs`.)
+#[test]
+fn anti_aliasing_draws_the_area_with_the_samples_chosen() {
+    let Some((mut h, area)) = area_harness("anti-aliasing") else { return };
+    settle(&mut h);
+    let offered = h.state().viewport.as_ref().unwrap().renderer.sample_count();
+    let samples = |h: &Harness<'_, Moonglow>| {
+        let renderer = h.state().viewport.as_ref().unwrap().renderer.sample_count();
+        (renderer, h.state().area_views[&area].picture_samples())
+    };
+    assert_eq!(samples(&h), (offered, Some(offered)), "four unless chosen, as the GPU takes them");
+    let dir = mg_testkit::scratch_dir("anti-aliasing");
+    let four = h.render().unwrap();
+    four.save(dir.join("four.png")).unwrap();
+    let pictures = h.state().area_views[&area].pictures;
+    h.state_mut().settings.anti_aliasing = Some(1);
+    settle(&mut h);
+    h.run_steps(3);
+    assert_eq!(samples(&h), (1, Some(1)));
+    assert!(h.state().area_views[&area].pictures > pictures, "drawn again");
+    let one = h.render().unwrap();
+    one.save(dir.join("one.png")).unwrap();
+    if offered > 1 {
+        let differ = four.pixels().zip(one.pixels()).filter(|(a, b)| a != b).count();
+        assert!(differ > 100, "the edges stepped: {differ} pixels differ");
+    }
+    h.state_mut().settings.anti_aliasing = None;
+    settle(&mut h);
+    h.run_steps(3);
+    assert_eq!(samples(&h), (offered, Some(offered)), "as it was");
+}
+
+/// The other 3D views follow Anti-aliasing too: the palette's pictures
+/// (thumbnails, made again) and the model viewer, with one sample a pixel
+/// and then four again.
+#[test]
+fn anti_aliasing_draws_the_thumbnails_and_the_model_viewer_alike() {
+    let Some((mut h, _)) = area_harness("anti-aliasing-others") else { return };
+    {
+        let app = h.state_mut();
+        app.palette.kind = mg_module::palette::BlueprintKind::Placeable;
+        (app.palette.tiles, app.palette.custom) = (false, false);
+        app.palette.filter = "plc_chest".into();
+        app.settings.palette_gallery = true;
+        show_palette(app);
+    }
+    settle(&mut h);
+    let offered = h.state().viewport.as_ref().unwrap().renderer.sample_count();
+    assert_eq!(h.state().thumbnails.picture_samples(), Some(offered), "the chests' pictures");
+    h.state_mut().settings.anti_aliasing = Some(1);
+    settle(&mut h);
+    assert_eq!(h.state().thumbnails.waiting(), 0, "made again");
+    assert_eq!(h.state().thumbnails.picture_samples(), Some(1), "made again with one");
+    let key = ResKey::parse("plc_a01", ResType::MDL).unwrap();
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
+    settle(&mut h);
+    let source = mg_ui::model_view::Source::Resource(key);
+    let model = |h: &Harness<'_, Moonglow>| h.state().model_views[&source].picture_samples();
+    assert_eq!(model(&h), Some(1), "the model viewer with one");
+    h.state_mut().settings.anti_aliasing = None;
+    settle(&mut h);
+    h.run_steps(3);
+    assert_eq!(model(&h), Some(offered), "and four again");
+}
+
 /// The model viewer playing an animation asks for frames while the window
-/// has the focus, and none behind another program's window.
+/// has the focus, a step at a time as the area view's animations step (it
+/// asked for one at once, every frame), and none behind another program's
+/// window.
 #[test]
 fn a_playing_model_waits_while_the_window_has_not_the_focus() {
     let root = mg_testkit::corpus!();
@@ -138,14 +241,94 @@ fn a_playing_model_waits_while_the_window_has_not_the_focus() {
     app.settings.game_shaders = Some(false);
     let key = ResKey::parse("plc_a01", ResType::MDL).unwrap();
     app.actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
-    let mut h = gpu_harness(app, rs, 900.0, 700.0);
-    h.run_steps(3);
+    // (Frames a 60th of a second apart: egui takes a frame's time off a
+    // delay asked for.)
+    let mut h = area_gpu_harness(app, rs, 900.0, 700.0);
+    settle(&mut h);
     let source = mg_ui::model_view::Source::Resource(key);
     let view = h.state_mut().model_views.get_mut(&source).unwrap();
     (view.animation, view.playing) = (Some("open".into()), true);
     h.run_steps(3);
-    assert!(again(&h) <= std::time::Duration::from_millis(40), "playing: {:?}", again(&h));
+    // (A step as the area view's, not a frame at once every frame.)
+    let step = again(&h);
+    assert!(
+        step >= std::time::Duration::from_millis(20)
+            && step <= std::time::Duration::from_millis(40),
+        "playing: {step:?}"
+    );
     h.input_mut().focused = false;
     h.run_steps(3);
     assert!(again(&h) > std::time::Duration::from_secs(1), "in the background: {:?}", again(&h));
+}
+
+/// A text model named `name` of `quads` square meshes side by side.
+fn quads_model(name: &str, quads: usize) -> Vec<u8> {
+    let mut text = format!(
+        "newmodel {name}\nsetsupermodel {name} NULL\nbeginmodelgeom {name}\nnode dummy {name}\n  \
+         parent NULL\nendnode\n"
+    );
+    for i in 0..quads {
+        text += &format!(
+            "node trimesh q{i}\n  parent {name}\n  bitmap NULL\n  verts 4\n    -1 1 0\n    -1 -1 0\n    \
+             1 1 0\n    1 -1 0\n  faces 2\n    0 1 2 1 0 0 0 1\n    3 2 1 1 0 0 0 1\n  position {} 0 \
+             0\nendnode\n",
+            i * 3
+        );
+    }
+    text += &format!("endmodelgeom {name}\ndonemodel {name}\n");
+    text.into_bytes()
+}
+
+/// A model's view looks at the model's bytes again (the review's B16: a
+/// model exported again was drawn as it had been until Moonglow was
+/// started again), and a view no open tab shows is dropped once unseen,
+/// with its models on the GPU; one whose tab is behind another is kept.
+#[test]
+fn a_model_s_view_reads_its_model_again_and_goes_with_its_tab() {
+    let root = mg_testkit::corpus!();
+    let Some(rs) = gpu() else { return };
+    let dir = mg_testkit::scratch_dir("ui-model-view-again");
+    let path = sample_module(&dir);
+    let mut app = game_app(&root, None);
+    app.set_render_state(rs.clone());
+    app.settings.game_shaders = Some(false);
+    app.open_module(&path);
+    let key = ResKey::parse("mg_quads", ResType::MDL).unwrap();
+    let set = |quads: usize| {
+        let data = Some(quads_model("mg_quads", quads));
+        let edit = mg_edit::Edit::SetResource { key, data };
+        mg_ui::Action::Apply(mg_edit::Command::new("Model", vec![edit]))
+    };
+    app.actions.push(set(1));
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Model(key)));
+    let mut h = area_gpu_harness(app, rs, 900.0, 700.0);
+    settle(&mut h);
+    let source = mg_ui::model_view::Source::Resource(key);
+    let nodes = |h: &Harness<'_, Moonglow>| h.state().model_views.get(&source).map(|v| v.nodes());
+    assert_eq!(nodes(&h), Some(2), "the model's root and its mesh");
+    // The model with two more meshes: drawn as it is now, its camera kept.
+    let orbit = mg_ui::area_view::Orbit {
+        target: glam::Vec3::new(1.0, 2.0, 3.0),
+        yaw: 0.5,
+        pitch: 0.25,
+        distance: 7.0,
+    };
+    h.state_mut().model_views.get_mut(&source).unwrap().orbit = orbit;
+    h.state_mut().actions.push(set(3));
+    h.run_steps(3);
+    assert_eq!(nodes(&h), Some(4), "read again");
+    assert_eq!(h.state().model_views[&source].orbit, orbit);
+    // Behind another tab: kept, its targets let go of.
+    let app = h.state_mut();
+    let at = app.dock.find_tab(&Tab::Model(key)).unwrap();
+    app.dock
+        .set_focused_node_and_surface(egui_dock::NodePath { surface: at.surface, node: at.node });
+    app.dock.push_to_focused_leaf(Tab::Journal);
+    h.run_steps(PAST_UNSEEN);
+    assert_eq!(nodes(&h), Some(4), "its tab is open still");
+    assert!(!h.state().model_views[&source].holds_targets());
+    // Its tab closed: the view goes.
+    close_tab(h.state_mut(), &Tab::Model(key));
+    h.run_steps(PAST_UNSEEN);
+    assert!(h.state().model_views.is_empty(), "dropped with its tab");
 }

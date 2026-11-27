@@ -297,15 +297,13 @@ impl AppearanceRow {
         // DefaultModel (not armor: a body wears it).
         let item = self.table == "baseitems";
         let armor = item
-            && usize::try_from(self.row)
-                .ok()
-                .and_then(|r| tables("baseitems")?.get(r, "ModelType"))
-                == Some("3");
+            && usize::try_from(self.row).is_ok_and(|r| {
+                tables("baseitems").is_some_and(|t| crate::items::is_armor_row(t, r))
+            });
         let drawn_instead = (item && !armor && out.found.is_empty())
             .then(|| {
                 let r = usize::try_from(self.row).ok()?;
-                let d = tables("baseitems")?.get(r, "DefaultModel")?.trim().to_ascii_lowercase();
-                models::has_model(resman, &d).then_some(d)
+                models::item_default_model(tables("baseitems")?, r, resman)
             })
             .flatten();
         // (An item none of whose own models are there and whose
@@ -320,6 +318,79 @@ impl AppearanceRow {
             out.problems.push(ModelProblem { at: *self, problem });
         }
         out
+    }
+}
+
+/// An item the game can't make: none of the models its parts name is
+/// there, and its base item's `DefaultModel` isn't either (or is empty),
+/// so the game's `CreateItem` fails ("Model ... nor the default model
+/// could be loaded") and a creature that holds or wears it leaves the
+/// client on the loading screen. Seen in the client (`batch8d.rs` in
+/// `client_render`, 2026-11-25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemWithoutModel {
+    /// The item's baseitems.2da row.
+    pub row: i64,
+    /// The row's `ItemClass`, which its models are named by; `None`: it
+    /// has none.
+    pub class: Option<String>,
+    /// The first model its parts name (lower case) and the field with its
+    /// number; `None` where the row has no `ItemClass`, so no model.
+    pub first: Option<(&'static str, String)>,
+    /// The row's `DefaultModel`, when it names one (which isn't there).
+    pub default: Option<String>,
+}
+
+/// Whether an item (a blueprint's or an inline item's fields) has no
+/// model at all: the one rule Verify's `item-model` goes by, built from
+/// the same lists as the previews' items ([`models::item_models`], the
+/// base item's [`models::item_default_model`]). Armor is the body's, and
+/// a row that isn't there is [`Problem::NotARow`]'s: `None` for both.
+pub fn item_without_model(
+    item: &Struct,
+    baseitems: &TwoDa,
+    cloaks: Option<&TwoDa>,
+    resman: &ResMan,
+) -> Option<ItemWithoutModel> {
+    use crate::models;
+    let row = usize::try_from(item.integer("BaseItem").unwrap_or(0)).ok()?;
+    baseitems.get(row, "label").filter(|l| !l.trim().is_empty())?;
+    if crate::items::is_armor_row(baseitems, row) {
+        return None;
+    }
+    let named = models::item_models(item, baseitems, cloaks);
+    if named.iter().any(|n| n.models.iter().any(|m| models::has_model(resman, m))) {
+        return None;
+    }
+    if models::item_default_model(baseitems, row, resman).is_some() {
+        return None;
+    }
+    let cell = |column: &str| {
+        let v = baseitems.get(row, column)?.trim();
+        (!v.is_empty() && v != "****").then(|| v.to_string())
+    };
+    Some(ItemWithoutModel {
+        row: row as i64,
+        class: cell("ItemClass"),
+        first: named.first().map(|n| (n.field, n.models[0].clone())),
+        default: cell("DefaultModel").map(|d| d.to_ascii_lowercase()),
+    })
+}
+
+impl std::fmt::Display for ItemWithoutModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let row = self.row;
+        match &self.first {
+            Some((field, model)) => write!(
+                f,
+                "No model: {model} (its {field}) isn't in the module, its haks or the game"
+            )?,
+            None => write!(f, "No model: baseitems.2da row {row} has no ItemClass to name one")?,
+        }
+        match &self.default {
+            Some(d) => write!(f, ", and its base item's DefaultModel {d} isn't either"),
+            None => write!(f, ", and baseitems.2da row {row} has no DefaultModel"),
+        }
     }
 }
 
@@ -352,16 +423,25 @@ impl crate::GameData {
     /// through every layer of the load order.
     pub fn appearance_problems(&self, kind: ObjectKind, object: &Struct) -> Vec<ModelProblem> {
         let key = judged_key(kind, object);
-        if let Some(said) = self.judged.read().expect("judged cache poisoned").get(&key) {
-            return said.to_vec();
+        {
+            let judged = self.judged.read().expect("judged cache poisoned");
+            if let Some(said) = judged.current.get(&key) {
+                return said.to_vec();
+            }
+            if let Some(said) = judged.prev.get(&key) {
+                let cached = std::sync::Arc::clone(said);
+                drop(judged);
+                let mut w = self.judged.write().expect("judged cache poisoned");
+                if !w.current.contains_key(&key) {
+                    w.prev.remove(&key);
+                    w.insert_current(key, std::sync::Arc::clone(&cached));
+                }
+                return cached.to_vec();
+            }
         }
         let said = self.judge_appearance(kind, object);
         let mut judged = self.judged.write().expect("judged cache poisoned");
-        // (Not without end: an editor's every change is another object.)
-        if judged.len() >= JUDGED_KEPT {
-            judged.clear();
-        }
-        judged.insert(key, std::sync::Arc::new(said.clone()));
+        judged.insert_current(key, std::sync::Arc::new(said.clone()));
         said
     }
 
@@ -394,7 +474,10 @@ impl crate::GameData {
             ObjectKind::Creature => "Appearance_Type",
             _ => "Appearance",
         };
-        let key = (kind, choices.len(), choices.first().map(|c| c.text.clone()));
+        // (By all of the list: two lists of one kind and length, the same
+        // rows in another order or other rows after the same first one,
+        // are not each other's.)
+        let key = (kind, choices.len(), rows_hash(choices));
         let cache = &self.marked;
         if let Some(made) = cache.read().expect("marked cache poisoned").get(&key) {
             return made.clone();
@@ -417,6 +500,27 @@ impl crate::GameData {
     }
 }
 
+/// A number for a list's rows, each one's number and name, in their
+/// order: what tells one Appearance list from another of its length. It
+/// is taken each frame the list shows, of lists of thousands of rows, so
+/// a name goes in eight bytes at a time.
+fn rows_hash(choices: &[crate::Choice]) -> u64 {
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+    let step = |h: u64, v: u64| (h.rotate_left(5) ^ v).wrapping_mul(MIX);
+    let mut h = 0;
+    for c in choices {
+        h = step(step(h, c.row as u64), c.text.len() as u64);
+        let (eights, rest) = c.text.as_bytes().as_chunks::<8>();
+        for eight in eights {
+            h = step(h, u64::from_le_bytes(*eight));
+        }
+        let mut last = [0; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        h = step(h, u64::from_le_bytes(last));
+    }
+    h
+}
+
 impl crate::GameData {
     /// Forgets the Appearance lists' marks (a model added to the
     /// resources or taken out: a row may have one now, or none), as
@@ -429,39 +533,100 @@ impl crate::GameData {
 
 /// What an object's appearance is judged by: its kind and the whole
 /// numbers of the fields that bear on it (the row, a door's generic type,
-/// the gender and phenotype, the model, body and armor parts, their EE
+/// The gender and phenotype, the model, body and armor parts, their EE
 /// twins), by label.
 pub(crate) type JudgedKey = (ObjectKind, Vec<(String, i64)>);
 
-/// The most objects' verdicts kept at once.
+/// The most objects' verdicts kept per generation.
 const JUDGED_KEPT: usize = 4096;
 
+/// Two-generation cache for [`GameData::appearance_problems`] so exceeding
+/// [`JUDGED_KEPT`] rotates out cold entries while promoting hot ones instead of
+/// clearing the whole cache at once.
+#[derive(Debug, Default)]
+pub(crate) struct JudgedCache {
+    current: std::collections::HashMap<JudgedKey, std::sync::Arc<Vec<ModelProblem>>>,
+    prev: std::collections::HashMap<JudgedKey, std::sync::Arc<Vec<ModelProblem>>>,
+}
+
+impl JudgedCache {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.current.len() + self.prev.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.current.is_empty() && self.prev.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.current.clear();
+        self.prev.clear();
+    }
+
+    fn insert_current(&mut self, key: JudgedKey, value: std::sync::Arc<Vec<ModelProblem>>) {
+        if self.current.len() >= JUDGED_KEPT {
+            self.prev = std::mem::take(&mut self.current);
+        }
+        self.current.insert(key, value);
+    }
+}
+
 fn judged_key(kind: ObjectKind, object: &Struct) -> JudgedKey {
-    const BEARING: [&str; 11] = [
-        "appearance",
-        "baseitem",
-        "generictype",
-        "gender",
-        "phenotype",
-        "modelpart",
-        "armorpart",
-        "bodypart",
-        "xmodelpart",
-        "xarmorpart",
-        "xbodypart",
+    const BEARING: [&[u8]; 11] = [
+        b"appearance",
+        b"baseitem",
+        b"generictype",
+        b"gender",
+        b"phenotype",
+        b"modelpart",
+        b"armorpart",
+        b"bodypart",
+        b"xmodelpart",
+        b"xarmorpart",
+        b"xbodypart",
     ];
-    let fields = (object.fields.iter())
+    let mut fields: Vec<(String, i64)> = object
+        .fields
+        .iter()
         .filter_map(|f| {
-            let label = f.label.to_string_lossy().to_ascii_lowercase();
-            let bears = BEARING.iter().any(|b| label.starts_with(b));
-            bears.then(|| Some((label, object.integer(&f.label.to_string_lossy())?))).flatten()
+            let bytes = f.label.as_bytes();
+            let bears = BEARING
+                .iter()
+                .any(|b| bytes.len() >= b.len() && bytes[..b.len()].eq_ignore_ascii_case(b));
+            if !bears {
+                return None;
+            }
+            let val = f.value.as_integer()?;
+            let label = bytes.iter().map(|&b| (b as char).to_ascii_lowercase()).collect();
+            Some((label, val))
         })
         .collect();
+    fields.sort_unstable();
     (kind, fields)
 }
 
 /// What an Appearance list says after a row with no model to draw.
 pub const NO_MODEL: &str = "  (no model)";
+
+/// The portraits.2da row of the portrait appearance.2da row `row` names
+/// (its `PORTRAIT`, `po_Minotaur`): the first whose `BaseResRef` is that
+/// name without `po_` (`Minotaur_`), case and a last `_` aside, as every
+/// row of the game's table finds its own. `None` where the row names
+/// none or portraits.2da has none of it.
+pub fn appearance_portrait(appearance: &TwoDa, portraits: &TwoDa, row: usize) -> Option<usize> {
+    let bare = |s: &str| s.trim().trim_end_matches('_').to_ascii_lowercase();
+    let named = appearance.get(row, "PORTRAIT")?.trim();
+    let named = match named.get(..3) {
+        Some(p) if p.eq_ignore_ascii_case("po_") => bare(&named[3..]),
+        _ => bare(named),
+    };
+    if named.is_empty() {
+        return None;
+    }
+    (0..portraits.len()).find(|&r| portraits.get(r, "BaseResRef").is_some_and(|b| bare(b) == named))
+}
 
 #[cfg(test)]
 mod tests {
@@ -469,6 +634,67 @@ mod tests {
     use mg_resman::{LayerClass, MemContainer, priority};
 
     use super::*;
+
+    #[test]
+    fn an_appearance_finds_the_portrait_it_names() {
+        let table = |text: &str| TwoDa::parse(text.as_bytes(), Default::default()).unwrap();
+        let appearance = table(
+            "2DA V2.0\n\n  LABEL PORTRAIT\n0 Minotaur po_Minotaur\n1 Wizard po_MinoWiz_\n\
+             2 None ****\n3 Lost po_nothere\n4 Bare Bat\n",
+        );
+        let portraits = table(
+            "2DA V2.0\n\n  BaseResRef Sex\n0 **** 4\n1 dw_f_01_ 1\n2 minotaur_ 4\n\
+             3 MinoWiz_ 4\n4 Minotaur_ 4\n5 bat_ 4\n",
+        );
+        let find = |row| appearance_portrait(&appearance, &portraits, row);
+        assert_eq!(find(0), Some(2), "case and the last _ aside, the first");
+        assert_eq!(find(1), Some(3));
+        assert_eq!(find(2), None, "names none");
+        assert_eq!(find(3), None, "portraits.2da has none of it");
+        assert_eq!(find(4), Some(5), "a name without po_ as it is");
+        assert_eq!(find(9), None, "no such row");
+    }
+
+    /// An item has no model at all where none of its parts' models and no
+    /// DefaultModel is there (the game can't make it): said with why; not
+    /// where one is, nor for an armor or a row that isn't there.
+    #[test]
+    fn an_item_with_no_model_at_all_is_found() {
+        let table = |text: &str| TwoDa::parse(text.as_bytes(), Default::default()).unwrap();
+        let baseitems = table(
+            "2DA V2.0\n\n  label ItemClass ModelType DefaultModel\n0 ring ring 0 it_ring\n\
+             1 odd **** 0 ****\n2 helm helm 1 ****\n3 armor cloth 3 ****\n4 bag bag 0 it_gone\n",
+        );
+        let mut mem = MemContainer::new();
+        for name in ["it_ring", "helm_001"] {
+            mem.insert(ResKey::parse(name, ResType::MDL).unwrap(), *b"x");
+        }
+        let mut rm = ResMan::new();
+        rm.add(priority::HAK_USER, "hak", LayerClass::Erf, mem);
+        let item = |base: i32, part: u8| {
+            let mut s = Struct::new(0);
+            s.set("BaseItem", Value::Int(base));
+            s.set("ModelPart1", Value::Byte(part));
+            s
+        };
+        let find = |base, part| item_without_model(&item(base, part), &baseitems, None, &rm);
+        assert_eq!(find(0, 9), None, "its DefaultModel is there");
+        assert_eq!(find(2, 1), None, "its model is there");
+        assert_eq!(find(3, 1), None, "armor is the body's");
+        assert_eq!(find(7, 1), None, "no such row");
+        let past = find(2, 9).unwrap();
+        assert_eq!(past.first, Some(("ModelPart1", "helm_009".to_string())));
+        assert_eq!(
+            past.to_string(),
+            "No model: helm_009 (its ModelPart1) isn't in the module, its haks or the game, \
+             and baseitems.2da row 2 has no DefaultModel"
+        );
+        let odd = find(1, 1).unwrap();
+        assert_eq!((odd.class, odd.first), (None, None));
+        assert!(find(1, 1).unwrap().to_string().contains("has no ItemClass"));
+        let gone = find(4, 1).unwrap();
+        assert!(gone.to_string().ends_with("its base item's DefaultModel it_gone isn't either"));
+    }
 
     fn resman() -> ResMan {
         let mut mem = MemContainer::new();
@@ -563,6 +789,24 @@ mod tests {
         game.forget_appearance_marks();
         let again = game.appearance_choices(ObjectKind::Placeable, &rows);
         assert!(!std::sync::Arc::ptr_eq(&marked, &again) && marked == again);
+        // Another list of the kind, as long and with the same first row
+        // (the rest in another order, or other rows, or other names), is
+        // its own: not the first one's marks.
+        let texts = |list: &[crate::Choice]| -> Vec<String> {
+            let marked = game.appearance_choices(ObjectKind::Placeable, list);
+            marked.iter().map(|c| c.text.clone()).collect()
+        };
+        let mut swapped = rows.to_vec();
+        swapped.swap(1, 3);
+        assert_eq!(
+            texts(&swapped),
+            ["Chair", "Mine  (no model)", "Empty  (no model)", "Gone  (no model)"]
+        );
+        let mut others = rows.to_vec();
+        (others[1].row, others[2].text) = (0, "Hollow".into());
+        assert_eq!(texts(&others), ["Chair", "Gone", "Hollow  (no model)", "Mine  (no model)"]);
+        let first: Vec<String> = again.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts(&rows), first);
         let columns = crate::ChoiceColumns { name: None, label: Some("LABEL") };
         let creatures = game.choices("appearance", columns).unwrap();
         let marked = game.appearance_choices(ObjectKind::Creature, &creatures);
@@ -746,8 +990,46 @@ mod tests {
         };
         assert_eq!(
             unread.to_string(),
-            "Unreadable model: pmd0_head009 (its Appearance_Head) is there and can't be read: \
-             truncated"
+            "Unreadable model: pmd0_head009 (its Appearance_Head) is there and can't be read: truncated"
         );
+    }
+
+    #[test]
+    fn judged_key_is_order_invariant_and_cache_promotes_hot_entries() {
+        let mut a = Struct::default();
+        a.set("Appearance_Type", Value::Word(0));
+        a.set("BodyPart_LShin", Value::Byte(2));
+        a.set("ArmorPart_Belt", Value::Byte(1));
+        a.set("Tag", Value::String(b"ALPHA".to_vec()));
+
+        let mut b = Struct::default();
+        b.set("ArmorPart_Belt", Value::Byte(1));
+        b.set("Tag", Value::String(b"BETA".to_vec()));
+        b.set("BodyPart_LShin", Value::Byte(2));
+        b.set("Appearance_Type", Value::Word(0));
+
+        assert_eq!(judged_key(ObjectKind::Creature, &a), judged_key(ObjectKind::Creature, &b));
+
+        let mut cache = JudgedCache::default();
+        let empty = std::sync::Arc::new(Vec::new());
+        let hot = judged_key(ObjectKind::Creature, &a);
+        cache.insert_current(hot.clone(), std::sync::Arc::clone(&empty));
+        for n in 1..=JUDGED_KEPT {
+            let mut s = Struct::default();
+            s.set("Appearance_Type", Value::Word(n as u16));
+            cache.insert_current(
+                judged_key(ObjectKind::Creature, &s),
+                std::sync::Arc::clone(&empty),
+            );
+        }
+        // `hot` moved to `prev` on rotation, while `current` holds the newly inserted entry.
+        assert!(cache.prev.contains_key(&hot));
+        assert!(!cache.current.contains_key(&hot));
+        assert!(cache.len() > JUDGED_KEPT);
+        // Promoting `hot` moves it into `current`.
+        cache.prev.remove(&hot);
+        cache.insert_current(hot.clone(), empty);
+        assert!(cache.current.contains_key(&hot));
+        assert!(!cache.prev.contains_key(&hot));
     }
 }

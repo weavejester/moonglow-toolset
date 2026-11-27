@@ -22,6 +22,8 @@ pub(super) struct Renderer<'a> {
     /// row's path, and the right edge its last button without a width
     /// stretches to (`Renderer::children`).
     pub(super) reach: Option<(String, f32)>,
+    /// The controls' natural sizes worked out in this pass.
+    pub(super) naturals: Naturals,
 }
 
 /// A control being drawn: where, in which state and with what. The kinds'
@@ -90,6 +92,78 @@ impl Control<'_> {
     }
 }
 
+/// A scrollbar as the pointer finds it: its strip along `axis` (end
+/// buttons and track), an end button's length at each end of it, and how
+/// far its view scrolls at most.
+pub(super) struct Bar {
+    pub strip: Rect,
+    pub axis: usize,
+    pub button: f32,
+    pub max: f32,
+}
+
+/// The frames a second the client is taken to draw at, for how fast an
+/// end button held scrolls ([`end_button_scroll`]): its scrolling is by
+/// the frame, so it is as fast as the client draws (60 where it waits on
+/// a 60 Hz display).
+const CLIENT_FPS: f32 = 60.0;
+
+/// How far an end button held for `seconds` scrolls a bar whose strip is
+/// `length` long: 1% of the length a frame of the client's, for a list's,
+/// a group's and a text's alike (Nuklear's repeating end buttons:
+/// `reading_scrollbar_end_buttons` in `client_render.rs`, where a group
+/// 150, 300 and 600 high scrolled 1, 2 and 5 pixels a frame down, 2, 3 and
+/// 6 up, the client keeping whole pixels, and a list a row at a time).
+/// A click shorter than a frame scrolls nothing in the client.
+pub(super) fn end_button_scroll(length: f32, seconds: f32) -> f32 {
+    0.01 * length * CLIENT_FPS * seconds
+}
+
+/// How far a view is scrolled after this frame's input, from `offset`:
+/// the wheel over `over` (the control), an end button of the bar held
+/// ([`end_button_scroll`] for the frame's time, the window drawn again
+/// while it is held), and a click or a drag on its track, which goes from
+/// the view's start to its end between the two buttons. In the canvas's
+/// pixels, as `offset` is: what is kept between frames is kept in points
+/// (`offset / scale`), so that a change of zoom or of the UI scale leaves
+/// the view where it was. A group's bars, a list's and a text's all
+/// scroll by this (each had its own copy, and the list's kept pixels: at
+/// 200% a list scrolled to row 30 showed row 15; a click on an end button
+/// scrolled a group 20 points, a text a line and a list to the track's
+/// end).
+pub(super) fn scroll_by(
+    ui: &Ui,
+    response: &egui::Response,
+    over: Rect,
+    bar: &Bar,
+    offset: f32,
+) -> f32 {
+    let Bar { strip, axis, button, max } = *bar;
+    let mut offset = offset;
+    if ui.rect_contains_pointer(over) {
+        offset -= ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta[axis]));
+    }
+    let (start, end) = (strip.min[axis] + button, strip.max[axis] - button);
+    let on_button = |p: egui::Pos2| p[axis] < start || p[axis] > end;
+    // (Where the press began: a drag begun on the track that runs over a
+    // button still drags the track, and a press begun on a button scrolls
+    // until it is let go, wherever the pointer goes.)
+    let origin = ui.input(|i| i.pointer.press_origin());
+    if response.is_pointer_button_down_on()
+        && let Some(from) = origin.filter(|&p| on_button(p))
+    {
+        let seconds = ui.input(|i| i.stable_dt).min(0.1);
+        let by = end_button_scroll(strip.size()[axis], seconds);
+        offset += if from[axis] < start { -by } else { by };
+        ui.ctx().request_repaint();
+    } else if let Some(pointer) = response.interact_pointer_pos()
+        && (response.dragged() || (response.clicked() && !on_button(pointer)))
+    {
+        offset = ((pointer[axis] - start) / (end - start).max(1.0)).clamp(0.0, 1.0) * max;
+    }
+    offset.clamp(0.0, max)
+}
+
 /// The skin's name for how a control looks now: `mode` is 2 under the
 /// pointer and 3 while pressed.
 fn look(disabled: bool, mode: usize, encouraged: bool) -> &'static str {
@@ -105,6 +179,22 @@ fn look(disabled: bool, mode: usize, encouraged: bool) -> &'static str {
             _ => "normal",
         }
     }
+}
+
+/// The skin's key of a section's text color in a look (`button.text_hover`),
+/// named without a string made for each control drawn.
+fn text_color(section: &'static str, look: &'static str) -> &'static str {
+    macro_rules! keys {
+        ($($s:literal)*) => {
+            match (section, look) {
+                $(($s, "hover") => concat!($s, ".text_hover"),
+                ($s, "active") => concat!($s, ".text_active"),)*
+                $(($s, _) => concat!($s, ".text_normal"),)*
+                _ => "text.text_normal",
+            }
+        };
+    }
+    keys!("button" "selectable" "checkbox" "edit" "combo" "text")
 }
 
 /// The skin's section that colors a kind's text.
@@ -153,7 +243,8 @@ impl Renderer<'_> {
     /// and each margin whole pixels apart.
     pub(super) fn cell(&self, node: &Value, row: Option<usize>, depth: usize) -> Vec2 {
         let extra = extra_margin(node, self.s, row);
-        let core = (natural(node, self.s, row, depth) - Vec2::splat(2.0 * extra)).max(Vec2::ZERO);
+        let core = natural(node, self.s, row, depth, Some(&self.naturals));
+        let core = (core - Vec2::splat(2.0 * extra)).max(Vec2::ZERO);
         self.scaled(core) + Vec2::splat(2.0 * self.margin_px(node, row))
     }
 
@@ -306,7 +397,7 @@ impl Renderer<'_> {
         let a = self.assets;
         let default_color = a.color("text.color", Color32::WHITE);
         let text_section = text_section(ty);
-        let default_color = a.color(&format!("{text_section}.text_{state_key}"), default_color);
+        let default_color = a.color(text_color(text_section, state_key), default_color);
         let fg = rgba(val(&node["foreground_color"], s, row), default_color) * tint;
         let font = localized_string(&node["font"], s, row, a);
         let font = if font.is_empty() { self.window_font } else { &font };
@@ -343,7 +434,10 @@ impl Renderer<'_> {
             changed: None,
             normalization: false,
         };
-        if visible {
+        // The window's root draws no draw list of its own when it is a group
+        // (8193.37-17: a row's and a column's are drawn).
+        let drawn = visible && !(source_path == "/root" && ty == "group");
+        if drawn {
             draw::paint(ui.painter(), node, body, scale, s, a, row, true, mouse);
         }
         if interactive && c.response.clicked() {
@@ -378,7 +472,7 @@ impl Renderer<'_> {
         } else {
             self.control(ui, &mut c);
         }
-        if visible {
+        if drawn {
             draw::paint(ui.painter(), node, body, scale, s, a, row, false, mouse);
         }
         self.ancestor_disabled = parent_disabled;
@@ -389,8 +483,14 @@ impl Renderer<'_> {
     /// gets its outline and tooltip.
     fn finish(&mut self, ui: &mut Ui, c: Control<'_>, rect: Rect, selected: bool, live: bool) {
         let Control { s, a, node, path, row, disabled, .. } = c;
+        // The client's own correction of a value (a combo's first entry, a
+        // slider's range) is asked for only where the simulation can write
+        // it: with no such bind, or no such row of it, it was asked for
+        // again every frame, each one saying "Missing preview bind" over
+        // whatever the event line showed, and asking for the next.
         if let Some(value) = c.changed
             && value.as_ref().is_none_or(|v| v != val(&node["value"], s, row))
+            && (!c.normalization || interaction::has_place(node, s, row))
         {
             self.changes.push(interaction::Change {
                 path: path.into(),
@@ -452,17 +552,17 @@ impl Renderer<'_> {
         match c.ty {
             "col" | "row" | "group" => self.container(ui, c),
             "list" => self.list(ui, c),
-            "button" | "button_image" | "button_select" => self.button(c),
-            "label" => self.label(c),
+            "button" | "button_image" | "button_select" => Self::button(c),
+            "label" => Self::label(c),
             "text" => self.text_block(ui, c),
-            "textedit" => self.textedit(ui, c),
-            "combo" => self.combo(ui, c),
-            "check" => self.check(c),
-            "slider" | "sliderf" | "progress" => self.slider(ui, c),
-            "image" => self.image(c),
-            "options" | "tabbar" => self.choices(ui, c),
-            "color_picker" => self.color_picker(ui, c),
-            "chart" => self.chart(ui, c),
+            "textedit" => Self::textedit(ui, c),
+            "combo" => self.combo(c),
+            "check" => Self::check(c),
+            "slider" | "sliderf" | "progress" => Self::slider(ui, c),
+            "image" => Self::image(c),
+            "options" | "tabbar" => Self::choices(ui, c),
+            "color_picker" => Self::color_picker(ui, c),
+            "chart" => Self::chart(ui, c),
             "spacer" => {}
             other => {
                 let (p, body, node) = (&c.p, c.body, c.node);
@@ -541,5 +641,22 @@ impl Renderer<'_> {
             horizontal,
             Color32::WHITE,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each kind's text color key in each look is the one the skin names.
+    #[test]
+    fn a_text_color_key_is_its_section_and_look() {
+        for ty in ["button", "button_image", "button_select", "check", "textedit", "combo", "label"]
+        {
+            for (disabled, mode) in [(false, 1), (false, 2), (false, 3), (true, 2)] {
+                let (section, look) = (text_section(ty), look(disabled, mode, false));
+                assert_eq!(text_color(section, look), format!("{section}.text_{look}"));
+            }
+        }
     }
 }

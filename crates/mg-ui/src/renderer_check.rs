@@ -1,8 +1,10 @@
 //! What Moonglow found of how its renderer draws on this machine: the
 //! startup check's verdict (`apps/moonglow`, [`mg_render::backend::start`])
 //! and the area view's watch ([`mg_render::watch`]); the notice under the
-//! toolbar when either found it drawing nothing, with **Restart with …**
-//! (the same GPU's other backend), and the restart itself.
+//! Top Bar when either found it drawing nothing, with **Restart with …**
+//! (the same GPU's other backend), and the restart itself. The notice
+//! that the game's shaders alone draw wrong, which says the same each run
+//! on that driver, offers **Don't Show Again** too.
 //!
 //! On Automatic, the restart records the backend's failure
 //! ([`crate::settings::GraphicsFailure`]), which Automatic passes over
@@ -29,6 +31,14 @@ pub struct RendererCheck {
     /// The same GPU's other backend, not recorded as failing: what the
     /// notice offers to restart with.
     pub other: Option<wgpu::Backend>,
+    /// The backends Automatic passes over, as this run found: those it
+    /// passed over as it started, and one it recorded then. Options says
+    /// of the other records that they failed here and are drawn with all
+    /// the same (no other backend is left).
+    pub passes_over: Vec<wgpu::Backend>,
+    /// The window's device was lost (why): nothing more is drawn. For the
+    /// desktop app to tell the builder with a dialog of the system's, once.
+    pub device_lost: Option<String>,
     /// What was found wrong, for the notice, until it is closed.
     pub trouble: Option<Trouble>,
     /// The watch has failed this run (it says so once).
@@ -47,7 +57,20 @@ pub struct RendererCheck {
 pub struct LitCheck {
     started: bool,
     pending: Option<std::sync::mpsc::Receiver<mg_render::probe::Lit>>,
+    /// The check's thread, waited for when the window ends: it holds the
+    /// GPU, and a check still making a pipeline as the process exited
+    /// crashed it there (with Vulkan's validation layer, which debug
+    /// builds load).
+    thread: Option<std::thread::JoinHandle<()>>,
     pub found: Option<mg_render::probe::Lit>,
+}
+
+impl Drop for LitCheck {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl LitCheck {
@@ -88,8 +111,9 @@ pub(crate) fn lit_check(app: &mut Moonglow) {
             std::thread::Builder::new().name("moonglow lit check".into()).spawn(move || {
                 let _ = tx.send(mg_render::probe::probe_lit(&gpu, &assets, cache));
             });
-        if spawned.is_ok() {
+        if let Ok(thread) = spawned {
             app.lit_check.pending = Some(rx);
+            app.lit_check.thread = Some(thread);
         }
         return;
     }
@@ -168,32 +192,54 @@ pub fn lit_found(app: &mut Moonglow, lit: mg_render::probe::Lit) {
         }
     };
     if let Err(why) = &lit.own {
-        let said = format!(
-            "Moonglow's check of lit drawing found that {drawing} {} ({why}).",
-            drew(lit.own_color, "draws")
-        );
+        // (A panic compared no picture: the backend is not recorded for
+        // it.)
+        let said = if lit.panicked {
+            format!("Moonglow's check of lit drawing failed through {drawing} ({why}).")
+        } else {
+            format!(
+                "Moonglow's check of lit drawing found that {drawing} {} ({why}).",
+                drew(lit.own_color, "draws")
+            )
+        };
         app.log.warn(format!("Graphics: {said}"));
-        check.trouble =
-            Some(Trouble { said, offer: check.other, what: format!("the lit check: {why}") });
+        check.trouble = Some(Trouble {
+            what: format!("the lit check: {why}"),
+            record: !lit.panicked,
+            ..Trouble::new(said, check.other)
+        });
     } else if lit.game_fails() {
         let why = match &lit.game {
             Some(Err(why)) => why.clone(),
             _ => String::new(),
         };
+        let found = if lit.panicked {
+            "could not draw the lit, textured test mesh".to_string()
+        } else {
+            drew(lit.game_color, "draw")
+        };
         let said = format!(
-            "Moonglow's check of lit drawing found that the game's shaders {} through \
+            "Moonglow's check of lit drawing found that the game's shaders {found} through \
              {drawing} ({why}), where Moonglow's own shaders draw it right: Moonglow draws with \
              its own shaders for the rest of this run (the Shaders button turns the game's on \
-             again).",
-            drew(lit.game_color, "draw")
+             again)."
         );
-        app.log.warn(format!("Graphics: {said}"));
         check.game_shaders_off = Some(why.clone());
-        check.trouble = Some(Trouble {
-            said,
-            offer: check.other,
-            what: format!("the lit check, the game's shaders: {why}"),
-        });
+        // (Hidden on this GPU, driver and backend: the log alone says it,
+        // as news, each run.)
+        if check.adapter.as_ref().is_some_and(|a| app.settings.graphics_notice_hidden(a)) {
+            app.log.info(format!(
+                "Graphics: {said} (Its notice is hidden on this GPU and driver: Options › \
+                 General shows it again.)"
+            ));
+        } else {
+            app.log.warn(format!("Graphics: {said}"));
+            check.trouble = Some(Trouble {
+                what: format!("the lit check, the game's shaders: {why}"),
+                hideable: check.adapter.is_some(),
+                ..Trouble::new(said, check.other)
+            });
+        }
     } else if let Some(why) = &lit.fell_back {
         app.log.warn(format!(
             "Graphics: the game's lit shaders can't be made through {drawing} ({why}): Moonglow's \
@@ -210,16 +256,36 @@ pub struct Trouble {
     pub offer: Option<wgpu::Backend>,
     /// What found it, as the record keeps it (`the startup check: …`).
     pub what: String,
+    /// Offers Don't Show Again: the game's shaders alone draw wrong, where
+    /// Moonglow's own draw for them ([`Settings::graphics_notices_hidden`]).
+    ///
+    /// [`Settings::graphics_notices_hidden`]: crate::Settings::graphics_notices_hidden
+    pub hideable: bool,
+    /// What was found is the backend's doing on this GPU and driver:
+    /// Restart with … records it, on Automatic, which passes over it from
+    /// then on. Off where the cause may as well be the content (tiles
+    /// whose models couldn't be built, textures that never came) or no
+    /// picture was compared: the restart is through the other backend for
+    /// that run alone.
+    pub record: bool,
+}
+
+impl Trouble {
+    fn new(said: String, offer: Option<wgpu::Backend>) -> Trouble {
+        Trouble { said, offer, what: String::new(), hideable: false, record: true }
+    }
 }
 
 /// Moonglow to be started again once this run has ended
 /// ([`Moonglow::relaunch`]): with the module that was open, through
-/// `backend` (`environment`: as `WGPU_BACKEND`, which named this run's).
+/// `backend` (`environment`: as `WGPU_BACKEND`, which named this run's),
+/// and (`start`, after an update) as the update says it is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relaunch {
     pub module: Option<PathBuf>,
     pub backend: wgpu::Backend,
     pub environment: bool,
+    pub start: Option<mg_update::Restart>,
 }
 
 impl RendererCheck {
@@ -243,7 +309,10 @@ impl RendererCheck {
             said += &format!(" Nor does {} ({w}).", mg_render::backend::backend_name(*b));
         }
         let offer = self.other.filter(|_| self.asked_for && others.is_empty());
-        self.trouble = Some(Trouble { said, offer, what: format!("the startup check: {why}") });
+        self.trouble = Some(Trouble {
+            what: format!("the startup check: {why}"),
+            ..Trouble::new(said, offer)
+        });
     }
 }
 
@@ -270,21 +339,63 @@ pub(crate) fn watch_failed(app: &mut Moonglow, failure: mg_render::watch::Failur
     crate::trace::note(format!("graphics watch: failed, {failure} ({drawing})"));
     let check = &mut app.renderer_check;
     check.trouble = Some(Trouble {
-        said,
-        offer: check.other,
         what: format!("the area view's watch: {failure}"),
+        // (Failed tiles or a wait for textures: the area's content may be
+        // what is wrong, not the backend.)
+        record: failure.failed == 0 && failure.waiting.is_none(),
+        ..Trouble::new(said, check.other)
     });
 }
 
-/// The notice of a renderer that draws nothing, under the toolbar while
+/// The adapter Automatic took is one Moonglow draws wrong or slowly with
+/// (OpenGL, a software adapter: nothing else was there), or such a one was
+/// asked for: said in the log and the notice, with what to install.
+pub fn fallback_taken(app: &mut Moonglow, fallback: mg_render::backend::Fallback) {
+    let check = &mut app.renderer_check;
+    let platform = mg_render::backend::Platform::current();
+    let said = format!("Moonglow draws through {}, {}", check.drawing(), fallback.said(platform));
+    app.log.warn(format!("Graphics: {said}"));
+    // (Under a notice of what the startup check found, if there is one.)
+    if check.trouble.is_none() {
+        check.trouble = Some(Trouble {
+            what: "a fallback adapter".into(),
+            record: false,
+            ..Trouble::new(said, None)
+        });
+    }
+}
+
+/// The window's device is lost (`why`): the unsaved work is kept in a
+/// recovery copy at once, and the builder told (the log, and the desktop
+/// app's dialog: the window draws nothing more).
+pub(crate) fn device_lost(app: &mut Moonglow, why: String) {
+    crate::trace::note(format!("graphics: the device was lost ({why})"));
+    // (Unless Options › General keeps none, or nothing is unsaved.)
+    let unsaved = !app.settings.no_autosave && app.has_unsaved_work();
+    let kept = match unsaved.then(|| app.write_recovery()) {
+        Some(Ok(copy)) => {
+            format!(" Unsaved work is kept in a recovery copy ({}).", copy.display())
+        }
+        _ => String::new(),
+    };
+    let said = format!(
+        "The graphics device was lost ({why}): the graphics driver was reset or updated, or the \
+         GPU removed. Moonglow can draw nothing more in this run.{kept} Close Moonglow and start \
+         it again."
+    );
+    app.log.error(said.clone());
+    app.renderer_check.device_lost = Some(said);
+}
+
+/// The notice of a renderer that draws nothing, under the Top Bar while
 /// there is one.
 pub(crate) fn notice_bar(app: &mut Moonglow, ui: &mut egui::Ui) {
     let Some(trouble) = app.renderer_check.trouble.clone() else { return };
-    let mut close = false;
+    let (mut close, mut hide) = (false, false);
     egui::Panel::top("renderer-notice").show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("⚠").color(ui.visuals().warn_fg_color));
-            ui.label(&trouble.said);
+            let warn = ui.visuals().warn_fg_color;
+            mg_uikit::icon_label(ui, mg_uikit::Icon::Warning, Some(warn), &trouble.said);
             match trouble.offer {
                 Some(b) => {
                     let name = mg_render::backend::backend_name(b);
@@ -293,19 +404,23 @@ pub(crate) fn notice_bar(app: &mut Moonglow, ui: &mut egui::Ui) {
                         "(for that run: WGPU_BACKEND names this one's)".to_string()
                     } else if check.asked_for {
                         format!("(Options › General › Graphics backend becomes {name})")
+                    } else if !trouble.record {
+                        "(for that run alone: what is wrong may not be this backend)".to_string()
                     } else {
                         "(Automatic passes over this backend on this driver from then on)".into()
                     };
                     if ui
                         .button(format!("Restart with {name}"))
                         .on_hover_text(format!(
-                            "Closes Moonglow, asking about unsaved work first, and starts it \
-                             again with the same module, drawing through {name} {after}"
+                            "Restart Moonglow with the same module, drawing through {name} {after}"
                         ))
                         .clicked()
                     {
                         app.actions.push(Action::RestartGraphics(b));
                     }
+                }
+                None if trouble.what == "a fallback adapter" => {
+                    ui.weak("See Help › User Manual › Troubleshooting.");
                 }
                 None => {
                     ui.weak(
@@ -314,12 +429,30 @@ pub(crate) fn notice_bar(app: &mut Moonglow, ui: &mut egui::Ui) {
                     );
                 }
             }
-            if ui.small_button("×").on_hover_text("Close").clicked() {
+            if trouble.hideable
+                && ui
+                    .button("Don't Show Again")
+                    .on_hover_text(
+                        "Hide this notice on this GPU, driver and backend. Options › General shows \
+                         it again.",
+                    )
+                    .clicked()
+            {
+                hide = true;
+            }
+            // (Named for what it closes: the update notice can show with it.)
+            let (name, tip) = ("Close Renderer Notice", "Close the notice");
+            if crate::widgets::icon_button(ui, mg_uikit::Icon::Close, name, tip).clicked() {
                 close = true;
             }
         });
     });
-    if close {
+    if hide && let Some(info) = &app.renderer_check.adapter {
+        let hidden = crate::settings::GraphicsFailure::of(info, &trouble.what);
+        crate::trace::note(format!("graphics: the lit check's notice hidden ({})", hidden.driver));
+        app.settings.hide_graphics_notice(hidden);
+    }
+    if close || hide {
         app.renderer_check.trouble = None;
     }
 }
@@ -329,7 +462,11 @@ pub(crate) fn notice_bar(app: &mut Moonglow, ui: &mut egui::Ui) {
 /// Moonglow quits, to be started again ([`Moonglow::relaunch`]).
 pub(crate) fn restart(app: &mut Moonglow, backend: wgpu::Backend) {
     let check = app.renderer_check.clone();
+    // (Recorded only where the backend is what is wrong; else the other
+    // backend for the new run alone, as `WGPU_BACKEND` names one.)
+    let record = check.trouble.as_ref().is_none_or(|t| t.record);
     if !check.asked_for
+        && record
         && let Some(info) = &check.adapter
     {
         let what = check.trouble.as_ref().map_or("the area view's watch", |t| t.what.as_str());
@@ -341,8 +478,12 @@ pub(crate) fn restart(app: &mut Moonglow, backend: wgpu::Backend) {
         "graphics: restart with {}",
         mg_render::backend::backend_name(backend)
     ));
-    app.relaunch =
-        Some(Relaunch { module: app.module_path(), backend, environment: check.from_environment });
+    app.relaunch = Some(Relaunch {
+        module: app.module_path(),
+        backend,
+        environment: check.from_environment || (!check.asked_for && !record),
+        start: None,
+    });
 }
 
 #[cfg(test)]
@@ -373,5 +514,65 @@ mod tests {
         assert_eq!(shaders.game_shader("fslit").as_deref(), Some("stock"));
         assert_eq!(shaders.shader_origin("fslit"), None);
         assert_eq!(shaders.game_shader("nothing"), None);
+    }
+
+    /// Restart with …, on Automatic: a watch that found the GPU drawing
+    /// nothing records the backend, which Automatic passes over from then
+    /// on; one that failed with tiles left out or textures waited for (the
+    /// area's content may be what is wrong) records nothing, and the new
+    /// run is through the other backend for itself alone.
+    #[test]
+    fn a_watch_failure_of_the_content_s_records_no_backend() {
+        let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Dx12);
+        (info.vendor, info.device, info.name) = (0x1002, 0x67df, "Radeon RX 580".into());
+        let failure = |failed, waiting| mg_render::watch::Failure {
+            expected: 100,
+            drawn: 3,
+            seconds: 5.0,
+            failed,
+            waiting,
+        };
+        for (failure, recorded) in
+            [(failure(0, None), true), (failure(40, None), false), (failure(0, Some(20.0)), false)]
+        {
+            let mut app = crate::Moonglow::new(None, Box::new(crate::NoDialogs::default()));
+            app.renderer_check.adapter = Some(info.clone());
+            app.renderer_check.other = Some(wgpu::Backend::Vulkan);
+            super::watch_failed(&mut app, failure);
+            let trouble = app.renderer_check.trouble.clone().expect("the notice");
+            assert_eq!((trouble.record, trouble.offer), (recorded, Some(wgpu::Backend::Vulkan)));
+            super::restart(&mut app, wgpu::Backend::Vulkan);
+            assert_eq!(app.settings.graphics_failures.len(), usize::from(recorded), "{failure}");
+            let again = app.relaunch.clone().expect("the restart");
+            assert_eq!((again.backend, again.environment), (wgpu::Backend::Vulkan, !recorded));
+        }
+    }
+
+    /// Options tells the backends Automatic passes over from those it
+    /// draws with all the same (one backend on the platform: the record
+    /// was said to be passed over, and Try Again offered for nothing).
+    #[test]
+    fn options_says_which_recorded_backends_are_passed_over() {
+        let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Dx12);
+        (info.vendor, info.device, info.name) = (0x1002, 0x67df, "Radeon RX 580".into());
+        info.driver_info = "25.9.1".into();
+        let dx12 = crate::settings::GraphicsFailure::of(&info, "the startup check: nothing drawn");
+        info.backend = wgpu::Backend::Vulkan;
+        let vulkan = crate::settings::GraphicsFailure::of(&info, "the area view's watch");
+        let said = |passes: &[wgpu::Backend]| {
+            crate::options::graphics_failures_said(&[dx12.clone(), vulkan.clone()], passes)
+        };
+        let both = said(&[wgpu::Backend::Dx12]);
+        assert!(
+            both.starts_with(
+                "Automatic passes over Direct3D 12 on Radeon RX 580 (driver 25.9.1): it drew \
+                 wrong here (the startup check: nothing drawn, less than a minute ago). Vulkan \
+                 on Radeon RX 580 (driver 25.9.1) drew wrong here (the area view's watch, "
+            ),
+            "{both}"
+        );
+        assert!(both.ends_with("where no other backend is left."), "{both}");
+        assert!(said(&[]).starts_with("Direct3D 12 on Radeon RX 580 (driver 25.9.1), Vulkan on"));
+        assert!(!said(&[]).contains("passes over"));
     }
 }

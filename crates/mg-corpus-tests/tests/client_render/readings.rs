@@ -8,7 +8,7 @@
 //! change of Moonglow's beside it).
 //!
 //! Needs the game and the off-screen display; run by hand:
-//! `DISPLAY=:2 cargo test -p mg-corpus-tests --release --test client_render reading -- --ignored --nocapture`.
+//! `DISPLAY=$D cargo test -p mg-corpus-tests --release --test client_render reading -- --ignored --nocapture`.
 
 use super::*;
 use mg_module::instances::{Placement, Placing, instance};
@@ -181,10 +181,24 @@ fn moonglow_beside(
     client: &Rgba,
     view: &dyn Fn(&mut mg_area::View),
 ) {
-    mg_testkit::gpu::hold();
+    moonglow_beside_as(dir, game, are, git, client, view, "moonglow");
+}
+
+/// [`moonglow_beside`], its pictures named `name` (`{name}.png` and
+/// `{name}_on.png`); the two pictures (off, on), `None` without a GPU.
+pub(super) fn moonglow_beside_as(
+    dir: &Path,
+    game: &GameData,
+    are: &Gff,
+    git: &Gff,
+    client: &Rgba,
+    view: &dyn Fn(&mut mg_area::View),
+    name: &str,
+) -> Option<(Rgba, Rgba)> {
+    crate::common::gpu_after_display();
     let Some(gpu) = Gpu::headless() else {
         eprintln!("Moonglow's side skipped: no GPU");
-        return;
+        return None;
     };
     let tileset = mg_area::tileset(game, are.root.resref("Tileset").unwrap()).ok();
     let model = mg_area::AreaModel::read(game, &are.root, &git.root, tileset.as_ref());
@@ -200,13 +214,16 @@ fn moonglow_beside(
     // runs those new to it.)
     if v.animate {
         let mut sims = HashMap::new();
-        scene.particles = area_scene.particles(&model, &v, &mut sims, 1.0 / 60.0, camera.view());
+        let (particles, chunks) =
+            area_scene.particles_and_chunks(&model, &v, &mut sims, 1.0 / 60.0, camera.view());
+        scene.particles = particles;
+        scene.instances.extend(chunks);
     }
     // (Where nothing is drawn: magenta, told apart from black meshes.)
     if std::env::var_os("MG_MAGENTA").is_some() {
         scene.background = [1.0, 0.0, 1.0];
     }
-    off_and_on(&gpu, game, &scene, &camera, size, Some(client), dir, "moonglow");
+    Some(off_and_on(&gpu, game, &scene, &camera, size, Some(client), dir, name))
 }
 
 /// The entry script of [`Reading::shoot_beside`]: the player's place
@@ -238,8 +255,9 @@ pub(super) fn client_after(
     wait: Duration,
     then: Option<&dyn Fn(&Path) -> bool>,
 ) -> (Option<Rgba>, bool) {
+    let _only = common::client_lock();
     let _ = std::fs::remove_file(dir.join("user/logs/nwclientLog1.txt"));
-    let Ok(mut child) = Command::new(common::repo().join("tools/nwclient/run-client.sh"))
+    let Ok(mut child) = common::client_script()
         .arg(dir)
         .args(args)
         .stdout(Stdio::null())
@@ -268,8 +286,7 @@ pub(super) fn client_after(
             winshot("client_then.png");
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    common::stop_client(&mut child);
     (first, said)
 }
 
@@ -282,6 +299,7 @@ pub(super) fn client_after(
 #[test]
 #[ignore]
 fn reading_choose_character() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x404040, diffuse: 0x808080, main_light: 0, only_tile: None };
     let mut r = Reading::new("choose_character", "tic01", light, &[]);
     r.save(&enter(INVISIBLE, (90.0, 12.0, 45.0)), SETTINGS);
@@ -369,6 +387,7 @@ fn inventory(female: bool) -> (PathBuf, Rgba) {
 #[test]
 #[ignore]
 fn reading_inventory_icons() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     for female in [false, true] {
         let (dir, _) = inventory(female);
         print_log(&dir);
@@ -382,6 +401,7 @@ fn reading_inventory_icons() {
 #[test]
 #[ignore]
 fn reading_illuminated_brazier() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x101010, diffuse: 0x101010, main_light: 0, only_tile: None };
     let mut r = Reading::new("illuminated", "tic01", light, &[]);
     for (x, on) in [(18.5f32, 1u8), (21.5, 0)] {
@@ -465,6 +485,7 @@ fn replacement(name: &str, value: Option<u8>, stock: bool) -> Option<Rgba> {
 #[test]
 #[ignore]
 fn reading_tile_replacement_texture() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let only = std::env::var("MG_REPLACE").ok();
     for (name, value, stock) in [
         ("none", None, false),
@@ -492,6 +513,7 @@ fn reading_tile_replacement_texture() {
 #[test]
 #[ignore]
 fn reading_tile_heights() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x606060, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
     // (From the middle, the server stood the player on the high tile: the
     // ground's player enters south of it.)
@@ -610,6 +632,7 @@ pub(super) fn placeables_with(game: &GameData, models: &[(&str, u8)]) -> (String
 #[test]
 #[ignore]
 fn reading_grass_on_placeables() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let root = mg_testkit::nwn_root().expect("the game");
     let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
     let (mdl, pwk) = slab("mg_slab", 4.0);
@@ -645,6 +668,7 @@ fn reading_grass_on_placeables() {
 #[test]
 #[ignore]
 fn reading_grass_tufts() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x606060, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
     // From the side and from above (a quad seen edge on is a line, crossed
     // ones a cross).
@@ -674,6 +698,7 @@ fn reading_grass_tufts() {
 #[test]
 #[ignore]
 fn reading_grass_sway() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x606060, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
     let overrides = [("mgwhite.tga", white_tga())];
     // (`MG_WIND`: the area's `WindPower`, 2 by default; `MG_CAMERA`:
@@ -733,6 +758,7 @@ fn reading_grass_sway() {
 #[test]
 #[ignore]
 fn reading_custom_talk_table_in_the_module() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x606060, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
     let mut r = Reading::new("custom_tlk", "tic01", light, &[]);
     let mut t = mg_tlk::Tlk::new(mg_core::Language::ENGLISH);
@@ -762,6 +788,7 @@ fn reading_custom_talk_table_in_the_module() {
 #[test]
 #[ignore]
 fn reading_custom_cloak_base_item() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let root = mg_testkit::nwn_root().expect("the game");
     let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
     let table = base.resman.get_named("baseitems", ResType::TWODA).unwrap();
@@ -813,6 +840,7 @@ fn reading_custom_cloak_base_item() {
 #[test]
 #[ignore]
 fn reading_placeable_without_its_state_s_animation() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let root = mg_testkit::nwn_root().expect("the game");
     let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
     let goblin = Model::read(&base.resman.get_named("c_goblina", ResType::MDL).unwrap()).unwrap();
@@ -873,6 +901,7 @@ fn reading_placeable_without_its_state_s_animation() {
 #[test]
 #[ignore]
 fn reading_git_sun_direction() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x303030, diffuse: 0xE0E0E0, main_light: 0, only_tile: None };
     let settings = SETTINGS.replace(
         "[graphics.shadows.environment]\n\t\t\tenabled = false",
@@ -951,6 +980,7 @@ pub(super) fn pillar(name: &str, side: f32, height: f32) -> String {
 #[test]
 #[ignore]
 fn reading_low_sun_shadow_length() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let root = mg_testkit::nwn_root().expect("the game");
     let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
     let (table, first) = placeables_with(&base, &[("mg_pillar", 1), ("mg_pillar", 0)]);
@@ -1001,6 +1031,7 @@ fn reading_low_sun_shadow_length() {
 #[test]
 #[ignore]
 fn reading_dropped_cloak_shine() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x909090, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
     let mut r = Reading::new("dropped_cloak_shine", "tic01", light, &[]);
     let bp = Gff::read(&r.game.resman.get_named("nw_maarcl055", ResType::UTI).unwrap()).unwrap();
@@ -1027,6 +1058,7 @@ fn reading_dropped_cloak_shine() {
 #[test]
 #[ignore]
 fn reading_git_sun_uniform() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let root = mg_testkit::nwn_root().expect("the game");
     let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
     let overrides = [("inc_standard.shd", debug_shader(&base).into_bytes())];
@@ -1079,6 +1111,7 @@ fn reading_git_sun_uniform() {
 #[test]
 #[ignore]
 fn reading_facelift_cliffs() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x606060, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
     let mut r = Reading::new("facelift_cliffs", "ttf02", light, &[]);
     let tiles = r.are.root.list_mut("Tile_List").unwrap();
@@ -1103,6 +1136,7 @@ fn reading_facelift_cliffs() {
 #[test]
 #[ignore]
 fn reading_shore() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x606060, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
     let mut r = Reading::new("shore", "ttr01", light, &[]);
     let tiles = r.are.root.list_mut("Tile_List").unwrap();
@@ -1119,6 +1153,7 @@ fn reading_shore() {
 #[test]
 #[ignore]
 fn reading_exact_tile_seams() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let light = Lighting { ambient: 0x606060, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
     let mut r = Reading::new("exact_tile_seams", "ttr01", light, &[]);
     let tiles = r.are.root.list_mut("Tile_List").unwrap();
@@ -1140,6 +1175,7 @@ fn reading_exact_tile_seams() {
 #[test]
 #[ignore]
 fn reading_tile_border() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
     let env = |name: &str, default: &str| -> Vec<f32> {
         let v = std::env::var(name).unwrap_or_else(|_| default.into());
         v.split(',').filter_map(|s| s.trim().parse().ok()).collect()
@@ -1228,4 +1264,136 @@ fn reading_tile_border() {
             v.border = border
         });
     eprintln!("{}", dir.display());
+}
+
+/// Reading 1 of the walkmesh bake proposal: the client draws a baked copy
+/// of a placeable's model (`mg_module::bake::copy_model`: the model
+/// renamed, compiled again) as it draws the original. North of the
+/// player, west to east: an armoire left closed, for comparison; the
+/// armoire (`plc_a01`, its own animations) and its copy; `mg_sub` (the
+/// armoire without animations of its own, the armoire its supermodel)
+/// and its copy, these four opened by the entry script; and in front,
+/// kelp (`plc_kelp33`, the game's one placeable whose animation is its
+/// supermodel's, `plc_kelp31`'s `default`) and its copy, scaled 3 by a
+/// visual transform to be seen. The copies' rows are the originals' with
+/// the copy as `ModelName` (`bake::pending_table`), in the scratch
+/// override's placeables.2da with the copies. Three pictures a second
+/// apart (`client_0.png`… in `target/test-output/client_reading_bake_copy/`).
+///
+/// Seen 2026-11-03 (89.8193.37): each copy drawn as its original; the
+/// four opened alike, the copy of `mg_sub` by its supermodel's `open`
+/// (whose nodes it finds by the part numbers the copy keeps, asserted
+/// here); the kelp alike, still in all three pictures, the original as
+/// well as the copy (the client doesn't sway it).
+#[test]
+#[ignore]
+fn reading_baked_copy_drawn_as_the_original() {
+    let _ = mg_testkit::oracle_tool!("nwn_script_comp");
+    use mg_module::bake;
+    let root = mg_testkit::nwn_root().expect("the game");
+    let base = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    let codepage = base.codepage();
+    let (table, _) = bake::table_under(&base.resman, codepage).unwrap();
+    let row_of = |model: &str| {
+        (0..table.len())
+            .find(|&r| table.get(r, "ModelName").is_some_and(|m| m.eq_ignore_ascii_case(model)))
+            .unwrap() as u32
+    };
+    let first = table.len() as u32;
+    let mut rows = bake::RowsFile::default();
+    let mut overrides: Vec<(String, Vec<u8>)> = Vec::new();
+    let identity = glam::Mat4::IDENTITY.to_cols_array_2d();
+    // `mg_sub`: the armoire without animations of its own, the armoire
+    // its supermodel: it opens by the supermodel's, which find its nodes
+    // by their part numbers.
+    let armoire = Model::read(&base.resman.get_named("plc_a01", ResType::MDL).unwrap()).unwrap();
+    let mut sub = armoire.renamed("mg_sub");
+    sub.animations.clear();
+    sub.supermodel = Some("plc_a01".into());
+    let order = mg_mdl::ascii_write::file_order(
+        &armoire,
+        &mg_mdl::binary_write::PartNumbers::of(&armoire).unwrap().numbers,
+    );
+    let text = mg_mdl::ascii_write::to_ascii_in_order(&sub, &Default::default(), &order);
+    let find = |n: &str| base.resman.get_named(n, ResType::MDL).ok().map(|d| d.into_owned());
+    let none = |_: &str| None;
+    let sub = mg_mdl::compile::compile_named(text.as_bytes(), "mg_sub", &find, &none).unwrap();
+    let armoire_pwk = base.resman.get_named("plc_a01", ResType::PWK).unwrap().into_owned();
+    let mut over = mg_resman::MemContainer::new();
+    over.insert(ResKey::parse("mg_sub", ResType::MDL).unwrap(), sub.binary.clone());
+    over.insert(ResKey::parse("mg_sub", ResType::PWK).unwrap(), armoire_pwk.clone());
+    let mut with_sub = GameData::open(&GameInstall::new(&root, None, "en")).unwrap();
+    with_sub.resman.add(12, "override", mg_resman::LayerClass::Erf, over);
+    overrides.push(("mg_sub.mdl".into(), sub.binary));
+    overrides.push(("mg_sub.pwk".into(), armoire_pwk));
+    rows.rows.push(bake::BakedRow {
+        row: first + 3,
+        copy_of: row_of("plc_a01"),
+        model: "mg_sub".into(),
+        label: "mg_sub".into(),
+    });
+    for (i, original) in ["plc_a01", "plc_kelp33", "mg_sub"].into_iter().enumerate() {
+        let copy = format!("mgbk_{:04}", i + 1);
+        let model = bake::copy_model(&with_sub.resman, original, &copy).unwrap();
+        let (a, b) = (Model::read(&model).unwrap(), {
+            let data = with_sub.resman.get_named(original, ResType::MDL).unwrap();
+            Model::read(&data).unwrap()
+        });
+        assert_eq!(a.name, copy);
+        assert_eq!(a.supermodel, b.supermodel, "{original}: its supermodel");
+        assert_eq!(
+            mg_mdl::binary_write::PartNumbers::of(&a),
+            mg_mdl::binary_write::PartNumbers::of(&b),
+            "{original}: its part numbers"
+        );
+        let pwk = bake::walkmesh_of(&with_sub.resman, original).unwrap();
+        overrides.push((format!("{copy}.mdl"), model));
+        overrides.push((format!("{copy}.pwk"), pwk.moved_text(&copy, identity, "").into_bytes()));
+        rows.rows.push(bake::BakedRow {
+            row: first + i as u32,
+            copy_of: row_of(if original == "mg_sub" { "plc_a01" } else { original }),
+            model: copy,
+            label: format!("Baked {original}"),
+        });
+    }
+    let with = bake::pending_table(&table, &rows).unwrap();
+    overrides.push((
+        "placeables.2da".into(),
+        with.to_bytes_as(codepage, mg_2da::Layout::Aligned).unwrap(),
+    ));
+    let overrides: Vec<(&str, Vec<u8>)> =
+        overrides.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    let light = Lighting { ambient: 0x909090, diffuse: 0xC0C0C0, main_light: 0, only_tile: None };
+    let mut r = Reading::new("bake_copy", "tic01", light, &overrides);
+    let scaled = mg_area::edit::visual_transform_list(mg_area::VisualTransform {
+        scale: Vec3::splat(3.0),
+        ..Default::default()
+    });
+    let tag = |t: &str| ("Tag", Value::String(t.as_bytes().to_vec()));
+    let (armoire, kelp) = (row_of("plc_a01"), row_of("plc_kelp33"));
+    // West to east: an armoire left closed; the armoire and its copy;
+    // `mg_sub` and its copy (the last four opened).
+    r.place(armoire, [16.4, 23.5, 0.0], 270.0, &[tag("MG_SHUT")]);
+    for (i, (row, x)) in [(armoire, 18.0), (first, 19.6), (first + 3, 21.2), (first + 2, 22.8)]
+        .into_iter()
+        .enumerate()
+    {
+        r.place(row, [x, 23.5, 0.0], 270.0, &[tag(&format!("MG_A{i}"))]);
+    }
+    for (row, x) in [(kelp, 19.3), (first + 1, 20.7)] {
+        r.place(row, [x, 21.0, 0.0], 270.0, &[("VisTransformList", scaled.clone())]);
+    }
+    let open: String = (0..4)
+        .map(|i| {
+            format!(
+                "\n    AssignCommand(GetObjectByTag(\"MG_A{i}\"), \
+                 ActionPlayAnimation(ANIMATION_PLACEABLE_OPEN));"
+            )
+        })
+        .collect();
+    let body = format!("{INVISIBLE}{open}");
+    r.save(&enter(&body, (90.0, 12.0, 45.0)), SETTINGS);
+    let shots = common::client_screenshots(&r.dir, "MgScene", 3, Duration::from_secs(1))
+        .unwrap_or_else(|| panic!("the client did not reach the scene ({})", r.dir.display()));
+    eprintln!("{} pictures in {}", shots.len(), r.dir.display());
 }

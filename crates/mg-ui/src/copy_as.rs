@@ -10,7 +10,7 @@ use mg_module::palette::BlueprintKind;
 use mg_resman::ResKey;
 
 use crate::text::{decode, encode};
-use crate::widgets::{autofocus, enter};
+use crate::widgets::{ResRefText, autofocus};
 use crate::{Action, Moonglow, Tab};
 
 /// What the Copy window asks.
@@ -24,6 +24,10 @@ pub struct CopyDraft {
     pub original_tag: Option<String>,
     /// From the palette: the copy is shown there and opened.
     pub palette: bool,
+    /// The tag is the ResRef, as it is typed, until the tag itself is
+    /// changed: an area's copy (its tag is what scripts find it by, and
+    /// builders name areas' tags as their ResRefs; a builder's ask).
+    pub tag_follows: bool,
 }
 
 /// The resources that go with one: an area's objects and comments.
@@ -89,12 +93,16 @@ impl Moonglow {
         let tag = resref_field(key.restype)
             .and_then(|_| Gff::read(&data).ok())
             .and_then(|g| g.root.string("Tag").map(decode));
+        let resref = resref.map(|r| r.to_string()).unwrap_or_default();
+        // An area's copy is tagged as it is named ([`CopyDraft::tag_follows`]).
+        let tag_follows = key.restype == ResType::ARE;
         self.copy_as = Some(CopyDraft {
             from: key,
-            resref: resref.map(|r| r.to_string()).unwrap_or_default(),
             original_tag: tag.clone(),
-            tag,
+            tag: if tag_follows { Some(resref.clone()) } else { tag },
+            resref,
             palette,
+            tag_follows,
         });
     }
 
@@ -112,7 +120,9 @@ impl Moonglow {
                 && let Ok(mut gff) = Gff::read(&data)
             {
                 gff.root.set(field, Value::resref(to));
-                if let Some(tag) = &draft.tag {
+                // (Following the ResRef: as it is, however it was set.)
+                let follows = draft.tag_follows.then(|| draft.resref.trim());
+                if let Some(tag) = follows.or(draft.tag.as_deref()) {
                     gff.root.set("Tag", Value::String(encode(tag.trim())));
                 }
                 data = gff.to_bytes().ok()?;
@@ -142,8 +152,17 @@ impl Moonglow {
         let made = crate::plugin_events::Made::resources("copy", vec![new]);
         let cmd = Command::new(format!("Copy {} as {new}", draft.from), edits);
         let cmd = crate::plugin_events::with_plugins(self, cmd, &made);
-        match self.apply(cmd) {
-            Ok(()) => {
+        // A blueprint's copy opens in its window (`window`), whose Cancel
+        // takes the copy back, as Aurora's Edit Copy makes it only at OK.
+        let opens = BlueprintKind::from_restype(new.restype).is_some();
+        if opens {
+            crate::blueprint::note_made(self, new, &[], &cmd);
+        }
+        // (Held for the Protected Area window: what goes ahead from there
+        // is this copy whole, its log and its tags' check too.)
+        let again = Action::CopyResource(Box::new(draft.clone()));
+        match self.apply_or_ask(cmd, Some(again)) {
+            Ok(true) => {
                 self.log.info(format!("Copied {} as {new}", draft.from));
                 // An area's copy has its objects' tags, and perhaps its own.
                 if new.restype == ResType::ARE {
@@ -166,11 +185,43 @@ impl Moonglow {
                 }
                 Some(new)
             }
-            Err(e) => {
-                self.log.error(e.to_string());
+            held => {
+                if opens {
+                    self.properties_changed.remove(&(new, mg_edit::GffPath::root()));
+                }
+                // (Held: the Protected Area window says it.)
+                if let Err(e) = held {
+                    self.log.error(e.to_string());
+                }
                 None
             }
         }
+    }
+}
+
+/// Makes the copy the Copy window asked for, and what follows it: what
+/// is said of a blueprint's tag another has, the palette showing it, and
+/// a blueprint's copy opened, to change.
+pub(crate) fn make(app: &mut Moonglow, draft: &CopyDraft) {
+    // (As it is before the copy has the tag too.)
+    let blueprint = BlueprintKind::from_restype(draft.from.restype).is_some();
+    let warned = draft.tag.as_deref().filter(|_| blueprint).and_then(|tag| {
+        let original = draft.original_tag.as_deref();
+        crate::tag_clash::blueprint_copy_warning(app, draft.from, original, tag)
+    });
+    let Some(new) = app.copy_resource(draft) else { return };
+    if let Some(w) = warned {
+        app.log.warn(format!("{new}: {w}"));
+    }
+    if draft.palette {
+        app.palette.custom = true;
+        app.palette.selected = Some(new);
+    }
+    // A blueprint's copy is opened, to change.
+    if BlueprintKind::from_restype(new.restype).is_some()
+        && let Some(t) = Tab::for_resource(new)
+    {
+        app.actions.push(Action::OpenTab(t));
     }
 }
 
@@ -180,18 +231,30 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     let title = format!("Copy {}", draft.from);
     let mut open = true;
     let (mut done, mut cancel) = (false, false);
-    let mut warned = None;
-    crate::widgets::dialog(ctx, &title, &mut open).collapsible(false).resizable(false).show(
-        ctx,
-        |ui| {
+    let footed = crate::widgets::dialog(ctx, &title, &mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show_foot(ctx, |ui| {
             egui::Grid::new("copy-as").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 crate::widgets::field_label(ui, "ResRef");
-                let r = ui.add(egui::TextEdit::singleline(&mut draft.resref).desired_width(200.0));
+                let mut text = ResRefText(&mut draft.resref);
+                let r = ui.add(crate::widgets::resref_edit(&mut text).desired_width(200.0));
                 autofocus(ui, &r);
                 ui.end_row();
+                if r.changed()
+                    && draft.tag_follows
+                    && let Some(tag) = &mut draft.tag
+                {
+                    tag.clone_from(&draft.resref);
+                }
                 if let Some(tag) = &mut draft.tag {
                     crate::widgets::field_label(ui, "Tag");
-                    ui.add(egui::TextEdit::singleline(tag).desired_width(200.0));
+                    // (As many characters as the game keeps of a tag.)
+                    let limit = mg_module::tags::MAX_TAG;
+                    let edit = mg_uikit::text_field(tag).char_limit(limit).desired_width(200.0);
+                    if ui.add(edit).changed() {
+                        draft.tag_follows = false;
+                    }
                     ui.end_row();
                 }
             });
@@ -217,9 +280,37 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             // (A blueprint's tag another has: said, and in the log once
             // copied, not stopping it.)
             let blueprint = BlueprintKind::from_restype(draft.from.restype).is_some();
-            warned = draft.tag.as_deref().filter(|_| blueprint && !stops).and_then(|tag| {
+            let warned = draft.tag.as_deref().filter(|_| blueprint && !stops).and_then(|tag| {
+                #[allow(clippy::type_complexity)]
+                type WarnCache = (
+                    (Option<(u64, u64, u64)>, u64, bool, ResKey, Option<String>, String),
+                    Option<String>,
+                );
+                let ws_key = app
+                    .ws
+                    .as_ref()
+                    .map(|ws| (ws.identity(), ws.revision(), ws.module.project_reads()));
+                let key = (
+                    ws_key,
+                    app.load_order,
+                    app.settings.warn_duplicate_tags,
+                    draft.from,
+                    draft.original_tag.clone(),
+                    tag.to_string(),
+                );
+                let warn_id = egui::Id::new("copy-as-tag-warning");
+                if !app.references.is_reading()
+                    && let Some((was, cached)) = ui.data(|d| d.get_temp::<WarnCache>(warn_id))
+                    && was == key
+                {
+                    return cached;
+                }
                 let original = draft.original_tag.as_deref();
-                crate::tag_clash::blueprint_copy_warning(app, draft.from, original, tag)
+                let res = crate::tag_clash::blueprint_copy_warning(app, draft.from, original, tag);
+                if !app.references.is_reading() {
+                    ui.data_mut(|d| d.insert_temp::<WarnCache>(warn_id, (key, res.clone())));
+                }
+                res
             });
             if let Some(w) = &warned {
                 ui.colored_label(ui.visuals().warn_fg_color, w);
@@ -227,33 +318,14 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             if draft.from.restype == ResType::ARE {
                 ui.weak("The area is copied with everything placed in it.");
             }
-            ui.horizontal(|ui| {
-                let ok = ui.add_enabled(!stops, egui::Button::new("Create Copy"));
-                if ok.clicked() || (!stops && enter(ui)) {
-                    done = true;
-                }
-                if crate::widgets::cancel(ui) {
-                    cancel = true;
-                }
-            });
-        },
-    );
+            ((), crate::widgets::Foot::new().main("Create Copy", !stops).cancel())
+        });
+    if let Some(f) = footed {
+        done = f.pressed.main();
+        cancel = f.pressed.cancelled();
+    }
     if done {
-        if let Some(new) = app.copy_resource(&draft) {
-            if let Some(w) = warned {
-                app.log.warn(format!("{new}: {w}"));
-            }
-            if draft.palette {
-                app.palette.custom = true;
-                app.palette.selected = Some(new);
-            }
-            // A blueprint's copy is opened, to change.
-            if BlueprintKind::from_restype(new.restype).is_some()
-                && let Some(t) = Tab::for_resource(new)
-            {
-                app.actions.push(Action::OpenTab(t));
-            }
-        }
+        app.actions.push(Action::CopyResource(Box::new(draft)));
     } else if open && !cancel {
         app.copy_as = Some(draft);
     }

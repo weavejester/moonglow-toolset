@@ -1,0 +1,819 @@
+//! Text typed into the module's talk table (`docs/typed-text-proposal.md`):
+//! with Options › Language › Put text typed into the talk table on, a
+//! name, a description or a conversation line typed becomes a line of the
+//! module's custom talk table, at the next free line of the project's
+//! range (`moonglow.toml`'s `[talk]`, [`mg_module::talk_range`]), and the
+//! field names it by its StrRef. The commands a field's typing makes are
+//! marked so (`Action::ApplyTyped`); [`apply`] puts their text in the
+//! table and applies them.
+//!
+//! The line is the module's change, outside the table's own history: it
+//! is kept with the module's step that set the field (by the step's place
+//! in the module's undo list), and the module's Undo and Redo take it out
+//! and put it back with the field ([`stepped`]).
+
+use std::collections::BTreeSet;
+
+use mg_core::{Gender, Language, LocString};
+use mg_edit::{Command, Edit};
+use mg_gff::Value;
+use mg_module::talk::{Line, Table, Typed};
+use mg_module::talk_range;
+
+use crate::settings::TalkReuse;
+use crate::{Action, Moonglow};
+
+/// What the builder answered for a text the table has already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Name that line.
+    Use(usize),
+    /// Add another line.
+    Add,
+    /// Keep the text in the file, Aurora's way.
+    File,
+}
+
+/// The question asked of a text the table has a line with already.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ask {
+    /// The command typed, as it was made.
+    pub cmd: Command,
+    pub text: String,
+    /// The line that has it.
+    pub row: usize,
+    /// What was answered of its other texts.
+    pub answers: Vec<(String, Answer)>,
+}
+
+/// The lines typed, with the module's steps they go with, and the
+/// question being asked.
+#[derive(Debug, Default)]
+pub struct TypedState {
+    /// The lines of each step Undo can take back, by its depth in the
+    /// module's undo list (`Workspace::undo_depth` once it is applied).
+    undo: Vec<(usize, Vec<Typed>)>,
+    /// The lines of each step Redo can put back, by the depth it is
+    /// applied at.
+    redo: Vec<(usize, Vec<Typed>)>,
+    pub ask: Option<Ask>,
+    /// The commands typed while a question is asked (with what was
+    /// answered of their texts), in turn: each goes on once the question
+    /// is answered. The one slot held the last of them alone, and the
+    /// edit asked about before it was dropped without a word.
+    waiting: std::collections::VecDeque<(Command, Vec<(String, Answer)>)>,
+    /// The lines of the project's `[talk] map` ([`map_lines`]), kept
+    /// while its file is as it was read.
+    map: std::cell::RefCell<Option<MapKept>>,
+    /// Where the next line goes and how many are left ([`room`]), kept
+    /// while what it was worked out from is as it was.
+    room: std::cell::RefCell<Option<(RoomFor, Room)>>,
+    /// The game data could not be given the table's new lines (it was
+    /// held): given them once it is free ([`show_when_free`]).
+    unshown: bool,
+    /// Why typed text stayed in the file, each said once.
+    said: BTreeSet<String>,
+}
+
+impl TypedState {
+    /// Forgets the lines' steps (the module closed, or its history gone):
+    /// the lines stay in the table.
+    pub(crate) fn forget(&mut self) {
+        *self = TypedState::default();
+    }
+
+    /// Drops what no longer goes with a step of the module's history
+    /// (`depth` commands to undo and `redo` to redo): their lines stay.
+    pub(crate) fn prune(&mut self, depth: usize, redo: usize) {
+        self.undo.retain(|(d, _)| *d <= depth);
+        self.redo.retain(|(d, _)| *d > depth && *d <= depth + redo);
+    }
+
+    /// A command was applied: nothing is to be redone any more.
+    pub(crate) fn applied(&mut self) {
+        self.redo.clear();
+    }
+
+    /// The last `n` steps of the module's history, its depth `top` before,
+    /// made one (`Workspace::join_last`, Edit Areas Together's Cancel All):
+    /// their typed lines go with the one step, so its Undo and Redo take
+    /// and put back them all, and what Redo puts back lands that much
+    /// lower. (No page of Edit Areas Together has a localized field today,
+    /// but one added carries its lines rightly.)
+    pub(crate) fn joined(&mut self, n: usize, top: usize) {
+        let fewer = n.saturating_sub(1);
+        let from = (top + 1).saturating_sub(n);
+        let mut lines = Vec::new();
+        while self.undo.last().is_some_and(|(d, _)| *d >= from) {
+            let (_, t) = self.undo.pop().expect("checked");
+            lines.splice(0..0, t);
+        }
+        if !lines.is_empty() {
+            self.undo.push((from, lines));
+        }
+        for (d, _) in &mut self.redo {
+            *d = d.saturating_sub(fewer);
+        }
+    }
+
+    /// The rows Redo would put lines back on: not given to another text.
+    fn held(&self) -> BTreeSet<usize> {
+        self.redo.iter().flat_map(|(_, t)| t.iter().map(|t| t.row)).collect()
+    }
+}
+
+/// A text typed into one field or more (Edit Together's several): the
+/// edits of the command that set it.
+struct Wanted {
+    text: String,
+    feminine: Option<String>,
+    edits: Vec<usize>,
+    /// Some edit of them changes the field's text.
+    changed: bool,
+}
+
+/// The text of a string in `language` (masculine, else feminine), as the
+/// field shows it.
+fn text_in(ls: &LocString, language: Language, gender: Gender) -> Option<String> {
+    let bytes = ls.get(language, gender)?;
+    Some(crate::text::entry_codepage(language).decode(bytes).into_owned())
+}
+
+/// The table typed text goes into: its language and whether it has a
+/// feminine table; or why there is none.
+fn table_language(app: &mut Moonglow) -> Result<(Language, bool), String> {
+    let Some(name) = crate::talk_view::load(app) else {
+        return Err("the module has no custom talk table (Module Properties › Custom Content \
+                    names one)"
+            .into());
+    };
+    if crate::talk_view::several_languages(app) {
+        return Err(format!(
+            "the project keeps the talk table {name} in more than one language: a line in one \
+             of them would be empty in the others"
+        ));
+    }
+    match crate::talk_view::can_add(app) {
+        Some(found) => Ok(found),
+        None => Err(format!(
+            "the talk table {name} can't be written here (one of a hak's, or not found where the \
+             game looks)"
+        )),
+    }
+}
+
+/// Says once why typed text stays in the file.
+fn note(app: &mut Moonglow, why: String) {
+    if app.typed.said.insert(why.clone()) {
+        app.log.warn(format!("Text typed is kept in the file: {why}"));
+    }
+}
+
+/// The map's file as it was when its lines were read: where it is, its
+/// time and its size (none: not there), and what was read.
+type MapKept = (
+    std::path::PathBuf,
+    Option<(std::time::SystemTime, u64)>,
+    Result<std::sync::Arc<BTreeSet<u32>>, String>,
+);
+
+/// The lines of the project's `[talk] map` (`mg tlk-alloc`'s, which typed
+/// text never takes; none where the project names no map), or why the
+/// map can't be read. Read again when the file's time or size changes,
+/// and kept between: Module Properties › Custom Content read and parsed
+/// it twice every frame it showed, a megabyte of JSON for a map of
+/// 20,000 lines.
+pub(crate) fn map_lines(app: &Moonglow) -> Result<std::sync::Arc<BTreeSet<u32>>, String> {
+    let path = app.ws.as_ref().and_then(|ws| ws.module.project_file.talk_map_path());
+    let Some(path) = path else {
+        *app.typed.map.borrow_mut() = None;
+        return Ok(Default::default());
+    };
+    let stamp = std::fs::metadata(&path).ok().map(|m| (m.modified().ok(), m.len()));
+    let stamp = stamp.and_then(|(time, len)| Some((time?, len)));
+    let mut kept = app.typed.map.borrow_mut();
+    if let Some((of, was, lines)) = &*kept
+        && *of == path
+        && *was == stamp
+    {
+        return lines.clone();
+    }
+    let read = app.ws.as_ref().map_or(Ok(None), |ws| ws.module.project_file.talk_map());
+    let lines =
+        read.map(|m| std::sync::Arc::new(m.map(|m| talk_range::map_lines(&m)).unwrap_or_default()));
+    *kept = Some((path, stamp, lines.clone()));
+    lines
+}
+
+/// Where the next typed line goes (or why nowhere), and how many of the
+/// project's range are left, of how many (none without a range).
+pub(crate) type Room = (Result<usize, String>, Option<(u32, u32)>);
+
+/// What a [`Room`] was worked out from: the table's lines
+/// (`Table::revision`), the lines a builder may take, the map's and those
+/// held for Redo.
+type RoomFor =
+    (u64, talk_range::Allowed, Result<std::sync::Arc<BTreeSet<u32>>, String>, BTreeSet<usize>);
+
+/// The [`Room`] left in the open talk table, for Module Properties ›
+/// Custom Content to say (none with no table open): worked out when the
+/// table, the range, the map or the lines held change, not every frame
+/// the page shows (a walk of the used part of the range, twice).
+pub(crate) fn room(app: &Moonglow) -> Option<Room> {
+    let t = app.talk.as_ref()?;
+    let allowed = (app.ws.as_ref())
+        .map_or(talk_range::Allowed::End, |ws| ws.module.project_file.talk_allowed());
+    let map = map_lines(app);
+    let made_for: RoomFor = (t.revision(), allowed, map, app.typed.held());
+    let same = |a: &RoomFor, b: &RoomFor| {
+        let maps = match (&a.2, &b.2) {
+            (Ok(a), Ok(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Err(a), Err(b)) => a == b,
+            _ => false,
+        };
+        maps && (a.0, &a.1, &a.3) == (b.0, &b.1, &b.3)
+    };
+    let mut kept = app.typed.room.borrow_mut();
+    if let Some((of, room)) = &*kept
+        && same(of, &made_for)
+    {
+        return Some(room.clone());
+    }
+    let next = next_line(app, t);
+    let len = u32::try_from(t.len()).unwrap_or(u32::MAX);
+    let map_lines = made_for.2.clone().unwrap_or_default();
+    let left = talk_range::free_lines(&made_for.1, len, |l| t.is_blank(l as usize), &map_lines);
+    let room: Room = (next, left);
+    *kept = Some((made_for, room.clone()));
+    Some(room)
+}
+
+/// The next line text typed (or Move to Talk Table) takes: in the
+/// builder's lines of the project's range, past lines with text, `mg
+/// tlk-alloc`'s and those Redo would put back; the table's end without a
+/// range. An error where the range is full or the map can't be read.
+pub(crate) fn next_line(app: &Moonglow, t: &Table) -> Result<usize, String> {
+    next_line_but(app, t, &[])
+}
+
+/// [`next_line`], with the lines `taken` (lines a window will add at its
+/// OK) taken as if they had text already.
+pub(crate) fn next_line_but(app: &Moonglow, t: &Table, taken: &[usize]) -> Result<usize, String> {
+    let Some(ws) = &app.ws else {
+        return Ok((t.len()..).find(|l| !taken.contains(l)).unwrap_or(t.len()));
+    };
+    let pf = &ws.module.project_file;
+    let allowed = pf.talk_allowed();
+    let map = map_lines(app)?;
+    let held = app.typed.held();
+    let len = u32::try_from(t.len()).unwrap_or(u32::MAX);
+    let row = talk_range::next_free(
+        &allowed,
+        len,
+        |l| t.is_blank(l as usize),
+        |l| map.contains(&l) || held.contains(&(l as usize)) || taken.contains(&(l as usize)),
+    );
+    row.map(|r| r as usize).ok_or_else(|| {
+        format!(
+            "the {} of the talk table typed text takes are all used (Module Properties › Custom \
+             Content sets other lines)",
+            allowed.describe()
+        )
+    })
+}
+
+/// Whether text typed goes into the talk table: the open module's project
+/// says (`[talk] typed`), else the builder's Options › Language.
+pub(crate) fn enabled(app: &Moonglow) -> bool {
+    let project = app.ws.as_ref().and_then(|ws| ws.module.project_file.talk.typed);
+    project.unwrap_or(app.settings.talk_typed)
+}
+
+/// Applies a command as `Action::Apply` does, saying why it failed.
+fn plain(app: &mut Moonglow, cmd: Command) {
+    if let Err(e) = app.apply(cmd)
+        && !std::mem::take(&mut app.claims.held)
+    {
+        app.log.error(e.to_string());
+    }
+}
+
+/// Applies a command a field's typing made (`Action::ApplyTyped`): its
+/// text typed put in the talk table first, where Options say so.
+pub(crate) fn apply(app: &mut Moonglow, cmd: Command) {
+    apply_with(app, cmd, Vec::new());
+}
+
+/// [`apply`], with what was answered of texts the table has already.
+pub(crate) fn apply_with(app: &mut Moonglow, cmd: Command, answers: Vec<(String, Answer)>) {
+    let loc = |e: &Edit| matches!(e, Edit::SetField { value: Some(Value::LocString(_)), .. });
+    if !enabled(app) || app.ws.is_none() || !cmd.edits.iter().any(loc) {
+        return plain(app, cmd);
+    }
+    // (A question is being asked: this one waits its turn behind it. Not
+    // the command asked about again, nor one that waits already: a field
+    // left with its text not yet set says so again.)
+    if let Some(ask) = &app.typed.ask {
+        if ask.cmd != cmd && !app.typed.waiting.iter().any(|(c, _)| *c == cmd) {
+            app.typed.waiting.push_back((cmd, answers));
+        }
+        return;
+    }
+    let (language, has_feminine) = match table_language(app) {
+        Ok(l) => l,
+        Err(why) => {
+            note(app, why);
+            return plain(app, cmd);
+        }
+    };
+    // The texts typed, each with the fields it goes in.
+    let mut wanted: Vec<Wanted> = Vec::new();
+    for (i, e) in cmd.edits.iter().enumerate() {
+        let Edit::SetField { key, path, label, value: Some(Value::LocString(new)) } = e else {
+            continue;
+        };
+        let Some(text) = text_in(new, language, Gender::Male).filter(|t| !t.trim().is_empty())
+        else {
+            continue;
+        };
+        // (The game shows any text of a string's own before its line, in
+        // another language too: such a string keeps its text.)
+        if talk_range::other_languages(new, language) {
+            note(
+                app,
+                format!(
+                    "a string with text in another language than the talk table's ({}) as well: \
+                     the game shows that text before a talk-table line, to every player",
+                    language.name().unwrap_or("its language")
+                ),
+            );
+            continue;
+        }
+        let feminine = text_in(new, language, Gender::Female).filter(|f| *f != text);
+        if feminine.is_some() && !has_feminine {
+            note(
+                app,
+                "a string with a feminine text of its own, where the talk table has no feminine \
+                 table to keep it in"
+                    .into(),
+            );
+            continue;
+        }
+        let ws = app.ws.as_mut().expect("checked");
+        let old = ws.doc(key).ok().and_then(|g| path.get(&g.root)).and_then(|s| s.locstring(label));
+        // (Changed from what the field shows: its own text, else its
+        // talk-table line's.)
+        let shown = old.and_then(|o| {
+            text_in(o, language, Gender::Male).or_else(|| {
+                let row = talk_range::line_of(o.strref)? as usize;
+                let t = app.talk.as_ref()?;
+                (row < t.len()).then(|| t.line(row).text)
+            })
+        });
+        let changed = shown.as_ref() != Some(&text);
+        match wanted.iter_mut().find(|w| w.text == text && w.feminine == feminine) {
+            Some(w) => {
+                w.edits.push(i);
+                w.changed |= changed;
+            }
+            None => wanted.push(Wanted { text, feminine, edits: vec![i], changed }),
+        }
+    }
+    wanted.retain(|w| w.changed);
+    if wanted.is_empty() {
+        return plain(app, cmd);
+    }
+    // Each text's line: one with the text already (asked first), or a new
+    // one.
+    let mut choices = Vec::new();
+    for w in &wanted {
+        let answered = answers.iter().find(|(t, _)| *t == w.text).map(|a| a.1);
+        let has = app.talk.as_ref().and_then(|t| t.find_text(&w.text, w.feminine.as_deref()));
+        let choice = match (answered, has) {
+            (Some(a), _) => a,
+            (None, None) => Answer::Add,
+            (None, Some(row)) => match app.settings.talk_reuse {
+                TalkReuse::Use => Answer::Use(row),
+                TalkReuse::Add => Answer::Add,
+                TalkReuse::File => Answer::File,
+                TalkReuse::Ask => {
+                    app.typed.ask = Some(Ask { cmd, text: w.text.clone(), row, answers });
+                    return;
+                }
+            },
+        };
+        choices.push(choice);
+    }
+    let mut typed: Vec<Typed> = Vec::new();
+    let mut said = Vec::new();
+    let mut edits = cmd.edits.clone();
+    for (w, choice) in wanted.iter().zip(choices) {
+        let row = match choice {
+            Answer::File => continue,
+            Answer::Use(row) => {
+                let uses = format!("uses line {row} of the talk table ({})", strref(row));
+                said.push((short(&w.text), uses));
+                row
+            }
+            Answer::Add => {
+                let Some(t) = app.talk.as_ref() else { continue };
+                let row = match next_line(app, t) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        app.log.error(format!("Text typed kept in the file: {e}"));
+                        continue;
+                    }
+                };
+                let line = Line {
+                    text: w.text.clone(),
+                    feminine: Some(w.feminine.clone().unwrap_or_else(|| w.text.clone())),
+                    sound: String::new(),
+                    sound_length: 0.0,
+                };
+                let t = app.talk.as_mut().expect("checked");
+                match t.put_typed(row, &line) {
+                    Ok(done) => typed.push(done),
+                    Err(e) => {
+                        app.log.error(format!("Text typed kept in the file: {e}"));
+                        continue;
+                    }
+                }
+                let is = format!("is line {row} of the talk table ({})", strref(row));
+                said.push((short(&w.text), is));
+                row
+            }
+        };
+        for &i in &w.edits {
+            if let Edit::SetField { value: Some(Value::LocString(ls)), .. } = &mut edits[i] {
+                *ls = talk_range::in_line(ls, language, row as u32);
+            }
+        }
+    }
+    if !typed.is_empty() {
+        shown(app);
+    }
+    let rewritten = Command::new(cmd.label.clone(), edits);
+    let depth = app.ws.as_ref().map_or(0, |ws| ws.undo_depth());
+    let result = app.apply(rewritten);
+    let now = app.ws.as_ref().map_or(0, |ws| ws.undo_depth());
+    match result {
+        Ok(()) if now == depth + 1 => {
+            if !typed.is_empty() {
+                app.typed.undo.push((now, typed));
+            }
+            // (Each with its own text: paired by place, a text kept in the
+            // file before it gave its line to the next text.)
+            for (text, s) in &said {
+                app.log.info(format!("“{text}” {s}"));
+            }
+        }
+        // (Nothing changed: a blueprint only looked at.)
+        Ok(()) => take_back(app, &typed),
+        Err(e) => {
+            take_back(app, &typed);
+            if std::mem::take(&mut app.claims.held) {
+                // (Asked first: what goes ahead is the command as typed,
+                // its text put in the table then.)
+                if let Some(ask) = &mut app.claims.protected_ask {
+                    ask.then = Action::ApplyTyped(cmd);
+                }
+            } else {
+                app.log.error(e.to_string());
+            }
+        }
+    }
+}
+
+fn strref(row: usize) -> u32 {
+    Table::strref(row).0
+}
+
+/// A text as the log quotes it: its first line, cut at 60 characters.
+fn short(text: &str) -> String {
+    let first = text.lines().next().unwrap_or_default();
+    match first.char_indices().nth(60) {
+        Some((at, _)) => format!("{}…", &first[..at]),
+        None if first.len() < text.len() => format!("{first}…"),
+        None => first.to_string(),
+    }
+}
+
+/// The table as it is now, lines typed and taken back, shown at once: in
+/// the editor, and in the game data's custom talk table, which the fields
+/// and lists read their text from (where it is the module's table) before
+/// the module is saved.
+fn shown(app: &mut Moonglow) {
+    app.talk_view.changed_outside();
+    app.release_game_data();
+    if !show(app) && !std::mem::replace(&mut app.typed.unshown, true) {
+        // (Held past the wait by something that still reads it: the line
+        // is in the table, and its fields show no text of it until then.
+        // It was left so without a word.)
+        app.log.warn(
+            "The game data is in use: the talk table's new lines show in the fields once it is \
+             free",
+        );
+    }
+}
+
+/// Gives the game data the talk table as it is now, where it can be
+/// changed (nothing else reads it): whether it was (or there was nothing
+/// to give). Only the lines that differ are copied
+/// (`GameData::update_custom_tlk`: the whole table was, 50,000 lines for
+/// one typed), and only what is made from the custom table's strings is
+/// forgotten (the choice lists): the 2DAs read and the appearances judged
+/// have none of them, and every typed text made the open editors read
+/// `appearance.2da` and the rest again.
+fn show(app: &mut Moonglow) -> bool {
+    let Some(t) = app.talk.as_ref().filter(|_| !app.talk_view.outside) else {
+        app.typed.unshown = false;
+        return true;
+    };
+    let Some(game) = crate::exclusive(&mut app.game) else { return app.game.is_none() };
+    game.update_custom_tlk(&t.tlk);
+    app.typed.unshown = false;
+    true
+}
+
+/// Each frame: a talk table the game data could not be given while it
+/// was held ([`shown`]) is given it once it is free.
+fn show_when_free(app: &mut Moonglow) {
+    if app.typed.unshown && show(app) {
+        app.log.info("The talk table's new lines show in the fields now");
+    }
+}
+
+/// Takes typed lines back out of the table (last first).
+fn take_back(app: &mut Moonglow, typed: &[Typed]) {
+    let Some(t) = app.talk.as_mut() else { return };
+    for done in typed.iter().rev() {
+        if !t.take_back(done) {
+            app.log.warn(format!(
+                "Line {} of the talk table was changed in its editor since it was typed: left as \
+                 it is",
+                done.row
+            ));
+        }
+    }
+    shown(app);
+}
+
+/// Whether the module's Redo may go ahead: the lines it puts back are
+/// still free. `depth`: the module's undo depth before it.
+pub(crate) fn may_redo(app: &Moonglow, depth: usize) -> Result<(), String> {
+    let Some((d, typed)) = app.typed.redo.last() else { return Ok(()) };
+    if *d != depth + 1 {
+        return Ok(());
+    }
+    let Some(t) = &app.talk else { return Ok(()) };
+    match typed.iter().find(|done| !t.can_put_back(done)) {
+        Some(done) => Err(format!(
+            "Redo: line {} of the talk table, which it puts back, has been given another text \
+             since",
+            done.row
+        )),
+        None => Ok(()),
+    }
+}
+
+/// After the module's Undo (or, `redo`, Redo) took a step: its typed lines
+/// taken out of the table or put back. `depth`: the module's undo depth
+/// before the step.
+pub(crate) fn stepped(app: &mut Moonglow, redo: bool, depth: usize) {
+    if redo {
+        if app.typed.redo.last().is_some_and(|(d, _)| *d == depth + 1) {
+            let (d, typed) = app.typed.redo.pop().expect("checked");
+            if let Some(t) = app.talk.as_mut() {
+                for done in &typed {
+                    if let Err(e) = t.put_back(done) {
+                        app.log.warn(e);
+                    }
+                }
+                shown(app);
+            }
+            app.typed.undo.push((d, typed));
+        }
+    } else if app.typed.undo.last().is_some_and(|(d, _)| *d == depth) {
+        let (d, typed) = app.typed.undo.pop().expect("checked");
+        if app.talk.is_none() {
+            app.log.warn("The talk table isn't open: the lines typed with that step stay in it");
+        }
+        take_back(app, &typed);
+        app.typed.redo.push((d, typed));
+    }
+}
+
+/// The question asked of a text the table has a line with already. It
+/// stops the editor until it is answered (an `egui::Modal`): it holds the
+/// command as it was typed, which for a conversation's new line is the
+/// conversation as it was then, and edits made behind the question were
+/// taken back when the answer applied it.
+pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
+    show_when_free(app);
+    let Some(ask) = app.typed.ask.clone() else { return };
+    let mut answer = None;
+    let title = "Text in the Talk Table";
+    let always_id = egui::Id::new("talk-typed-always");
+    let (on, tip) = crate::widgets::always_now(
+        ctx,
+        always_id,
+        "Tools › Options › Language › When the talk table has the text",
+    );
+    // (Escape is this question's, as a dialog's is: the Properties window
+    // under it doesn't take it for its Cancel.)
+    let escape = crate::widgets::escape_closes(ctx, title);
+    let modal =
+        crate::widgets::modal_window(ctx, egui::Id::new("talk-typed-ask")).show(ctx, |ui| {
+            crate::widgets::modal_titled_foot(ui, title, |ui| {
+                ui.set_max_width(ui.available_width().min(420.0));
+                ui.label(format!(
+                    "The talk table has this text already, at line {} (StrRef {}):",
+                    ask.row,
+                    strref(ask.row)
+                ));
+                ui.add(egui::Label::new(egui::RichText::new(short(&ask.text)).strong()).wrap());
+                ui.add_space(4.0);
+                ui.weak(
+            "The field can name that line, or have a line of its own: a line named by several \
+             fields changes for each of them when it is changed in the talk table editor.",
+        );
+                let foot = crate::widgets::Foot::new()
+                    .check("Always do this", on, Some(tip))
+                    .main(format!("Use Line {}", ask.row), true)
+                    .tip("The field names the line the table has")
+                    .button("Add a Line", true)
+                    .tip("A new line with the same text")
+                    .leave("Keep in the File")
+                    .tip("The text is the field's own, as Aurora writes it");
+                ((), foot)
+            })
+            .1
+        });
+    let (stop, pressed) = (modal.should_close(), modal.inner);
+    let always = crate::widgets::always_kept(ctx, always_id, pressed.checked);
+    if pressed.main() {
+        answer = Some(Answer::Use(ask.row));
+    } else if pressed.clicked("Add a Line") {
+        answer = Some(Answer::Add);
+    } else if pressed.cancelled() {
+        answer = Some(Answer::File);
+    }
+    // (Always so: Options › Language's choice, from now on.)
+    if always && let Some(a) = answer {
+        app.settings.talk_reuse = match a {
+            Answer::Use(_) => TalkReuse::Use,
+            Answer::Add => TalkReuse::Add,
+            Answer::File => TalkReuse::File,
+        };
+    }
+    if escape || stop {
+        answer = answer.or(Some(Answer::File));
+    }
+    if let Some(answer) = answer {
+        app.typed.ask = None;
+        let mut answers = ask.answers;
+        answers.push((ask.text, answer));
+        app.actions.push(Action::ApplyTypedWith(ask.cmd, answers));
+        // (Then those typed while it was asked, each asked about in its
+        // turn where the table has its text.)
+        for (cmd, answers) in std::mem::take(&mut app.typed.waiting) {
+            app.actions.push(Action::ApplyTypedWith(cmd, answers));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mg_module::{Module, ModuleLocation};
+
+    /// The lines of the project's `[talk] map` are read once and kept
+    /// while the file is as it was (Module Properties read and parsed it
+    /// twice a frame: the review of November 2026, D25), read again when
+    /// it changes, and none where the project names no map.
+    #[test]
+    fn the_talk_map_s_lines_are_kept_while_its_file_is_as_it_was() {
+        let dir = mg_testkit::scratch_dir("ui-talk-map-kept").join("project");
+        Module::new().save_as(&ModuleLocation::Folder(dir.clone())).unwrap();
+        std::fs::write(dir.join("moonglow.toml"), "[talk]\nmap = \"lines.json\"\n").unwrap();
+        let map = |lines: &str| {
+            format!("{{\"version\": 1, \"lines\": {{{lines}}}, \"retired\": {{\"old\": 7}}}}")
+        };
+        std::fs::write(dir.join("lines.json"), map("\"a\": 3")).unwrap();
+        let mut app = Moonglow::new(None, Box::new(crate::NoDialogs::default()));
+        app.open_module(&dir);
+        let first = map_lines(&app).unwrap();
+        assert_eq!(first.iter().copied().collect::<Vec<u32>>(), [3, 7], "in use and retired");
+        let again = map_lines(&app).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &again), "kept: not read again");
+        // Changed (another line: another size): read again.
+        std::fs::write(dir.join("lines.json"), map("\"a\": 3, \"b\": 12")).unwrap();
+        let next = map_lines(&app).unwrap();
+        assert_eq!(next.iter().copied().collect::<Vec<u32>>(), [3, 7, 12]);
+        // One that does not read is said, and gone is none.
+        std::fs::write(dir.join("lines.json"), "not a map").unwrap();
+        assert!(map_lines(&app).is_err());
+        std::fs::remove_file(dir.join("lines.json")).unwrap();
+        assert!(map_lines(&app).unwrap().is_empty());
+        // No map named: none, and nothing kept.
+        std::fs::write(dir.join("moonglow.toml"), "").unwrap();
+        app.reload_project_files();
+        assert!(map_lines(&app).unwrap().is_empty());
+        assert!(app.typed.map.borrow().is_none());
+    }
+
+    /// Where the next typed line goes and how many are left ([`room`]) is
+    /// what a look through the range finds, kept while the table, the
+    /// range, the map and the lines held are as they were, and worked out
+    /// again when one of them changes (the walk ran every frame Module
+    /// Properties › Custom Content showed: what the first pass left of
+    /// the review's D25).
+    #[test]
+    fn the_room_left_for_typed_lines_is_kept_until_something_changes() {
+        use mg_module::talk::{Line, Table};
+        let dir = mg_testkit::scratch_dir("ui-talk-room").join("project");
+        Module::new().save_as(&ModuleLocation::Folder(dir.clone())).unwrap();
+        let toml = |lines: &str| format!("[talk]\nlines = \"{lines}\"\nmap = \"lines.json\"\n");
+        std::fs::write(dir.join("moonglow.toml"), toml("10-19")).unwrap();
+        let map = |line: u32| format!("{{\"version\": 1, \"lines\": {{\"a\": {line}}}}}");
+        std::fs::write(dir.join("lines.json"), map(10)).unwrap();
+        let mut app = Moonglow::new(None, Box::new(crate::NoDialogs::default()));
+        app.open_module(&dir);
+        assert_eq!(room(&app), None, "no table open");
+        let line = |text: &str| Line {
+            text: text.into(),
+            feminine: None,
+            sound: String::new(),
+            sound_length: 0.0,
+        };
+        app.talk = Some(Table::create("talk", &dir, mg_core::Language::ENGLISH, false));
+        // As a look finds it, each time.
+        let look = |app: &Moonglow| -> Room {
+            let t = app.talk.as_ref().unwrap();
+            let allowed = app.ws.as_ref().unwrap().module.project_file.talk_allowed();
+            let map = map_lines(app).unwrap_or_default();
+            let len = t.len() as u32;
+            (
+                next_line(app, t),
+                talk_range::free_lines(&allowed, len, |l| t.is_blank(l as usize), &map),
+            )
+        };
+        let kept = |app: &Moonglow| app.typed.room.borrow().as_ref().map(|(of, _)| of.0);
+        // (Line 10 is the map's.)
+        assert_eq!(room(&app), Some((Ok(11), Some((9, 10)))));
+        assert_eq!(room(&app), Some(look(&app)));
+        let first = kept(&app);
+        assert_eq!(room(&app), Some(look(&app)));
+        assert_eq!(kept(&app), first, "kept: not worked out again");
+        // A line of the table set: worked out again.
+        app.talk.as_mut().unwrap().put_line(11, &line("Typed")).unwrap();
+        assert_eq!(room(&app), Some((Ok(12), Some((8, 10)))));
+        assert_eq!(room(&app), Some(look(&app)));
+        assert_ne!(kept(&app), first);
+        // Taken back by the table's Undo.
+        app.talk.as_mut().unwrap().undo();
+        assert_eq!(room(&app), Some((Ok(11), Some((9, 10)))));
+        // The map changed (another line of the range its own, a longer file).
+        std::fs::write(dir.join("lines.json"), map(11).replace("\"a\"", "\"another\"")).unwrap();
+        assert_eq!(room(&app), Some(look(&app)));
+        assert_eq!(room(&app).unwrap().0, Ok(10));
+        // The range changed.
+        std::fs::write(dir.join("moonglow.toml"), toml("30-31")).unwrap();
+        app.reload_project_files();
+        assert_eq!(room(&app), Some((Ok(30), Some((2, 2)))));
+        assert_eq!(room(&app), Some(look(&app)));
+        // Another table: its own lines.
+        let mut other = Table::create("talk", &dir, mg_core::Language::ENGLISH, false);
+        other.put_line(30, &line("There")).unwrap();
+        other.put_line(31, &line("And there")).unwrap();
+        app.talk = Some(other);
+        assert_eq!(room(&app), Some(look(&app)));
+        assert!(room(&app).unwrap().0.is_err(), "the range is full");
+    }
+
+    /// Edit Areas Together's Cancel All made its steps one (ruling 66):
+    /// their typed lines go with the one step, and the lines of steps
+    /// undone above them are redone that much lower.
+    #[test]
+    fn steps_made_one_keep_their_typed_lines_and_redo_lands_lower() {
+        let dir = mg_testkit::scratch_dir("ui-typed-joined");
+        let mut t = Table::create("mg_joined", &dir, Language::ENGLISH, false);
+        let mut typed = |row: usize| {
+            let text = format!("line {row}");
+            let line = Line { text, feminine: None, sound: String::new(), sound_length: 0.0 };
+            vec![t.put_typed(row, &line).unwrap()]
+        };
+        let mut s = TypedState {
+            undo: vec![(1, typed(1)), (3, typed(3)), (4, typed(4))],
+            redo: vec![(6, typed(6)), (5, typed(5))],
+            ..Default::default()
+        };
+        // (Steps 2 to 4, the history 4 deep, made one: at depth 2.)
+        s.joined(3, 4);
+        let rows = |v: &[(usize, Vec<Typed>)]| -> Vec<(usize, Vec<usize>)> {
+            v.iter().map(|(d, t)| (*d, t.iter().map(|t| t.row).collect())).collect()
+        };
+        assert_eq!(rows(&s.undo), [(1, vec![1]), (2, vec![3, 4])], "the lines with the one step");
+        assert_eq!(rows(&s.redo), [(4, vec![6]), (3, vec![5])], "redone two lower");
+    }
+}

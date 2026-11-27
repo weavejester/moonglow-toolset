@@ -4,6 +4,12 @@
 //! area's grid with its first row at the bottom (south). The game client
 //! draws the same (`tests/client_minimap.rs`). A tile without a picture is
 //! black, as on the game's map.
+//!
+//! Map notes ([`map_notes`], [`mark`]) are marked as the game's map marks
+//! them: an enabled one (`HasMapNote` and `MapNoteEnabled`) by the GUI
+//! model `ctl_map_pin`'s picture, centered on the waypoint, a disabled one
+//! not at all. The game's map draws no text of the note, so none is drawn
+//! (`client_minimap`'s `map_notes_are_marked_as_the_client_marks_them`).
 
 use mg_core::{ResRef, ResType};
 use mg_gff::Struct;
@@ -14,6 +20,33 @@ use mg_set::Tileset;
 /// The pixels one tile takes when not asked: the largest picture's, within
 /// these bounds.
 const SIZE: (u32, u32) = (16, 256);
+
+/// The most tiles an area's side is taken to have (the game's own limit is
+/// 32; `doctor::tile_seams` reads as many).
+const MAX_TILES: u32 = 1024;
+
+/// The most pixels a minimap's side has: 32 tiles at the largest tile
+/// asked for (1024).
+const MAX_PIXELS: u32 = 32 * 1024;
+/// The most RGBA bytes a minimap takes (256 MiB, 67,108,864 pixels): the
+/// game's largest area, 32 by 32 tiles, at the largest tile a picture is
+/// taken at unasked (256), or at 1024 a tile an area of 8 by 8. (32 by 32
+/// at 1024 was 4 GiB to hold.) The command line's `--size` and the
+/// manual say so.
+const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A picture of `w` by `h` pixels, if a minimap may be that large
+/// ([`MAX_PIXELS`] a side, [`MAX_BYTES`] of RGBA).
+fn fits(w: u64, h: u64) -> Result<(u32, u32), String> {
+    if w > u64::from(MAX_PIXELS) || h > u64::from(MAX_PIXELS) || w * h * 4 > MAX_BYTES {
+        return Err(format!(
+            "the picture would be {w} by {h} pixels: {MAX_PIXELS} a side and {} pixels (256 MiB) \
+             at most",
+            MAX_BYTES / 4
+        ));
+    }
+    Ok((w as u32, h as u32))
+}
 
 /// A tile's picture, as RGBA (rows bottom first).
 fn picture(rm: &ResMan, name: &str) -> Option<Rgba> {
@@ -54,10 +87,13 @@ pub fn minimap(
 ) -> Result<Rgba, String> {
     let width = are.integer("Width").ok_or("the area has no width")?;
     let height = are.integer("Height").ok_or("the area has no height")?;
-    let (width, height) = (
-        u32::try_from(width).map_err(|_| "bad width")?,
-        u32::try_from(height).map_err(|_| "bad height")?,
-    );
+    // Nothing is sized or divided by what the file claims before this: the
+    // game's own areas are 32 tiles a side at most.
+    let side = |v: i64, what: &str| match u32::try_from(v) {
+        Ok(v) if (1..=MAX_TILES).contains(&v) => Ok(v),
+        _ => Err(format!("the area's {what} is {v}: an area is 1 to {MAX_TILES} tiles a side")),
+    };
+    let (width, height) = (side(width, "width")?, side(height, "height")?);
     let tiles = match are.get("Tile_List") {
         Some(mg_gff::Value::List(l)) => l.as_slice(),
         _ => &[],
@@ -86,7 +122,8 @@ pub fn minimap(
     if size == 0 || size > 1024 {
         return Err("a tile is 1 to 1024 pixels".into());
     }
-    let mut out = Rgba::new(width * size, height * size);
+    let (w, h) = fits(u64::from(width) * u64::from(size), u64::from(height) * u64::from(size))?;
+    let mut out = Rgba::new(w, h);
     for px in out.data.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
@@ -95,11 +132,182 @@ pub fn minimap(
         if row >= height {
             break;
         }
-        if let Some(image) = image {
+        if let Some(image) = image.as_ref().filter(|p| p.width > 0 && p.height > 0) {
             place(&mut out, (col * size, row * size), size, image, *turns);
         }
     }
     Ok(out)
+}
+
+/// The pixels a tile takes on the game's map: its minimap pictures' size,
+/// by which the map note's marker is sized.
+const MAP_TILE: f32 = 16.0;
+
+/// The pixels of a GUI model's unit.
+const GUI_UNIT: f32 = 100.0;
+
+/// The marker the game's map draws for a map note: the picture of the GUI
+/// model `ctl_map_pin` (its mesh's part of its texture, rows bottom first),
+/// its size and where its middle is from the note, in the pixels of the
+/// game's map (a tile 16 of them; y up).
+#[derive(Debug, Clone)]
+pub struct Pin {
+    pub image: Rgba,
+    pub size: [f32; 2],
+    pub offset: [f32; 2],
+}
+
+/// The map note's marker, from the game data (a hak's `ctl_map_pin` or
+/// its texture over the game's).
+pub fn pin(rm: &ResMan) -> Result<Pin, String> {
+    let name = ResRef::from_str("ctl_map_pin").map_err(|e| e.to_string())?;
+    let data = rm.get(&mg_resman::ResKey::new(name, ResType::MDL)).map_err(|e| e.to_string())?;
+    let model = mg_mdl::Model::read(&data).map_err(|e| format!("ctl_map_pin.mdl: {e}"))?;
+    let (node, mesh, texture) = (model.nodes.iter())
+        .find_map(|n| {
+            let m = n.mesh()?;
+            let t = m.textures[0].clone().filter(|t| !t.eq_ignore_ascii_case("null"))?;
+            (!m.vertices.is_empty() && !m.uvs[0].is_empty()).then_some((n, m, t))
+        })
+        .ok_or("ctl_map_pin.mdl has no textured mesh")?;
+    let bounds = |points: &mut dyn Iterator<Item = [f32; 2]>| {
+        points.fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, [x, y]| {
+            [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)]
+        })
+    };
+    let [x0, y0, x1, y1] = bounds(&mut mesh.vertices.iter().map(|v| [v[0], v[1]]));
+    let [u0, v0, u1, v1] = bounds(&mut mesh.uvs[0].iter().copied());
+    let texture = picture(rm, &texture).ok_or_else(|| format!("{texture}: not found"))?;
+    // The texels the mesh shows (v counted from the bottom, as the rows).
+    let (w, h) = (texture.width as f32, texture.height as f32);
+    let cols = ((u0 * w).round().max(0.0) as u32, ((u1 * w).round() as u32).min(texture.width));
+    let rows = ((v0 * h).round().max(0.0) as u32, ((v1 * h).round() as u32).min(texture.height));
+    if cols.1 <= cols.0 || rows.1 <= rows.0 {
+        return Err("ctl_map_pin.mdl shows none of its texture".into());
+    }
+    let mut image = Rgba::new(cols.1 - cols.0, rows.1 - rows.0);
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let px = texture.pixel(cols.0 + x, rows.0 + y);
+            let i = (y as usize * image.width as usize + x as usize) * 4;
+            image.data[i..i + 4].copy_from_slice(&px);
+        }
+    }
+    let size = [(x1 - x0) * GUI_UNIT, (y1 - y0) * GUI_UNIT];
+    let offset = [
+        (node.position[0] + (x0 + x1) / 2.0) * GUI_UNIT,
+        (node.position[1] + (y0 + y1) / 2.0) * GUI_UNIT,
+    ];
+    Ok(Pin { image, size, offset })
+}
+
+/// A map note the game's map marks: where (meters) and what it says.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapNote {
+    pub tag: String,
+    pub text: String,
+    pub position: [f32; 2],
+}
+
+/// The map notes the game's map shows of an area (its GIT's root): its
+/// waypoints with a map note that is enabled, in their order; `language`'s
+/// text of the note, or its first, in the module's `codepage`.
+pub fn map_notes(
+    git: &Struct,
+    language: mg_core::Language,
+    codepage: mg_core::Codepage,
+) -> Vec<MapNote> {
+    let Some(mg_gff::Value::List(waypoints)) = git.get("WaypointList") else { return Vec::new() };
+    let on = |w: &Struct, label: &str| w.integer(label).is_some_and(|v| v != 0);
+    (waypoints.iter())
+        .filter(|w| on(w, "HasMapNote") && on(w, "MapNoteEnabled"))
+        .filter_map(|w| {
+            let x = w.float("XPosition")?;
+            let y = w.float("YPosition")?;
+            let text = (w.locstring("MapNote"))
+                .and_then(|l| {
+                    l.get(language, mg_core::Gender::Male)
+                        .or_else(|| l.strings.first().map(|(_, t)| t.as_slice()))
+                })
+                .map(|t| codepage.decode(t).into_owned())
+                .unwrap_or_default();
+            let tag = w.string("Tag").map(|t| codepage.decode(t).into_owned());
+            Some(MapNote { tag: tag.unwrap_or_default(), text, position: [x, y] })
+        })
+        .collect()
+}
+
+/// Marks `notes` on a minimap (as [`minimap`] made it, `tile` pixels a
+/// tile) with `pin`, sized as on the game's map (a tile 16 pixels there)
+/// and laid over the map by its transparency; one partly off the map is
+/// cut at its edge. Where in the picture each note's middle is (pixels
+/// from the left and from the top, as a PNG's).
+pub fn mark(image: &mut Rgba, tile: u32, notes: &[MapNote], pin: &Pin) -> Vec<[f32; 2]> {
+    let scale = tile as f32 / MAP_TILE;
+    let (pw, ph) = (pin.size[0] * scale, pin.size[1] * scale);
+    let mut middles = Vec::new();
+    for note in notes {
+        // Meters to pixels: a tile is 10 meters, the first row south.
+        let cx = note.position[0] / 10.0 * tile as f32 + pin.offset[0] * scale;
+        let cy = note.position[1] / 10.0 * tile as f32 + pin.offset[1] * scale;
+        middles.push([cx, image.height as f32 - cy]);
+        let (left, bottom) = (cx - pw / 2.0, cy - ph / 2.0);
+        let xs =
+            left.floor().max(0.0) as u32..((left + pw).ceil().max(0.0) as u32).min(image.width);
+        let ys = bottom.floor().max(0.0) as u32
+            ..((bottom + ph).ceil().max(0.0) as u32).min(image.height);
+        for y in ys {
+            for x in xs.clone() {
+                // The pin's texel under this pixel's middle (nearest).
+                let u = (x as f32 + 0.5 - left) / pw;
+                let v = (y as f32 + 0.5 - bottom) / ph;
+                if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                    continue;
+                }
+                let sx = ((u * pin.image.width as f32) as u32).min(pin.image.width - 1);
+                let sy = ((v * pin.image.height as f32) as u32).min(pin.image.height - 1);
+                let src = pin.image.pixel(sx, sy);
+                let a = u32::from(src[3]);
+                let i = (y as usize * image.width as usize + x as usize) * 4;
+                for (d, s) in image.data[i..i + 3].iter_mut().zip(src) {
+                    *d = ((u32::from(s) * a + u32::from(*d) * (255 - a) + 127) / 255) as u8;
+                }
+            }
+        }
+    }
+    middles
+}
+
+/// An area's minimap as [`draw`] makes it: the picture, and the map notes
+/// marked on it, each with where its middle is (pixels from the left and
+/// the top).
+#[derive(Debug, Clone)]
+pub struct Drawn {
+    pub image: Rgba,
+    pub notes: Vec<(MapNote, [f32; 2])>,
+}
+
+/// An area's minimap (its ARE's root), `tile` pixels a tile (or its
+/// pictures' size), and, given its GIT's root, its map notes marked as the
+/// game's map marks them (their text in the module's `codepage`).
+pub fn draw(
+    rm: &ResMan,
+    are: &Struct,
+    git: Option<&Struct>,
+    tile: Option<u32>,
+    codepage: mg_core::Codepage,
+) -> Result<Drawn, String> {
+    let set = tileset(rm, are)?;
+    let mut image = minimap(rm, are, &set, tile)?;
+    let Some(git) = git else { return Ok(Drawn { image, notes: Vec::new() }) };
+    let notes = map_notes(git, mg_core::Language::ENGLISH, codepage);
+    if notes.is_empty() {
+        return Ok(Drawn { image, notes: Vec::new() });
+    }
+    let width = are.integer("Width").and_then(|w| u32::try_from(w).ok()).unwrap_or(1).max(1);
+    let size = image.width / width;
+    let middles = mark(&mut image, size, &notes, &pin(rm)?);
+    Ok(Drawn { image, notes: notes.into_iter().zip(middles).collect() })
 }
 
 /// The tileset an ARE names, from the game data.
@@ -111,14 +319,7 @@ pub fn tileset(rm: &ResMan, are: &Struct) -> Result<Tileset, String> {
 
 /// A picture as a PNG (top row first, as PNGs are).
 pub fn png(image: &Rgba) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    let mut enc = png::Encoder::new(&mut out, image.width, image.height);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut w = enc.write_header().map_err(|e| e.to_string())?;
-    w.write_image_data(&image.top_down().data).map_err(|e| e.to_string())?;
-    w.finish().map_err(|e| e.to_string())?;
-    Ok(out)
+    mg_image::png::write_rgba(image.width, image.height, &image.top_down().data)
 }
 
 #[cfg(test)]
@@ -156,5 +357,135 @@ mod tests {
         assert_eq!(big.pixel(3, 3), [255, 255, 255, 255]);
         let png = png(&big).unwrap();
         assert_eq!(&png[1..4], b"PNG");
+    }
+
+    /// An ARE's root of `width` by one tiles, with one tile.
+    fn area(width: i32) -> Struct {
+        let mut are = Struct::new(0);
+        are.set("Width", mg_gff::Value::Int(width));
+        are.set("Height", mg_gff::Value::Int(1));
+        let mut tile = Struct::new(1);
+        tile.set("Tile_ID", mg_gff::Value::Int(0));
+        are.set("Tile_List", mg_gff::Value::List(vec![tile]));
+        are
+    }
+
+    /// An area whose ARE claims no width, or one no area has, is refused
+    /// before anything is divided or sized by it (the review's V1: Width 0
+    /// divided by zero, Width 70000 asked for the memory of such a picture).
+    #[test]
+    fn a_width_no_area_has_is_refused() {
+        let rm = ResMan::new();
+        let set = Tileset::parse(b"[GENERAL]\r\nName=none\r\n", Default::default()).unwrap();
+        for width in [0, 70000] {
+            let err = minimap(&rm, &area(width), &set, None).unwrap_err();
+            assert!(err.contains("width"), "{width}: {err}");
+        }
+        let mut flat = area(1);
+        flat.set("Height", mg_gff::Value::Int(0));
+        assert!(minimap(&rm, &flat, &set, None).unwrap_err().contains("height"));
+        // A picture too large for its tiles' size is refused too.
+        let err = minimap(&rm, &area(1024), &set, Some(1024)).unwrap_err();
+        assert!(err.contains("pixels"), "{err}");
+        // Maps past 256 MiB of RGBA are refused.
+        let square = |side: i32| {
+            let mut sq = area(side);
+            sq.set("Height", mg_gff::Value::Int(side));
+            sq
+        };
+        let err = minimap(&rm, &square(32), &set, Some(1024)).unwrap_err();
+        assert!(err.contains("256 MiB"), "{err}");
+        let err = minimap(&rm, &square(512), &set, Some(64)).unwrap_err();
+        assert!(err.contains("256 MiB"), "{err}");
+        // One the game could hold is drawn: black where a tile has no picture.
+        let map = minimap(&rm, &area(2), &set, Some(4)).unwrap();
+        assert_eq!((map.width, map.height), (8, 4));
+        assert_eq!(map.pixel(0, 0), [0, 0, 0, 255]);
+    }
+
+    /// A minimap is at most 32,768 pixels a side and 256 MiB of RGBA: the
+    /// sizes the manual gives fit (the game's largest area at the largest
+    /// tile taken unasked, a tile of 1024 in an area of 8, a long thin
+    /// one), a pixel more a side or in all does not. (Checked by the sums
+    /// alone: drawing them took 640 MiB.)
+    #[test]
+    fn a_minimap_fits_in_256_mib_and_32768_pixels_a_side() {
+        for (w, h) in [(32 * 256, 32 * 256), (8 * 1024, 8 * 1024), (32 * 1024, 1024), (32768, 2048)]
+        {
+            assert_eq!(fits(w, h), Ok((w as u32, h as u32)), "{w} by {h}");
+        }
+        for (w, h) in [(8192, 8193), (32769, 1), (1, 32769), (32768, 2049), (32 * 1024, 32 * 1024)]
+        {
+            let err = fits(w, h).unwrap_err();
+            assert!(err.contains("256 MiB"), "{w} by {h}: {err}");
+        }
+    }
+
+    /// A waypoint at `at` (meters) with a map note, enabled or not, or none.
+    fn waypoint(tag: &str, at: [f32; 2], note: Option<(bool, &str)>) -> Struct {
+        let mut w = crate::instances::walk_waypoint(tag.as_bytes(), [at[0], at[1], 0.0]);
+        if let Some((enabled, text)) = note {
+            w.set("HasMapNote", mg_gff::Value::Byte(1));
+            w.set("MapNoteEnabled", mg_gff::Value::Byte(u8::from(enabled)));
+            let mut l = mg_core::LocString::default();
+            l.set(mg_core::Language::ENGLISH, mg_core::Gender::Male, text);
+            w.set("MapNote", mg_gff::Value::LocString(l));
+        }
+        w
+    }
+
+    /// The map notes the game's map shows: the enabled ones alone (as the
+    /// client's map showed four waypoints: `client_minimap`'s
+    /// `map_notes_are_marked_as_the_client_marks_them`), with their text and
+    /// where they are.
+    #[test]
+    fn the_enabled_map_notes_are_the_ones_shown() {
+        let mut git = Struct::new(0);
+        let list = vec![
+            waypoint("ALPHA", [5.0, 25.0], Some((true, "Alpha note"))),
+            waypoint("BETA", [25.0, 25.0], Some((false, "Beta note"))),
+            waypoint("GAMMA", [35.0, 5.0], None),
+            waypoint("DELTA", [32.0, 12.0], Some((true, "Delta note"))),
+        ];
+        git.set("WaypointList", mg_gff::Value::List(list));
+        let notes = map_notes(&git, mg_core::Language::ENGLISH, mg_core::Codepage::default());
+        let found: Vec<_> = notes.iter().map(|n| (n.tag.as_str(), n.text.as_str())).collect();
+        assert_eq!(found, [("ALPHA", "Alpha note"), ("DELTA", "Delta note")]);
+        assert_eq!(notes[1].position, [32.0, 12.0]);
+        assert!(
+            map_notes(&Struct::new(0), mg_core::Language::ENGLISH, Default::default()).is_empty()
+        );
+    }
+
+    /// A note is marked by the pin centered on it, sized as on the game's
+    /// map (12 of its 16 pixels a tile: 24 at 32), laid over by the pin's
+    /// transparency; one at the map's edge is cut there.
+    #[test]
+    fn a_note_is_marked_by_the_pin_centered_on_it() {
+        // A 2×2 pin, opaque red but for a clear top right.
+        let mut image = Rgba::new(2, 2);
+        for (i, px) in image.data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *px = if i == 3 { [0, 0, 0, 0] } else { [255, 0, 0, 255] };
+        }
+        let pin = Pin { image, size: [12.0, 12.0], offset: [0.0, 0.0] };
+        // A 2×1 area at 32 pixels a tile, gray.
+        let mut map = Rgba::new(64, 32);
+        for px in map.data.as_chunks_mut::<4>().0 {
+            *px = [100, 100, 100, 255];
+        }
+        let note = |x, y| MapNote { tag: String::new(), text: String::new(), position: [x, y] };
+        let middles = mark(&mut map, 32, &[note(10.0, 5.0), note(0.0, 0.0)], &pin);
+        // 10 m east, 5 m north: (32, 16) from the bottom left, (32, 16)
+        // from the top left too (the map is 32 high).
+        assert_eq!(middles, [[32.0, 16.0], [0.0, 32.0]]);
+        // 24 pixels: from 20 to 44 across and up.
+        assert_eq!(map.pixel(20, 4), [255, 0, 0, 255], "bottom left");
+        assert_eq!(map.pixel(19, 16), [100, 100, 100, 255], "left of it");
+        assert_eq!(map.pixel(43, 10), [255, 0, 0, 255], "the bottom right quarter");
+        assert_eq!(map.pixel(43, 27), [100, 100, 100, 255], "the clear quarter");
+        assert_eq!(map.pixel(44, 16), [100, 100, 100, 255], "right of it");
+        // The one at the corner: its top right quarter alone, on the map.
+        assert_eq!(map.pixel(0, 0), [100, 100, 100, 255], "its clear quarter");
+        assert_eq!(map.pixel(13, 13), [100, 100, 100, 255], "past it");
     }
 }

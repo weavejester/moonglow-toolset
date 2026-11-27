@@ -207,6 +207,50 @@ fn rename_renames_a_window_and_builds_it_under_its_new_name() {
     assert_eq!(again["resources"], json!([]), "{again}");
 }
 
+/// A script that opens the window and does not compile under the new
+/// name: the window is renamed, built and saved all the same, the script
+/// is printed, and the command
+/// fails, as `mg nui generate` does (it exited 0, and a pipeline went on
+/// with a module of old scripts).
+#[test]
+fn a_rename_fails_when_a_script_that_opens_the_window_does_not_compile() {
+    let root = mg_testkit::corpus!();
+    let path = module("mg-nui-rename-bad-caller");
+    let p = path.to_str().unwrap();
+    assert!(mg(None, &["new", p, "shop"]).0);
+    let mut m = Module::open(&path).unwrap();
+    m.set(
+        key("my_enter.nss"),
+        b"#include \"shop_o\"\nvoid main() { Open_shop(GetEnteringObject()); }\n".to_vec(),
+    );
+    m.save().unwrap();
+    assert!(mg(Some(&root), &["generate", p, "shop"]).0);
+    let mut m = Module::open(&path).unwrap();
+    m.set(
+        key("my_broken.nss"),
+        b"#include \"shop_o\"\nvoid main() { Open_shop(NoSuchFunction()); }\n".to_vec(),
+    );
+    m.set(key("my_broken.ncs"), b"NCS as it was".to_vec());
+    m.save().unwrap();
+    let (ok, renamed) = crate::quiet_json_out(&mut command(
+        Some(&root),
+        &["--json", "rename", p, "shop.jui", "store"],
+    ));
+    assert!(!ok, "{renamed}");
+    assert_eq!((&renamed["built"], &renamed["compiled"]["failed"]), (&json!(true), &json!(1)));
+    assert_eq!(renamed["compiled"]["errors"][0]["script"], "my_broken", "{renamed}");
+    let m = Module::open(&path).unwrap();
+    for name in ["store.jui", "store_o.nss", "store_e.ncs", "my_enter.ncs"] {
+        assert!(m.contains(&key(name)), "{name}");
+    }
+    assert!(!m.contains(&key("shop.jui")), "renamed and saved all the same");
+    // (Its compiled script was of its text before the rename: gone, as
+    // a rename leaves no compiled script of another text.)
+    assert!(!m.contains(&key("my_broken.ncs")));
+    let broken = String::from_utf8_lossy(m.get(&key("my_broken.nss")).unwrap()).into_owned();
+    assert!(broken.contains("#include \"store_o\""), "{broken}");
+}
+
 #[test]
 fn a_second_generate_changes_nothing() {
     let root = mg_testkit::corpus!();
@@ -311,9 +355,10 @@ fn a_script_that_includes_the_opener_and_fails_is_printed_and_the_window_is_buil
         b"#include \"shop_o\"\nvoid main() { Open_shop(GetEnteringObject()); }\n".to_vec(),
     );
     m.save().unwrap();
-    // As `mg compile` does of a script that fails: said, the rest saved.
+    // As `mg compile` does of a script that fails: said, the rest saved,
+    // and the exit a failure, so that a pipeline stops there.
     let (ok, made) = mg(Some(&root), &["generate", p, "shop"]);
-    assert!(ok, "{made}");
+    assert!(!ok, "{made}");
     assert_eq!((&made["saved"], &made["failed"]), (&json!(true), &json!(1)), "{made}");
     assert_eq!(made["errors"][0]["script"], "my_broken", "{made}");
     let resources = made["resources"].as_array().unwrap();
@@ -324,9 +369,18 @@ fn a_script_that_includes_the_opener_and_fails_is_printed_and_the_window_is_buil
     assert_eq!(m.get(&key("my_broken.ncs")).unwrap(), b"NCS as it was");
     // For people: the compiler's line on standard output.
     let out = output(Some(&root), &["nui", "generate", p, "shop", "--dry-run"]);
-    assert!(out.status.success());
+    assert!(!out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.lines().any(|l| l.starts_with("my_broken.nss(")), "{text}");
+    // Once it compiles: a success.
+    let mut m = Module::open(&path).unwrap();
+    m.set(
+        key("my_broken.nss"),
+        b"#include \"shop_o\"\nvoid main() { Open_shop(OBJECT_SELF); }\n".to_vec(),
+    );
+    m.save().unwrap();
+    let (ok, made) = mg(Some(&root), &["generate", p, "shop"]);
+    assert!(ok && made["failed"] == 0, "{made}");
 }
 
 /// What `mg nui generate` compiled, `mg compile` passes over: both keep
@@ -564,9 +618,27 @@ fn schema_prints_the_settings_form_and_the_controls() {
     assert_eq!(layout["window"]["version"], 1);
 }
 
+/// `mg nui import` on a `.mod` with its module folder beside it says, as
+/// every other command does, that it is the `.mod` it reads and changes
+/// (it opened the module its own way, and said nothing).
+#[test]
+fn import_says_a_module_folder_beside_the_mod() {
+    let jui = crier_files("mg-nui-import-beside-files");
+    let path = module("mg-nui-import-beside");
+    let folder = path.with_file_name("Keep");
+    Module::open(&path).unwrap().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
+    let (p, j) = (path.to_str().unwrap(), jui.to_str().unwrap());
+    let out = output(None, &["nui", "import", p, j]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("has its module folder beside it"), "{said}");
+    assert!(Module::open(&path).unwrap().contains(&key("crier.jui")));
+    assert!(!Module::open(&folder).unwrap().contains(&key("crier.jui")), "the folder is left");
+}
+
 /// The town crier's window (`crates/mg-nui/tests/data`), as files in a
 /// scratch folder of its own: `crier.jui` and `crier.txt`.
-fn crier_files(test: &str) -> PathBuf {
+pub(crate) fn crier_files(test: &str) -> PathBuf {
     window_files(test, "crier")
 }
 

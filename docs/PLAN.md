@@ -3,7 +3,7 @@ type: Reference
 title: 'Moonglow Toolset: Architecture and Record of the Phases'
 description: What Moonglow Toolset reproduces of Aurora, the landscape, its principles, crate architecture and key designs, a record of the phases it was built in with the tests that hold each, the testing strategy and licensing. The plan it began as, kept as the description of what was built.
 tags: [architecture, testing, parity, phases, plan]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-11-01T22:59:13Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-19T14:00:00Z }
 ---
 
 # Moonglow Toolset: Architecture and Record of the Phases
@@ -126,7 +126,7 @@ alternatives are GPL, LGPL or incomplete; §8).
 ## 4. Architecture
 
 A Cargo workspace, layered bottom-up. A crate may only depend on crates above it
-in this list (test code may also use `mg-testkit`). All of these exist.
+in this list (test code may also use `mg-testkit` and `mg-testkit-gpu`). All of these exist.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -138,28 +138,33 @@ in this list (test code may also use `mg-testkit`). All of these exist.
 | `mg-tlk` | TLK V3.0, custom TLK StrRefs |
 | `mg-set` | tilesets (SET/INI) with data warnings |
 | `mg-ssf` | soundsets |
-| `mg-audio` | sounds and music decoded (MP3 behind `BMU V1.0`, IMA ADPCM and PCM WAVE) for playback |
+| `mg-audio` | what a sound file holds, told from its bytes or its first bytes, and where the game plays it (`role`: the names music, ambient sounds and other sounds are looked for under and the forms played there, for the window's log and Verify); decoded for playback (the default feature `decode`, Symphonia, which mg-module leaves off): MP3 (its first frame found behind `BMU V1.0`, ID3v2 tags or junk, bare or inside a WAVE), IMA ADPCM and PCM WAVE; what is refused is named |
 | `mg-resman` | layered resolution in the engine's order, DDS/TGA rule, install detection |
 | `mg-image` | TGA, DDS (standard and BioWare, BC1–BC5), PLT and palettes, TXI, MTR (KTX: not yet) |
-| `mg-shader` | the game's own shaders (`.shd`): a program assembled as the engine does it (preamble, `#include` splicing through the load order), compiled by glslang (built in), its combined samplers split and locations given on the SPIR-V, read into a validated naga module with its uniforms, textures and varyings by name; errors at their file and line ([the shaders proposal](shaders-proposal.md), M0) |
+| `mg-shader` | the game's own shaders (`.shd`): a program assembled as the engine does it (preamble, `#include` splicing through the load order), compiled by glslang (built in), its combined samplers split and locations given on the SPIR-V, read into a validated naga module with its uniforms, textures and varyings by name, a program's uniforms checked against the std430 layout OpenGL reads (`layout`, `split_uniforms`); errors at their file and line ([the shaders proposal](shaders-proposal.md), M0) |
 | `mg-mdl` | MDL binary and ASCII, read and written; the model compiler, the linter and the outline; WOK/PWK/DWK walkmeshes |
 | `mg-schema` | typed views of IFO, ARE, GIT, GIC, UTC/UTD/UTE/UTI/UTM/UTP/UTS/UTT/UTW, DLG, JRL, FAC, ITP, PTM and PTT, generated from the observed schema |
-| `mg-rules` | 2DA/TLK-backed game data (appearance, baseitems, classes, feats, spells, skills, item properties, placeables, doors, portraits, sounds, ...); the nine types of placed object (`ObjectKind`: blueprint type, GIT list and struct id, names) |
+| `mg-rules` | 2DA/TLK-backed game data (appearance, baseitems, classes, feats, spells, skills, item properties, placeables, doors, portraits, sounds, ...); the nine types of placed object (`ObjectKind`: blueprint type, GIT list and struct id, names), where one stands (`placement`, with the Lock's field) and an area's grass (`grass`), and how a light Moonglow made is named (`lights`): what an area's scene reads, kept here below the module workspace |
 | `mg-script` | the compiler built in; NWScript lexer, outline and analysis for the editor and `mg lsp`; the `nwscript.nss` spec |
-| `mg-tiles` | the tile grid over a lattice of corners, tile fitting, and terrain painting with the SET's rules |
+| `mg-tiles` | the tile grid over a lattice of corners, tile fitting, and terrain painting with the SET's rules; a placed tile's door hooks (`door_hooks`) |
 | `mg-module` | module workspace: open/save, working copy, palettes, reference graph, verify and the content doctor, build, import/export, haks/TLK, nasher projects |
 | `mg-edit` | editor core: the undoable workspace, commands with their inverses, edits as JSON (no UI) |
 | `mg-nui` | NUI windows: the JUI document and its settings, the checks against the stock `nw_inc_nui` API and what the client does, and the generated opener and event scripts (`mg nui`; the manual's `18-nui-creator.md`) |
 | `mg-plugin` | plugins: manifests, and a sandboxed Luau runtime in which a plugin's commands and checks read a module and hand back edits and findings (the API in `docs/manual/17-plugin-api.md`; the decisions in `docs/plugin-proposal.md`) |
 | `mg-serve` | the game's headless server run on a module: private unless asked, a user directory of the caller's, its log followed, its console on a pipe (`mg serve`, `mg test`, the engine tests) |
-| `mg-render` | renderer: scene, materials and maps, EE lighting (matched to the client), offscreen mode, animation, skinning, animated and dangly meshes, particles |
-| `mg-preview` | blueprint previews: part-based and single-model creatures with equipment, wings and tails, PLT colors; items; placeables; doors (the renderer's half, `compose`, is the default feature `render`: without it, no mg-render); what a module uses of its haks, the walk from its resources (`usage`, the feature `usage`: it reads modules, with mg-module and mg-ssf; `mg` and the window turn it on, the viewer leaves it off) |
-| `mg-area` | areas as the area editor shows them: tiles with their lights and animation loops, placed objects with their previews and outlines, sun, moon and fog; the renderer's scene of an area; picking, arranging, reshaping and the walkmesh |
+| `mg-render` | renderer: scene, materials and maps, EE lighting (matched to the client), offscreen mode, animation, skinning, animated and dangly meshes, particles, the game's camera (`Camera::game`), presenting to a window (`present`: `Presenter`, `Screen`), the game's programs and the renderer's own drawn on wgpu's OpenGL back end as on the others |
+| `mg-preview` | blueprint previews: part-based and single-model creatures with equipment, wings and tails, PLT colors (a creature drawn from its looks as values, `DressedLook`, into which a blueprint is read: a game client's way in); items; placeables; doors (the renderer's half, `compose`, is the default feature `render`: without it, no mg-render); what a module uses of its haks, the walk from its resources (`usage`, the feature `usage`: it reads modules, with mg-module and mg-ssf; `mg` and the window turn it on, the viewer leaves it off) |
+| `mg-area` | areas as the area editor shows them: tiles with their lights and animation loops, placed objects with their previews and outlines, sun, moon and fog, read from an area's files or built from values (`values`); the renderer's scene of an area, its objects added, moved and taken out without building it again; picking, arranging and the walkmesh; the editing half (undoable edits, painting, reshaping, Change Tileset: mg-edit and mg-module) is the default feature `edit`, which a game client (Moonglow Client) leaves off |
+| `mg-update` | the app updating itself: the releases GitHub lists, the package each install takes, its checks against the release's `SHA256SUMS` signed with minisign, the download beside what it replaces, and the install's steps; the requests themselves (ureq) are the feature `http`, the GUI's alone ([the design](update-install-proposal.md)) |
+| `mg-uikit` | the suite's look, on egui alone so that Moonglow Viewer takes it too: the color tokens of the dark and light themes, metrics, the theme applied to egui's style, fonts, the drawn icon set and the generic form helpers ([the UI redesign](ui-redesign-proposal.md)) |
 | `mg-ui` | egui widgets and editors |
 | `apps/mg` | the command line: 44 commands (`mg --help`; the manual's `11-command-line.md`), each able to answer in JSON; `mg nui render` and `mg nui layout` (mg-ui, wgpu) are the default feature `nui-preview`, and the rest builds without the GPU stack |
 | `apps/moonglow` | the GUI application |
 
 Test support: `mg-testkit` (corpus locator, oracle tools, engine runner),
+`mg-testkit-gpu` (the GPU hold, `gpu::hold`, and the places tests take
+turns at, with no dependency: mg-testkit re-exports it, and a client of the
+crates takes it alone),
 `mg-corpus-tests` (corpus, differential and engine tests). Tools:
 `tools/aurora/` (Aurora under Wine, on the desktop or on an off-screen display driven by
 scripts; form decoder, inventory generator, wizard capture), `tools/nwclient/`
@@ -299,7 +304,7 @@ What a phase left undone is in the [deferred list](deferred.md).
 | 8 Blueprints and palettes | Standard and custom palettes, the palette pane, editors and wizards for every blueprint type, item costs as the engine computes them | `aurora_blueprints.rs`, `aurora_palette_add.rs`, `engine_blueprints.rs`, `engine_item_cost.rs`, `item_properties.rs` |
 | 9 Area editor, objects | Every shipped area opens and draws; the area viewer with Aurora's camera and selection bindings, filters, grid, placing, moving, turning, raising, copy and paste, polygons, Adjust Location, Find Instance, Area Properties, the context menu's commands, the Preview window | `areas.rs`, `aurora_instances.rs`, `engine_area_edits.rs`, `engine_facings.rs` |
 | 10 Area editor, terrain | Painting as Aurora paints (terrain, crossers, groups, heights), Resize Area and Rotate Area, tile properties, the walkmesh overlay, Area Statistics | `aurora_terrain.rs`, `engine_terrain.rs`, `tiles.rs` |
-| 11 Build, verify, test | Build Module with Aurora's options, the challenge rating calculation, Test Module (F9), Verify, Update Instances, the Levelup and Creature Wizards, creature spell and inventory warnings, sound playback, the remaining dialogs | `aurora_creatures.rs`, `aurora_levelup.rs`, `aurora_creature_wizard.rs`, `aurora_spell_warnings.rs`, `aurora_inventory.rs`, `aurora_update_instances.rs`, `audio.rs` |
+| 11 Build, verify, test | Build Module with Aurora's options, the challenge rating calculation, Test Module (F9), Verify, Update Instances, the Levelup and Creature Wizards, creature spell and inventory warnings, sound playback, the remaining dialogs | `aurora_creatures.rs`, `aurora_levelup.rs`, `aurora_creature_wizard.rs`, `aurora_spell_warnings.rs`, `aurora_inventory.rs`, `aurora_update_instances.rs`, `audio.rs`, `client_audio.rs` (by hand) |
 | 12 Hardening and release | Recovery copies of unsaved work and crash reports; performance budgets on the largest campaigns; packages (AppImage, Flatpak, Windows installer, macOS disk image, built by `.github/workflows/release.yml` on every `v*` tag); the user manual (17 chapters, also in the application) | `crates/mg-ui/src/recovery.rs`, `crates/mg-ui/tests/campaign_perf.rs` (by hand), `packaging/`, `docs/manual/` |
 
 Parity itself is tracked row by row in `docs/parity/checklists.md`: each row
@@ -308,8 +313,9 @@ gaps against the original scope: the Plot Wizard is not built; spell
 checking is left out (EE ships no lexicon, and Aurora's finds nothing);
 the Conversation Editor's Scrap tab is partly done. The renderer's approximations (dangly-mesh dynamics and the
 point-to-point and lightning emitters follow the wiki's descriptions, not
-measurements) and what it does not draw (creatures' and point lights'
-shadows) are in §5.5.
+measurements) are in §5.5; creatures' and point lights' shadows are drawn
+since 2026-10-28, and what is left of shadows is on the
+[deferred list](deferred.md).
 
 ### After parity
 
@@ -460,9 +466,11 @@ BioWare's own palettes contain.
 and the targets are `test = false`, so neither `cargo test` nor CI runs
 them): `campaign_perf.rs` (the three largest campaigns) and
 `world_perf.rs` (a synthetic persistent world) hold each step to a budget;
-`frame_perf.rs` (frames against 144 a second) and `editor_perf.rs` (the
-script editor on `nwscript.nss`) print timings. They need the game, and
-all but `editor_perf.rs` a GPU. Budgets are set from the first
+`frame_perf.rs` and `editor_perf.rs` (the script editor on `nwscript.nss`:
+typing, moving the cursor and the selection, scrolling, pasting) hold
+frames to 144 a second, and `editor_perf.rs` times the 2DA editor and
+Select Texture besides. They need the game, and all but `editor_perf.rs`
+a GPU. Budgets are set from the first
 measurements (three to five times them in `world_perf.rs`) and only
 tightened.
 

@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use mg_ui::{Action, Dialogs, FileKind, Moonglow, Settings};
 
 mod speakers;
-mod update_check;
 
 /// Native file dialogs.
 struct NativeDialogs;
@@ -32,6 +31,28 @@ impl Dialogs for NativeDialogs {
             d = d.add_filter("What the plugin reads", extensions).add_filter("All files", &["*"]);
         }
         d.pick_file()
+    }
+
+    fn save_file_of(
+        &mut self,
+        title: &str,
+        extension: &str,
+        suggested: Option<&Path>,
+    ) -> Option<PathBuf> {
+        let title = if title.is_empty() { FileKind::Any.title(true) } else { title };
+        let mut d = rfd::FileDialog::new().set_title(title);
+        if !extension.is_empty() {
+            d = d.add_filter("What the plugin writes", &[extension]);
+        }
+        if let Some(c) = suggested {
+            if let Some(dir) = c.parent().filter(|d| !d.as_os_str().is_empty()) {
+                d = d.set_directory(dir);
+            }
+            if let Some(name) = c.file_name() {
+                d = d.set_file_name(name.to_string_lossy());
+            }
+        }
+        d.save_file()
     }
 
     fn save_file(&mut self, kind: FileKind, suggested: Option<&Path>) -> Option<PathBuf> {
@@ -84,8 +105,24 @@ const SETTINGS_KEY: &str = "moonglow-settings";
 struct App {
     moonglow: Moonglow,
     title: String,
-    /// Where a restart asked for is left for `main` (Restart with …).
-    again: std::sync::Arc<std::sync::Mutex<Option<mg_ui::renderer_check::Relaunch>>>,
+    /// The settings' file, and the settings as this window last read or
+    /// saved them with the text it wrote: what another Moonglow saved
+    /// since is kept, but for the settings changed here ([`App::save`]).
+    settings_file: Option<std::path::PathBuf>,
+    saved: (Settings, String),
+    /// What is left for `main` once the window has closed (Restart with
+    /// …, Restart Now; an update to install).
+    again: std::sync::Arc<std::sync::Mutex<Closing>>,
+}
+
+/// What is done once the window has closed.
+#[derive(Default)]
+struct Closing {
+    /// Moonglow started again (Restart with …, an update's Restart Now).
+    relaunch: Option<mg_ui::renderer_check::Relaunch>,
+    /// An update ready, installed as Moonglow closes, and the updates'
+    /// cache folder (the installer's log, the install's report).
+    update: Option<(mg_update::Staged, std::path::PathBuf)>,
 }
 
 /// Windows: the window was last left maximized and is to be maximized
@@ -107,6 +144,23 @@ fn maximize_later(window: egui::ViewportBuilder, windows: bool) -> egui::Viewpor
     }
 }
 
+/// The window no smaller than [`mg_ui::LEAST_WINDOW_SIZE`] inside (where
+/// the Top Bar's menus fit): its least size, and a size kept from an
+/// earlier run that is smaller raised to it, side by side (eframe hands
+/// the kept size to the window as it is, which winit would make the
+/// window at). The larger side of a kept size stays. Both are in points,
+/// which egui-winit makes pixels at the zoom eframe restored (the last
+/// run's interface size); the application gives the least size again
+/// each time the interface size changes (`shell::keep_least_size`).
+fn at_least(window: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    let least = mg_ui::LEAST_WINDOW_SIZE;
+    let window = window.with_min_inner_size(least);
+    match window.inner_size {
+        Some(size) => window.with_inner_size(size.max(least)),
+        None => window,
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Closing the window asks about unsaved work like File > Exit.
@@ -122,23 +176,54 @@ impl eframe::App for App {
         }
         // (A panic keeps the unsaved work in a recovery copy first.)
         self.moonglow.recovering(|m| m.ui(ui));
+        // The device lost: the window draws nothing more, so the builder
+        // is told by a dialog of the system's (once; the log has it too).
+        if let Some(said) = self.moonglow.renderer_check.device_lost.take() {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("Moonscar Toolset")
+                .set_description(said)
+                .show();
+        }
         let title = self.moonglow.title();
         if title != self.title {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
         if self.moonglow.quit_requested {
-            if let Some(again) = self.moonglow.relaunch.take()
-                && let Ok(mut left) = self.again.lock()
-            {
-                *left = Some(again);
+            // (Each only when there is one: a frame drawn after Close is
+            // asked for finds none, and leaves what the first one left.)
+            if let Ok(mut left) = self.again.lock() {
+                if let Some(again) = self.moonglow.relaunch.take() {
+                    left.relaunch = Some(again);
+                }
+                // (An update is only ever downloaded into the cache folder.)
+                if let Some(cache) = self.moonglow.updates.cache.clone()
+                    && let Some(staged) = self.moonglow.updates.at_close()
+                {
+                    left.update = Some((staged, cache));
+                }
             }
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
+    /// Saves the settings. The file is this window's and any other
+    /// Moonglow's that runs beside it, each writing it whole: where
+    /// another has written it since this one did, the settings changed
+    /// here since then go over what is there, and the rest stay as that
+    /// window saved them (`Settings::saved_over`), where this one would
+    /// have put its own older ones back.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, SETTINGS_KEY, &self.moonglow.settings);
+        let settings = &self.moonglow.settings;
+        let there = (self.settings_file.as_deref())
+            .and_then(|f| Settings::text_in_eframe_file(f, SETTINGS_KEY));
+        let text = match there {
+            Some(there) if there != self.saved.1 => settings.saved_over(&self.saved.0, &there),
+            _ => settings.saved_text(),
+        };
+        storage.set_string(SETTINGS_KEY, text.clone());
+        self.saved = (settings.clone(), text);
     }
 }
 
@@ -165,14 +250,19 @@ fn crash_reports() {
             enabled => enabled.join(", "),
         };
         // A model that failed is left out and Moonglow carries on: the
-        // report says so, and is named apart from a crash's.
-        let carried_on = mg_ui::model_guard::guarding();
+        // report says so, and is named apart from a crash's. So a
+        // graphics check that panicked (a backend opening its device):
+        // its finding, which the check tells.
+        let checking = mg_ui::model_guard::checking();
+        let carried_on = checking || mg_ui::model_guard::guarding();
         // (A panic in a thread of its own leaves the window going: the
         // next frame keeps the unsaved work in a recovery copy.)
         if !carried_on {
             mg_ui::recovery::note_panic();
         }
-        let what = if carried_on {
+        let what = if checking {
+            "found a graphics check failing and carried on"
+        } else if carried_on {
             "could not show a model, left it out and carried on"
         } else {
             "crashed"
@@ -182,7 +272,11 @@ fn crash_reports() {
             env!("CARGO_PKG_VERSION"),
             std::backtrace::Backtrace::force_capture()
         );
-        let name = if carried_on { "model-failure" } else { "crash" };
+        let name = match (checking, carried_on) {
+            (true, _) => "graphics-check",
+            (false, true) => "model-failure",
+            (false, false) => "crash",
+        };
         let path = dir.join(format!("{name}-{time}.txt"));
         // (In the debug log too, if one is written: where it stopped.)
         mg_ui::trace::note(format!("{what}: {info} (report: {})", path.display()));
@@ -239,9 +333,16 @@ impl CommandLine {
 struct Taken {
     why: String,
     missing: Option<wgpu::Backend>,
-    /// The adapters that failed the startup check, and what they drew
-    /// wrong (to be recorded, and said).
-    failed: Vec<(wgpu::AdapterInfo, String)>,
+    /// The adapters that failed the startup check, what they drew wrong
+    /// (to be said), and whether that is the backend's doing (to be
+    /// recorded: `Probe::blames_backend`).
+    failed: Vec<(wgpu::AdapterInfo, String, bool)>,
+    /// The backends Automatic passed over as recorded.
+    passed_over: Vec<wgpu::Backend>,
+    /// The adapter taken is OpenGL's or a software one.
+    fallback: Option<mg_ui::graphics::Fallback>,
+    /// What to say of `WGPU_BACKEND`'s names that are no backend.
+    environment_unknown: Option<String>,
     /// The adapter taken failed it (kept: asked for, or no other drew).
     failing: bool,
     /// The pick failed and the same GPU's other backend was taken.
@@ -273,11 +374,24 @@ fn pick_adapter(
         adapters.iter().filter(|a| surface.is_none_or(|s| a.is_surface_supported(s))).collect();
     let infos: Vec<wgpu::AdapterInfo> = usable.iter().map(|a| a.get_info()).collect();
     let power = wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance);
-    let from_environment = wgpu::Backends::from_env().is_some();
+    // (Set but naming no backend: as not set, and said.)
+    let (named, unknown) = graphics::backends_from_env();
+    let from_environment = named.is_some();
     let platform = graphics::Platform::current();
     let mut probes = Vec::new();
     let check = |i: usize| {
+        // (A marker while the check runs: a backend that ends the process
+        // in it is known at the next start, `died_checking`.)
+        let marker = check_marker();
+        if let Some(marker) = &marker {
+            let record = mg_ui::settings::GraphicsFailure::of(&infos[i], DIED_CHECKING);
+            let _ = marker.parent().map(std::fs::create_dir_all);
+            let _ = std::fs::write(marker, record.to_line());
+        }
         let p = mg_ui::renderer_check::probe(usable[i]);
+        if let Some(marker) = &marker {
+            let _ = std::fs::remove_file(marker);
+        }
         let outcome = p.outcome.clone();
         probes.push(p);
         outcome
@@ -304,11 +418,23 @@ fn pick_adapter(
     }
     let mut known = failed.to_vec();
     known.extend(started.failures().map(|(i, _)| graphics::Failed::of(&infos[i])));
+    // (The checks and the probes are in one order: each check ran one.)
+    let blamed = |i: usize| {
+        let at = started.checks.iter().position(|(checked, _)| *checked == i);
+        at.and_then(|k| probes.get(k)).is_some_and(|p| p.blames_backend)
+    };
     if let Ok(mut t) = taken.lock() {
         *t = Taken {
             why,
             missing: started.pick.missing,
-            failed: started.failures().map(|(i, w)| (infos[i].clone(), w.to_string())).collect(),
+            failed: started
+                .failures()
+                .map(|(i, w)| (infos[i].clone(), w.to_string(), blamed(i)))
+                .collect(),
+            passed_over: started.pick.passed_over.clone(),
+            fallback: graphics::Fallback::of(&infos[started.index], platform)
+                .filter(|_| !from_environment),
+            environment_unknown: graphics::unknown_backends_said(&unknown, from_environment),
             failing: started.failing(),
             switched: started.switched,
             asked_for: started.pick.asked_for(),
@@ -320,49 +446,93 @@ fn pick_adapter(
     Ok(usable[started.index].clone())
 }
 
+/// What a record says found it where Moonglow ended during the startup
+/// check of a backend.
+const DIED_CHECKING: &str = "the startup check: Moonglow ended during it";
+
+/// The startup check's marker: there while an adapter is checked, with
+/// the record of that adapter failing ([`died_checking`]).
+fn check_marker() -> Option<PathBuf> {
+    mg_ui::recovery::data_dir().map(|d| d.join("graphics-check.txt"))
+}
+
+/// The backend the last start ended in the check of (the process ended by
+/// the driver, or killed while it hung): its record, the marker removed.
+/// Nothing was written of it otherwise, and Automatic took the same
+/// backend at every start.
+fn died_checking(marker: Option<&std::path::Path>) -> Option<mg_ui::settings::GraphicsFailure> {
+    let marker = marker?;
+    let line = std::fs::read_to_string(marker).ok()?;
+    let _ = std::fs::remove_file(marker);
+    mg_ui::settings::GraphicsFailure::from_line(line.trim())
+}
+
 /// What the startup check found, into the app: the failures recorded
-/// (Automatic passes over them from the next start), said in the log, and
-/// the notice where the adapter taken draws nothing.
+/// (those that are the backend's doing: Automatic passes over them from
+/// the next start), said in the log, and the notice where the adapter
+/// taken draws nothing or is a fallback.
 fn startup_check(moonglow: &mut Moonglow, taken: &Taken) {
     let check = &mut moonglow.renderer_check;
     check.asked_for = taken.asked_for;
     check.from_environment = taken.from_environment;
     check.other = taken.other;
+    check.passes_over = taken.passed_over.clone();
     let name = |b| mg_ui::graphics::backend_name(b);
-    for (info, why) in &taken.failed {
+    if let Some(said) = &taken.environment_unknown {
+        moonglow.log.warn(said.clone());
+    }
+    for (info, why, blamed) in &taken.failed {
+        // (No device, a panic, a GPU that didn't finish, a device lost:
+        // not this backend's doing for good. It is checked again.)
+        if !blamed {
+            continue;
+        }
         let what = format!("the startup check: {why}");
         moonglow
             .settings
             .record_graphics_failure(mg_ui::settings::GraphicsFailure::of(info, &what));
+        if taken.switched && !moonglow.renderer_check.passes_over.contains(&info.backend) {
+            moonglow.renderer_check.passes_over.push(info.backend);
+        }
     }
     let drawing = moonglow.renderer_check.adapter.clone();
     if taken.switched
-        && let (Some((first, why)), Some(now)) = (taken.failed.first(), &drawing)
+        && let (Some((first, why, blamed)), Some(now)) = (taken.failed.first(), &drawing)
     {
+        let from_now = if *blamed {
+            format!(
+                ", and passes over {} on this driver from now on (Options › General › Graphics \
+                 backend)",
+                name(first.backend)
+            )
+        } else {
+            " in this run".to_string()
+        };
         moonglow.log.warn(format!(
-            "Graphics: {} on {} drew nothing in Moonglow's startup check ({why}); Moonglow draws \
-             through {} instead, and passes over {} on this driver from now on (Options › \
-             General › Graphics backend)",
+            "Graphics: {} on {} failed Moonglow's startup check ({why}); Moonglow draws through \
+             {} instead{from_now}",
             name(first.backend),
             first.name,
             name(now.backend),
-            name(first.backend),
         ));
     }
     if taken.failing
         && let Some(now) = &drawing
     {
-        let mine = taken.failed.iter().find(|(i, _)| i.backend == now.backend);
+        let mine = taken.failed.iter().find(|(i, ..)| i.backend == now.backend);
         let others: Vec<(wgpu::Backend, String)> = taken
             .failed
             .iter()
-            .filter(|(i, _)| i.backend != now.backend)
-            .map(|(i, w)| (i.backend, w.clone()))
+            .filter(|(i, ..)| i.backend != now.backend)
+            .map(|(i, w, _)| (i.backend, w.clone()))
             .collect();
-        let why = mine.map_or("", |(_, w)| w.as_str());
+        let why = mine.map_or("", |(_, w, _)| w.as_str());
         moonglow.renderer_check.startup_failed(why, &others);
         let said = moonglow.renderer_check.trouble.as_ref().map(|t| t.said.clone());
         moonglow.log.warn(format!("Graphics: {}", said.unwrap_or_default()));
+    }
+    if let Some(fallback) = taken.fallback {
+        mg_ui::renderer_check::fallback_taken(moonglow, fallback);
     }
 }
 
@@ -372,17 +542,42 @@ fn startup_check(moonglow: &mut Moonglow, taken: &Taken) {
 /// (as `WGPU_BACKEND` where that named this run's; else the settings
 /// saved say it).
 fn relaunch(again: &mg_ui::renderer_check::Relaunch, line: &CommandLine) {
-    let Ok(exe) = std::env::current_exe() else { return };
-    let mut command = std::process::Command::new(exe);
+    use mg_update::Restart;
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
     if line.no_plugins {
-        command.arg("--no-plugins");
+        args.push("--no-plugins".into());
     }
     if let Some(dir) = &line.user_dir {
-        command.arg("--user-dir").arg(dir);
+        args.push("--user-dir".into());
+        args.push(dir.into());
     }
     if let Some(module) = &again.module {
-        command.arg(module);
+        args.push(module.into());
     }
+    let mut command = match &again.start {
+        // (The installer starts it when it is done.)
+        Some(Restart::ByInstaller) => return,
+        Some(Restart::Open(app)) => {
+            let mut c = std::process::Command::new("open");
+            c.arg("-n").arg(app);
+            if !args.is_empty() {
+                c.arg("--args");
+            }
+            c
+        }
+        Some(Restart::Exe(exe)) => std::process::Command::new(exe),
+        // This program: the AppImage itself where it is one (the program
+        // inside its mount goes when this run ends), which `$APPIMAGE`
+        // alone does not say.
+        None => match mg_update::Facts::here().image() {
+            Some(image) => std::process::Command::new(image),
+            None => {
+                let Ok(exe) = std::env::current_exe() else { return };
+                std::process::Command::new(exe)
+            }
+        },
+    };
+    command.args(&args);
     if again.environment {
         let name = match again.backend {
             wgpu::Backend::Dx12 => "dx12",
@@ -397,6 +592,34 @@ fn relaunch(again: &mg_ui::renderer_check::Relaunch, line: &CommandLine) {
     }
 }
 
+/// The update ready as Moonglow closed, installed (its outcome kept for
+/// the next start's log); whether it was.
+fn install_at_close(staged: &mg_update::Staged, cache: &std::path::Path, restart: bool) -> bool {
+    let what = staged.kind.what();
+    match mg_update::install::install(staged, restart, cache) {
+        // (The AppImage replaced already: its run's log said so.)
+        Ok(_) if staged.installed() => true,
+        Ok(_) => {
+            let said = match staged.kind {
+                mg_update::Kind::WindowsInstaller { .. } => format!(
+                    "Moonglow {}'s installer was started as Moonglow closed (its log: {}).",
+                    staged.version,
+                    cache.join("install.log").display()
+                ),
+                _ => format!("Moonglow {} was installed in place of {what}.", staged.version),
+            };
+            mg_update::install::write_report(cache, &said);
+            true
+        }
+        Err(why) => {
+            let said = format!("Moonglow {} isn't installed: {why}.", staged.version);
+            eprintln!("{said}");
+            mg_update::install::write_report(cache, &said);
+            false
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // (What the libraries write of the release reads it from there.)
     mg_core::release::set(env!("CARGO_PKG_VERSION"));
@@ -407,21 +630,34 @@ fn main() -> eframe::Result<()> {
     // device (`run_native`'s closure, below): the graphics backend chosen
     // is read from the same file before, so that it is one setting among
     // the others in Options (its own file would keep it apart from them).
-    // Without the file, or where it can't be read: Automatic.
+    // Without the file, or where it can't be read: Automatic. They are
+    // read here once, for the app too: where they do not all read, what
+    // does is kept, the file as it was is put aside before eframe saves
+    // over it, and the log says so (`Settings::read_eframe`). With no
+    // file at all (Moonglow's first start here), a new installation's
+    // settings (`Settings::new_installation`: the log closed); a file
+    // that does not name a setting gives it its default, as before.
     let settings_file = eframe::storage_dir(APP_NAME).map(|d| d.join("app.ron"));
-    let saved = settings_file
+    let read = settings_file
         .as_deref()
-        .and_then(|f| Settings::read_eframe_file(f, SETTINGS_KEY))
+        .map(|f| Settings::read_eframe(f, SETTINGS_KEY))
         .unwrap_or_default();
+    let saved = &read.settings;
+    // (As they are in the file: what `App::save` tells another window's
+    // save from.)
+    let as_read = (saved.clone(), saved.saved_text());
+    let app_file = settings_file.clone();
     let wanted = saved.graphics_backend.backend();
     // (The backends recorded as drawing nothing here: Automatic passes
-    // over them.)
-    let failed = saved.failed_backends();
+    // over them. And the one the last start ended in the check of.)
+    let mut failed = saved.failed_backends();
+    let died = died_checking(check_marker().as_deref());
+    failed.extend(died.as_ref().and_then(|d| d.failed()));
     let taken = std::sync::Arc::new(std::sync::Mutex::new(Taken::default()));
     let picked = taken.clone();
-    // Restart with … (the renderer's notice): to start again once the
-    // window has closed.
-    let again = std::sync::Arc::new(std::sync::Mutex::new(None));
+    // Restart with … (the renderer's notice), Restart Now (an update's)
+    // and an update to install: once the window has closed.
+    let again = std::sync::Arc::new(std::sync::Mutex::new(Closing::default()));
     let asked_again = again.clone();
     let line_again =
         CommandLine { module: None, user_dir: line.user_dir.clone(), no_plugins: line.no_plugins };
@@ -454,20 +690,31 @@ fn main() -> eframe::Result<()> {
         // The settings stay where they were before the window had an app
         // ID (eframe would otherwise name their folder after it).
         persistence_path: settings_file,
-        window_builder: Some(Box::new(|window| maximize_later(window, cfg!(windows)))),
+        // (Given the builder with the size kept from the last run.)
+        window_builder: Some(Box::new(|window| maximize_later(at_least(window), cfg!(windows)))),
         ..Default::default()
     };
     let result = eframe::run_native(
         APP_NAME,
         options,
         Box::new(move |cc| {
-            let mut settings: Settings =
-                cc.storage.and_then(|s| eframe::get_value(s, SETTINGS_KEY)).unwrap_or_default();
+            // (As read above, from the file eframe's storage is.)
+            let unread = read.problem();
+            let mut settings: Settings = read.settings;
+            // (A backend another release of Moonglow recorded as failing
+            // is tried again: what failed may be mended.)
+            let forgotten = settings.forget_other_releases_graphics_failures();
+            if let Some(died) = &died {
+                settings.record_graphics_failure(died.clone());
+            }
             // `--user-dir DIR`: this run's user folder, over Options' (not
             // saved).
             let not_a_folder = line.user_dir.clone().filter(|d| !d.is_dir());
             settings.user_dir_this_run = line.user_dir.clone().filter(|d| d.is_dir());
             let mut moonglow = Moonglow::with_settings(settings, Box::new(NativeDialogs));
+            if let Some(unread) = unread {
+                moonglow.log.error(unread);
+            }
             if let Some(dir) = not_a_folder {
                 moonglow.log.error(format!(
                     "--user-dir {}: not a folder; the user folder of Options › Folders is used",
@@ -490,34 +737,61 @@ fn main() -> eframe::Result<()> {
                         mg_ui::graphics::backend_name(rs.adapter.get_info().backend),
                     ));
                 }
+                if forgotten > 0 {
+                    moonglow.log.info(
+                        "Graphics: the backends an earlier version of Moonglow found drawing \
+                         wrong here are tried again",
+                    );
+                }
+                if let Some(died) = &died {
+                    moonglow.log.warn(format!(
+                        "Graphics: Moonglow ended during its startup check of {} on {} the last \
+                         time it started; Automatic passes over it on this driver from now on \
+                         (Options › General › Graphics backend)",
+                        died.backend, died.adapter
+                    ));
+                }
                 startup_check(&mut moonglow, &taken);
                 moonglow.graphics_choice = Some(taken.why);
             }
             // Recovery copies of unsaved work go to Moonglow's data folder;
             // those a crashed session left are offered back.
             moonglow.recovery_dir = mg_ui::recovery::data_dir().map(|d| d.join("recovery"));
+            // Conversation backups too (not the system's temporary folder,
+            // which every user of the machine writes to).
+            moonglow.conversation_backups =
+                mg_ui::recovery::data_dir().map(|d| d.join("conversation-backups"));
             moonglow.compiled_dir = mg_ui::recovery::data_dir().map(|d| d.join("compiled"));
             // A nasher project's locked objects (kept out of its files).
             moonglow.locks_dir = mg_ui::recovery::data_dir().map(|d| d.join("locks"));
             // Each module's open tabs, to open again with it.
             moonglow.open_tabs_dir = mg_ui::recovery::data_dir().map(|d| d.join("open-tabs"));
             // The game's shaders, compiled, in the user's cache folder.
-            moonglow.shader_cache_dir = mg_ui::recovery::cache_dir().map(|d| d.join("shaders"));
+            moonglow.shader_cache_dir = mg_ui::recovery::shader_cache_dir();
+            // And each module's pipelines of them, made again as it opens.
+            moonglow.pipelines_dir = mg_ui::recovery::cache_dir().map(|d| d.join("pipelines"));
             // Long work runs while the window keeps drawing.
             moonglow.background_jobs = true;
             // Help › Check for Updates… and the daily check ask GitHub
             // (not where a package manager updates Moonglow: Flatpak,
-            // Scoop, Nix; Options › Updates).
-            moonglow.updates.fetch = Some(std::sync::Arc::new(update_check::latest_release));
-            moonglow.updates.installer = mg_ui::updates::Installer::here();
+            // Scoop, Nix; Options › Updates), and an update is installed
+            // from here where Moonglow updates itself and the build has
+            // the key its checksums are signed with (`build.rs`).
+            moonglow.updates.http = Some(std::sync::Arc::new(mg_update::http::Client::new()));
+            moonglow.updates.kind = mg_update::Kind::detect(&mg_update::Facts::here());
+            moonglow.updates.key = update_key();
+            moonglow.updates.cache = mg_ui::recovery::cache_dir().map(|d| d.join("updates"));
+            mg_ui::updates::startup(&mut moonglow);
             // The plugins installed in the data folder (`--no-plugins`
             // starts without them).
             moonglow.plugin_dir = mg_ui::recovery::data_dir().map(|d| d.join("plugins"));
             moonglow.plugin_answers = mg_ui::plugins::answers_path();
+            moonglow.plugin_values = mg_ui::plugins::values_path();
             moonglow.no_plugins = line.no_plugins;
             moonglow.load_plugins();
             moonglow.prefab_dir = mg_ui::prefabs::dir();
             moonglow.var_set_dir = mg_ui::var_sets::dir();
+            moonglow.param_set_dir = mg_ui::param_sets::dir();
             moonglow.area_set_dir = mg_ui::area_sets::dir();
             moonglow.lighting_dir = mg_ui::lighting::dir();
             moonglow.find_recoveries();
@@ -530,15 +804,43 @@ fn main() -> eframe::Result<()> {
             if let Some(path) = &line.module {
                 moonglow.actions.push(mg_ui::Action::OpenModule(path.clone()));
             }
-            Ok(Box::new(App { moonglow, title: String::new(), again: asked_again }))
+            Ok(Box::new(App {
+                moonglow,
+                title: String::new(),
+                again: asked_again,
+                settings_file: app_file,
+                saved: as_read,
+            }))
         }),
     );
     // (After the window has closed and the settings are saved: the new
     // run reads what this one recorded.)
-    if let Some(again) = again.lock().ok().and_then(|mut a| a.take()) {
+    let closing = again.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
+    let mut relaunched = closing.relaunch;
+    if let Some((staged, cache)) = &closing.update
+        && !install_at_close(staged, cache, relaunched.is_some())
+        && let Some(r) = &mut relaunched
+    {
+        // (Not installed: this copy starts again, as it was.)
+        r.start = None;
+    }
+    if let Some(again) = relaunched {
         relaunch(&again, &line_again);
     }
     result
+}
+
+/// The key the releases' checksums are signed with, built in from
+/// `packaging/minisign.pub` (`build.rs`); none until the owner commits it.
+fn update_key() -> Option<mg_update::PublicKey> {
+    let key = option_env!("MOONGLOW_UPDATE_KEY")?;
+    match mg_update::PublicKey::parse(key) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprintln!("Moonglow's update key: {e}");
+            None
+        }
+    }
 }
 
 /// The window's device, of an adapter with `features` and `limits`: BC
@@ -553,13 +855,8 @@ fn device_descriptor(
     features: wgpu::Features,
     limits: wgpu::Limits,
 ) -> wgpu::DeviceDescriptor<'static> {
-    wgpu::DeviceDescriptor {
-        label: Some("moonglow"),
-        required_features: features & mg_ui::OPTIONAL_FEATURES,
-        required_limits: limits,
-        memory_hints: wgpu::MemoryHints::MemoryUsage,
-        ..Default::default()
-    }
+    // (One with the startup check's: `mg_render::backend`.)
+    mg_ui::graphics::device_descriptor("moonglow", features, limits)
 }
 
 #[cfg(test)]
@@ -588,6 +885,31 @@ mod tests {
         assert!(!super::MAXIMIZE.load(Ordering::Relaxed));
         assert_eq!(super::maximize_later(left(true), true).maximized, Some(false));
         assert!(super::MAXIMIZE.swap(false, Ordering::Relaxed));
+    }
+
+    /// The window is never smaller than the least size: that is its least
+    /// size, and a size kept smaller (from before there was one, or a
+    /// settings file edited) opens at it, side by side; a larger one
+    /// opens as it was, and so does no size kept.
+    #[test]
+    fn a_window_kept_smaller_than_the_least_size_opens_at_it() {
+        let least = mg_ui::LEAST_WINDOW_SIZE;
+        let kept = |w: f32, h: f32| egui::ViewportBuilder::default().with_inner_size([w, h]);
+        let small = super::at_least(kept(300.0, 200.0));
+        assert_eq!(small.min_inner_size, Some(least));
+        assert_eq!(small.inner_size, Some(least));
+        let narrow = super::at_least(kept(300.0, 900.0)).inner_size;
+        assert_eq!(narrow, Some(egui::vec2(least.x, 900.0)));
+        let low = super::at_least(kept(1600.0, 100.0)).inner_size;
+        assert_eq!(low, Some(egui::vec2(1600.0, least.y)));
+        assert_eq!(
+            super::at_least(kept(1280.0, 800.0)).inner_size,
+            Some(egui::vec2(1280.0, 800.0))
+        );
+        let none = super::at_least(egui::ViewportBuilder::default());
+        assert_eq!((none.inner_size, none.min_inner_size), (None, Some(least)));
+        // (The first run's size, 1280 by 800, is larger.)
+        assert!(least.x < 1280.0 && least.y < 800.0);
     }
 
     /// `--user-dir` takes the next argument (or the one after `=`), which
@@ -639,7 +961,7 @@ mod tests {
         let nothing = "the solid mesh is [0, 0, 0] at (8, 18)".to_string();
         let mut heed = app(wgpu::Backend::Vulkan);
         let switched = Taken {
-            failed: vec![(info(wgpu::Backend::Dx12), nothing.clone())],
+            failed: vec![(info(wgpu::Backend::Dx12), nothing.clone(), true)],
             switched: true,
             ..Default::default()
         };
@@ -652,7 +974,7 @@ mod tests {
         assert_eq!(heed.renderer_check.trouble, None);
         let mut chosen = app(wgpu::Backend::Dx12);
         let kept = Taken {
-            failed: vec![(info(wgpu::Backend::Dx12), nothing)],
+            failed: vec![(info(wgpu::Backend::Dx12), nothing, true)],
             failing: true,
             asked_for: true,
             other: Some(wgpu::Backend::Vulkan),
@@ -662,5 +984,84 @@ mod tests {
         let trouble = chosen.renderer_check.trouble.clone().expect("the notice");
         assert_eq!(trouble.offer, Some(wgpu::Backend::Vulkan));
         assert!(trouble.said.contains("Direct3D 12 on Radeon RX 580 Series"), "{}", trouble.said);
+        assert_eq!(heed.renderer_check.passes_over, [wgpu::Backend::Dx12]);
+    }
+
+    /// A check that failed without a picture compared (no device: the
+    /// GPU's memory taken by another program; a panic; a GPU that didn't
+    /// finish) is not the backend's doing for good: the other backend is
+    /// drawn with in this run, and nothing is recorded, so Automatic
+    /// checks the backend again at the next start.
+    #[test]
+    fn a_check_that_compared_no_picture_records_nothing() {
+        use super::{Taken, startup_check};
+        let info = |backend| {
+            let mut a = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, backend);
+            (a.vendor, a.device, a.name) = (0x1002, 0x67df, "Radeon RX 580 Series".into());
+            a
+        };
+        for why in ["no device: out of memory", "opening the device panicked"] {
+            let mut m = mg_ui::Moonglow::new(None, Box::new(mg_ui::NoDialogs::default()));
+            m.renderer_check.adapter = Some(info(wgpu::Backend::Vulkan));
+            let switched = Taken {
+                failed: vec![(info(wgpu::Backend::Dx12), why.to_string(), false)],
+                switched: true,
+                ..Default::default()
+            };
+            startup_check(&mut m, &switched);
+            assert!(m.settings.graphics_failures.is_empty(), "{why}");
+            assert!(m.renderer_check.passes_over.is_empty());
+            let said = &m.log.entries.last().unwrap().1;
+            assert!(said.ends_with("Moonglow draws through Vulkan instead in this run"), "{said}");
+        }
+    }
+
+    /// OpenGL or a software adapter taken (nothing else was there) is
+    /// said, in the log and a notice, with what to install; and a name in
+    /// `WGPU_BACKEND` that is no backend.
+    #[test]
+    fn a_fallback_adapter_is_told() {
+        use super::{Taken, startup_check};
+        let mut m = mg_ui::Moonglow::new(None, Box::new(mg_ui::NoDialogs::default()));
+        let mut gl = wgpu::AdapterInfo::new(wgpu::DeviceType::IntegratedGpu, wgpu::Backend::Gl);
+        gl.name = "Mesa Intel(R) UHD".into();
+        m.renderer_check.adapter = Some(gl);
+        let taken = Taken {
+            fallback: Some(mg_ui::graphics::Fallback::Backend(wgpu::Backend::Gl)),
+            environment_unknown: mg_ui::graphics::unknown_backends_said(&["d3d".into()], false),
+            ..Default::default()
+        };
+        startup_check(&mut m, &taken);
+        let trouble = m.renderer_check.trouble.clone().expect("the notice");
+        assert!(trouble.said.starts_with("Moonglow draws through OpenGL on Mesa Intel(R) UHD, "));
+        assert!(!trouble.record && trouble.offer.is_none());
+        let log: Vec<&str> = m.log.entries.iter().map(|e| e.1.as_str()).collect();
+        assert!(log.iter().any(|l| l.starts_with("WGPU_BACKEND names no backend")), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("Graphics: Moonglow draws through OpenGL")));
+    }
+
+    /// The marker the startup check leaves while it runs is the record of
+    /// the backend checked: found at the next start where the last one
+    /// ended in the check, and removed; a marker that is no record is
+    /// removed and gives none.
+    #[test]
+    fn a_start_that_ended_in_the_check_is_known_at_the_next() {
+        use super::{DIED_CHECKING, died_checking};
+        let dir = mg_testkit::scratch_dir("moonglow-check");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("graphics-check.txt");
+        assert_eq!(died_checking(Some(&marker)), None, "no marker");
+        assert_eq!(died_checking(None), None);
+        let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Dx12);
+        (info.vendor, info.device, info.name) = (0x1002, 0x67df, "Radeon RX 580 Series".into());
+        let record = mg_ui::settings::GraphicsFailure::of(&info, DIED_CHECKING);
+        std::fs::write(&marker, record.to_line()).unwrap();
+        let died = died_checking(Some(&marker)).expect("the record");
+        assert_eq!(died.failed(), Some(mg_ui::graphics::Failed::of(&info)));
+        assert!(!marker.exists(), "removed once read");
+        std::fs::write(&marker, "not a record").unwrap();
+        assert_eq!(died_checking(Some(&marker)), None);
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

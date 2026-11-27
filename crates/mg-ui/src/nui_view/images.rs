@@ -113,8 +113,11 @@ fn asked() -> egui::Id {
 pub(super) fn from_disk(ui: &mut Ui) -> Option<String> {
     let field = ui.make_persistent_id("from-disk");
     let picked = ui.ctx().data_mut(|d| d.remove_temp::<String>(field));
+    if picked.is_some() {
+        super::mark_mutated(ui.ctx());
+    }
     if ui
-        .button("From disk…")
+        .button("From Disk…")
         .on_hover_text("Add a picture file to the module and use it")
         .clicked()
     {
@@ -162,7 +165,7 @@ pub(crate) fn pictures_left_behind(
         format!(
             "Not exported, as the module doesn't hold {}: {}. A client without {} shows the \
              game's gui_error picture in {} place: give players the hak, or add the picture to \
-             the module (Images › Add images from disk…)",
+             the module (Images › Add Images from Disk…)",
             if missed.len() == 1 { "it" } else { "them" },
             missed.join(", "),
             if missed.len() == 1 { "it" } else { "them" },
@@ -171,14 +174,18 @@ pub(crate) fn pictures_left_behind(
     })
 }
 
+fn is_background(layer: &Value) -> bool {
+    layer["type"] == 5 && layer["order"] == -1
+}
+
 /// The picture the root's first draw layer stretches under the controls.
 fn current_background(doc: &Value) -> Option<&str> {
     let first = doc["root"]["draw_list"].get(0)?;
-    (first["type"] == 5 && first["order"] == -1).then(|| first["image"].as_str()).flatten()
+    is_background(first).then(|| first["image"].as_str()).flatten()
 }
 
 /// A stretched picture under the window's controls: a draw layer of the
-/// root column, painted before it.
+/// root column, painted before it (replacing any existing background layer).
 pub(super) fn background(doc: &mut Value, s: &Settings, name: &str) {
     let geometry = resolved(&doc["geometry"], s);
     let title = doc["title"] != json!(false);
@@ -192,7 +199,11 @@ pub(super) fn background(doc: &mut Value, s: &Settings, name: &str) {
         root["draw_list"] = json!([]);
     }
     if let Some(layers) = root["draw_list"].as_array_mut() {
-        layers.insert(0, item);
+        if layers.first().is_some_and(is_background) {
+            layers[0] = item;
+        } else {
+            layers.insert(0, item);
+        }
     }
 }
 
@@ -207,7 +218,14 @@ fn chosen_hak(app: &mut Moonglow, name: &str, choice: &Option<String>) -> Option
         // A listed hak the game finds elsewhere (its data, the Workshop) isn't
         // ours to write: one made in the hak folder would hide it.
         Some(hak) => {
-            let path = folder.join(mg_resman::named_file(hak, "hak"));
+            let Some(file) = mg_resman::named_file(hak, "hak") else {
+                app.log.error(format!(
+                    "{hak} can't take pictures ({}): choose a new hak",
+                    mg_resman::NO_FILE_NAME
+                ));
+                return None;
+            };
+            let path = folder.join(file);
             if !path.is_file() {
                 app.log.error(format!(
                     "{hak}.hak isn't in the game's hak folder, so it can't take pictures: choose \
@@ -221,8 +239,9 @@ fn chosen_hak(app: &mut Moonglow, name: &str, choice: &Option<String>) -> Option
             .dialogs
             .save_file(FileKind::Hak, Some(&folder.join(format!("{name}_images.hak"))))?,
     };
-    // As the hak editor's Save: never into the game's folder.
-    if app.install.as_ref().is_some_and(|gi| path.starts_with(&gi.root)) {
+    // As the hak editor's Save: never into the game's folder, by whatever
+    // name the path reaches it (a hak folder linked into it).
+    if crate::hak_view::in_game_folder(app, &path) {
         app.log.error("Moonglow doesn't write into the game's folder: save the hak elsewhere");
         return None;
     }
@@ -301,8 +320,9 @@ fn use_hak(app: &mut Moonglow, path: &Path, edits: &mut Vec<Edit>) -> bool {
     };
     let hak = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     if path.parent() != Some(folder.as_path()) {
-        let user = folder.parent().unwrap_or(&folder).to_owned();
-        match mg_module::attach::placements(&user, &[path.to_owned()]) {
+        let tlk_dir = app.install.as_ref().and_then(|i| i.user_folder("tlk"));
+        let tlk_dir = tlk_dir.unwrap_or_else(|| folder.with_file_name("tlk"));
+        match mg_module::attach::placements(&folder, &tlk_dir, &[path.to_owned()]) {
             Ok(places) => {
                 if places.iter().any(|p| p.there == mg_module::attach::There::Different) {
                     app.log.error(format!("Another {hak}.hak is in the hak folder: not replaced"));
@@ -347,13 +367,30 @@ pub(super) fn page(
     let names = used(doc, s);
     let module_images: Vec<ResKey> = names.iter().flat_map(|n| in_module(&ws.module, n)).collect();
     let haks = crate::listed_haks(ws);
-    // Pictures added to the module that no control shows yet.
-    let unused: BTreeSet<String> = TYPES
-        .iter()
-        .flat_map(|ty| ws.module.keys_of(*ty))
-        .map(|k| k.resref.to_string().to_lowercase())
-        .filter(|n| !names.contains(n))
-        .collect();
+    // Pictures added to the module that no control shows yet (cached per revision & used set).
+    let names_hash = {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        names.hash(&mut h);
+        h.finish()
+    };
+    let unused_id = egui::Id::new("nui-images-unused");
+    let unused_key = (ws.identity(), ws.revision(), names_hash);
+    let unused: std::sync::Arc<BTreeSet<String>> = ui
+        .data(|d| d.get_temp::<((u64, u64, u64), std::sync::Arc<BTreeSet<String>>)>(unused_id))
+        .filter(|(k, _)| *k == unused_key)
+        .map(|(_, u)| u)
+        .unwrap_or_else(|| {
+            let u: BTreeSet<String> = TYPES
+                .iter()
+                .flat_map(|ty| ws.module.keys_of(*ty))
+                .map(|k| k.resref.to_string().to_lowercase())
+                .filter(|n| !names.contains(n))
+                .collect();
+            let u = std::sync::Arc::new(u);
+            ui.data_mut(|d| d.insert_temp(unused_id, (unused_key, u.clone())));
+            u
+        });
     egui::ScrollArea::vertical().id_salt("nui-images-page").show(ui, |ui| {
         widgets::section_heading(ui, "Images");
         ui.label(
@@ -362,62 +399,59 @@ pub(super) fn page(
         );
         if names.is_empty() && unused.is_empty() {
             ui.weak(
-                "No pictures yet: an Image, an Image button or a draw layer's Image names one.",
+                "No pictures yet: an Image, an Image Button or a draw layer's Image names one.",
             );
         }
         let background_now = current_background(doc).map(str::to_owned);
         let module_names: BTreeSet<String> =
             module_images.iter().map(|k| k.resref.to_string().to_lowercase()).collect();
-        egui::Grid::new("nui-images").striped(true).num_columns(3).spacing([12.0, 6.0]).show(
-            ui,
-            |ui| {
-                if !names.is_empty() || !unused.is_empty() {
-                    widgets::table_heading(ui, "Picture");
-                    widgets::table_heading(ui, "Found in");
-                    ui.label("");
-                    ui.end_row();
-                }
-                for picture in names.iter().chain(&unused) {
-                    ui.label(picture);
-                    let origin = app
-                        .nui_assets
-                        .origins
-                        .iter()
-                        .find(|(k, _)| k.rsplit_once('.').is_some_and(|(n, _)| n == picture))
-                        .map(|(_, o)| o.clone());
-                    let in_module = module_names.contains(picture);
-                    let missing = origin.is_none() && !in_module && !unused.contains(picture);
-                    match origin {
-                        Some(origin) => ui.label(origin_name(&origin)).on_hover_text(origin),
-                        None if unused.contains(picture) => ui.label("Module (not shown yet)"),
-                        None if in_module => ui.label("Module"),
-                        None => ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            "Missing: the game shows its gui_error picture",
-                        ),
-                    };
-                    let is_background = background_now.as_deref() == Some(picture.as_str());
-                    if ui
-                        .add_enabled(
-                            !missing && !is_background,
-                            egui::Button::new("Use as background").small(),
-                        )
-                        .on_hover_text("Stretched under the window's controls")
-                        .on_disabled_hover_text(if is_background {
-                            "It is the background"
-                        } else {
-                            "The picture is missing"
-                        })
-                        .clicked()
-                    {
-                        background(doc, s, picture);
+        mg_uikit::with_rows(ui, |ui| {
+            egui::Grid::new("nui-images").striped(true).num_columns(3).spacing([12.0, 0.0]).show(
+                ui,
+                |ui| {
+                    if !names.is_empty() || !unused.is_empty() {
+                        widgets::table_heading(ui, "Picture");
+                        widgets::table_heading(ui, "Found in");
+                        ui.label("");
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-            },
-        );
+                    for picture in names.iter().chain(unused.iter()) {
+                        ui.label(picture);
+                        let origin = app.nui_assets.origin_stems.get(picture).cloned();
+                        let in_module = module_names.contains(picture);
+                        let missing = origin.is_none() && !in_module && !unused.contains(picture);
+                        match origin {
+                            Some(origin) => ui.label(origin_name(&origin)).on_hover_text(origin),
+                            None if unused.contains(picture) => ui.label("Module (not shown yet)"),
+                            None if in_module => ui.label("Module"),
+                            None => ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                "Missing: the game shows its gui_error picture",
+                            ),
+                        };
+                        let is_background = background_now.as_deref() == Some(picture.as_str());
+                        if ui
+                            .add_enabled(
+                                !missing && !is_background,
+                                egui::Button::new("Use as Background").small(),
+                            )
+                            .on_hover_text("Stretched under the window's controls")
+                            .on_disabled_hover_text(if is_background {
+                                "It is the background"
+                            } else {
+                                "The picture is missing"
+                            })
+                            .clicked()
+                        {
+                            background(doc, s, picture);
+                        }
+                        ui.end_row();
+                    }
+                },
+            )
+        });
         if ui
-            .button("Add images from disk…")
+            .button("Add Images from Disk…")
             .on_hover_text("Into the module, named as their files")
             .clicked()
         {
@@ -432,6 +466,9 @@ pub(super) fn page(
         }
         let target =
             state.images_hak.as_ref().map_or("a new hak".to_owned(), |h| format!("{h}.hak"));
+        // (The buttons name it in title case.)
+        let named =
+            state.images_hak.as_ref().map_or("a New Hak".to_owned(), |h| format!("{h}.hak"));
         ui.horizontal_wrapped(|ui| {
             // Only a module with haks has a choice to make.
             if !haks.is_empty() {
@@ -445,7 +482,7 @@ pub(super) fn page(
                     })
                     .labelled_by(label.id);
             }
-            if ui.button(format!("Add images to {target}…")).clicked() {
+            if ui.button(format!("Add Images to {named}…")).clicked() {
                 let files = app.dialogs.open_files(FileKind::Images, None);
                 if !files.is_empty()
                     && let Some(path) = chosen_hak(app, name, &state.images_hak)
@@ -471,11 +508,11 @@ pub(super) fn page(
             if ui
                 .add_enabled(
                     !module_images.is_empty(),
-                    egui::Button::new(format!("Move module images into {target}")),
+                    egui::Button::new(format!("Move Module Images into {named}")),
                 )
                 .on_hover_text(
-                    "This window's pictures leave the module for the hak; Undo brings them back, \
-                     the hak keeps them",
+                    "Move this window's pictures from the module into the hak. Undo brings them \
+                     back.",
                 )
                 .on_disabled_hover_text("None of this window's pictures is in the module")
                 .clicked()
@@ -545,5 +582,58 @@ mod tests {
         );
         assert!(!said.contains("pic_game"), "{said}");
         assert!(said.contains("give players the hak"), "{said}");
+    }
+
+    /// A hak is in the game's folder by whatever name its path reaches
+    /// it: a hak folder that is a link into the game's was written into
+    /// (the check compared the path as written). A hak named with a
+    /// folder in it is joined to none (`mg_resman::named_file`).
+    #[test]
+    fn a_hak_reached_through_a_link_is_in_the_folder_it_is_in() {
+        use crate::hak_view::in_folder;
+        let dir = mg_testkit::scratch_dir("nui-images-in-folder");
+        let (game, user) = (dir.join("game"), dir.join("user"));
+        std::fs::create_dir_all(game.join("data")).unwrap();
+        std::fs::create_dir_all(user.join("hak")).unwrap();
+        assert!(in_folder(&game.join("data/new.hak"), &game));
+        assert!(!in_folder(&user.join("hak/new.hak"), &game));
+        assert!(!in_folder(&user.join("nowhere/new.hak"), &game), "no such folder: not in it");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(game.join("data"), user.join("linked")).unwrap();
+            assert!(in_folder(&user.join("linked/new.hak"), &game), "through the link");
+            assert!(in_folder(&game.join("data/../data/new.hak"), &game));
+        }
+        assert!(mg_resman::named_file("../../Documents/other/pack", "hak").is_none());
+    }
+
+    #[test]
+    fn background_replaces_existing_background_layer() {
+        let s = Settings::default();
+        let mut empty = json!({
+            "title": "Test",
+            "geometry": {"x": 0.0, "y": 0.0, "w": 300.0, "h": 200.0},
+            "root": {"type": "col", "children": []}
+        });
+        background(&mut empty, &s, "bg1");
+        background(&mut empty, &s, "bg2");
+        assert_eq!(current_background(&empty), Some("bg2"));
+        assert_eq!(empty["root"]["draw_list"].as_array().unwrap().len(), 1);
+
+        let mut with_other = json!({
+            "title": "Test",
+            "geometry": {"x": 0.0, "y": 0.0, "w": 300.0, "h": 200.0},
+            "root": {
+                "type": "col",
+                "draw_list": [{"type": 1, "order": 0}],
+                "children": []
+            }
+        });
+        background(&mut with_other, &s, "bg1");
+        background(&mut with_other, &s, "bg2");
+        let layers = with_other["root"]["draw_list"].as_array().unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(current_background(&with_other), Some("bg2"));
+        assert_eq!(layers[1], json!({"type": 1, "order": 0}));
     }
 }

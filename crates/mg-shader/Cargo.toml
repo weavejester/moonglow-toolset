@@ -15,7 +15,8 @@ naga.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-naga = { workspace = true, features = ["wgsl-out"] }
+mg-testkit.workspace = true
+naga = { workspace = true, features = ["glsl-out", "wgsl-out"] }
 
 [lints]
 workspace = true

@@ -7,10 +7,13 @@
 //! app's default); the area's lighting unless `MG_LIT=0` (the Lighting
 //! switch off); `MG_EYE=x,y,z` and `MG_TARGET=x,y,z` place the camera
 //! instead; `MG_HIGH_SHADOWS=1` draws the shadows as stencil volumes (High);
+//! `MG_FADE=1` leaves out what Fade Geometry fades (roofs, upper walls);
 //! `MG_LIGHTS=1` lists the scene's lights; `MG_TIME=<frames>` times
 //! the scene's making over that many frames, the clock moving (the median);
 //! `MG_TIME_RENDER=<frames>` times its making, its drawing (encoded) and the
-//! GPU's work at the frame test's size, the camera turning (the medians).
+//! GPU's work at the frame test's size, the camera turning (the medians);
+//! `MG_USER_DIR=<folder>` reads haks from that user folder (`frame_perf`'s
+//! scratch module of The Domains of Dread's woods keeps one beside it).
 
 use mg_area::{AreaModel, AreaScene, View, overview};
 use mg_core::{ResRef, ResType};
@@ -33,7 +36,8 @@ fn main() {
         std::process::exit(2);
     };
     let root = mg_testkit::nwn_root().expect("no game install");
-    let install = GameInstall::new(&root, None, "en");
+    let user = std::env::var_os("MG_USER_DIR").map(std::path::PathBuf::from);
+    let install = GameInstall::new(&root, user, "en");
     let m = Module::open(std::path::Path::new(module)).unwrap();
     let mut game = GameData::open(&install).unwrap();
     let (missing, wrong) = m.stack_onto(&mut game.resman, &install);
@@ -49,7 +53,8 @@ fn main() {
     eprintln!("missing models: {:?}", scene.missing);
     let fog = std::env::var_os("MG_FOG").is_some();
     let lit = std::env::var("MG_LIT").ok().is_none_or(|v| v != "0");
-    let view = View { fog, lit, ..View::of(&model) };
+    let fade = std::env::var_os("MG_FADE").is_some();
+    let view = View { fog, lit, fade, ..View::of(&model) };
     // (`MG_TIME=<frames>`: the scene made that many times, the clock
     // moving on by a 144th of a second each, and the median printed.)
     if let Some(frames) = std::env::var("MG_TIME").ok().and_then(|n| n.parse::<usize>().ok()) {
@@ -111,6 +116,15 @@ fn main() {
             });
         };
         let (mut made, mut encoded, mut drawn) = (Vec::new(), Vec::new(), Vec::new());
+        // (The encoding's time on the processor too, summed over the frames:
+        // with other programs running, the time it took less the time it
+        // waited for the processor. Linux's schedstat, updated at the
+        // scheduler's ticks: a mean, not a median.)
+        let on_cpu = || {
+            let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+            stat.split_whitespace().next()?.parse::<u64>().ok()
+        };
+        let mut cpu = 0u64;
         for i in 0..frames.max(1) + 4 {
             let view = View { time: i as f32 / 144.0, ..view };
             let mut camera = camera;
@@ -120,11 +134,14 @@ fn main() {
             let t0 = std::time::Instant::now();
             let s = scene.scene(&model, &view);
             let t1 = std::time::Instant::now();
+            let c1 = on_cpu();
             r.render_targets(&gpu, &game.resman, &s, &camera, &targets);
+            let c2 = on_cpu();
             let t2 = std::time::Instant::now();
             wait();
             let t3 = std::time::Instant::now();
             if i >= 4 {
+                cpu += c2.zip(c1).map_or(0, |(b, a)| b.saturating_sub(a));
                 made.push(t1 - t0);
                 encoded.push(t2 - t1);
                 drawn.push(t3 - t2);
@@ -135,9 +152,11 @@ fn main() {
             v[v.len() / 2].as_secs_f64() * 1e3
         };
         eprintln!(
-            "scene {:.2} ms, encoded {:.2} ms, GPU {:.2} ms (medians of {frames}); drawn: {:?}",
+            "scene {:.2} ms, encoded {:.2} ms (on the processor {:.2}, the mean), GPU {:.2} ms \
+             (medians of {frames}); drawn: {:?}",
             median(made),
             median(encoded),
+            cpu as f64 / 1e6 / frames.max(1) as f64,
             median(drawn),
             r.drawn
         );

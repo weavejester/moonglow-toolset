@@ -85,13 +85,112 @@ impl Source {
     }
 }
 
+/// What a job makes the host hold for it, outside its machine's own
+/// memory (which Luau counts, to [`MEMORY_LIMIT`]): the tables and talk
+/// tables it makes, pictures decoded, edits and files waiting to be
+/// written. Counted in bytes, roughly, and held to [`crate::HELD_LIMIT`]:
+/// a call that would go past it fails, before it takes the memory.
+#[derive(Default)]
+pub(crate) struct Budget {
+    used: std::cell::Cell<usize>,
+    /// The job's machine: what its code let go of is the host's until
+    /// the machine collects it, so it collects before a call is refused.
+    lua: RefCell<Option<mlua::WeakLua>>,
+}
+
+/// What a job is told that made the host hold too much.
+const HELD_TOO_MUCH: &str = "held";
+
+impl Budget {
+    /// `bytes` more, for as long as the job lasts.
+    pub(crate) fn keep(&self, bytes: usize) -> mlua::Result<()> {
+        let fits = || self.used.get().saturating_add(bytes) <= crate::HELD_LIMIT;
+        if !fits() {
+            let lua = self.lua.borrow().as_ref().and_then(mlua::WeakLua::try_upgrade);
+            if let Some(lua) = lua {
+                let _ = lua.gc_collect();
+            }
+        }
+        if !fits() {
+            return Err(mlua::Error::MemoryError(HELD_TOO_MUCH.into()));
+        }
+        self.used.set(self.used.get() + bytes);
+        Ok(())
+    }
+
+    /// `bytes` no longer held (a file written again, the one before it).
+    pub(crate) fn give_back(&self, bytes: usize) {
+        self.used.set(self.used.get().saturating_sub(bytes));
+    }
+
+    /// `bytes` held for as long as what is returned lives (a table's, in
+    /// the functions the plugin has of it).
+    pub(crate) fn hold(self: &Rc<Self>, bytes: usize) -> mlua::Result<Charge> {
+        self.keep(bytes)?;
+        Ok(Charge { of: self.clone(), bytes: std::cell::Cell::new(bytes) })
+    }
+}
+
+/// Bytes of a job's [`Budget`], given back when this is dropped.
+pub(crate) struct Charge {
+    of: Rc<Budget>,
+    bytes: std::cell::Cell<usize>,
+}
+
+impl Charge {
+    /// `bytes` more (what it stands for grew).
+    pub(crate) fn more(&self, bytes: usize) -> mlua::Result<()> {
+        self.of.keep(bytes)?;
+        self.bytes.set(self.bytes.get() + bytes);
+        Ok(())
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.of.give_back(self.bytes.get());
+    }
+}
+
+/// Roughly the bytes a field's value takes.
+fn weight(v: &Value) -> usize {
+    32 + match v {
+        Value::String(b) | Value::ResRef(b) | Value::Void(b) => b.len(),
+        Value::LocString(s) => s.strings.iter().map(|(_, b)| 16 + b.len()).sum(),
+        Value::Struct(s) => weight_of(s),
+        Value::List(items) => items.iter().map(weight_of).sum(),
+        _ => 0,
+    }
+}
+
+/// Roughly the bytes a struct takes.
+fn weight_of(s: &Struct) -> usize {
+    32 + s.fields.iter().map(|f| 24 + weight(&f.value)).sum::<usize>()
+}
+
+/// Roughly the bytes an edit takes.
+fn edit_weight(e: &Edit) -> usize {
+    64 + match e {
+        Edit::SetField { value, .. } => value.as_ref().map_or(0, weight),
+        Edit::InsertItem { item, .. } => weight_of(item),
+        Edit::RemoveItem { .. } => 0,
+        Edit::SetResource { data, .. } => data.as_ref().map_or(0, Vec::len),
+    }
+}
+
 /// What a job's API works on.
 pub(crate) struct Shared {
     files: Source,
     pub(crate) ws: RefCell<Workspace>,
-    edits: RefCell<Vec<Edit>>,
+    pub(crate) edits: RefCell<Vec<Edit>>,
     /// What the job wants written into haks, each hak once.
     pub(crate) haks: RefCell<Vec<HakWrite>>,
+    /// How many bytes of it are held in memory ([`crate::HELD_IN_MEMORY`]),
+    /// and the scratch files of those past them.
+    pub(crate) held_bytes: std::cell::Cell<usize>,
+    pub(crate) held: RefCell<Option<Arc<crate::Held>>>,
+    /// What the job makes the host hold for it.
+    pub(crate) budget_held: Rc<Budget>,
     /// What the job wants written into folders the user chose.
     pub(crate) folders: RefCell<Vec<crate::FolderWrite>>,
     pub(crate) game: Option<Arc<GameData>>,
@@ -102,38 +201,66 @@ pub(crate) struct Shared {
     pub(crate) rng: RefCell<fastrand::Rng>,
     /// What is selected and open in the window.
     selection: Selection,
+    /// The values of the panel's fields the command was run from
+    /// (`ctx.values`; API 0.9).
+    values: std::collections::BTreeMap<String, serde_json::Value>,
     /// The plugin's settings, their values as the job goes (what it set
     /// read back), and what it set.
     decls: RefCell<Vec<crate::SettingDecl>>,
     settings: RefCell<crate::Settings>,
-    settings_set: RefCell<Vec<crate::SettingWrite>>,
+    pub(crate) settings_set: RefCell<Vec<crate::SettingWrite>>,
     /// Why `ctx.settings:set` is refused in this job (a check's), if it is.
-    no_set: std::cell::Cell<Option<&'static str>>,
+    pub(crate) no_set: std::cell::Cell<Option<&'static str>>,
     /// How long the job may run ([`Input::budget`]), and when it must
-    /// have ended.
+    /// have ended: none until [`start`] has the plugin's code run.
     budget: Option<std::time::Duration>,
-    deadline: Option<std::time::Instant>,
+    deadline: std::cell::Cell<Option<std::time::Instant>>,
+    /// Whether the job was found past its deadline, and stopped for it.
+    ran_out: std::cell::Cell<bool>,
 }
 
 pub(crate) fn fail<T>(message: impl std::fmt::Display) -> mlua::Result<T> {
     Err(mlua::Error::runtime(message))
 }
 
+/// The resource a plugin names (`name.ext`): as `ctx.module:resources()`
+/// lists it (a byte above 0x7F as the character of that number, which
+/// [`ResKey::from_filename`] reads back), or as a ResRef field read gave
+/// its name, in the module's codepage (`œuvre`, a Polish or Cyrillic
+/// module's letters), which was taken as UTF-8 and named no resource.
 pub(crate) fn key_of(name: &str) -> mlua::Result<ResKey> {
-    match ResKey::from_filename(name) {
+    let in_codepage = || {
+        let (stem, ext) = name.rsplit_once('.')?;
+        // (A character past U+00FF is no listed name's: a field's text.)
+        stem.chars().any(|c| c > '\u{ff}').then_some(())?;
+        let resref = ResRef::from_bytes(&codepage().encode(stem)?).ok()?;
+        Some(ResKey::new(resref, mg_core::ResType::from_extension(ext)?))
+    };
+    match in_codepage().or_else(|| ResKey::from_filename(name)) {
         Some(key) => Ok(key),
         None => fail(format!("{name:?} is not a resource's name (name.ext)")),
     }
 }
 
 impl Shared {
-    /// Whether the job ran past its time budget.
+    /// Whether the job ran past its time budget (the job is to stop:
+    /// so it is told after, by [`Shared::ran_out`]).
     pub(crate) fn out_of_time(&self) -> bool {
-        self.deadline.is_some_and(|d| std::time::Instant::now() > d)
+        let past = self.deadline.get().is_some_and(|d| std::time::Instant::now() > d);
+        if past {
+            self.ran_out.set(true);
+        }
+        past
+    }
+
+    /// Whether the job was stopped for its time budget: an error it raised
+    /// before, though only reported after the deadline, is its own.
+    pub(crate) fn ran_out(&self) -> bool {
+        self.ran_out.get()
     }
 
     /// Whether the job is to stop: canceled, or out of time.
-    fn stopped(&self) -> bool {
+    pub(crate) fn stopped(&self) -> bool {
         self.host.cancelled() || self.out_of_time()
     }
 
@@ -147,6 +274,9 @@ impl Shared {
         if edits.is_empty() {
             return Ok(());
         }
+        // (Held twice: in the job's copy of the module, to be read back
+        // and undone, and for the host.)
+        self.budget_held.keep(2 * edits.iter().map(edit_weight).sum::<usize>())?;
         let applied = self.ws.borrow_mut().apply(Command::new("plugin", edits.clone()));
         match applied {
             Ok(()) => {
@@ -157,16 +287,22 @@ impl Shared {
         }
     }
 
-    /// A resource the job has put into a hak (the last one written, of
-    /// the hak written to last).
-    fn in_haks(&self, key: &ResKey) -> Option<Vec<u8>> {
+    /// What `read` makes of a resource the job has put into a hak (the
+    /// last one written, of the hak written to last), where it is held:
+    /// its bytes, or the file of the user's it is a copy of, which is not
+    /// read for it.
+    fn in_haks<R>(&self, key: &ResKey, read: impl FnOnce(&crate::HakData) -> R) -> Option<R> {
         let haks = self.haks.borrow();
         let found = haks.iter().rev().find_map(|h| h.files.iter().rev().find(|(k, _)| k == key))?;
         match &found.1 {
-            crate::HakData::Bytes(b) => Some(b.to_vec()),
-            crate::HakData::File(p) => std::fs::read(p).ok(),
             crate::HakData::Archive => None,
+            data => Some(read(data)),
         }
+    }
+
+    /// Whether the job has put the resource into a hak.
+    fn is_in_haks(&self, key: &ResKey) -> bool {
+        self.in_haks(key, |_| ()).is_some()
     }
 
     /// A resource's bytes: the module's (with the job's edits), or with
@@ -174,8 +310,14 @@ impl Shared {
     /// first).
     pub(crate) fn bytes(&self, key: &ResKey, game: bool) -> mlua::Result<Vec<u8>> {
         if game {
-            if let Some(bytes) = self.in_haks(key) {
-                return Ok(bytes);
+            // (A file of the user's is held to what a plugin reads of one.)
+            let put = self.in_haks(key, |data| match data {
+                crate::HakData::File(path) => crate::files::read(path),
+                crate::HakData::Bytes(bytes) => Ok(bytes.to_vec()),
+                crate::HakData::Archive => unreachable!("not handed on"),
+            });
+            if let Some(bytes) = put {
+                return bytes;
             }
             let Some(data) = &self.game else {
                 self.host.not_in_game(&key.to_string());
@@ -217,6 +359,13 @@ impl Shared {
             Ok(bytes) => Ok(bytes.into_owned()),
             Err(_) => fail(format!("{layer} has no {key}")),
         }
+    }
+
+    /// What `read` makes of a GFF resource of the module, read where the
+    /// job's copy has it (not copied: an area's GIT is megabytes, and an
+    /// entry of the selection reads two fields of it).
+    fn read_gff<R>(&self, key: &ResKey, read: impl FnOnce(&Gff) -> R) -> Option<R> {
+        self.ws.borrow_mut().doc(key).ok().map(read)
     }
 
     /// A GFF resource's root.
@@ -333,14 +482,22 @@ fn typed(ty: FieldType, v: &LuaValue, old: Option<&Value>) -> Result<Value, Stri
                 LuaValue::Number(f) if f.is_finite() => *f,
                 _ => return Err(format!("a {} takes a number", ty.json_name())),
             };
+            // (A number past what a float holds would be written as
+            // infinity.)
+            if ty == FieldType::Float && !(n as f32).is_finite() {
+                return Err(format!("{n} does not fit a float"));
+            }
             if ty == FieldType::Float { Value::Float(n as f32) } else { Value::Double(n) }
         }
         FieldType::String => Value::String(text_of(v, ty)?),
         FieldType::ResRef => {
+            // (Its bytes in the module's codepage, as a field read gives
+            // them: not turned back into text, which a letter outside
+            // ASCII does not survive.)
             let bytes = text_of(v, ty)?;
-            let name = String::from_utf8_lossy(&bytes).into_owned();
-            let r = ResRef::from_str(&name)
-                .map_err(|e| format!("{name:?} is not a resource name: {e}"))?;
+            let r = ResRef::from_bytes(&bytes).map_err(|e| {
+                format!("{:?} is not a resource name: {e}", codepage().decode(&bytes))
+            })?;
             Value::resref(r)
         }
         FieldType::Void => match v {
@@ -481,8 +638,7 @@ fn reader(lua: &Lua, sh: &Rc<Shared>, game: bool) -> mlua::Result<Table> {
         lua.create_function(move |_, (_, name): (This, String)| {
             let key = key_of(&name)?;
             Ok(if game {
-                s.in_haks(&key).is_some()
-                    || s.game.as_ref().is_some_and(|g| g.resman.contains(&key))
+                s.is_in_haks(&key) || s.game.as_ref().is_some_and(|g| g.resman.contains(&key))
             } else {
                 s.ws.borrow().module.contains(&key)
             })
@@ -587,7 +743,8 @@ fn reader(lua: &Lua, sh: &Rc<Shared>, game: bool) -> mlua::Result<Table> {
                 }
                 let table = data.table(&name).or_else(fail)?;
                 let file = ResKey::from_filename(&file).and_then(|k| data.resman.get(&k).ok());
-                crate::tables::twoda(lua, table.clone(), file.map(|f| f.into_owned()))
+                let file = file.map(|f| f.into_owned());
+                crate::tables::twoda(lua, &s.budget_held, table, file)
             })?,
         )?;
         let s = sh.clone();
@@ -599,6 +756,20 @@ fn reader(lua: &Lua, sh: &Rc<Shared>, game: bool) -> mlua::Result<Table> {
         )?;
     }
     Ok(t)
+}
+
+/// The resource a job writes whole (`ctx.edit:write` and its like): one
+/// the module has, by whatever name it has it, or a new one, whose name a
+/// file can have ([`ResRef::is_file_name`]). A module kept as files could
+/// not be saved with one that can't, and the save fails for all of it.
+fn key_to_write(s: &Shared, name: &str) -> mlua::Result<ResKey> {
+    let key = key_of(name)?;
+    if !key.resref.is_file_name() && !s.ws.borrow().module.contains(&key) {
+        return fail(format!(
+            "{name:?} can't be a new resource's name: a file can't be named so (no /, \\ or :)"
+        ));
+    }
+    Ok(key)
 }
 
 /// `ctx.edit`: the changes a command makes.
@@ -711,7 +882,7 @@ fn editor(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
     t.set(
         "write",
         lua.create_function(move |_, (_, name, text): (This, String, mlua::LuaString)| {
-            let key = key_of(&name)?;
+            let key = key_to_write(&s, &name)?;
             let text =
                 text.to_str().or_else(|_| fail("text must be UTF-8 (write_bytes takes any)"))?;
             let Some(data) = codepage().encode(&text) else {
@@ -724,7 +895,7 @@ fn editor(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
     t.set(
         "write_bytes",
         lua.create_function(move |_, (_, name, bytes): (This, String, mlua::LuaString)| {
-            let key = key_of(&name)?;
+            let key = key_to_write(&s, &name)?;
             s.apply(Edit::SetResource { key, data: Some(bytes.as_bytes().to_vec()) })
         })?,
     )?;
@@ -732,7 +903,7 @@ fn editor(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
     t.set(
         "write_gff",
         lua.create_function(move |lua, (_, name, doc): (This, String, LuaValue)| {
-            let key = key_of(&name)?;
+            let key = key_to_write(&s, &name)?;
             let json = json_of(lua, doc)?;
             let gff =
                 mg_gff::from_json(&json, codepage()).or_else(|e| fail(format!("{key}{e}")))?;
@@ -755,51 +926,143 @@ fn editor(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
 }
 
 /// A form's fields from the plugin's table of them.
-fn form_fields(fields: Table) -> mlua::Result<Vec<FormField>> {
+pub(crate) fn form_fields(fields: Table) -> mlua::Result<Vec<FormField>> {
     let mut out = Vec::new();
     for field in fields.sequence_values::<Table>() {
         let f = field?;
-        let id: String = f.get("id")?;
-        let label = f.get::<Option<String>>("label")?.unwrap_or_else(|| id.clone());
-        let kind = match f.get::<Option<String>>("type")?.as_deref().unwrap_or("text") {
-            "text" => {
-                FieldKind::Text { default: f.get::<Option<String>>("default")?.unwrap_or_default() }
-            }
-            "number" => FieldKind::Number {
-                default: f.get::<Option<f64>>("default")?.unwrap_or(0.0),
-                min: f.get("min")?,
-                max: f.get("max")?,
-            },
-            "check" => {
-                FieldKind::Check { default: f.get::<Option<bool>>("default")?.unwrap_or(false) }
-            }
-            "choice" => {
-                let choices: Vec<String> = f.get("choices")?;
-                if choices.is_empty() {
-                    return fail(format!("the choice {id:?} has no choices"));
-                }
-                let wanted = f.get::<Option<String>>("default")?;
-                let default =
-                    wanted.and_then(|w| choices.iter().position(|c| *c == w)).unwrap_or(0);
-                FieldKind::Choice { choices, default }
-            }
-            other => {
-                return fail(format!(
-                    "a form's field is \"text\", \"number\", \"check\" or \"choice\", not {other:?}"
-                ));
-            }
-        };
-        if out.iter().any(|o: &FormField| o.id == id) {
-            return fail(format!("a form has two fields {id:?}"));
+        let kind = f.get::<Option<String>>("type")?;
+        let field = form_field(&f, kind.as_deref().unwrap_or("text"), "default")?;
+        if out.iter().any(|o: &FormField| o.id == field.id) {
+            return fail(format!("a form has two fields {:?}", field.id));
         }
-        out.push(FormField { id, label, kind });
+        out.push(field);
+    }
+    Ok(out)
+}
+
+/// A field from its table: a form's (its kind its `type`, what it starts
+/// with its `default`), or a panel's (API 0.9: its `kind`, and its
+/// `value`). `start` is the key of what it starts with.
+pub(crate) fn form_field(f: &Table, kind: &str, start: &str) -> mlua::Result<FormField> {
+    let id: String = match f.get::<LuaValue>("id")? {
+        LuaValue::String(s) => s.to_str()?.to_string(),
+        _ => return fail("a field has an id, its value's key: { id = \"…\", … }"),
+    };
+    let label = f.get::<Option<String>>("label")?.unwrap_or_else(|| id.clone());
+    let kind = match kind {
+        "text" => FieldKind::Text { default: f.get::<Option<String>>(start)?.unwrap_or_default() },
+        "number" => {
+            let default = f.get::<Option<f64>>(start)?.unwrap_or(0.0);
+            let (min, max): (Option<f64>, Option<f64>) = (f.get("min")?, f.get("max")?);
+            // (Not a number, or no end: it would reach the plugin as no
+            // number at all.)
+            for (what, n) in [(start, Some(default)), ("min", min), ("max", max)] {
+                if n.is_some_and(|n| !n.is_finite()) {
+                    return fail(format!("the number {id:?}'s {what} is not a number"));
+                }
+            }
+            if let (Some(min), Some(max)) = (min, max)
+                && min > max
+            {
+                return fail(format!("the number {id:?}'s min, {min}, is above its max, {max}"));
+            }
+            // (What it starts with, within its limits: a field given
+            // none with `min = 1` started at 0, which the window's
+            // widget then made 1 as it was drawn, as if the user had.)
+            let default = default.max(min.unwrap_or(f64::MIN)).min(max.unwrap_or(f64::MAX));
+            FieldKind::Number { default, min, max }
+        }
+        "check" => FieldKind::Check { default: f.get::<Option<bool>>(start)?.unwrap_or(false) },
+        "choice" => {
+            let choices = choices_of(&id, f.get("choices")?)?;
+            if choices.is_empty() {
+                return fail(format!("the choice {id:?} has no choices"));
+            }
+            let wanted = f.get::<Option<String>>(start)?;
+            let default =
+                wanted.and_then(|w| choices.iter().position(|c| c.text == w)).unwrap_or(0);
+            FieldKind::Choice { choices, default }
+        }
+        "color" => {
+            let default = match f.get::<Option<String>>(start)? {
+                None => [255; 3],
+                Some(text) => match crate::color_of(&text) {
+                    Some(c) => c,
+                    None => {
+                        return fail(format!(
+                            "the color {id:?}'s {start} is \"#rrggbb\", not {text:?}"
+                        ));
+                    }
+                },
+            };
+            let variable = f.get::<Option<String>>("variable")?.filter(|v| !v.is_empty());
+            FieldKind::Color { default, variable }
+        }
+        other => {
+            return fail(format!(
+                "a field is \"text\", \"number\", \"check\", \"choice\" or \"color\", not \
+                 {other:?}"
+            ));
+        }
+    };
+    Ok(FormField { id, label, kind })
+}
+
+/// A choice's options: each its text, or (API 0.9) `{ text = "Crimson",
+/// color = "#a01010" }`, the color of the swatch drawn before it.
+fn choices_of(id: &str, given: Option<Table>) -> mlua::Result<Vec<crate::Choice>> {
+    let mut out = Vec::new();
+    let Some(given) = given else { return Ok(out) };
+    let shape = "an option is text, or { text = \"…\", color = \"#rrggbb\" }";
+    // (Its options are drawn each frame its list is open, and its value
+    // is an option's whole text: more than a list can be read through, or
+    // a text past what a panel shows, is refused, not cut.)
+    let checked = |text: String| -> mlua::Result<String> {
+        if text.chars().nth(crate::MAX_TEXT).is_some() {
+            return fail(format!(
+                "the choice {id:?} has an option of over {} characters",
+                crate::MAX_TEXT
+            ));
+        }
+        Ok(text)
+    };
+    for c in given.sequence_values::<LuaValue>() {
+        if out.len() >= crate::MAX_CHOICES {
+            return fail(format!(
+                "the choice {id:?} has over {} options: a list is no place to choose among so \
+                 many",
+                crate::MAX_CHOICES
+            ));
+        }
+        out.push(match c? {
+            LuaValue::String(s) => crate::Choice::text(checked(s.to_str()?.to_string())?),
+            LuaValue::Table(t) => {
+                let Some(text) = t.get::<Option<String>>("text")? else {
+                    return fail(format!("the choice {id:?}: {shape}"));
+                };
+                let text = checked(text)?;
+                let color = match t.get::<Option<String>>("color")? {
+                    None => None,
+                    Some(c) => match crate::color_of(&c) {
+                        Some(c) => Some(c),
+                        None => {
+                            return fail(format!(
+                                "the choice {id:?}: {text:?}'s color is \"#rrggbb\", not {c:?}"
+                            ));
+                        }
+                    },
+                };
+                crate::Choice { text, color }
+            }
+            _ => return fail(format!("the choice {id:?}: {shape}")),
+        });
     }
     Ok(out)
 }
 
 /// The fields of an entry of `ctx.selection` (and of `ctx.open`), as the
 /// reference names them.
-pub(crate) const SELECTED: [&str; 10] = [
+pub(crate) const SELECTED: [&str; 13] = [
     "selected.kind",
     "selected.resource",
     "selected.path",
@@ -810,6 +1073,9 @@ pub(crate) const SELECTED: [&str; 10] = [
     "selected.tag",
     "selected.resref",
     "selected.layer",
+    "selected.x",
+    "selected.y",
+    "selected.together",
 ];
 
 /// An entry of `ctx.selection`, or `ctx.open`: what it is, where it is
@@ -829,6 +1095,16 @@ fn selected(lua: &Lua, sh: &Shared, s: &Selected) -> mlua::Result<Table> {
             t.set("area", area.to_string())?;
             t.set("index", *index)?;
         }
+        // (Its column and row, by the area's width.)
+        Selected::Tile { area, index } => {
+            t.set("area", area.to_string())?;
+            t.set("index", *index)?;
+            let width = sh.read_gff(&key, |g| g.root.integer("Width")).flatten();
+            if let Some(w) = width.filter(|w| *w > 0).map(|w| w as usize) {
+                t.set("x", index % w)?;
+                t.set("y", index / w)?;
+            }
+        }
         Selected::Area(area) => t.set("area", area.to_string())?,
         Selected::Copy { layer, .. } => t.set("layer", layer.as_str())?,
         Selected::Blueprint(_) | Selected::Resource(_) => {}
@@ -836,32 +1112,66 @@ fn selected(lua: &Lua, sh: &Shared, s: &Selected) -> mlua::Result<Table> {
     // (A layer's copy is the game's, whether or not the module has its own.)
     let in_module = s.layer().is_none() && sh.ws.borrow().module.contains(&key);
     t.set("module", in_module)?;
+    // Its tag, and what a placed object was made from, where it is.
+    let facts = |g: &Gff| {
+        let at = path.get(&g.root)?;
+        let field = match path.0.first() {
+            Some(mg_edit::Step::Item(list, _)) => mg_rules::ObjectKind::from_list(list)
+                .map_or("TemplateResRef", mg_rules::ObjectKind::resref_field),
+            _ => "TemplateResRef",
+        };
+        Some((at.string("Tag").map(<[u8]>::to_vec), at.resref(field)))
+    };
     let read = match s {
         Selected::Resource(_) => None,
-        Selected::Copy { layer, .. } if key.restype.is_gff() => {
-            sh.layer_bytes(&key, layer).ok().and_then(|b| Gff::read(&b).ok())
-        }
+        Selected::Copy { layer, .. } if key.restype.is_gff() => sh
+            .layer_bytes(&key, layer)
+            .ok()
+            .and_then(|b| Gff::read(&b).ok())
+            .and_then(|g| facts(&g)),
         Selected::Copy { .. } => None,
-        Selected::Blueprint(_) if !in_module => sh.gff(&key, true).ok(),
-        _ => sh.gff(&key, false).ok(),
+        Selected::Blueprint(_) if !in_module => sh.gff(&key, true).ok().and_then(|g| facts(&g)),
+        _ => sh.read_gff(&key, facts).flatten(),
     };
     let text = |b: &[u8]| lua.create_string(codepage().decode(b).as_bytes());
-    if let Some(at) = read.as_ref().and_then(|g| path.get(&g.root)) {
-        if let Some(tag) = at.string("Tag") {
-            t.set("tag", text(tag)?)?;
+    if let Some((tag, made_from)) = read {
+        if let Some(tag) = tag {
+            t.set("tag", text(&tag)?)?;
         }
         // (What a placed object was made from; else its own name.)
         let resref = match s {
-            Selected::Object { .. } => at.resref("TemplateResRef"),
+            Selected::Object { .. } => made_from,
+            Selected::Tile { .. } => None,
             _ => Some(key.resref),
         };
         if let Some(r) = resref {
             t.set("resref", r.to_string())?;
         }
-    } else if !matches!(s, Selected::Object { .. }) {
+    } else if !matches!(s, Selected::Object { .. } | Selected::Tile { .. }) {
         t.set("resref", key.resref.to_string())?;
     }
     Ok(t)
+}
+
+/// The lines of a text that differ between `old` and `new`, as
+/// `ctx.event.changed` gives them: what is between the lines they begin
+/// and end with alike, each line taken out (`12: - text`) and put in
+/// (`12: + text`) by its number, at most `most`.
+pub(crate) fn text_changes(old: &str, new: &str, most: usize) -> Vec<String> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let tail =
+        (a[head..].iter().rev()).zip(b[head..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let mut out = Vec::new();
+    for (i, l) in a[head..a.len() - tail].iter().enumerate() {
+        out.push(format!("{}: - {l}", head + i + 1));
+    }
+    for (i, l) in b[head..b.len() - tail].iter().enumerate() {
+        out.push(format!("{}: + {l}", head + i + 1));
+    }
+    out.truncate(most);
+    out
 }
 
 /// A setting's value as the plugin reads it.
@@ -870,6 +1180,10 @@ fn setting_value(lua: &Lua, v: &crate::SettingValue) -> mlua::Result<LuaValue> {
         crate::SettingValue::Text(t) => LuaValue::String(lua.create_string(t)?),
         crate::SettingValue::Int(n) => LuaValue::Integer(*n),
         crate::SettingValue::Bool(b) => LuaValue::Boolean(*b),
+        crate::SettingValue::Float(x) => LuaValue::Number(*x),
+        crate::SettingValue::List(items) => {
+            LuaValue::Table(lua.create_sequence_from(items.iter().map(String::as_str))?)
+        }
     })
 }
 
@@ -896,18 +1210,38 @@ fn settings_table(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
                 d.scope.name()
             ));
         }
+        let float = matches!(d.kind, crate::SettingKind::Float { .. });
         let given = match &value {
             LuaValue::Nil => None,
             LuaValue::String(t) => Some(crate::SettingValue::Text(t.to_str()?.to_string())),
             LuaValue::Boolean(b) => Some(crate::SettingValue::Bool(*b)),
+            LuaValue::Integer(n) if float => Some(crate::SettingValue::Float(*n as f64)),
             LuaValue::Integer(n) => Some(crate::SettingValue::Int(*n)),
+            LuaValue::Number(n) if float => Some(crate::SettingValue::Float(*n)),
             LuaValue::Number(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => {
                 Some(crate::SettingValue::Int(*n as i64))
             }
+            LuaValue::Number(n) => Some(crate::SettingValue::Float(*n)),
+            // (A list: its texts, from 1.)
+            LuaValue::Table(t) => {
+                let mut items = Vec::new();
+                for v in t.clone().sequence_values::<LuaValue>() {
+                    match v? {
+                        LuaValue::String(s) => items.push(s.to_str()?.to_string()),
+                        other => {
+                            return fail(format!(
+                                "ctx.settings:set({name:?}, …): a list's items are texts, not {}",
+                                other.type_name()
+                            ));
+                        }
+                    }
+                }
+                Some(crate::SettingValue::List(items))
+            }
             other => {
                 return fail(format!(
-                    "ctx.settings:set({name:?}, …): {} is no setting's value (text, a whole \
-                     number, true or false; nil for its default)",
+                    "ctx.settings:set({name:?}, …): {} is no setting's value (text, a number, \
+                     true or false, a list of texts; nil for its default)",
                     other.type_name()
                 ));
             }
@@ -998,7 +1332,8 @@ fn unknown_setting(name: &str, decls: &[crate::SettingDecl]) -> String {
 }
 
 /// What a job's handler gets (`about`: the plugin's id, name and version).
-fn context(lua: &Lua, sh: &Rc<Shared>, about: [&str; 3]) -> mlua::Result<Table> {
+pub(crate) fn context(lua: &Lua, sh: &Rc<Shared>, about: [&str; 3]) -> mlua::Result<Table> {
+    let began = std::time::Instant::now();
     let ctx = lua.create_table()?;
     ctx.set("module", reader(lua, sh, false)?)?;
     ctx.set("game", reader(lua, sh, true)?)?;
@@ -1016,8 +1351,23 @@ fn context(lua: &Lua, sh: &Rc<Shared>, about: [&str; 3]) -> mlua::Result<Table> 
         chosen.raw_seti(i + 1, selected(lua, sh, s)?)?;
     }
     ctx.set("selection", chosen)?;
+    // (Each as a form gives it back; none: an empty table.)
+    let values = lua.create_table()?;
+    for (k, v) in &sh.values {
+        values.set(k.as_str(), lua.to_value(v)?)?;
+    }
+    ctx.set("values", values)?;
     if let Some(open) = &sh.selection.open {
-        ctx.set("open", selected(lua, sh, open)?)?;
+        let entry = selected(lua, sh, open)?;
+        // (Several edited together: each, the first being `open` itself.)
+        if !sh.selection.together.is_empty() {
+            let together = lua.create_table()?;
+            for (i, s) in sh.selection.together.iter().enumerate() {
+                together.raw_seti(i + 1, selected(lua, sh, s)?)?;
+            }
+            entry.set("together", together)?;
+        }
+        ctx.set("open", entry)?;
     }
 
     let log = lua.create_table()?;
@@ -1074,6 +1424,8 @@ fn context(lua: &Lua, sh: &Rc<Shared>, about: [&str; 3]) -> mlua::Result<Table> 
     )?;
     crate::files::questions(lua, sh, &ui)?;
     ctx.set("ui", ui)?;
+    // (Making it is the host's work, not time of the job's budget.)
+    sh.deadline.set(sh.deadline.get().map(|d| d + began.elapsed()));
     Ok(ctx)
 }
 
@@ -1082,16 +1434,39 @@ fn context(lua: &Lua, sh: &Rc<Shared>, about: [&str; 3]) -> mlua::Result<Table> 
 fn api(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
     let mg = lua.create_table()?;
     mg.set("api", crate::API)?;
-    for (kind, registry) in
-        [("command", "mg.commands"), ("check", "mg.checks"), ("event", "mg.events")]
-    {
+    for (kind, name, registry) in crate::manifest::KINDS {
         lua.set_named_registry_value(registry, lua.create_table()?)?;
         mg.set(
-            if kind == "event" { "on" } else { kind },
-            lua.create_function(move |lua, (id, handler): (String, Function)| {
+            name,
+            lua.create_function(move |lua, (id, handler): (String, LuaValue)| {
                 let handlers: Table = lua.named_registry_value(registry)?;
                 if handlers.contains_key(id.as_str())? {
                     return fail(format!("the {kind} {id:?} is registered twice"));
+                }
+                // (A wizard is its pages and its finish; the rest, a
+                // function.)
+                match (&handler, kind) {
+                    (LuaValue::Table(t), "wizard") => {
+                        if !t.get::<LuaValue>("pages")?.is_table() {
+                            return fail(format!(
+                                "mg.wizard({id:?}, {{ pages = {{ … }}, finish = … }}): its pages, \
+                                 a list"
+                            ));
+                        }
+                        if !t.get::<LuaValue>("finish")?.is_function() {
+                            return fail(format!(
+                                "mg.wizard({id:?}, {{ pages = …, finish = function(ctx, answers) \
+                                 … end }}): what its Finish does"
+                            ));
+                        }
+                    }
+                    (_, "wizard") => {
+                        return fail(format!(
+                            "mg.wizard({id:?}, {{ pages = {{ … }}, finish = … }}): a table"
+                        ));
+                    }
+                    (LuaValue::Function(_), _) => {}
+                    _ => return fail(format!("mg.{name}({id:?}, handler): a function")),
                 }
                 handlers.set(id, handler)
             })?,
@@ -1144,9 +1519,10 @@ fn api(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
             })?,
         )?;
     }
-    mg.set("image", lua.create_function(crate::files::image)?)?;
-    mg.set("twoda", crate::tables::twoda_api(lua, sh.game.clone())?)?;
-    mg.set("tlk", crate::tables::tlk_api(lua)?)?;
+    let held = sh.budget_held.clone();
+    mg.set("image", lua.create_function(move |lua, args| crate::files::image(lua, &held, args))?)?;
+    mg.set("twoda", crate::tables::twoda_api(lua, &sh.budget_held, sh.game.clone())?)?;
+    mg.set("tlk", crate::tables::tlk_api(lua, &sh.budget_held)?)?;
     mg.set("vars", vars_api(lua, sh)?)?;
     // Where a struct read with `gff` is: its path, for the edits.
     mg.set(
@@ -1185,11 +1561,13 @@ fn api(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
 /// `described()`, every description, in the file's order.
 fn vars_api(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
     use mg_module::var_desc::{Described, ModuleLookup};
-    fn table(lua: &Lua, sh: &Shared, d: &Described) -> mlua::Result<Table> {
-        let ws = sh.ws.borrow();
-        let module = &ws.module;
-        let lookup = ModuleLookup::new(module, sh.game.as_deref().map(|g| &g.resman));
-        let choices = d.choices(&lookup);
+    fn table(
+        lua: &Lua,
+        module: &mg_module::Module,
+        lookup: &ModuleLookup<'_>,
+        d: &Described,
+    ) -> mlua::Result<Table> {
+        let choices = d.choices(lookup);
         let t = lua.create_table()?;
         t.set("name", d.name.as_str())?;
         t.set("pattern", d.is_pattern())?;
@@ -1222,16 +1600,27 @@ fn vars_api(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
     api.set(
         "describe",
         lua.create_function(move |lua, name: String| {
-            let d = s.ws.borrow().module.project_file.variables.describe(&name).cloned();
-            d.map(|d| table(lua, &s, &d)).transpose()
+            let ws = s.ws.borrow();
+            let Some(d) = ws.module.project_file.variables.describe(&name) else {
+                return Ok(None);
+            };
+            let lookup = ModuleLookup::new(&ws.module, s.game.as_deref().map(|g| &g.resman));
+            table(lua, &ws.module, &lookup, d).map(Some)
         })?,
     )?;
     let s = sh.clone();
     api.set(
         "described",
         lua.create_function(move |lua, ()| {
-            let all = s.ws.borrow().module.project_file.variables.described.clone();
-            all.iter().map(|d| table(lua, &s, d)).collect::<mlua::Result<Vec<_>>>()
+            let ws = s.ws.borrow();
+            let lookup = ModuleLookup::new(&ws.module, s.game.as_deref().map(|g| &g.resman));
+            ws.module
+                .project_file
+                .variables
+                .described
+                .iter()
+                .map(|d| table(lua, &ws.module, &lookup, d))
+                .collect::<mlua::Result<Vec<_>>>()
         })?,
     )?;
     Ok(api)
@@ -1239,9 +1628,10 @@ fn vars_api(lua: &Lua, sh: &Rc<Shared>) -> mlua::Result<Table> {
 
 /// A machine for one job, the plugin's code loaded (`entry`; the console
 /// has none).
-fn start(entry: Option<&str>, sh: &Rc<Shared>) -> mlua::Result<Lua> {
+pub(crate) fn start(entry: Option<&str>, sh: &Rc<Shared>) -> mlua::Result<Lua> {
     let lua = Lua::new();
     lua.set_memory_limit(MEMORY_LIMIT)?;
+    *sh.budget_held.lua.borrow_mut() = Some(lua.weak());
     lua.set_named_registry_value("mg.api", api(&lua, sh)?)?;
     lua.set_named_registry_value("mg.modules", lua.create_table()?)?;
     let globals = lua.globals();
@@ -1331,20 +1721,26 @@ fn start(entry: Option<&str>, sh: &Rc<Shared>) -> mlua::Result<Lua> {
 
     // From here the globals are fixed, and each script has its own.
     lua.sandbox(true)?;
-    if let Some(entry) = entry {
-        let source = sh.files.read(entry).or_else(|e| fail(format!("{entry}: {e}")))?;
+    let source = match entry {
+        Some(entry) => Some(sh.files.read(entry).or_else(|e| fail(format!("{entry}: {e}")))?),
+        None => None,
+    };
+    // The budget is the plugin's code's, from its loading on: making the
+    // machine and reading the file are the host's work.
+    sh.deadline.set(sh.budget.map(|b| std::time::Instant::now() + b));
+    if let (Some(entry), Some(source)) = (entry, source) {
         lua.load(source).set_mode(TEXT).set_name(format!("@{entry}")).exec()?;
     }
     Ok(lua)
 }
 
-fn about(plugin: &Plugin) -> [&str; 3] {
+pub(crate) fn about(plugin: &Plugin) -> [&str; 3] {
     [&plugin.manifest.id, &plugin.manifest.name, &plugin.manifest.version]
 }
 
 /// A job's failure as the host reports it.
-fn failed(plugin: &Plugin, sh: &Shared, e: mlua::Error) -> PluginError {
-    if let Some(budget) = sh.budget.filter(|_| sh.out_of_time() && !sh.host.cancelled()) {
+pub(crate) fn failed(plugin: &Plugin, sh: &Shared, e: mlua::Error) -> PluginError {
+    if let Some(budget) = sh.budget.filter(|_| sh.ran_out() && !sh.host.cancelled()) {
         return PluginError::Script {
             plugin: plugin.manifest.name.clone(),
             message: format!(
@@ -1360,16 +1756,30 @@ fn failure(name: &str, host: &Rc<dyn Host>, e: mlua::Error) -> PluginError {
     if host.cancelled() {
         return PluginError::Canceled(name.to_string());
     }
-    let message = match &e {
-        mlua::Error::MemoryError(_) => {
-            format!("it ran out of the {} MB a plugin may use", MEMORY_LIMIT >> 20)
+    // (The machine's own memory, or what the host holds for the job:
+    // raised in a function of the API, it comes wrapped.)
+    fn memory(e: &mlua::Error) -> Option<&str> {
+        match e {
+            mlua::Error::MemoryError(what) => Some(what),
+            mlua::Error::CallbackError { cause, .. } | mlua::Error::WithContext { cause, .. } => {
+                memory(cause)
+            }
+            _ => None,
         }
-        other => other.to_string(),
+    }
+    let message = match memory(&e) {
+        Some(HELD_TOO_MUCH) => format!(
+            "it made Moonglow hold more than the {} MB a job may (the tables and pictures it \
+             has, the edits and files it wants written)",
+            crate::HELD_LIMIT >> 20
+        ),
+        Some(_) => format!("it ran out of the {} MB a plugin may use", MEMORY_LIMIT >> 20),
+        None => e.to_string(),
     };
     PluginError::Script { plugin: name.to_string(), message }
 }
 
-fn shared(plugin: &Plugin, input: Input, host: &Rc<dyn Host>) -> Rc<Shared> {
+pub(crate) fn shared(plugin: &Plugin, input: Input, host: &Rc<dyn Host>) -> Rc<Shared> {
     let sh = shared_in(source_of(plugin), &plugin.manifest.name, input, host);
     // Each declared setting has a value: the host's, else its default.
     {
@@ -1384,22 +1794,38 @@ fn shared(plugin: &Plugin, input: Input, host: &Rc<dyn Host>) -> Rc<Shared> {
 }
 
 fn shared_in(files: Source, who: &str, input: Input, host: &Rc<dyn Host>) -> Rc<Shared> {
+    shared_holding(files, who, input, host, Rc::default())
+}
+
+/// [`shared_in`] for a job within another (a check's fixes), which
+/// counts what the host holds for it to the other's budget.
+fn shared_holding(
+    files: Source,
+    who: &str,
+    input: Input,
+    host: &Rc<dyn Host>,
+    budget_held: Rc<Budget>,
+) -> Rc<Shared> {
     let game = input.game.as_deref().map_or(CODEPAGE, |g| g.text_codepage());
     GAME_CODEPAGE.with(|c| c.set(game));
-    let deadline = input.budget.map(|b| std::time::Instant::now() + b);
     Rc::new(Shared {
         budget: input.budget,
-        deadline,
+        deadline: std::cell::Cell::new(None),
+        ran_out: std::cell::Cell::new(false),
         files,
         ws: RefCell::new(Workspace::new(input.module)),
         edits: RefCell::new(Vec::new()),
         haks: RefCell::new(Vec::new()),
+        held_bytes: std::cell::Cell::new(0),
+        held: RefCell::new(None),
+        budget_held,
         folders: RefCell::new(Vec::new()),
         game: input.game,
         host: host.clone(),
         who: who.to_string(),
         rng: RefCell::new(fastrand::Rng::new()),
         selection: input.selection,
+        values: input.values,
         decls: RefCell::default(),
         settings: RefCell::new(input.settings.unwrap_or_default()),
         settings_set: RefCell::default(),
@@ -1407,7 +1833,7 @@ fn shared_in(files: Source, who: &str, input: Input, host: &Rc<dyn Host>) -> Rc<
     })
 }
 
-fn handler(lua: &Lua, registry: &str, kind: &str, id: &str) -> mlua::Result<Function> {
+pub(crate) fn handler(lua: &Lua, registry: &str, kind: &str, id: &str) -> mlua::Result<Function> {
     let handlers: Table = lua.named_registry_value(registry)?;
     match handlers.get::<Option<Function>>(id)? {
         Some(f) => Ok(f),
@@ -1506,7 +1932,7 @@ fn event_table(
     key: Option<ResKey>,
     objects: &[Selected],
     said: &Rc<RefCell<Vec<crate::Said>>>,
-    records: &Rc<RefCell<Vec<FixRecord>>>,
+    records: &Rc<RefCell<Fixes>>,
 ) -> mlua::Result<Table> {
     let event = lua.create_table()?;
     let kind = happened.kind;
@@ -1562,6 +1988,16 @@ fn event_table(
                                 let lines = mg_gff::diff(&a, &b, CHANGED_LINES);
                                 LuaValue::Table(lua.create_sequence_from(lines)?)
                             }
+                            // (A script or another text: its lines that
+                            // differ.)
+                            (false, _, _) => match (before.as_deref(), now().as_deref()) {
+                                (Some(a), Some(b)) => {
+                                    let text = |b: &[u8]| codepage().decode(b).into_owned();
+                                    let lines = text_changes(&text(a), &text(b), CHANGED_LINES);
+                                    LuaValue::Table(lua.create_sequence_from(lines)?)
+                                }
+                                _ => LuaValue::Nil,
+                            },
                             _ => LuaValue::Nil,
                         }
                     }
@@ -1583,7 +2019,7 @@ fn event_table(
                         return fail(format!("ctx.event:{name}(text): say why"));
                     }
                     let what = format!("ctx.event:{name}'s fix");
-                    let fix = fix_of(&records, fix, &what)?;
+                    let fix = fix_of(&records, fix, &what, None)?;
                     said.borrow_mut().push(crate::Said { resource: key, text, refused, fix });
                     Ok(())
                 })?,
@@ -1635,7 +2071,7 @@ pub(crate) fn run_event(
         sh.no_set
             .set(Some("a resource saving's handler only reads: ctx.settings:set is not for it"));
     }
-    let records: Rc<RefCell<Vec<FixRecord>>> = Rc::default();
+    let records: Rc<RefCell<Fixes>> = Rc::default();
     let said: Rc<RefCell<Vec<crate::Said>>> = Rc::default();
     let label_of = |made: LuaValue| -> mlua::Result<Option<String>> {
         Ok(match made {
@@ -1699,13 +2135,49 @@ pub(crate) fn run_event(
     })
 }
 
-/// A fix a check records (`ctx.fix`): what its button says, and the job
-/// its edits go into, made at its first edit on a copy of the module as
-/// the check reads it (so that the check goes on reading the module as it
-/// is, and each fix starts from it).
+/// A fix a check records (`ctx.fix`): what its button says, and the edits
+/// made through it.
 struct FixRecord {
     label: String,
+    edits: Vec<Edit>,
+    /// For a fix that asks: the plugin's command its button runs, and on
+    /// what (a resource and where in it; none: the finding's resource).
+    asks: Option<(String, Option<(ResKey, GffPath)>)>,
+}
+
+/// The fixes a check (or a resource saving's handler) records, and the
+/// job their edits are made in: one copy of the module as the check reads
+/// it, made at the first edit of a fix, for all of them (so that the check
+/// goes on reading the module as it is). Each fix starts from the module
+/// as it is: the copy has the edits of one fix at a time ([`turn_to`]),
+/// not a copy of the module a fix.
+#[derive(Default)]
+struct Fixes {
+    records: Vec<FixRecord>,
     job: Option<Rc<Shared>>,
+    /// The fix whose edits the job's copy has now.
+    current: Option<usize>,
+}
+
+/// Makes the copy of the module the fixes edit that of fix `n`: the
+/// module as the check reads it with that fix's edits so far, those of
+/// the fix it had before taken back.
+fn turn_to(fixes: &RefCell<Fixes>, job: &Shared, n: usize) -> mlua::Result<()> {
+    let mut all = fixes.borrow_mut();
+    if all.current == Some(n) {
+        return Ok(());
+    }
+    let mut ws = job.ws.borrow_mut();
+    all.current = None;
+    while ws.can_undo().is_some() {
+        ws.undo().or_else(fail)?;
+    }
+    let edits = all.records[n].edits.clone();
+    if !edits.is_empty() {
+        ws.apply(Command::new("plugin", edits)).or_else(fail)?;
+    }
+    all.current = Some(n);
+    Ok(())
 }
 
 /// The methods of a fix: those of `ctx.edit`, as the reference writes them.
@@ -1724,44 +2196,80 @@ pub(crate) const FIX_NAMES: [&str; 10] = [
 
 /// `ctx.fix(label)`: a fix to give a finding, which records the edits made
 /// through it (its methods are `ctx.edit`'s) and makes none.
-fn fix_maker(
-    lua: &Lua,
-    sh: &Rc<Shared>,
-    records: &Rc<RefCell<Vec<FixRecord>>>,
-) -> mlua::Result<Function> {
+fn fix_maker(lua: &Lua, sh: &Rc<Shared>, records: &Rc<RefCell<Fixes>>) -> mlua::Result<Function> {
     let (sh, records) = (sh.clone(), records.clone());
-    lua.create_function(move |lua, label: String| {
+    lua.create_function(move |lua, (label, options): (String, Option<Table>)| {
         if label.trim().is_empty() {
             return fail("ctx.fix(label): the label is what its button says, and needs words");
         }
-        let n = records.borrow().len();
-        records.borrow_mut().push(FixRecord { label: label.clone(), job: None });
+        // (A fix that asks: a command of the plugin's, run on the finding's
+        // place when the button is clicked; API 0.5.)
+        let asks = match &options {
+            None => None,
+            Some(o) => {
+                let command: String = o.get("command").or_else(|_| {
+                    fail("ctx.fix(label, { command = \"…\" }): the command its button runs")
+                })?;
+                let on = match o.get::<Option<Table>>("on")? {
+                    None => None,
+                    Some(s) => {
+                        let resource: String = s.get("resource")?;
+                        let path: Option<String> = s.get("path")?;
+                        let path = match path.as_deref() {
+                            None | Some("") => GffPath::root(),
+                            Some(p) => p.parse().or_else(fail)?,
+                        };
+                        Some((key_of(&resource)?, path))
+                    }
+                };
+                Some((command, on))
+            }
+        };
+        let n = records.borrow().records.len();
+        records.borrow_mut().records.push(FixRecord {
+            label: label.clone(),
+            edits: Vec::new(),
+            asks,
+        });
         let fix = lua.create_table()?;
         fix.set("label", label)?;
         let meta = lua.create_table()?;
         meta.set("__fix", n)?;
-        // Its methods are made at the first one used (a copy of the module
-        // for each fix that edits).
+        // Its methods are made at the first one used (and the copy of the
+        // module the fixes edit, at the first of them all): each makes
+        // its edit on the copy as this fix has it, and the edit is the
+        // fix's.
         let (sh, records) = (sh.clone(), records.clone());
         meta.set(
             "__index",
             lua.create_function(move |lua, (fix, name): (Table, LuaValue)| {
                 let job = {
                     let mut all = records.borrow_mut();
-                    let record = &mut all[n];
-                    record
-                        .job
+                    all.job
                         .get_or_insert_with(|| {
                             let module = sh.ws.borrow().module.clone();
                             let input = Input::new(module, sh.game.clone());
-                            shared_in(Source::Nothing, &sh.who, input, &sh.host)
+                            let held = sh.budget_held.clone();
+                            shared_holding(Source::Nothing, &sh.who, input, &sh.host, held)
                         })
                         .clone()
                 };
                 let methods = editor(lua, &job)?;
                 for pair in methods.pairs::<String, Function>() {
                     let (k, f) = pair?;
-                    fix.raw_set(k, f)?;
+                    let (records, job) = (records.clone(), job.clone());
+                    let method = lua.create_function(move |_, args: mlua::MultiValue| {
+                        turn_to(&records, &job, n)?;
+                        let made = f.call::<mlua::MultiValue>(args);
+                        records.borrow_mut().records[n].edits.append(&mut job.edits.borrow_mut());
+                        // (The method's own error, not one of a call within
+                        // a call.)
+                        made.map_err(|e| match e {
+                            mlua::Error::CallbackError { cause, .. } => Arc::unwrap_or_clone(cause),
+                            e => e,
+                        })
+                    })?;
+                    fix.raw_set(k, method)?;
                 }
                 fix.raw_get::<LuaValue>(name)
             })?,
@@ -1772,11 +2280,13 @@ fn fix_maker(
 }
 
 /// A fix given with a finding or a warning: one made with `ctx.fix`, and
-/// only if it edits (`what`: what it was given as, for the error).
+/// only if it edits (`what`: what it was given as, for the error), or (a
+/// finding's, `about` its resource; `plugin` the plugin) runs a command.
 fn fix_of(
-    records: &RefCell<Vec<FixRecord>>,
+    records: &RefCell<Fixes>,
     given: LuaValue,
     what: &str,
+    asking: Option<(&Manifest, ResKey)>,
 ) -> mlua::Result<Option<Fix>> {
     match given {
         LuaValue::Nil => Ok(None),
@@ -1786,13 +2296,41 @@ fn fix_of(
                 None => None,
             };
             let all = records.borrow();
-            let Some(record) = n.and_then(|n| all.get(n)) else {
+            let Some(record) = n.and_then(|n| all.records.get(n)) else {
                 return fail(format!("{what} is one made with ctx.fix(label)"));
             };
-            let edits = record.job.as_ref().map(|j| j.edits.borrow().clone());
-            Ok(edits
-                .filter(|e| !e.is_empty())
-                .map(|edits| Fix { label: record.label.clone(), edits }))
+            if let Some((command, on)) = &record.asks {
+                let Some((manifest, about)) = asking else {
+                    return fail(format!(
+                        "{what} is one that edits: a fix that asks is a finding's"
+                    ));
+                };
+                if !manifest.commands.iter().any(|c| c.id == *command) {
+                    return fail(format!(
+                        "{what}: the manifest declares no command {command:?} for it to run"
+                    ));
+                }
+                if !record.edits.is_empty() {
+                    return fail(format!(
+                        "{what}: a fix that asks runs its command, and edits none"
+                    ));
+                }
+                let on = on.clone().unwrap_or((about, GffPath::root()));
+                return Ok(Some(Fix {
+                    label: record.label.clone(),
+                    edits: Vec::new(),
+                    asks: Some(mg_edit::fix::Asks {
+                        plugin: manifest.id.clone(),
+                        command: command.clone(),
+                        on: vec![on],
+                    }),
+                }));
+            }
+            Ok((!record.edits.is_empty()).then(|| Fix {
+                label: record.label.clone(),
+                edits: record.edits.clone(),
+                asks: None,
+            }))
         }
         _ => fail(format!("{what} is one made with ctx.fix(label)")),
     }
@@ -1806,7 +2344,7 @@ pub(crate) fn run_check(
 ) -> Result<Vec<Found>, PluginError> {
     let sh = shared(plugin, input, &host);
     sh.no_set.set(Some("a check only reads: ctx.settings:set is for commands and events"));
-    let records: Rc<RefCell<Vec<FixRecord>>> = Rc::default();
+    let records: Rc<RefCell<Fixes>> = Rc::default();
     let run = || -> mlua::Result<Vec<Found>> {
         let lua = start(Some(&plugin.manifest.entry), &sh)?;
         let f = handler(&lua, "mg.checks", "check", &decl.id)?;
@@ -1831,13 +2369,16 @@ pub(crate) fn run_check(
                     ));
                 }
             };
-            // Its fix: one made with ctx.fix, and only if it edits.
-            let fix = fix_of(&records, f.get::<LuaValue>("fix")?, "a finding's fix")?;
+            // Its fix: one made with ctx.fix, and only if it edits (or
+            // asks, running a command).
+            let resource = key_of(&f.get::<String>("resource")?)?;
+            let asking = Some((&plugin.manifest, resource));
+            let fix = fix_of(&records, f.get::<LuaValue>("fix")?, "a finding's fix", asking)?;
             let finding = Finding {
                 severity,
                 check: plugin.check_id(&decl.id).into(),
                 source: "module".into(),
-                resource: key_of(&f.get::<String>("resource")?)?,
+                resource,
                 at: f.get::<Option<String>>("at")?.unwrap_or_default(),
                 message: f.get("message")?,
             };
@@ -1857,13 +2398,16 @@ pub(crate) fn run_check(
 }
 
 /// Loads a plugin's code from `files` and compares what it registers with
-/// what `manifest` declares.
+/// what `manifest` declares. The code has [`crate::EVENT_BUDGET`] to load
+/// in: what is inspected may be an archive from anywhere, and nobody is
+/// there to cancel it.
 pub(crate) fn inspect(
     files: Source,
     manifest: &Manifest,
     host: Rc<dyn Host>,
 ) -> Result<Vec<String>, PluginError> {
-    let input = Input::new(mg_module::Module::new(), None);
+    let mut input = Input::new(mg_module::Module::new(), None);
+    input.budget = Some(crate::EVENT_BUDGET);
     let sh = shared_in(files, &manifest.name, input, &host);
     let run = || -> mlua::Result<Vec<String>> {
         let lua = start(Some(&manifest.entry), &sh)?;
@@ -1872,14 +2416,9 @@ pub(crate) fn inspect(
             let handlers: Table = lua.named_registry_value(registry)?;
             handlers.pairs::<String, LuaValue>().map(|p| p.map(|(id, _)| id)).collect()
         };
-        let declared: BTreeMap<&str, Vec<&str>> = BTreeMap::from([
-            ("command", manifest.commands.iter().map(|c| c.id.as_str()).collect()),
-            ("check", manifest.checks.iter().map(|c| c.id.as_str()).collect()),
-            ("event", manifest.events.iter().map(|c| c.id.as_str()).collect()),
-        ]);
-        for (kind, registry) in
-            [("command", "mg.commands"), ("check", "mg.checks"), ("event", "mg.events")]
-        {
+        let declared: BTreeMap<&str, Vec<&str>> =
+            crate::manifest::KINDS.iter().map(|(kind, _, _)| (*kind, manifest.ids(kind))).collect();
+        for (kind, _, registry) in crate::manifest::KINDS {
             let mut code = registered(registry)?;
             code.sort();
             for id in &declared[kind] {
@@ -1899,7 +2438,16 @@ pub(crate) fn inspect(
         }
         Ok(faults)
     };
-    run().map_err(|e| failure(&manifest.name, &host, e))
+    run().map_err(|e| match sh.budget {
+        Some(budget) if sh.ran_out() && !host.cancelled() => PluginError::Script {
+            plugin: manifest.name.clone(),
+            message: format!(
+                "it ran out of time: its code may take {} seconds to load, and was stopped",
+                budget.as_secs_f32()
+            ),
+        },
+        _ => failure(&manifest.name, &host, e),
+    })
 }
 
 /// A value as the console shows it: text and numbers as they are, a table
@@ -2009,7 +2557,7 @@ pub(crate) fn api_names() -> Vec<String> {
         }
         // What is selected and open (an empty list here, and nothing
         // open), and the fields of each.
-        out.extend(["ctx.selection", "ctx.open"].map(String::from));
+        out.extend(["ctx.selection", "ctx.open", "ctx.values"].map(String::from));
         // The settings (none here) and their method.
         out.extend(["ctx.settings", "ctx.settings:set"].map(String::from));
         out.extend(SELECTED.map(String::from));
@@ -2021,10 +2569,270 @@ pub(crate) fn api_names() -> Vec<String> {
         // What `ctx.game:table` returns, and the other things handed out.
         out.extend(["twoda.rows", "twoda.columns", "twoda:get"].map(String::from));
         out.extend(crate::files::NAMES.map(String::from));
+        out.extend(crate::kinds::NAMES.map(String::from));
         out.extend(crate::tables::NAMES.map(String::from));
         out.extend(crate::terrain::NAMES.map(String::from));
         out.sort();
         Ok(out)
     };
     names().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Numbers that are none (`0/0`), or have no end, are refused where
+    /// they are given: a form's field kept them and handed the plugin
+    /// something that is no number, and a float field was written as
+    /// infinity.
+    #[test]
+    fn numbers_that_are_not_finite_are_refused() {
+        let lua = Lua::new();
+        let e = typed(FieldType::Float, &LuaValue::Number(1e300), None).unwrap_err();
+        assert!(e.ends_with("does not fit a float"), "{e}");
+        assert_eq!(typed(FieldType::Float, &LuaValue::Number(1.5), None), Ok(Value::Float(1.5)));
+        assert_eq!(
+            typed(FieldType::Double, &LuaValue::Number(1e300), None),
+            Ok(Value::Double(1e300))
+        );
+        assert!(typed(FieldType::Double, &LuaValue::Number(f64::NAN), None).is_err());
+        let field = |code: &str| {
+            let t: Table = lua.load(code).eval().unwrap();
+            form_field(&t, "number", "default").map_err(|e| e.to_string())
+        };
+        assert!(field("{ id = 'n', default = 2, min = 1, max = 3 }").is_ok());
+        for bad in [
+            "{ id = 'n', default = 0/0 }",
+            "{ id = 'n', min = -1/0 }",
+            "{ id = 'n', max = 1/0 }",
+            "{ id = 'n', min = 3, max = 1 }",
+        ] {
+            let e = field(bad).unwrap_err();
+            assert!(e.contains("the number \"n\"'s"), "{bad}: {e}");
+        }
+    }
+
+    /// A resource named as a ResRef field read gave its name, in the
+    /// module's codepage, is that resource: a letter Latin-1 has not was
+    /// taken as its UTF-8 bytes, a name the module has not. A name as
+    /// `ctx.module:resources()` lists it is read as before.
+    #[test]
+    fn a_resource_is_named_as_a_field_read_gave_it() {
+        assert_eq!(codepage(), Codepage::WINDOWS_1252);
+        let named = |n: &str| key_of(n).unwrap().resref.as_bytes().to_vec();
+        assert_eq!(named("\u{153}uvre_\u{20ac}.dlg"), b"\x9cuvre_\x80");
+        assert_eq!(named("caf\u{e9}_01.utc"), b"caf\xe9_01");
+        // As listed: the byte's own number.
+        let listed = ResKey::new(ResRef::from_bytes(b"\x9cuvre").unwrap(), mg_core::ResType::DLG);
+        assert_eq!(key_of(&listed.to_string()).unwrap(), listed);
+        // A letter the codepage has not: its UTF-8 bytes, as a file's name.
+        assert_eq!(named("\u{17c}.dlg"), "\u{17c}".as_bytes());
+        assert!(key_of("no_type").is_err() && key_of("x.nosuch").is_err());
+    }
+
+    /// A number field starts within its limits, whatever it is given (or
+    /// not given): the window's widget held a value outside them to them
+    /// as it was drawn, which a panel took for the user's setting it and
+    /// ran the field's command.
+    #[test]
+    fn a_number_field_starts_within_its_limits() {
+        let lua = Lua::new();
+        let start = |code: &str| {
+            let t: Table = lua.load(code).eval().unwrap();
+            match form_field(&t, "number", "value").unwrap().kind {
+                FieldKind::Number { default, .. } => default,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(start("{ id = 'n', min = 1 }"), 1.0);
+        assert_eq!(start("{ id = 'n', value = 9, min = 1, max = 5 }"), 5.0);
+        assert_eq!(start("{ id = 'n', value = -3, max = -4 }"), -4.0);
+        assert_eq!(start("{ id = 'n', value = 3, min = 1, max = 5 }"), 3.0);
+        assert_eq!(start("{ id = 'n', value = 7 }"), 7.0);
+    }
+
+    /// A choice's options are held to a count and each to a length: a
+    /// choice of every resource of a large module, or what a careless
+    /// loop returns, was copied each frame and drawn whole once open.
+    #[test]
+    fn a_choice_of_too_many_or_too_long_options_is_refused() {
+        let lua = Lua::new();
+        let field = |code: &str| {
+            let t: Table = lua.load(code).eval().unwrap();
+            form_field(&t, "choice", "default").map_err(|e| e.to_string())
+        };
+        let many = |n: usize| {
+            format!(
+                "(function() local c = {{}} for i = 1, {n} do c[i] = 'option ' .. i end \
+                 return {{ id = 'c', choices = c }} end)()"
+            )
+        };
+        match field(&many(crate::MAX_CHOICES)).unwrap().kind {
+            FieldKind::Choice { choices, .. } => assert_eq!(choices.len(), crate::MAX_CHOICES),
+            other => panic!("{other:?}"),
+        }
+        let e = field(&many(100_000)).unwrap_err();
+        assert!(e.contains("the choice \"c\" has over 2000 options"), "{e}");
+        let long = |n: usize| format!("{{ id = 'c', choices = {{ string.rep('x', {n}) }} }}");
+        assert!(field(&long(crate::MAX_TEXT)).is_ok());
+        let e = field(&long(crate::MAX_TEXT + 1)).unwrap_err();
+        assert!(e.contains("has an option of over 1000 characters"), "{e}");
+        let e = field(&format!(
+            "{{ id = 'c', choices = {{ {{ text = string.rep('x', {}) }} }} }}",
+            crate::MAX_TEXT + 1
+        ))
+        .unwrap_err();
+        assert!(e.contains("has an option of over 1000 characters"), "{e}");
+    }
+
+    /// A resource's name set from text is the text's bytes in the
+    /// module's codepage, as reading the field gave them: a letter outside
+    /// ASCII was written as three other bytes, and counted as three.
+    #[test]
+    fn a_resref_set_from_text_keeps_its_letters() {
+        let lua = Lua::new();
+        let text = |t: &str| LuaValue::String(lua.create_string(t).unwrap());
+        assert_eq!(codepage(), Codepage::WINDOWS_1252);
+        let made = typed(FieldType::ResRef, &text("caf\u{e9}"), None).unwrap();
+        assert_eq!(made, Value::ResRef(vec![0x63, 0x61, 0x66, 0xe9]));
+        // Sixteen letters are sixteen bytes, whichever they are.
+        let long = "\u{e9}".repeat(16);
+        assert_eq!(typed(FieldType::ResRef, &text(&long), None), Ok(Value::ResRef(vec![0xe9; 16])));
+        let e = typed(FieldType::ResRef, &text(&"\u{e9}".repeat(17)), None).unwrap_err();
+        assert!(e.contains("is not a resource name"), "{e}");
+        // And it reads back as it was given.
+        let mut s = Struct::new(0);
+        s.set("Conversation", made);
+        let read = plain(&lua, &s, &GffPath::root()).unwrap();
+        assert_eq!(read.get::<String>("Conversation").unwrap(), "caf\u{e9}");
+    }
+
+    struct Nobody;
+    impl Host for Nobody {
+        fn log(&self, _: Level, _: &str) {}
+        fn ask(&self, _: &Question) -> Option<Answer> {
+            None
+        }
+    }
+
+    fn budgeted(ms: u64) -> Rc<Shared> {
+        let mut input = Input::new(mg_module::Module::new(), None);
+        input.budget = Some(std::time::Duration::from_millis(ms));
+        let host: Rc<dyn Host> = Rc::new(Nobody);
+        shared_in(Source::Nothing, "", input, &host)
+    }
+
+    /// A job's time budget is its code's: what the host does before the
+    /// code runs (the job's state, the machine, reading the file) is not
+    /// counted, however long it takes. A panel's set-up on a busy Windows
+    /// runner took its 250 milliseconds.
+    #[test]
+    fn the_hosts_setup_is_not_the_jobs_time() {
+        let sh = budgeted(50);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let lua = start(None, &sh).unwrap();
+        assert_eq!(lua.load("return 1 + 1").eval::<i64>().unwrap(), 2);
+        assert!(!sh.out_of_time() && !sh.ran_out());
+        // And code past it is still stopped.
+        let e = lua.load("while true do end").exec().unwrap_err();
+        assert!(sh.ran_out(), "{e}");
+    }
+
+    /// An error the code raised in time is its own, though the job is
+    /// only told of it after the deadline (the thread held up between):
+    /// only a job the budget stopped ran out of time.
+    #[test]
+    fn an_error_reported_after_the_deadline_is_the_codes_own() {
+        let sh = budgeted(50);
+        let lua = start(None, &sh).unwrap();
+        let stalled = lua
+            .create_function(|_, ()| -> mlua::Result<()> {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                fail("a panel only reads")
+            })
+            .unwrap();
+        let e = lua.load("local stalled = ...; stalled()").call::<()>(stalled).unwrap_err();
+        assert!(e.to_string().contains("a panel only reads"), "{e}");
+        assert!(!sh.ran_out());
+    }
+
+    /// A large selection in a large area is read where the job's copy of
+    /// the area has it: 500 of an area's 4,000 placed objects make a
+    /// `ctx.selection` in a moment (each entry copied the whole GIT, which
+    /// took a panel's quarter second many times over), and the entries
+    /// say what they said.
+    #[test]
+    fn a_large_selection_is_read_without_copying_the_area() {
+        use mg_rules::ObjectKind;
+        let area = ResRef::from_str("big").unwrap();
+        let mut git = Gff::new(*b"GIT ");
+        let placeables: Vec<Struct> = (0..4000)
+            .map(|i| {
+                let mut p = Struct::new(9);
+                p.set("Tag", Value::String(format!("crate_{i}").into_bytes()));
+                p.set("TemplateResRef", Value::resref(ResRef::from_str("plc_crate").unwrap()));
+                for n in 0..20 {
+                    p.set(&format!("Field{n}"), Value::String(b"some text of a field".to_vec()));
+                }
+                p
+            })
+            .collect();
+        git.root.set(ObjectKind::Placeable.list(), Value::List(placeables));
+        let mut are = Gff::new(*b"ARE ");
+        are.root.set("Width", Value::Int(8));
+        let tiles: Vec<Struct> = (0..64).map(|_| Struct::new(1)).collect();
+        are.root.set("Tile_List", Value::List(tiles));
+        let mut module = mg_module::Module::new();
+        module.set_gff(ResKey::new(area, mg_core::ResType::GIT), &git).unwrap();
+        module.set_gff(ResKey::new(area, mg_core::ResType::ARE), &are).unwrap();
+        let mut input = Input::new(module, None);
+        input.selection.selected = (0..500)
+            .map(|i| Selected::Object { area, kind: ObjectKind::Placeable, index: i * 8 })
+            .chain((0..64).map(|index| Selected::Tile { area, index }))
+            .collect();
+        input.budget = Some(std::time::Duration::from_millis(250));
+        let host: Rc<dyn Host> = Rc::new(Nobody);
+        let sh = shared_in(Source::Nothing, "", input, &host);
+        let lua = start(None, &sh).unwrap();
+        let started = std::time::Instant::now();
+        let ctx = context(&lua, &sh, ["", "", ""]).unwrap();
+        let took = started.elapsed();
+        let chosen: Table = ctx.get("selection").unwrap();
+        assert_eq!(chosen.raw_len(), 564);
+        let entry: Table = chosen.get(3).unwrap();
+        assert_eq!(entry.get::<String>("tag").unwrap(), "crate_16");
+        assert_eq!(entry.get::<String>("resref").unwrap(), "plc_crate");
+        assert_eq!(entry.get::<String>("path").unwrap(), "/Placeable List[16]");
+        let tile: Table = chosen.get(500 + 11).unwrap();
+        assert_eq!((tile.get::<usize>("x").unwrap(), tile.get::<usize>("y").unwrap()), (2, 1));
+        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+        // And the time it took is not the job's.
+        assert!(!sh.out_of_time());
+        let left = sh.deadline.get().unwrap() - std::time::Instant::now();
+        assert!(left > std::time::Duration::from_millis(100), "{left:?}");
+    }
+
+    #[test]
+    fn placed_store_selection_exposes_store_resref_field() {
+        let area = ResRef::from_str("area001").unwrap();
+        let mut git = Gff::new(*b"GIT ");
+        let mut store = Struct::new(0);
+        store.set("Tag", Value::String(b"SHOP_1".to_vec()));
+        store.set("ResRef", Value::resref(ResRef::from_str("my_shop").unwrap()));
+        git.root.set(mg_rules::ObjectKind::Store.list(), Value::List(vec![store]));
+        let mut module = mg_module::Module::new();
+        module.set_gff(ResKey::new(area, mg_core::ResType::GIT), &git).unwrap();
+        let mut input = Input::new(module, None);
+        input.selection.selected =
+            vec![Selected::Object { area, kind: mg_rules::ObjectKind::Store, index: 0 }];
+        let host: Rc<dyn Host> = Rc::new(Nobody);
+        let sh = shared_in(Source::Nothing, "", input, &host);
+        let lua = start(None, &sh).unwrap();
+        let ctx = context(&lua, &sh, ["", "", ""]).unwrap();
+        let chosen: Table = ctx.get("selection").unwrap();
+        let entry: Table = chosen.get(1).unwrap();
+        assert_eq!(entry.get::<String>("tag").unwrap(), "SHOP_1");
+        assert_eq!(entry.get::<String>("resref").unwrap(), "my_shop");
+    }
 }

@@ -26,13 +26,18 @@
 //!
 //! A class the creature did not have gets its spells: for a class that
 //! prepares them, each spell level's slots (the `SpellGainTable`, and
-//! bonus slots for the casting ability) filled with a domain spell (the
+//! bonus slots for the casting ability wherever the table gives the level
+//! a number, 0 too, but at level 0: [`crate::spell_warnings::level_slots`])
+//! filled with a domain spell (the
 //! package's first domain's for that level, else the second's) and then
 //! the package's spells of that level (`SpellPref2DA`) in order, the first
 //! repeated in what is left; for one that knows them, the package's first
-//! spells of each level up to the `SpellKnownTable` (not yet checked
-//! against Aurora). Its package's equipment is [`GameData::new_class_gear`]'s
-//! (the caller makes the items).
+//! spells of each level up to the `SpellKnownTable`. Its package's
+//! equipment is [`GameData::new_class_gear`]'s (the caller makes the items).
+//! Captured (`levelup/spells-after.mod`): Paladin 4 added at Wisdom 14, a
+//! level whose gain cell is 0, has its one bonus first-level spell;
+//! Sorcerer 1 and Bard 1 added know the package's first four cantrips
+//! (and the sorcerer two first-level spells), each entry `SpellFlags` 1.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -45,6 +50,11 @@ use crate::creatures::{ABILITIES, modifier};
 const FEAT_ID: u32 = 1;
 const CLASS_ID: u32 = 2;
 const SPELL_ID: u32 = 3;
+
+/// The most spells of one level a new class is given: a byte's worth, as
+/// the game's own spell gain tables stay far inside. (A table's cell is
+/// whatever a hak says.)
+const MOST_SLOTS: i32 = 255;
 
 /// What a feat may be taken as.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,13 +88,13 @@ struct State {
 
 impl State {
     fn level(&self) -> u32 {
-        self.classes.iter().map(|&(_, l)| l).sum()
+        self.classes.iter().fold(0, |all, &(_, l)| all.saturating_add(l))
     }
     fn has(&self, feat: u16) -> bool {
         self.feats.contains(&feat)
     }
     fn total(&self, ability: usize) -> i32 {
-        self.abilities[ability] + self.racial[ability]
+        self.abilities[ability].saturating_add(self.racial[ability])
     }
 }
 
@@ -102,14 +112,16 @@ impl GameData {
                 .list("ClassList")
                 .unwrap_or(&[])
                 .iter()
-                .map(|e| (int(e, "Class").max(0) as u32, int(e, "ClassLevel").max(0) as u32))
+                .map(|e| {
+                    let level = crate::held(int(e, "ClassLevel"), 0, i32::from(i16::MAX));
+                    (crate::row(int(e, "Class")), level as u32)
+                })
                 .collect(),
             feats: c
                 .list("FeatList")
                 .unwrap_or(&[])
                 .iter()
-                .filter_map(|f| f.integer("Feat"))
-                .map(|f| f as u16)
+                .filter_map(|f| u16::try_from(f.integer("Feat")?).ok())
                 .collect(),
             skills: c
                 .list("SkillList")
@@ -117,11 +129,11 @@ impl GameData {
                 .iter()
                 .map(|s| int(s, "Rank").clamp(0, 255) as u8)
                 .collect(),
-            abilities: ABILITIES.map(|a| int(&c, a) as i32),
-            racial: self.racial_adjustments(int(&c, "Race").max(0) as u32),
-            race: int(&c, "Race").max(0) as usize,
+            abilities: ABILITIES.map(|a| crate::held(int(&c, a), 0, 255)),
+            racial: self.racial_adjustments(crate::row(int(&c, "Race"))),
+            race: crate::row(int(&c, "Race")) as usize,
         };
-        let mut spare = int(&c, "SkillPoints").max(0) as u32;
+        let mut spare = crate::held(int(&c, "SkillPoints"), 0, i32::from(u16::MAX)) as u32;
         let mut hit_points = 0.0f64;
         for &(class, target) in targets {
             if !state.classes.iter().any(|&(k, _)| k == class) {
@@ -170,7 +182,7 @@ impl GameData {
         }
         c.set("ClassList", Value::List(list));
         let old: Vec<Struct> = c.list("FeatList").unwrap_or(&[]).to_vec();
-        let feats = state
+        let mut feats: Vec<Struct> = state
             .feats
             .iter()
             .map(|&f| {
@@ -184,6 +196,10 @@ impl GameData {
                     })
             })
             .collect();
+        // (An entry that names no feat, a number past a WORD or none at
+        // all, is not levelling's to drop: kept, after the feats.)
+        let no_feat = |s: &&Struct| s.integer("Feat").is_none_or(|f| u16::try_from(f).is_err());
+        feats.extend(old.iter().filter(no_feat).cloned());
         c.set("FeatList", Value::List(feats));
         if let Some(skills) = c.list_mut("SkillList") {
             for (s, rank) in skills.iter_mut().zip(&state.skills) {
@@ -226,12 +242,14 @@ impl GameData {
         // again and again while points last (a first level's 12 points go
         // two rounds).
         let extra = self.race_value(s, "ExtraSkillPointsPerLevel").unwrap_or(0);
-        let mut per_level =
-            (num("SkillPointBase").unwrap_or(0) + modifier(s.total(3)) + extra).max(1);
+        // (The tables' cells are any numbers: added up without wrapping.)
+        let base = num("SkillPointBase").unwrap_or(0);
+        let mut per_level = base.saturating_add(modifier(s.total(3))).saturating_add(extra).max(1);
         if level == 1 {
-            per_level *= self.race_value(s, "FirstLevelSkillPointsMultiplier").unwrap_or(4).max(1);
+            let first = self.race_value(s, "FirstLevelSkillPointsMultiplier").unwrap_or(4).max(1);
+            per_level = per_level.saturating_mul(first);
         }
-        let mut points = *spare as i32 + per_level;
+        let mut points = i32::try_from(*spare).unwrap_or(i32::MAX).saturating_add(per_level);
         let skill_table = col("SkillsTable").and_then(|t| self.table(&t.to_lowercase()).ok());
         let class_skill = |skill: u32| -> bool {
             skill_table.as_ref().is_some_and(|t| {
@@ -255,7 +273,8 @@ impl GameData {
             let mut spent = false;
             for &k in &order {
                 let Some(rank) = s.skills.get_mut(k) else { continue };
-                if points >= 1 && u32::from(*rank) < level + 3 {
+                // (No higher than a rank's BYTE holds, whatever the level.)
+                if points >= 1 && u32::from(*rank) < level.saturating_add(3) && *rank < u8::MAX {
                     *rank += 1;
                     points -= 1;
                     spent = true;
@@ -329,7 +348,8 @@ impl GameData {
             0
         };
         if level == 1 {
-            normal += self.race_value(s, "ExtraFeatsAtFirstLevel").unwrap_or(0).max(0) as u32;
+            let extra = self.race_value(s, "ExtraFeatsAtFirstLevel").unwrap_or(0).max(0) as u32;
+            normal = normal.saturating_add(extra);
         }
         let bonus = col("BonusFeatsTable")
             .and_then(|t| self.table(&t.to_lowercase()).ok())
@@ -350,10 +370,11 @@ impl GameData {
                 let choice = prefs.iter().copied().find(|&f| {
                     !s.has(f) && self.may_take(s, &before, &lists, f, pick) && !taken.contains(&f)
                 });
-                if let Some(f) = choice {
-                    taken.insert(f);
-                    s.feats.push(f);
-                }
+                // (None left to take: none for the picks after it either,
+                // however many a table's cell says there are.)
+                let Some(f) = choice else { break };
+                taken.insert(f);
+                s.feats.push(f);
             }
         }
         // A player class's first level has its whole hit die; other levels,
@@ -407,18 +428,16 @@ impl GameData {
             let of_level: Vec<u16> =
                 prefs.iter().copied().filter(|&sp| spell_level(sp) == Some(n)).collect();
             if prepares {
-                let base = table("SpellGainTable")
-                    .and_then(|t| t.get_int(level as usize - 1, &format!("SpellLevel{n}")))
-                    .unwrap_or(0)
-                    .max(0);
-                // Bonus slots: one for each four points of modifier from
-                // the spell level up.
-                let bonus = if n > 0 && base > 0 && ability >= n as i32 {
-                    (ability - n as i32) / 4 + 1
-                } else {
-                    0
-                };
-                let slots = (base + bonus) as usize;
+                // The cell and a bonus slot for each four points of
+                // modifier from the spell level up, a cell of 0 too (a
+                // paladin's first level, cast by bonus slots alone); none
+                // for `****`, nor at level 0. (As many as a table's cell
+                // and an ability say, held to [`MOST_SLOTS`]: a cell of two
+                // billion was as many spells.)
+                let cell = table("SpellGainTable")
+                    .and_then(|t| t.get_int(level as usize - 1, &format!("SpellLevel{n}")));
+                let slots = crate::spell_warnings::level_slots(cell, ability, n, false)
+                    .clamp(0, i64::from(MOST_SLOTS)) as usize;
                 let mut list: Vec<u16> = Vec::new();
                 if n > 0
                     && let Some(d) = domain_spell(n)
@@ -440,10 +459,11 @@ impl GameData {
                     out.push((format!("MemorizedList{n}"), list));
                 }
             } else {
-                let known = table("SpellKnownTable")
-                    .and_then(|t| t.get_int(level as usize - 1, &format!("SpellLevel{n}")))
-                    .unwrap_or(0)
-                    .max(0) as usize;
+                // (The table's count: no ability bonus for spells known.)
+                let cell = table("SpellKnownTable")
+                    .and_then(|t| t.get_int(level as usize - 1, &format!("SpellLevel{n}")));
+                let known = crate::spell_warnings::level_slots(cell, 0, n, false)
+                    .clamp(0, i64::from(MOST_SLOTS)) as usize;
                 let list: Vec<u16> = of_level.into_iter().take(known).collect();
                 if !list.is_empty() {
                     out.push((format!("KnownList{n}"), list));
@@ -490,7 +510,7 @@ impl GameData {
         if !allowed {
             return false;
         }
-        let had = |f: i32| before.contains(&(f as u16));
+        let had = |f: i32| u16::try_from(f).is_ok_and(|f| before.contains(&f));
         if int("MINATTACKBONUS").is_some_and(|b| self.base_attack(&s.classes) < b) {
             return false;
         }
@@ -520,42 +540,44 @@ impl GameData {
         }
         if let Some(min) = int("MinLevel") {
             let level = match int("MinLevelClass") {
-                Some(k) => s.classes.iter().filter(|&&(c, _)| c as i32 == k).map(|&(_, l)| l).sum(),
+                Some(k) => (s.classes.iter())
+                    .filter(|&&(c, _)| i64::from(c) == i64::from(k))
+                    .fold(0u32, |all, &(_, l)| all.saturating_add(l)),
                 None => s.level(),
             };
-            if (level as i32) < min {
+            if i64::from(level) < i64::from(min) {
                 return false;
             }
         }
-        if int("MaxLevel").is_some_and(|m| s.level() as i32 > m) {
+        if int("MaxLevel").is_some_and(|m| i64::from(s.level()) > i64::from(m)) {
             return false;
         }
         if int("PreReqEpic") == Some(1) && s.level() < 21 {
             return false;
         }
         if let Some(min) = int("MinFortSave") {
-            let fort: i32 = s.classes.iter().map(|&(c, l)| self.class_saves(c, l)[0]).sum();
+            // (The base save as the Statistics page has it: the game's.)
+            let fort = self.base_saves(&s.classes)[0];
             if fort < min {
                 return false;
             }
         }
-        if int("MINSPELLLVL").is_some_and(|m| self.top_spell_level(&s.classes) < m) {
-            return false;
-        }
-        true
+        !int("MINSPELLLVL").is_some_and(|m| self.top_spell_level(&s.classes) < m)
     }
 
-    /// The base attack bonus of a creature's classes.
+    /// The classes' attack bonus tables added up, each at its class's full
+    /// level: what a feat's `MINATTACKBONUS` is held against as a creature
+    /// is levelled up, its one use. Up to 20 levels in all it is the
+    /// game's base attack bonus; past them it is not (the game adds a
+    /// point every two epic levels, whatever the classes: a fighter 30 has
+    /// 25, and this gives its table's 30), so it is not for a statistic.
     pub fn base_attack(&self, classes: &[(u32, u32)]) -> i32 {
         let Ok(t) = self.table("classes") else { return 0 };
-        classes
-            .iter()
-            .filter(|&&(_, l)| l > 0)
-            .filter_map(|&(c, l)| {
-                let name = t.get(c as usize, "AttackBonusTable")?.to_lowercase();
-                self.table(&name).ok()?.get_int(l as usize - 1, "BAB")
-            })
-            .sum()
+        let of_class = |&(c, l): &(u32, u32)| {
+            let name = t.get(c as usize, "AttackBonusTable")?.to_lowercase();
+            self.table(&name).ok()?.get_int(l as usize - 1, "BAB")
+        };
+        (classes.iter().filter(|&&(_, l)| l > 0).filter_map(of_class)).fold(0, i32::saturating_add)
     }
 
     /// The highest spell level any of the classes casts (-1 if none).
@@ -585,7 +607,68 @@ pub enum GearPlace {
     Carry(u16, u16),
 }
 
+/// How wide an inventory's grid is, and the most rows an item is taken to
+/// fill: [`GameData::inventory_size`]'s bounds.
+pub const INVENTORY_WIDTH: u16 = 10;
+const INVENTORY_ROWS: u16 = 255;
+
+/// Where an inventory's entry is in its grid (`Repos_PosX`, `Repos_Posy`),
+/// for [`place`]: a number below 0 (a file's INT of -1) is 0, as a place
+/// left out is.
+pub fn placed_at(entry: &Struct) -> (u32, u32) {
+    let at =
+        |label: &str| u32::try_from(entry.integer(label).unwrap_or(0).max(0)).unwrap_or(u32::MAX);
+    (at("Repos_PosX"), at("Repos_Posy"))
+}
+
+/// The first free place for a `w`×`h` item in an inventory grid
+/// `width` wide, row by row, among `taken` rectangles (x, y, w, h).
+///
+/// The rows looked at are the first and those just under a taken
+/// rectangle: the first free place is in one of them (a place free in a
+/// row and not in the row above is right under what was in its way), so
+/// a rectangle of any height costs one look, not a row at a time down
+/// its side. Where every such row is past what a place can be (rectangles
+/// down to the last row), the last row is given.
+pub fn place(taken: &[(u32, u32, u32, u32)], width: u32, w: u32, h: u32) -> (u32, u32) {
+    let width = width.max(1);
+    let w = w.clamp(1, width);
+    // (A place and a size are numbers a file gives: added in 64 bits, an
+    // item at the far end of what a field holds wraps onto no row.)
+    let end = |at: u32, size: u32| u64::from(at) + u64::from(size);
+    let free = |x: u32, y: u32| {
+        taken.iter().all(|&(tx, ty, tw, th)| {
+            end(x, w) <= u64::from(tx)
+                || end(tx, tw) <= u64::from(x)
+                || end(y, h) <= u64::from(ty)
+                || end(ty, th) <= u64::from(y)
+        })
+    };
+    let mut rows: Vec<u32> = std::iter::once(0)
+        .chain(taken.iter().filter_map(|&(_, ty, _, th)| u32::try_from(end(ty, th)).ok()))
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    (rows.into_iter())
+        .find_map(|y| (0..=width - w).find(|&x| free(x, y)).map(|x| (x, y)))
+        .unwrap_or((0, u32::MAX))
+}
+
 impl GameData {
+    /// The room a base item takes in an inventory's grid (baseitems.2da
+    /// `InvSlotWidth` by `InvSlotHeight`): 1 by 1 where the table says
+    /// nothing, and at most the grid's width across and 255 down, whatever
+    /// a hak's cell says. Both [`GameData::new_class_gear`] and edit-list
+    /// item placement read this bound and place items via [`place`].
+    pub fn inventory_size(&self, base_item: usize) -> (u16, u16) {
+        let table = self.table("baseitems").ok();
+        let cell = |column: &str, most: u16| {
+            let v = table.as_ref().and_then(|t| t.get_int(base_item, column)).unwrap_or(1);
+            v.clamp(1, i32::from(most)) as u16
+        };
+        (cell("InvSlotWidth", INVENTORY_WIDTH), cell("InvSlotHeight", INVENTORY_ROWS))
+    }
+
     /// The equipment a class new to the creature brings (its package's
     /// `Equip2DA`), as Aurora places it: an item goes to the first slot of
     /// its base item's `EquipableSlots` if that is free and it is a weapon,
@@ -601,27 +684,22 @@ impl GameData {
     ) -> Vec<(mg_core::ResRef, GearPlace)> {
         let Ok(base_items) = self.table("baseitems") else { return Vec::new() };
         let base_of = |s: &Struct| s.integer("BaseItem").and_then(|b| usize::try_from(b).ok());
-        let size = |b: usize| {
-            let n = |c: &str| base_items.get_int(b, c).unwrap_or(1).max(1) as u16;
-            (n("InvSlotWidth"), n("InvSlotHeight"))
-        };
+        let size = |b: usize| self.inventory_size(b);
         let mut used: u32 =
             creature.list("Equip_ItemList").unwrap_or(&[]).iter().fold(0, |m, e| m | e.id);
-        // The backpack's cells taken.
-        let mut taken: BTreeSet<(u16, u16)> = BTreeSet::new();
-        let occupy = |taken: &mut BTreeSet<(u16, u16)>, x: u16, y: u16, (w, h): (u16, u16)| {
-            for i in 0..w {
-                for j in 0..h {
-                    taken.insert((x + i, y + j));
-                }
-            }
-        };
+        // The backpack's occupied rectangles (x, y, w, h), at the rows the
+        // file gives (past row 255 too, where a builder put an item: read
+        // as row 255, as they once were, the gear went on top of it), and
+        // the gear placed so far.
+        let mut taken: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut given: Vec<(u32, u32, u32, u32)> = Vec::new();
         for e in creature.list("ItemList").unwrap_or(&[]) {
             let b = base_of(e)
                 .or_else(|| e.resref("InventoryRes").and_then(item).and_then(|i| base_of(&i)));
-            let at = |l: &str| e.integer(l).unwrap_or(0).clamp(0, 255) as u16;
             if let Some(b) = b {
-                occupy(&mut taken, at("Repos_PosX"), at("Repos_Posy"), size(b));
+                let (x, y) = placed_at(e);
+                let (w, h) = size(b);
+                taken.push((x, y, u32::from(w), u32::from(h)));
             }
         }
         let classes = self.table("classes").ok();
@@ -643,13 +721,9 @@ impl GameData {
             };
             let Some(bp) = item(res) else { continue };
             let Some(b) = base_of(&bp) else { continue };
-            let slots = base_items
-                .get(b, "EquipableSlots")
-                .and_then(|v| {
-                    u32::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16)
-                        .ok()
-                })
-                .unwrap_or(0);
+            // (A number as the game reads a cell, `0x` or not, as the
+            // inventory's slots read it: not always hexadecimal.)
+            let slots = base_items.get_int(b, "EquipableSlots").unwrap_or(0) as u32;
             let first = slots.isolate_lowest_one();
             // Weapons, shields, armour, helmets, ammunition, and creature
             // items (claws, bites, hides) for their slots.
@@ -661,16 +735,234 @@ impl GameData {
                 continue;
             }
             let (w, h) = size(b);
-            let fits =
-                |x: u16, y: u16| (0..w).all(|i| (0..h).all(|j| !taken.contains(&(x + i, y + j))));
-            let place = (0..200u16)
-                .flat_map(|y| (0..=10u16.saturating_sub(w)).map(move |x| (x, y)))
-                .find(|&(x, y)| fits(x, y));
-            if let Some((x, y)) = place {
-                occupy(&mut taken, x, y, (w, h));
-                out.push((res, GearPlace::Carry(x, y)));
+            let (w, h) = (u32::from(w), u32::from(h));
+            let width = u32::from(INVENTORY_WIDTH);
+            let all: Vec<_> = taken.iter().chain(&given).copied().collect();
+            let (mut x, mut y) = place(&all, width, w, h);
+            if u16::try_from(x).is_err() || u16::try_from(y).is_err() {
+                // No place a file's row can say (items carried down to the
+                // last row a WORD holds): placed as before the rows were
+                // kept, the carried items read as at most row 255, so the
+                // item is given, never dropped.
+                let near: Vec<_> = (taken.iter())
+                    .map(|&(tx, ty, tw, th)| (tx.min(255), ty.min(255), tw, th))
+                    .chain(given.iter().copied())
+                    .collect();
+                (x, y) = place(&near, width, w, h);
             }
+            let (cx, cy) = (u16::try_from(x).unwrap_or(0), u16::try_from(y).unwrap_or(u16::MAX));
+            given.push((u32::from(cx), u32::from(cy), w, h));
+            out.push((res, GearPlace::Carry(cx, cy)));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A class that prepares spells, whose gain table gives two billion
+    /// slots of each of two levels, whose bonus feats are two billion a
+    /// level, in a package with a spell of each level.
+    const TABLES: [(&str, &str); 9] = [
+        (
+            "classes",
+            "Label HitDie SkillPointBase Package PlayerClass SpellCaster MemorizesSpells \
+             SpellTableColumn SpellGainTable SpellcastingAbil BonusFeatsTable SavingThrowTable \
+             AttackBonusTable\n\
+             0 Mage 4 2147483647 0 1 1 1 Mage cls_spgn_mage INT cls_bfeat_mage cls_savthr_a \
+             cls_atk_a\n1 Brute 12 2 0 1 0 **** **** **** **** **** cls_savthr_a cls_atk_a\n",
+        ),
+        ("packages", "Label Attribute SpellPref2DA Equip2DA\n0 Mage INT packspmage packeqmage\n"),
+        ("cls_spgn_mage", "SpellLevel0 SpellLevel1\n0 2147483647 2147483647\n"),
+        ("cls_bfeat_mage", "Bonus\n0 2147483647\n"),
+        ("spells", "Label Mage\n0 Daze 0\n1 Sleep 1\n"),
+        ("packspmage", "SpellIndex\n0 0\n1 1\n"),
+        ("racialtypes", "Label FirstLevelSkillPointsMultiplier\n0 Human 2147483647\n"),
+        ("packeqmage", "Label\n0 big\n1 ring\n2 band\n3 **** \n"),
+        (
+            "baseitems",
+            "label InvSlotWidth InvSlotHeight EquipableSlots Category\n\
+             0 big 60000 60000 **** ****\n1 ring 1 1 16 1\n2 band 1 1 0x10 1\n",
+        ),
+    ];
+
+    /// The numbers of a hak's tables bound nothing: a spell gain cell of
+    /// two billion is as many spells as a level of a class is given at
+    /// most, not two billion structs; two billion bonus feats end where
+    /// there are none to take; and a creature's own numbers are held to
+    /// their fields.
+    #[test]
+    fn a_table_s_numbers_do_not_bound_the_work() {
+        let game = crate::test_game(&TABLES);
+        let mut creature = Struct::new(0);
+        creature.set("Str", Value::Int64(i64::MAX));
+        creature.set("Int", Value::Int(2_000_000_000));
+        creature.set("SkillPoints", Value::Int64(i64::MAX));
+        creature.set("SkillList", Value::List(vec![Struct::new(0)]));
+        let mut odd = Struct::new(1);
+        odd.set("Feat", Value::Int(70_000));
+        creature.set("FeatList", Value::List(vec![odd.clone()]));
+        let started = std::time::Instant::now();
+        let after = game.level_up(&creature, &[(0, 1)]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        let class = &after.list("ClassList").unwrap()[0];
+        for (label, spell) in [("MemorizedList0", 0), ("MemorizedList1", 1)] {
+            let list = class.list(label).unwrap();
+            assert_eq!(list.len(), MOST_SLOTS as usize, "{label}");
+            assert!(list.iter().all(|s| s.integer("Spell") == Some(spell)));
+        }
+        // (A feat entry that names none is kept as it was.)
+        assert_eq!(after.list("FeatList").unwrap(), [odd]);
+        assert_eq!(after.integer("Str"), Some(255));
+        assert_eq!(after.integer("SkillPoints"), Some(i64::from(u16::MAX)));
+        // A class of 32,767 levels in a file, and another level of it.
+        let mut entry = Struct::new(CLASS_ID);
+        entry.set("Class", Value::Int(1));
+        entry.set("ClassLevel", Value::Int64(i64::MAX));
+        let mut many = Struct::new(0);
+        many.set("ClassList", Value::List(vec![entry.clone(), entry]));
+        let after = game.level_up(&many, &[(1, 60)]);
+        assert_eq!(after.list("ClassList").unwrap().len(), 2);
+        assert_eq!(game.base_attack(&[(1, u32::MAX), (1, u32::MAX)]), 0);
+    }
+
+    /// A level whose gain cell is 0 is cast by bonus slots alone: a new
+    /// paladin's first spell level at Wisdom 14 has one spell, as Aurora's
+    /// Levelup Wizard gives it (`aurora_levelup.rs`, Paladin 4); a cell
+    /// of `****` none, and level 0 no bonus. (A cell of 0 gave none.)
+    #[test]
+    fn a_level_of_bonus_slots_alone_has_its_spells() {
+        let tables = |cell: &str| {
+            [
+                (
+                    "classes",
+                    "Label HitDie SkillPointBase Package PlayerClass SpellCaster \
+                     MemorizesSpells SpellTableColumn SpellGainTable SpellcastingAbil\n\
+                     0 Paladin 10 2 0 1 1 1 Paladin cls_spgn_pal WIS\n"
+                        .to_string(),
+                ),
+                ("packages", "Label Attribute SpellPref2DA\n0 Paladin WIS packsppal\n".into()),
+                (
+                    "cls_spgn_pal",
+                    format!("NumSpellLevels SpellLevel0 SpellLevel1\n0 2 **** {cell}\n"),
+                ),
+                ("spells", "Label Paladin\n0 Bless 1\n1 Light 0\n".into()),
+                ("packsppal", "SpellIndex\n0 0\n1 1\n".into()),
+                ("racialtypes", "Label FirstLevelSkillPointsMultiplier\n0 Human 1\n".into()),
+            ]
+        };
+        for (cell, wis, want) in [("0", 14, Some(vec![0])), ("****", 14, None), ("0", 11, None)] {
+            let owned = tables(cell);
+            let refs: Vec<(&str, &str)> = owned.iter().map(|(n, t)| (*n, t.as_str())).collect();
+            let game = crate::test_game(&refs);
+            let mut creature = Struct::new(0);
+            creature.set("Wis", Value::Byte(wis));
+            let after = game.level_up(&creature, &[(0, 1)]);
+            let class = &after.list("ClassList").unwrap()[0];
+            let spells = |label: &str| {
+                class
+                    .list(label)
+                    .map(|l| l.iter().filter_map(|s| s.integer("Spell")).collect::<Vec<_>>())
+            };
+            assert_eq!(spells("MemorizedList1"), want, "cell {cell}, Wisdom {wis}");
+            assert_eq!(spells("MemorizedList0"), None, "cell {cell}, Wisdom {wis}");
+        }
+    }
+
+    /// A base item 60,000 by 60,000 in a hak's table takes the room the
+    /// backpack's grid has across, not 3.6 billion cells; and
+    /// `EquipableSlots` is a number as the game reads a cell: `16` and
+    /// `0x10` are one slot (the first was read as hexadecimal, 0x16).
+    #[test]
+    fn a_new_class_s_gear_is_placed_by_what_a_cell_can_mean() {
+        let game = crate::test_game(&TABLES);
+        assert_eq!(game.inventory_size(0), (INVENTORY_WIDTH, INVENTORY_ROWS));
+        assert_eq!(game.inventory_size(1), (1, 1));
+        assert_eq!(game.inventory_size(99), (1, 1), "no such row");
+        let item = |r: mg_core::ResRef| {
+            let base = ["big", "ring", "band"].iter().position(|n| r.to_string() == *n)?;
+            let mut s = Struct::new(0);
+            s.set("BaseItem", Value::Int(base as i32));
+            Some(s)
+        };
+        let mut creature = Struct::new(0);
+        let mut held = Struct::new(0);
+        held.set("BaseItem", Value::Int(1));
+        held.set("Repos_PosX", Value::Word(0));
+        held.set("Repos_Posy", Value::Word(0));
+        creature.set("ItemList", Value::List(vec![held]));
+        let started = std::time::Instant::now();
+        let gear = game.new_class_gear(&creature, 0, &item);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        let places: Vec<(String, GearPlace)> =
+            gear.into_iter().map(|(r, at)| (r.to_string(), at)).collect();
+        // (The big one under the ring carried, as wide as the grid; the
+        // ring worn; the band, its slot taken, beside the first ring.)
+        let expected = [
+            ("big", GearPlace::Carry(0, 1)),
+            ("ring", GearPlace::Equip(16)),
+            ("band", GearPlace::Carry(1, 0)),
+        ];
+        assert_eq!(places, expected.map(|(name, at)| (name.to_string(), at)));
+        // A backpack whose first 255 rows are taken (one such item
+        // carried): the gear still finds room, under it. (Past row 200
+        // nothing was looked at, and the big one was not given.)
+        let mut full = Struct::new(0);
+        let mut carried = Struct::new(0);
+        carried.set("BaseItem", Value::Int(0));
+        full.set("ItemList", Value::List(vec![carried]));
+        let gear = game.new_class_gear(&full, 0, &item);
+        let places: Vec<(String, GearPlace)> =
+            gear.into_iter().map(|(r, at)| (r.to_string(), at)).collect();
+        let expected = [
+            ("big", GearPlace::Carry(0, 255)),
+            ("ring", GearPlace::Equip(16)),
+            ("band", GearPlace::Carry(0, 510)),
+        ];
+        assert_eq!(places, expected.map(|(name, at)| (name.to_string(), at)));
+        // An existing item placed past row 255 keeps its true row instead
+        // of clamping onto row 255, leaving row 255 free for a smaller item.
+        let mut high = Struct::new(0);
+        let mut at_0 = Struct::new(0);
+        at_0.set("BaseItem", Value::Int(0));
+        let mut at_300 = Struct::new(0);
+        at_300.set("BaseItem", Value::Int(1));
+        at_300.set("Repos_PosX", Value::Word(0));
+        at_300.set("Repos_Posy", Value::Word(300));
+        high.set("ItemList", Value::List(vec![at_0, at_300]));
+        let gear = game.new_class_gear(&high, 0, &item);
+        let places: Vec<(String, GearPlace)> =
+            gear.into_iter().map(|(r, at)| (r.to_string(), at)).collect();
+        let expected = [
+            ("big", GearPlace::Carry(0, 301)),
+            ("ring", GearPlace::Equip(16)),
+            ("band", GearPlace::Carry(0, 255)),
+        ];
+        assert_eq!(places, expected.map(|(name, at)| (name.to_string(), at)));
+        // A backpack carried full down past the last row a WORD holds:
+        // no place there, and the gear is still given (placed as it was
+        // before rows past 255 were kept), not dropped.
+        let mut deep = Struct::new(0);
+        let stack: Vec<Struct> = (0..=257u16)
+            .map(|i| {
+                let mut s = Struct::new(0);
+                s.set("BaseItem", Value::Int(0));
+                s.set("Repos_PosX", Value::Word(0));
+                s.set("Repos_Posy", Value::Word(i * 255));
+                s
+            })
+            .collect();
+        deep.set("ItemList", Value::List(stack));
+        let gear = game.new_class_gear(&deep, 0, &item);
+        let places: Vec<(String, GearPlace)> =
+            gear.into_iter().map(|(r, at)| (r.to_string(), at)).collect();
+        let expected = [
+            ("big", GearPlace::Carry(0, 510)),
+            ("ring", GearPlace::Equip(16)),
+            ("band", GearPlace::Carry(0, 765)),
+        ];
+        assert_eq!(places, expected.map(|(name, at)| (name.to_string(), at)));
     }
 }

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*"]
+# (Vendored crates patched below, which aren't Moonglow's to lint or
+# format.)
+exclude = ["vendor/winit", "vendor/egui_dock"]
 
 [workspace.package]
 # The release: the version of the two programs (apps/mg, apps/moonglow),
@@ -19,7 +22,9 @@ publish = false
 # Moonglow crates
 mg-2da = { path = "crates/mg-2da" }
 mg-area = { path = "crates/mg-area" }
-mg-audio = { path = "crates/mg-audio" }
+# (Without decoding by default, so that mg-module's Verify can tell what a
+# sound holds without Symphonia: mg-ui, the GUI and the corpus tests ask for it.)
+mg-audio = { path = "crates/mg-audio", default-features = false }
 mg-core = { path = "crates/mg-core" }
 mg-gff = { path = "crates/mg-gff" }
 mg-image = { path = "crates/mg-image" }
@@ -43,9 +48,12 @@ mg-shader = { path = "crates/mg-shader" }
 mg-set = { path = "crates/mg-set" }
 mg-ssf = { path = "crates/mg-ssf" }
 mg-testkit = { path = "crates/mg-testkit" }
+mg-testkit-gpu = { path = "crates/mg-testkit-gpu" }
 mg-tiles = { path = "crates/mg-tiles" }
 mg-tlk = { path = "crates/mg-tlk" }
 mg-ui = { path = "crates/mg-ui" }
+mg-uikit = { path = "crates/mg-uikit" }
+mg-update = { path = "crates/mg-update" }
 
 # Third party
 anyhow = "1"
@@ -92,16 +100,17 @@ rayon = "1"
 rars = { version = "0.12", default-features = false }
 rfd = "0.17"
 regex-lite = "0.1"
+# (Quick Open's search of the load order: already in the tree, by aho-corasick.)
+memchr = "2"
 # (eframe's settings file, read before the window opens: the version
 # eframe writes it with.)
 ron = "0.12"
 # (A project's command canceled: its shell's process group stopped, by
 # signals sent without `unsafe`. Already in the tree, by zbus.)
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
-ruzstd = "0.9"
-# (NWSync's data written at the levels ruzstd's encoder lacks: the reference
-# library's C, built from the sources zstd-sys ships, with cc; BSD. ruzstd
-# still reads.)
+# (Compressed resources read, and NWSync's data written at every level:
+# the reference library's C, built from the sources zstd-sys ships, with
+# cc; BSD. One library for both ways.)
 zstd = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -113,16 +122,27 @@ sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"
 # zero keys, what `DefaultHasher` is today, but fixed whatever the
 # toolchain. Already in the tree.)
 siphasher = "1"
+# (SHA-256, mg-core's: the CPU's SHA instructions where it has them,
+# found at run time (x86-64's SHA-NI, ARMv8's SHA2), software where it
+# hasn't; pure Rust, MIT or Apache-2.0. A 1.5 GB hak hashes in 0.6 s
+# with SHA-NI, where mg-core's own code took 3.6 s.)
+sha2 = { version = "0.11", default-features = false }
 # (A font's metrics for the NUI preview. epaint reads fonts with it too:
 # the version follows egui's.)
 skrifa = "0.44"
 rodio = { version = "0.22", default-features = false, features = ["playback"] }
 symphonia = { version = "0.6", default-features = false, features = ["adpcm", "mp3", "pcm", "wav"] }
 thiserror = "2"
-# (The GUI's check for a new release: one HTTPS request to GitHub, on a
-# thread. rustls with ring and webpki-roots' certificates, built in, so
-# that the AppImage and the Windows and macOS builds need nothing of the
-# system's; no gzip, no proxies of the registry. The CLI doesn't link it.)
+# (An update's verification: the release's SHA256SUMS signed with
+# minisign (MIT, pure Rust); the SHA-256 is mg-core's (sha2). The
+# signing crate is the tests' alone (mg-testkit's), with keys they make.)
+minisign-verify = "0.3"
+minisign = "0.10"
+# (The GUI's check for a new release and its download: HTTPS requests to
+# GitHub, on a thread (mg-update's `http`). rustls with ring and
+# webpki-roots' certificates, built in, so that the AppImage and the
+# Windows and macOS builds need nothing of the system's; no gzip, no
+# proxies of the registry. The CLI doesn't call it.)
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "1"
 # (Writing the project file's plugin tables in place, the rest of it as written.)
@@ -147,8 +167,11 @@ undocumented_unsafe_blocks = "warn"
 [profile.dev]
 debug = "line-tables-only"
 
+# Strip DWARF from third-party dependencies in dev/test builds: otherwise each
+# linked test executable embeds ~330 MB of duplicated dependency DWARF.
 [profile.dev.package."*"]
 opt-level = 2
+debug = 0
 
 [profile.test]
 opt-level = 1
@@ -160,3 +183,18 @@ inherits = "release"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# winit 0.30.13 with one change, on macOS: an event that comes while
+# another is being handled is kept and handled after it, where winit
+# panicked and the app aborted (rust-windowing/winit#3992). A native file
+# dialog runs its own loop inside Moonglow's frame, and resizing it (or a
+# drag from Finder over the window) brought such an event: a builder's
+# report, the Open dialog resized. Dropped once winit fixes it, or eframe
+# moves to a winit that has. `vendor/winit/MOONGLOW.md` says what changed.
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+# egui_dock 0.21.1 with two additions for the editor area (the main
+# surface's tab bars without the leaf buttons, the windows' with them, and
+# a call for the tab being dragged): `vendor/egui_dock/MOONGLOW.md` says
+# what changed, why and when to drop it.
+egui_dock = { path = "vendor/egui_dock" }

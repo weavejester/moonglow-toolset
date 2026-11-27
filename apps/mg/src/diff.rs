@@ -29,12 +29,59 @@ fn table(path: &Path, cp: Codepage) -> Result<TwoDa> {
     TwoDa::parse(&data, cp).with_context(|| path.display().to_string())
 }
 
-fn shown(cell: &Option<String>) -> String {
+/// `table` written as the file `like` is laid out (`TwoDa::to_bytes_like`:
+/// its columns in line or compact, their widths, its rows' labels, its
+/// tabs and line ends): a merge written like the table A it was made
+/// into, an update like the table B it is.
+fn written_like(table: &TwoDa, like: &Path, cp: Codepage) -> Result<Vec<u8>> {
+    let file = std::fs::read(like).with_context(|| like.display().to_string())?;
+    Ok(table.to_bytes_like(cp, &file)?)
+}
+
+pub(crate) fn shown_cell(cell: Option<&str>) -> String {
     match cell {
         None => "****".into(),
-        Some(v) if v.is_empty() || v.contains(' ') => format!("\"{v}\""),
-        Some(v) => v.clone(),
+        Some(v) if v.is_empty() || v.contains([' ', '\t']) => format!("\"{v}\""),
+        Some(v) => v.to_string(),
     }
+}
+
+pub(crate) fn truncate_ellipsis(s: String, max_chars: usize) -> String {
+    match s.chars().count() > max_chars {
+        true => s.chars().take(max_chars.saturating_sub(1)).chain(['…']).collect(),
+        false => s,
+    }
+}
+
+fn parse_ab_prefer<T>(prefer: Option<&str>, a: T, b: T) -> Result<T> {
+    match prefer {
+        None | Some("a") => Ok(a),
+        Some("b") => Ok(b),
+        Some(other) => bail!("--prefer a or b, not {other}"),
+    }
+}
+
+pub(crate) fn mark_unsettled(
+    out: &mut Output,
+    conflicts: usize,
+    prefer_given: bool,
+    set_written_null: bool,
+    note: impl FnOnce() -> String,
+) -> bool {
+    let unsettled = conflicts > 0 && !prefer_given;
+    out.json["merged"] = json!(!unsettled);
+    if unsettled {
+        out.failed = true;
+        if set_written_null {
+            out.json["written"] = json!(null);
+        }
+        out.note(note());
+    }
+    unsettled
+}
+
+fn shown(cell: &Option<String>) -> String {
+    shown_cell(cell.as_deref())
 }
 
 /// A row as people know it: its number and its label, if the table has
@@ -48,10 +95,18 @@ fn row_name(tables: &[&TwoDa], row: usize) -> String {
 }
 
 /// An edit file that sets `resource` to `table`, for `mg apply`.
-fn edit_file(resource: &str, table: &TwoDa, cp: Codepage, label: &str) -> Result<Value> {
+/// (`like`: the file the table is written like, its layout, widths, row
+/// labels and tabs kept.)
+fn edit_file(
+    resource: &str,
+    table: &TwoDa,
+    like: &Path,
+    cp: Codepage,
+    label: &str,
+) -> Result<Value> {
     let key = ResKey::from_filename(resource)
         .with_context(|| format!("{resource:?} is not a resource name like classes.2da"))?;
-    let data = table.to_bytes(cp)?;
+    let data = written_like(table, like, cp)?;
     let edit = mg_edit::Edit::SetResource { key, data: Some(data) };
     let command = mg_edit::Command::new(label, vec![edit]);
     Ok(mg_edit::wire::command_to_json(&command, cp)?)
@@ -111,8 +166,9 @@ pub(crate) fn twoda(args: &Args<'_>, cp: Codepage) -> Result<Output> {
         out.json["same"] = json!(d.is_empty());
         lines(&mut out, &d, &[&b, &a], "");
         if let Some(file) = args.changes {
-            let edits = edit_file(&resource, &b, cp, &format!("Update {resource}"))?;
-            std::fs::write(file, serde_json::to_string_pretty(&edits)? + "\n")?;
+            let edits = edit_file(&resource, &b, args.b, cp, &format!("Update {resource}"))?;
+            let text = serde_json::to_string_pretty(&edits)? + "\n";
+            crate::write_bytes_whole(file, text.as_bytes())?;
         }
         out.note(match d.is_empty() {
             true => "the tables are the same".to_string(),
@@ -121,11 +177,7 @@ pub(crate) fn twoda(args: &Args<'_>, cp: Codepage) -> Result<Output> {
         return Ok(out);
     };
     let base = table(base, cp)?;
-    let prefer = match args.prefer {
-        None | Some("a") => Prefer::Ours,
-        Some("b") => Prefer::Theirs,
-        Some(other) => bail!("--prefer a or b, not {other}"),
-    };
+    let prefer = parse_ab_prefer(args.prefer, Prefer::Ours, Prefer::Theirs)?;
     let merged = merge_tables(&base, &a, &b, prefer);
     let (ours, theirs) = (diff_tables(&base, &a), diff_tables(&base, &b));
     let mut out = Output::new(json!({
@@ -146,24 +198,23 @@ pub(crate) fn twoda(args: &Args<'_>, cp: Codepage) -> Result<Output> {
             shown(&c.theirs)
         ));
     }
-    let unsettled = !merged.conflicts.is_empty() && args.prefer.is_none();
-    out.json["merged"] = json!(!unsettled);
-    if unsettled {
-        out.failed = true;
-        out.note(format!(
+    if mark_unsettled(&mut out, merged.conflicts.len(), args.prefer.is_some(), false, || {
+        format!(
             "{} cells were changed by both, each to something else: nothing written (--prefer \
              a or b takes one side's)",
             merged.conflicts.len()
-        ));
+        )
+    }) {
         return Ok(out);
     }
     if let Some(file) = args.output {
-        std::fs::write(file, merged.table.to_bytes(cp)?)
-            .with_context(|| file.display().to_string())?;
+        crate::write_bytes_whole(file, &written_like(&merged.table, args.a, cp)?)?;
     }
     if let Some(file) = args.changes {
-        let edits = edit_file(&resource, &merged.table, cp, &format!("Merge {resource}"))?;
-        std::fs::write(file, serde_json::to_string_pretty(&edits)? + "\n")?;
+        let label = format!("Merge {resource}");
+        let edits = edit_file(&resource, &merged.table, args.a, cp, &label)?;
+        let text = serde_json::to_string_pretty(&edits)? + "\n";
+        crate::write_bytes_whole(file, text.as_bytes())?;
     }
     out.note(format!(
         "merged: {} cells from A, {} from B, {} changed by both",
@@ -194,11 +245,7 @@ fn line_shown(e: &Option<mg_tlk::TlkEntry>, cp: Codepage) -> String {
     match e {
         None => "(none)".into(),
         Some(e) => {
-            let text = cp.decode(&e.text).replace('\n', "\\n");
-            let text: String = match text.chars().count() > 70 {
-                true => text.chars().take(69).chain(['…']).collect(),
-                false => text,
-            };
+            let text = truncate_ellipsis(cp.decode(&e.text).replace('\n', "\\n"), 70);
             match e.sound_resref() {
                 Some(sound) => format!("\"{text}\" [{sound}]"),
                 None => format!("\"{text}\""),
@@ -252,7 +299,7 @@ pub(crate) fn tlk(args: &Args<'_>, cp: Codepage) -> Result<Output> {
         if let Some(file) = args.changes {
             let changed: Vec<u32> = d.iter().map(|c| c.line).collect();
             let text = serde_json::to_string_pretty(&lines_file(&b, &changed, cp))? + "\n";
-            std::fs::write(file, text).with_context(|| file.display().to_string())?;
+            crate::write_bytes_whole(file, text.as_bytes())?;
         }
         out.note(match d.is_empty() {
             true => "the tables are the same".to_string(),
@@ -261,11 +308,7 @@ pub(crate) fn tlk(args: &Args<'_>, cp: Codepage) -> Result<Output> {
         return Ok(out);
     };
     let base = talk(base)?;
-    let prefer_theirs = match args.prefer {
-        None | Some("a") => false,
-        Some("b") => true,
-        Some(other) => bail!("--prefer a or b, not {other}"),
-    };
+    let prefer_theirs = parse_ab_prefer(args.prefer, false, true)?;
     let (merged, conflicts) = mg_tlk::diff::merge(&base, &a, &b, prefer_theirs);
     let (ours, theirs) = (mg_tlk::diff::diff(&base, &a), mg_tlk::diff::diff(&base, &b));
     let mut out = Output::new(json!({
@@ -286,24 +329,22 @@ pub(crate) fn tlk(args: &Args<'_>, cp: Codepage) -> Result<Output> {
             line_shown(&c.theirs, cp)
         ));
     }
-    let unsettled = !conflicts.is_empty() && args.prefer.is_none();
-    out.json["merged"] = json!(!unsettled);
-    if unsettled {
-        out.failed = true;
-        out.note(format!(
+    if mark_unsettled(&mut out, conflicts.len(), args.prefer.is_some(), false, || {
+        format!(
             "{} lines were changed by both, each to something else: nothing written (--prefer a \
              or b takes one side's)",
             conflicts.len()
-        ));
+        )
+    }) {
         return Ok(out);
     }
     if let Some(file) = args.output {
-        std::fs::write(file, merged.to_bytes()?).with_context(|| file.display().to_string())?;
+        crate::write_bytes_whole(file, &merged.to_bytes()?)?;
     }
     if let Some(file) = args.changes {
         let changed: Vec<u32> = mg_tlk::diff::diff(&base, &merged).iter().map(|c| c.line).collect();
         let text = serde_json::to_string_pretty(&lines_file(&merged, &changed, cp))? + "\n";
-        std::fs::write(file, text).with_context(|| file.display().to_string())?;
+        crate::write_bytes_whole(file, text.as_bytes())?;
     }
     out.note(format!(
         "merged: {} lines from A, {} from B, {} changed by both",
@@ -314,35 +355,85 @@ pub(crate) fn tlk(args: &Args<'_>, cp: Codepage) -> Result<Output> {
     Ok(out)
 }
 
-/// `mg 2da-check`: tables held to their descriptions.
+/// A talk table's count of strings, from its file: a `.tlk`, or a
+/// nasher project's `.tlk.json`.
+fn talk_table_count(path: &Path, cp: Codepage) -> Result<usize> {
+    let data = std::fs::read(path).with_context(|| path.display().to_string())?;
+    let name = path.to_string_lossy().to_ascii_lowercase();
+    let tlk = match name.ends_with(".json") {
+        true => mg_tlk::json::from_json(&data, cp).map_err(|e| anyhow::anyhow!(e)),
+        false => mg_tlk::Tlk::read(&data).map_err(|e| anyhow::anyhow!(e.to_string())),
+    };
+    Ok(tlk.with_context(|| path.display().to_string())?.entries.len())
+}
+
+/// `mg 2da-check`: tables held to their descriptions. A custom string
+/// (16777216 and on) is held to `talk` (a talk table's file), else to the
+/// one talk table of the folder walked, if it has one; with neither, it
+/// is not looked up (and said so).
 pub(crate) fn check(
     paths: &[PathBuf],
     beside: Option<&Path>,
+    talk: Option<&Path>,
     game: Option<&mg_rules::GameData>,
     cp: Codepage,
 ) -> Result<Output> {
     use mg_module::doctor::TalkTables;
-    use mg_module::table_desc::{Beside, Description, path_beside};
-    let tlk = TalkTables {
-        base: game.map_or(0, |g| g.tlk().entries.len()),
-        custom: game.and_then(|g| g.custom_tlk().map(|t| t.entries.len())),
+    use mg_module::table_desc::{Beside, Description, find_for, game_description, path_beside};
+    let base = game.map_or(0, |g| g.tlk().entries.len());
+    let custom = match talk {
+        Some(path) => Some(talk_table_count(path, cp)?),
+        None => game.and_then(|g| g.custom_tlk().map(|t| t.entries.len())),
     };
     let mut tables = Vec::new();
     let (mut wrong, mut unread) = (0, 0);
     let mut out = Output::new(Value::Null);
     for path in paths {
-        // A folder: its described tables; a table: its own description,
-        // which it must have.
+        // A folder: its described tables; a table: its own description (or
+        // its family's), else Moonglow's of the game's table of its name.
         let (root, found) = if path.is_dir() {
             (path.clone(), Beside::of(path).described())
         } else {
-            let description = path_beside(path);
-            if !description.is_file() {
-                bail!("{} has no description ({})", path.display(), description.display());
-            }
+            let name = path.file_stem().map(|n| n.to_string_lossy().into_owned());
+            let description = find_for(path)
+                .or_else(|| game_description(name.as_deref()?).map(|_| PathBuf::new()));
+            let Some(description) = description else {
+                bail!(
+                    "{} has no description ({}, or a family's in its folder)",
+                    path.display(),
+                    path_beside(path).display()
+                );
+            };
             (Beside::root_of(path), vec![(path.clone(), description)])
         };
         let files = Beside::of(beside.unwrap_or(&root));
+        // The talk table its custom strings are held to: the one asked
+        // for, the game's module's, else the folder's own if it has one.
+        let custom = custom.or_else(|| {
+            let tables: Vec<&PathBuf> = files
+                .files()
+                .iter()
+                .filter(|p| {
+                    let n = p.to_string_lossy().to_ascii_lowercase();
+                    n.ends_with(".tlk") || n.ends_with(".tlk.json")
+                })
+                .collect();
+            let [one] = tables[..] else { return None };
+            let count = talk_table_count(one, cp).ok()?;
+            out.note(format!("custom strings are held to {} ({count} strings)", one.display()));
+            Some(count)
+        });
+        let tlk = TalkTables {
+            base,
+            // (None known: a custom string is not looked up.)
+            custom: Some(custom.unwrap_or(TalkTables::UNCOUNTED)),
+        };
+        if custom.is_none() {
+            out.note(
+                "no talk table: custom strings (16777216 and on) are not looked up (--tlk FILE \
+                 names one)",
+            );
+        }
         let script = |name: &str| {
             let key = ResKey::from_filename(&format!("{name}.nss"))?;
             files.script(name).or_else(|| Some(game?.resman.get(&key).ok()?.into_owned()))
@@ -353,9 +444,26 @@ pub(crate) fn check(
         for (table_path, description_path) in found {
             let name = table_path.display().to_string();
             let t = table(&table_path, cp)?;
-            let source = std::fs::read_to_string(&description_path)
-                .with_context(|| description_path.display().to_string())?;
-            let d = match Description::parse(&source, &script) {
+            // (No file: Moonglow's description of the game's table.)
+            let ours = description_path.as_os_str().is_empty();
+            let stem = table_path.file_stem().map(|n| n.to_string_lossy().into_owned());
+            let source = match ours {
+                true => game_description(stem.as_deref().unwrap_or_default())
+                    .unwrap_or_default()
+                    .to_string(),
+                false => std::fs::read_to_string(&description_path)
+                    .with_context(|| description_path.display().to_string())?,
+            };
+            let description_path = match ours {
+                true => PathBuf::from(format!(
+                    "Moonglow's description of the game's {}.2da",
+                    stem.as_deref().unwrap_or_default()
+                )),
+                false => description_path,
+            };
+            // (Read as the 2DA editor does: each column or rule that can't
+            // be read is said by its line, and the others are checked.)
+            let d = match Description::read(&source, &script) {
                 Ok(d) => d,
                 Err(e) => {
                     unread += 1;
@@ -368,7 +476,19 @@ pub(crate) fn check(
                     continue;
                 }
             };
-            let faults = d.faults(&t, &rows_of, tlk);
+            unread += d.mistakes.len();
+            for mistake in &d.mistakes {
+                out.line(format!("{}: not read: {mistake}", description_path.display()));
+            }
+            let mut faults = d.faults(&t, &rows_of, tlk);
+            // (Moonglow's description of a game's table: a cell as the
+            // game's own copy has it is the game's, not the builder's.)
+            if ours && let Some(base) = stem.as_deref().and_then(|n| game?.table(n).ok()) {
+                faults.retain(|f| {
+                    let column = &t.columns()[f.column];
+                    base.get(f.row, column) != t.cell(f.row, f.column)
+                });
+            }
             let missing = d.missing_columns(&t);
             wrong += faults.len();
             out.line(match faults.len() {
@@ -380,7 +500,8 @@ pub(crate) fn check(
                 let column = &t.columns()[f.column];
                 out.line(format!("  {}, {column}: {}", row_name(&[&t], f.row), f.message));
             }
-            for note in &d.notes {
+            let notes: Vec<&String> = d.notes.iter().filter(|n| !d.mistakes.contains(n)).collect();
+            for note in &notes {
                 out.note(format!("{}: {note}", description_path.display()));
             }
             if !missing.is_empty() {
@@ -397,7 +518,8 @@ pub(crate) fn check(
                     "message": f.message,
                 })).collect::<Vec<_>>(),
                 "missing_columns": missing,
-                "notes": d.notes,
+                "mistakes": d.mistakes,
+                "notes": notes,
             }));
         }
     }
@@ -407,4 +529,21 @@ pub(crate) fn check(
     out.json = json!({ "tables": tables, "wrong": wrong, "unread": unread });
     out.failed = wrong > 0 || unread > 0;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shown_cell;
+
+    /// How a cell is shown in the text of a diff: a missing one as `****`,
+    /// and one that is empty or holds a space or a tab (which would read as
+    /// two cells) in quotes.
+    #[test]
+    fn a_cell_is_quoted_where_it_would_read_as_two() {
+        assert_eq!(shown_cell(None), "****");
+        assert_eq!(shown_cell(Some("")), "\"\"");
+        assert_eq!(shown_cell(Some("a b")), "\"a b\"");
+        assert_eq!(shown_cell(Some("a\tb")), "\"a\tb\"");
+        assert_eq!(shown_cell(Some("plain")), "plain");
+    }
 }

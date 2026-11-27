@@ -20,9 +20,6 @@
 //! patch of surface: they overlap, or a flat one lies on a face of the
 //! other. Boxes that only touch do not meet: tiles lie edge to edge.
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
-
 use glam::Vec3;
 
 /// What draws must share to be one draw: the mesh (its address), its
@@ -73,48 +70,10 @@ const WIDE: i64 = 16;
 /// draw is taken to meet one of them.
 const TRIED: usize = 48;
 
-/// A hash for the squares and the keys (small numbers, looked up for every
-/// draw: the standard one costs more than the rest of placing a draw).
-#[derive(Default)]
-struct Mix(u64);
-
-impl Hasher for Mix {
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.write_u64(u64::from_le_bytes(word));
-        }
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.write_u64(u64::from(n));
-    }
-
-    fn write_i32(&mut self, n: i32) {
-        self.write_u64(n as u64);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.write_u64(n as u64);
-    }
-
-    fn write_u8(&mut self, n: u8) {
-        self.write_u64(u64::from(n));
-    }
-
-    fn finish(&self) -> u64 {
-        // (The table takes its place from the low bits, which the
-        // multiplication leaves the weakest.)
-        self.0 ^ (self.0 >> 29)
-    }
-}
-
-type Mixed<K, V> = HashMap<K, V, BuildHasherDefault<Mix>>;
+/// The squares and the keys (small numbers, looked up for every draw: the
+/// standard hash costs more than the rest of placing a draw) by the
+/// renderer's quick hasher.
+type Mixed<K, V> = crate::game::Fast<K, V>;
 
 /// A batch's place in the order of draws: its run, and its place in the
 /// run (as one number, the run's in the high half).
@@ -125,9 +84,10 @@ fn place_of(run: u32, index: u32) -> Place {
 }
 
 /// What draws must share to be drawn one after another without binding
-/// anything anew (their pipeline and their material): batches of one such
-/// state are put in a run, where they can be.
-pub(crate) type State = (u32, u32);
+/// anything anew (their pipeline, their material, and the chunk of
+/// buffers their meshes lie in, `pool.rs`): batches of one such state
+/// are put in a run, where they can be.
+pub(crate) type State = (u32, u32, u32);
 
 /// A draw placed: its batch's place, when it was placed (the count of the
 /// pass's draws before it), its box.
@@ -182,6 +142,10 @@ pub(crate) struct Batcher {
     wide: Vec<Placed>,
     /// The latest place of the pass's draws.
     top: Place,
+    /// Scratch buffers reused across frames by [`Batcher::in_order_into`].
+    first_scratch: Vec<u32>,
+    rank_scratch: Vec<u32>,
+    cursor_scratch: Vec<u32>,
 }
 
 impl std::fmt::Debug for Batcher {
@@ -240,8 +204,10 @@ impl Batcher {
         };
         let ((c0, c1), (r0, r1)) =
             (along(bounds.min.x, bounds.max.x), along(bounds.min.y, bounds.max.y));
-        let count = (i64::from(c1) - i64::from(c0) + 1) * (i64::from(r1) - i64::from(r0) + 1);
-        (count <= WIDE).then_some((c0, r0, c1, r1))
+        // (Each way first: a box from one end of the numbers to the other
+        // is 2^32 squares each way, whose product is past an `i64`.)
+        let (across, down) = (i64::from(c1) - i64::from(c0) + 1, i64::from(r1) - i64::from(r0) + 1);
+        (across <= WIDE && down <= WIDE && across * down <= WIDE).then_some((c0, r0, c1, r1))
     }
 
     /// Whether a draw with `bounds` meets one placed (since `since`, of
@@ -376,35 +342,83 @@ impl Batcher {
     }
 
     /// The draws in the order they are drawn in, batch by batch (each
-    /// batch's draws in the order they came in), from the batch each draw
-    /// was placed in: where each batch's draws begin (and, last, where
-    /// they end), and the draws.
+    /// batch's draws in the order they came in), written into `starts`
+    /// and `order` reusing `self`'s internal scratch buffers.
+    pub(crate) fn in_order_into(
+        &mut self,
+        batch_of: &[u32],
+        starts: &mut Vec<u32>,
+        order: &mut Vec<u32>,
+    ) {
+        fill_order(
+            &self.runs,
+            &self.places,
+            &self.sizes,
+            batch_of,
+            &mut self.first_scratch,
+            &mut self.rank_scratch,
+            &mut self.cursor_scratch,
+            starts,
+            order,
+        );
+    }
+
+    /// Convenience allocating wrapper used by tests.
+    #[cfg(test)]
     pub(crate) fn in_order(&self, batch_of: &[u32]) -> (Vec<u32>, Vec<u32>) {
-        // (Each batch's place in the order: its run's first, and its place
-        // in the run.)
-        let mut first = Vec::with_capacity(self.runs.len());
-        let mut n = 0;
-        for &(batches, _) in &self.runs {
-            first.push(n);
-            n += batches;
-        }
-        let rank: Vec<u32> =
-            self.places.iter().map(|&p| first[(p >> 32) as usize] + p as u32).collect();
-        let mut starts = vec![0u32; self.places.len() + 1];
-        for (b, &size) in self.sizes.iter().enumerate() {
-            starts[rank[b] as usize + 1] = size;
-        }
-        for b in 1..starts.len() {
-            starts[b] += starts[b - 1];
-        }
-        let mut next = starts.clone();
-        let mut order = vec![0u32; batch_of.len()];
-        for (draw, &b) in batch_of.iter().enumerate() {
-            let r = rank[b as usize] as usize;
-            order[next[r] as usize] = draw as u32;
-            next[r] += 1;
-        }
+        let (mut first, mut rank, mut cursor) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut starts, mut order) = (Vec::new(), Vec::new());
+        fill_order(
+            &self.runs,
+            &self.places,
+            &self.sizes,
+            batch_of,
+            &mut first,
+            &mut rank,
+            &mut cursor,
+            &mut starts,
+            &mut order,
+        );
         (starts, order)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_order(
+    runs: &[(u32, u32)],
+    places: &[Place],
+    sizes: &[u32],
+    batch_of: &[u32],
+    first: &mut Vec<u32>,
+    rank: &mut Vec<u32>,
+    cursor: &mut Vec<u32>,
+    starts: &mut Vec<u32>,
+    order: &mut Vec<u32>,
+) {
+    first.clear();
+    let mut n = 0;
+    for &(batches, _) in runs {
+        first.push(n);
+        n += batches;
+    }
+    rank.clear();
+    rank.extend(places.iter().map(|&p| first[(p >> 32) as usize] + p as u32));
+    starts.clear();
+    starts.resize(places.len() + 1, 0);
+    for (b, &size) in sizes.iter().enumerate() {
+        starts[rank[b] as usize + 1] = size;
+    }
+    for b in 1..starts.len() {
+        starts[b] += starts[b - 1];
+    }
+    cursor.clear();
+    cursor.extend_from_slice(starts);
+    order.clear();
+    order.resize(batch_of.len(), 0);
+    for (draw, &b) in batch_of.iter().enumerate() {
+        let r = rank[b as usize] as usize;
+        order[cursor[r] as usize] = draw as u32;
+        cursor[r] += 1;
     }
 }
 
@@ -534,6 +548,33 @@ mod tests {
         assert!(later > fourth);
     }
 
+    /// A box from one end of the numbers to the other (two stray vertices,
+    /// a transform with a huge scale) is on too many squares to count by
+    /// multiplying: it is kept with the wide ones, and what meets it
+    /// keeps its order.
+    #[test]
+    fn a_box_over_every_square_is_a_wide_one() {
+        let mut b = Batcher::default();
+        b.begin();
+        b.pass(10.0, 1e-3);
+        let floor = (1, 0, 0, None);
+        let first = b.place(floor, None, Some(cube(0.0, 0.0, 0.0, 10.0, 0.0)), None);
+        for (min, max) in [
+            ([-1e30, -1e30, 0.0], [1e30, 1e30, 1.0]),
+            // (2^32 squares one way and 2^31 the other.)
+            ([-1e30, 0.0, 0.0], [1e30, 1e30, 1.0]),
+            ([-3e10, -3e10, 0.0], [3e10, 3e10, 0.0]),
+        ] {
+            let huge = slab(min, max);
+            assert_eq!(b.squares_of(&huge), None, "{min:?}");
+            let stray = b.place((2, 1, 0, None), None, Some(huge), None);
+            // A floor it lies across comes after it, as it came.
+            let second = b.place(floor, None, Some(cube(20.0, 0.0, 0.0, 10.0, 0.0)), None);
+            assert!(first < stray && stray < second, "{first} {stray} {second}");
+        }
+        assert_eq!(b.used, 2, "the squares of the floors alone");
+    }
+
     /// However draws lie: each is in one batch with draws of its key, and
     /// any two that meet (or of which one has no bounds, or which are one
     /// model's in a pass that keeps a model's order, or which are of two
@@ -591,8 +632,8 @@ mod tests {
                             Some(Bounds { min, max: min + size })
                         }
                     };
-                    // (A key's state: its material, and a third of its mesh.)
-                    let state = runs.then_some((key.1, (key.0 % 3) as u32));
+                    // (A key's state: its material, a third of its mesh, its chunk.)
+                    let state = runs.then_some((key.1, (key.0 % 3) as u32, (key.0 % 2) as u32));
                     let batch = b.place(key, state, bounds, if runs { None } else { last });
                     last = Some(batch);
                     draws.push((key, bounds, model, pass));
@@ -648,7 +689,7 @@ mod tests {
             let mesh = i % 4;
             let key = (mesh, mesh as u32 % 2, 0, None);
             let bounds = Some(slab([x, y, 0.0], [x + 0.1, y + 0.1, 0.0]));
-            placed.push(b.place(key, Some((0, mesh as u32 % 2)), bounds, None));
+            placed.push(b.place(key, Some((0, mesh as u32 % 2, 0)), bounds, None));
         }
         // One batch a mesh, the two states' batches in a row each.
         assert_eq!(b.batches(), 4);
@@ -662,9 +703,42 @@ mod tests {
         let over = Some(slab([0.0, 0.0, 0.0], [0.1, 0.1, 0.0]));
         let mut placed = Vec::new();
         for i in 0..8usize {
-            placed.push(b.place((i % 2, 0, 0, None), Some((0, (i % 2) as u32)), over, None));
+            placed.push(b.place((i % 2, 0, 0, None), Some((0, (i % 2) as u32, 0)), over, None));
         }
         assert_eq!(b.batches(), 8);
+        let (_, order) = b.in_order(&placed);
+        assert_eq!(order, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// Meshes of one pipeline and material in two chunks, in turn: those
+    /// that meet nothing are drawn chunk by chunk (their buffers bound
+    /// once a chunk, not at every other draw); those over one another as
+    /// they came, whatever their chunks.
+    #[test]
+    fn see_through_draws_of_a_material_are_drawn_by_chunk_where_they_meet_nothing() {
+        let mut b = Batcher::default();
+        b.begin();
+        b.pass(0.125, 0.0001);
+        let mut placed = Vec::new();
+        for i in 0..64 {
+            let (x, y) = ((i % 8) as f32 * 0.2 - 0.9, (i / 8) as f32 * 0.2 - 0.9);
+            let mesh = i % 4;
+            let chunk = mesh as u32 % 2;
+            let bounds = Some(slab([x, y, 0.0], [x + 0.1, y + 0.1, 0.0]));
+            placed.push(b.place((mesh, 7, 0, None), Some((0, 7, chunk)), bounds, None));
+        }
+        let (starts, order) = b.in_order(&placed);
+        let chunks: Vec<usize> =
+            starts[..4].iter().map(|&s| order[s as usize] as usize % 4 % 2).collect();
+        assert_eq!(chunks, [0, 0, 1, 1]);
+        let mut b = Batcher::default();
+        b.begin();
+        b.pass(0.125, 0.0001);
+        let over = Some(slab([0.0, 0.0, 0.0], [0.1, 0.1, 0.0]));
+        let mut placed = Vec::new();
+        for i in 0..8usize {
+            placed.push(b.place((i % 2, 7, 0, None), Some((0, 7, (i % 2) as u32)), over, None));
+        }
         let (_, order) = b.in_order(&placed);
         assert_eq!(order, [0, 1, 2, 3, 4, 5, 6, 7]);
     }

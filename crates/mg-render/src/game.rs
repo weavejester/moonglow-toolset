@@ -11,10 +11,10 @@
 //!   has no data for (`vColor`, the engine's baked static light, with
 //!   `staticLighting` 0) read zeros from a buffer of their own.
 //! - **Varyings** are matched by name ([`Program::link_inputs`]).
-//! - **Bind groups**: the vertex program's resources in group 0, the
-//!   fragment program's in group 1 (each binds its own uniform block at
-//!   binding 0), each block at a dynamic offset into one buffer of the
-//!   frame's blocks.
+//! - **Bind groups**: group 0 holds the shared draw/light/order storage buffers
+//!   ([`DRAW_GROUP`]), group 1 holds skinned bone uniforms and framebuffer
+//!   textures ([`BONES_GROUP`]), and groups 2 and 3 hold the vertex and fragment
+//!   stages' per-material frame blocks and textures ([`STAGE_GROUPS`]).
 //! - **The uniform contract**: every member of a block is filled by name
 //!   from what the renderer has ([`key`]); names it doesn't know are an
 //!   MTR `parameter` of that name, else zero.
@@ -182,6 +182,10 @@ pub(crate) enum Key {
     ModuleDay,
     ModuleMonth,
     ModuleYear,
+    /// `scriptableVec1` to `scriptableVec16` (0 to 15), which a script
+    /// sets for a player (`SetShaderUniformVec`): the scene's
+    /// ([`crate::scene::Environment::scriptable`]).
+    ScriptableVec(usize),
     // The camera, and the player at its focus.
     CameraPosition,
     CameraFocus,
@@ -207,6 +211,10 @@ pub(crate) enum Key {
     /// shader's own (`fSwaySpeed`); and every name the contract doesn't
     /// know.
     Param(String),
+    /// [`Key::Param`] of a uniform its program declares with a value
+    /// (`uniform float rowHair = 0.172363;`): the MTR's, else that one,
+    /// as OpenGL keeps it in the client ([`mg_shader::uniform_defaults`]).
+    ParamOr(String, MtrParam),
 }
 
 /// The contract (`docs/shaders-proposal.md`, "The uniform contract"):
@@ -278,7 +286,10 @@ pub(crate) fn key(name: &str) -> Key {
             Some(n) if n.parse::<u8>().is_ok_and(|n| n <= 15) => {
                 TextureBound(n.parse().unwrap_or_default())
             }
-            _ => Param(name.to_string()),
+            _ => match name.strip_prefix("scriptableVec").and_then(|n| n.parse::<usize>().ok()) {
+                Some(n @ 1..=16) => ScriptableVec(n - 1),
+                _ => Param(name.to_string()),
+            },
         },
     }
 }
@@ -307,6 +318,8 @@ enum Own {
     Mvp,
     M,
     Normal,
+    Texture,
+    Skinmesh,
     Ambient,
     Diffuse,
     Emissive,
@@ -322,6 +335,8 @@ impl Own {
             Key::Mvp if mat4 => Own::Mvp,
             Key::M if mat4 => Own::M,
             Key::Normal if mat4 => Own::Normal,
+            Key::TextureMatrix if mat4 => Own::Texture,
+            Key::Skinmesh if m.count.is_none() && m.ty == ValueType::Int => Own::Skinmesh,
             Key::MaterialAmbient if vec4 => Own::Ambient,
             Key::MaterialDiffuse if vec4 => Own::Diffuse,
             Key::MaterialEmissive if vec4 => Own::Emissive,
@@ -343,6 +358,8 @@ fn fill_own(own: &[(Own, Member, Key)], f: &FrameValues, d: &DrawValues<'_>, out
                 let normal = model_view().inverse().transpose();
                 put_floats(out, m.offset, &normal.to_cols_array());
             }
+            Own::Texture => put_floats(out, m.offset, &d.texture_matrix.to_cols_array()),
+            Own::Skinmesh => put(out, m.offset, i32::from(!d.bones.is_empty()).to_le_bytes()),
             Own::Ambient => put_floats(out, m.offset, &d.ambient),
             Own::Diffuse => put_floats(out, m.offset, &d.diffuse),
             Own::Emissive => put_floats(out, m.offset, &d.emissive),
@@ -353,8 +370,30 @@ fn fill_own(own: &[(Own, Member, Key)], f: &FrameValues, d: &DrawValues<'_>, out
 
 impl Plan {
     pub(crate) fn new(block: &UniformBlock) -> Plan {
+        Plan::declared(block, &[])
+    }
+
+    /// [`Plan::new`] of a program that declares some of its uniforms
+    /// with values (`declared`, [`mg_shader::Program::defaults`]): those
+    /// hold them where the MTR gives none ([`Key::ParamOr`]).
+    pub(crate) fn declared(
+        block: &UniformBlock,
+        declared: &[(String, mg_shader::UniformDefault)],
+    ) -> Plan {
+        let keyed = |m: &Member| match key(&m.name) {
+            Key::Param(name) => match declared.iter().find(|(n, _)| *n == name) {
+                Some((_, mg_shader::UniformDefault::Float(v))) => {
+                    Key::ParamOr(name, MtrParam::Float(v.clone()))
+                }
+                Some((_, mg_shader::UniformDefault::Int(i))) => {
+                    Key::ParamOr(name, MtrParam::Int(*i))
+                }
+                None => Key::Param(name),
+            },
+            k => k,
+        };
         let members: Vec<(Member, Key)> =
-            block.members.iter().map(|m| (m.clone(), key(&m.name))).collect();
+            block.members.iter().map(|m| (m.clone(), keyed(m))).collect();
         let (material, own): (Vec<_>, Vec<_>) = members.iter().cloned().partition(|(_, k)| {
             matches!(
                 k,
@@ -364,6 +403,7 @@ impl Plan {
                     | Key::TexEnvBound
                     | Key::TexEnvCubeBound
                     | Key::Param(_)
+                    | Key::ParamOr(..)
             )
         });
         let own = own.into_iter().map(|(m, k)| (Own::of(&m, &k), m, k)).collect();
@@ -466,6 +506,13 @@ pub(crate) struct DrawValues<'a> {
     pub(crate) blend_mode: i32,
     /// A particle's `particleSoftness` (0: no fade).
     pub(crate) particle_softness: f32,
+}
+
+impl DrawValues<'_> {
+    /// Its MTR's parameter of this name (any case).
+    fn param(&self, name: &str) -> Option<&MtrParam> {
+        self.params.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, p)| p)
+    }
 }
 
 /// A value to write.
@@ -581,6 +628,7 @@ fn value<'a>(key: &Key, f: &FrameValues, d: &DrawValues<'a>, mv: &mut Option<Mat
         ModuleDay => Val::I(f.environment.clock.day as i32),
         ModuleMonth => Val::I(f.environment.clock.month as i32),
         ModuleYear => Val::I(f.environment.clock.year as i32),
+        ScriptableVec(n) => Val::V(f.environment.scriptable[*n]),
         CameraPosition => Val::V(v3(f.eye, 0.0)),
         CameraFocus => Val::V(v3(f.target, 0.0)),
         CameraPitch => Val::F(f.derived.pitch),
@@ -594,14 +642,17 @@ fn value<'a>(key: &Key, f: &FrameValues, d: &DrawValues<'a>, mv: &mut Option<Mat
         AreaWeatherDensity => Val::F(f.environment.weather_density),
         BlendMode => Val::I(d.blend_mode),
         ParticleSoftness => Val::F(d.particle_softness),
-        Param(name) => match d.params.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
-            Some((_, MtrParam::Int(i))) => Val::I(*i),
-            Some((_, MtrParam::Float(v))) if v.len() == 1 => Val::F(v[0]),
-            Some((_, MtrParam::Float(v))) => {
-                Val::V(std::array::from_fn(|i| v.get(i).copied().unwrap_or(0.0)))
-            }
-            None => Val::Zero,
-        },
+        Param(name) => d.param(name).map_or(Val::Zero, param_value),
+        ParamOr(name, declared) => param_value(d.param(name).unwrap_or(declared)),
+    }
+}
+
+/// An MTR parameter's value (or a uniform's declared one).
+fn param_value(p: &MtrParam) -> Val<'static> {
+    match p {
+        MtrParam::Int(i) => Val::I(*i),
+        MtrParam::Float(v) if v.len() == 1 => Val::F(v[0]),
+        MtrParam::Float(v) => Val::V(std::array::from_fn(|i| v.get(i).copied().unwrap_or(0.0))),
     }
 }
 
@@ -617,9 +668,13 @@ pub(crate) fn time_values(seconds: f32) -> (i32, i32) {
 /// clock counts 60 a second.
 pub(crate) const TIME_FRAMES_PER_SECOND: f64 = 60.0;
 /// `worldtimerTimeOfDay` counts real milliseconds (measured likewise;
-/// whatever the module's minutes an hour). Its origin in the client
-/// follows neither the module's hour nor its day and is not known: the
-/// stock and TDoD shaders use it as a phase or as seconds.
+/// whatever the module's minutes an hour). Its origin in the client is
+/// known (`docs/findings.md`, "The client's clock starts from the
+/// machine's"): 23:59:56 of a day of 5 minutes an hour, in steps of two
+/// hours of the machine's uptime, whatever the module's hour or day, so a
+/// player's machine decides it. Moonglow's starts at 0 by design
+/// ([`time_values`]): the stock and TDoD shaders use it as a phase or as
+/// seconds.
 pub(crate) const TIME_TIMER_PER_SECOND: f64 = 1000.0;
 
 fn put(out: &mut [u8], at: u32, bytes: [u8; 4]) {
@@ -818,7 +873,7 @@ pub(crate) fn unit(name: &str) -> Unit {
 /// written once a frame for every draw of the program (the
 /// projection, the fog, the clock, the camera, the area; and what the
 /// contract leaves zero, the wind sources' arrays among them).
-pub(crate) fn part(m: &Member) -> Part {
+pub fn part(m: &Member) -> Part {
     use Key::*;
     match key(&m.name) {
         Mv | Mvp | M | Normal | TextureMatrix | Skinmesh | BboxMin | BboxMax | MaterialAmbient
@@ -828,17 +883,22 @@ pub(crate) fn part(m: &Member) -> Part {
         Bones => Part::Bones,
         Param(name) if unfilled(&name) => Part::Frame,
         // (An MTR's parameter is one value, a float, a vector or an int:
-        // an array or a matrix of a name the contract doesn't know is
-        // zero for every draw.)
-        Param(_) if m.count.is_none() && !matches!(m.ty, ValueType::Matrix(..)) => Part::Draw,
+        // an array, a matrix or a struct of a name the contract doesn't
+        // know is zero for every draw.)
+        Param(_)
+            if m.count.is_none() && !matches!(m.ty, ValueType::Matrix(..) | ValueType::Struct) =>
+        {
+            Part::Draw
+        }
         _ => Part::Frame,
     }
 }
 
 /// The engine's uniforms the contract leaves zero (`staticLighting`, as
 /// Moonglow has no baked light, and as the client has it for every mesh
-/// at fragment lighting; the target, scriptable, keyhole and wind
-/// sources' values): the same for every draw, so the frame's, not looked
+/// at fragment lighting; the target, keyhole and wind sources' values,
+/// and the scriptable floats and ints: [`Key::ScriptableVec`] alone has a
+/// source): the same for every draw, so the frame's, not looked
 /// up as an MTR's parameter for each.
 fn unfilled(name: &str) -> bool {
     matches!(
@@ -869,8 +929,8 @@ const DRAW_GROUP: u32 = 0;
 const BONES_GROUP: u32 = 1;
 const STAGE_GROUPS: [u32; 2] = [2, 3];
 
-/// The storage buffers of group 2: the variable's name, the stage, the
-/// binding.
+/// The storage buffers of group 0 (`DRAW_GROUP`): the variable's name, the
+/// stage, the binding.
 const STORAGE: [(&str, usize, u32); 7] = [
     (mg_shader::ORDER, 0, 0),
     (mg_shader::DRAWS, 0, 1),
@@ -916,6 +976,52 @@ fn fb_layout_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
     ]
 }
 
+/// Group 1's binding of the shadows' mask ([`crate::shadow::Mask`]), after
+/// the framebuffer's copies: read by a see-through mesh's soft part
+/// ([`GamePass::Fringe`]) drawn after the shadows are laid.
+const MASK_BINDING: u32 = FB_BINDING + 4;
+
+/// The shadows' mask's entry of group 1's layout.
+fn mask_layout_entry() -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: MASK_BINDING,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// The shadows' mask this frame's soft parts read
+/// ([`GameShaders::set_mask`]): its number, its view, and the view's
+/// copies it is kept for (`None`: the draws without copies).
+#[derive(Debug, Clone)]
+pub(crate) struct MaskView {
+    pub(crate) id: u64,
+    pub(crate) view: wgpu::TextureView,
+    pub(crate) of: Option<u64>,
+}
+
+/// What a pipeline's group 1 made for the frame binds: the copies' number
+/// and the mask's (0: white), and the view the mask is kept for.
+type FrameKey = (u64, u64, Option<u64>);
+
+/// What a pipeline's group 1 is made of ([`GamePipeline::layouts`]'s
+/// last): each stage's bones block (its binding and size), whether it
+/// holds the framebuffer's copies and the shadows' mask, and the frame's
+/// copies and mask it binds (`None`: white for both). Pipelines of one
+/// key share one group: their layouts are one to wgpu, which takes the
+/// group bound for one as bound for the next.
+type Group1Key = ([Option<(u32, u32)>; 2], bool, bool, Option<FrameKey>);
+
+fn group1_key(p: &GamePipeline, frame: Option<FrameKey>) -> Group1Key {
+    let bones = |s: &StagePlan| s.bones.as_ref().map(|b| (b.binding, b.plan.size));
+    ([bones(&p.stages[0]), bones(&p.stages[1])], p.reads_fb, p.shaded, frame)
+}
+
 /// The framebuffer's copies a frame's draws read
 /// ([`GameShaders::set_framebuffer`]): the colour, the depth, and a number
 /// that tells one pair from another.
@@ -953,7 +1059,11 @@ impl StagePlan {
     /// the bindings its entry point uses; the stock includes declare
     /// samplers for vertex programs that never read them, and each a
     /// material binds costs as it is bound).
-    fn new(r: &Reflection, used: &[u32]) -> Result<StagePlan, String> {
+    fn new(
+        r: &Reflection,
+        used: &[u32],
+        declared: &[(String, mg_shader::UniformDefault)],
+    ) -> Result<StagePlan, String> {
         let mut plan =
             StagePlan { draw: None, lights: None, frame: None, bones: None, textures: Vec::new() };
         for b in &r.uniforms {
@@ -964,7 +1074,7 @@ impl StagePlan {
             let bound = || Some(Bound { binding: b.binding, plan: Plan::new(b) });
             match b.part {
                 Part::Whole => return Err("its uniforms couldn't be split".into()),
-                Part::Draw => plan.draw = Some(Plan::new(b)),
+                Part::Draw => plan.draw = Some(Plan::declared(b, declared)),
                 Part::Lights => plan.lights = Some(Plan::new(b)),
                 Part::Frame => plan.frame = bound(),
                 Part::Bones => plan.bones = bound(),
@@ -991,6 +1101,9 @@ pub(crate) enum GamePass {
     Solid,
     /// The rest of it: blended over everything solid, hiding nothing.
     Fringe,
+    /// A mesh of mesh `alpha` under 1, whole: blended, its depth written,
+    /// in its model's order (as the client draws it).
+    Ordered,
     /// An additive mesh (TXI `blending additive`): added to what is behind,
     /// hiding nothing.
     Additive,
@@ -1015,9 +1128,10 @@ impl GamePass {
         };
         match self {
             GamePass::Opaque | GamePass::Sky | GamePass::Particles(B::PunchThrough) => None,
-            GamePass::Solid | GamePass::Fringe | GamePass::Particles(B::Normal) => {
-                Some(wgpu::BlendState::ALPHA_BLENDING)
-            }
+            GamePass::Solid
+            | GamePass::Fringe
+            | GamePass::Ordered
+            | GamePass::Particles(B::Normal) => Some(wgpu::BlendState::ALPHA_BLENDING),
             // (As Moonglow's own shader adds an additive mesh: by its
             // alpha, as the client does, `reading_additive_blending`.)
             GamePass::Additive => Some(add(wgpu::BlendFactor::SrcAlpha)),
@@ -1053,7 +1167,13 @@ impl GamePass {
     /// Whether the pass writes its depth.
     fn depth_write(self) -> bool {
         use crate::particles::ParticleBlend as B;
-        matches!(self, GamePass::Opaque | GamePass::Solid | GamePass::Particles(B::PunchThrough))
+        matches!(
+            self,
+            GamePass::Opaque
+                | GamePass::Solid
+                | GamePass::Ordered
+                | GamePass::Particles(B::PunchThrough)
+        )
     }
 
     /// Whether its faces are drawn from behind whatever the material says.
@@ -1074,6 +1194,77 @@ pub(crate) struct PipelineKey {
     pub(crate) tangents: bool,
     pub(crate) twosided: bool,
     pub(crate) pass: GamePass,
+}
+
+impl PipelineKey {
+    /// The key as a line of text (`vs fs pass` and its four switches as
+    /// 0 or 1: `NO_DISCARD`, skinned, tangents, two-sided), as a module's
+    /// pipelines are kept between sessions ([`PipelineKey::from_line`]).
+    pub(crate) fn line(&self) -> String {
+        use crate::particles::ParticleBlend as B;
+        let pass = match self.pass {
+            GamePass::Opaque => "opaque",
+            GamePass::Solid => "solid",
+            GamePass::Fringe => "fringe",
+            GamePass::Ordered => "ordered",
+            GamePass::Additive => "additive",
+            GamePass::Sky => "sky",
+            GamePass::Particles(B::Normal) => "particles",
+            GamePass::Particles(B::Lighten) => "particles-lighten",
+            GamePass::Particles(B::PunchThrough) => "particles-punchthrough",
+        };
+        let flag = |b: bool| if b { '1' } else { '0' };
+        format!(
+            "{} {} {pass} {}{}{}{}",
+            self.vs,
+            self.fs,
+            flag(self.no_discard),
+            flag(self.skinned),
+            flag(self.tangents),
+            flag(self.twosided)
+        )
+    }
+
+    /// A key from its [`PipelineKey::line`]; `None` for a line that is no
+    /// key (another release's, or written wrong).
+    pub(crate) fn from_line(line: &str) -> Option<PipelineKey> {
+        use crate::particles::ParticleBlend as B;
+        let mut words = line.split_ascii_whitespace();
+        let (vs, fs, pass, flags) = (words.next()?, words.next()?, words.next()?, words.next()?);
+        if words.next().is_some() || vs.len() > 64 || fs.len() > 64 {
+            return None;
+        }
+        let pass = match pass {
+            "opaque" => GamePass::Opaque,
+            "solid" => GamePass::Solid,
+            "fringe" => GamePass::Fringe,
+            "ordered" => GamePass::Ordered,
+            "additive" => GamePass::Additive,
+            "sky" => GamePass::Sky,
+            "particles" => GamePass::Particles(B::Normal),
+            "particles-lighten" => GamePass::Particles(B::Lighten),
+            "particles-punchthrough" => GamePass::Particles(B::PunchThrough),
+            _ => return None,
+        };
+        let flags: Vec<bool> = flags
+            .chars()
+            .map(|c| match c {
+                '0' => Some(false),
+                '1' => Some(true),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let [no_discard, skinned, tangents, twosided] = flags[..] else { return None };
+        Some(PipelineKey {
+            vs: vs.to_ascii_lowercase(),
+            fs: fs.to_ascii_lowercase(),
+            no_discard,
+            skinned,
+            tangents,
+            twosided,
+            pass,
+        })
+    }
 }
 
 /// A program pair ready to draw.
@@ -1098,9 +1289,14 @@ pub(crate) struct GamePipeline {
     /// `sceneCurrentFrame`): what it draws moves by itself.
     pub(crate) timed: bool,
     /// The vertex program may move a mesh's vertices out of its box: it
-    /// reads the clock or the wind (a sway), or samples a texture (a
-    /// height map).
+    /// reads the clock or the wind (a sway), samples a texture (a height
+    /// map), or reads an offset ([`GamePipeline::offsets`]).
     pub(crate) moves: bool,
+    /// The uniforms its vertex program reads that offset a mesh by a
+    /// distance an MTR's parameter gives, in meters: those named
+    /// `…Offset…` (The Domains of Dread's `fTilesetMeshOffsetZ` lifts its
+    /// grass 2 m, `fRoofOffsetZ` its roofs).
+    pub(crate) offsets: Vec<String>,
     /// Its fragment program reads the framebuffer's copies (`texFBColor`,
     /// `texFBDepth`; `docs/framebuffer-proposal.md`): bound in its group 1,
     /// with the bones ([`FB_BINDING`]), white without them.
@@ -1108,6 +1304,11 @@ pub(crate) struct GamePipeline {
     /// A draw of it asks for the copies to be made: it reads them, and it
     /// is no particle (a particle asks by its softness).
     pub(crate) wants_fb: bool,
+    /// Its fragment program's color is multiplied by the shadows' mask
+    /// ([`MASK_BINDING`]; white in its own group 1, which a draw that
+    /// receives no shadows binds): a see-through mesh's soft part that
+    /// reads no copies.
+    pub(crate) shaded: bool,
 }
 
 /// A map of small keys, hashed quickly (a frame looks its draws' values up
@@ -1115,13 +1316,20 @@ pub(crate) struct GamePipeline {
 pub(crate) type Fast<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Quick>>;
 
 /// FxHash's multiply-and-rotate: for numbers, not for what an adversary
-/// chooses.
+/// chooses. The renderer's one quick hasher: the batcher's squares and
+/// keys, the lights' choices by their balls, the game's programs' values.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Quick(u64);
 
 impl std::hash::Hasher for Quick {
     fn finish(&self) -> u64 {
-        self.0
+        // (The table takes its place from the low bits, which the
+        // multiplication leaves the weakest: the high ones folded down,
+        // twice. Without, keys that differ in their high bits alone, as
+        // the bits of floats on a grid of tiles or addresses do, landed
+        // in a few buckets: 1,024 tiles' balls in 32 of 1,024, where
+        // these fill 600, and chance would 650.)
+        self.0 ^ (self.0 >> 29) ^ (self.0 >> 47)
     }
 
     /// Eight bytes at a time (a draw's lights are a slice of numbers).
@@ -1143,6 +1351,10 @@ impl std::hash::Hasher for Quick {
 
     fn write_u32(&mut self, n: u32) {
         self.write_u64(u64::from(n));
+    }
+
+    fn write_i32(&mut self, n: i32) {
+        self.write_u64(n as u64);
     }
 
     fn write_usize(&mut self, n: usize) {
@@ -1190,8 +1402,8 @@ pub(crate) struct GameDraw<'a> {
     /// Its place among its pipeline's values this frame: each stage's draw
     /// and lights.
     places: [u32; 4],
-    /// Its bones' offset in the bones' buffer (a skinned draw's).
-    bones: Option<u32>,
+    /// Each stage's bones offset in the bones buffer, where that stage reads it.
+    bones: [Option<u32>; 2],
     /// The instance it is drawn as: its place in the order of draws.
     instance: u32,
     /// Drawn after the framebuffer's copy, which it reads (shiny water
@@ -1200,6 +1412,9 @@ pub(crate) struct GameDraw<'a> {
     /// The sun's shadows fall on it ([`crate::Instance::receives_shadows`]):
     /// among the solid draws, first, before the shadows are laid.
     pub(crate) receives: bool,
+    /// Drawn after the shadows and darkened by their mask, where its
+    /// pipeline is [`GamePipeline::shaded`] (a receiver's soft part).
+    pub(crate) shaded: bool,
 }
 
 impl GameDraw<'_> {
@@ -1237,7 +1452,10 @@ impl GameDraw<'_> {
     /// and material (and the renderer's mesh); `None` for a skinned draw,
     /// whose bones are its own.
     pub(crate) fn batch_key(&self) -> Option<(u32, u32)> {
-        self.bones.is_none().then_some((self.pipeline.id, self.material))
+        // (A shaded draw binds another group 1: apart from the others, by
+        // the material's top bit, which no material's number reaches.)
+        let material = self.material | u32::from(self.shaded && self.pipeline.shaded) << 31;
+        (self.bones == [None, None]).then_some((self.pipeline.id, material))
     }
 
     /// Whether `next` can be drawn as the next instance of this draw.
@@ -1246,8 +1464,9 @@ impl GameDraw<'_> {
             && self.material == next.material
             && matches!((self.geometry, next.geometry), (Geometry::Mesh(a), Geometry::Mesh(b)) if std::ptr::eq(a, b))
             && self.dynamic == next.dynamic
-            && self.bones.is_none()
-            && next.bones.is_none()
+            && self.shaded == next.shaded
+            && self.bones == [None, None]
+            && next.bones == [None, None]
     }
 }
 
@@ -1267,6 +1486,12 @@ pub(crate) struct Bound3 {
     pub(crate) materials: usize,
     /// The group of the draws' values is bound.
     storage: bool,
+    /// The bound pipeline's group 1 is the frame's with the shadows' mask
+    /// (a shaded draw's), not its own.
+    shaded: bool,
+    /// The group 1 bound, and its offsets (pipelines share one where
+    /// they can: `GameShaders::group1s`).
+    group1: Option<(wgpu::BindGroup, [u32; 2], usize)>,
 }
 
 impl Bound3 {
@@ -1274,6 +1499,7 @@ impl Bound3 {
     /// bound, and its bones and weights where a program's are.
     pub(crate) fn lost(&mut self) {
         (self.pipeline, self.material, self.storage) = (None, None, false);
+        self.group1 = None;
         self.mesh.forget_skin();
     }
 
@@ -1281,7 +1507,7 @@ impl Bound3 {
     /// bound in it. (The counts go on.)
     pub(crate) fn new_pass(&mut self) {
         self.lost();
-        self.mesh = crate::renderer::BoundMesh::default();
+        self.mesh.new_pass();
     }
 }
 
@@ -1428,27 +1654,46 @@ pub(crate) struct GameShaders {
     /// frame where the pipeline draws.
     frames: Blocks,
     /// The frame each pipeline's frame blocks were last written in (by its
-    /// number); the frame's number; and the places written this frame.
+    /// `id - filled_base`); the frame's number; and the places written this frame.
     filled: Vec<u64>,
+    filled_base: u32,
     frame: u64,
     written: Vec<(u32, u32)>,
-    /// Bumped when a buffer the groups bind is made anew.
-    generation: u64,
-    groups: Fast<(u32, u32), [wgpu::BindGroup; 2]>,
+    /// Generation counters bumped independently when storage buffers
+    /// (`data`, `light_table`, `order_buffer`), `bones.buffer`, or
+    /// `frames.buffer` are reallocated.
+    storage_gen: u64,
+    bones_gen: u64,
+    frames_gen: u64,
+    /// Per-(pipeline, material) stage-0 (if stage 0 samples textures) and
+    /// stage-1 bind groups.
+    groups: Fast<(u32, u32), (Option<wgpu::BindGroup>, wgpu::BindGroup)>,
+    /// Shared stage-0 bind group per pipeline whose vertex stage samples no textures.
+    stage0_groups: Fast<u32, wgpu::BindGroup>,
     /// Each pipeline's groups 0 and 1 (a pipeline that reads the
-    /// framebuffer: its group 1 with white for the copies).
-    draw_groups: Fast<u32, [wgpu::BindGroup; 2]>,
+    /// framebuffer: its group 1 with white for the copies), paired with their
+    /// storage and bones generations.
+    draw_groups: Fast<u32, (u64, u64, [wgpu::BindGroup; 2])>,
     /// The group of the draws' values, the same for every pipeline.
     storage_group: Option<wgpu::BindGroup>,
-    /// A pipeline's group 1 with the framebuffer's copies, and which.
-    fb_groups: Fast<u32, (u64, wgpu::BindGroup)>,
+    /// A pipeline's group 1 with the framebuffer's copies or the shadows'
+    /// mask, and which.
+    fb_groups: Fast<u32, (FrameKey, wgpu::BindGroup)>,
+    /// The groups 1 of those and of `draw_groups`, one for the pipelines
+    /// whose layouts and resources are the same ([`group1_key`]): a draw
+    /// of another pipeline binds it again only where it is another group.
+    group1s: Fast<Group1Key, wgpu::BindGroup>,
     /// The copies this frame's draws read, if any.
     fb: Option<FbViews>,
+    /// The shadows' mask this frame's soft parts read, if any.
+    mask: Option<MaskView>,
     /// Nearest, clamped: the depth copy's sampler.
     nearest: wgpu::Sampler,
-    groups_generation: u64,
     align: u32,
     next_id: u32,
+    /// Per-clear counter for [`GamePipeline::values`] so `regions` and
+    /// `light_places` stay dense starting from 1 after `clear()`.
+    next_values_id: u32,
 }
 
 /// What a window is told by when a pipeline is ready (it asks for a
@@ -1541,6 +1786,9 @@ fn assembled(
 struct Job {
     era: u64,
     key: PipelineKey,
+    /// Asked for ahead of a draw ([`GameShaders::prepare`]): a failure
+    /// is not reported (the draw that needs it asks again and reports it).
+    quiet: bool,
     vs: Result<mg_shader::Assembled, String>,
     fs: Result<mg_shader::Assembled, String>,
     format: wgpu::TextureFormat,
@@ -1581,14 +1829,17 @@ struct Built {
     zero_slot: Option<u32>,
     timed: bool,
     moves: bool,
+    offsets: Vec<String>,
     reads_fb: bool,
     wants_fb: bool,
+    shaded: bool,
 }
 
 /// What the worker made of a job.
 struct Done {
     era: u64,
     key: PipelineKey,
+    quiet: bool,
     built: Result<Built, String>,
     stats: ShaderStats,
 }
@@ -1597,6 +1848,27 @@ struct Done {
 struct WorkerLink {
     jobs: std::sync::mpsc::Sender<Job>,
     done: std::sync::mpsc::Receiver<Done>,
+    /// Set as this end goes: the worker takes no more jobs.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The worker is waited for as its end goes (the renderer dropped as the
+/// window closes): the last of the GPU it holds is then let go before the
+/// process ends. Left to end by itself, its device was destroyed while
+/// the process was ending, after the Vulkan layers' and driver's own
+/// state had gone, and the process crashed as it ended (a lone test's,
+/// seen every run with the validation layer). It finishes the program it
+/// is making, if any, and takes no other.
+impl Drop for WorkerLink {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(std::mem::replace(&mut self.jobs, std::sync::mpsc::channel().0));
+        drop(std::mem::replace(&mut self.done, std::sync::mpsc::channel().1));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl std::fmt::Debug for WorkerLink {
@@ -1622,13 +1894,18 @@ impl Worker {
         jobs: std::sync::mpsc::Receiver<Job>,
         done: std::sync::mpsc::Sender<Done>,
         waker: Arc<std::sync::Mutex<Option<Waker>>>,
+        stop: &std::sync::atomic::AtomicBool,
     ) {
+        let stopped = || stop.load(std::sync::atomic::Ordering::SeqCst);
         let mut w = Worker { gpu, era: 0, programs: HashMap::new(), stats: ShaderStats::default() };
         while let Ok(job) = jobs.recv() {
             // (Held back, in a test: the programs pending as long as it
-            // wants.)
-            while crate::guard::programs_held() {
+            // wants, or until the renderer goes.)
+            while crate::guard::programs_held() && !stopped() {
                 std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if stopped() {
+                break;
             }
             if job.era != w.era {
                 w.era = job.era;
@@ -1644,7 +1921,8 @@ impl Worker {
             } else {
                 w.stats.failed = 1;
             }
-            let reply = Done { era: job.era, key: job.key, built, stats: w.stats };
+            let reply =
+                Done { era: job.era, key: job.key, quiet: job.quiet, built, stats: w.stats };
             if done.send(reply).is_err() {
                 break;
             }
@@ -1714,17 +1992,16 @@ impl Worker {
             vs.at_far_plane().map_err(|e| at(&key.vs, e.to_string()))?;
         }
         let particles = matches!(key.pass, GamePass::Particles(_));
-        // The framebuffer's copies, where the fragment program reads them:
-        // `gl_FragCoord.y` counted from the bottom as OpenGL counts it (the
-        // copies have OpenGL's rows), and the copies bound in group 1,
-        // with the bones (bound for the pipeline, not the material).
+        // The framebuffer's copies, where the fragment program reads them,
+        // bound in group 1, with the bones (bound for the pipeline, not the
+        // material); and `gl_FragCoord.y` counted from the bottom as OpenGL
+        // counts it, the height the copies' (which have OpenGL's rows) or,
+        // reading none, `screenParams'`.
         let fs_used = used(&fs);
         let reads_fb = fs.reflection.textures.iter().any(|t| {
             matches!(unit(&t.name), Unit::FbColor | Unit::FbDepth) && fs_used.contains(&t.binding)
         });
-        if reads_fb {
-            fs.frag_coord_from_bottom().map_err(|e| at(&key.fs, e.to_string()))?;
-        }
+        fs.frag_coord_from_bottom(reads_fb).map_err(|e| at(&key.fs, e.to_string()))?;
         let wants_fb = reads_fb && !particles;
         vs.set_group(STAGE_GROUPS[0]).map_err(|e| at(&key.vs, e.to_string()))?;
         fs.set_group(STAGE_GROUPS[1]).map_err(|e| at(&key.fs, e.to_string()))?;
@@ -1749,6 +2026,12 @@ impl Worker {
             }
             fs.reflection.textures.retain(|t| !FB_NAMES.contains(&t.name.as_str()));
         }
+        // (A see-through mesh's soft part, drawn after the shadows, takes
+        // them from their mask: one that reads the copies doesn't.)
+        let shaded = key.pass == GamePass::Fringe && !reads_fb;
+        if shaded {
+            fs.darken_by_mask(BONES_GROUP, MASK_BINDING).map_err(|e| at(&key.fs, e.to_string()))?;
+        }
         for (p, binding, name) in [(&mut vs, 0, &key.vs), (&mut fs, 1, &key.fs)] {
             if p.reflection.uniforms.iter().any(|b| b.part == Part::Bones) {
                 p.place_block(Part::Bones, BONES_GROUP, binding)
@@ -1759,8 +2042,8 @@ impl Worker {
             p.reads_uniform("worldtimerTimeOfDay") || p.reads_uniform("sceneCurrentFrame")
         });
         let stages = [
-            StagePlan::new(&vs.reflection, &used(&vs)).map_err(|e| at(&key.vs, e))?,
-            StagePlan::new(&fs.reflection, &used(&fs)).map_err(|e| at(&key.fs, e))?,
+            StagePlan::new(&vs.reflection, &used(&vs), &vs.defaults).map_err(|e| at(&key.vs, e))?,
+            StagePlan::new(&fs.reflection, &used(&fs), &fs.defaults).map_err(|e| at(&key.fs, e))?,
         ];
         let winds: Vec<String> = vs
             .reflection
@@ -1770,12 +2053,25 @@ impl Worker {
             .filter(|m| m.name.starts_with("windPointSource"))
             .map(|m| m.name.clone())
             .collect();
+        // (An MTR's parameters are the draw's part, whose members are
+        // those the program reads; the engine's own offsets, the frame's,
+        // move nothing of a mesh's.)
+        let offsets: Vec<String> = vs
+            .reflection
+            .uniforms
+            .iter()
+            .filter(|b| b.part == Part::Draw)
+            .flat_map(|b| &b.members)
+            .filter(|m| is_offset(&m.name) && matches!(self::key(&m.name), Key::Param(_)))
+            .map(|m| m.name.clone())
+            .collect();
         let moves = ["worldtimerTimeOfDay", "sceneCurrentFrame", "areaGlobalWind"]
             .iter()
             .copied()
             .chain(winds.iter().map(String::as_str))
             .any(|u| vs.reads_uniform(u))
-            || !stages[0].textures.is_empty();
+            || !stages[0].textures.is_empty()
+            || !offsets.is_empty();
         let visibility = [wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT];
         // (The same for every pipeline, its elements' sizes checked as it
         // draws: one group of the draws' values for all, bound once while
@@ -1798,10 +2094,13 @@ impl Worker {
             .zip(visibility)
             .filter_map(|(s, v)| s.bones.as_ref().map(|b| block_entry(b, v, true)))
             .collect();
-        // (The framebuffer's copies with the bones: group 0 stays the same
+        // (Group 1 holds bones and framebuffer copies so group 0 stays the same
         // for every pipeline.)
         if reads_fb {
             bones.extend(fb_layout_entries());
+        }
+        if shaded {
+            bones.push(mask_layout_entry());
         }
         let group_layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| {
             w.gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1903,7 +2202,7 @@ impl Worker {
                 vs_entry: vs_entry.clone().unwrap_or_default(),
                 fs_entry: fs_entry.clone().unwrap_or_default(),
                 groups: vec![
-                    storage.clone(),
+                    storage,
                     bones.clone(),
                     layout_entries(&stages[0], visibility[0]),
                     layout_entries(&stages[1], visibility[1]),
@@ -1969,10 +2268,45 @@ impl Worker {
             zero_slot,
             timed,
             moves,
+            offsets,
             reads_fb,
             wants_fb,
+            shaded,
         })
     }
+}
+
+impl GamePipeline {
+    /// How far its vertex program may move a mesh's vertices out of its
+    /// box, in meters each way: `sway` (a sway's reach), and where it reads
+    /// an offset ([`GamePipeline::offsets`]) the largest its MTR gives
+    /// (`offset`: [`offset_of`] its parameters, worked out with the
+    /// material), added.
+    pub(crate) fn moved_by(&self, sway: f32, offset: f32) -> f32 {
+        sway + if self.offsets.is_empty() { 0.0 } else { offset }
+    }
+}
+
+/// The largest of an MTR's parameters `named` takes, in meters (a vector's
+/// largest component), as an offset: 0 for none.
+pub(crate) fn offset_of(params: &[(String, MtrParam)], named: impl Fn(&str) -> bool) -> f32 {
+    params
+        .iter()
+        .filter(|(n, _)| named(n))
+        .map(|(_, v)| match v {
+            MtrParam::Float(f) => f.iter().fold(0.0f32, |a, x| a.max(x.abs())),
+            MtrParam::Int(i) => i.unsigned_abs() as f32,
+        })
+        .fold(0.0f32, f32::max)
+}
+
+/// Whether an MTR's parameter is named as an offset (`…Offset…`): a
+/// distance a program may move the mesh by ([`GamePipeline::offsets`]);
+/// not the engine's parallax depth (`DisplacementOffset`), which moves
+/// none.
+pub(crate) fn is_offset(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("offset") && !name.starts_with("displacement")
 }
 
 impl GameShaders {
@@ -2012,21 +2346,27 @@ impl GameShaders {
             light_table: storage_buffer(gpu, "game draws' lights", 1 << 12),
             frames: Blocks::new(gpu, "game frame blocks"),
             filled: Vec::new(),
+            filled_base: 0,
             frame: 0,
             written: Vec::new(),
-            generation: 0,
+            storage_gen: 0,
+            bones_gen: 0,
+            frames_gen: 0,
             groups: Fast::default(),
+            stage0_groups: Fast::default(),
             draw_groups: Fast::default(),
             storage_group: None,
             fb_groups: Fast::default(),
+            group1s: Fast::default(),
             fb: None,
+            mask: None,
             nearest: gpu.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("framebuffer depth"),
                 ..Default::default()
             }),
-            groups_generation: 0,
             align: gpu.device.limits().min_uniform_buffer_offset_alignment.max(16),
             next_id: 0,
+            next_values_id: 0,
         }
     }
 
@@ -2036,23 +2376,30 @@ impl GameShaders {
         self.pending.clear();
         self.pipelines.clear();
         self.groups.clear();
+        self.stage0_groups.clear();
         self.draw_groups.clear();
         self.fb_groups.clear();
+        self.group1s.clear();
         self.regions.clear();
+        self.light_places.clear();
         self.templates.clear();
         self.value_ids.clear();
+        self.next_values_id = 0;
         self.filled.clear();
+        self.filled_base = self.next_id;
         self.frames.bytes.clear();
         self.zero_bones = 0;
         self.failures.clear();
     }
 
-    /// Forgets what was made of the renderer's materials (their places
-    /// among its groups are given anew): the bind groups of their textures
-    /// and the values they decide.
-    pub(crate) fn forget_materials(&mut self) {
-        self.groups.clear();
-        self.templates.clear();
+    /// Forgets the bind groups and templates of the renderer materials whose
+    /// slot indices are in `gone`.
+    pub(crate) fn forget_materials_in(&mut self, gone: &std::collections::HashSet<u32>) {
+        if gone.is_empty() {
+            return;
+        }
+        self.groups.retain(|&(_, m), _| !gone.contains(&m));
+        self.templates.retain(|&(_, _, m, _), _| !gone.contains(&m));
     }
 
     pub(crate) fn fail(&mut self, what: &str, why: String) {
@@ -2085,6 +2432,7 @@ impl GameShaders {
             let job = Job {
                 era: self.era,
                 key: key.clone(),
+                quiet: false,
                 vs: assembled(assets, &preamble, &key.vs, Stage::Vertex),
                 fs: assembled(assets, &preamble, &key.fs, Stage::Fragment),
                 format,
@@ -2092,28 +2440,9 @@ impl GameShaders {
                 cache: self.cache.clone(),
                 capture: self.capture.clone(),
             };
-            if self.worker.is_none() {
-                let (jobs, inbox) = std::sync::mpsc::channel();
-                let (outbox, done) = std::sync::mpsc::channel();
-                let (gpu, waker) = (gpu.clone(), self.waker.clone());
-                let started = std::thread::Builder::new()
-                    .name("moonglow shaders".into())
-                    .spawn(move || Worker::run(gpu, inbox, outbox, waker));
-                if started.is_err() {
-                    self.fail(&format!("{}/{}", key.vs, key.fs), "no thread to compile in".into());
-                    self.pipelines.insert(key.clone(), None);
-                    return Ready::No;
-                }
-                self.worker = Some(WorkerLink { jobs, done });
-            }
-            let sent = self.worker.as_ref().is_some_and(|w| w.jobs.send(job).is_ok());
-            if !sent {
-                self.worker = None;
-                self.fail(&format!("{}/{}", key.vs, key.fs), "the compiling thread stopped".into());
-                self.pipelines.insert(key.clone(), None);
+            if !self.send(gpu, job) {
                 return Ready::No;
             }
-            self.pending.insert(key.clone());
         }
         if wait {
             while self.pending.contains(key) {
@@ -2132,6 +2461,96 @@ impl GameShaders {
             return self.pipelines.get(key).map_or(Ready::No, ready);
         }
         Ready::Pending
+    }
+
+    /// Gives the worker `job` (started the first time): whether it took it.
+    /// A pipeline that can't be asked for is reported (unless the job is
+    /// quiet) and, but for a quiet one, kept as one that can't be made.
+    fn send(&mut self, gpu: &Gpu, job: Job) -> bool {
+        let (key, quiet) = (job.key.clone(), job.quiet);
+        let failed = |s: &mut Self, why: &str| {
+            if !quiet {
+                s.fail(&format!("{}/{}", key.vs, key.fs), why.into());
+                s.pipelines.insert(key.clone(), None);
+            }
+            false
+        };
+        if self.worker.is_none() {
+            let (jobs, inbox) = std::sync::mpsc::channel();
+            let (outbox, done) = std::sync::mpsc::channel();
+            let (gpu, waker) = (gpu.clone(), self.waker.clone());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let started = std::thread::Builder::new()
+                .name("moonglow shaders".into())
+                .spawn(move || Worker::run(gpu, inbox, outbox, waker, &stopping));
+            let Ok(thread) = started else {
+                return failed(self, "no thread to compile in");
+            };
+            self.worker = Some(WorkerLink { jobs, done, stop, thread: Some(thread) });
+        }
+        let sent = self.worker.as_ref().is_some_and(|w| w.jobs.send(job).is_ok());
+        if !sent {
+            self.worker = None;
+            return failed(self, "the compiling thread stopped");
+        }
+        self.pending.insert(key);
+        true
+    }
+
+    /// Asks the worker for `key`'s pipeline ahead of any draw (one a
+    /// module's areas drew with in an earlier session), unless it is made
+    /// or asked for already: whether it was asked for. Quietly: a pair
+    /// whose programs the resources haven't (a hak taken away since) is
+    /// not asked for, and one that fails isn't reported nor kept (a draw
+    /// that needs it asks again).
+    pub(crate) fn prepare_pipeline(
+        &mut self,
+        gpu: &Gpu,
+        assets: &dyn crate::Assets,
+        key: &PipelineKey,
+        format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> bool {
+        if self.pipelines.contains_key(key) || self.pending.contains(key) {
+            return false;
+        }
+        let preamble = Preamble { no_discard: key.no_discard, ..self.preamble.clone() };
+        let vs = assembled(assets, &preamble, &key.vs, Stage::Vertex);
+        let fs = assembled(assets, &preamble, &key.fs, Stage::Fragment);
+        if vs.is_err() || fs.is_err() {
+            return false;
+        }
+        let job = Job {
+            era: self.era,
+            key: key.clone(),
+            quiet: true,
+            vs,
+            fs,
+            format,
+            samples,
+            cache: self.cache.clone(),
+            capture: self.capture.clone(),
+        };
+        self.send(gpu, job)
+    }
+
+    /// The pipelines made after `mark` ([`GamePrograms::mark`]; 0: all
+    /// there are), as their keys, the earliest made first.
+    pub(crate) fn made_after(&self, mark: u32) -> Vec<&PipelineKey> {
+        let mut made: Vec<(u32, &PipelineKey)> = (self.pipelines.iter())
+            .filter_map(|(k, p)| Some((p.as_ref()?.id, k)))
+            .filter(|(id, _)| *id > mark)
+            .collect();
+        made.sort_unstable_by_key(|(id, _)| *id);
+        made.into_iter().map(|(_, k)| k).collect()
+    }
+
+    /// The newest pipeline's number ([`GamePipeline::id`]: given once,
+    /// never again, also across [`GamePrograms::clear`]): those made
+    /// later have a greater one.
+    pub(crate) fn mark(&self) -> u32 {
+        self.next_id
     }
 
     /// Takes what the worker has made since: whether anything.
@@ -2172,6 +2591,10 @@ impl GameShaders {
         s.failed += done.stats.failed;
         s.seconds += done.stats.seconds;
         let key = done.key;
+        // (One asked for ahead that failed: neither reported nor kept.)
+        if done.quiet && done.built.is_err() {
+            return false;
+        }
         let p = match done.built {
             Ok(b) => {
                 // Its frame blocks' places, for good; and room for the
@@ -2186,11 +2609,14 @@ impl GameShaders {
                     }
                 }
                 self.next_id += 1;
-                let next = self.next_id;
-                let values = *self
-                    .value_ids
+                let value_ids = &mut self.value_ids;
+                let next_values_id = &mut self.next_values_id;
+                let values = *value_ids
                     .entry((key.vs.clone(), key.fs.clone(), key.no_discard, key.skinned))
-                    .or_insert(next);
+                    .or_insert_with(|| {
+                        *next_values_id += 1;
+                        *next_values_id
+                    });
                 Some(Arc::new(GamePipeline {
                     id: self.next_id,
                     values,
@@ -2202,8 +2628,10 @@ impl GameShaders {
                     zero_slot: b.zero_slot,
                     timed: b.timed,
                     moves: b.moves,
+                    offsets: b.offsets,
                     reads_fb: b.reads_fb,
                     wants_fb: b.wants_fb,
+                    shaded: b.shaded,
                 }))
             }
             Err(why) => {
@@ -2290,11 +2718,13 @@ impl GameShaders {
                 };
             }
         }
-        let bones = pipeline.stages[0].bones.as_ref().filter(|_| !d.bones.is_empty()).map(|b| {
-            let at = self.bones.take(b.plan.size, self.align);
-            let end = (at + b.plan.size) as usize;
-            fill(&b.plan, f, d, &mut self.bones.bytes[at as usize..end]);
-            at
+        let bones = std::array::from_fn(|s| {
+            pipeline.stages[s].bones.as_ref().filter(|_| !d.bones.is_empty()).map(|b| {
+                let at = self.bones.take(b.plan.size, self.align);
+                let end = (at + b.plan.size) as usize;
+                fill(&b.plan, f, d, &mut self.bones.bytes[at as usize..end]);
+                at
+            })
         });
         GameDraw {
             pipeline,
@@ -2306,6 +2736,7 @@ impl GameShaders {
             instance: 0,
             late: false,
             receives: false,
+            shaded: false,
         }
     }
 
@@ -2324,7 +2755,7 @@ impl GameShaders {
     /// Writes a pipeline's frame blocks, the first time the frame draws
     /// with it.
     fn fill_frame(&mut self, pipeline: &GamePipeline, f: &FrameValues) {
-        let id = pipeline.id as usize;
+        let id = pipeline.id.saturating_sub(self.filled_base) as usize;
         if self.filled.len() <= id {
             self.filled.resize(id + 1, 0);
         }
@@ -2363,7 +2794,8 @@ impl GameShaders {
         }
         if self.data.size() < end.max(16) {
             self.data = storage_buffer(gpu, "game draws' values", end.next_power_of_two());
-            self.generation += 1;
+            self.storage_gen += 1;
+            self.storage_group = None;
         }
         for r in self.regions.iter().flatten().filter(|r| !r.bytes.is_empty()) {
             let at = u64::from(r.base) * u64::from(r.stride.max(16));
@@ -2381,23 +2813,29 @@ impl GameShaders {
         if self.light_table.size() < table.len() as u64 {
             let size = (table.len() as u64).next_power_of_two();
             self.light_table = storage_buffer(gpu, "game draws' lights", size);
-            self.generation += 1;
+            self.storage_gen += 1;
+            self.storage_group = None;
         }
         gpu.queue.write_buffer(&self.light_table, 0, table);
         let order: &[u8] = bytemuck::cast_slice(&self.order);
         if self.order_buffer.size() < order.len() as u64 {
             let size = (order.len() as u64).next_power_of_two();
             self.order_buffer = storage_buffer(gpu, "game draws' order", size);
-            self.generation += 1;
+            self.storage_gen += 1;
+            self.storage_group = None;
         }
         if !order.is_empty() {
             gpu.queue.write_buffer(&self.order_buffer, 0, order);
         }
         if self.bones.fit(gpu) {
-            self.generation += 1;
+            self.bones_gen += 1;
+            self.fb_groups.clear();
+            self.group1s.clear();
         }
         if self.frames.fit(gpu) {
-            self.generation += 1;
+            self.frames_gen += 1;
+            self.groups.clear();
+            self.stage0_groups.clear();
             // (Made anew: every place written again.)
             self.written = vec![(0, self.frames.bytes.len() as u32)];
         }
@@ -2412,11 +2850,15 @@ impl GameShaders {
 
     /// Whether the bind groups `draw` needs are made ([`GameShaders::prepare`]).
     pub(crate) fn prepared(&self, draw: &GameDraw<'_>) -> bool {
-        self.groups_generation == self.generation
+        self.draw_groups
+            .get(&draw.pipeline.id)
+            .is_some_and(|&(sg, bg, _)| sg == self.storage_gen && bg == self.bones_gen)
             && self.groups.contains_key(&(draw.pipeline.id, draw.material))
-            && self.draw_groups.contains_key(&draw.pipeline.id)
-            && (!draw.pipeline.reads_fb
-                || self.fb_group(draw.pipeline.id).is_some() == self.fb.is_some())
+            && (!draw.pipeline.stages[0].textures.is_empty()
+                || self.stage0_groups.contains_key(&draw.pipeline.id))
+            && self.frame_key(&draw.pipeline).is_none_or(|k| {
+                self.fb_groups.get(&draw.pipeline.id).is_some_and(|(of, _)| *of == k)
+            })
     }
 
     /// The framebuffer's copies this frame's draws read (`None`: white).
@@ -2424,32 +2866,80 @@ impl GameShaders {
         self.fb = fb;
     }
 
-    /// A pipeline's group 1 with this frame's copies, where it is made.
-    fn fb_group(&self, id: u32) -> Option<&wgpu::BindGroup> {
-        let fb = self.fb.as_ref()?;
-        self.fb_groups.get(&id).filter(|(of, _)| *of == fb.id).map(|(_, g)| g)
+    /// The shadows' mask this frame's soft parts read (`None`: white).
+    pub(crate) fn set_mask(&mut self, mask: Option<MaskView>) {
+        self.mask = mask;
+    }
+
+    /// Lets go of the mask numbered `id` (made again at another size):
+    /// the pipelines' groups made with it.
+    pub(crate) fn forget_mask(&mut self, id: u64) {
+        if self.mask.as_ref().is_some_and(|m| m.id == id) {
+            self.mask = None;
+        }
+        self.fb_groups.retain(|_, ((_, mask, _), _)| *mask != id);
+        self.group1s.retain(|(.., frame), _| frame.is_none_or(|(_, mask, _)| mask != id));
+    }
+
+    /// Lets go of the copies numbered `id` (their target is let go of):
+    /// this frame's, and the pipelines' groups made with them or with the
+    /// shadows' mask of their view, which held them on the GPU.
+    pub(crate) fn forget_framebuffer(&mut self, id: u64) {
+        if self.fb.as_ref().is_some_and(|fb| fb.id == id) {
+            self.fb = None;
+        }
+        if self.mask.as_ref().is_some_and(|m| m.of == Some(id)) {
+            self.mask = None;
+        }
+        self.fb_groups.retain(|_, ((fb, _, of), _)| *fb != id && *of != Some(id));
+        self.group1s
+            .retain(|(.., frame), _| frame.is_none_or(|(fb, _, of)| fb != id && of != Some(id)));
+    }
+
+    /// Whether anything holds the copies numbered `id`, or their view's
+    /// mask.
+    pub(crate) fn holds_framebuffer(&self, id: u64) -> bool {
+        self.fb.as_ref().is_some_and(|fb| fb.id == id)
+            || self.mask.as_ref().is_some_and(|m| m.of == Some(id))
+            || self.fb_groups.values().any(|((fb, _, of), _)| *fb == id || *of == Some(id))
+            || self
+                .group1s
+                .keys()
+                .any(|(.., f)| f.is_some_and(|(fb, _, of)| fb == id || of == Some(id)))
+    }
+
+    /// What a pipeline's group 1 made for this frame binds, where it
+    /// binds anything of the frame's: the copies it reads, the mask it is
+    /// darkened by (`None`: its own group 1, white for both, serves).
+    fn frame_key(&self, p: &GamePipeline) -> Option<FrameKey> {
+        let fb = self.fb.as_ref().filter(|_| p.reads_fb).map(|fb| fb.id);
+        let mask = self.mask.as_ref().filter(|_| p.shaded);
+        (fb.is_some() || mask.is_some())
+            .then(|| (fb.unwrap_or(0), mask.map_or(0, |m| m.id), mask.and_then(|m| m.of)))
+    }
+
+    /// A pipeline's group 1 with this frame's copies and mask, where it is
+    /// made.
+    fn fb_group(&self, p: &GamePipeline) -> Option<&wgpu::BindGroup> {
+        let key = self.frame_key(p)?;
+        self.fb_groups.get(&p.id).filter(|(of, _)| *of == key).map(|(_, g)| g)
     }
 
     /// The group 1 a draw binds: its pipeline's own (the bones; white for
-    /// the copies), or with this frame's framebuffer copies.
+    /// the copies and the mask), or with this frame's framebuffer copies
+    /// and, for a draw the shadows are laid on, their mask.
     fn bones_group<'a>(
         &'a self,
         d: &GameDraw<'_>,
         own: &'a [wgpu::BindGroup; 2],
     ) -> &'a wgpu::BindGroup {
-        let fb = if d.pipeline.reads_fb { self.fb_group(d.pipeline.id) } else { None };
+        let frame = d.pipeline.reads_fb || d.pipeline.shaded && d.shaded;
+        let fb = if frame { self.fb_group(&d.pipeline) } else { None };
         fb.unwrap_or(&own[1])
     }
 
     /// Makes the bind groups a draw needs, where they aren't made yet.
     pub(crate) fn prepare(&mut self, gpu: &Gpu, draw: &GameDraw<'_>, views: &MaterialViews<'_>) {
-        if self.groups_generation != self.generation {
-            self.groups.clear();
-            self.draw_groups.clear();
-            self.storage_group = None;
-            self.fb_groups.clear();
-            self.groups_generation = self.generation;
-        }
         let p = &draw.pipeline;
         // (The copies, with the bones in group 1: white in the pipeline's
         // own group 1, this frame's in one made for them.)
@@ -2473,73 +2963,111 @@ impl GameShaders {
                 },
             ]
         };
-        let bones: Vec<wgpu::BindGroupEntry> = p
-            .stages
-            .iter()
-            .filter_map(|s| s.bones.as_ref())
-            .map(|b| wgpu::BindGroupEntry {
-                binding: b.binding,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &self.bones.buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(u64::from(b.plan.size)),
-                }),
-            })
-            .collect();
-        if p.reads_fb
-            && let Some(fb) = &self.fb
-            && self.fb_groups.get(&p.id).is_none_or(|(of, _)| *of != fb.id)
-        {
-            let mut entries = bones.clone();
-            entries.extend(fb_entries(&fb.color, &fb.depth));
-            let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("game bones, framebuffer"),
-                layout: &p.layouts[3],
-                entries: &entries,
-            });
-            self.fb_groups.insert(p.id, (fb.id, group));
-        }
-        if !self.draw_groups.contains_key(&p.id) {
-            let storage = self.storage_group.get_or_insert_with(|| {
-                let entries: Vec<wgpu::BindGroupEntry> = STORAGE
+        let mask_entry = |view| wgpu::BindGroupEntry {
+            binding: MASK_BINDING,
+            resource: wgpu::BindingResource::TextureView(view),
+        };
+        let frame_key = self.frame_key(p);
+        let need_fb =
+            frame_key.is_some_and(|k| self.fb_groups.get(&p.id).is_none_or(|(of, _)| *of != k));
+        let (prev_sg, prev_bg) =
+            self.draw_groups.get(&p.id).map_or((None, None), |(sg, bg, _)| (Some(*sg), Some(*bg)));
+        let need_storage = prev_sg != Some(self.storage_gen);
+        let need_bones = prev_bg != Some(self.bones_gen);
+        if need_fb || need_storage || need_bones {
+            let make_bones = || -> Vec<wgpu::BindGroupEntry> {
+                p.stages
                     .iter()
-                    .map(|&(name, _, binding)| wgpu::BindGroupEntry {
-                        binding,
-                        resource: match name {
-                            n if n == mg_shader::ORDER => self.order_buffer.as_entire_binding(),
-                            n if n == mg_shader::LIGHT_TABLE => {
-                                self.light_table.as_entire_binding()
-                            }
-                            _ => self.data.as_entire_binding(),
-                        },
+                    .filter_map(|s| s.bones.as_ref())
+                    .map(|b| wgpu::BindGroupEntry {
+                        binding: b.binding,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.bones.buffer,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(u64::from(b.plan.size)),
+                        }),
                     })
-                    .collect();
-                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("game draws"),
-                    layout: &p.layouts[2],
-                    entries: &entries,
-                })
-            });
-            let storage = storage.clone();
-            let mut bones = bones;
-            if p.reads_fb {
-                bones.extend(fb_entries(views.white, views.white));
-            }
-            let group = |label, layout, entries: &[wgpu::BindGroupEntry]| {
-                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(label),
-                    layout,
-                    entries,
-                })
+                    .collect()
             };
-            let groups = [storage, group("game bones", &p.layouts[3], &bones)];
-            self.draw_groups.insert(p.id, groups);
+            if need_fb && let Some(key) = frame_key {
+                let mut entries = make_bones();
+                if p.reads_fb {
+                    entries.extend(match &self.fb {
+                        Some(fb) => fb_entries(&fb.color, &fb.depth),
+                        None => fb_entries(views.white, views.white),
+                    });
+                }
+                if p.shaded {
+                    entries.push(mask_entry(self.mask.as_ref().map_or(views.white, |m| &m.view)));
+                }
+                let group = self
+                    .group1s
+                    .entry(group1_key(p, Some(key)))
+                    .or_insert_with(|| {
+                        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("game bones, framebuffer"),
+                            layout: &p.layouts[3],
+                            entries: &entries,
+                        })
+                    })
+                    .clone();
+                self.fb_groups.insert(p.id, (key, group));
+            }
+            if need_storage || need_bones {
+                let storage = if need_storage {
+                    self.storage_group
+                        .get_or_insert_with(|| {
+                            let entries: Vec<wgpu::BindGroupEntry> = STORAGE
+                                .iter()
+                                .map(|&(name, _, binding)| wgpu::BindGroupEntry {
+                                    binding,
+                                    resource: match name {
+                                        n if n == mg_shader::ORDER => {
+                                            self.order_buffer.as_entire_binding()
+                                        }
+                                        n if n == mg_shader::LIGHT_TABLE => {
+                                            self.light_table.as_entire_binding()
+                                        }
+                                        _ => self.data.as_entire_binding(),
+                                    },
+                                })
+                                .collect();
+                            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("game draws"),
+                                layout: &p.layouts[2],
+                                entries: &entries,
+                            })
+                        })
+                        .clone()
+                } else {
+                    self.draw_groups[&p.id].2[0].clone()
+                };
+                let bones_group = if need_bones {
+                    let mut entries = make_bones();
+                    if p.reads_fb {
+                        entries.extend(fb_entries(views.white, views.white));
+                    }
+                    if p.shaded {
+                        entries.push(mask_entry(views.white));
+                    }
+                    self.group1s
+                        .entry(group1_key(p, None))
+                        .or_insert_with(|| {
+                            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("game bones"),
+                                layout: &p.layouts[3],
+                                entries: &entries,
+                            })
+                        })
+                        .clone()
+                } else {
+                    self.draw_groups[&p.id].2[1].clone()
+                };
+                self.draw_groups
+                    .insert(p.id, (self.storage_gen, self.bones_gen, [storage, bones_group]));
+            }
         }
-        let key = (p.id, draw.material);
-        if self.groups.contains_key(&key) {
-            return;
-        }
-        let group = |i: usize| {
+        let stage_group = |i: usize| {
             let stage = &p.stages[i];
             let mut entries = Vec::new();
             if let (Some(b), Some(at)) = (&stage.frame, p.frame_at[i]) {
@@ -2583,7 +3111,15 @@ impl GameShaders {
                 entries: &entries,
             })
         };
-        let groups = [group(0), group(1)];
+        let g0_shared = p.stages[0].textures.is_empty();
+        if g0_shared && !self.stage0_groups.contains_key(&p.id) {
+            self.stage0_groups.insert(p.id, stage_group(0));
+        }
+        let key = (p.id, draw.material);
+        if self.groups.contains_key(&key) {
+            return;
+        }
+        let groups = (if g0_shared { None } else { Some(stage_group(0)) }, stage_group(1));
         self.groups.insert(key, groups);
     }
 
@@ -2597,13 +3133,25 @@ impl GameShaders {
         particles: &wgpu::Buffer,
         bound: &mut Bound3,
     ) -> usize {
-        let Bound3 { pipeline, material, mesh, pipelines, materials, storage } = bound;
+        let Bound3 { pipeline, material, mesh, pipelines, materials, storage, shaded, group1 } =
+            bound;
+        // (Group 1 bound where another group or other offsets are bound.)
+        let mut bind_group1 =
+            |pass: &mut wgpu::RenderPass<'_>, group: &wgpu::BindGroup, offsets: &[u32]| {
+                let mut at = [0u32; 2];
+                at[..offsets.len()].copy_from_slice(offsets);
+                let want = (at, offsets.len());
+                if group1.as_ref().is_none_or(|(g, o, n)| g != group || (*o, *n) != want) {
+                    pass.set_bind_group(BONES_GROUP, group, offsets);
+                    *group1 = Some((group.clone(), want.0, want.1));
+                }
+            };
         let mut calls = 0;
         let mut i = 0;
         #[allow(clippy::type_complexity)]
         let mut found_for: Option<(
             (u32, u32),
-            &[wgpu::BindGroup; 2],
+            (&Option<wgpu::BindGroup>, &wgpu::BindGroup),
             &[wgpu::BindGroup; 2],
         )> = None;
         while i < draws.len() {
@@ -2623,14 +3171,29 @@ impl GameShaders {
             // looked up once.)
             let found = match found_for {
                 Some((at, groups, own)) if at == (id, d.material) => Some((groups, own)),
-                _ => self.groups.get(&(id, d.material)).zip(self.draw_groups.get(&id)),
+                _ => self
+                    .groups
+                    .get(&(id, d.material))
+                    .map(|(g0, g1)| (g0, g1))
+                    .zip(self.draw_groups.get(&id).map(|(_, _, g)| g)),
             };
             let Some((groups, own)) = found else { continue };
             found_for = Some(((id, d.material), groups, own));
             // (A pipeline of skinned meshes binds each draw's bones; the
             // others, the zeros once.)
-            let skinned = d.pipeline.skin_slot.is_some() && d.pipeline.stages[0].bones.is_some();
-            let has_bones = d.pipeline.stages[0].bones.is_some();
+            let stage_has =
+                [d.pipeline.stages[0].bones.is_some(), d.pipeline.stages[1].bones.is_some()];
+            let any_bones = stage_has[0] || stage_has[1];
+            let skinned = d.pipeline.skin_slot.is_some() && any_bones;
+            let mut bone_offsets = [0u32; 2];
+            let mut offset_len = 0usize;
+            for (has, at) in stage_has.into_iter().zip(d.bones) {
+                if has {
+                    bone_offsets[offset_len] = if skinned { at.unwrap_or(0) } else { 0 };
+                    offset_len += 1;
+                }
+            }
+            let bone_offsets = &bone_offsets[..offset_len];
             if *pipeline != Some(id) {
                 pass.set_pipeline(&d.pipeline.pipeline);
                 *pipeline = Some(id);
@@ -2640,7 +3203,7 @@ impl GameShaders {
                 *material = None;
                 mesh.forget_skin();
                 if let Some(slot) = d.pipeline.zero_slot {
-                    pass.set_vertex_buffer(slot, self.zero.slice(..));
+                    mesh.bind_zeros(pass, slot, &self.zero);
                 }
                 // (The draws' values: one group for every pipeline.)
                 if !*storage {
@@ -2648,21 +3211,28 @@ impl GameShaders {
                     *storage = true;
                 }
                 if !skinned {
-                    let zeros: &[u32] = if has_bones { &[0] } else { &[] };
-                    pass.set_bind_group(BONES_GROUP, self.bones_group(d, own), zeros);
+                    bind_group1(pass, self.bones_group(d, own), bone_offsets);
+                    *shaded = d.shaded;
                 }
+            } else if !skinned && d.pipeline.shaded && *shaded != d.shaded {
+                // (A draw the shadows are laid on after one they aren't, or
+                // the other way: the mask, or white.)
+                bind_group1(pass, self.bones_group(d, own), bone_offsets);
+                *shaded = d.shaded;
             }
             if skinned {
                 // (Its bones, or the zeros of a draw without.)
-                pass.set_bind_group(BONES_GROUP, self.bones_group(d, own), &[d.bones.unwrap_or(0)]);
+                bind_group1(pass, self.bones_group(d, own), bone_offsets);
             }
             if *material != Some(d.material) {
                 // (A vertex program that samples no texture binds the same
                 // for every material: once a pipeline.)
-                if material.is_none() || !d.pipeline.stages[0].textures.is_empty() {
-                    pass.set_bind_group(STAGE_GROUPS[0], &groups[0], &[]);
+                if (material.is_none() || !d.pipeline.stages[0].textures.is_empty())
+                    && let Some(g0) = groups.0.as_ref().or_else(|| self.stage0_groups.get(&id))
+                {
+                    pass.set_bind_group(STAGE_GROUPS[0], g0, &[]);
                 }
-                pass.set_bind_group(STAGE_GROUPS[1], &groups[1], &[]);
+                pass.set_bind_group(STAGE_GROUPS[1], groups.1, &[]);
                 *material = Some(d.material);
                 *materials += 1;
             }
@@ -2869,6 +3439,34 @@ pub(crate) fn program_pair(
 mod tests {
     use std::collections::BTreeMap;
 
+    /// The quick hasher spreads keys that differ in their high bits alone
+    /// over a table's buckets (which go by the low bits): the meshes'
+    /// balls of an area, their floats' bits on a grid of tiles, landed in
+    /// a few buckets before the high bits were folded down; so addresses
+    /// (whose low bits are all alike).
+    #[test]
+    fn the_quick_hasher_spreads_keys_that_differ_in_their_high_bits() {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let hasher = BuildHasherDefault::<super::Quick>::default();
+        let buckets = |hashes: Vec<u64>| {
+            let mut low: Vec<u64> = hashes.iter().map(|h| h & 1023).collect();
+            low.sort_unstable();
+            low.dedup();
+            low.len()
+        };
+        // 1,024 balls on a grid of tiles, 10 m apart, one radius.
+        let balls: Vec<[u32; 4]> = (0..32)
+            .flat_map(|x| (0..32).map(move |y| (x as f32 * 10.0 + 5.0, y as f32 * 10.0 + 5.0)))
+            .map(|(x, y)| [x, y, 0.0, 7.5f32].map(f32::to_bits))
+            .collect();
+        let spread = buckets(balls.iter().map(|b| hasher.hash_one(b)).collect());
+        // (1,024 keys thrown at 1,024 buckets fill about 647 of them.)
+        assert!(spread > 550, "{spread} of 1024 buckets for the tiles' balls");
+        let places: Vec<usize> = (0..1024).map(|i| 0x7f3a_0000_0000 + i * 4096).collect();
+        let spread = buckets(places.iter().map(|p| hasher.hash_one(p)).collect());
+        assert!(spread > 550, "{spread} of 1024 buckets for addresses a page apart");
+    }
+
     #[test]
     fn a_material_names_a_pair_only_with_both_programs() {
         let pair = |vs, fs| custom_pair(vs, fs);
@@ -2888,6 +3486,45 @@ mod tests {
         assert_eq!(program_pair(None, hinted), ("vslit_nm".into(), "fslit_nm".into(), false));
     }
 
+    /// A pipeline's key is kept as a line of text and read back the same,
+    /// for every pass; a line that is no key's is none.
+    #[test]
+    fn a_pipeline_s_key_is_kept_as_a_line() {
+        use crate::particles::ParticleBlend as B;
+        let passes = [
+            GamePass::Opaque,
+            GamePass::Solid,
+            GamePass::Fringe,
+            GamePass::Ordered,
+            GamePass::Additive,
+            GamePass::Sky,
+            GamePass::Particles(B::Normal),
+            GamePass::Particles(B::Lighten),
+            GamePass::Particles(B::PunchThrough),
+        ];
+        for (i, pass) in passes.into_iter().enumerate() {
+            let key = PipelineKey {
+                vs: "vslit_nm".into(),
+                fs: "fs_tdod_grass".into(),
+                no_discard: i % 2 == 0,
+                skinned: i % 3 == 0,
+                tangents: i % 4 == 0,
+                twosided: i % 5 == 0,
+                pass,
+            };
+            assert_eq!(PipelineKey::from_line(&key.line()), Some(key.clone()), "{}", key.line());
+        }
+        for bad in [
+            "",
+            "vslit fslit",
+            "vslit fslit opaque 10",
+            "vslit fslit glow 1000",
+            "a b opaque 1000 x",
+        ] {
+            assert_eq!(PipelineKey::from_line(bad), None, "{bad}");
+        }
+    }
+
     /// A pass that doesn't blend leaves the picture's alpha as it was
     /// (opaque): the programs write a cut-out's kept texels' alpha out, below
     /// 1 at its edges. One that blends writes it, and over opaque it stays
@@ -2899,6 +3536,7 @@ mod tests {
             GamePass::Opaque,
             GamePass::Solid,
             GamePass::Fringe,
+            GamePass::Ordered,
             GamePass::Additive,
             GamePass::Sky,
             GamePass::Particles(B::Normal),
@@ -3132,7 +3770,10 @@ mod tests {
         assert_eq!(key("fSwaySpeed"), Key::Param("fSwaySpeed".into()));
         assert_eq!(unit("texUnit0"), Unit::Slot(0));
         assert_eq!(unit("texUnit5"), Unit::Slot(5));
-        assert_eq!(unit("texUnit9"), Unit::White);
+        // (An MTR binds texture0 to texture10.)
+        assert_eq!(unit("texUnit9"), Unit::Slot(9));
+        assert_eq!(unit("texUnit10"), Unit::Slot(10));
+        assert_eq!(unit("texUnit11"), Unit::White);
         assert_eq!(unit("texUnitEnv"), Unit::Env);
         assert_eq!(unit("texUnitEnvCube"), Unit::EnvCube);
         assert_eq!(unit("texUnitNoise"), Unit::Noise);
@@ -3205,6 +3846,7 @@ uniform mat4 m_mvp;
 uniform mat4 m_m;
 uniform mat4 m_normal;
 uniform mat3 m_normal3;
+uniform mat4 m_texture;
 uniform vec4 materialFrontAmbient;
 uniform vec4 materialFrontDiffuse;
 uniform vec3 materialFrontEmissive;
@@ -3216,14 +3858,23 @@ void main ()
 {
     vec4 c = materialFrontAmbient + materialFrontDiffuse + globalColor + bboxMin;
     c.xyz += materialFrontEmissive + m_normal3 * vec3(float(skinmesh));
-    gl_Position = m_mv * m_mvp * m_m * m_normal * vPos + c;
+    gl_Position = m_mv * m_mvp * m_m * m_normal * m_texture * vPos + c;
 }
 "#;
         let src: BTreeMap<String, String> = [("vs_own".to_string(), vs.to_string())].into();
         let p = mg_shader::compile("vs_own", Stage::Vertex, &Preamble::default(), &src).unwrap();
         let plan = Plan::new(&p.reflection.uniforms[0]);
         let kinds: Vec<Own> = plan.own.iter().map(|(o, _, _)| *o).collect();
-        for kind in [Own::Mv, Own::Mvp, Own::M, Own::Normal, Own::Ambient, Own::Diffuse] {
+        for kind in [
+            Own::Mv,
+            Own::Mvp,
+            Own::M,
+            Own::Normal,
+            Own::Texture,
+            Own::Skinmesh,
+            Own::Ambient,
+            Own::Diffuse,
+        ] {
             assert!(kinds.contains(&kind), "{kind:?} in {kinds:?}");
         }
         // (A vec3, a mat3: as any member.)
@@ -3249,15 +3900,26 @@ void main ()
             diffuse: [0.4, 0.5, 0.6, 0.7],
             emissive: [0.8, 0.9, 1.0, 1.0],
             bbox: (Vec3::splat(-1.0), Vec3::splat(2.0)),
+            texture_matrix: Mat4::from_scale_rotation_translation(
+                Vec3::new(2.0, 0.5, 1.0),
+                glam::Quat::from_rotation_z(0.3),
+                Vec3::new(0.25, 0.5, 0.0),
+            ),
             ..Default::default()
         };
         let own: Vec<(Member, Key)> =
             plan.own.iter().map(|(_, m, k)| (m.clone(), k.clone())).collect();
-        let (mut quick, mut each) = (vec![0u8; plan.size as usize], vec![0u8; plan.size as usize]);
-        fill_own(&plan.own, &f, &d, &mut quick);
-        fill_members(&own, &f, &d, &mut each);
-        assert_eq!(quick, each);
-        assert!(quick.iter().any(|&b| b != 0));
+        // (Without bones and with: `skinmesh` 0 and 1.)
+        let bones = [Mat4::IDENTITY.to_cols_array_2d()];
+        let skinned = DrawValues { bones: &bones, params: d.params, ..d };
+        for d in [&d, &skinned] {
+            let size = plan.size as usize;
+            let (mut quick, mut each) = (vec![0u8; size], vec![0u8; size]);
+            fill_own(&plan.own, &f, d, &mut quick);
+            fill_members(&own, &f, d, &mut each);
+            assert_eq!(quick, each);
+            assert!(quick.iter().any(|&b| b != 0));
+        }
     }
 
     fn f32_at(b: &[u8], at: u32) -> f32 {
@@ -3370,5 +4032,106 @@ void main ()
         let wind = m("areaGlobalWind").offset;
         assert!((f32_at(&out, wind) - std::f32::consts::SQRT_2).abs() < 1e-5);
         assert_eq!(f32_at(&out, wind + 8), 0.0);
+    }
+
+    /// A uniform its program declares with a value holds it where the MTR
+    /// gives none, as OpenGL keeps it in the client (a builder's tinting
+    /// shader's `rowHair = 0.172363` and `illumColor = vec4(1.0, …)`); the
+    /// MTR's parameter goes first, and one declared without a value is
+    /// zero as before.
+    #[test]
+    fn a_uniform_declared_with_a_value_holds_it() {
+        let fs = r#"
+#define SHADER_TYPE 2
+uniform float rowHair = 0.25;
+uniform vec4 illumColor = vec4(1.0, 0.5, 0.25, 1.0);
+uniform int xivOpacityUV = 3;
+uniform float fAlphaClipRef = 0.01;
+uniform float fPlain;
+void main ()
+{
+    gl_FragColor = illumColor * (rowHair + fAlphaClipRef + fPlain + float(xivOpacityUV));
+}
+"#;
+        let src: BTreeMap<String, String> = [("fs_declared".to_string(), fs.to_string())].into();
+        let p =
+            mg_shader::compile("fs_declared", Stage::Fragment, &Preamble::default(), &src).unwrap();
+        let block = &p.reflection.uniforms[0];
+        let plan = Plan::declared(block, &p.defaults);
+        let params = vec![("FALPHACLIPREF".to_string(), MtrParam::Float(vec![1.1]))];
+        let d = DrawValues { params: &params, ..Default::default() };
+        let mut out = vec![0u8; plan.size as usize];
+        fill(&plan, &FrameValues::default().derive(), &d, &mut out);
+        let m = |name: &str| block.member(name).unwrap_or_else(|| panic!("{name}")).offset;
+        assert_eq!(f32_at(&out, m("rowHair")), 0.25);
+        let illum: Vec<f32> = (0..4).map(|i| f32_at(&out, m("illumColor") + 4 * i)).collect();
+        assert_eq!(illum, [1.0, 0.5, 0.25, 1.0]);
+        assert_eq!(i32_at(&out, m("xivOpacityUV")), 3);
+        assert_eq!(f32_at(&out, m("fAlphaClipRef")), 1.1, "the MTR's first");
+        assert_eq!(f32_at(&out, m("fPlain")), 0.0);
+        // (Without the declarations, as before: zeros.)
+        let mut bare = vec![0u8; plan.size as usize];
+        fill(&Plan::new(block), &FrameValues::default().derive(), &d, &mut bare);
+        assert_eq!(f32_at(&bare, m("rowHair")), 0.0);
+    }
+
+    /// The renderer's end of the shader worker waits for the worker as it
+    /// goes, and the worker takes no more jobs: the GPU it holds is let go
+    /// before the renderer's drop returns. Left to end by itself, the
+    /// worker's device was destroyed while the process ended, which
+    /// crashed it (a lone test of model_view's, with the validation layer).
+    #[test]
+    fn the_shader_worker_has_let_the_gpu_go_when_its_renderer_goes() {
+        struct Unhold;
+        impl Drop for Unhold {
+            fn drop(&mut self) {
+                crate::guard::hold_programs(false);
+            }
+        }
+        // (Holding the programs back is the process's: no other test makes
+        // any meanwhile.)
+        mg_testkit::gpu::alone();
+        let Some(gpu) = mg_testkit::gpu::open(crate::Gpu::headless) else { return };
+        let _unhold = Unhold;
+        // (The worker kept waiting with its job: it ends at once only by
+        // being told to.)
+        crate::guard::hold_programs(true);
+        let mut shaders = GameShaders::new(&gpu);
+        let waker = shaders.waker.clone();
+        let key = PipelineKey {
+            vs: "vslit".into(),
+            fs: "fslit".into(),
+            no_discard: false,
+            skinned: false,
+            tangents: false,
+            twosided: false,
+            pass: GamePass::Opaque,
+        };
+        let job = Job {
+            era: 0,
+            key,
+            quiet: true,
+            vs: Err("none".into()),
+            fs: Err("none".into()),
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            samples: 1,
+            cache: None,
+            capture: None,
+        };
+        assert!(shaders.send(&gpu, job), "the worker took the job");
+        // (Time for the worker to reach its job and wait there: just
+        // started, it could end within the drop by itself.)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // (Dropped on a thread of its own: a drop waiting for a worker that
+        // never ends fails here in seconds, not by hanging the test.)
+        let (dropped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(shaders);
+            let _ = dropped.send(());
+        });
+        let waited = done.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(waited.is_ok(), "the renderer's drop did not return in 5 s");
+        // (The waker's other holder is the worker.)
+        assert_eq!(std::sync::Arc::strong_count(&waker), 1, "the worker still runs");
     }
 }

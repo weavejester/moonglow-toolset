@@ -285,16 +285,82 @@ pub(crate) fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// One client at a time in this process, and the machine's display lock
+/// (`mg_testkit::display`, taken once and kept to the end of the run: a batch
+/// reads `DISPLAY` once). Every run of the client takes it first, before its
+/// readiness clock starts; `run-client.sh` is told it is held
+/// ([`client_script`]).
 #[allow(dead_code)]
+pub(crate) fn client_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ONE_CLIENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let only = ONE_CLIENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    mg_testkit::display::hold();
+    only
+}
+
+/// A client test's start: the display lock, then the GPU (the machine's
+/// order: a test holding the GPU never waits for the display), unless the
+/// test only replays pictures of an earlier run (`MG_CLIENT_PICTURES`),
+/// which never runs the client. (`MG_CLIENT_CAPTURED` still takes it: a
+/// picture not kept yet is taken with the client.)
+#[allow(dead_code)]
+pub(crate) fn gpu_after_display() {
+    if std::env::var_os("MG_CLIENT_PICTURES").is_none() {
+        mg_testkit::display::hold();
+    }
+    mg_testkit::gpu::hold();
+}
+
+/// Stops a client started with `run-client.sh`: a SIGTERM to the launcher,
+/// which stops the client (kill -9) and writes the display history's end
+/// line (`docs/locks.md`), then a kill -9 of the launcher if it has not
+/// ended in 10 seconds.
+#[allow(dead_code)]
+pub(crate) fn stop_client(child: &mut std::process::Child) {
+    let _ = Command::new("kill").args(["-TERM", &child.id().to_string()]).status();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if child.try_wait().is_ok_and(|s| s.is_some()) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The client's launcher, told that the display is held (by
+/// [`client_lock`]), so that it takes nothing of its own.
+#[allow(dead_code)]
+pub(crate) fn client_script() -> Command {
+    let mut command = Command::new(repo().join("tools/nwclient/run-client.sh"));
+    mg_testkit::display::held_by_us(&mut command);
+    command
+}
+
 /// Runs the client until the scene is ready and screenshots its window.
 /// One client at a time: the screenshot finds the window by its title.
+///
+/// With `MG_CLIENT_PICTURES` set to the `test-output` folder of an earlier
+/// run, the client isn't run: its picture and log are taken from that
+/// run's folder of the same name, so that a reading's Moonglow side is
+/// drawn again (after a change to the renderer) beside the client's
+/// picture without the client or the off-screen display.
 pub(crate) fn client_screenshot(dir: &Path, module: &str) -> Option<Rgba> {
-    static ONE_CLIENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _only = ONE_CLIENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(earlier) = std::env::var_os("MG_CLIENT_PICTURES") {
+        let from = Path::new(&earlier).join(dir.file_name()?);
+        let log = "user/logs/nwclientLog1.txt";
+        std::fs::create_dir_all(dir.join("user/logs")).ok()?;
+        std::fs::copy(from.join(log), dir.join(log)).ok()?;
+        std::fs::copy(from.join("client.png"), dir.join("client.png")).ok()?;
+        eprintln!("the client's picture of {}", from.display());
+        return Some(read_png(&dir.join("client.png")));
+    }
+    let _only = client_lock();
     // In single player the game's server logs to the client's log.
     let log = dir.join("user/logs/nwclientLog1.txt");
     let _ = std::fs::remove_file(&log);
-    let mut child = Command::new(repo().join("tools/nwclient/run-client.sh"))
+    let mut child = client_script()
         .arg(dir)
         .args(["+TestNewModule", module])
         .stdout(Stdio::null())
@@ -324,8 +390,7 @@ pub(crate) fn client_screenshot(dir: &Path, module: &str) -> Option<Rgba> {
             .arg(&shot)
             .status()
             .is_ok_and(|s| s.success());
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_client(&mut child);
     ok.then(|| read_png(&shot))
 }
 
@@ -367,13 +432,26 @@ pub(crate) fn client_screenshots(
     shots: usize,
     gap: Duration,
 ) -> Option<Vec<(f64, Rgba)>> {
-    static ONE_CLIENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _only = ONE_CLIENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    client_screenshots_with(dir, module, shots, gap, &[])
+}
+
+#[allow(dead_code)]
+/// [`client_screenshots`] with `env` in run-client.sh's environment (as
+/// `MG_CLIENT_PRELOAD`, which it hands the client alone).
+pub(crate) fn client_screenshots_with(
+    dir: &Path,
+    module: &str,
+    shots: usize,
+    gap: Duration,
+    env: &[(&str, &str)],
+) -> Option<Vec<(f64, Rgba)>> {
+    let _only = client_lock();
     let log = dir.join("user/logs/nwclientLog1.txt");
     let _ = std::fs::remove_file(&log);
-    let mut child = Command::new(repo().join("tools/nwclient/run-client.sh"))
+    let mut child = client_script()
         .arg(dir)
         .args(["+TestNewModule", module])
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -383,6 +461,10 @@ pub(crate) fn client_screenshots(
     while start.elapsed() < Duration::from_secs(180) {
         if std::fs::read_to_string(&log).is_ok_and(|l| l.contains("MG_READY")) {
             ready = true;
+            break;
+        }
+        if child.try_wait().is_ok_and(|s| s.is_some()) {
+            eprintln!("the client ended before the scene was ready (see {})", dir.display());
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -413,8 +495,7 @@ pub(crate) fn client_screenshots(
         let first = *first.get_or_insert(at);
         out.push(((at - first).as_secs_f64(), read_png(&shot)));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_client(&mut child);
     (out.len() == shots).then_some(out)
 }
 

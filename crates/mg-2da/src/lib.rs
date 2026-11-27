@@ -31,6 +31,10 @@ pub enum TwoDaError {
     DuplicateColumn(String),
     #[error("a cell value contains a double quote, which 2DA cannot express")]
     Unquotable,
+    #[error("a cell value contains a line break, which 2DA cannot express")]
+    LineBreak,
+    #[error("{place}: the character {character:?} is not in the codepage the table is written in")]
+    Unencodable { place: String, character: char },
     #[error(
         "the table's short rows would be padded with more than {0} empty cells (a header of \
          many columns over many short lines)"
@@ -168,6 +172,10 @@ impl TwoDa {
         let width = t.columns.len();
         let lines: Vec<&str> = lines.skip_while(|l| l.is_empty()).collect();
         let mut padding = PaddingBudget::for_input(data.len());
+        // (How many rows there are up to the last line with a label: a
+        // row of empty cells at the end is a row, the blank lines after
+        // it are not.)
+        let mut labeled = 0;
         for line in lines {
             let mut cells = split_cells(line, width + 1);
             // The first cell is the row label, which the game ignores.
@@ -177,10 +185,11 @@ impl TwoDa {
             padding.take(width - cells.len())?;
             cells.resize(width, None);
             t.rows.push(cells);
+            if !line.is_empty() {
+                labeled = t.rows.len();
+            }
         }
-        while t.rows.last().is_some_and(|r| r.iter().all(Option::is_none)) {
-            t.rows.pop();
-        }
+        t.rows.truncate(labeled);
         Ok(t)
     }
 
@@ -245,9 +254,23 @@ impl TwoDa {
         self.get(row, column).and_then(parse_int)
     }
 
+    /// Whether a cell can hold `value`: an error for a double quote (a
+    /// cell is quoted with them, and nothing escapes one) and for a line
+    /// break (a row is a line: the rest of the value would be the next
+    /// row, and every row after it one further down).
+    pub fn holds(value: &str) -> Result<(), TwoDaError> {
+        if value.contains('"') {
+            Err(TwoDaError::Unquotable)
+        } else if value.contains(['\n', '\r']) {
+            Err(TwoDaError::LineBreak)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Sets the cell at (`row`, `column`): `None`, or `****`, empties it.
-    /// An error for a value a 2DA cannot hold (a double quote); nothing
-    /// for a cell the table does not have.
+    /// An error for a value a 2DA cannot hold ([`TwoDa::holds`]: a double
+    /// quote, a line break); nothing for a cell the table does not have.
     pub fn set(
         &mut self,
         row: usize,
@@ -255,8 +278,8 @@ impl TwoDa {
         value: Option<String>,
     ) -> Result<(), TwoDaError> {
         let value = value.filter(|v| v != "****");
-        if value.as_ref().is_some_and(|v| v.contains('"')) {
-            return Err(TwoDaError::Unquotable);
+        if let Some(v) = &value {
+            TwoDa::holds(v)?;
         }
         if let Some(cell) = self.rows.get_mut(row).and_then(|r| r.get_mut(column)) {
             *cell = value;
@@ -398,7 +421,7 @@ impl TwoDa {
         let esc = |c: &Option<String>| -> Result<String, TwoDaError> {
             match c {
                 None => Ok("****".into()),
-                Some(v) if v.contains('"') => Err(TwoDaError::Unquotable),
+                Some(v) if TwoDa::holds(v).is_err() => TwoDa::holds(v).map(|()| String::new()),
                 Some(v) if v.is_empty() || v.contains([' ', '\t']) => Ok(format!("\"{v}\"")),
                 Some(v) => Ok(v.clone()),
             }
@@ -417,8 +440,17 @@ impl TwoDa {
                     .unwrap_or(0)
             })
             .collect();
-        let id_width =
-            (rows.len().saturating_sub(1).to_string().len().max(1) + 2).max(at_least.numbers);
+        // Each row's label: the file's, where it had the row (and one of a
+        // word), else its number.
+        let labels: Vec<String> = (0..rows.len())
+            .map(|i| match at_least.labels.get(i) {
+                Some(l) if !l.is_empty() && !l.contains([' ', '\t', '"']) => l.clone(),
+                _ => i.to_string(),
+            })
+            .collect();
+        let widest = labels.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let id_width = (widest + 2).max(at_least.numbers);
+        let sep = if at_least.tabs { '\t' } else { ' ' };
         let end = if at_least.lf { "\n" } else { "\r\n" };
         let mut out = format!("2DA V2.0{end}");
         if let Some(d) = &self.default {
@@ -431,7 +463,7 @@ impl TwoDa {
                 // rows begin with their numbers.)
                 let mut l = label.to_string();
                 for c in cells {
-                    l.push(' ');
+                    l.push(sep);
                     l += c;
                 }
                 return l + end;
@@ -448,10 +480,39 @@ impl TwoDa {
             l + end
         };
         out += &line("", &self.columns);
-        for (i, r) in rows.iter().enumerate() {
-            out += &line(&i.to_string(), r);
+        for (label, r) in labels.iter().zip(&rows) {
+            out += &line(label, r);
         }
-        codepage.encode(&out).map(|b| b.into_owned()).ok_or(TwoDaError::Unquotable)
+        match codepage.encode(&out) {
+            Some(bytes) => Ok(bytes.into_owned()),
+            None => Err(self.unencodable(codepage)),
+        }
+    }
+
+    /// The first of the table's texts with a character `codepage` lacks
+    /// (looked for once the whole table failed to encode): where it is
+    /// and the character, for the builder to find it.
+    fn unencodable(&self, codepage: Codepage) -> TwoDaError {
+        let lacking = |text: &str| {
+            let mut buf = [0u8; 4];
+            text.chars().find(|c| codepage.encode(c.encode_utf8(&mut buf)).is_none())
+        };
+        let columns = self.columns.iter().map(|c| (format!("the column name {c}"), c.as_str()));
+        let default = self.default.iter().map(|d| ("the DEFAULT: value".to_string(), d.as_str()));
+        let cells = self.rows.iter().enumerate().flat_map(|(r, row)| {
+            row.iter().enumerate().filter_map(move |(c, cell)| {
+                let column = self.columns.get(c).map_or("?", String::as_str);
+                Some((format!("row {r}, column {column}"), cell.as_deref()?))
+            })
+        });
+        columns
+            .chain(default)
+            .chain(cells)
+            .find_map(|(place, text)| {
+                lacking(text).map(|character| TwoDaError::Unencodable { place, character })
+            })
+            // (Nothing of the table's: not reached, the rest being ASCII.)
+            .unwrap_or(TwoDaError::Unencodable { place: "the table".into(), character: '?' })
     }
 }
 
@@ -464,6 +525,11 @@ struct Widths {
     columns: Vec<(String, usize)>,
     numbers: usize,
     lf: bool,
+    /// The rows' labels as the file has them, in order (the game passes
+    /// over them: a builder's own, as `Sword` or a number out of step).
+    labels: Vec<String>,
+    /// The rows' cells are set apart by tabs (one between each).
+    tabs: bool,
 }
 
 impl Widths {
@@ -490,7 +556,20 @@ impl Widths {
             .enumerate()
             .filter_map(|(i, n)| Some((n.to_string(), starts.get(i + 1)? - starts.get(i)?)))
             .collect();
-        Widths { columns, numbers: starts.first().copied().unwrap_or(0), lf }
+        // The rows: each line after the column names' (blank ones as the
+        // parse takes them, up to the last with a label).
+        let rows: Vec<&str> = (text.lines().map(str::trim))
+            .skip_while(|l| *l != header.trim())
+            .skip(1)
+            .skip_while(|l| l.is_empty())
+            .collect();
+        let rows = &rows[..rows.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1)];
+        let labels = (rows.iter())
+            .map(|l| split_cells(l, 1).into_iter().next().flatten().unwrap_or_default())
+            .collect();
+        let tabs = rows.iter().any(|l| has_unquoted_tab(l))
+            && rows.iter().all(|l| !has_unquoted_padding_pair(l));
+        Widths { columns, numbers: starts.first().copied().unwrap_or(0), lf, labels, tabs }
     }
 
     /// A column's width, its name's and the space after it, where the file
@@ -517,10 +596,51 @@ impl Layout {
         let padded = data
             .split(|b| *b == b'\n')
             .skip(3)
-            .any(|line| line.trim_ascii().windows(2).any(|w| w.iter().all(|b| b" \t".contains(b))));
+            .any(|line| has_unquoted_blank_run(line.trim_ascii()));
         let rows = data.split(|b| *b == b'\n').skip(3).any(|l| !l.trim_ascii().is_empty());
         if rows && !padded { Layout::Compact } else { Layout::Aligned }
     }
+}
+
+/// Whether `f(previous, byte)` holds for a byte of `bytes` outside double
+/// quotes (the previous byte none at a quote's either side).
+fn scan_unquoted_blanks(bytes: &[u8], mut f: impl FnMut(Option<u8>, u8) -> bool) -> bool {
+    let mut quoted = false;
+    let mut prev: Option<u8> = None;
+    for &b in bytes {
+        if b == b'"' {
+            quoted = !quoted;
+            prev = None;
+            continue;
+        }
+        if !quoted {
+            if f(prev, b) {
+                return true;
+            }
+            prev = Some(b);
+        }
+    }
+    false
+}
+
+/// Whether a line has two blanks (spaces or tabs) in a row outside quotes.
+fn has_unquoted_blank_run(line: &[u8]) -> bool {
+    scan_unquoted_blanks(line, |prev, cur| {
+        matches!(prev, Some(b' ' | b'\t')) && matches!(cur, b' ' | b'\t')
+    })
+}
+
+/// Whether a line has a tab outside quotes.
+fn has_unquoted_tab(line: &str) -> bool {
+    scan_unquoted_blanks(line.as_bytes(), |_, cur| cur == b'\t')
+}
+
+/// Whether a line is padded outside quotes: two spaces, or a space and a
+/// tab either way round.
+fn has_unquoted_padding_pair(line: &str) -> bool {
+    scan_unquoted_blanks(line.as_bytes(), |prev, cur| {
+        matches!((prev, cur), (Some(b' '), b' ' | b'\t') | (Some(b'\t'), b' '))
+    })
 }
 
 /// Parses an integer cell like the game: optional sign, then decimal digits
@@ -548,41 +668,10 @@ pub fn parse_int(s: &str) -> Option<i32> {
 }
 
 /// Parses a float cell like C's `atof`: the longest valid prefix. `None` if
-/// there is none.
+/// there is none. (One reader for every text file of the game's:
+/// [`mg_core::num::parse_float`].)
 pub fn parse_float(s: &str) -> Option<f32> {
-    let s = s.trim();
-    let b = s.as_bytes();
-    let mut end = 0;
-    if matches!(b.first(), Some(b'+' | b'-')) {
-        end = 1;
-    }
-    let digits_start = end;
-    while end < b.len() && b[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end < b.len() && b[end] == b'.' {
-        end += 1;
-        while end < b.len() && b[end].is_ascii_digit() {
-            end += 1;
-        }
-    }
-    if end == digits_start || (end == digits_start + 1 && b[digits_start] == b'.') {
-        return None;
-    }
-    // Optional exponent.
-    if end < b.len() && matches!(b[end], b'e' | b'E') {
-        let mut e = end + 1;
-        if matches!(b.get(e), Some(b'+' | b'-')) {
-            e += 1;
-        }
-        if b.get(e).is_some_and(u8::is_ascii_digit) {
-            while b.get(e).is_some_and(u8::is_ascii_digit) {
-                e += 1;
-            }
-            end = e;
-        }
-    }
-    s[..end].parse().ok()
+    mg_core::num::parse_float(s)
 }
 
 #[cfg(test)]
@@ -596,8 +685,10 @@ mod tests {
         let t = TwoDa::parse(SAMPLE.as_bytes(), Codepage::default()).unwrap();
         assert_eq!(t.default.as_deref(), Some("7"));
         assert_eq!(t.columns(), ["LABEL", "HOSTILE", "Name"]);
-        // Blank lines inside the table are rows; trailing empty rows go.
-        assert_eq!(t.len(), 4);
+        // Blank lines inside the table are rows, and so is a label alone at
+        // its end (the game counts it: `engine_counts_an_empty_last_row`);
+        // the blank line after the last row is not.
+        assert_eq!(t.len(), 6);
         assert_eq!(t.get(0, "name"), Some("Two words"));
         assert_eq!(t.get_int(1, "HOSTILE"), Some(16));
         assert_eq!(t.get(1, "Name"), None);
@@ -623,7 +714,7 @@ mod tests {
             text
         };
         let t = TwoDa::parse(table(1000, 10).as_bytes(), Codepage::default()).unwrap();
-        assert_eq!((t.columns().len(), t.rows.len()), (1000, 0), "trailing empty rows go");
+        assert_eq!((t.columns().len(), t.rows.len()), (1000, 10), "a label alone is a row");
         let t = TwoDa::parse(format!("{}9 x\n", table(1000, 10)).as_bytes(), Codepage::default());
         assert_eq!(t.unwrap().rows.iter().map(Vec::len).collect::<Vec<_>>(), [1000; 11]);
         let e = TwoDa::parse(table(20_000, 30_000).as_bytes(), Codepage::default()).unwrap_err();
@@ -683,6 +774,33 @@ mod tests {
         );
     }
 
+    /// The file's own row labels (the game passes over them), its tabs
+    /// between cells and a row of empty cells at its end are kept when
+    /// it is written again; blank lines after the last row are not rows.
+    #[test]
+    fn labels_tabs_and_an_empty_last_row_are_kept() {
+        let cp = Codepage::default();
+        let tabbed = b"2DA V2.0\n\n\tLabel\tCost\nsword\tSword\t10\nAXE\tAxe\t5\n2\t****\t****\n\n";
+        let mut t = TwoDa::parse(tabbed, cp).unwrap();
+        assert_eq!(t.len(), 3, "the empty row at the end is a row, the blank line not");
+        t.set(1, 1, Some("7".into())).unwrap();
+        let written = String::from_utf8(t.to_bytes_like(cp, tabbed).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            "2DA V2.0\n\n\tLabel\tCost\nsword\tSword\t10\nAXE\tAxe\t7\n2\t****\t****\n"
+        );
+        // A row added is numbered; aligned, the labels are padded.
+        t.add_row();
+        let aligned = b"2DA V2.0\n\n      Label  Cost\nsword  Sword  10\n";
+        let written = String::from_utf8(t.to_bytes_like(cp, aligned).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            "2DA V2.0\n\n       Label  Cost\nsword  Sword  10\n1      Axe    7\n2      ****   ****\n\
+             3      ****   ****\n"
+        );
+        assert_eq!(TwoDa::parse(written.as_bytes(), cp).unwrap(), t);
+    }
+
     #[test]
     fn write_round_trip() {
         let t = TwoDa::parse(SAMPLE.as_bytes(), Codepage::default()).unwrap();
@@ -725,6 +843,26 @@ mod tests {
         t.set(0, 0, Some("****".into())).unwrap();
         assert_eq!((t.get(1, "Cost"), t.get(0, "Label")), (Some("5"), None));
         assert_eq!(t.set(0, 0, Some("a \"b\"".into())), Err(TwoDaError::Unquotable));
+        // A character the codepage lacks is named with its cell, not
+        // called a double quote.
+        let mut wide = t.clone();
+        wide.set(1, 0, Some("z\u{142}oty".into())).unwrap();
+        let e = wide.to_bytes(Codepage::WINDOWS_1252).unwrap_err();
+        let place = format!("row 1, column {}", wide.columns()[0]);
+        assert_eq!(e, TwoDaError::Unencodable { place, character: '\u{142}' });
+        assert!(e.to_string().contains("row 1, column") && e.to_string().contains("'\u{142}'"));
+        assert!(wide.to_bytes(Codepage::WINDOWS_1250).is_ok());
+        let mut named = t.clone();
+        named.rename_column(0, "A\u{2192}B").unwrap();
+        let e = named.to_bytes(Codepage::WINDOWS_1252).unwrap_err();
+        assert!(e.to_string().starts_with("the column name A\u{2192}B: "), "{e}");
+        // A line break would be the next row's beginning.
+        for broken in ["a\nb", "a\r\nb", "a\r"] {
+            assert_eq!(t.set(0, 0, Some(broken.into())), Err(TwoDaError::LineBreak), "{broken:?}");
+        }
+        let mut read = t.clone();
+        read.rows[0][0] = Some("a\nb".into());
+        assert_eq!(read.to_bytes(Codepage::default()), Err(TwoDaError::LineBreak));
         // (A cell that is not there: nothing.)
         t.set(9, 0, Some("x".into())).unwrap();
         assert_eq!(t.add_row(), 2);
@@ -776,5 +914,23 @@ mod tests {
             ["0  ****        1    ****", "1  ****        **** ****", "2  \"two words\" **** 7"]
         );
         assert_eq!(TwoDa::parse(text.as_bytes(), Codepage::default()).unwrap(), t);
+    }
+
+    #[test]
+    fn quoted_double_spaces_keep_compact_and_tab_delimited_layouts() {
+        let compact = b"2DA V2.0\n\n Label Text\n0 Foo \"a  b\"\n";
+        assert_eq!(Layout::of(compact), Layout::Compact);
+        let mut t = TwoDa::parse(compact, Codepage::default()).unwrap();
+        t.set(0, 0, Some("Bar".into())).unwrap();
+        let rewritten = t.to_bytes_like(Codepage::default(), compact).unwrap();
+        assert_eq!(Layout::of(&rewritten), Layout::Compact);
+
+        let tabbed = b"2DA V2.0\n\n\tLabel\tText\n0\tFoo\t\"a  b\"\n";
+        assert_eq!(Layout::of(tabbed), Layout::Compact);
+        let mut t2 = TwoDa::parse(tabbed, Codepage::default()).unwrap();
+        t2.set(0, 0, Some("Baz".into())).unwrap();
+        let out =
+            String::from_utf8(t2.to_bytes_like(Codepage::default(), tabbed).unwrap()).unwrap();
+        assert!(out.contains("0\tBaz\t\"a  b\""), "{out:?}");
     }
 }

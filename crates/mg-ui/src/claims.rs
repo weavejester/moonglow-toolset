@@ -35,21 +35,34 @@ pub(crate) struct ClaimsState {
     pub(crate) cleared: bool,
     /// The Protected Area window.
     pub(crate) protected_ask: Option<ProtectedAsk>,
-    /// A change the builder said to make anyway: let through once.
-    let_through: Option<Pass>,
+    /// The changes the builder said to make anyway (those the window
+    /// named): let through once.
+    let_through: Vec<Pass>,
     /// A command was held just now (for the window): Apply says no more.
     pub(crate) held: bool,
-    /// The Claims Table window (Edit › Claims Table…).
-    pub(crate) table: Option<TableWindow>,
+    /// The Claims Table tab.
+    pub(crate) table: Option<TableTab>,
+    /// Counted up as the listing is made again: the table's order follows.
+    pub(crate) listed_revision: u64,
+    /// The Claims Table's listing, kept while the claims, workspace
+    /// `(identity, revision)`, and module's areas match ([`listing`]).
+    listed: Option<ListedClaims>,
 }
 
-/// The Claims Table window: what is being answered in it.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct TableWindow {
+type ListedClaims =
+    (ClaimsNow, Option<(u64, u64)>, Vec<ResRef>, std::sync::Arc<Vec<mg_module::claims::Listed>>);
+
+/// The Claims Table tab: what is being answered in it, and its table's sort
+/// and row chosen.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TableTab {
     /// An area being handed on, and the code typed for whom.
     hand: Option<(ResRef, String)>,
     /// Another's area about to be taken over (asked first).
     take: Option<ResRef>,
+    /// Hand To's field takes the keys as it is drawn.
+    focus: bool,
+    pub(crate) table: crate::report_table::Table,
 }
 
 /// What a builder does to an area's claim, in the window.
@@ -83,14 +96,21 @@ fn whose(p: &ProjectFile) -> ClaimsNow {
     (p.claim_table.clone(), p.claims.clone(), p.user.builder_code.clone())
 }
 
-/// A change to a protected area, held until the builder answers.
+/// Whether the claims are still `was`, compared where they are: copied
+/// each frame to compare, a world's table of 1,400 areas cost 0.1 ms.
+fn still_whose(p: &ProjectFile, was: &ClaimsNow) -> bool {
+    p.claim_table == was.0 && p.claims == was.1 && p.user.builder_code == was.2
+}
+
+/// A change to protected areas, held until the builder answers.
 #[derive(Debug, Clone)]
 pub(crate) struct ProtectedAsk {
-    pub area: ResRef,
-    /// Why it is protected.
-    pub why: String,
-    pub what: Protected,
-    /// What goes ahead if it is changed anyway.
+    /// Every protected area it would change (one command may change
+    /// several: areas chosen together and deleted, a field set on all an
+    /// Advanced Search found), each with why it is protected and what of
+    /// it would change. Never empty.
+    pub changes: Vec<(ResRef, String, Protected)>,
+    /// What goes ahead if they are changed anyway.
     pub then: Action,
 }
 
@@ -169,21 +189,27 @@ fn tag_now(app: &mut Moonglow, area: ResRef) -> Option<Vec<u8>> {
     doc.root.string("Tag").map(<[u8]>::to_vec)
 }
 
-/// What a command changes of a protected area, if it changes any: its
+/// What a command changes of protected areas, each one it changes: its
 /// Tag, its ResRef (a rename: the area goes, another comes), or the area
-/// itself (deleted).
-fn protected_change(app: &mut Moonglow, cmd: &Command) -> Option<(ResRef, String, Protected)> {
+/// itself (deleted). All of them: the first alone was asked about, and
+/// its answer let the others through unnamed.
+fn protected_changes(app: &mut Moonglow, cmd: &Command) -> Vec<(ResRef, String, Protected)> {
     // (The protected areas' edits, each with why.)
     let candidates: Vec<(&Edit, String)> = {
-        let p = project(app)?;
+        let Some(p) = project(app) else { return Vec::new() };
         let protected = |e: &Edit| {
             let key = e.key();
             (key.restype == ResType::ARE).then(|| p.protected(key.resref)).flatten()
         };
         cmd.edits.iter().filter_map(|e| protected(e).map(|why| (e, why))).collect()
     };
+    let mut out: Vec<(ResRef, String, Protected)> = Vec::new();
     for (e, why) in candidates {
         let area = e.key().resref;
+        // (An area gone or renamed is said once, not its Tag too.)
+        if out.iter().any(|(a, _, w)| *a == area && *w != Protected::Tag) {
+            continue;
+        }
         let new_tag = match e {
             Edit::SetField { path, label, value, .. }
                 if *path == GffPath::root() && label == "Tag" =>
@@ -200,7 +226,9 @@ fn protected_change(app: &mut Moonglow, cmd: &Command) -> Option<(ResRef, String
                         if k.restype == ResType::ARE && k.resref != area)
                 });
                 let what = if renamed { Protected::ResRef } else { Protected::Deleted };
-                return Some((area, why, what));
+                out.retain(|(a, ..)| *a != area);
+                out.push((area, why, what));
+                continue;
             }
             Edit::SetResource { data: Some(bytes), .. } => {
                 mg_gff::Gff::read(bytes).ok().and_then(|g| g.root.string("Tag").map(<[u8]>::to_vec))
@@ -208,11 +236,11 @@ fn protected_change(app: &mut Moonglow, cmd: &Command) -> Option<(ResRef, String
             _ => continue,
         };
         // (A Tag set to what it is: no change.)
-        if new_tag != tag_now(app, area) {
-            return Some((area, why, Protected::Tag));
+        if new_tag != tag_now(app, area) && !out.iter().any(|(a, ..)| *a == area) {
+            out.push((area, why, Protected::Tag));
         }
     }
-    None
+    out
 }
 
 /// Whether a command may change the module, as the project's claims
@@ -236,20 +264,64 @@ pub(crate) fn gate(app: &mut Moonglow, cmd: &Command) -> Result<(), EditError> {
             });
         }
     }
-    if let Some((area, why, what)) = protected_change(app, cmd) {
-        if app.claims.let_through == Some(Pass { area, what }) {
-            app.claims.let_through = None;
-            return Ok(());
-        }
-        app.claims.protected_ask =
-            Some(ProtectedAsk { area, why, what, then: Action::Apply(cmd.clone()) });
-        app.claims.held = true;
+    let changes = protected_changes(app, cmd);
+    let Some(&(area, _, what)) = changes.first() else { return Ok(()) };
+    // (Let through only where the builder was shown every one of them.)
+    let passed = |app: &Moonglow, (area, _, what): &(ResRef, String, Protected)| {
+        app.claims.let_through.contains(&Pass { area: *area, what: *what })
+    };
+    if changes.iter().all(|c| passed(app, c)) {
+        app.claims.let_through.clear();
+        return Ok(());
+    }
+    // (Another held for the window already, whose follow-ups wait for its
+    // answer: this one is refused, not put in its place. Whatever held it:
+    // a plugin job's change took a builder's Rename's place.)
+    if app.claims.protected_ask.is_some() {
         return Err(EditError::Invalid {
             key: ResKey::new(area, ResType::ARE),
-            message: format!("not changed yet: {}'s {} is kept: asked first", area, what.noun()),
+            message: format!(
+                "not changed: {area}'s {} is kept, and the Protected Area window waits for an \
+                 answer about another change",
+                what.noun()
+            ),
         });
     }
-    Ok(())
+    app.claims.protected_ask = Some(ProtectedAsk { changes, then: Action::Apply(cmd.clone()) });
+    app.claims.held = true;
+    Err(EditError::Invalid {
+        key: ResKey::new(area, ResType::ARE),
+        message: format!("not changed yet: {}'s {} is kept: asked first", area, what.noun()),
+    })
+}
+
+impl Moonglow {
+    /// [`Moonglow::apply`] for a caller that goes on once its command is
+    /// applied: `Ok(true)` when it was; `Ok(false)` when it was held for
+    /// the Protected Area window (asked first: the caller stops without a
+    /// word, and nothing is to be said of an error); an error otherwise.
+    /// `then`: what goes ahead if the builder says to change it anyway,
+    /// where the caller has an action of its own for it (its follow-ups
+    /// happen then too); none: the command alone. A caller that asked
+    /// plain `apply` and said the error left the mark of a held command
+    /// set, and the next command that failed for another reason failed
+    /// without a word.
+    pub(crate) fn apply_or_ask(
+        &mut self,
+        cmd: Command,
+        then: Option<Action>,
+    ) -> Result<bool, EditError> {
+        match self.apply(cmd) {
+            Ok(()) => Ok(true),
+            Err(_) if std::mem::take(&mut self.claims.held) => {
+                if let (Some(ask), Some(then)) = (&mut self.claims.protected_ask, then) {
+                    ask.then = then;
+                }
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl Protected {
@@ -271,13 +343,23 @@ pub(crate) fn asks_first(app: &mut Moonglow, action: &Action) -> bool {
     };
     let key = crate::references::main_key(key);
     if key.restype != ResType::ARE
-        || app.claims.let_through == Some(Pass { area: key.resref, what })
+        || app.claims.let_through.contains(&Pass { area: key.resref, what })
     {
         return false;
     }
     let Some(why) = project(app).and_then(|p| p.protected(key.resref)) else { return false };
-    app.claims.protected_ask =
-        Some(ProtectedAsk { area: key.resref, why, what, then: action.clone() });
+    // (Another held for the window already: this one is not done, nor put
+    // in its place, as in `gate`.)
+    if app.claims.protected_ask.is_some() {
+        app.log.warn(format!(
+            "Not done: {} is protected, and the Protected Area window waits for an answer about \
+             another change",
+            key.resref
+        ));
+        return true;
+    }
+    let changes = vec![(key.resref, why, what)];
+    app.claims.protected_ask = Some(ProtectedAsk { changes, then: action.clone() });
     true
 }
 
@@ -383,10 +465,12 @@ pub(crate) fn change(app: &mut Moonglow, area: ResRef, how: How) {
     }
 }
 
-/// Opens the Claims Table window (Edit › Claims Table…).
+/// Opens the Claims Table (Edit › Claims Table…): its tab brought to the
+/// front of the Bottom Dock, opened, the table taking the keys.
 pub(crate) fn open_table(app: &mut Moonglow) {
     if kept(app) {
-        app.claims.table = Some(TableWindow::default());
+        app.claims.table.get_or_insert_with(TableTab::default);
+        crate::dock_reports::bring(app, crate::shell::Panel::ClaimsTable);
     }
 }
 
@@ -451,21 +535,18 @@ pub(crate) fn tree_mark(p: Option<&ProjectFile>, ui: &mut egui::Ui, area: ResRef
     let merged = p.protected(area);
     let (mark, tip) = match standing {
         Standing::Mine(c) => (
-            format!("{} {}", crate::icons::CLAIMED_MINE, c.builder.as_deref().unwrap_or("")),
+            Some((crate::icons::CLAIMED_MINE, c.builder.clone().unwrap_or_default())),
             format!("Yours: claimed by {}", c.holder().unwrap_or_default()),
         ),
         Standing::Others(c) => (
-            format!("{} {}", crate::icons::CLAIMED, c.builder.as_deref().unwrap_or("")),
+            Some((crate::icons::CLAIMED, c.builder.clone().unwrap_or_default())),
             format!("Claimed by {}", c.holder().unwrap_or_default()),
         ),
-        Standing::Free(_) if merged.is_some() => (String::new(), "Claimed by no one".into()),
+        Standing::Free(_) if merged.is_some() => (None, "Claimed by no one".into()),
         Standing::Free(_) => return,
     };
-    let mut text = mark;
     let mut tip = tip;
     if let Some(why) = &merged {
-        text.push(' ');
-        text.push_str(crate::icons::MERGED);
         tip.push_str(&format!(
             "\n{why}: its Tag and ResRef are kept (players' positions and first visits)"
         ));
@@ -474,7 +555,20 @@ pub(crate) fn tree_mark(p: Option<&ProjectFile>, ui: &mut egui::Ui, area: ResRef
         Standing::Others(_) => ui.visuals().warn_fg_color,
         _ => ui.visuals().weak_text_color(),
     };
-    ui.label(egui::RichText::new(text.trim()).color(color)).on_hover_text(tip);
+    // (The holder's icon and builder code, then a pin where it is merged:
+    // the code names it for a screen reader.)
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = ui.spacing().icon_spacing;
+        if let Some((icon, builder)) = mark {
+            let text = egui::RichText::new(builder).color(color);
+            mg_uikit::icon_label(ui, icon, Some(color), text).on_hover_text(&tip);
+        }
+        if merged.is_some() {
+            let (rect, r) = ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+            crate::icons::MERGED.paint(ui.painter(), rect, color);
+            r.on_hover_text(&tip);
+        }
+    });
 }
 
 /// Above an area's view (and its Properties): whose it is, where it
@@ -486,16 +580,19 @@ pub(crate) fn banner(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
     let protected = p.protected(area);
     let coded = p.user.builder_code.is_some();
     let text = match (&access, standing) {
-        (Access::ReadOnly(why), _) => Some(format!(
-            "{} {why}: read-only here. Ask them to release it, then claim it.",
-            crate::icons::CLAIMED
+        (Access::ReadOnly(why), _) => Some((
+            Some(crate::icons::CLAIMED),
+            format!("{why}: read-only here. Ask them to release it, then claim it."),
         )),
-        (Access::Warn(why), Some(Standing::Others(_))) => Some(format!(
-            "{} {why}: a save asks before it writes your changes to it.",
-            crate::icons::CLAIMED
+        (Access::Warn(why), Some(Standing::Others(_))) => Some((
+            Some(crate::icons::CLAIMED),
+            format!("{why}: a save asks before it writes your changes to it."),
         )),
-        (Access::Warn(why), _) => Some(format!(
-            "{why}: a save asks before it writes your changes to it. Claim it to build it."
+        (Access::Warn(why), _) => Some((
+            None,
+            format!(
+                "{why}: a save asks before it writes your changes to it. Claim it to build it."
+            ),
         )),
         (Access::Edit, _) => None,
     };
@@ -505,8 +602,17 @@ pub(crate) fn banner(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
     let free = matches!(standing, Some(Standing::Free(_)));
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            if let Some(text) = &text {
-                ui.colored_label(ui.visuals().warn_fg_color, text);
+            if let Some((icon, text)) = &text {
+                let warn = ui.visuals().warn_fg_color;
+                match icon {
+                    Some(icon) => {
+                        let text = egui::RichText::new(text).color(warn);
+                        mg_uikit::icon_label(ui, *icon, Some(warn), text);
+                    }
+                    None => {
+                        ui.colored_label(warn, text);
+                    }
+                }
                 if free {
                     let r = ui.add_enabled(coded, egui::Button::new("Claim This Area"));
                     let r = r.on_disabled_hover_text(
@@ -521,11 +627,17 @@ pub(crate) fn banner(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
                 if text.is_some() {
                     ui.end_row();
                 }
-                ui.weak(format!(
-                    "{} {why}: its Tag and ResRef are kept (players' positions and first visits \
-                     go by them).",
-                    crate::icons::MERGED
-                ));
+                let weak = ui.visuals().weak_text_color();
+                let text = format!(
+                    "{why}: its Tag and ResRef are kept (players' positions and first visits go \
+                     by them)."
+                );
+                mg_uikit::icon_label(
+                    ui,
+                    crate::icons::MERGED,
+                    Some(weak),
+                    egui::RichText::new(text).color(weak),
+                );
             }
         });
     });
@@ -535,34 +647,76 @@ pub(crate) fn banner(app: &mut Moonglow, ui: &mut egui::Ui, area: ResRef) {
 /// change.
 pub(crate) fn windows(app: &mut Moonglow, ctx: &egui::Context) {
     end_pass(app);
-    table_window(app, ctx);
+    if app.claims.table.is_none() {
+        app.claims.listed = None;
+    }
     save_window(app, ctx);
     protected_window(app, ctx);
 }
 
-/// The Claims Table window: every area of the table and the module, whose
-/// each is, and what this builder may do with each (Claim, Release, Hand
-/// To…, Take Over…), as `mg claims` lists and changes them.
-fn table_window(app: &mut Moonglow, ctx: &egui::Context) {
-    let Some(mut w) = app.claims.table.take() else { return };
-    let Some(p) = project(app).filter(|p| p.claim_table.is_some() || p.claims.file.is_some())
-    else {
-        return;
-    };
+/// Every area of the claims table and the module, whose each is
+/// (`ProjectFile::claims_listing`), the Claims Table tab's rows: made when
+/// the claims (the table, the rules, the builder's code) or the module's
+/// areas change, and kept between. It was made anew every frame the table
+/// showed (a window then, before M4's U28), each area
+/// looked for in the table and the module's list: eight million
+/// comparisons a frame for a world of 1,400 areas.
+fn listing(app: &mut Moonglow) -> Option<std::sync::Arc<Vec<mg_module::claims::Listed>>> {
+    let p = project(app).filter(|p| p.claim_table.is_some() || p.claims.file.is_some())?;
+    let ws_key = app.ws.as_ref().map(|ws| (ws.identity(), ws.revision()));
+    if let Some((was, was_ws, _, listed)) = &app.claims.listed
+        && still_whose(p, was)
+        && *was_ws == ws_key
+    {
+        return Some(listed.clone());
+    }
+    let by = whose(p);
     let areas: Vec<ResRef> = (app.ws.as_ref())
         .map(|ws| ws.module.keys_of(ResType::ARE).map(|k| k.resref).collect())
         .unwrap_or_default();
-    let listed = p.claims_listing(Some(&areas));
+    let mut matched = None;
+    if let Some((was, _, of, listed)) = &app.claims.listed
+        && *was == by
+        && *of == areas
+    {
+        matched = Some(listed.clone());
+    }
+    if let Some(listed) = matched {
+        if let Some((_, was_ws, _, _)) = &mut app.claims.listed {
+            *was_ws = ws_key;
+        }
+        return Some(listed);
+    }
+    let listed = std::sync::Arc::new(p.claims_listing(Some(&areas)));
+    app.claims.listed = Some((by, ws_key, areas, listed.clone()));
+    app.claims.listed_revision += 1;
+    Some(listed)
+}
+
+/// The Claims Table's body (M4's U28, a Bottom Dock tab; before it a
+/// window): what the table is and the builder's code, Take Over's question
+/// or Hand To's field while asked, then a row an area (Area, Whose, Notes,
+/// and what this builder may do with it), only those in sight laid out;
+/// sorted by a head's click, the arrows choosing a row.
+use crate::dock_reports::{ACTIONS, CLAIM, HAND_TO, RELEASE, TAKE_OVER};
+
+pub(crate) fn table_body(app: &mut Moonglow, ui: &mut egui::Ui) {
+    let Some(mut w) = app.claims.table.take() else { return };
+    let Some(listed) = listing(app) else {
+        app.claims.table = Some(w);
+        return;
+    };
+    let Some(p) = project(app) else {
+        app.claims.table = Some(w);
+        return;
+    };
     let file = p.claims.file.clone().unwrap_or_default();
     let code = p.user.builder_code.clone();
-    let mut open = true;
-    let mut close = false;
     let mut chosen: Option<(ResRef, How)> = None;
-    crate::widgets::dialog(ctx, "Claims Table", &mut open)
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.set_max_width(640.0);
+    let warn = mg_uikit::tokens(ui.ctx()).warn;
+    let margin = egui::Margin { left: 8, right: 8, top: 4, bottom: 4 };
+    egui::Frame::new().inner_margin(margin).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
             match &code {
                 Some(c) => ui.label(format!("{file}: whose each area is. Your code is {c}.")),
                 None => ui.label(format!(
@@ -570,144 +724,217 @@ fn table_window(app: &mut Moonglow, ctx: &egui::Context) {
                      Builder Code…)."
                 )),
             };
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                egui::Grid::new("claims-table").striped(true).num_columns(4).show(ui, |ui| {
-                    for l in &listed {
-                        let c = l.claim.as_ref();
-                        ui.label(l.area.to_string());
-                        let whose = match (l.whose, c.and_then(|c| c.holder())) {
-                            (Whose::Mine, Some(h)) => format!("yours: {h}"),
-                            (_, Some(h)) => h,
-                            (_, None) => "free".to_string(),
-                        };
-                        if l.whose == Whose::Others {
-                            ui.colored_label(ui.visuals().warn_fg_color, whose);
-                        } else {
-                            ui.label(whose);
-                        }
-                        let mut notes = Vec::new();
-                        if c.is_some_and(|c| c.merged()) {
-                            notes.push("merged");
-                        } else if l.protected {
-                            notes.push("protected");
-                        }
-                        if !l.in_module {
-                            notes.push("not in the module");
-                        }
-                        ui.weak(notes.join(", "));
-                        ui.horizontal(|ui| match l.whose {
-                            Whose::Mine => {
-                                if ui.button("Release").clicked() {
-                                    chosen = Some((l.area, How::Release));
-                                }
-                                if ui
-                                    .button("Hand To…")
-                                    .on_hover_text("Give your claim to another builder")
-                                    .clicked()
-                                {
-                                    w.hand = Some((l.area, String::new()));
-                                    w.take = None;
-                                }
-                            }
-                            Whose::Others => {
-                                let r =
-                                    ui.add_enabled(code.is_some(), egui::Button::new("Take Over…"));
-                                let r = r
-                                    .on_hover_text("Claim it in their place (asked first)")
-                                    .on_disabled_hover_text(
-                                        "Set your builder code first (Edit › Builder Code…)",
-                                    );
-                                if r.clicked() {
-                                    w.take = Some(l.area);
-                                    w.hand = None;
-                                }
-                            }
-                            Whose::Free => {
-                                let r = ui.add_enabled(code.is_some(), egui::Button::new("Claim"));
-                                let r = r.on_disabled_hover_text(
-                                    "Set your builder code first (Edit › Builder Code…)",
-                                );
-                                if r.clicked() {
-                                    chosen = Some((l.area, How::Claim));
-                                }
-                            }
-                        });
-                        ui.end_row();
-                    }
-                });
-            });
-            if let Some(area) = w.take {
-                let who = listed
-                    .iter()
-                    .find(|l| l.area == area)
-                    .and_then(|l| l.claim.as_ref()?.holder())
-                    .unwrap_or_default();
-                ui.separator();
+            ui.weak("The table is a file of the checkout: commit it, so the others see it.");
+        });
+        if let Some(area) = w.take {
+            let who = listed
+                .iter()
+                .find(|l| l.area == area)
+                .and_then(|l| l.claim.as_ref()?.holder())
+                .unwrap_or_default();
+            ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
-                    ui.visuals().warn_fg_color,
+                    warn,
                     format!(
                         "{area} is claimed by {who}. Taken over, their changes to it not yet \
                          merged are the conflict version control can't merge: ask them first."
                     ),
                 );
-                ui.horizontal(|ui| {
-                    if ui.button("Take It Over").clicked() {
-                        chosen = Some((area, How::TakeOver));
-                        w.take = None;
+                if ui.button("Take It Over").clicked() {
+                    chosen = Some((area, How::TakeOver));
+                    w.take = None;
+                }
+                if ui.button("Don't Take It").clicked() {
+                    w.take = None;
+                }
+            });
+        }
+        if let Some((area, to)) = &mut w.hand {
+            let area = *area;
+            let mut give = false;
+            let mut back = false;
+            let typed = to.trim().to_ascii_lowercase();
+            let problem = if typed.is_empty() {
+                Some(String::new())
+            } else if Some(&typed) == code.as_ref() {
+                Some("That is your own code.".to_string())
+            } else {
+                code_problem(&typed)
+            };
+            ui.horizontal_wrapped(|ui| {
+                crate::widgets::field_label(ui, format!("Hand {area} to"));
+                let field = ui.add(
+                    mg_uikit::text_field(to)
+                        .char_limit(MAX_CODE + 4)
+                        .desired_width(100.0)
+                        .hint_text("their code"),
+                );
+                if std::mem::take(&mut w.focus) {
+                    field.request_focus();
+                }
+                // (Enter in it hands over where it can; Escape keeps it.)
+                if field.lost_focus() {
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                        give = problem.is_none();
                     }
-                    if ui.button("Don't Take It").clicked() {
-                        w.take = None;
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                        back = true;
                     }
-                });
-            }
-            if let Some((area, to)) = &mut w.hand {
-                ui.separator();
-                let area = *area;
-                let mut give = false;
-                ui.horizontal(|ui| {
-                    crate::widgets::field_label(ui, format!("Hand {area} to"));
-                    let field = ui.add(
-                        egui::TextEdit::singleline(to)
-                            .char_limit(MAX_CODE + 4)
-                            .desired_width(100.0)
-                            .hint_text("their code"),
-                    );
-                    crate::widgets::autofocus(ui, &field);
-                });
-                let typed = to.trim().to_ascii_lowercase();
-                let problem = if typed.is_empty() {
-                    Some(String::new())
-                } else if Some(&typed) == code.as_ref() {
-                    Some("That is your own code.".to_string())
-                } else {
-                    code_problem(&typed)
-                };
+                }
+                give |= ui.add_enabled(problem.is_none(), egui::Button::new("Hand Over")).clicked();
+                back |= ui.button("Keep It").clicked();
                 if let Some(p) = problem.as_ref().filter(|p| !p.is_empty()) {
-                    ui.colored_label(ui.visuals().warn_fg_color, p);
+                    ui.colored_label(warn, p);
                 }
-                let mut back = false;
-                ui.horizontal(|ui| {
-                    give =
-                        ui.add_enabled(problem.is_none(), egui::Button::new("Hand Over")).clicked();
-                    back = ui.button("Keep It").clicked();
-                });
-                if give {
-                    chosen = Some((area, How::Hand(typed)));
-                }
-                if give || back {
-                    w.hand = None;
-                }
+            });
+            if give {
+                chosen = Some((area, How::Hand(typed)));
             }
-            ui.separator();
-            ui.weak("The table is a file of the checkout: commit it, so the others see it.");
-            close = ui.button("Close").clicked();
+            if give || back {
+                w.hand = None;
+            }
+        }
+    });
+    let order = w.table.order(
+        app.claims.listed_revision,
+        listed.len(),
+        |_| true,
+        |a, b, col| {
+            let (a, b) = (&listed[a], &listed[b]);
+            match col {
+                0 => crate::report_table::by_words(&a.area.to_string(), &b.area.to_string()),
+                1 => crate::report_table::by_words(
+                    &crate::dock_reports::whose_words(a),
+                    &crate::dock_reports::whose_words(b),
+                ),
+                _ => crate::report_table::by_words(
+                    &crate::dock_reports::notes_words(a),
+                    &crate::dock_reports::notes_words(b),
+                ),
+            }
+        },
+    );
+    let t = mg_uikit::tokens(ui.ctx());
+    // (The row's actions as wide as its widest pair, Release and Hand To…;
+    // where the room is too narrow for them, a row's menu button.)
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let pad_x = ui.spacing().button_padding.x;
+    let width_key = (font.size.to_bits(), pad_x.to_bits());
+    let width_id = egui::Id::new("claims-actions-width");
+    let actions = ui
+        .data(|d| d.get_temp::<(u32, u32, f32)>(width_id))
+        .filter(|(fs, px, _)| (*fs, *px) == width_key)
+        .map(|(_, _, w)| w)
+        .unwrap_or_else(|| {
+            let words = |w: &str| {
+                let g = ui
+                    .fonts_mut(|f| f.layout_no_wrap(w.into(), font.clone(), egui::Color32::WHITE));
+                g.size().x + 2.0 * pad_x
+            };
+            let w = (words(RELEASE) + words(HAND_TO) + 4.0).max(words(TAKE_OVER)) + 12.0;
+            ui.data_mut(|d| d.insert_temp(width_id, (width_key.0, width_key.1, w)));
+            w
         });
+    let (cols, folded) = crate::dock_reports::claim_columns(ui.available_width(), actions);
+    let spec = crate::report_table::Spec {
+        id: egui::Id::new("claims-table"),
+        name: crate::dock_reports::CLAIM_ROWS,
+        cols: &cols,
+        keys: crate::palette_view::Keys::ClaimsTable,
+        may_take_keys: true,
+    };
+    let no_code = "Set your builder code first (Edit › Builder Code…)";
+    // (Hand To… or Take Over… asked: the area, and whether it is Hand To.)
+    let mut asked: Option<(ResRef, bool)> = None;
+    crate::report_table::show(
+        ui,
+        &mut w.table,
+        &spec,
+        &order,
+        |i| {
+            let l = &listed[i];
+            let notes = crate::dock_reports::notes_words(l);
+            let whose = crate::dock_reports::whose_words(l);
+            let value = if notes.is_empty() { whose } else { format!("{whose}, {notes}") };
+            (l.area.to_string(), value)
+        },
+        |ui, i, cells, on| {
+            let l = &listed[i];
+            let (text, quiet) = if on { (t.on_fill, t.on_fill) } else { (t.text, t.text_2) };
+            crate::report_table::text(ui, cells[0], l.area.to_string(), text, false);
+            let whose = crate::dock_reports::whose_words(l);
+            let color = if l.whose == Whose::Others && !on { t.warn } else { text };
+            crate::report_table::text(ui, cells[1], whose, color, false);
+            crate::report_table::text(
+                ui,
+                cells[2],
+                crate::dock_reports::notes_words(l),
+                quiet,
+                false,
+            );
+            // (The row's buttons in its last cell, its own controls.)
+            let room = cells[3].shrink2(egui::vec2(4.0, 1.0));
+            let mut row = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(room)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            row.spacing_mut().item_spacing.x = 4.0;
+            let mut acts = |ui: &mut egui::Ui| match l.whose {
+                Whose::Mine => {
+                    if ui.add(egui::Button::new(RELEASE).small()).clicked() {
+                        chosen = Some((l.area, How::Release));
+                        ui.close();
+                    }
+                    let r = ui.add(egui::Button::new(HAND_TO).small());
+                    if r.on_hover_text("Give your claim to another builder").clicked() {
+                        asked = Some((l.area, true));
+                        ui.close();
+                    }
+                }
+                Whose::Others => {
+                    let r = ui.add_enabled(code.is_some(), egui::Button::new(TAKE_OVER).small());
+                    let r = r
+                        .on_hover_text("Claim it in their place (asked first)")
+                        .on_disabled_hover_text(no_code);
+                    if r.clicked() {
+                        asked = Some((l.area, false));
+                        ui.close();
+                    }
+                }
+                Whose::Free => {
+                    let r = ui.add_enabled(code.is_some(), egui::Button::new(CLAIM).small());
+                    if r.on_disabled_hover_text(no_code).clicked() {
+                        chosen = Some((l.area, How::Claim));
+                        ui.close();
+                    }
+                }
+            };
+            if folded {
+                // (Too narrow for them: the row's menu button, its actions
+                // in the menu by the same names.)
+                let more = mg_uikit::IconButton::new(mg_uikit::Icon::MoreHorizontal, ACTIONS);
+                let r =
+                    row.add(more.small()).on_hover_text(format!("What you can do with {}", l.area));
+                egui::Popup::menu(&r).show(|ui| {
+                    ui.set_min_width(120.0);
+                    acts(ui);
+                });
+            } else {
+                acts(&mut row);
+            }
+        },
+    );
+    match asked {
+        Some((area, true)) => {
+            (w.hand, w.take, w.focus) = (Some((area, String::new())), None, true);
+        }
+        Some((area, false)) => (w.take, w.hand) = (Some(area), None),
+        None => {}
+    }
+    app.claims.table = Some(w);
     if let Some((area, how)) = chosen {
         change(app, area, how);
-    }
-    if open && !close {
-        app.claims.table = Some(w);
     }
 }
 
@@ -716,8 +943,10 @@ fn table_window(app: &mut Moonglow, ctx: &egui::Context) {
 /// (or never opened), or an action that ran without making it, takes it
 /// away, so that the area's next change is asked about again.
 fn end_pass(app: &mut Moonglow) {
-    let Some(pass) = app.claims.let_through else { return };
-    let open = match pass.what {
+    if app.claims.let_through.is_empty() {
+        return;
+    }
+    let open = app.claims.let_through.iter().any(|pass| match pass.what {
         Protected::ResRef => app
             .rename
             .as_ref()
@@ -727,9 +956,9 @@ fn end_pass(app: &mut Moonglow) {
             app.confirm_delete.as_ref().is_some_and(|keys| keys.iter().any(asked))
         }
         Protected::Tag => false,
-    };
+    });
     if !open && app.actions.is_empty() {
-        app.claims.let_through = None;
+        app.claims.let_through.clear();
     }
 }
 
@@ -753,11 +982,11 @@ fn save_window(app: &mut Moonglow, ctx: &egui::Context) {
     let SaveAsk { areas, then, .. } = ask;
     let mut open = true;
     let (mut save, mut cancel) = (false, false);
-    crate::widgets::dialog(ctx, "Areas Not Yours", &mut open)
+    let footed = crate::widgets::dialog(ctx, "Areas Not Yours", &mut open)
         .collapsible(false)
         .resizable(false)
-        .show(ctx, |ui| {
-            ui.set_max_width(460.0);
+        .show_foot(ctx, |ui| {
+            crate::widgets::fit_width(ui, 460.0);
             ui.label("The save would write changes to areas you have not claimed:");
             ui.add_space(4.0);
             for (_, why) in &areas {
@@ -769,12 +998,12 @@ fn save_window(app: &mut Moonglow, ctx: &egui::Context) {
                  merge. Claim an area before building in it (its menu's Claim This Area), or \
                  save anyway.",
             );
-            ui.separator();
-            ui.horizontal(|ui| {
-                save = ui.button("Save Anyway").clicked();
-                cancel = crate::widgets::cancel(ui);
-            });
+            ((), crate::widgets::Foot::new().main("Save Anyway", true).no_enter().cancel())
         });
+    if let Some(f) = footed {
+        save = f.pressed.main();
+        cancel = f.pressed.cancelled();
+    }
     if save {
         app.claims.save_ask = None;
         app.claims.cleared = true;
@@ -789,45 +1018,130 @@ fn protected_window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some(ask) = app.claims.protected_ask.clone() else { return };
     let mut open = true;
     let (mut anyway, mut copy, mut cancel) = (false, false, false);
-    crate::widgets::dialog(ctx, "Protected Area", &mut open)
+    let footed = crate::widgets::dialog(ctx, "Protected Area", &mut open)
         .collapsible(false)
         .resizable(false)
-        .show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            let change = match ask.what {
+        .show_foot(ctx, |ui| {
+            crate::widgets::fit_width(ui, 460.0);
+            let doing = |what: Protected| match what {
                 Protected::Tag => "Changing its Tag",
                 Protected::ResRef => "Renaming it",
                 Protected::Deleted => "Deleting it",
             };
-            ui.label(format!("{}.", ask.why));
+            match ask.changes.as_slice() {
+                [(_, why, what)] => {
+                    ui.label(format!("{why}."));
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "{} loses what the game keeps of it: a character's position is kept by \
+                         the area's Tag, and its first visits by the area's ResRef. Players who \
+                         were there come back somewhere else, and see it as new.",
+                        doing(*what)
+                    ));
+                }
+                // (Every one named: the answer is for them all.)
+                several => {
+                    ui.label(format!("This changes {} protected areas:", several.len()));
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for (_, why, what) in several {
+                            let done = match what {
+                                Protected::Tag => "its Tag would change",
+                                Protected::ResRef => "it would be renamed",
+                                Protected::Deleted => "it would be deleted",
+                            };
+                            ui.label(format!("• {why}: {done}"));
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        "That loses what the game keeps of them: a character's position is \
+                         kept by the area's Tag, and its first visits by the area's ResRef. \
+                         Players who were there come back somewhere else, and see them as new.",
+                    );
+                }
+            }
             ui.add_space(4.0);
-            ui.label(format!(
-                "{change} loses what the game keeps of it: a character's position is kept by \
-                 the area's Tag, and its first visits by the area's ResRef. Players who were \
-                 there come back somewhere else, and see it as new."
-            ));
-            ui.add_space(4.0);
-            ui.weak("A copy of it, under a new ResRef and Tag, is a new area and loses nothing.");
-            ui.separator();
-            ui.horizontal(|ui| {
-                copy = ui.button("Make a Copy Instead…").clicked();
-                let label = match ask.what {
-                    Protected::Tag => "Change It Anyway",
-                    Protected::ResRef => "Rename It Anyway",
-                    Protected::Deleted => "Delete It Anyway",
-                };
-                anyway = ui.button(label).clicked();
-                cancel = crate::widgets::cancel(ui);
+            let one = ask.changes.len() == 1;
+            ui.weak(match one {
+                true => "A copy of it, under a new ResRef and Tag, is a new area and loses nothing.",
+                false => "A copy of an area, under a new ResRef and Tag, is a new area and loses nothing.",
             });
+            let first = ask.changes[0].2;
+            let same = ask.changes.iter().all(|c| c.2 == first);
+            let label = match (first, one) {
+                (Protected::Tag, true) => "Change It Anyway",
+                (Protected::ResRef, true) => "Rename It Anyway",
+                (Protected::Deleted, true) => "Delete It Anyway",
+                (Protected::ResRef, false) if same => "Rename Them Anyway",
+                (Protected::Deleted, false) if same => "Delete Them Anyway",
+                (_, false) => "Change Them Anyway",
+            };
+            let mut foot = crate::widgets::Foot::new().main(label, true).no_enter();
+            if one {
+                foot = foot.button("Make a Copy Instead…", true);
+            }
+            ((), foot.cancel())
         });
+    if let Some(f) = footed {
+        anyway = f.pressed.main();
+        copy = f.pressed.clicked("Make a Copy Instead…");
+        cancel = f.pressed.cancelled();
+    }
     if anyway {
         app.claims.protected_ask = None;
-        app.claims.let_through = Some(Pass { area: ask.area, what: ask.what });
+        app.claims.let_through =
+            ask.changes.iter().map(|(area, _, what)| Pass { area: *area, what: *what }).collect();
         app.actions.push(ask.then);
     } else if copy {
         app.claims.protected_ask = None;
-        app.actions.push(Action::CopyDialog(ResKey::new(ask.area, ResType::ARE)));
+        app.cancel_pending_protected();
+        app.actions.push(Action::CopyDialog(ResKey::new(ask.changes[0].0, ResType::ARE)));
     } else if cancel || !open {
         app.claims.protected_ask = None;
+        app.cancel_pending_protected();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A change asked about while the Protected Area window asks about
+    /// another, which nothing holds (a builder's Rename), is refused, not
+    /// put in its place: a plugin job's change took the Rename's window
+    /// (review U's 5).
+    #[test]
+    fn a_builder_s_ask_is_not_replaced_by_another_change() {
+        let dir = mg_testkit::scratch_dir("ui-claims-ask-kept");
+        let mod_dir = dir.join("mod");
+        let area = ResKey::parse("start", ResType::ARE).unwrap();
+        let mut are = mg_gff::Gff::new(*b"ARE ");
+        are.root.set("Tag", mg_gff::Value::String(b"ORIG".to_vec()));
+        let mut m = mg_module::Module::new();
+        m.set_info(&mg_gff::Gff::new(*b"IFO ")).unwrap();
+        m.set(area, are.to_bytes().unwrap());
+        m.save_as(&mg_module::ModuleLocation::Folder(mod_dir.clone())).unwrap();
+        std::fs::write(mod_dir.join("moonglow.toml"), "[claims]\nprotected = [\"start\"]\n")
+            .unwrap();
+        let mut app = Moonglow::new(None, Box::new(crate::NoDialogs::default()));
+        app.open_module(&mod_dir);
+
+        assert!(asks_first(&mut app, &Action::RenameDialog(area)), "asked first");
+        assert!(!app.held_for_protected(), "nothing held");
+        let retag = mg_edit::Edit::SetField {
+            key: area,
+            path: mg_edit::GffPath::root(),
+            label: "Tag".into(),
+            value: Some(mg_gff::Value::String(b"OTHER".to_vec())),
+        };
+        let other = app.apply_or_ask(Command::new("Tag", vec![retag]), None);
+        assert!(other.is_err(), "{other:?}");
+        let ask = app.claims.protected_ask.as_ref().expect("the Rename's window");
+        assert!(matches!(ask.then, Action::RenameDialog(k) if k == area), "{:?}", ask.then);
+        assert!(!app.claims.held);
+        // Nor by another window asked for.
+        assert!(asks_first(&mut app, &Action::DeleteDialog(area)), "held back");
+        let ask = app.claims.protected_ask.as_ref().expect("the Rename's window");
+        assert!(matches!(ask.then, Action::RenameDialog(k) if k == area), "{:?}", ask.then);
     }
 }

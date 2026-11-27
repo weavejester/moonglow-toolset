@@ -31,7 +31,7 @@ impl egui::TextBuffer for NativeTextBuffer {
 }
 
 impl Renderer<'_> {
-    pub(super) fn label(&mut self, c: &Control<'_>) {
+    pub(super) fn label(c: &Control<'_>) {
         let Control { s, a, scale, node, row, body, font, .. } = *c;
         if body.width() >= a.font_height(font) * scale * 0.5 {
             let value = localized_string(&node["value"], s, row, a);
@@ -158,28 +158,8 @@ impl Renderer<'_> {
                 )
             });
             if !disabled && editable {
-                if ui.rect_contains_pointer(body) {
-                    offset[axis] -= ui.input_mut(|i| {
-                        let delta = i.smooth_scroll_delta[axis];
-                        i.smooth_scroll_delta[axis] = 0.0;
-                        delta
-                    });
-                }
-                if (response.clicked() || response.dragged())
-                    && let Some(pointer) = response.interact_pointer_pos()
-                {
-                    let start = strip.min[axis] + size;
-                    let end = strip.max[axis] - size;
-                    if pointer[axis] < start {
-                        offset[axis] -= a.font_height(font) * scale;
-                    } else if pointer[axis] > end {
-                        offset[axis] += a.font_height(font) * scale;
-                    } else {
-                        offset[axis] = ((pointer[axis] - start) / (end - start).max(1.0))
-                            .clamp(0.0, 1.0)
-                            * maximum;
-                    }
-                }
+                let bar = Bar { strip, axis, button: size, max: maximum };
+                offset[axis] = scroll_by(ui, &response, body, &bar, offset[axis]);
             }
             offset[axis] = offset[axis].clamp(0.0, maximum);
             let length = if axis == 1 { galley.size().y + extra } else { content.width() + extra };
@@ -203,7 +183,7 @@ impl Renderer<'_> {
         p.with_clip_rect(clip.intersect(p.clip_rect())).galley(content.min - offset, galley, fg);
     }
 
-    pub(super) fn textedit(&mut self, ui: &mut Ui, c: &mut Control<'_>) {
+    pub(super) fn textedit(ui: &mut Ui, c: &mut Control<'_>) {
         let Control { s, a, scale, node, row, body, fg, font, interactive, source_path, .. } = *c;
         let p = &c.p;
         c.frame("edit", body);

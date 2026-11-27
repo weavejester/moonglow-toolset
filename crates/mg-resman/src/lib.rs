@@ -25,12 +25,13 @@ use thiserror::Error;
 
 pub use container::{
     Container, DirContainer, ERF_READ_LIMIT, ErfContainer, KeyContainer, MemContainer,
+    is_file_or_link_to_one,
 };
 pub use file_name::{
-    CASE_IGNORED, Listed, differs_in_case, file_name_bytes, file_name_text, listed, name_of_file,
-    named_file,
+    CASE_IGNORED, Listed, NO_FILE_NAME, differs_in_case, file_name_bytes, file_name_text,
+    is_file_name, listed, name_of_file, named_file,
 };
-pub use install::{GameInstall, default_user_dir};
+pub use install::{GameInstall, SharedGameBase, default_user_dir};
 
 /// A resource name and type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -181,7 +182,7 @@ impl ResMan {
     ) {
         let at =
             self.layers.iter().position(|l| l.priority < priority).unwrap_or(self.layers.len());
-        let fingerprint = c.fingerprint();
+        let fingerprint = c.initial_fingerprint();
         self.layers.insert(
             at,
             Layer { label: label.into(), priority, class, container: Box::new(c), fingerprint },
@@ -208,7 +209,7 @@ impl ResMan {
         c: impl Container + 'static,
     ) -> Option<Box<dyn Container>> {
         let layer = self.layer_mut(label)?;
-        layer.fingerprint = c.fingerprint();
+        layer.fingerprint = c.initial_fingerprint();
         Some(std::mem::replace(&mut layer.container, Box::new(c)))
     }
 
@@ -219,7 +220,7 @@ impl ResMan {
         match self.layer_mut(label) {
             Some(l) => {
                 l.container.rescan()?;
-                l.fingerprint = l.container.fingerprint();
+                l.fingerprint = l.container.initial_fingerprint();
                 Ok(true)
             }
             None => Ok(false),
@@ -440,7 +441,8 @@ impl ResMan {
     /// first is the copy the game reads), sorted by name and type: what
     /// [`entries`](Self::entries) gives, and the copies it overrides.
     pub fn every_copy(&self) -> Vec<(ResKey, Vec<usize>)> {
-        let mut at: HashMap<ResKey, Vec<usize>> = HashMap::new();
+        let hint = self.layers.iter().map(|l| l.container.keys().size_hint().0).max().unwrap_or(0);
+        let mut at: HashMap<ResKey, Vec<usize>> = HashMap::with_capacity(hint);
         for (i, l) in self.layers.iter().enumerate() {
             for k in l.container.keys() {
                 let layers = at.entry(k).or_default();
@@ -653,6 +655,34 @@ mod tests {
         assert!(rm.texture_over(ResRef::from_str("po_none").unwrap(), none).is_none());
     }
 
+    /// A file linked into a folder is one of its resources, as the game
+    /// reads it (`engine_linked_files`); a link to a folder is not
+    /// followed; and the linked file changed is the folder changed (the
+    /// review's Z3: a linked model or script was not in the load order).
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_s_linked_files_are_its_resources() {
+        let dir = mg_testkit::scratch_dir("mg-resman-linked");
+        let (outside, dev) = (dir.join("build"), dir.join("development"));
+        std::fs::create_dir_all(outside.join("deeper")).unwrap();
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(outside.join("linked.nss"), b"void main() {}").unwrap();
+        std::fs::write(outside.join("deeper/inside.nss"), b"void main() {}").unwrap();
+        std::fs::write(dev.join("plain.nss"), b"void main() {}").unwrap();
+        std::os::unix::fs::symlink(outside.join("linked.nss"), dev.join("linked.nss")).unwrap();
+        std::os::unix::fs::symlink(outside.join("deeper"), dev.join("deeper")).unwrap();
+        std::os::unix::fs::symlink(outside.join("gone.nss"), dev.join("gone.nss")).unwrap();
+        let c = DirContainer::open(&dev);
+        let mut keys: Vec<String> = c.keys().map(|k| k.to_string()).collect();
+        keys.sort();
+        assert_eq!(keys, ["linked.nss", "plain.nss"], "a link to a folder or to nothing: not");
+        let linked = ResKey::parse("linked", ResType::NSS).unwrap();
+        assert_eq!(&*c.read(&linked).unwrap(), b"void main() {}");
+        let before = Container::fingerprint(&c);
+        std::fs::write(outside.join("linked.nss"), b"void main() { int n; }").unwrap();
+        assert_ne!(Container::fingerprint(&c), before, "its file changed: the folder changed");
+    }
+
     #[test]
     fn layers_change_in_place() {
         let one = |data: &'static [u8]| {
@@ -669,7 +699,7 @@ mod tests {
         assert_eq!(rm.get(&key("x", ResType::NSS)).unwrap().as_ref(), b"one");
         assert!(rm.replace("third", one(b"3")).is_none());
 
-        let dir = std::env::temp_dir().join(format!("mg-resman-rescan-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-resman-rescan");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         rm.add(priority::OVERRIDE, "folder", LayerClass::Directory, DirContainer::open(&dir));
@@ -707,11 +737,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A resource's first bytes are its bytes' first, from an archive (read
-    /// alone) and from other containers alike.
+    /// A resource's first bytes are its bytes' first, from an archive and a
+    /// folder (read alone) and from other containers alike.
     #[test]
     fn a_resource_s_first_bytes() {
-        let dir = std::env::temp_dir().join(format!("mg-resman-start-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-resman-start");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hak = dir.join("x.hak");
@@ -725,12 +755,31 @@ mod tests {
         let mut rm = ResMan::new();
         rm.add(priority::HAK, "hak", LayerClass::Erf, ErfContainer::open(&hak).unwrap());
         rm.add(priority::MODULE, "module", LayerClass::Erf, mem);
-        for (name, n) in [("long", 12), ("long", 1000), ("short", 12), ("mem", 3), ("mem", 0)] {
+        let folder = dir.join("override");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("loose.mdl"), b"loose model, read in part").unwrap();
+        std::fs::write(folder.join("empty.mdl"), b"").unwrap();
+        rm.add(priority::OVERRIDE, "override", LayerClass::Directory, DirContainer::open(&folder));
+        let cases = [
+            ("long", 12),
+            ("long", 1000),
+            ("short", 12),
+            ("mem", 3),
+            ("mem", 0),
+            ("loose", 5),
+            ("loose", 0),
+            ("loose", usize::MAX),
+            ("empty", 4),
+        ];
+        for (name, n) in cases {
             let k = key(name, ResType::MDL);
             let all = rm.get(&k).unwrap();
             assert_eq!(&rm.get_start(&k, n).unwrap()[..], &all[..n.min(all.len())], "{name} {n}");
         }
         assert!(rm.get_start(&key("none", ResType::MDL), 12).is_err());
+        // A file gone from the folder since it was listed is an error.
+        std::fs::remove_file(folder.join("loose.mdl")).unwrap();
+        assert!(rm.get_start(&key("loose", ResType::MDL), 5).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -743,9 +792,35 @@ mod tests {
         assert_eq!(ResKey::from_filename("waytoolongname_abcdef.utc"), None);
     }
 
+    /// A name with bytes above 0x7F (`pi\xE8ce01`, as other tools make
+    /// them) is the same resource written into a folder and read back,
+    /// sixteen such bytes too.
+    #[test]
+    fn a_name_past_ascii_survives_a_folder() {
+        let dir = Path::new("unpacked");
+        let all: Vec<u8> = (0x80..=0xFF).collect();
+        let names = all.chunks(16).chain([&b"pi\xE8ce01"[..], b"Se\xF1or"]);
+        for bytes in names {
+            let key = ResKey::new(ResRef::from_bytes(bytes).unwrap(), ResType::UTC);
+            let file = key.path_in(dir).unwrap();
+            let name = file.file_name().unwrap().to_str().unwrap();
+            let back = ResKey::from_filename(name).unwrap();
+            assert_eq!(back, key, "{name}");
+            assert_eq!(back.resref.to_lowercase().as_bytes(), key.resref.to_lowercase().as_bytes());
+            assert_eq!(ResKey::from_filename(&key.to_string()), Some(key));
+        }
+        assert_eq!(
+            ResKey::from_filename("pi\u{e8}ce01.utc").unwrap().resref.as_bytes(),
+            b"pi\xE8ce01"
+        );
+        // A character that is no byte: the name's UTF-8, as it was.
+        let wide = ResKey::from_filename("z\u{142}oty.utc").unwrap();
+        assert_eq!(wide.resref.as_bytes(), "z\u{142}oty".as_bytes());
+    }
+
     #[test]
     fn changed_folders_and_archives_are_reloaded() {
-        let dir = std::env::temp_dir().join(format!("mg-resman-reload-{}", std::process::id()));
+        let dir = mg_testkit::scratch_dir("mg-resman-reload");
         let _ = std::fs::remove_dir_all(&dir);
         let folder = dir.join("override");
         std::fs::create_dir_all(&folder).unwrap();
@@ -779,6 +854,26 @@ mod tests {
         std::fs::remove_file(folder.join("a.2da")).unwrap();
         assert_eq!(rm.changed_layers(|_| true), ["override"]);
         assert!(rm.changed_layers(|l| l.label != "override").is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dir_fingerprint_ignores_non_resources_and_matches_initial_scan() {
+        let dir = mg_testkit::scratch_dir("mg-resman-fp-filter");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.uti"), b"uti").unwrap();
+        let c = DirContainer::open(&dir);
+        let base = Container::initial_fingerprint(&c);
+        assert_eq!(base, Container::fingerprint(&c));
+
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), b"ref: main").unwrap();
+        std::fs::write(dir.join("notes.readme.unknown"), b"ignore").unwrap();
+        assert_eq!(Container::fingerprint(&c), base);
+
+        std::fs::write(dir.join("bar.uti"), b"uti2").unwrap();
+        assert_ne!(Container::fingerprint(&c), base);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

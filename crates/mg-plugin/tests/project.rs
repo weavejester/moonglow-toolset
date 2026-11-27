@@ -2,7 +2,6 @@
 //! content, allowed or denied by the builder, and run from what was read;
 //! and a plugin's settings, read and set through `ctx.settings`.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -12,25 +11,11 @@ use mg_module::Module;
 use mg_module::project_file::ProjectFile;
 use mg_plugin::project::{self, Answers, Trust};
 use mg_plugin::{
-    Answer, Host, Input, Level, Plugin, PluginError, Question, SettingValue, Settings, run_check,
-    run_command, settings,
+    Input, Plugin, PluginError, SettingValue, Settings, run_check, run_command, settings,
 };
 use mg_resman::ResKey;
 
-#[derive(Default)]
-struct TestHost {
-    log: RefCell<Vec<String>>,
-}
-
-impl Host for TestHost {
-    fn log(&self, _: Level, text: &str) {
-        self.log.borrow_mut().push(text.to_string());
-    }
-
-    fn ask(&self, _: &Question) -> Option<Answer> {
-        None
-    }
-}
+use crate::common::TestHost;
 
 fn module() -> Module {
     let mut m = Module::new();
@@ -133,7 +118,7 @@ fn run(
     let host = Rc::new(TestHost::default());
     let input = Input { settings, ..Input::new(module(), None) };
     let outcome = run_command(plugin, command, input, host.clone()).unwrap();
-    let log = host.log.borrow().clone();
+    let log = host.log_texts();
     (log, outcome)
 }
 
@@ -176,6 +161,11 @@ fn the_builder_s_answer_holds_for_the_plugin_as_it_was() {
     assert!(Trust::Unasked.to_ask() && !Trust::Unasked.runs());
     project::decide(&kept, &root, p, true).unwrap();
     assert_eq!(trust(p), Trust::Allowed);
+    // (Written whole, as every file Moonglow keeps: nothing left beside it.)
+    let beside: Vec<_> = (std::fs::read_dir(kept.parent().unwrap()).unwrap().flatten())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(beside, ["answers.toml"]);
     // Kept by the project's canonical path, the plugin and its digest.
     let text = std::fs::read_to_string(&kept).unwrap();
     let canonical = root.canonicalize().unwrap();
@@ -189,11 +179,27 @@ fn the_builder_s_answer_holds_for_the_plugin_as_it_was() {
     );
     assert!(text.contains("plugin = \"team.rules\"") && text.contains("digest = \"sha256:"));
     assert!(!root.join(".moonglow").exists(), "nothing written into the project");
-    // Another project with the same plugin: not allowed by this answer.
-    let (other, _) = project_with_plugin("project-plugin-trust-other");
+    // The project moved or copied (another project with the very same
+    // plugin): allowed, its content being what was allowed; said where.
+    let (other, other_dir) = project_with_plugin("project-plugin-trust-other");
     let theirs = &found(&other)[0];
     assert_eq!(theirs.digest(), p.digest());
-    assert_eq!(Answers::read(&kept).unwrap().trust(&other, theirs), Trust::Unasked);
+    let answers = Answers::read(&kept).unwrap();
+    assert_eq!(answers.trust(&other, theirs), Trust::Allowed);
+    let elsewhere = answers.allowed_elsewhere(&project::canonical(&other), theirs);
+    assert_eq!(elsewhere, Some(canonical.as_path()));
+    assert_eq!(answers.allowed_elsewhere(&canonical, p), None, "its own answer");
+    // Not with other content; and a no there holds there alone.
+    std::fs::write(other_dir.join("rules.luau"), "return { word = \"other\" }").unwrap();
+    assert_eq!(answers.trust(&other, &found(&other)[0]), Trust::Unasked);
+    std::fs::write(other_dir.join("rules.luau"), "return { word = \"first\" }").unwrap();
+    project::decide(&kept, &other, theirs, false).unwrap();
+    let answers = Answers::read(&kept).unwrap();
+    assert_eq!(answers.trust(&other, theirs), Trust::Denied);
+    assert_eq!(answers.trust(&root, p), Trust::Allowed, "the no is the other project's");
+    let mut answers = answers;
+    answers.answers.retain(|a| a.project == canonical);
+    answers.write(&kept).unwrap();
     // Changed: asked again.
     std::fs::write(dir.join("main.luau"), format!("{CODE}\n-- more")).unwrap();
     let changed = &found(&root)[0];
@@ -308,9 +314,11 @@ fn a_setting_misused_is_an_error_that_says_how() {
     let e = fails("ctx.settings.code = 'x'");
     assert!(e.contains("is set with ctx.settings:set(\"code\", value)"), "{e}");
     assert!(fails("ctx.settings:set('most', 40)").contains("40 is more than 32"));
-    assert!(fails("ctx.settings:set('most', 2.5)").contains("number is no setting's value"));
+    assert!(fails("ctx.settings:set('most', 2.5)").contains("2.5 is not a whole number"));
     assert!(fails("ctx.settings:set('most', 'x')").contains("\"x\" is not a whole number"));
-    assert!(fails("ctx.settings:set('loud', {})").contains("table is no setting's value"));
+    assert!(fails("ctx.settings:set('loud', {})").contains("[] is not true or false"));
+    assert!(fails("ctx.settings:set('loud', { 1 })").contains("a list's items are texts"));
+    assert!(fails("ctx.settings:set('loud', print)").contains("function is no setting's value"));
     assert!(fails("ctx.settings:set('gone', 1)").contains("declares no setting \"gone\""));
     assert!(fails("setmetatable(ctx.settings, {})").contains("protected metatable"));
     // A check that sets one fails.

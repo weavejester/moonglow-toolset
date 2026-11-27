@@ -24,13 +24,19 @@ struct Placed {
     colors: Option<[u8; 10]>,
     env_map: Option<String>,
     env_map_default: bool,
+    material_values: Option<Arc<[mg_image::mtr::MaterialValue]>>,
     animated: bool,
     /// A body part whose skins are bound to the base's skeleton: its
     /// nodes from here on stand for the base's, posed as the base is
     /// ([`on_skeleton`]).
     skeleton: Option<Skeleton>,
-    /// Its own animations and its supermodels' (animated parts).
-    anims: Vec<(String, Arc<Model>)>,
+    /// Its own animations and its supermodels' (animated parts), each at
+    /// the scale it plays at through the chain of supermodels
+    /// ([`anim::animations_scaled`]).
+    anims: Vec<(String, Arc<Model>, f32)>,
+    /// An item held in a hand (a weapon, a shield, a torch): its emitters
+    /// stand as its `equip` animation leaves them ([`Composed::emitting`]).
+    held: bool,
 }
 
 impl Placed {
@@ -46,8 +52,49 @@ impl Placed {
 
     /// One of its animations (its own or a supermodel's), by name.
     fn animation(&self, name: &str) -> Option<&Animation> {
-        let owner = self.anims.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))?;
+        let owner = self.anims.iter().find(|(n, ..)| n.eq_ignore_ascii_case(name))?;
         owner.1.animation(name)
+    }
+
+    /// The scale `a` (one of [`Placed::animation`]'s) plays its positions
+    /// at: through the chain of supermodels, each link's but the owner's
+    /// (the client's: `batch6_supermodel_chain`); 1 for its own.
+    fn chain_scale(&self, a: &Animation) -> f32 {
+        let owns = |m: &Model| m.animations.iter().any(|b| std::ptr::eq(a, b));
+        self.anims.iter().find(|(_, m, _)| owns(m)).map_or(1.0, |(.., s)| *s)
+    }
+
+    /// Its model's pose playing `a` (one of [`Placed::animation`]'s) at
+    /// `t`, at the scale of [`Placed::chain_scale`].
+    fn pose(&self, a: &Animation, t: f32) -> Vec<Mat4> {
+        anim::pose_scaled(&self.gpu.model, a, t, self.chain_scale(a))
+    }
+
+    /// [`Placed::pose`] of `a` (none: its rest pose) with `over` played
+    /// over it (an overlay, [`crate::Preview::overlay`]), each one of
+    /// [`Placed::animation`]'s.
+    fn pose_over(&self, a: Option<&Animation>, over: Option<&Animation>, t: f32) -> Vec<Mat4> {
+        match (a, over) {
+            (Some(a), None) => self.pose(a, t),
+            (None, None) => self.gpu.rest.clone(),
+            _ => {
+                let layers: Vec<_> =
+                    a.into_iter().chain(over).map(|l| (l, self.chain_scale(l))).collect();
+                anim::pose_layers_scaled(&self.gpu.model, &layers, t)
+            }
+        }
+    }
+
+    /// The scale a part worn on it plays `a` (one of its
+    /// [`Placed::animation`]'s; none: one of the part's own) at: as it
+    /// moves this model's bones, its own `setanimationscale` for its own
+    /// animation, else the chain's.
+    fn worn_scale(&self, a: Option<&Animation>) -> f32 {
+        let own = |a: &Animation| self.gpu.model.animations.iter().any(|b| std::ptr::eq(a, b));
+        match a {
+            Some(a) if !own(a) => self.chain_scale(a),
+            _ => self.gpu.model.animation_scale,
+        }
     }
 
     /// A body part bound to the skeleton ([`Placed::skeleton`]), posed:
@@ -83,6 +130,18 @@ fn playing<'a>(asked: &str, find: impl Fn(&str) -> Option<&'a Animation>) -> Opt
     })
 }
 
+/// Whether every controller in `a` is constant over time and there is no anim-mesh morph.
+fn animation_is_static(a: &Animation) -> bool {
+    a.nodes.iter().all(|n| {
+        n.anim_mesh.is_none()
+            && n.controllers.iter().all(|c| {
+                c.columns == 0
+                    || c.times.len() <= 1
+                    || c.values.chunks_exact(c.columns).all(|row| row == c.row(0))
+            })
+    })
+}
+
 /// A preview ready to draw.
 #[derive(Debug)]
 pub struct Composed {
@@ -90,6 +149,9 @@ pub struct Composed {
     parts: Vec<Placed>,
     /// The animation the preview stands in.
     pub idle: Option<String>,
+    /// The animation the base plays over whichever it plays
+    /// ([`crate::Preview::overlay`]: a torch-bearer's raised arm).
+    overlay: Option<String>,
     /// The light of its appearance (placeables.2da `LightColor`).
     pub lights: Vec<PreviewLight>,
     /// The light nodes of its models (the base's and the parts'), in the
@@ -100,9 +162,17 @@ pub struct Composed {
     lamps: Vec<anim::Lamp>,
     /// How many of [`Composed::lamps`] are the base model's (the first).
     base_lamps: usize,
+    /// Whether the idle animation has no animated keys so `idle_pose` can be
+    /// computed once and shared across frames and objects.
+    idle_static: bool,
+    idle_pose: std::sync::OnceLock<Arc<Vec<Mat4>>>,
     /// Its idle animation keys the base's meshes (their alpha or
     /// self-illumination, or their vertices): played with the pose.
     idle_keys_meshes: bool,
+    /// Which of its models have particle emitters ([`Emitting::source`]),
+    /// found once: most have none, and an area full of creatures asks
+    /// every frame.
+    emitting: Vec<usize>,
     /// Models named by the preview that could not be loaded.
     pub missing: Vec<String>,
     /// Posing it failed once: it is drawn no more (rather than fail again
@@ -131,10 +201,16 @@ fn place_unguarded(
     // A part hung from a node and not animated (a body part, a held
     // item) is drawn rigid by the game, and a mesh in it that is a skin
     // has no skeleton to follow there, save a body part's skin bound to
-    // the body's skeleton.
+    // the body's skeleton. A body part is one of the body's, whatever its
+    // node is called: capart.2da may hang them from any (a builder's
+    // FFXIV skeleton's `j_sebo_a`), and the client draws a bound skin
+    // there as on `torso_g` (`reading_custom_skeleton_body`). (An item
+    // hung from one of the skeleton's `*_g` part nodes, a helmet on
+    // `head_g`, is taken as it was: the client's way with a helmet's skin
+    // is not read.)
     let mut skeleton = None;
     if let Some((node, base)) = part.attach.as_deref().zip(base).filter(|_| !part.animated) {
-        let body_part = node.ends_with("_g").then_some(base);
+        let body_part = (!part.item || node.ends_with("_g")).then_some(base);
         model = without_skins(model, body_part);
         if let Some((on, at)) = body_part.and_then(|base| on_skeleton(&model, base)) {
             (model, skeleton) = (on, Some(at));
@@ -144,8 +220,11 @@ fn place_unguarded(
         .attach
         .as_deref()
         .and_then(|name| base?.nodes.iter().position(|n| n.name.eq_ignore_ascii_case(name)));
-    let anims =
-        if part.animated || base.is_none() { anim::animations(&model, load) } else { Vec::new() };
+    let anims = if part.animated || base.is_none() {
+        anim::animations_scaled(&model, load)
+    } else {
+        Vec::new()
+    };
     Some(Placed {
         gpu: Arc::new(GpuModel::new(gpu, model)),
         attach,
@@ -156,10 +235,47 @@ fn place_unguarded(
         colors: part.colors,
         env_map: part.env_map.clone(),
         env_map_default: part.env_map_default,
+        material_values: (!part.material_values.is_empty())
+            .then(|| Arc::from(part.material_values.as_slice())),
         animated: part.animated,
         skeleton,
         anims,
+        held: part.item
+            && part
+                .attach
+                .as_deref()
+                .is_some_and(|n| HANDS.iter().any(|h| h.eq_ignore_ascii_case(n))),
     })
+}
+
+/// The nodes a creature holds its items at: its weapons, its shield (on
+/// its forearm), a torch.
+const HANDS: [&str; 3] = ["rhand", "lhand", "lforearm"];
+
+/// Whether a model has particle emitters.
+fn has_emitters(m: &Model) -> bool {
+    m.nodes.iter().any(|n| matches!(n.kind, mg_mdl::NodeKind::Emitter(_)))
+}
+
+/// One of a preview's models that has particle emitters, as it stands
+/// ([`Composed::emitting`]): what a particle simulation is given.
+#[derive(Debug)]
+pub struct Emitting<'a> {
+    /// Which of the preview's models: 0 the base, then each part (in
+    /// [`crate::Preview::parts`]' order, those that hang) from 1. The
+    /// same model from frame to frame: what its simulation is kept by.
+    pub source: usize,
+    pub model: &'a Model,
+    /// The animation that keys its emitters (`None`: they are as the
+    /// model has them).
+    pub animation: Option<&'a Animation>,
+    /// The time in it its keys stand at, whatever the clock (a held
+    /// item's, as its `equip` ends); `None`: the clock's.
+    pub held_at: Option<f32>,
+    /// Its nodes.
+    pub pose: Vec<Mat4>,
+    /// Where it is in the preview's space.
+    pub transform: Mat4,
 }
 
 /// A part hung from a node, with the skin meshes the game does not draw
@@ -294,16 +410,23 @@ impl Composed {
             base,
             parts,
             idle: preview.idle.clone(),
+            overlay: preview.overlay.clone(),
             lights: preview.lights.clone(),
             lamps: Vec::new(),
             base_lamps: 0,
+            idle_static: false,
+            idle_pose: std::sync::OnceLock::new(),
             idle_keys_meshes: false,
+            emitting: Vec::new(),
             missing,
             failed: Default::default(),
         };
         // (Once: where they are as it stands, not as each frame poses it.)
         let name = c.base.gpu.model.name.clone();
         c.lamps = mg_render::guard::guarded(&name, || c.lamps_standing()).unwrap_or_default();
+        let effects = &preview.effect_lights;
+        let effect_lamps = mg_render::guard::guarded(&name, || c.effect_lamps(effects, load));
+        let effect_lamps = effect_lamps.unwrap_or_default();
         let base_model = &*c.base.gpu.model;
         c.base_lamps = base_model
             .nodes
@@ -311,7 +434,15 @@ impl Composed {
             .filter(|n| matches!(n.kind, mg_mdl::NodeKind::Light(_)))
             .count()
             .min(c.lamps.len());
+        c.lamps.extend(effect_lamps);
+        let models = std::iter::once(&c.base).chain(&c.parts);
+        c.emitting = (models.enumerate())
+            .filter(|(_, p)| has_emitters(&p.gpu.model))
+            .map(|(i, _)| i)
+            .collect();
         let idle = c.idle.as_deref().and_then(|a| playing(a, |n| c.base.animation(n)));
+        c.idle_static =
+            idle.is_none_or(animation_is_static) && c.overlay().is_none_or(animation_is_static);
         c.idle_keys_meshes = idle.is_some_and(|a| {
             a.nodes.iter().any(|n| {
                 n.anim_mesh.is_some()
@@ -332,11 +463,7 @@ impl Composed {
         if !has_light(base_model) && !self.parts.iter().any(|p| has_light(&p.gpu.model)) {
             return Vec::new();
         }
-        let idle = self.idle.as_deref().and_then(|a| playing(a, |n| self.base.animation(n)));
-        let base_pose = match idle {
-            Some(a) => anim::pose(base_model, a, 0.0),
-            None => self.base.gpu.rest.clone(),
-        };
+        let (idle, base_pose) = self.base_posed(self.idle.as_deref(), 0.0);
         let mut lamps = anim::lamps_layers(base_model, idle.as_slice(), 0.0, &base_pose);
         for p in &self.parts {
             if !has_light(&p.gpu.model) {
@@ -352,6 +479,50 @@ impl Composed {
         lamps
     }
 
+    /// The lights of its effects (`effects`, [`crate::Preview::effect_lights`]:
+    /// a held item's Light property), in the base's space as it stands in
+    /// its idle animation: each effect model's light nodes as its
+    /// animation leaves them as it ends (`fx_light_clr`'s `Yello_20m`
+    /// keys the color 1.75, 1.5, 1 and the radius from 0 up to 13.3 m),
+    /// at the node it is at (a torch's, in the hand, raised: the client's
+    /// light is there, `part_emitters_torch_light`), casting shadows as
+    /// the effect says. An effect whose model or animation is missing gives
+    /// none.
+    fn effect_lamps(
+        &self,
+        effects: &[crate::EffectLight],
+        load: &dyn Fn(&str) -> Option<Arc<Model>>,
+    ) -> Vec<anim::Lamp> {
+        if effects.is_empty() {
+            return Vec::new();
+        }
+        let (_, base_pose) = self.base_posed(self.idle.as_deref(), 0.0);
+        let mut lamps = Vec::new();
+        for e in effects {
+            let Some(model) = load(&e.model) else { continue };
+            let Some(a) = model.animation(&e.animation) else { continue };
+            let node = e.attach.as_deref().and_then(|name| {
+                self.base.gpu.model.nodes.iter().position(|n| n.name.eq_ignore_ascii_case(name))
+            });
+            let node_at = node.and_then(|i| base_pose.get(i)).map(|m| m.w_axis.truncate());
+            let at = Mat4::from_translation(node_at.unwrap_or(Vec3::ZERO) + e.offset);
+            let rest = anim::compose(&model, &anim::rest_locals(&model));
+            let own = anim::lamps_layers(&model, &[a], a.length, &rest);
+            lamps.extend(own.into_iter().map(|l| anim::Lamp {
+                at: at.transform_point3(l.at),
+                shadow: e.shadows,
+                ..l
+            }));
+        }
+        lamps
+    }
+
+    /// The animation the base plays over whichever it plays
+    /// ([`Composed::overlay`]), where it has one of the name.
+    fn overlay(&self) -> Option<&Animation> {
+        self.overlay.as_deref().and_then(|n| self.base.animation(n))
+    }
+
     /// The base model.
     pub fn base(&self) -> &Arc<GpuModel> {
         &self.base.gpu
@@ -364,27 +535,87 @@ impl Composed {
 
     /// The animations the base can play (its own and its supermodels').
     pub fn animations(&self) -> Vec<String> {
-        self.base.anims.iter().map(|(n, _)| n.clone()).collect()
+        self.base.anims.iter().map(|(n, ..)| n.clone()).collect()
     }
 
-    /// The base model's particle emitters, to simulate: the model, the
-    /// animation it stands in and its nodes' places at `t`. `None` for a
-    /// model without emitters (most).
-    pub fn emitters(
-        &self,
-        animation: Option<&str>,
-        t: f32,
-    ) -> Option<(&Model, Option<&Animation>, Vec<Mat4>)> {
-        let model = &*self.base.gpu.model;
-        if !model.nodes.iter().any(|n| matches!(n.kind, mg_mdl::NodeKind::Emitter(_))) {
-            return None;
+    /// Whether any of its models (the base's or a part's) has particle
+    /// emitters.
+    pub fn emits(&self) -> bool {
+        !self.emitting.is_empty()
+    }
+
+    /// Which of its models have particle emitters ([`Emitting::source`]).
+    pub fn emitting_sources(&self) -> impl Iterator<Item = usize> + '_ {
+        self.emitting.iter().copied()
+    }
+
+    /// Its models with particle emitters, to simulate, as it stands in
+    /// `animation` at `t`: the base's, and its parts' where they hang (an
+    /// effect worn as a tail or wings, CEP's 574 `@VFX` tails: the game's
+    /// effect models, all emitters; a held torch's flame). Each keyed as
+    /// the client keys it (`client_render/part_emitters.rs`): the base by
+    /// the animation it plays; a tail or wings by its own animation of the
+    /// name, else its own `default` (none: as the model has them, so an
+    /// effect's `duration` or `conjure01` keys play no part); a held item
+    /// by its `equip`, as it ends; another part (a helmet) as its model
+    /// has them. Empty for a
+    /// preview without emitters (most).
+    pub fn emitting(&self, animation: Option<&str>, t: f32) -> Vec<Emitting<'_>> {
+        if self.emitting.is_empty() {
+            return Vec::new();
         }
-        let playing = animation.and_then(|name| self.base.animation(name));
-        let pose = match playing {
-            Some(a) => anim::pose(model, a, t),
-            None => self.base.gpu.rest.clone(),
-        };
-        Some((model, playing, pose))
+        let (base_anim, base_pose) = self.base_posed(animation, t);
+        let mut out = Vec::with_capacity(self.emitting.len());
+        for &source in &self.emitting {
+            let Some(i) = source.checked_sub(1) else {
+                out.push(Emitting {
+                    source,
+                    model: &self.base.gpu.model,
+                    animation: base_anim,
+                    held_at: None,
+                    pose: base_pose.to_vec(),
+                    transform: self.base.local,
+                });
+                continue;
+            };
+            let Some(p) = self.parts.get(i) else { continue };
+            let at = p.attach.and_then(|i| base_pose.get(i).copied()).unwrap_or(Mat4::IDENTITY);
+            let (hung, bones) = p.hung(at);
+            let mut pose = self.part_pose(p, animation, base_anim, &base_pose, bones, t);
+            let (keys, held_at) = if p.animated {
+                let own = animation.and_then(|a| p.animation(a));
+                // (An effect keyed in its `default` alone, CEP's tail 620
+                // `fx_lavaspurt`, spurts in the client: one of no animation
+                // of the name plays its `default`, posed by it.)
+                let default = own.is_none().then(|| p.animation("default")).flatten();
+                if let Some(a) = default {
+                    pose = Some(p.pose(a, t));
+                }
+                (own.or(default), None)
+            } else if p.held {
+                let equip = p.gpu.model.animation("equip");
+                (equip, equip.map(|a| a.length))
+            } else {
+                (None, None)
+            };
+            out.push(Emitting {
+                source,
+                model: &p.gpu.model,
+                animation: keys,
+                held_at,
+                pose: pose.unwrap_or_else(|| p.gpu.rest.clone()),
+                transform: hung,
+            });
+        }
+        out
+    }
+
+    /// The light nodes of its parts (a tail's effect's, a held lamp's), as
+    /// they stand in its idle animation, placed by `transform`: those of
+    /// [`Composed::point_lights`] that are not the base model's.
+    pub fn part_point_lights(&self, transform: Mat4) -> Vec<PointLight> {
+        let parts = self.lamps.iter().skip(self.base_lamps);
+        parts.filter_map(|l| l.placed(transform, &|_| None)).collect()
     }
 
     /// Instances at time `t` of `animation` (none: the rest pose), placed
@@ -405,18 +636,73 @@ impl Composed {
         })
     }
 
-    fn posed(&self, animation: Option<&str>, t: f32, transform: Mat4) -> Vec<Instance> {
+    /// The base as it stands in `animation` at `t`: the animation it
+    /// plays for it (none: it has none of the name, and is at rest) and
+    /// its nodes. Reuses the cached `idle_pose` when the idle animation
+    /// has no animated keys.
+    fn base_posed(&self, animation: Option<&str>, t: f32) -> (Option<&Animation>, Arc<Vec<Mat4>>) {
         let base_anim = animation.and_then(|a| playing(a, |n| self.base.animation(n)));
-        let base_pose: Arc<Vec<Mat4>> = Arc::new(match &base_anim {
-            Some(a) => anim::pose(&self.base.gpu.model, a, t),
-            None => self.base.gpu.rest.clone(),
-        });
+        // (Its overlay over whatever it plays; at rest, none.)
+        let over = animation.and(self.overlay());
+        if self.idle_static && animation == self.idle.as_deref() {
+            let pose =
+                self.idle_pose.get_or_init(|| Arc::new(self.base.pose_over(base_anim, over, 0.0)));
+            return (base_anim, Arc::clone(pose));
+        }
+        (base_anim, Arc::new(self.base.pose_over(base_anim, over, t)))
+    }
+
+    /// A part's nodes as it stands where `animation` is asked at `t`, the
+    /// base playing `base_anim` with its nodes at `base_pose` (`bones`:
+    /// where the part's skin's bones are worked out from,
+    /// [`Placed::hung`]); none: as its model has them at rest. The one
+    /// rule for what is drawn ([`Composed::instances`]) and for what is
+    /// boxed and picked ([`Composed::stance`]).
+    ///
+    /// Animated parts play the animation on their own nodes: their own
+    /// (wings, tails), also where the base has none of the name, else the
+    /// base's (robe and cloak bones). A part without the one asked plays
+    /// none of its own: the client stands it as the base's leaves it
+    /// (`reading_wings_without_bones`, 2026-11-01).
+    fn part_pose(
+        &self,
+        p: &Placed,
+        animation: Option<&str>,
+        base_anim: Option<&Animation>,
+        base_pose: &[Mat4],
+        bones: Mat4,
+        t: f32,
+    ) -> Option<Vec<Mat4>> {
+        if !p.animated {
+            return p.skeleton_pose(base_pose, bones);
+        }
+        let own = animation.and_then(|a| p.animation(a));
+        // (A skeleton's animation, the base's or its supermodel's, moves
+        // the part as it moves the base: at the base's scale, through its
+        // chain of supermodels. The part's very own keep theirs.)
+        let worn = self.base.worn_scale(base_anim);
+        // (The base's overlay moves its bones too: a robe's sleeve follows
+        // a torch-bearer's raised arm.)
+        match (own.or(base_anim), animation.and(self.overlay())) {
+            (a, None) => a.map(|a| anim::pose_worn(&p.gpu.model, a, t, worn)),
+            (a, Some(over)) => {
+                let layers: Vec<_> = (a.map(|a| (a, worn)).into_iter())
+                    .chain([(over, self.base.worn_scale(Some(over)))])
+                    .collect();
+                Some(anim::pose_worn_layers(&p.gpu.model, &layers, t))
+            }
+        }
+    }
+
+    fn posed(&self, animation: Option<&str>, t: f32, transform: Mat4) -> Vec<Instance> {
+        let (base_anim, base_pose) = self.base_posed(animation, t);
         let instance = |p: &Placed, transform: Mat4, pose: Option<Arc<Vec<Mat4>>>| Instance {
             pose,
             env_map: p.env_map.clone(),
             env_map_default: p.env_map_default,
             plt_colors: p.colors,
             textures: p.textures.clone(),
+            material_values: p.material_values.clone(),
             ..Instance::new(p.gpu.clone(), transform)
         };
         // (The base in its own visual transform too, where it has one: a
@@ -438,21 +724,8 @@ impl Composed {
             let at = p.attach.and_then(|i| base_pose.get(i).copied()).unwrap_or(Mat4::IDENTITY);
             let (hung, bones) = p.hung(at);
             let placed = transform * hung;
-            // Animated parts play the animation on their own nodes: their
-            // own (wings, tails), else the base's (robe and cloak bones).
-            let pose = if p.animated {
-                let own = animation.and_then(|a| p.animation(a)).or_else(|| {
-                    ["creadyl", "cpause1", "pause1"].iter().find_map(|a| p.animation(a))
-                });
-                // (A skeleton's animation, the base's or its supermodel's,
-                // moves the part as it moves the base: at the base's
-                // scale. The part's very own keep theirs.)
-                let worn = self.base.gpu.model.animation_scale;
-                own.or(base_anim).map(|a| Arc::new(anim::pose_worn(&p.gpu.model, a, t, worn)))
-            } else {
-                p.skeleton_pose(&base_pose, bones).map(Arc::new)
-            };
-            out.push(instance(p, placed, pose));
+            let pose = self.part_pose(p, animation, base_anim, &base_pose, bones, t);
+            out.push(instance(p, placed, pose.map(Arc::new)));
         }
         out
     }
@@ -485,7 +758,7 @@ impl Composed {
             return self.point_lights(transform);
         };
         let model = &*self.base.gpu.model;
-        let pose = anim::pose(model, a, t);
+        let (_, pose) = self.base_posed(animation, t);
         let mut lights = self.row_lights(transform);
         let base = anim::lamps_layers(model, &[a], t, &pose);
         let parts = self.lamps.iter().skip(self.base_lamps);
@@ -624,26 +897,16 @@ impl Composed {
     /// [`Composed::ray_hit_in`] meets it. Made once and kept, a click on
     /// it is tried against what the box is around.
     pub fn stance(&self, animation: Option<&str>, t: f32) -> Stance {
-        let playing = animation.and_then(|a| playing(a, |n| self.base.animation(n)));
-        let (base, playing) = match (playing, animation) {
-            (Some(a), Some(asked)) => (anim::pose(&self.base.gpu.model, a, t), Some((asked, a, t))),
-            _ => (self.base.gpu.rest.clone(), None),
-        };
-        // The parts: those that play it (wings, tails, robes) as they
-        // stand in it too, as [`Composed::instances`] draws them; the
-        // others on the base's nodes.
+        let (base_anim, base_pose) = self.base_posed(animation, t);
+        let base = base_pose.as_ref().clone();
+        // The parts: each as [`Composed::instances`] draws it (those that
+        // play it, wings, tails and robes, as they stand in it; the
+        // others on the base's nodes).
         let parts = (self.parts.iter())
             .map(|p| {
                 let at = p.attach.and_then(|i| base.get(i).copied()).unwrap_or(Mat4::IDENTITY);
-                let posed = playing.filter(|_| p.animated).and_then(|(asked, base, t)| {
-                    let find = |name: &str| p.animation(name);
-                    let own = find(asked)
-                        .or_else(|| ["creadyl", "cpause1", "pause1"].iter().find_map(|a| find(a)));
-                    let worn = self.base.gpu.model.animation_scale;
-                    Some(anim::pose_worn(&p.gpu.model, own.or(Some(base))?, t, worn))
-                });
                 let (hung, bones) = p.hung(at);
-                (posed.or_else(|| p.skeleton_pose(&base, bones)), hung)
+                (self.part_pose(p, animation, base_anim, &base, bones, t), hung)
             })
             .collect();
         Stance { base, parts }
@@ -678,49 +941,101 @@ impl Composed {
     /// its box is.
     pub fn ray_hit_in(&self, stance: &Stance, origin: Vec3, dir: Vec3) -> Option<f32> {
         let mut best: Option<f32> = None;
-        let mut meet = |gm: &GpuModel, nodes: &[Mat4], to: Mat4| {
+        self.ray_triangles(stance, origin, dir, |t, _, _, _, _| {
+            if best.is_none_or(|b| t < b) {
+                best = Some(t);
+            }
+        });
+        best
+    }
+
+    /// Every place a ray (from `origin` along `dir`, in the preview's own
+    /// space; in units of `dir`) crosses one of the drawn triangles, with
+    /// its nodes as `stance` has them: how far along, and the triangle's
+    /// unit normal there in the preview's space. [`Composed::ray_hit_in`]
+    /// is the nearest of them. The normal is the triangle's own (its
+    /// corners', not its vertices' smoothed ones, which lean at a box's
+    /// edges), turned to the side its vertices' normals face; where they
+    /// have none, the side its corners go anticlockwise round, as the
+    /// game's models face (as `plc_chest1`'s lid does).
+    pub fn ray_crossings_in(&self, stance: &Stance, origin: Vec3, dir: Vec3) -> Vec<(f32, Vec3)> {
+        let mut out = Vec::new();
+        let facing = |a: Vec3, b: Vec3, c: Vec3, along: Option<Vec3>| {
+            let n = (b - a).cross(c - a);
+            match along {
+                Some(v) if v.dot(n) < 0.0 => -n,
+                _ => n,
+            }
+        };
+        self.ray_triangles(stance, origin, dir, |t, [a, b, c], tri, mesh, inverse| {
+            let Some(inverse) = inverse else {
+                // A skinned mesh, by its corners' order: its normals are
+                // where it was bound.
+                out.push((t, facing(a, b, c, None).normalize_or_zero()));
+                return;
+            };
+            // (The vertices' normals of a triangle, summed: the side it
+            // faces.)
+            let n = |i: u32| mesh.normals.get(i as usize).copied().map(Vec3::from);
+            let along = (|| Some(n(tri[0])? + n(tri[1])? + n(tri[2])?))();
+            // (A normal out of the mesh's space: by the inverse's
+            // transpose, which keeps it square to a scaled face.)
+            let n = inverse.transpose().transform_vector3(facing(a, b, c, along));
+            out.push((t, n.normalize_or_zero()));
+        });
+        out
+    }
+
+    /// Each drawn triangle a ray (from `origin` along `dir`, in the
+    /// preview's own space) crosses, with its nodes as `stance` has them,
+    /// given to `crossed`: how far along (in units of `dir`), its corners,
+    /// its vertices' indices in its mesh, the mesh, and the inverse of
+    /// where the mesh stands. A skinned mesh is where its bones put it, as
+    /// it is drawn: its corners are in the preview's space and there is no
+    /// inverse; another's are in the mesh's own space (an affine map keeps
+    /// the ray's parameter), and those of a mesh whose box the ray passes
+    /// are not tried.
+    fn ray_triangles(
+        &self,
+        stance: &Stance,
+        origin: Vec3,
+        dir: Vec3,
+        mut crossed: impl FnMut(f32, [Vec3; 3], [u32; 3], &mg_mdl::Mesh, Option<Mat4>),
+    ) {
+        for (gm, nodes, to) in self.models_in(stance) {
             for m in &gm.meshes {
                 let Some(mesh) = gm.model.nodes.get(m.node).and_then(|n| n.mesh()) else {
                     continue;
                 };
                 let faces = mesh.faces.iter().map(|f| f.vertices);
                 let triangles = faces.chain(mesh.drawn.iter().copied());
-                let mut meets = |t: Option<f32>| {
-                    if let Some(t) = t.filter(|&t| best.is_none_or(|b| t < b)) {
-                        best = Some(t);
-                    }
-                };
-                // A skinned mesh where its bones put it, as it is drawn.
                 if let Some(places) = skinned_places(gm, m, nodes, to) {
                     let corner = |i: u32| places.get(i as usize).copied();
-                    for [a, b, c] in triangles {
-                        if let (Some(a), Some(b), Some(c)) = (corner(a), corner(b), corner(c)) {
-                            meets(ray_triangle(origin, dir, a, b, c));
+                    for tri @ [a, b, c] in triangles {
+                        if let (Some(a), Some(b), Some(c)) = (corner(a), corner(b), corner(c))
+                            && let Some(t) = ray_triangle(origin, dir, a, b, c)
+                        {
+                            crossed(t, [a, b, c], tri, mesh, None);
                         }
                     }
                     continue;
                 }
                 let node = nodes.get(m.node).copied().unwrap_or(Mat4::IDENTITY);
-                // The ray in the mesh's space (an affine map keeps its
-                // parameter).
                 let inverse = (to * node).inverse();
                 let (o, d) = (inverse.transform_point3(origin), inverse.transform_vector3(dir));
-                // (Past its box, none of its triangles.)
                 if ray_box(o, d, m.min, m.max).is_none() {
                     continue;
                 }
                 let corner = |i: u32| mesh.vertices.get(i as usize).copied().map(Vec3::from);
-                for [a, b, c] in triangles {
-                    if let (Some(a), Some(b), Some(c)) = (corner(a), corner(b), corner(c)) {
-                        meets(ray_triangle(o, d, a, b, c));
+                for tri @ [a, b, c] in triangles {
+                    if let (Some(a), Some(b), Some(c)) = (corner(a), corner(b), corner(c))
+                        && let Some(t) = ray_triangle(o, d, a, b, c)
+                    {
+                        crossed(t, [a, b, c], tri, mesh, Some(inverse));
                     }
                 }
             }
-        };
-        for (gm, nodes, to) in self.models_in(stance) {
-            meet(gm, nodes, to);
         }
-        best
     }
 
     /// Whether it draws any mesh (not an emitter or a light alone).
@@ -731,7 +1046,22 @@ impl Composed {
     /// The box around it with its nodes as `stance` has them (model
     /// space).
     pub fn bounds_of(&self, stance: &Stance) -> (Vec3, Vec3) {
-        let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        let reached = self.reached_of(stance);
+        mg_render::box_of(reached).unwrap_or((Vec3::splat(-1.0), Vec3::splat(1.0)))
+    }
+
+    /// The points it reaches in `animation` at `t` (model space): each
+    /// mesh's box's corners where its node puts it (a skinned mesh's
+    /// vertices where its bones put them), or with no mesh its emitters'
+    /// boxes' corners. Tighter than [`Composed::bounds_in`]'s one box: a
+    /// view fits what it shows by them (the model viewer's Frame).
+    pub fn reached_in(&self, animation: Option<&str>, t: f32) -> Vec<Vec3> {
+        self.reached_of(&self.stance(animation, t))
+    }
+
+    fn reached_of(&self, stance: &Stance) -> Vec<Vec3> {
+        // (Every point it reaches.)
+        let mut reached: Vec<Vec3> = Vec::new();
         let mut add = |gm: &GpuModel, nodes: &[Mat4], to: Mat4| {
             for m in &gm.meshes {
                 let node = nodes.get(m.node).copied().unwrap_or(Mat4::IDENTITY);
@@ -741,24 +1071,49 @@ impl Composed {
                 // pause, and the box around the spread was several times
                 // the dragon.
                 if let Some(places) = skinned_places(gm, m, nodes, to) {
-                    for w in places {
-                        min = min.min(w);
-                        max = max.max(w);
-                    }
+                    reached.extend(places);
                     continue;
                 }
-                for p in mg_render::box_corners(m.min, m.max) {
-                    let w = (to * node).transform_point3(p);
-                    min = min.min(w);
-                    max = max.max(w);
-                }
+                let node = to * node;
+                reached
+                    .extend(mg_render::box_corners(m.min, m.max).map(|p| node.transform_point3(p)));
             }
         };
         for (gm, nodes, to) in self.models_in(stance) {
             add(gm, nodes, to);
         }
-        if min.x > max.x { (Vec3::splat(-1.0), Vec3::splat(1.0)) } else { (min, max) }
+        // (No mesh to draw, as a fog of particles alone: the box its
+        // emitters' particles fill.)
+        if reached.is_empty() {
+            for (gm, nodes, to) in self.models_in(stance) {
+                for (i, n) in gm.model.nodes.iter().enumerate() {
+                    if !matches!(n.kind, mg_mdl::NodeKind::Emitter(_)) {
+                        continue;
+                    }
+                    let node = to * nodes.get(i).copied().unwrap_or(Mat4::IDENTITY);
+                    let (low, high) = emitter_box(n);
+                    reached.extend(
+                        mg_render::box_corners(low, high).map(|p| node.transform_point3(p)),
+                    );
+                }
+            }
+        }
+        reached
     }
+}
+
+/// The box an emitter's particles fill, in its node's space: its area
+/// (`xsize` by `ysize`, centimeters), as far along its Z as they fly
+/// in their life (`velocity` times `lifeexp`, at most 20 m), widened by
+/// half their largest size.
+fn emitter_box(n: &mg_mdl::Node) -> (Vec3, Vec3) {
+    let p = |name: &str| n.value(name).and_then(|v| v.first().copied()).unwrap_or(0.0);
+    let (x, y) = (p("xsize").abs() / 200.0, p("ysize").abs() / 200.0);
+    let reach = (p("velocity") * p("lifeexp")).clamp(-20.0, 20.0);
+    let size = p("sizestart").abs().max(p("sizeend").abs()).min(20.0) / 2.0;
+    let low = Vec3::new(-x, -y, reach.min(0.0)) - Vec3::splat(size);
+    let high = Vec3::new(x, y, reach.max(0.0)) + Vec3::splat(size);
+    (low, high)
 }
 
 /// How a preview stands: its models' nodes in an animation at a time, or
@@ -931,13 +1286,14 @@ mod ray_tests {
     /// A skeleton for it: the part hangs from `pelvis_g`, half a meter
     /// below `torso_g`.
     fn skeleton() -> Model {
-        let text = "newmodel base\nsetsupermodel base NULL\nclassification character\n\
-            beginmodelgeom base\nnode dummy base\n  parent NULL\nendnode\n\
-            node dummy pelvis_g\n  parent base\n  position 0 0 0.5\nendnode\n\
-            node dummy torso_g\n  parent base\n  position 0 0 1\nendnode\n\
-            endmodelgeom base\ndonemodel base\n";
-        Model::read(text.as_bytes()).unwrap()
+        Model::read(SKELETON.as_bytes()).unwrap()
     }
+
+    const SKELETON: &str = "newmodel base\nsetsupermodel base NULL\nclassification character\n\
+        beginmodelgeom base\nnode dummy base\n  parent NULL\nendnode\n\
+        node dummy pelvis_g\n  parent base\n  position 0 0 0.5\nendnode\n\
+        node dummy torso_g\n  parent base\n  position 0 0 1\nendnode\n\
+        endmodelgeom base\ndonemodel base\n";
 
     /// The part as compiled against the skeleton (as Beamdog's HD bodies
     /// are): its bone is the skeleton's `torso_g` (node 2), and its bind
@@ -1034,6 +1390,73 @@ mod ray_tests {
         );
     }
 
+    /// A builder's FFXIV-style body (a builder's report, 2026-11-04) drew
+    /// nothing: capart.2da hangs its parts from the skeleton's own bones
+    /// (`j_kosi`, `j_sebo_a`), not `*_g` nodes, and its parts' skins,
+    /// compiled against the skeleton, were taken for a held item's and
+    /// hidden; the client draws them (`reading_custom_skeleton_body`).
+    /// And the skeleton has no animations of its own: its idle is its
+    /// supermodel's supermodel's, which poses the skin's bone.
+    #[test]
+    fn a_body_part_bound_to_a_skeleton_of_its_own_names_follows_its_idle() {
+        mg_testkit::gpu::hold();
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("skipped: no GPU");
+            return;
+        };
+        let rename = |text: &str| text.replace("pelvis_g", "j_kosi").replace("torso_g", "j_sebo_a");
+        let mut base = Model::read(rename(SKELETON).as_bytes()).unwrap();
+        base.supermodel = Some("chain1".into());
+        // (The chain: base → chain1, with nothing, → chain2, with `pause1`,
+        // which raises `j_sebo_a` to 2 m.)
+        let link = |name: &str, supermodel: &str, anims: &str| {
+            let text = format!(
+                "newmodel {name}\nsetsupermodel {name} {supermodel}\nclassification character\n\
+                 beginmodelgeom {name}\nnode dummy {name}\n  parent NULL\nendnode\n\
+                 node dummy j_kosi\n  parent {name}\n  position 0 0 0.5\nendnode\n\
+                 node dummy j_sebo_a\n  parent {name}\n  position 0 0 1\nendnode\n\
+                 endmodelgeom {name}\n{anims}donemodel {name}\n"
+            );
+            Arc::new(Model::read(text.as_bytes()).unwrap())
+        };
+        let pause = "newanim pause1 chain2\n  length 1\n  transtime 0\n  animroot chain2\n\
+            node dummy chain2\n  parent NULL\nendnode\n\
+            node dummy j_sebo_a\n  parent chain2\n  positionkey 2\n    0 0 0 2\n    1 0 0 2\n\
+            endnode\ndoneanim pause1 chain2\n";
+        let (chain1, chain2) = (link("chain1", "chain2", ""), link("chain2", "NULL", pause));
+        let mut part = bound_part();
+        part.nodes[1].name = "j_sebo_a_skin".into();
+        let (base, part) = (Arc::new(base), Arc::new(part));
+        let load = |name: &str| match name {
+            "base" => Some(base.clone()),
+            "part" => Some(part.clone()),
+            "chain1" => Some(chain1.clone()),
+            "chain2" => Some(chain2.clone()),
+            _ => None,
+        };
+        let part = crate::Part { attach: Some("j_kosi".into()), ..crate::Part::new("part") };
+        let preview =
+            Preview { parts: vec![part], idle: Some("pause1".into()), ..Preview::model("base") };
+        let c = Composed::new(&gpu, &preview, &load).unwrap();
+        // Drawn, at `j_sebo_a`, a meter up at rest.
+        let (min, max) = c.bounds();
+        assert!((min.z - 1.0).abs() < 1e-4 && (max.z - 1.0).abs() < 1e-4, "{min} {max}");
+        assert_eq!(c.animations(), ["pause1"]);
+        // Standing in its idle: the bone two meters up, and the skin with it.
+        let instances = c.instances(c.idle.as_deref(), 0.5, Mat4::IDENTITY);
+        let pose = instances[1].pose.as_ref().expect("posed by the skeleton");
+        let bone = instances[1].transform * pose[4];
+        assert!(bone.w_axis.truncate().abs_diff_eq(Vec3::Z * 2.0, 1e-5), "{bone}");
+        // A held item's skin, hung there, is not drawn.
+        let held = crate::Part { item: true, ..preview.parts[0].clone() };
+        let preview = Preview { parts: vec![held], ..preview };
+        let c = Composed::new(&gpu, &preview, &load).unwrap();
+        assert_eq!(
+            c.bounds(),
+            Composed::new(&gpu, &Preview::model("base"), &load).unwrap().bounds()
+        );
+    }
+
     /// A part's own visual transform (a placed creature's head scaled,
     /// `Part::local`) places it within the node it hangs from: the part
     /// bound to the skeleton, twice the size about `pelvis_g` (half a meter
@@ -1067,6 +1490,121 @@ mod ray_tests {
         let pose = instances[1].pose.as_ref().expect("posed by the skeleton");
         let torso = instances[1].transform * pose[4];
         assert!(torso.w_axis.truncate().abs_diff_eq(Vec3::Z * 1.5, 1e-5), "{torso}");
+    }
+
+    /// An animated part (wings, a tail) without the animation asked plays
+    /// none of its own: the game's `c_wings2`, whose animations are all a
+    /// creature's, stands spread on a human playing `pause1` in the
+    /// client, as at rest (`reading_wings_without_bones`, 2026-11-01),
+    /// where its `creadyl` hung it edge on.
+    #[test]
+    fn an_animated_part_without_the_animation_plays_none_of_its_own() {
+        mg_testkit::gpu::hold();
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("skipped: no GPU");
+            return;
+        };
+        let base = "newmodel base\nsetsupermodel base NULL\nclassification character\n\
+            beginmodelgeom base\nnode dummy base\n  parent NULL\nendnode\n\
+            endmodelgeom base\n\
+            newanim pause1 base\n  length 1\n  transtime 0\n  animroot base\n\
+            node dummy base\n  parent NULL\nendnode\ndoneanim pause1 base\n\
+            donemodel base\n";
+        let wing = "newmodel wing\nsetsupermodel wing NULL\nclassification character\n\
+            beginmodelgeom wing\nnode dummy wing\n  parent NULL\nendnode\n\
+            node dummy bone\n  parent wing\n  position 0 0 0\nendnode\n\
+            endmodelgeom wing\n\
+            newanim creadyl wing\n  length 1\n  transtime 0\n  animroot wing\n\
+            node dummy wing\n  parent NULL\nendnode\n\
+            node dummy bone\n  parent wing\n  positionkey 2\n    0 1 0 0\n    1 1 0 0\nendnode\n\
+            doneanim creadyl wing\ndonemodel wing\n";
+        let (base, wing) = (
+            Arc::new(Model::read(base.as_bytes()).unwrap()),
+            Arc::new(Model::read(wing.as_bytes()).unwrap()),
+        );
+        let load = |name: &str| match name {
+            "base" => Some(base.clone()),
+            "wing" => Some(wing.clone()),
+            _ => None,
+        };
+        let part = crate::Part { animated: true, ..crate::Part::new("wing") };
+        let preview = Preview { parts: vec![part], ..Preview::model("base") };
+        let c = Composed::new(&gpu, &preview, &load).unwrap();
+        let bone_x = |animation: &str| {
+            let instances = c.instances(Some(animation), 0.5, Mat4::IDENTITY);
+            instances[1].pose.as_ref().map_or(0.0, |pose| pose[1].w_axis.x)
+        };
+        assert!(bone_x("pause1").abs() < 1e-5, "standing: the wing at rest");
+        assert!((bone_x("creadyl") - 1.0).abs() < 1e-5, "its own, asked: played");
+        let stance = c.stance(Some("pause1"), 0.5);
+        let at_rest = stance.parts[0].0.as_ref().is_none_or(|p| p[1].w_axis.x.abs() < 1e-5);
+        assert!(at_rest, "its stance as it is drawn");
+        // And where the base has none of the name and the part has: it is
+        // drawn playing its own, and boxed and picked as it is drawn (its
+        // stance had it at rest: the review's M15). Whatever is asked, a
+        // part's stance is its instance's pose.
+        for asked in [Some("creadyl"), Some("pause1"), Some("nothing"), None] {
+            let drawn = c.instances(asked, 0.5, Mat4::IDENTITY)[1].pose.clone();
+            let stance = c.stance(asked, 0.5);
+            assert_eq!(stance.parts[0].0.as_ref(), drawn.as_deref(), "{asked:?}");
+        }
+        let stance = c.stance(Some("creadyl"), 0.5);
+        assert!((stance.parts[0].0.as_ref().unwrap()[1].w_axis.x - 1.0).abs() < 1e-5);
+    }
+
+    /// A model of scale 2 on one of 3 plays the owner's animation at 6, as
+    /// the client does (`batch6_supermodel_chain`: the owner's own scale,
+    /// here 0.5, not counted), and a part worn on it (a cloak's bone)
+    /// moves at the same scale; the middle model's animation at 2.
+    #[test]
+    fn a_chain_of_scaled_supermodels_plays_at_each_link_s_scale() {
+        mg_testkit::gpu::hold();
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("skipped: no GPU");
+            return;
+        };
+        let model = |name: &str, sup: &str, scale: f32, anim: &str| {
+            let anim = if anim.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "newanim {anim} {name}\n  length 1\n  transtime 0\n  animroot {name}\n\
+                     node dummy {name}\n  parent NULL\nendnode\n\
+                     node dummy bone\n  parent {name}\n  positionkey 1\n    0 1 0 0\nendnode\n\
+                     doneanim {anim} {name}\n"
+                )
+            };
+            let text = format!(
+                "newmodel {name}\nsetsupermodel {name} {sup}\nclassification character\n\
+                 setanimationscale {scale}\nbeginmodelgeom {name}\nnode dummy {name}\n  parent NULL\n\
+                 endnode\nnode dummy bone\n  parent {name}\n  position 0 0 0\nendnode\n\
+                 endmodelgeom {name}\n{anim}donemodel {name}\n"
+            );
+            Arc::new(Model::read(text.as_bytes()).unwrap())
+        };
+        let owner = model("owner", "NULL", 0.5, "walk");
+        let middle = model("middle", "owner", 3.0, "sit");
+        let top = model("top", "middle", 2.0, "");
+        let cloak = model("cloak", "NULL", 1.0, "");
+        let load = |name: &str| match name {
+            "owner" => Some(owner.clone()),
+            "middle" => Some(middle.clone()),
+            "top" => Some(top.clone()),
+            "cloak" => Some(cloak.clone()),
+            _ => None,
+        };
+        let part = crate::Part { animated: true, ..crate::Part::new("cloak") };
+        let preview = Preview { parts: vec![part], ..Preview::model("top") };
+        let c = Composed::new(&gpu, &preview, &load).unwrap();
+        let bone_x = |animation: &str, i: usize| {
+            let instances = c.instances(Some(animation), 0.0, Mat4::IDENTITY);
+            instances[i].pose.as_ref().map_or(0.0, |pose| pose[1].w_axis.x)
+        };
+        assert!((bone_x("walk", 0) - 6.0).abs() < 1e-5, "{}", bone_x("walk", 0));
+        assert!((bone_x("sit", 0) - 2.0).abs() < 1e-5, "{}", bone_x("sit", 0));
+        assert!((bone_x("walk", 1) - 6.0).abs() < 1e-5, "worn: {}", bone_x("walk", 1));
+        let stance = c.stance(Some("walk"), 0.0);
+        assert!((stance.base[1].w_axis.x - 6.0).abs() < 1e-5);
     }
 
     #[test]
@@ -1104,6 +1642,266 @@ mod ray_tests {
         assert_eq!(name(playing("deadfnt", find)), Some("deadfnt".into()));
         assert_eq!(name(playing("CPAUSE1", find)), Some("pause1".into()));
         assert_eq!(name(playing("pause1", find)), Some("pause1".into()));
+    }
+
+    /// A creature of an animated `tail` node (moved 1 m up over its
+    /// `pause1`), wearing as a tail an effect of one emitter and no mesh
+    /// (`fx`), keyed as `anims` says, and holding in its right hand an
+    /// item (`torch`) whose emitter is keyed in its `equip`, and a helmet
+    /// (`helm`) of one emitter.
+    fn effect_creature(gpu: &Gpu, fx_anims: &str, scale: f32) -> Option<Composed> {
+        let base = "newmodel base\nsetsupermodel base NULL\nclassification character\n\
+            beginmodelgeom base\nnode dummy base\n  parent NULL\nendnode\n\
+            node dummy tail\n  parent base\n  position 0 -0.2 1\nendnode\n\
+            node dummy rhand\n  parent base\n  position 0.3 0 1\nendnode\n\
+            node dummy head_g\n  parent base\n  position 0 0 1.7\nendnode\n\
+            node trimesh body\n  parent base\n  bitmap NULL\n  verts 3\n    0 0 0\n    0.1 0 0\n    0 0 1\n\
+            faces 1\n    0 1 2 1 0 0 0 0\nendnode\n\
+            endmodelgeom base\n\
+            newanim pause1 base\n  length 2\n  transtime 0\n  animroot base\n\
+            node dummy base\n  parent NULL\nendnode\n\
+            node dummy tail\n  parent base\n  positionkey 2\n    0 0 -0.2 1\n    2 0 -0.2 3\nendnode\n\
+            doneanim pause1 base\ndonemodel base\n";
+        let emitter = |model: &str, rest: f32| {
+            format!(
+                "node emitter jet\n  parent {model}\n  update Fountain\n  render Normal\n\
+                 birthrate {rest}\n  lifeExp 1\n  velocity 1\n  sizeStart 0.1\n  sizeEnd 0.1\nendnode\n"
+            )
+        };
+        let model = |name: &str, rest: f32, anims: &str| {
+            Model::read(
+                format!(
+                    "newmodel {name}\nsetsupermodel {name} NULL\nclassification effects\n\
+                     beginmodelgeom {name}\nnode dummy {name}\n  parent NULL\nendnode\n{}\
+                     endmodelgeom {name}\n{}donemodel {name}\n",
+                    emitter(name, rest),
+                    anims.replace("MODEL", name)
+                )
+                .as_bytes(),
+            )
+            .map(Arc::new)
+            .unwrap()
+        };
+        let keyed = |anim: &str, from: f32, to: f32| {
+            format!(
+                "newanim {anim} MODEL\n  length 1\n  transtime 0\n  animroot MODEL\n\
+                 node dummy MODEL\n  parent NULL\nendnode\nnode emitter jet\n  parent MODEL\n\
+                 birthratekey 2\n    0 {from}\n    1 {to}\nendnode\ndoneanim {anim} MODEL\n"
+            )
+        };
+        let base = Arc::new(Model::read(base.as_bytes()).unwrap());
+        let fx = model("fx", 0.0, fx_anims);
+        let torch = model("torch", 0.0, &keyed("equip", 0.0, 8.0));
+        let helm = model("helm", 8.0, &keyed("equip", 8.0, 0.0));
+        let load = |name: &str| match name {
+            "base" => Some(base.clone()),
+            "fx" => Some(fx.clone()),
+            "torch" => Some(torch.clone()),
+            "helm" => Some(helm.clone()),
+            _ => None,
+        };
+        let tail = crate::Part {
+            attach: Some("tail".into()),
+            animated: true,
+            scale,
+            ..crate::Part::new("fx")
+        };
+        let held =
+            crate::Part { attach: Some("rhand".into()), item: true, ..crate::Part::new("torch") };
+        let worn =
+            crate::Part { attach: Some("head_g".into()), item: true, ..crate::Part::new("helm") };
+        let preview = Preview {
+            parts: vec![tail, held, worn],
+            idle: Some("pause1".into()),
+            ..Preview::model("base")
+        };
+        Composed::new(gpu, &preview, &load)
+    }
+
+    /// The birthrate an [`Emitting`]'s emitter has as it is keyed.
+    fn birthrate(e: &Emitting<'_>, clock: f32) -> f32 {
+        let t = e.held_at.unwrap_or(clock);
+        let keyed = e.animation.and_then(|a| {
+            let node = a.nodes.iter().find(|n| n.name == "jet")?;
+            let c = node.controllers.iter().find(|c| c.name == "birthrate")?;
+            mg_render::anim::sample(c, mg_render::anim::time_in(a, t)).first().copied()
+        });
+        keyed.unwrap_or_else(|| {
+            let fx = e.model.nodes.iter().find(|n| n.name == "jet").unwrap();
+            fx.value("birthrate").and_then(|v| v.first().copied()).unwrap_or(0.0)
+        })
+    }
+
+    /// The parts' emitters are simulated where the parts hang, as the
+    /// client runs them (`client_render/part_emitters.rs`): a tail's
+    /// follows its node as the base's animation moves it, at the part's
+    /// scale; a held item's stands as its `equip` ends; a helmet's as its
+    /// model has it.
+    #[test]
+    fn a_part_s_emitters_hang_where_the_part_does() {
+        mg_testkit::gpu::hold();
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("skipped: no GPU");
+            return;
+        };
+        let c = effect_creature(&gpu, "", 3.0).unwrap();
+        assert!(c.emits());
+        assert_eq!(c.emitting_sources().collect::<Vec<_>>(), vec![1, 2, 3]);
+        let at = |t: f32| {
+            let e = c.emitting(Some("pause1"), t);
+            let tail = e.iter().find(|e| e.source == 1).unwrap();
+            let fx = tail.model.nodes.iter().position(|n| n.name == "jet").unwrap();
+            tail.transform * tail.pose[fx]
+        };
+        // (Up the tail's node with the pause, at the part's scale.)
+        let (start, half) = (at(0.0), at(1.0));
+        assert!(start.w_axis.truncate().abs_diff_eq(Vec3::new(0.0, -0.2, 1.0), 1e-4), "{start}");
+        assert!(half.w_axis.truncate().abs_diff_eq(Vec3::new(0.0, -0.2, 2.0), 1e-4), "{half}");
+        assert!((start.x_axis.length() - 3.0).abs() < 1e-4, "{start}");
+        let all = c.emitting(Some("pause1"), 0.5);
+        // A tail without the animation: as its model has it.
+        let tail = &all[0];
+        assert!(tail.animation.is_none() && tail.held_at.is_none());
+        // The torch: its `equip`, as it ends (8); the helmet: at rest (8).
+        let torch = &all[1];
+        assert_eq!(torch.animation.map(|a| a.name.as_str()), Some("equip"));
+        assert_eq!(torch.held_at, Some(1.0));
+        assert!((birthrate(torch, 0.5) - 8.0).abs() < 1e-4);
+        let helm = &all[2];
+        assert!(helm.animation.is_none());
+        assert!((birthrate(helm, 0.5) - 8.0).abs() < 1e-4);
+        assert!(helm.transform.w_axis.truncate().abs_diff_eq(Vec3::new(0.0, 0.0, 1.7), 1e-4));
+        // A preview with no emitter anywhere has none to give.
+        let plain = Preview::model("base");
+        let base = Arc::new(skeleton());
+        let none = Composed::new(&gpu, &plain, &|_| Some(base.clone())).unwrap();
+        assert!(!none.emits() && none.emitting(None, 0.0).is_empty());
+    }
+
+    /// A tail's emitters are keyed by its own animation of the name the
+    /// creature plays, else its own `default`; an effect's others
+    /// (`duration`) play no part (the client: `mg_tailkey`, CEP's
+    /// `fx_lavaspurt` and `vdr_smoke`).
+    #[test]
+    fn a_tail_s_emitters_play_its_own_animation_or_its_default() {
+        mg_testkit::gpu::hold();
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("skipped: no GPU");
+            return;
+        };
+        let keyed = |anim: &str| {
+            format!(
+                "newanim {anim} MODEL\n  length 1\n  transtime 0\n  animroot MODEL\n\
+                 node dummy MODEL\n  parent NULL\nendnode\nnode emitter jet\n  parent MODEL\n\
+                 birthratekey 2\n    0 6\n    1 6\nendnode\ndoneanim {anim} MODEL\n"
+            )
+        };
+        let tail_keys = |anims: &str| {
+            let c = effect_creature(&gpu, anims, 1.0).unwrap();
+            let e = c.emitting(Some("pause1"), 0.5);
+            (e[0].animation.map(|a| a.name.clone()), birthrate(&e[0], 0.5))
+        };
+        assert_eq!(tail_keys(&keyed("pause1")), (Some("pause1".into()), 6.0));
+        let both = keyed("pause1") + &keyed("default");
+        assert_eq!(tail_keys(&both).0.as_deref(), Some("pause1"));
+        assert_eq!(tail_keys(&keyed("default")), (Some("default".into()), 6.0));
+        assert_eq!(tail_keys(&keyed("duration")), (None, 0.0));
+    }
+
+    /// A torch-bearer as the client draws him (`part_emitters_torch_light`):
+    /// his overlay (`torchl`) moves the nodes it keys over his idle, which
+    /// keys the others, and an animated part's (a robe's arm bone) with
+    /// them, but not at rest; his light is the effect model's light node
+    /// as its animation ends (the color 1.75, 1.5, 1 and radius 13.3 of
+    /// `fx_light_clr`'s `Yello_20m`), at his `headconjure` and the offset
+    /// from it, casting shadows as the effect says. An effect whose model
+    /// is missing gives no light.
+    #[test]
+    fn a_torch_bearer_raises_his_arm_and_lights_around_him() {
+        mg_testkit::gpu::hold();
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("skipped: no GPU");
+            return;
+        };
+        let key = |anim: &str, node: &str, z: f32| {
+            format!(
+                "newanim {anim} base\n  length 2\n  transtime 0\n  animroot base\n\
+                 node dummy base\n  parent NULL\nendnode\n\
+                 node dummy {node}\n  parent base\n  positionkey 2\n    0 0 0 {z}\n    2 0 0 {z}\n\
+                 endnode\ndoneanim {anim} base\n"
+            )
+        };
+        let base = format!(
+            "newmodel base\nsetsupermodel base NULL\nclassification character\n\
+             beginmodelgeom base\nnode dummy base\n  parent NULL\nendnode\n\
+             node dummy lhand\n  parent base\n  position 0 0 1\nendnode\n\
+             node dummy head_g\n  parent base\n  position 0 0 1.5\nendnode\n\
+             node dummy headconjure\n  parent base\n  position 0 0.1 2\nendnode\n\
+             endmodelgeom base\n{}{}donemodel base\n",
+            key("pause1", "head_g", 1.6),
+            key("torchl", "lhand", 1.8),
+        );
+        let robe = "newmodel robe\nsetsupermodel robe NULL\nclassification character\n\
+            beginmodelgeom robe\nnode dummy robe\n  parent NULL\nendnode\n\
+            node dummy lhand\n  parent robe\n  position 0 0 1\nendnode\n\
+            endmodelgeom robe\ndonemodel robe\n";
+        let fx = "newmodel fx\nsetsupermodel fx NULL\nclassification effect\n\
+            beginmodelgeom fx\nnode dummy fx\n  parent NULL\nendnode\n\
+            node light glow\n  parent fx\n  position 0 0 0\n  radius 50\n  color 0 0 0\n\
+              shadow 0\nendnode\nendmodelgeom fx\n\
+            newanim Yello_20m fx\n  length 0.3\n  transtime 0\n  animroot fx\n\
+            node dummy fx\n  parent NULL\nendnode\n\
+            node light glow\n  parent fx\n  colorkey 1\n    0.3 1.75 1.5 1\n\
+              radiuskey 2\n    0 0\n    0.3 13.3\nendnode\ndoneanim Yello_20m fx\n\
+            donemodel fx\n";
+        let read = |text: &str| Arc::new(Model::read(text.as_bytes()).unwrap());
+        let (base, robe, fx) = (read(&base), read(robe), read(fx));
+        let load = |name: &str| match name {
+            "base" => Some(base.clone()),
+            "robe" => Some(robe.clone()),
+            "fx" => Some(fx.clone()),
+            _ => None,
+        };
+        let light = crate::EffectLight {
+            model: "fx".into(),
+            animation: "yello_20m".into(),
+            shadows: true,
+            attach: Some("headconjure".into()),
+            offset: Vec3::new(0.0, 0.75, 0.6),
+        };
+        let preview = Preview {
+            parts: vec![crate::Part { animated: true, ..crate::Part::new("robe") }],
+            idle: Some("pause1".into()),
+            overlay: Some(crate::TORCH_OVERLAY.into()),
+            effect_lights: vec![light.clone()],
+            ..Preview::model("base")
+        };
+        let c = Composed::new(&gpu, &preview, &load).unwrap();
+        let z = |pose: &[Mat4], i: usize| pose[i].w_axis.z;
+        let drawn = c.instances(c.idle.as_deref(), 0.5, Mat4::IDENTITY);
+        let base_pose = drawn[0].pose.as_ref().unwrap();
+        assert_eq!((z(base_pose, 1), z(base_pose, 2)), (1.8, 1.6), "the arm up, the idle kept");
+        assert_eq!(z(drawn[1].pose.as_ref().unwrap(), 1), 1.8, "the robe's arm with it");
+        let rest = c.instances(None, 0.0, Mat4::IDENTITY);
+        assert_eq!(z(rest[0].pose.as_ref().unwrap(), 1), 1.0, "at rest, none");
+        // Without the overlay, the arm down.
+        let plain = Preview { overlay: None, ..preview.clone() };
+        let p = Composed::new(&gpu, &plain, &load).unwrap();
+        let drawn = p.instances(p.idle.as_deref(), 0.5, Mat4::IDENTITY);
+        assert_eq!(z(drawn[0].pose.as_ref().unwrap(), 1), 1.0);
+        // The light, ahead of and above `headconjure`.
+        let at = Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0));
+        let lights = c.point_lights(at);
+        assert_eq!(lights.len(), 1, "{lights:?}");
+        let l = lights[0];
+        assert!(l.position.abs_diff_eq(Vec3::new(10.0, 0.85, 2.6), 1e-5), "{l:?}");
+        let linear = (Vec3::new(1.75, 1.5, 1.0) / 1.75).powf(2.2);
+        assert!(l.color.abs_diff_eq(linear, 1e-5) && (l.cutoff - 13.3 * 2.0 * 1.75).abs() < 1e-3);
+        assert!(l.casts_shadows);
+        assert_eq!(c.part_point_lights(at), lights, "a light of its own, not its base model's");
+        let missing = crate::EffectLight { model: "none".into(), ..light };
+        let none = Preview { effect_lights: vec![missing], ..preview };
+        assert!(Composed::new(&gpu, &none, &load).unwrap().point_lights(at).is_empty());
     }
 }
 

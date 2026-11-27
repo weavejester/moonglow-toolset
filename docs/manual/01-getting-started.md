@@ -3,7 +3,7 @@ type: Manual Page
 title: Getting started
 description: What Moonglow needs, installing it, the first start (finding the game) and a first module.
 tags: [manual, installing]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-29T18:21:15Z }
+generated: { by: claude-code/claude-sonnet-5-5, at: 2026-11-25T19:30:00Z }
 ---
 
 # Getting started
@@ -31,7 +31,7 @@ generated: { by: claude-code/claude-opus-5-5, at: 2026-10-29T18:21:15Z }
   [Troubleshooting](13-troubleshooting.md)).
 - **Windows**: run `Moonglow-*-setup.exe`. It installs for your user
   without administrator rights (or for all users, if you choose), adds a
-  Start menu entry and, if you tick it, opens `.mod` files with Moonglow.
+  Start menu entry and, if you check it, opens `.mod` files with Moonglow.
 - **Windows, Scoop**: `scoop bucket add moonglow
   https://github.com/jadzziaa/moonglow-toolset`, then `scoop install
   moonglow`; `scoop update moonglow` for a newer release.
@@ -66,27 +66,70 @@ the registry, where its installer notes the folder. On macOS only
 Steam's and Beamdog's folders are looked in: a game from GOG there is
 set in Options, as below.
 
-The log at the bottom of the window says where it found the game ("Game
-data loaded from …"); the status bar shows the folder. If the game is
-somewhere else (a folder of your own, say), choose
-**Tools › Options… › Folders** and set **Neverwinter Nights installation**
-(the folder with `data/` and `bin/` in it) and, if needed, the **NWN user
-folder**.
+The log says where it found the game ("Game data loaded from …"): at
+first it is closed, and its last line shows in the Status Bar at the
+bottom of the window, beside the **Log** switch that opens it. In a
+window 1400 or more wide the Status Bar also shows the game's folder at
+its right. If the game is somewhere else (a folder of your own, say),
+choose **Tools › Options › Folders** (the **Options** tab opens on
+that page). Set **Neverwinter Nights installation** (the folder with `data/`
+and `bin/` in it) and, if needed, **NWN user folder (haks, override,
+modules)**.
 
-The **Welcome** tab offers **New Module…** and **Open Module…**; later it
-also lists your recent modules.
+## The Welcome page
+
+With no module open, the **Welcome** tab shows Moonglow's version and,
+in three columns, Recent Modules; Start and Status; and Learn. In a
+narrower window it has two (Recent Modules over Learn, beside Start
+over Status), then one, and the page scrolls where it does not fit:
+
+- **Recent Modules**: the modules you opened last, newest first, each
+  its name (a module folder or a nasher project with a `/` after it, a
+  `.mod` or `.nwm` without) over the folder it is in (`~` for your
+  home folder; the whole path in its tooltip), and at the row's right
+  end when it was opened last ("2 hours ago"; a module from before
+  Moonglow kept the times shows none until it is opened again; saving
+  does not change the time). A click, or Enter or
+  Space on the row, opens it; Tab goes from row to row, those below
+  the window's edge too. Before your first module it says "No module
+  opened yet." The same list is **File › Recent Modules**, and a
+  module's `.mod`, `.nwm` or folder dropped on the window opens too.
+- **Start**: **New Module…**, **Open Module…** and **Open Folder…**, each
+  with its key as you bound it (Tools › Options › Keyboard).
+- **Without a Module**: what opens with no module: **Open Hak…**,
+  **New Hak**, **Open Tileset…**, **New Tileset…**, **2DA File…**,
+  **Talk Table**, **Resource Browser** and **Appearance Gallery** (also
+  in Tools).
+- **Status**: **Game data found** and the game's folder, or where none
+  was found what to do, with **Options…** (it opens on Folders). A newer
+  release is told here, with its buttons ([updates](02-main-window.md#updates)),
+  and "Checking for updates…" while Moonglow asks.
+- **Learn**: **User Manual**, and a link to each of its chapters (but
+  the two on writing plugins, which are in its contents), which opens
+  the manual on that chapter; under **Help**, **Command
+  Palette…**, **Check for Updates…** and **About Moonglow Toolset**.
+
+The Status Bar shows the page's keys: New module, Open module, and Go
+to resource or command (Quick Open).
 
 ## A first module
 
-1. **File › New Module…** (Ctrl+N) asks for a name and makes an empty
-   module, as Aurora's module wizard does.
-2. **Wizards › Area Wizard…** (Ctrl+Alt+A, or **New Area** on the toolbar)
-   makes an area: pick a tileset, a size and a name. The area opens in the
-   area viewer.
-3. Choose a blueprint in the palette on the right (a creature, a
-   placeable…) and click in the area to place it.
-4. **File › Save** (Ctrl+S). Save the module in your user folder's
-   `modules` folder if you want to test it in the game.
+1. **File › New Module…** (Ctrl+N) asks for a **Module name**; **Create**
+   makes an empty module, as Aurora's module wizard does, and opens the
+   **Area Wizard**.
+2. The Area Wizard makes an area in three steps: give it a name and
+   pick a tileset (**Next >**), choose a size (**Next >**), and press
+   **Finish**. With **Open area in the Area Viewer**
+   checked (as it is at first), the area opens in the area viewer. For another area later,
+   choose **Wizards › Area Wizard…** (Ctrl+Alt+A), or **New Area** (the
+   plus) on the Module panel's tab bar. While no area is open in front,
+   the editor area shows **No area open**, with **Area Wizard…** and
+   **Go to Start** buttons.
+3. Choose a blueprint in the **Palette** panel on the right (a creature,
+   a placeable…) and click in the area to place it.
+4. **File › Save** (Ctrl+S). A module never saved asks where first, and
+   offers its name as a `.mod` in your user folder's `modules` folder,
+   where the game finds it to test.
 5. **Build › Test Module** (F9) saves the module and starts the game on it,
    with your first local character at the start location.
 

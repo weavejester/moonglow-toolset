@@ -3,12 +3,12 @@ type: Guide
 title: 'Plugins: for authors'
 description: Starting point for plugin authors - the example plugins, the editor type file, the API changes, where the manual covers plugins, and the mg plugin commands for checking, testing, running and packing one.
 tags: [plugins, authors, examples]
-generated: { by: claude-code/claude-opus-5-5, at: 2026-10-22T22:23:18Z }
+generated: { by: claude-code/claude-opus-5-5, at: 2026-11-09T00:38:51Z }
 ---
 
 # Plugins: for authors
 
-Plugins are experimental: the plugin API is at 0.4, and a later release
+Plugins are experimental: the plugin API is at 0.9, and a later release
 may change it ([`CHANGES.md`](CHANGES.md) lists each change).
 
 What a plugin author needs besides the manual:
@@ -43,8 +43,30 @@ What a plugin author needs besides the manual:
     menus of objects and areas (API 0.4), run on what was clicked: a
     local variable set on the objects or blueprints selected, and an
     area's objects counted.
+  - [`pick-tint`](examples/pick-tint): a color field (API 0.8). A
+    placed placeable's right-click command that asks for its tint
+    (The Domains of Dread's `tdod_tint`), drawn on the placeables while
+    it is picked, and sets it.
+  - [`tint-panel`](examples/tint-panel): a panel's fields (API 0.9).
+    The same tint picked in a pane that stays open and follows the
+    selection: a color field showing the selected placeable's
+    `tdod_tint`, drawn on it while it is picked and set by the field's
+    command when the picker closes (`ctx.values`), and a choice of named
+    tints, each with its swatch; tests of its own.
   - [`creature-report`](examples/creature-report): reading the game's
     data (a 2DA and the talk table).
+  - [`creature-sheet`](examples/creature-sheet): an exporter and an
+    importer (API 0.6). File › Export writes the module's creature
+    blueprints (or those selected) to a CSV file, File › Import reads one
+    back, setting each creature's tag and name; tests of its own.
+  - [`store-wizard`](examples/store-wizard): a wizard (API 0.6). A store
+    made page by page, the pages after the first made from its answers
+    (or skipped), a page's check keeping it until it is right; tests of
+    its own, answering its pages.
+  - [`module-overview`](examples/module-overview): a panel (API 0.6). A
+    pane of what the module has and of what is selected, its areas to
+    open, a button running the plugin's command; tests of its own of what
+    it shows.
   - [`tileset-import`](examples/tileset-import): outside the module. A
     folder the user chooses (a tileset's files, as NWN Mapper exports
     them) goes into a hak, and an area is made with one of the
@@ -59,7 +81,7 @@ The manual has the rest: [Plugins](../manual/15-plugins.md) (for the
 people who use them), [Writing plugins](../manual/16-writing-plugins.md)
 and the [Plugin API reference](../manual/17-plugin-api.md). The design
 and its reasons are in the [proposal](../plugin-proposal.md); what is
-planned beyond API 0.4 is in the [deferred list](../deferred.md)
+planned beyond API 0.9 is in the [deferred list](../deferred.md)
 (Automation).
 
 To check a plugin, run its own tests, try a command without the window,
@@ -72,5 +94,7 @@ mg plugin test docs/plugins/examples/tag-conventions
 mg plugin test docs/plugins/examples/builder-tags
 mg plugin test docs/plugins/examples/house-rules
 mg plugin run mymodule.mod docs/plugins/examples/tag-conventions fix-tags --dry-run
+mg plugin export mymodule.mod docs/plugins/examples/creature-sheet creatures-csv creatures.csv
+mg plugin wizard mymodule.mod docs/plugins/examples/store-wizard new-store --answer name=Smithy
 mg plugin pack docs/plugins/examples/tag-conventions
 ```

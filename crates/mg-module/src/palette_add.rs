@@ -34,6 +34,14 @@ pub struct Added {
     pub instance: Struct,
 }
 
+/// The first `most` characters of `text` (all of it where it has no
+/// more): where a new resref's stem is cut. By characters, not bytes: a
+/// resref's byte above 0x7F is written as a character of two, and a cut
+/// by bytes could fall inside it.
+pub fn first_chars(text: &str, most: usize) -> &str {
+    text.char_indices().nth(most).map_or(text, |(at, _)| &text[..at])
+}
+
 /// A new blueprint resref for a copy of `template`, a creature's or an
 /// item's, as Aurora's Add to Palette names it: the template without a
 /// leading `nw_` and its trailing number (within 13 characters); from that
@@ -61,7 +69,7 @@ pub fn new_resref_named(
     let base = naming.strip(base);
     let stem = base.trim_end_matches(|c: char| c.is_ascii_digit());
     let mut n: u32 = base[stem.len()..].parse().unwrap_or(0);
-    let stem = &stem[..stem.len().min(13)];
+    let stem = first_chars(stem, 13);
     let stem = if stem.is_empty() { "blueprint" } else { stem };
     let named = |n: u32| naming.fit(stem, &format!("{n:03}"));
     let used = |n: u32| match n {
@@ -76,7 +84,7 @@ pub fn new_resref_named(
     while n < 999 && used(n) {
         n += 1;
     }
-    naming.numbered(stem, n + 1, taken)
+    naming.numbered(stem, n.saturating_add(1), taken)
 }
 
 /// A new blueprint resref for a copy of `template`, a placeable's, door's,
@@ -133,18 +141,20 @@ pub fn copy_resref_named(
     let base = naming.strip(lower.strip_prefix("nw_").unwrap_or(&lower));
     let stem = base.trim_end_matches(|c: char| c.is_ascii_digit());
     let n: u32 = base[stem.len()..].parse().unwrap_or(0);
-    let stem = &stem[..stem.len().min(13)];
+    let stem = first_chars(stem, 13);
     let stem = if stem.is_empty() { "blueprint" } else { stem };
-    naming.numbered(stem, n + 1, taken)
+    naming.numbered(stem, n.saturating_add(1), taken)
 }
 
 /// The fields a placed object has and its blueprint does not: where it
-/// stands ([`crate::placement::fields_of`]), and a sound's
+/// stands ([`crate::placement::fields_of`]), Moonglow's own marks of
+/// the placed object (its lock and an outline's own color), and a sound's
 /// `GeneratedType`, an encounter's spawn points and the others' visual
 /// transform.
 fn placement_fields(t: ResType) -> Vec<&'static str> {
     let Some(kind) = ObjectKind::from_restype(t) else { return Vec::new() };
     let mut out = crate::placement::fields_of(kind);
+    out.extend([mg_rules::placement::LOCKED, mg_rules::placement::OUTLINE_COLOR]);
     out.push(match kind {
         ObjectKind::Sound => "GeneratedType",
         ObjectKind::Encounter => "SpawnPointList",
@@ -195,7 +205,7 @@ pub fn add_to_palette(
     let mut bp = blueprint_fields(game, restype, instance, from.as_ref(), resref);
 
     // The items it holds, each a new item blueprint.
-    let item_blueprint = |item: &Struct, blueprints: &mut Vec<(ResKey, Gff)>| -> ResRef {
+    let item_blueprint = |item: &Struct, blueprints: &mut Vec<(ResKey, Gff)>| -> Option<ResRef> {
         let template = item.resref("TemplateResRef").map(|r| r.to_string()).unwrap_or_default();
         // (The object's own new name is taken too: an item may hold one
         // of its own blueprint.)
@@ -204,7 +214,7 @@ pub fn add_to_palette(
             let key = ResKey::parse(name, ResType::UTI);
             key.is_some_and(|k| k == own || taken(&k) || blueprints.iter().any(|(b, _)| *b == k))
         };
-        let r = new_resref_named(&template, naming, &used).unwrap_or(ResRef::EMPTY);
+        let r = new_resref_named(&template, naming, &used)?;
         let from = item
             .resref("TemplateResRef")
             .filter(|t| !t.is_empty())
@@ -216,7 +226,7 @@ pub fn add_to_palette(
         let mut g = Gff::new(*b"UTI ");
         g.root = fields;
         blueprints.push((ResKey::new(r, ResType::UTI), g));
-        r
+        Some(r)
     };
     let mut items = Vec::new();
     // Inventories: the object's own, and each store page's.
@@ -235,7 +245,7 @@ pub fn add_to_palette(
         let mut entries = Vec::new();
         let mut renamed = Vec::new();
         for (i, item) in held.iter().enumerate() {
-            let r = item_blueprint(item, &mut items);
+            let r = item_blueprint(item, &mut items)?;
             let mut entry = Struct::new(i as u32);
             entry.set("InventoryRes", Value::resref(r));
             for label in HELD {
@@ -269,7 +279,7 @@ pub fn add_to_palette(
         let mut entries = Vec::new();
         let mut renamed = Vec::new();
         for item in &equipped {
-            let r = item_blueprint(item, &mut items);
+            let r = item_blueprint(item, &mut items)?;
             let mut entry = Struct::new(item.id);
             entry.set("EquippedRes", Value::resref(r));
             for label in ["Dropable", "Pickpocketable"] {
@@ -363,6 +373,21 @@ fn file_type(t: ResType) -> [u8; 4] {
 mod tests {
     use super::*;
 
+    /// A template with a byte above 0x7F (a character of two bytes in its
+    /// text) where the stem is cut: cut after the character, not in it.
+    #[test]
+    fn a_stem_is_cut_by_characters() {
+        assert_eq!(first_chars("abcdefghijkl\u{e9}xy", 13), "abcdefghijkl\u{e9}");
+        assert_eq!(first_chars("abc", 13), "abc");
+        assert_eq!(first_chars("\u{e9}\u{e9}", 1), "\u{e9}");
+        let free = |_: &str| false;
+        let template = "abcdefghijkl\u{e9}x";
+        let _ = new_resref(template, &free);
+        let _ = copy_resref_named(template, &Naming::default(), &free);
+        let _ = situated_resref_named(template, &Naming::default(), &free);
+        assert_eq!(new_resref("abcdefghijklmnop", &free).unwrap().to_string(), "abcdefghijklm001");
+    }
+
     /// A placed creature made a blueprint: its items' `Dropable` and
     /// `Pickpocketable` go into the blueprint's entries, equipped as in
     /// the backpack.
@@ -394,6 +419,37 @@ mod tests {
         assert!(hand.get("Pickpocketable").is_none(), "only what it had");
         let held = &bp.list("ItemList").unwrap()[0];
         assert_eq!(held.get("Pickpocketable"), Some(&Value::Byte(1)));
+    }
+
+    /// Moonglow's own marks of a placed object (an encounter's outline
+    /// color, the area editor's lock) stay on the object: its new
+    /// blueprint has neither, so what is placed from it is not born with
+    /// them.
+    #[test]
+    fn a_blueprint_made_of_an_object_leaves_its_outline_color_and_lock_out() {
+        use mg_rules::placement::{LOCKED, OUTLINE_COLOR};
+        let game =
+            GameData::new(mg_resman::ResMan::new(), mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let mut encounter = Struct::new(7);
+        encounter.set("TemplateResRef", Value::resref(ResRef::from_str("goblins").unwrap()));
+        encounter.set("Tag", Value::String(b"GOBLINS".to_vec()));
+        encounter.set(OUTLINE_COLOR, Value::Dword(0x00FF_8020));
+        encounter.set(LOCKED, Value::Byte(1));
+        let added = add_to_palette(
+            &game,
+            ResType::UTE,
+            &encounter,
+            &|_| None,
+            &|_| false,
+            &Naming::default(),
+        )
+        .unwrap();
+        let bp = &added.blueprints[0].1.root;
+        assert!(bp.get(OUTLINE_COLOR).is_none(), "{bp:?}");
+        assert!(bp.get(LOCKED).is_none(), "{bp:?}");
+        assert_eq!(bp.string("Tag"), Some(&b"GOBLINS"[..]), "the rest kept");
+        assert_eq!(added.instance.get(OUTLINE_COLOR), Some(&Value::Dword(0x00FF_8020)));
+        assert_eq!(added.instance.get(LOCKED), Some(&Value::Byte(1)));
     }
 
     #[test]
@@ -472,5 +528,24 @@ mod tests {
         assert_eq!(add("x3_plc_rubble1"), "plc_rubble1", "one prefix at a time");
         assert_eq!(add("plc_rubble1"), "rubble1");
         assert_eq!(add("rubble1"), "rubble002");
+    }
+
+    #[test]
+    fn u32_max_suffix_does_not_overflow_and_exhausted_items_return_none() {
+        let r = |s: &str| ResRef::from_str(s).unwrap();
+        let naming = Naming::default();
+        assert_eq!(new_resref_named("x4294967295", &naming, &|_| false), None);
+        assert_eq!(copy_resref_named("x4294967295", &naming, &|_| false), None);
+        assert_eq!(copy_resref_named("x9998", &naming, &|_| false), Some(r("x9999")));
+
+        let game =
+            GameData::new(mg_resman::ResMan::new(), mg_tlk::Tlk::new(mg_core::Language::ENGLISH));
+        let mut held = Struct::new(0);
+        held.set("TemplateResRef", Value::resref(r("x_item")));
+        let mut chest = Struct::new(0);
+        chest.set("TemplateResRef", Value::resref(r("chest")));
+        chest.set("ItemList", Value::List(vec![held]));
+        let taken = |k: &ResKey| k.restype == ResType::UTI;
+        assert!(add_to_palette(&game, ResType::UTP, &chest, &|_| None, &taken, &naming).is_none());
     }
 }

@@ -12,10 +12,12 @@ fn welcome_then_open_a_module_through_the_dialog() {
     h.get_by_label("Open Module…").click();
     h.run();
     assert_eq!(h.state().module_path().as_deref(), Some(path.as_path()));
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
     // The tree lists the area and the script; Module Properties is open.
     h.get_by_label("Areas (1)");
     h.get_by_label_contains("Scripts (1)");
-    h.get_by_label("Module Properties");
+    tree_row(&h, "Module Properties");
     assert!(h.state().log.entries.iter().any(|(_, m)| m.contains("Opened")));
 }
 
@@ -84,6 +86,72 @@ fn the_build_window_s_advanced_controls_keep_its_buttons_in_reach() {
     assert!(done.bottom() < 800.0, "the buttons are in the window: {done:?}");
 }
 
+/// Module Properties' event rows yield at a window of 420, the least
+/// (U30's #14): each field narrows, its "…" and Edit stay inside the
+/// window; at 1000 the fields keep their 160.
+#[test]
+fn module_properties_event_rows_yield_to_a_narrow_window() {
+    let dir = mg_testkit::scratch_dir("ui-module-events-420");
+    let path = sample_module(&dir);
+    for width in [420.0, 1000.0] {
+        let mut app = app_with(Vec::new());
+        app.open_module(&path);
+        app.actions.push(mg_ui::Action::OpenTab(Tab::ModuleProperties));
+        let mut h = harness(app, width, 600.0);
+        settle(&mut h);
+        // (The page's, not the menu bar's Edit.)
+        let edits: Vec<egui::Rect> =
+            h.get_all_by_label("Edit").map(|n| n.rect()).filter(|r| r.top() > 60.0).collect();
+        assert!(edits.len() >= 10, "at {width}: the events' Edit buttons: {}", edits.len());
+        for edit in &edits {
+            assert!(edit.right() <= width, "at {width}: Edit at {edit:?} past the window");
+        }
+        if width > 900.0 {
+            let fields = (h.get_all_by_role(egui::accesskit::Role::TextInput))
+                .map(|n| n.rect())
+                .filter(|r| edits.iter().any(|e| (e.center().y - r.center().y).abs() < 4.0));
+            for field in fields {
+                assert!((field.width() - 160.0).abs() < 1.0, "at {width}: {field:?}");
+            }
+        }
+    }
+}
+
+/// Missing Resources' two columns of kinds stand the Dialogs board's 8
+/// apart (`.two-c`; U30's #10: "Encounters" 4 from the check box after
+/// it).
+#[test]
+fn the_build_window_s_missing_resources_columns_stand_8_apart() {
+    let dir = mg_testkit::scratch_dir("ui-build-columns");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.open_module(&path);
+    app.build = Some(Default::default());
+    let mut h = harness(app, 1200.0, 1000.0);
+    h.run();
+    h.get_by_label("Advanced Controls").click();
+    h.run();
+    // (The kinds: the check boxes under Advanced Controls, between
+    // Missing Resources' heading and Compile's.)
+    let under = h.get_by_label("Advanced Controls").rect().bottom();
+    let heading = |name: &str| {
+        let rects = h.get_all_by_label(name).map(|n| n.rect());
+        rects.filter(|r| r.top() > under).map(|r| r.left()).next().unwrap()
+    };
+    let (from, to) = (heading("Missing Resources"), heading("Compile"));
+    let boxes: Vec<egui::Rect> = (h.get_all_by_role(egui::accesskit::Role::CheckBox))
+        .map(|n| n.rect())
+        .filter(|r| r.top() > under && r.left() >= from - 0.5 && r.left() < to - 0.5)
+        .collect();
+    assert_eq!(boxes.len(), 11, "the eleven kinds: {boxes:?}");
+    let first = boxes.iter().map(|r| r.left()).fold(f32::INFINITY, f32::min);
+    let (left, right): (Vec<egui::Rect>, Vec<egui::Rect>) =
+        boxes.iter().partition(|r| r.left() < first + 1.0);
+    let end = left.iter().map(|r| r.right()).fold(0.0, f32::max);
+    let next = right.iter().map(|r| r.left()).fold(f32::INFINITY, f32::min);
+    assert!(next - end >= 7.5, "the columns {:.1} apart", next - end);
+}
+
 #[test]
 fn closing_with_unsaved_changes_asks_first() {
     let dir = mg_testkit::scratch_dir("ui-unsaved");
@@ -113,7 +181,7 @@ fn closing_with_unsaved_changes_asks_first() {
     // Save saves, then closes.
     h.state_mut().actions.push(mg_ui::Action::Close);
     h.run();
-    h.get_by_label("Save").click();
+    apart(&h, "Save").click();
     h.run();
     assert!(h.state().ws.is_none());
     assert_eq!(
@@ -183,7 +251,7 @@ fn a_first_save_builds_once_and_not_when_called_off() {
     h.state_mut().settings.build_on_save = true;
     h.run();
     let builds = |h: &Harness<'_, Moonglow>| {
-        h.state().log.entries.iter().filter(|(_, m)| m == "Building Module...").count()
+        h.state().log.entries.iter().filter(|(_, m)| m == "Building Module…").count()
     };
     let dialogs = std::mem::replace(&mut h.state_mut().dialogs, Box::new(NoDialogs::default()));
     h.state_mut().actions.push(mg_ui::Action::Save);
@@ -195,6 +263,80 @@ fn a_first_save_builds_once_and_not_when_called_off() {
     h.run();
     assert_eq!(h.state().module_path().as_deref(), Some(path.as_path()));
     assert_eq!(builds(&h), 1, "{:?}", h.state().log.entries);
+}
+
+/// A project's `[tilesets] hidden` (The Domains of Dread's ask: four
+/// versions of a set listed, one wanted): the Area Wizard leaves them out,
+/// its first shown chosen, and Show Hidden Tilesets brings them back; an
+/// area made on one is the module's as any other. Change Tileset leaves
+/// them out too, but for the area's own.
+#[test]
+fn a_project_s_hidden_tilesets_are_left_out_of_the_pickers() {
+    let root = mg_testkit::corpus!();
+    let rules = "[tilesets]\nhidden = [\"tic01\", \"TCN*\"]\n";
+    let dir = project_folder("ui-hidden-tilesets", &[("moonglow.toml", rules)]);
+    let mut app = game_app(&root, None);
+    app.settings.no_last_area = true;
+    app.open_module(&dir);
+    let mut h = harness(app, 1000.0, 800.0);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::AreaWizard);
+    settle(&mut h);
+    let wizard = |h: &Harness<'_, Moonglow>| match &h.state().wizard {
+        Some(mg_ui::wizards::Wizard::NewArea(w)) => w.clone(),
+        _ => panic!("the Area Wizard is open"),
+    };
+    let w = wizard(&h);
+    let named =
+        |r: &str| w.tilesets.iter().find(|t| t.resref.to_string() == r).unwrap().name.clone();
+    let (castle, city) = (named("tic01"), named("tcn01"));
+    assert!(
+        w.hidden.len() >= 2
+            && w.hidden.iter().all(|r| {
+                let r = r.to_string();
+                r == "tic01" || r.starts_with("tcn")
+            })
+    );
+    assert!(h.query_by_label(&castle).is_none(), "{castle} hidden");
+    assert!(h.query_by_label(&city).is_none(), "{city} hidden");
+    let chosen = &w.tilesets[w.selected.unwrap()];
+    assert!(!w.hidden.contains(&chosen.resref), "the first shown chosen");
+    // Shown: chosen, and made.
+    if std::env::var_os("MG_SHOT").is_some() {
+        mg_testkit::gpu::hold();
+        let shot = mg_testkit::scratch_dir("ui-hidden-tilesets-shot");
+        h.render().unwrap().save(shot.join("wizard.png")).unwrap();
+    }
+    h.get_by_label_contains("Show hidden tilesets").click();
+    h.run();
+    assert!(wizard(&h).show_hidden);
+    // (Down the list, out of its sight: chosen as a click does.)
+    let castle_at = w.tilesets.iter().position(|t| t.name == castle);
+    if let Some(mg_ui::wizards::Wizard::NewArea(w)) = &mut h.state_mut().wizard {
+        w.selected = castle_at;
+    }
+    h.run();
+    area_wizard_next(&mut h, 1);
+    area_wizard_finish(&mut h);
+    h.run_steps(3);
+    let made = (h.state().ws.as_ref().unwrap().module.keys_of(ResType::ARE)).find_map(|k| {
+        let ws = h.state().ws.as_ref().unwrap();
+        let data = ws.module.get(k)?;
+        let are = mg_gff::Gff::read(data).ok()?;
+        (are.root.resref("Tileset")?.to_string() == "tic01").then_some(k.resref)
+    });
+    let made = made.expect("an area on the hidden tileset");
+    // Change Tileset on it: the hidden ones out, but for its own.
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Area(made)));
+    h.run_steps(3);
+    h.get_by_label("Edit").click();
+    h.run_steps(2);
+    h.get_by_label("Change Tileset…").click();
+    h.run_steps(2);
+    let d = h.state().change_tileset.as_ref().expect("the window is open");
+    assert_eq!(d.from.to_string(), "tic01");
+    assert!(d.hidden.iter().any(|r| r.to_string() == "tic01") && !d.show_hidden);
+    h.get_by_label_contains("Show hidden tilesets");
 }
 
 #[test]
@@ -228,12 +370,15 @@ fn new_module_and_area_through_the_wizards() {
     assert_eq!(w.selected, Some(0));
     h.get_by_label("Castle Interior").click();
     h.run();
+    area_wizard_next(&mut h, 1);
     h.get_by_label("Small").click();
     h.run();
-    h.get_by_label("Create").click();
+    area_wizard_finish(&mut h);
     h.run();
     let key = ResKey::parse("area001", ResType::ARE).unwrap();
     assert!(h.state().ws.as_ref().unwrap().module.contains(&key), "{:?}", h.state().log.entries);
+    // (The builder unfolds the Left Dock, folded at this width: M3 T14.)
+    unfold_left_dock(&mut h);
     h.get_by_label_contains("Areas (1)");
     // Open Area in the Area Viewer is on by default, as in Aurora.
     assert!(
@@ -279,9 +424,8 @@ fn recent_modules_reopen_from_the_welcome_page() {
     app.close();
     let mut h = window_harness(app);
     h.run();
-    // (Its name, and the folder it is in.)
-    let place = dir.file_name().unwrap().to_string_lossy().into_owned();
-    h.get_by_label(&format!("sample.mod  in {place}")).click();
+    // (Its name, and the folder it is in: M4's U24.)
+    h.get_by_label_contains("sample.mod in ").click();
     h.run();
     assert_eq!(h.state().module_path().as_deref(), Some(path.as_path()));
 }
@@ -331,11 +475,16 @@ fn export_lists_a_kind() {
     assert!(!left.contains(&ResKey::parse("mg_two", ResType::NSS).unwrap()));
 }
 
-/// An Export to an archive that is there asks what Aurora's asks, in its
-/// words: Yes adds the resources to it (what it held stays), No replaces
-/// it, Cancel writes nothing (Aurora's Export, captured 2026-10-29).
+/// An Export to an archive that is there asks what Aurora's asks (its
+/// Export, captured 2026-10-29: Yes appends, No overwrites, Cancel does
+/// nothing), with buttons named for what they do and each said
+/// (Carcerian's ask on Discord, 2026-11-06): Append adds the resources to
+/// it (what it held stays), Overwrite replaces it, Cancel writes nothing.
+/// "Always do this" makes the answer Options › General's, which then does
+/// it without asking.
 #[test]
 fn export_to_an_archive_that_is_there_asks_to_append_overwrite_or_cancel() {
+    use mg_ui::settings::ExistingArchive;
     let dir = mg_testkit::scratch_dir("ui-export-ask");
     let source = sample_module(&dir);
     let erf = dir.join("kept.erf");
@@ -346,8 +495,11 @@ fn export_to_an_archive_that_is_there_asks_to_append_overwrite_or_cancel() {
         let archive = mg_erf::Erf::read(&bytes).unwrap();
         archive.entries.iter().map(|e| ResKey::new(e.resref, e.restype)).collect()
     };
-    let answer = |label: &str| {
-        // The archive there, holding one script.
+    // Exports `area` into the archive there (holding one script), with
+    // Options' choice `existing`, answering `label` (with "Always do
+    // this" ticked when `always`) where asked; what it holds then, and
+    // Options' choice after.
+    let export = |existing: ExistingArchive, label: Option<&str>, always: bool| {
         let mut old = mg_erf::ErfWriter::new(*b"ERF ");
         old.add(keep.resref, keep.restype, b"void main() {}\n".to_vec()).unwrap();
         std::fs::write(&erf, old.to_bytes().unwrap()).unwrap();
@@ -355,28 +507,321 @@ fn export_to_an_archive_that_is_there_asks_to_append_overwrite_or_cancel() {
             None,
             Box::new(NoDialogs { save: vec![erf.clone()], ..Default::default() }),
         );
+        app.settings.export_existing = existing;
         app.open_module(&source);
         let mut h = window_harness(app);
         h.state_mut().actions.push(mg_ui::Action::ExportDialog(vec![area]));
         h.run();
         h.get_by_label("Export 1…").click();
         h.run();
-        // Asked first: nothing written yet.
-        assert_eq!(held(&erf), [keep], "asked before anything is written");
-        h.get_by_label_contains("already exists. Do you wish to append to it?");
-        h.get_by_label("Click YES to append to the file.");
-        h.get_by_label("Click NO to overwrite the file.");
-        h.get_by_label("Click CANCEL to do nothing.");
-        h.get_by_label(label).click();
-        h.run();
+        match label {
+            Some(label) => {
+                // Asked first: nothing written yet.
+                assert_eq!(held(&erf), [keep], "asked before anything is written");
+                h.get_by_label("kept.erf is there already.");
+                h.get_by_label_contains("Append adds the resources to it");
+                h.get_by_label_contains("Overwrite replaces it");
+                if always {
+                    h.get_by_label("Always do this").click();
+                    h.run();
+                }
+                h.get_by_label(label).click();
+                h.run();
+            }
+            None => assert!(h.state().export_ask.is_none(), "not asked"),
+        }
         assert!(h.state().export_ask.is_none(), "answered");
-        held(&erf)
+        (held(&erf), h.state().settings.export_existing)
     };
-    let appended = answer("Yes");
+    let ask = ExistingArchive::Ask;
+    let (appended, after) = export(ask, Some("Append"), false);
     assert!(appended.contains(&keep) && appended.contains(&area), "{appended:?}");
-    let replaced = answer("No");
+    assert_eq!(after, ask, "asked again next time");
+    let (replaced, _) = export(ask, Some("Overwrite"), false);
     assert!(!replaced.contains(&keep) && replaced.contains(&area), "{replaced:?}");
-    assert_eq!(answer("Cancel"), [keep], "nothing written");
+    assert_eq!(export(ask, Some("Cancel"), true), (vec![keep], ask), "nothing written");
+    // Always: the answer becomes Options' choice.
+    let (appended, after) = export(ask, Some("Append"), true);
+    assert!(appended.contains(&keep), "{appended:?}");
+    assert_eq!(after, ExistingArchive::Append);
+    assert_eq!(export(ask, Some("Overwrite"), true).1, ExistingArchive::Overwrite);
+    // Options' choice: done without asking.
+    let (appended, _) = export(ExistingArchive::Append, None, false);
+    assert!(appended.contains(&keep) && appended.contains(&area), "{appended:?}");
+    let (replaced, _) = export(ExistingArchive::Overwrite, None, false);
+    assert!(!replaced.contains(&keep) && replaced.contains(&area), "{replaced:?}");
+}
+
+/// File › Export Changed Resources… (Twohand's ask): grayed on a module
+/// just opened, with its tip; after edits and a save (the session
+/// outlives a save), the Export window with exactly the resources changed
+/// ticked (an edited area, an edited script, a new script), alone (not
+/// what they use) and said; its Export writes those, as they are now.
+#[test]
+fn export_changed_resources_ticks_what_changed_since_the_module_was_opened() {
+    let dir = mg_testkit::scratch_dir("ui-export-changed");
+    let path = sample_module(&dir);
+    let erf = dir.join("changed.erf");
+    let mut app =
+        Moonglow::new(None, Box::new(NoDialogs { save: vec![erf.clone()], ..Default::default() }));
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = window_harness(app);
+    h.run();
+    let menu_item = |h: &mut Harness<'_, Moonglow>| {
+        h.get_by_label("File").click();
+        h.run();
+        let item = h.get_by_label("Export Changed Resources…");
+        let off = item.accesskit_node().is_disabled();
+        item.hover();
+        h.run();
+        off
+    };
+    assert!(menu_item(&mut h), "nothing changed yet");
+    assert!(h.query_by_label("No resource has changed since the module was opened").is_some());
+    h.key_press(egui::Key::Escape);
+    h.run();
+    // An area's field and a script edited, a script added; saved.
+    let area = ResKey::parse("start", ResType::ARE).unwrap();
+    let hello = ResKey::parse("hello", ResType::NSS).unwrap();
+    let added = ResKey::parse("mg_added", ResType::NSS).unwrap();
+    let text = |t: &str| Some(t.as_bytes().to_vec());
+    let edits = vec![
+        mg_edit::Edit::SetField {
+            key: area,
+            path: mg_gff::GffPath::root(),
+            label: "Tag".into(),
+            value: Some(mg_gff::Value::String(b"CHANGED".to_vec())),
+        },
+        mg_edit::Edit::SetResource { key: hello, data: text("void main() { int changed; }\n") },
+        mg_edit::Edit::SetResource { key: added, data: text("void main() {}\n") },
+    ];
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Edits", edits)));
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    settle(&mut h);
+    assert!(!h.state().ws.as_ref().unwrap().is_modified(), "saved");
+    assert!(!menu_item(&mut h), "changed since the module was opened, saved or not");
+    h.get_by_label("Export Changed Resources…").click();
+    h.run();
+    let draft = h.state().export.clone().expect("the Export window");
+    let wanted: std::collections::BTreeSet<ResKey> = [area, hello, added].into();
+    assert_eq!(draft.selected, wanted);
+    assert!(!draft.dependencies, "what changed alone, not what it uses");
+    h.get_by_label("3 resources changed since the module was opened");
+    h.run_steps(3);
+    assert!(h.get_by_label("Select Changed").accesskit_node().is_disabled(), "all ticked already");
+    h.get_by_label("Export 3…").click();
+    settle(&mut h);
+    let bytes = std::fs::read(&erf).expect("written");
+    let archive = mg_erf::Erf::read(&bytes).unwrap();
+    let held: std::collections::BTreeSet<ResKey> =
+        archive.entries.iter().map(|e| ResKey::new(e.resref, e.restype)).collect();
+    assert_eq!(held, wanted);
+    let ws = h.state().ws.as_ref().unwrap();
+    for e in &archive.entries {
+        let k = ResKey::new(e.resref, e.restype);
+        assert_eq!(archive.data(e).ok().as_deref(), ws.module.get(&k), "{k}: as it is now");
+    }
+}
+
+/// Export Changed Resources with the game's data (a save makes the
+/// custom palettes): the module opened again starts a session of its own;
+/// a save with nothing changed changes nothing; a change
+/// to module.ifo alone leaves the command grayed, and the window lists it
+/// unticked; an area's .git edited ticks its .are and .gic with it; a
+/// resource removed is said; a script typed in and not saved is warned
+/// of, and goes out as stored. The archive holds exactly what is ticked.
+#[test]
+fn export_changed_resources_leaves_module_ifo_out_and_warns_of_unsaved_scripts() {
+    let root = mg_testkit::corpus!();
+    let dir = mg_testkit::scratch_dir("ui-export-changed-edges");
+    let path = sample_module(&dir);
+    let area = ResKey::parse("start", ResType::ARE).unwrap();
+    let git = ResKey::parse("start", ResType::GIT).unwrap();
+    let gic = ResKey::parse("start", ResType::GIC).unwrap();
+    let gone = ResKey::parse("mg_gone", ResType::NSS).unwrap();
+    let hello = ResKey::parse("hello", ResType::NSS).unwrap();
+    let ifo_key = ResKey::parse("module", ResType::IFO).unwrap();
+    let mut m = Module::open(&path).unwrap();
+    m.set(git, Gff::new(*b"GIT ").to_bytes().unwrap());
+    m.set(gic, Gff::new(*b"GIC ").to_bytes().unwrap());
+    m.set(gone, b"void main() {}\n".to_vec());
+    m.save().unwrap();
+    let erf = dir.join("changed.erf");
+    let dialogs = NoDialogs { save: vec![erf.clone()], ..Default::default() };
+    let mut app = game_app_with(&root, None, dialogs);
+    app.settings.no_last_area = true;
+    app.open_module(&path);
+    let mut h = window_harness(app);
+    settle(&mut h);
+    let changed = |h: &Harness<'_, Moonglow>| {
+        h.state().ws.as_ref().unwrap().changed_since_opened().changed.clone()
+    };
+    let grayed = |h: &mut Harness<'_, Moonglow>| {
+        h.get_by_label("File").click();
+        h.run();
+        let off = h.get_by_label("Export Changed Resources…").accesskit_node().is_disabled();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        off
+    };
+    // The first save makes the custom palettes the module lacked: new
+    // resources, changed. Opened again (a session of its own), and saved
+    // with nothing changed: nothing changed.
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    settle(&mut h);
+    assert!(changed(&h).iter().all(|k| k.restype == ResType::ITP), "{:?}", changed(&h));
+    h.state_mut().open_module(&path);
+    settle(&mut h);
+    assert_eq!(changed(&h), [], "another session");
+    h.state_mut().actions.push(mg_ui::Action::Save);
+    settle(&mut h);
+    assert_eq!(changed(&h), [], "a save alone changes nothing");
+    // module.ifo alone: grayed.
+    let field = |key: ResKey, label: &str, value: mg_gff::Value| mg_edit::Edit::SetField {
+        key,
+        path: mg_gff::GffPath::root(),
+        label: label.into(),
+        value: Some(value),
+    };
+    let xp = field(ifo_key, "Mod_XPScale", mg_gff::Value::Byte(50));
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("XP", vec![xp])));
+    h.run();
+    assert_eq!(changed(&h), [ifo_key]);
+    assert!(grayed(&mut h), "module.ifo alone is not exported");
+    // The area's .git edited, a script removed, another typed in unsaved.
+    let edits = vec![
+        field(git, "Tag", mg_gff::Value::String(b"CHANGED".to_vec())),
+        mg_edit::Edit::SetResource { key: gone, data: None },
+    ];
+    h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Edits", edits)));
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Script(hello)));
+    h.run();
+    h.state_mut().script_tools.jump = Some((hello, 0));
+    h.run_steps(3);
+    h.event(egui::Event::Text("// typed\n".into()));
+    h.run_steps(3);
+    assert!(h.state().script_text(hello).unwrap().starts_with("// typed"));
+    assert!(!grayed(&mut h));
+    h.state_mut().actions.push(mg_ui::Action::ExportChangedDialog);
+    h.run_steps(3);
+    let draft = h.state().export.clone().expect("the Export window");
+    let wanted: std::collections::BTreeSet<ResKey> = [area, git, gic].into();
+    assert_eq!(draft.selected, wanted, "the area whole, module.ifo unticked");
+    h.get_by_label("1 resource changed since the module was opened");
+    h.get_by_label("Checked with their areas' other files (2).");
+    h.get_by_label_contains("module.ifo changed too, left unchecked");
+    h.get_by_label("1 resource was removed since, not exported.");
+    h.get_by_label_contains("Careful: open with unsaved changes, which the export leaves out");
+    h.get_by_label("Export 3…").click();
+    settle(&mut h);
+    let bytes = std::fs::read(&erf).expect("written");
+    let archive = mg_erf::Erf::read(&bytes).unwrap();
+    let held: std::collections::BTreeSet<ResKey> =
+        archive.entries.iter().map(|e| ResKey::new(e.resref, e.restype)).collect();
+    assert_eq!(held, wanted);
+    let ws = h.state().ws.as_ref().unwrap();
+    assert_eq!(ws.module.get(&hello), Some(&b"void main() { }\n"[..]), "as stored");
+}
+
+/// File dialogs that answer from `NoDialogs`' lists and note where each
+/// started (what a save suggested, where an open began).
+struct Started(NoDialogs, std::rc::Rc<std::cell::RefCell<Vec<Option<std::path::PathBuf>>>>);
+
+impl mg_ui::Dialogs for Started {
+    fn open_file(
+        &mut self,
+        kind: mg_ui::FileKind,
+        start: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        self.1.borrow_mut().push(start.map(std::path::Path::to_path_buf));
+        mg_ui::Dialogs::open_file(&mut self.0, kind, start)
+    }
+    fn save_file(
+        &mut self,
+        kind: mg_ui::FileKind,
+        suggested: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        self.1.borrow_mut().push(suggested.map(std::path::Path::to_path_buf));
+        mg_ui::Dialogs::save_file(&mut self.0, kind, suggested)
+    }
+    fn pick_folder(
+        &mut self,
+        title: &str,
+        start: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        mg_ui::Dialogs::pick_folder(&mut self.0, title, start)
+    }
+}
+
+/// Export's and Import's file dialogs open in the user folder's `erf`
+/// folder, as Aurora's do (a builder's uploader watches it), then where
+/// the last archive was written or read (Carcerian's ask on Discord,
+/// 2026-11-06); in the module's folder without either.
+#[test]
+fn export_and_import_open_in_the_erf_folder_then_the_last_one() {
+    let dir = mg_testkit::scratch_dir("ui-export-folder");
+    let source = sample_module(&dir);
+    let user = dir.join("user");
+    let erf_dir = user.join("erf");
+    let other = dir.join("other");
+    std::fs::create_dir_all(&erf_dir).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let area = ResKey::parse("start", ResType::ARE).unwrap();
+    let written = other.join("start.erf");
+    let started = std::rc::Rc::default();
+    let dialogs = NoDialogs {
+        save: vec![written.clone(), written.clone()],
+        open: vec![written.clone()],
+        ..Default::default()
+    };
+    let export = |h: &mut Harness<'_, Moonglow>| {
+        h.state_mut().actions.push(mg_ui::Action::ExportDialog(vec![area]));
+        h.run();
+        h.get_by_label("Export 1…").click();
+        h.run();
+        if h.state().export_ask.is_some() {
+            h.get_by_label("Overwrite").click();
+            h.run();
+        }
+    };
+
+    // No user folder: the module's folder, as before.
+    let mut app =
+        Moonglow::new(None, Box::new(Started(NoDialogs::default(), std::rc::Rc::clone(&started))));
+    app.open_module(&source);
+    let mut h = window_harness(app);
+    export(&mut h);
+    assert_eq!(started.borrow().as_slice(), [Some(dir.join("start.erf"))]);
+    assert_eq!(h.state().settings.erf_folder, None, "cancelled: nothing remembered");
+    started.borrow_mut().clear();
+
+    // The user folder's `erf` first.
+    let mut app = Moonglow::new(None, Box::new(Started(dialogs, std::rc::Rc::clone(&started))));
+    app.install = Some(mg_resman::GameInstall::new(dir.join("game"), Some(user.clone()), "en"));
+    app.open_module(&source);
+    let mut h = window_harness(app);
+    export(&mut h);
+    assert!(written.is_file());
+    assert_eq!(started.borrow().as_slice(), [Some(erf_dir.join("start.erf"))]);
+    assert_eq!(h.state().settings.erf_folder.as_ref(), Some(&other), "remembered");
+    // Then the folder last written: Export's and Import's.
+    export(&mut h);
+    h.state_mut().actions.push(mg_ui::Action::ImportDialog);
+    h.run();
+    assert_eq!(
+        started.borrow()[1..],
+        [Some(other.join("start.erf")), Some(other.clone())],
+        "the folder last written"
+    );
+    // A remembered folder that is gone: the `erf` folder again.
+    std::fs::remove_dir_all(&other).unwrap();
+    started.borrow_mut().clear();
+    h.state_mut().import = None;
+    h.state_mut().actions.push(mg_ui::Action::ImportDialog);
+    h.run();
+    assert_eq!(started.borrow().as_slice(), [Some(erf_dir.clone())]);
 }
 
 #[test]
@@ -509,10 +954,12 @@ fn import_resources_chooses_every_overwrite_at_once_and_resizes() {
     let pointer = corner + egui::vec2(60.0, 150.0);
     assert!((now.right_bottom() - pointer).length() < 12.0, "its corner at the pointer: {now:?}");
     // (A picture to look at, where there is a GPU.)
-    if adapter() {
+    if let Some(dir) = shot_dir("ui-import-overwrites")
+        && adapter()
+    {
         mg_testkit::gpu::hold();
         let img = h.render().expect("render");
-        img.save(mg_testkit::output_dir("ui-import-overwrites").join("resized.png")).unwrap();
+        img.save(dir.join("resized.png")).unwrap();
     }
     // Imported with every one ticked: the archive's scripts in the module.
     h.get_by_label("Select All").click();
@@ -560,6 +1007,303 @@ fn an_area_exported_alone_takes_its_git_and_gic() {
     assert_eq!(names, ["start.are", "start.gic", "start.git"]);
 }
 
+/// Files for File › Import Files… and Import Folder…: a script the sample
+/// module has, changed; a new blueprint; a new area's three files; a
+/// blueprint that doesn't read and the module's properties, refused.
+fn import_files_folder(dir: &std::path::Path) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    let files = dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let gff = |t: &[u8; 4]| Gff::new(*t).to_bytes().unwrap();
+    let mut written = Vec::new();
+    for (name, bytes) in [
+        ("hello.nss", b"// imported\nvoid main() { }\n".to_vec()),
+        ("guard.utc", gff(b"UTC ")),
+        ("market.are", gff(b"ARE ")),
+        ("market.git", gff(b"GIT ")),
+        ("market.gic", gff(b"GIC ")),
+        ("broken.uti", b"not a GFF".to_vec()),
+        ("module.ifo", gff(b"IFO ")),
+    ] {
+        std::fs::write(files.join(name), bytes).unwrap();
+        written.push(files.join(name));
+    }
+    (files, written)
+}
+
+/// El Grillo's request (2026-11-03): File › Import Files… brings loose
+/// files into the module through Import Resources, as an archive's
+/// resources come: what the module has to overwrite or not (none until
+/// ticked), what is refused and why, the new area in the area list, all
+/// one step to undo. Import Folder… takes a folder's files, and with the
+/// script ticked, overwrites it.
+#[test]
+fn import_files_and_a_folder_through_the_menu() {
+    let dir = mg_testkit::scratch_dir("ui-import-files");
+    let path = sample_module(&dir);
+    let (folder, files) = import_files_folder(&dir);
+    let dialogs = NoDialogs { open_many: vec![files], folders: vec![folder], ..Default::default() };
+    let mut app = Moonglow::new(None, Box::new(dialogs));
+    app.open_module(&path);
+    let mut h = harness(app, 1000.0, 800.0);
+    settle(&mut h);
+    let hello = ResKey::parse("hello", ResType::NSS).unwrap();
+    let guard = ResKey::parse("guard", ResType::UTC).unwrap();
+    let market = ResKey::parse("market", ResType::ARE).unwrap();
+    let script = |h: &mut Harness<'_, Moonglow>| {
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.flush().unwrap();
+        String::from_utf8_lossy(ws.module.get(&hello).unwrap()).into_owned()
+    };
+    h.get_by_label("File").click();
+    h.run();
+    h.get_by_label("Import Files…").click();
+    settle(&mut h);
+    {
+        let draft = h.state().import.as_ref().expect("Import Resources open");
+        assert_eq!(draft.name, "7 files");
+        assert_eq!(draft.resources.len(), 5);
+        assert_eq!(draft.overwrites, [(hello, false)]);
+        assert_eq!(draft.refused.len(), 2, "{:?}", draft.refused);
+    }
+    h.get_by_label("7 files: 5 resources, 4 new");
+    h.get_by_label("Not imported (2):");
+    h.get_by_label_contains("broken.uti: doesn't read as a GFF");
+    h.get_by_label_contains("module.ifo: the module itself");
+    // No stamp line: files say nothing of what they were made from.
+    assert!(h.query_by_label("It doesn't say what it was made from.").is_none());
+    h.get_by_label("Import").click();
+    settle(&mut h);
+    {
+        let ws = h.state().ws.as_ref().unwrap();
+        assert!(ws.module.contains(&guard) && ws.module.contains(&market));
+        assert!(!ws.module.contains(&ResKey::parse("broken", ResType::UTI).unwrap()));
+        assert_eq!(ws.module.areas().unwrap(), [ResRef::from_str("start").unwrap(), market.resref]);
+    }
+    assert_eq!(script(&mut h), "void main() { }\n", "not ticked: the module's own kept");
+    let log = &h.state().log.entries;
+    assert!(
+        log.iter().any(|(_, m)| m == "Imported 7 files: 4 added, 0 replaced, 1 kept"),
+        "{log:?}"
+    );
+    assert!(log.iter().any(|(l, m)| *l == mg_ui::Level::Warning && m.starts_with("Not imported:")));
+    // One step to undo.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    {
+        let ws = h.state().ws.as_ref().unwrap();
+        assert!(!ws.module.contains(&guard) && !ws.module.contains(&market));
+        assert_eq!(ws.module.areas().unwrap(), [ResRef::from_str("start").unwrap()]);
+    }
+
+    // The folder: its files, the script ticked to overwrite.
+    h.get_by_label("File").click();
+    h.run();
+    h.get_by_label("Import Folder…").click();
+    settle(&mut h);
+    assert_eq!(h.state().import.as_ref().unwrap().name, "files/");
+    h.get_by_label("hello.nss").click();
+    settle(&mut h);
+    h.get_by_label("1 of 1 to overwrite");
+    h.get_by_label("Import").click();
+    settle(&mut h);
+    assert_eq!(script(&mut h), "// imported\nvoid main() { }\n");
+    assert!(h.state().ws.as_ref().unwrap().module.contains(&guard));
+}
+
+/// A script to be replaced whose editor holds unsaved typing: the import
+/// window says so beside it, and warns once it is ticked (the editor
+/// keeps the typing, and saving it would write over what was imported).
+#[test]
+fn import_files_says_which_editors_hold_unsaved_changes() {
+    let dir = mg_testkit::scratch_dir("ui-import-files-unsaved");
+    let path = sample_module(&dir);
+    let (_, files) = import_files_folder(&dir);
+    let dialogs = NoDialogs { open_many: vec![files], ..Default::default() };
+    let mut app = Moonglow::new(None, Box::new(dialogs));
+    app.open_module(&path);
+    let hello = ResKey::parse("hello", ResType::NSS).unwrap();
+    app.actions.push(mg_ui::Action::OpenTab(Tab::Script(hello)));
+    let mut h = harness(app, 1000.0, 800.0);
+    settle(&mut h);
+    h.state_mut().script_tools.jump = Some((hello, 0));
+    h.run_steps(3);
+    h.event(egui::Event::Text("// typed\n".into()));
+    h.run_steps(3);
+    h.ctx.memory_mut(|m| m.surrender_focus(egui::Id::new(("script", hello))));
+    h.state_mut().actions.push(mg_ui::Action::ImportFilesDialog);
+    settle(&mut h);
+    assert_eq!(h.state().import.as_ref().unwrap().unsaved, [hello]);
+    h.get_by_label("hello.nss (open, with unsaved changes)");
+    assert!(h.query_by_label_contains("Careful: one checked item is open").is_none());
+    h.get_by_label("Select All").click();
+    settle(&mut h);
+    h.get_by_label(
+        "Careful: one checked item is open with unsaved changes. The import replaces it in the \
+         module, but its editor keeps your changes, and saving them writes over what was imported.",
+    );
+    h.get_by_label("Import").click();
+    settle(&mut h);
+    let log = &h.state().log.entries;
+    assert!(log.iter().any(|(_, m)| m.starts_with("Replaced while open with unsaved changes")));
+    assert!(h.state().script_text(hello).unwrap().starts_with("// typed\n"), "the editor's kept");
+}
+
+/// A script that comes without its compiled script is compiled as it is
+/// imported, with the module's scripts that include it, into the same
+/// step: Undo takes the compiled scripts back with it. With compiling on
+/// save off, it isn't, and the window and the log say so.
+#[test]
+fn import_files_compiles_a_script_that_comes_alone() {
+    let Some(root) = mg_testkit::nwn_root() else {
+        eprintln!("skipped: no game install");
+        return;
+    };
+    let dir = mg_testkit::scratch_dir("ui-import-files-compile");
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    let user = ResKey::parse("mg_user", ResType::NSS).unwrap();
+    m.set(user, b"#include \"mg_inc\"\nvoid main() { Greet(); }\n".to_vec());
+    m.set(ResKey::parse("mg_inc", ResType::NSS).unwrap(), b"void Greet() { }\n".to_vec());
+    m.save().unwrap();
+    let files = dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    std::fs::write(files.join("mg_new.nss"), "void main() { PrintString(\"new\"); }\n").unwrap();
+    std::fs::write(files.join("mg_inc.nss"), "void Greet() { PrintString(\"hi\"); }\n").unwrap();
+    std::fs::write(files.join("mg_bad.nss"), "void main() { nope }\n").unwrap();
+    let dialogs = NoDialogs { folders: vec![files.clone(), files], ..Default::default() };
+    let mut app = game_app_with(&root, None, dialogs);
+    app.settings.auto_compile = true;
+    app.open_module(&path);
+    let mut h = window_harness(app);
+    settle(&mut h);
+    let ncs = |name: &str| ResKey::parse(name, ResType::NCS).unwrap();
+    let has = |h: &Harness<'_, Moonglow>, name: &str| {
+        h.state().ws.as_ref().unwrap().module.contains(&ncs(name))
+    };
+    h.state_mut().actions.push(mg_ui::Action::ImportFolderDialog);
+    settle(&mut h);
+    h.get_by_label_contains("Compiled as they are imported");
+    h.get_by_label("Select All").click();
+    settle(&mut h);
+    h.get_by_label("Import").click();
+    settle(&mut h);
+    assert!(has(&h, "mg_new"), "compiled as it came in");
+    assert!(has(&h, "mg_user"), "it includes the include imported");
+    assert!(!has(&h, "mg_bad") && !has(&h, "mg_inc"));
+    let log = &h.state().log.entries;
+    assert!(log.iter().any(|(_, m)| m.starts_with("Compiled as imported:")), "{log:?}");
+    assert!(log.iter().any(|(l, m)| *l == mg_ui::Level::Error && m.contains("mg_bad")), "{log:?}");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    assert!(!has(&h, "mg_new") && !has(&h, "mg_user"), "one step: its compiles undone too");
+    // Compiling on save off: not compiled, and said.
+    h.state_mut().settings.auto_compile = false;
+    h.state_mut().actions.push(mg_ui::Action::ImportFolderDialog);
+    settle(&mut h);
+    h.get_by_label_contains("Not compiled (no .ncs comes with them");
+    h.get_by_label("Import").click();
+    settle(&mut h);
+    assert!(
+        h.state()
+            .ws
+            .as_ref()
+            .unwrap()
+            .module
+            .contains(&ResKey::parse("mg_new", ResType::NSS).unwrap())
+    );
+    assert!(!has(&h, "mg_new"));
+    let log = &h.state().log.entries;
+    assert!(log.iter().any(|(l, m)| *l == mg_ui::Level::Warning && m.starts_with("Not compiled")));
+}
+
+/// A file dropped onto the window, as the window's system hands it over.
+#[derive(Debug)]
+struct DroppedFile(std::path::PathBuf);
+
+impl egui::DroppedFile for DroppedFile {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+fn drop_files(h: &mut Harness<'_, Moonglow>, paths: &[std::path::PathBuf]) {
+    let input = h.input_mut();
+    input.hovered_files.clear();
+    for p in paths {
+        input.dropped_files.push(std::sync::Arc::new(DroppedFile(p.clone())));
+    }
+    settle(h);
+}
+
+/// Qlippoth's addition to El Grillo's request (2026-11-03): files and
+/// folders dropped onto the window open Import Resources with them, as
+/// File › Import Files… does; an `.erf` dropped alone imports as File ›
+/// Import… does, a hak opens in the hak editor and a `.mod` opens as the
+/// module. With no module open, nothing is imported, and the log says
+/// so. (What dragging them over the window says: the screen
+/// `import_files`.)
+#[test]
+fn files_dropped_onto_the_window_are_imported() {
+    let dir = mg_testkit::scratch_dir("ui-import-dropped");
+    let path = sample_module(&dir);
+    let (folder, files) = import_files_folder(&dir);
+    let mut h = harness(Moonglow::new(None, Box::new(NoDialogs::default())), 1000.0, 800.0);
+    settle(&mut h);
+    // No module: nothing.
+    drop_files(&mut h, &files);
+    assert!(h.state().import.is_none());
+    let log = &h.state().log.entries;
+    assert!(
+        log.iter().any(|(l, m)| *l == mg_ui::Level::Warning && m.starts_with("Nothing imported")),
+        "{log:?}"
+    );
+    // A .mod alone: opened.
+    drop_files(&mut h, std::slice::from_ref(&path));
+    assert_eq!(h.state().module_path().as_deref(), Some(path.as_path()));
+    // Files and a folder: in Import Resources, as one.
+    let gone = dir.join("guard.utc");
+    std::fs::write(&gone, Gff::new(*b"UTC ").to_bytes().unwrap()).unwrap();
+    drop_files(&mut h, &[folder.clone(), gone]);
+    {
+        let draft = h.state().import.as_ref().expect("Import Resources open");
+        assert_eq!(draft.name, "2 files and folders");
+        assert!(!draft.archive);
+        assert!(draft.refused.iter().any(|r| r.contains("guard.utc is among the files twice")));
+    }
+    h.get_by_label("Cancel").click();
+    settle(&mut h);
+    // An archive among files: refused, and said why.
+    let erf = dir.join("some.erf");
+    let mut w = mg_erf::ErfWriter::new(*b"ERF ");
+    w.add(ResRef::from_str("mg_dropped").unwrap(), ResType::NSS, b"void main() {}".to_vec())
+        .unwrap();
+    std::fs::write(&erf, w.to_bytes().unwrap()).unwrap();
+    drop_files(&mut h, &[erf.clone(), files[1].clone()]);
+    let draft = h.state().import.as_ref().unwrap();
+    assert!(draft.refused.iter().any(|r| r.contains("File › Import…")), "{:?}", draft.refused);
+    h.get_by_label("Cancel").click();
+    settle(&mut h);
+    // An .erf alone: its resources, as File › Import… has them.
+    drop_files(&mut h, std::slice::from_ref(&erf));
+    let draft = h.state().import.as_ref().unwrap();
+    assert!(draft.archive);
+    assert_eq!(draft.resources, [ResKey::parse("mg_dropped", ResType::NSS).unwrap()]);
+    h.get_by_label("It doesn't say what it was made from.");
+    h.get_by_label("Import").click();
+    settle(&mut h);
+    let ws = h.state().ws.as_ref().unwrap();
+    assert!(ws.module.contains(&ResKey::parse("mg_dropped", ResType::NSS).unwrap()));
+    // A hak alone: in the hak editor.
+    let hak = dir.join("mine.hak");
+    std::fs::write(&hak, mg_erf::ErfWriter::new(*b"HAK ").to_bytes().unwrap()).unwrap();
+    drop_files(&mut h, std::slice::from_ref(&hak));
+    assert!(h.state().haks.iter().any(|d| d.hak.path.as_deref() == Some(hak.as_path())));
+    assert!(h.state().import.is_none());
+}
+
 /// A module that is a folder is written as a `.mod` beside the folder too
 /// when it is saved, as Aurora saves a module directory; not with
 /// Options › General's switch off.
@@ -600,6 +1344,35 @@ fn a_folder_module_is_saved_as_a_mod_beside_it() {
 /// Aurora keeps one) asks which to open, as Aurora does: the folder (saved
 /// into, and written as the `.mod` too), or the `.mod`; Options › General
 /// opens either without asking (GitHub issue 30).
+/// The question of a .mod with its folder beside it keeps its answer with
+/// Always do this (Options › General › Questions), and isn't asked again
+/// (a builder's ask: a question always given the same answer).
+#[test]
+fn a_mod_with_its_folder_beside_it_is_answered_once_for_all() {
+    let dir = mg_testkit::scratch_dir("ui-mod-folder-always");
+    let path = sample_module(&dir);
+    let folder = dir.join("sample");
+    Module::open(&path).unwrap().save_as(&ModuleLocation::Folder(folder.clone())).unwrap();
+    let mut h = window_harness(app_with(vec![path.clone(), path.clone()]));
+    h.run();
+    let location = |h: &Harness<'_, Moonglow>| h.state().ws.as_ref()?.module.location.clone();
+    h.get_by_label("Open Module…").click();
+    h.run();
+    h.get_by_label("Always do this").click();
+    h.run();
+    h.get_by_label("Open .mod File").click();
+    h.run();
+    assert_eq!(location(&h), Some(ModuleLocation::Archive(path.clone())));
+    assert_eq!(h.state().settings.module_folders, mg_ui::settings::ModuleFolders::Module);
+    // Not asked again: the .mod.
+    h.state_mut().actions.push(mg_ui::Action::Close);
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenModuleDialog);
+    h.run();
+    assert!(h.state().module_folder.is_none(), "not asked");
+    assert_eq!(location(&h), Some(ModuleLocation::Archive(path)));
+}
+
 #[test]
 fn a_mod_with_its_folder_beside_it_asks_which_to_open() {
     let dir = mg_testkit::scratch_dir("ui-mod-folder");
@@ -620,6 +1393,7 @@ fn a_mod_with_its_folder_beside_it_asks_which_to_open() {
     assert_eq!(location(&h), Some(ModuleLocation::Folder(folder.clone())));
     assert!(h.state().module_folder.is_none());
     assert_eq!(h.state().settings.recent.first(), Some(&folder), "the folder is remembered");
+    assert_eq!(h.state().settings.module_folders, mg_ui::settings::ModuleFolders::Ask);
     // An edit saved goes into the folder, and into the .mod beside it.
     let key = ResKey::parse("hello", ResType::NSS).unwrap();
     let text = b"void main() { int saved; }\n".to_vec();
@@ -685,9 +1459,12 @@ fn the_welcome_page_tells_a_folder_from_its_mod() {
     app.settings.module_folders = mg_ui::settings::ModuleFolders::Folder;
     let mut h = window_harness(app);
     h.run();
+    // (Named with the folder each is in: M4's U24.)
     let place = dir.file_name().unwrap().to_string_lossy().into_owned();
-    h.get_by_label(&format!("sample.mod  in {place}"));
-    h.get_by_label(&format!("sample/  in {place}")).click();
+    let mod_row =
+        h.get_by_label_contains("sample.mod in ").accesskit_node().label().unwrap_or_default();
+    assert!(mod_row.ends_with(&place), "{mod_row}");
+    h.get_by_label_contains("sample/ in ").click();
     h.run();
     let location = h.state().ws.as_ref().unwrap().module.location.clone();
     assert_eq!(location, Some(ModuleLocation::Folder(folder)));
@@ -737,7 +1514,7 @@ fn module_name_in_every_language_and_variables() {
     };
 
     // String Edit: add a German name.
-    h.get_by_label("…").click();
+    in_page(&h, "Basic").get_by_label("…").click();
     h.run();
     h.get_by_label("Add Text").click();
     h.run();
@@ -756,12 +1533,12 @@ fn module_name_in_every_language_and_variables() {
     assert_eq!(name.get(Language::GERMAN, Gender::Male), Some(&b"Beispiel"[..]));
     assert_eq!(name.strref.0, 12);
 
-    // Variables on the Advanced tab.
-    h.get_by_label("Advanced").click();
+    // Variables on the Advanced tab (scrolled to: below the edge).
+    page(&mut h, "Advanced");
     h.run();
-    h.get_by_label("Variables (0)…").click();
+    click_in_sight(&mut h, "Variables (0)…");
     h.run();
-    h.get_by_label("Add").click();
+    h.get_all_by_label("Add").last().unwrap().click();
     h.run();
     {
         let v = h.state_mut().var_edit.as_mut().unwrap();
@@ -839,6 +1616,9 @@ fn published_to_nwsync_from_the_build_menu() {
         let text = std::fs::read_to_string(&order).unwrap_or_default();
         text.lines().map(|l| l.trim().to_string()).collect()
     };
+    // (A few frames first: the footer is at the window's foot, which the
+    // window finds in the frames after it opens.)
+    h.run_steps(4);
     h.get_by_label("Publish").click();
     h.run_steps(1);
     until_done(&mut h);
@@ -917,6 +1697,98 @@ fn faction_editor_adds_and_removes_factions() {
     assert_eq!(factions(h.state()).factions.len(), 6);
 }
 
+/// The sample module with `fac` as its `repute.fac`, the Faction Editor
+/// open.
+fn faction_harness(name: &str, fac: Vec<u8>) -> Harness<'static, Moonglow> {
+    let dir = mg_testkit::scratch_dir(name);
+    let path = sample_module(&dir);
+    let mut m = Module::open(&path).unwrap();
+    m.set(ResKey::parse("repute", ResType::FAC).unwrap(), fac);
+    m.save().unwrap();
+    let mut app = app_with(Vec::new());
+    app.open_module(&path);
+    // (Wide enough for the list's three buttons in a row.)
+    let mut h = harness(app, 1400.0, 800.0);
+    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Factions));
+    h.run();
+    h
+}
+
+/// The standard factions' file with only its first `n` factions.
+fn factions_cut_to(n: usize) -> Vec<u8> {
+    let mut g = mg_module::factions::Factions::of_module(&Module::new()).to_gff();
+    let Some(mg_gff::Value::List(list)) = g.root.get_mut("FactionList") else { panic!() };
+    list.truncate(n);
+    g.to_bytes().unwrap()
+}
+
+#[test]
+fn a_factions_file_short_of_the_standard_five_or_unreadable_is_said_and_kept() {
+    // (The review's B1: the editor indexed the standard five unchecked,
+    // and showed a file it couldn't read as the standard five, which the
+    // first change then wrote over it.)
+    let key = ResKey::parse("repute", ResType::FAC).unwrap();
+    let cases = [
+        ("three", factions_cut_to(3), "repute.fac has 3 of the 5 standard factions"),
+        ("none", factions_cut_to(0), "repute.fac has 0 of the 5 standard factions"),
+        ("garbage", b"not a faction file at all".to_vec(), "repute.fac can't be read"),
+    ];
+    for (name, fac, said) in cases {
+        let mut h = faction_harness(&format!("ui-factions-{name}"), fac.clone());
+        h.get_by_label_contains(said);
+        assert!(h.query_by_label("Add Faction…").is_none(), "{name}: no editor over it");
+        h.run();
+        let ws = h.state_mut().ws.as_mut().unwrap();
+        ws.flush().unwrap();
+        assert_eq!(ws.module.get(&key), Some(&fac[..]), "{name}: the file is as it was");
+    }
+}
+
+#[test]
+fn change_faction_name_closes_when_its_faction_is_removed_behind_it() {
+    // (The review's B2: the window kept the faction's number, and its OK
+    // indexed past the end, or renamed the faction that slid into it.)
+    let mut f = mg_module::factions::Factions::of_module(&Module::new());
+    f.add("Guards", true, 4);
+    f.add("Thieves", true, 2);
+    let mut h = faction_harness("ui-factions-rename", f.to_gff().to_bytes().unwrap());
+    let names = |app: &Moonglow| -> Vec<String> {
+        let f = mg_module::factions::Factions::of_module(&app.ws.as_ref().unwrap().module);
+        f.factions.iter().map(|x| x.name.clone()).collect()
+    };
+    // Change Name… on Guards (5), and Guards removed behind the window:
+    // Thieves slides into 5.
+    h.state_mut().faction_view.selected = 5;
+    h.run();
+    h.get_by_label("Change Name…").click();
+    h.run();
+    assert_eq!(h.state().faction_view.renaming.as_ref().map(|r| r.0), Some(5));
+    h.get_by_label("Remove Faction").click();
+    h.run();
+    h.run();
+    assert_eq!(names(h.state())[5..], ["Thieves"]);
+    assert!(h.state().faction_view.renaming.is_none(), "the window went with its faction");
+    assert!(h.query_by_label("Change Faction Name").is_none());
+
+    // On the last one, and that one removed: nothing to index.
+    h.state_mut().faction_view.selected = 5;
+    h.run();
+    h.get_by_label("Change Name…").click();
+    h.run();
+    h.state_mut().faction_view.renaming.as_mut().unwrap().1 = "Rogues".into();
+    h.get_by_label("Remove Faction").click();
+    h.run();
+    h.run();
+    assert_eq!(names(h.state()).len(), 5);
+    assert!(h.state().faction_view.renaming.is_none());
+
+    // And an Undo of the removal doesn't bring the window back.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run();
+    assert_eq!(names(h.state())[5..], ["Thieves"]);
+    assert!(h.state().faction_view.renaming.is_none());
+}
+
 #[test]
 fn journal_editor_builds_what_aurora_builds() {
     let dir = mg_testkit::scratch_dir("ui-journal");
@@ -927,19 +1799,20 @@ fn journal_editor_builds_what_aurora_builds() {
     h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Journal));
     h.run();
     // As Aurora was driven: two categories, two entries in the first, one
-    // in the second.
+    // in the second. (The tree's last rows are below its edge until
+    // scrolled to.)
     let click = |h: &mut Harness<'_, Moonglow>, label: &str| {
-        h.get_by_label(label).click();
+        click_in_sight(h, label);
         h.run();
     };
     click(&mut h, "Add");
     click(&mut h, "Root");
     click(&mut h, "Add");
-    click(&mut h, "Category000  [Category000]");
+    click(&mut h, "Category000 [Category000]");
     click(&mut h, "Add");
-    click(&mut h, "Category000  [Category000]");
+    click(&mut h, "Category000 [Category000]");
     click(&mut h, "Add");
-    click(&mut h, "Category001  [Category001]");
+    click(&mut h, "Category001 [Category001]");
     click(&mut h, "Add");
     let key = ResKey::parse("module", ResType::JRL).unwrap();
     let ws = h.state_mut().ws.as_mut().unwrap();
@@ -962,6 +1835,29 @@ fn journal_editor_builds_what_aurora_builds() {
         mg_module::journal::entries(&doc.root.items(&mg_schema::jrl::CATEGORIES)[0]).len(),
         2
     );
+    // String Edit of the second entry's text holds the entry by its place:
+    // with the first deleted behind it, its OK set the text of whatever
+    // stood there (the review's B11). It follows its entry, and closes
+    // when the entry is deleted.
+    use mg_ui::widgets::{FieldTarget, LocStringEdit};
+    let entry = |e: usize| mg_edit::GffPath::root().item("Categories", 0).item("EntryList", e);
+    let target = FieldTarget::new(key, entry(1), "Text");
+    h.state_mut().loc_edit = Some(LocStringEdit::new(target, "Text", &LocString::default()));
+    h.run();
+    let held =
+        |h: &Harness<'_, Moonglow>| h.state().loc_edit.as_ref().map(|w| w.target.path.clone());
+    use mg_ui::journal_view::Node;
+    h.state_mut().journal_view.selected = Some(Node::Entry(0, 0));
+    h.run();
+    click(&mut h, "Delete");
+    assert_eq!(held(&h), Some(entry(0)));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run();
+    assert_eq!(held(&h), Some(entry(1)), "back with the Undo");
+    h.state_mut().journal_view.selected = Some(Node::Entry(0, 1));
+    h.run();
+    click(&mut h, "Delete");
+    assert_eq!(held(&h), None, "its entry is gone");
 }
 
 /// A waypoint's editor in a module whose hak has (or, `table` off, has
@@ -1013,7 +1909,7 @@ fn turkish_harness(name: &str, table: bool) -> Option<(Harness<'static, Moonglow
     )));
     app.actions.push(mg_ui::Action::OpenTab(Tab::Blueprint(key)));
     close_tab(&mut app, &Tab::ModuleProperties);
-    app.open_palette = false;
+    app.palette_dock = false;
     let h = harness(app, 1000.0, 800.0);
     Some((h, key))
 }
@@ -1088,7 +1984,7 @@ fn text_without_an_encoding_table_is_windows_1252() {
 #[test]
 fn build_module_compiles_and_reports() {
     use mg_edit::{Command, Edit, GffPath};
-    let Some((mut h, area)) = area_harness("build") else { return };
+    let Some((mut h, area)) = area_ui_harness("build") else { return };
     // A script that does not compile, an encounter blueprint whose creature
     // entry has a stale CR, and a waypoint naming a missing script.
     let mut ute = Gff::new(*b"UTE ");
@@ -1128,11 +2024,13 @@ fn build_module_compiles_and_reports() {
     assert!(w.compile && w.missing && !w.unused, "Aurora's defaults");
     h.get_all_by_label("Build").last().unwrap().click();
     h.run_steps(3);
-    let results: Vec<String> =
-        h.state().build.as_ref().unwrap().results.iter().map(|f| f.text.clone()).collect();
+    // (Its results in Problems, M4's U28: brought to the front, open.)
+    let results = build_results(&h);
     let has = |s: &str| results.iter().any(|r| r.contains(s));
-    assert!(has("Error:"), "the bad script: {results:?}");
+    assert!(has("Error: mg_bad.nss"), "the bad script: {results:?}");
     assert!(has("mg_nosuchscript"), "{results:?}");
+    assert_eq!(h.state().bottom_dock_shows(), Some(mg_ui::Panel::Problems));
+    h.get_by_label_contains("Error: mg_bad.nss");
     let log = &h.state().log.entries;
     assert!(
         log.iter().any(|(_, m)| m.contains("1 encounter creature entries")),
@@ -1165,14 +2063,19 @@ fn build_module_marks_an_unused_script_as_used() {
         .with_size([900.0, 900.0])
         .build_ui_state(|ui, app: &mut Moonglow| app.ui(ui), app);
     h.run_steps(2);
+    dock_high(&mut h, 360);
     h.get_all_by_label("Build").last().unwrap().click();
     h.run_steps(3);
-    let results = |h: &Harness<'_, Moonglow>| -> Vec<String> {
-        h.state().build.as_ref().unwrap().results.iter().map(|f| f.text.clone()).collect()
-    };
-    let line = "Unused: hello.nss (source and compiled)";
+    let results = build_results;
+    // (In Problems, M4's U28: a warning, its place the script.)
+    let line = "Warning: hello.nss, Unused (source and compiled)";
     assert!(results(&h).iter().any(|r| r == line), "{:?}", results(&h));
     assert!(!results(&h).iter().any(|r| r.contains("hello.ncs")), "once: {:?}", results(&h));
+    // (Nothing chosen: the dialog's Mark as Used can't be.)
+    assert!(
+        h.get_by_label("Mark as Used").accesskit_node().is_disabled(),
+        "no Unused result chosen"
+    );
     h.get_by_label(line).click();
     h.run();
     h.get_by_label("Mark as Used").click();
@@ -1186,8 +2089,12 @@ fn build_module_marks_an_unused_script_as_used() {
     // Built again: still not said.
     h.get_all_by_label("Build").last().unwrap().click();
     h.run_steps(3);
-    assert!(!results(&h).is_empty() && !results(&h).iter().any(|r| r.contains("hello")));
-    // Counted as Used lists it, and takes it out.
+    assert!(!results(&h).iter().any(|r| r.contains("hello")), "{:?}", results(&h));
+    let log = &h.state().log.entries;
+    let last = &log[log.len().saturating_sub(3)..];
+    assert!(last.iter().any(|(_, m)| m == "No errors found"), "{log:?}");
+    // Counted as Used (Build's heading's, in Problems) lists it, and takes
+    // it out.
     h.get_by_label("Counted as Used").click();
     h.run();
     h.get_by_label("Script: hello");
@@ -1358,7 +2265,7 @@ fn a_panic_keeps_the_unsaved_work() {
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("tag", vec![edit])));
     h.run();
     panics(h.state_mut());
-    let copies = mg_ui::recovery::find(&recovery);
+    let copies = mg_ui::recovery::find_all(&recovery);
     assert_eq!(copies.len(), 1);
     let kept = Module::open(&copies[0].archive).unwrap();
     let ifo = kept.gff(&key).unwrap().unwrap();
@@ -1376,7 +2283,7 @@ fn closing_without_saving_leaves_no_copy() {
     app.recovery_dir = Some(recovery.clone());
     app.open_module(&path);
     app.write_recovery().unwrap();
-    assert_eq!(mg_ui::recovery::find(&recovery).len(), 1);
+    assert_eq!(mg_ui::recovery::find_all(&recovery).len(), 1);
     app.close();
     assert!(mg_ui::recovery::find(&recovery).is_empty());
 }
@@ -1396,10 +2303,9 @@ fn a_build_without_game_data_says_so() {
     h.run_steps(2);
     h.get_all_by_label("Build").last().unwrap().click();
     h.run_steps(3);
-    let results: Vec<String> =
-        h.state().build.as_ref().unwrap().results.iter().map(|f| f.text.clone()).collect();
+    let results = build_results(&h);
     assert_eq!(results.len(), 1, "{results:?}");
-    assert!(results[0].starts_with("No game data"), "{results:?}");
+    assert!(results[0].starts_with("Error: No game data"), "{results:?}");
 }
 
 /// Verify's report: errors first; objects placed from a blueprint that is
@@ -1421,6 +2327,7 @@ fn verify_says_errors_first_and_gone_blueprints_once_each() {
         category: Category::Placeables,
         uncompiled: false,
         only_local: None,
+        found_as: None,
     };
     let utp = RefKind::Blueprint(ResType::UTP);
     let list = [
@@ -1466,7 +2373,7 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
     };
     let scratch = dir.join("scratch");
     let mut h = open(&path, &scratch);
-    h.get_by_label("To Scratch").click();
+    script_click(&mut h, "To Scratch");
     h.run_steps(3);
     assert_eq!(std::fs::read(scratch.join("hello.nss")).unwrap(), b"void main() { }\n");
     let ncs = std::fs::read(scratch.join("hello.ncs")).unwrap();
@@ -1487,7 +2394,7 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
     if apart {
         std::fs::write(&other_spelling, b"NCS V1.0 older").unwrap();
     }
-    h.get_by_label("To Scratch").click();
+    script_click(&mut h, "To Scratch");
     h.run_steps(3);
     assert!(std::fs::read(scratch.join("hello.ncs")).unwrap().starts_with(b"NCS V1.0"));
     assert!(!scratch.join("hello.ndb").exists(), "no debug file of an older compile");
@@ -1502,7 +2409,7 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
     }
     // With debug information: the debug file made goes with it.
     h.state_mut().settings.debug_info = true;
-    h.get_by_label("To Scratch").click();
+    script_click(&mut h, "To Scratch");
     h.run_steps(3);
     assert!(scratch.join("hello.ndb").exists(), "{:?}", texts(&h));
     h.state_mut().settings.debug_info = false;
@@ -1515,7 +2422,7 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
     m.save().unwrap();
     let scratch = dir.join("scratch2");
     let mut h = open(&broken_path, &scratch);
-    h.get_by_label("To Scratch").click();
+    script_click(&mut h, "To Scratch");
     h.run_steps(3);
     assert_eq!(std::fs::read(scratch.join("hello.nss")).unwrap(), b"void main() { x = 1; }\n");
     assert!(!scratch.join("hello.ncs").exists(), "no compiled script");
@@ -1529,7 +2436,7 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
     std::fs::write(scratch.join("hello.ncs"), b"NCS V1.0 older").unwrap();
     std::fs::write(scratch.join("hello.ndb"), b"NDB older").unwrap();
     std::fs::write(scratch.join("other.ncs"), b"NCS V1.0 other").unwrap();
-    h.get_by_label("To Scratch").click();
+    script_click(&mut h, "To Scratch");
     h.run_steps(3);
     assert!(!scratch.join("hello.ncs").exists() && !scratch.join("hello.ndb").exists());
     assert!(scratch.join("other.ncs").exists(), "another script's is left");
@@ -1545,7 +2452,7 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
     m.save().unwrap();
     let scratch = dir.join("scratch3");
     let mut h = open(&include_path, &scratch);
-    h.get_by_label("To Scratch").click();
+    script_click(&mut h, "To Scratch");
     h.run_steps(3);
     let source = std::fs::read(scratch.join("hello.nss")).unwrap();
     assert_eq!(source, b"int Twice(int n) { return 2 * n; }\n");
@@ -1559,7 +2466,7 @@ fn a_script_goes_to_the_scratch_folder_compiled() {
 /// with what it compiles to now, not with the older compiled script.
 #[test]
 fn a_stale_compiled_script_is_compiled_before_it_goes_out() {
-    let Some((mut h, _)) = area_harness("stale-ncs") else { return };
+    let Some((mut h, _)) = area_ui_harness("stale-ncs") else { return };
     let key = ResKey::parse("hello", ResType::NSS).unwrap();
     let ncs = ResKey::parse("hello", ResType::NCS).unwrap();
     let scratch = mg_testkit::scratch_dir("ui-stale-ncs").join("scratch");
@@ -1663,18 +2570,18 @@ fn an_area_goes_to_the_scratch_folder() {
         // (One the area doesn't use stays behind.)
         m.set(ResKey::parse("mg_other", ResType::NSS).unwrap(), b"void main() {}\n".to_vec());
     };
-    let Some((mut h, area)) = area_harness_with("area-scratch", "ttr01", None, 4, None, &enter)
+    let Some((mut h, area)) = area_ui_harness_with("area-scratch", "ttr01", None, 4, None, &enter)
     else {
         return;
     };
     // No scratch folder yet, and none chosen when asked: nothing is copied.
-    h.get_by_label("📤 To Scratch").click();
+    area_click(&mut h, "To Scratch");
     h.run_steps(2);
     assert_eq!(h.state().settings.scratch_dir, None);
     let scratch = mg_testkit::scratch_dir("ui-area-scratch").join("scratch");
     h.state_mut().settings.scratch_dir = Some(scratch.clone());
     h.run_steps(2);
-    h.get_by_label("📤 To Scratch").click();
+    area_click(&mut h, "To Scratch");
     h.run_steps(3);
     let mut names: Vec<String> = std::fs::read_dir(&scratch)
         .unwrap()
@@ -1782,7 +2689,7 @@ fn a_field_typed_in_sets_its_text_before_files_changed_outside_are_read() {
     app.open_module(&folder);
     let mut h = harness(app, 1200.0, 800.0);
     h.run_steps(3);
-    h.get_by_label("Description").click();
+    page(&mut h, "Description");
     h.run_steps(3);
     let memo = egui_kittest::kittest::by().role(egui::accesskit::Role::MultilineTextInput);
     let at = h.get(memo).rect().center();
@@ -1821,7 +2728,9 @@ fn a_field_typed_in_sets_its_text_before_files_changed_outside_are_read() {
 
 /// The window's own close button asks before Moonglow closes where there
 /// is nothing unsaved to ask about; with the option off it closes, and
-/// with unsaved work (a table's here) the question is about that.
+/// with unsaved work (a table's here) the question is about that: the
+/// table's own, by its name, not the module's ("the new module", with
+/// none open).
 #[test]
 fn closing_the_window_asks_first() {
     let dir = mg_testkit::scratch_dir("ui-close-asks");
@@ -1841,15 +2750,23 @@ fn closing_the_window_asks_first() {
     h.state_mut().tables.iter_mut().find(|d| d.id == id).unwrap().edit.add_rows(1);
     h.state_mut().actions.push(mg_ui::Action::CloseWindow);
     h.run_steps(3);
-    assert!(!h.state().closing && h.state().confirm_discard.is_some());
-    h.state_mut().confirm_discard = None;
+    assert!(!h.state().closing && h.state().confirm_discard.is_none());
+    assert!(h.query_by_label("Save changes to loose.2da?").is_some(), "the table's question");
+    assert!(h.state().side_then.is_some(), "closing waits for the answer");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run_steps(3);
+    assert!(h.state().side_then.is_none() && !h.state().quit_requested, "Cancel: nothing");
     assert!(mg_ui::table_view::save(h.state_mut(), id));
-    // Nothing unsaved again: asked, and closed on the answer.
+    // Nothing unsaved again: asked, and closed on the answer; Don't ask
+    // again switches the question off (Options › General › Questions).
     h.state_mut().actions.push(mg_ui::Action::CloseWindow);
     h.run_steps(3);
+    h.get_by_label("Don't ask again").click();
+    h.run_steps(2);
     h.get_by_label("Close Moonglow").click();
     h.run_steps(3);
     assert!(h.state().quit_requested);
+    assert!(h.state().settings.close_without_asking, "not asked again");
     // With the option off, the button closes.
     h.state_mut().quit_requested = false;
     h.state_mut().settings.close_without_asking = true;
@@ -1893,11 +2810,21 @@ fn a_game_moonglow_did_not_start_is_known_before_a_test() {
     let name = format!("mgtest{}", std::process::id());
     let file = user.join(format!("modules/{name}.mod"));
     std::fs::copy(&path, &file).unwrap();
+    // (Waited for until its command line is the game's: spawned, it is this
+    // process's copy until it execs, which a busy machine can be slow to.)
     let game = |module: &str| {
-        std::process::Command::new(&running)
+        let child = std::process::Command::new(&running)
             .args(["-c", "sleep 30; true", "nwmain-linux", "+TestNewModule", module])
             .spawn()
-            .unwrap()
+            .unwrap();
+        let cmdline = format!("/proc/{}/cmdline", child.id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::fs::read(&cmdline).is_ok_and(|c| c.windows(14).any(|w| w == b"+TestNewModule"))
+        {
+            assert!(std::time::Instant::now() < deadline, "the stand-in game never started");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child
     };
     let mut app = game_app_with(&root, Some(user.clone()), NoDialogs::default());
     app.settings.no_last_area = true;
@@ -2013,11 +2940,78 @@ fn check_for_conflicts_says_what_the_module_uses_of_its_haks() {
     h.run();
     h.state_mut().actions.push(mg_ui::Action::HakReport);
     h.run();
+    // (A Bottom Dock tab, M4's U28: brought to the front.)
     assert!(h.state().hak_report.is_some());
+    assert_eq!(h.state().bottom_dock_shows(), Some(mg_ui::Panel::HakConflicts));
     h.get_by_label("What the Module Uses").click();
     h.run();
-    let used = h.state().hak_usage.clone().expect("the walk ran");
+    let used = h.state().hak_report.as_ref().and_then(|r| r.usage.clone()).expect("the walk ran");
     assert!(used.contains("mg_content\t2 of 3 used"), "{used}");
     assert!(used.contains("1 unused"), "{used}");
+    // (Its lines its own view's rows, shown.)
     assert!(h.query_by_label_contains("What the module uses (in the game a player has)").is_some());
+}
+
+/// Recover, New Module's Create and "Open Directory as a Module" replaced
+/// the open module without the question the other ways of leaving it ask
+/// (the review of November 2026, S2). The second step of New Module and
+/// of the folder question asks only where the work is not what it was
+/// when the first step was let through.
+#[test]
+fn recover_and_new_module_ask_before_they_replace_unsaved_work() {
+    let dir = mg_testkit::scratch_dir("ui-replace-asks");
+    let path = sample_module(&dir);
+    let mut app = app_with(Vec::new());
+    app.recovery_dir = Some(dir.join("recovery"));
+    app.open_module(&path);
+    let mut h = window_harness(app);
+    h.run();
+    let key = ResKey::parse("mg_note", ResType::NSS).unwrap();
+    let edit = |text: &[u8]| {
+        let e = mg_edit::Edit::SetResource { key, data: Some(text.to_vec()) };
+        mg_ui::Action::Apply(mg_edit::Command::new("Note", vec![e]))
+    };
+    let asked = |h: &Harness<'_, Moonglow>| h.state().confirm_discard.clone();
+
+    // New Module… with nothing unsaved asks nothing; an edit made while
+    // its window waits is asked about at Create.
+    h.state_mut().actions.push(mg_ui::Action::NewModuleDialog);
+    h.run();
+    assert!(asked(&h).is_none());
+    h.state_mut().actions.push(edit(b"// one"));
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::NewModule("other".into()));
+    h.run();
+    assert_eq!(asked(&h), Some(mg_ui::Action::NewModule("other".into())));
+    assert!(h.state().ws.as_ref().unwrap().is_modified(), "the module is still there");
+    h.state_mut().confirm_discard = None;
+    h.state_mut().wizard = None;
+
+    // Asked at New Module… and answered: Create is not asked again.
+    h.state_mut().actions.push(mg_ui::Action::NewModuleDialog);
+    h.run();
+    assert_eq!(asked(&h), Some(mg_ui::Action::NewModuleDialog));
+    let ask = h.state_mut().confirm_discard.take().unwrap();
+    h.state_mut().actions.push(mg_ui::Action::Proceed(Box::new(ask)));
+    h.run();
+    h.state_mut().actions.push(mg_ui::Action::OpenModuleAsIs(dir.join("none.mod")));
+    h.run();
+    assert!(asked(&h).is_none(), "the same work as when it was asked");
+    h.state_mut().wizard = None;
+
+    // A recovery copy opened over unsaved work: asked, the copy still
+    // listed.
+    h.state_mut().actions.push(edit(b"// two"));
+    h.run();
+    // (Listed as a start lists a session's that did not end; the window
+    // that wrote one holds it, and is not offered its own.)
+    let written = h.state_mut().write_recovery().unwrap();
+    h.state_mut().find_recoveries();
+    assert!(h.state().recoveries.is_empty(), "its own, still open");
+    h.state_mut().recoveries = mg_ui::recovery::find_all(written.parent().unwrap());
+    let copy = h.state().recoveries[0].clone();
+    h.state_mut().actions.push(mg_ui::Action::Recover(copy.clone()));
+    h.run();
+    assert_eq!(asked(&h), Some(mg_ui::Action::Recover(copy)));
+    assert_eq!(h.state().recoveries.len(), 1);
 }

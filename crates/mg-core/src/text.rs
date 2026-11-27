@@ -96,9 +96,34 @@ impl Needle {
         self.finds_in(&[folded])
     }
 
+    /// Whether everything it finds, `wider` finds too: each of `wider`'s
+    /// words is in one of its own (a key typed after them), so a list can
+    /// look for it among what `wider` found rather than in every name.
+    pub fn narrows(&self, wider: &Needle) -> bool {
+        self.in_order == wider.in_order
+            && wider.words.iter().all(|w| match self.in_order {
+                true => self.words.iter().any(|n| {
+                    let mut letters = n.chars();
+                    w.chars().all(|c| letters.any(|x| x == c))
+                }),
+                false => self.words.iter().any(|n| n.contains(w.as_str())),
+            })
+    }
+
+    /// Whether it looks for a single word.
+    pub fn is_single_word(&self) -> bool {
+        self.words.len() == 1
+    }
+
     /// Whether every word is in one of `fields` (each already [`fold`]ed):
     /// a row found by its name, its ResRef and its tag together.
     pub fn finds_in(&self, fields: &[&str]) -> bool {
+        self.words.iter().all(|w| fields.iter().any(|f| self.holds(f, w)))
+    }
+
+    /// Same as [`Self::finds_in`] over owned `String` slices without
+    /// constructing an intermediate `&[&str]` slice.
+    pub fn finds_in_strings(&self, fields: &[String]) -> bool {
         self.words.iter().all(|w| fields.iter().any(|f| self.holds(f, w)))
     }
 
@@ -347,13 +372,119 @@ fn extended_additional(c: char) -> Option<&'static str> {
     if let Some(letter) = n.checked_sub(0x1e96).and_then(|i| alone.get(i as usize)) {
         return Some(letter);
     }
-    let run = RUNS.windows(2).find(|w| w[0].0 <= n && n < w[1].0)?;
-    Some(run[0].1).filter(|l| !l.is_empty())
+    let at = RUNS.partition_point(|&(start, _)| start <= n);
+    if at == 0 || at >= RUNS.len() {
+        return None;
+    }
+    Some(RUNS[at - 1].1).filter(|l| !l.is_empty())
+}
+
+/// The line (from 1) that byte offset `at` of `text` is on: one more than
+/// the line ends before it. An offset past the end is on the last line.
+/// (Counted nine ways in the workspace before; a counter that goes on
+/// from where it was counts with [`line_ends`].)
+pub fn line_of(text: &[u8], at: usize) -> usize {
+    line_ends(&text[..at.min(text.len())]) + 1
+}
+
+/// `N` bytes written as `2 × N` hex digits (`9e97d3` for a color's three),
+/// either case; anything else (another length, a character that is no hex
+/// digit, one of several bytes) is none. The one reader of a color's
+/// `#rrggbb` (the `#` is the caller's: some ask for it, some take it
+/// left out): four were written.
+pub fn hex_bytes<const N: usize>(digits: &str) -> Option<[u8; N]> {
+    let d = digits.as_bytes();
+    if d.len() != 2 * N || !d.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let nibble = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
+    let mut out = [0; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = nibble(d[2 * i])? << 4 | nibble(d[2 * i + 1])?;
+    }
+    Some(out)
+}
+
+/// How many line ends (`\n`) `bytes` holds.
+pub fn line_ends(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == b'\n').count()
+}
+
+/// Strips `suffix` from `s` once, matching ASCII case-insensitively.
+pub fn strip_suffix_ascii_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
+    match s.len().checked_sub(suffix.len()) {
+        Some(at) if s.is_char_boundary(at) && s[at..].eq_ignore_ascii_case(suffix) => &s[..at],
+        _ => s,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A byte offset's line: at the text's start, at a line end and just
+    /// after it, at the end and past it.
+    #[test]
+    fn a_byte_offset_s_line_is_one_more_than_the_line_ends_before_it() {
+        let text = b"one\ntwo\r\n\nfour";
+        assert_eq!(line_of(text, 0), 1);
+        assert_eq!(line_of(text, 3), 1, "on its line end");
+        assert_eq!(line_of(text, 4), 2);
+        assert_eq!(line_of(text, 9), 3);
+        assert_eq!(line_of(text, text.len()), 4);
+        assert_eq!(line_of(text, usize::MAX), 4, "past the end: the last line");
+        assert_eq!(line_of(b"", 0), 1);
+        assert_eq!(line_ends(text), 3);
+    }
+
+    /// A filter narrows another where everything it finds the other finds:
+    /// a key typed after it, a word added, its words in another order; not
+    /// a key taken back, a word split in two, or a search by letters in
+    /// order against one by words. Over a few names, what it finds is
+    /// within what the wider finds wherever it says it narrows.
+    #[test]
+    fn a_filter_narrows_another_only_where_it_finds_within_it() {
+        let n = Needle::new;
+        assert!(n("gui_errorq").narrows(&n("gui_error")));
+        assert!(n("gui_error").narrows(&n("gui_error")));
+        assert!(n("Sword iron").narrows(&n("iron")));
+        assert!(n("iron sword").narrows(&n("sword IRON")));
+        assert!(n("anything").narrows(&n("")));
+        assert!(!n("gui_erro").narrows(&n("gui_error")));
+        assert!(!n("gui error").narrows(&n("gui_error")));
+        assert!(!n("").narrows(&n("a")));
+        assert!(n("lngswd").letters_in_order().narrows(&n("lsw").letters_in_order()));
+        assert!(!n("lngswd").letters_in_order().narrows(&n("lsw")));
+        assert!(!n("lsw").narrows(&n("lsw").letters_in_order()));
+        let names = ["gui_error", "gui_errorq", "iron sword", "longsword", "árbol", "lsw"];
+        let filters = ["", "gui", "gui_error", "gui error", "sword", "iron sword", "lsw", "arb"];
+        for wide in filters {
+            for narrow in filters {
+                for in_order in [false, true] {
+                    let pick = |t| if in_order { n(t).letters_in_order() } else { n(t) };
+                    let (w, x) = (pick(wide), pick(narrow));
+                    if x.narrows(&w) {
+                        for name in names {
+                            assert!(!x.finds(name) || w.finds(name), "{narrow:?} {wide:?} {name}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A color's hex digits: either case; another length, a letter past
+    /// `f` or a character of several bytes (`aéb23` is six bytes) is none,
+    /// without a panic.
+    #[test]
+    fn hex_digits_are_read_as_bytes_or_not_at_all() {
+        assert_eq!(hex_bytes::<3>("9e97D3"), Some([0x9e, 0x97, 0xd3]));
+        assert_eq!(hex_bytes::<4>("9e97d380"), Some([0x9e, 0x97, 0xd3, 0x80]));
+        for no in ["9e97d", "9e97d3a", "9e97g3", "aéb23", "+e97d3", ""] {
+            assert_eq!(hex_bytes::<3>(no), None, "{no:?}");
+        }
+        assert_eq!(hex_bytes::<0>(""), Some([]));
+    }
 
     #[test]
     fn case_and_accents_are_folded() {
@@ -455,5 +586,14 @@ mod tests {
         assert!(!same_letter('æ', 'a'));
         // A capital whose small letter is two characters: compared whole.
         assert!(!same_letter('İ', 'i'));
+    }
+
+    #[test]
+    fn strip_suffix_ascii_ci_strips_once_and_ignores_case() {
+        assert_eq!(strip_suffix_ascii_ci("INC_FOO.NSS", ".nss"), "INC_FOO");
+        assert_eq!(strip_suffix_ascii_ci("Cls_Feat.2Da", ".2da"), "Cls_Feat");
+        assert_eq!(strip_suffix_ascii_ci("a.nss.nss", ".nss"), "a.nss");
+        assert_eq!(strip_suffix_ascii_ci("a\u{e9}b", "\u{e9}b"), "a");
+        assert_eq!(strip_suffix_ascii_ci("\u{e9}", "xx"), "\u{e9}");
     }
 }

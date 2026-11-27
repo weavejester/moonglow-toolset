@@ -14,6 +14,7 @@ use mg_edit::{Command, Edit};
 use mg_gff::Struct;
 use mg_resman::ResKey;
 use mg_rules::Choice;
+use mg_uikit::Controls as _;
 
 use crate::{Action, Moonglow};
 
@@ -46,16 +47,17 @@ fn material_name(materials: &[Choice], row: u32) -> String {
     }
 }
 
-/// The tileset's grass (`[GRASS]`), read once for each tileset; `None`
-/// when the tileset grows none, or cannot be read.
-fn tileset_grass(app: &Moonglow, ctx: &egui::Context, tileset: ResRef) -> Option<GrassLook> {
-    let id = egui::Id::new(("mg-tileset-grass", tileset));
-    if let Some(known) = ctx.data(|d| d.get_temp::<Option<GrassLook>>(id)) {
-        return known;
+/// The tileset's grass (`[GRASS]`), read once for each tileset, until
+/// the game data is read again (kept with what the palette made of it:
+/// `PaletteView::forget_game_data`); `None` when the tileset grows none,
+/// or cannot be read.
+fn tileset_grass(app: &Moonglow, tileset: ResRef) -> Option<GrassLook> {
+    if let Some(known) = app.palette.tileset_grass.borrow().get(&tileset) {
+        return known.clone();
     }
     app.game.as_ref()?;
     let look = app.tileset(tileset).and_then(|t| GrassLook::of_tileset(&t));
-    ctx.data_mut(|d| d.insert_temp(id, look.clone()));
+    app.palette.tileset_grass.borrow_mut().insert(tileset, look.clone());
     look
 }
 
@@ -113,7 +115,7 @@ fn texture_picture(app: &mut Moonglow, ui: &mut Ui, texture: &str) {
 
 /// The GITs' `AreaProperties` alone (what the edits look at: not the
 /// objects, copied every frame), by GIT, of those that have it.
-fn properties(app: &mut Moonglow, areas: &[ResRef]) -> Vec<(ResKey, Struct)> {
+pub(crate) fn properties(app: &mut Moonglow, areas: &[ResRef]) -> Vec<(ResKey, Struct)> {
     let Some(ws) = app.ws.as_mut() else { return Vec::new() };
     areas
         .iter()
@@ -143,9 +145,22 @@ fn apply(
 
 /// The page: of `area`, and of `others` with it (each change is made to
 /// each of them; an override, to the one each has for its material).
-pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResRef]) {
-    let areas: Vec<ResRef> = std::iter::once(area).chain(others.iter().copied()).collect();
-    let gits = properties(app, &areas);
+pub(crate) fn page(
+    app: &mut Moonglow,
+    ui: &mut Ui,
+    area: ResRef,
+    others: &[ResRef],
+    kept: Option<&[(ResKey, Struct)]>,
+) {
+    let read;
+    let gits = match kept {
+        Some(gits) => gits,
+        None => {
+            let areas: Vec<ResRef> = std::iter::once(area).chain(others.iter().copied()).collect();
+            read = properties(app, &areas);
+            &read[..]
+        }
+    };
     let Some((_, first)) = gits.first() else {
         ui.label("This area has no grass settings (its GIT lacks AreaProperties).");
         return;
@@ -157,7 +172,7 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
         .and_then(|ws| ws.doc(&ResKey::new(area, ResType::ARE)).ok())
         .and_then(|are| are.root.resref("Tileset"))
         .unwrap_or(ResRef::EMPTY);
-    let own = tileset_grass(app, ui.ctx(), tileset);
+    let own = tileset_grass(app, tileset);
     let materials = materials(app);
     let present = materials_present(app, ui.ctx(), area, tileset);
     // What is being tried out, in place of the stored values.
@@ -175,12 +190,12 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
         Some(look) => {
             let mut grows = !current.default_disabled;
             if ui
-                .checkbox(&mut grows, "Grow the tileset's grass on Grass faces")
+                .check_box(&mut grows, "Grow the tileset's grass on Grass faces")
                 .on_hover_text("Off: SetAreaDefaultGrassDisabled(TRUE) from the start")
                 .changed()
             {
                 let what = if grows { "Grow the tileset's grass" } else { "No tileset grass" };
-                apply(app, &gits, what, |k, root| grass::set_disabled(k, root, !grows));
+                apply(app, gits, what, |k, root| grass::set_disabled(k, root, !grows));
             }
             ui.horizontal(|ui| {
                 texture_picture(app, ui, &look.texture);
@@ -235,7 +250,7 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
                         list.show(ui).and_then(|v| u32::try_from(v).ok()).unwrap_or(o.material);
                     if to != o.material {
                         let (from, what) = (o.material, "Grass's surface material");
-                        apply(app, &gits, what, |k, root| grass::move_override(k, root, from, to));
+                        apply(app, gits, what, |k, root| grass::move_override(k, root, from, to));
                     }
                     if ui
                         .button("Remove")
@@ -243,7 +258,7 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
                         .clicked()
                     {
                         let m = o.material;
-                        apply(app, &gits, "Remove grass", |k, root| {
+                        apply(app, gits, "Remove grass", |k, root| {
                             grass::remove_override(k, root, m)
                         });
                     }
@@ -304,7 +319,7 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
                 ui.weak("No face of this area's tiles is of this material: nothing grows here.");
             }
             if set && changed != *o {
-                apply(app, &gits, "Grass", |k, root| grass::set_override(k, root, &changed));
+                apply(app, gits, "Grass", |k, root| grass::set_override(k, root, &changed));
             } else if changed != *o
                 && let Some(slot) =
                     trying.overrides.iter_mut().rev().find(|t| t.material == o.material)
@@ -314,21 +329,22 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
         });
     }
     ui.horizontal(|ui| {
-        let free: Vec<&Choice> =
-            materials.iter().filter(|c| !taken.contains(&(c.row as u32))).collect();
-        // The materials the area's tiles have first, the most of the
-        // ground first; the others after.
-        let mut on: Vec<(&Choice, f32)> =
-            free.iter().filter_map(|c| Some((*c, *present.get(&(c.row as u32))?))).collect();
-        on.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.row.cmp(&b.0.row)));
-        let off: Vec<&Choice> =
-            free.iter().copied().filter(|c| !present.contains_key(&(c.row as u32))).collect();
         let mut pick: Option<u32> = None;
-        ui.menu_button("Add Grass to…", |ui| {
+        mg_uikit::menu_button(ui, "Add Grass to…", |ui| {
+            let free: Vec<&Choice> =
+                materials.iter().filter(|c| !taken.contains(&(c.row as u32))).collect();
+            // The materials the area's tiles have first, the most of the
+            // ground first; the others after.
+            let mut on: Vec<(&Choice, f32)> =
+                free.iter().filter_map(|c| Some((*c, *present.get(&(c.row as u32))?))).collect();
+            on.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.row.cmp(&b.0.row)));
+            let off: Vec<&Choice> =
+                free.iter().copied().filter(|c| !present.contains_key(&(c.row as u32))).collect();
+            mg_uikit::menu_rows(ui);
             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                ui.weak("On this area's tiles");
+                mg_uikit::menu_heading(ui, "On this area's tiles");
                 if on.is_empty() {
-                    ui.weak("(none left)");
+                    mg_uikit::menu_note(ui, "(none left)");
                 }
                 for (c, square_meters) in &on {
                     let row = c.row as u32;
@@ -340,8 +356,11 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
                         pick = Some(row);
                     }
                 }
-                ui.separator();
-                ui.weak("Not on this area's tiles (nothing grows until a tile has it)");
+                mg_uikit::menu_separator(ui);
+                mg_uikit::menu_heading(
+                    ui,
+                    "Not on this area's tiles (nothing grows until a tile has it)",
+                );
                 for c in off {
                     let row = c.row as u32;
                     let text = egui::RichText::new(material_name(&materials, row)).weak();
@@ -352,11 +371,11 @@ pub(crate) fn page(app: &mut Moonglow, ui: &mut Ui, area: ResRef, others: &[ResR
             });
         })
         .response
-        .on_hover_text("Grass of the area's own on a surface material: the tileset's, as a start");
+        .on_hover_text("The area's own grass on a surface material, starting from the tileset's");
         if let Some(m) = pick {
             let set = app.tileset(tileset);
             let o = GrassOverride::new(m, set.as_deref());
-            apply(app, &gits, "Add grass", |k, root| grass::set_override(k, root, &o));
+            apply(app, gits, "Add grass", |k, root| grass::set_override(k, root, &o));
         }
     });
     ui.add_space(8.0);
@@ -396,4 +415,34 @@ fn color(ui: &mut Ui, id: egui::Id, rgb: [f32; 3]) -> ([f32; 3], bool, bool) {
         return (picked, false, picked != rgb);
     }
     (picked, open, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The review's A15: the tileset's grass shown by Area Properties ›
+    /// Grass was kept for the life of the process, by the tileset's name:
+    /// with a tileset's `[GRASS]` changed and the resources read again,
+    /// the page still said the old texture, density and height, and what
+    /// a drag tried out in the view grew the old grass. It is kept with
+    /// what the palette made of the game data, and forgotten with it.
+    #[test]
+    fn a_tileset_s_grass_is_forgotten_with_the_game_data() {
+        let mut app = Moonglow::new(None, Box::new(crate::NoDialogs::default()));
+        let set = ResRef::from_str("tst01").unwrap();
+        let look = GrassLook {
+            texture: "grass_old".into(),
+            density: 8.0,
+            height: 0.5,
+            ambient: [1.0; 3],
+            diffuse: [1.0; 3],
+        };
+        app.palette.tileset_grass.borrow_mut().insert(set, Some(look.clone()));
+        assert_eq!(tileset_grass(&app, set), Some(look), "kept while the game data is");
+        app.palette.forget_game_data();
+        // (Read again: with no game here, there is none to read.)
+        assert_eq!(tileset_grass(&app, set), None);
+        assert!(app.palette.tileset_grass.borrow().is_empty());
+    }
 }

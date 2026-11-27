@@ -78,10 +78,7 @@ fn project_settings(dir: &Path) -> Option<Settings> {
 
 fn shown(v: &Option<Value>, cp: Codepage) -> String {
     let Some(v) = v else { return "(none)".into() };
-    let short = |s: String| match s.chars().count() > 60 {
-        true => s.chars().take(59).chain(['…']).collect(),
-        false => s,
-    };
+    let short = |s: String| crate::diff::truncate_ellipsis(s, 60);
     match v {
         Value::String(b) | Value::ResRef(b) => format!("\"{}\"", short(cp.decode(b).into_owned())),
         // (Its English, else another language's, as lists show it.)
@@ -112,13 +109,17 @@ fn conflict_json(c: &Conflict, cp: Codepage) -> serde_json::Value {
     })
 }
 
-pub(crate) fn merge_gff(args: &Args<'_>) -> Result<Output> {
-    let prefer = match args.prefer {
-        None => None,
-        Some("ours" | "a") => Some(Prefer::Ours),
-        Some("theirs" | "b") => Some(Prefer::Theirs),
+fn parse_prefer<T>(prefer: Option<&str>, ours: T, theirs: T) -> Result<Option<T>> {
+    match prefer {
+        None => Ok(None),
+        Some("ours" | "a") => Ok(Some(ours)),
+        Some("theirs" | "b") => Ok(Some(theirs)),
         Some(other) => bail!("--prefer ours or theirs, not {other}"),
-    };
+    }
+}
+
+pub(crate) fn merge_gff(args: &Args<'_>) -> Result<Output> {
+    let prefer = parse_prefer(args.prefer, Prefer::Ours, Prefer::Theirs)?;
     let near = match args.path {
         Some(p) => p.parent().map(Path::to_path_buf).unwrap_or_default(),
         None => args.ours.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -151,16 +152,13 @@ pub(crate) fn merge_gff(args: &Args<'_>) -> Result<Output> {
             shown(&c.theirs, cp)
         ));
     }
-    let unsettled = !merged.conflicts.is_empty() && prefer.is_none();
-    out.json["merged"] = json!(!unsettled);
-    if unsettled {
-        out.failed = true;
-        out.json["written"] = json!(null);
-        out.note(format!(
+    if crate::diff::mark_unsettled(&mut out, merged.conflicts.len(), prefer.is_some(), true, || {
+        format!(
             "{name}: {} values were changed by both, each its own way: nothing written (--prefer \
              ours or theirs takes one side's)",
             merged.conflicts.len()
-        ));
+        )
+    }) {
         return Ok(out);
     }
     let target = args.output.unwrap_or(args.ours);
@@ -169,8 +167,8 @@ pub(crate) fn merge_gff(args: &Args<'_>) -> Result<Output> {
     } else if merged.gff == theirs.gff && theirs.form == ours.form {
         (theirs.data, "theirs")
     } else if ours.form == Form::Nwnt {
-        if let Some(path) = mg_gff::nwnt_unkept_label(&merged.gff.root) {
-            bail!("{name}: {path}: NWNT can't keep a label with a dot in it");
+        if let Some(unkept) = mg_gff::nwnt_unkept(&merged.gff.root, cp) {
+            bail!("{name}: {unkept}");
         }
         (mg_gff::to_nwnt(&merged.gff, cp, conv.float_places).into_bytes(), "merged")
     } else if ours.form == Form::Json {
@@ -182,7 +180,7 @@ pub(crate) fn merge_gff(args: &Args<'_>) -> Result<Output> {
     };
     let unchanged = taken == "ours" && args.output.is_none();
     if !unchanged {
-        std::fs::write(target, &bytes).with_context(|| target.display().to_string())?;
+        crate::write_bytes_whole(target, &bytes)?;
     }
     out.json["written"] = json!((!unchanged).then(|| target.display().to_string()));
     out.json["result"] = json!(taken);
@@ -196,6 +194,68 @@ pub(crate) fn merge_gff(args: &Args<'_>) -> Result<Output> {
                 Some(Prefer::Theirs) => "theirs",
                 _ => "ours",
             }
+        ),
+    });
+    Ok(out)
+}
+
+/// `mg merge-claims BASE OURS THEIRS`: two copies of a project's claims
+/// table merged by area ([`mg_module::claims::merge`]), git's merge driver
+/// as [`merge_gff`] is: written over OURS (or `output`) in OURS's
+/// encoding, a failure where an area was changed by both, each its own
+/// way, unless `prefer` takes a side; a merge that is OURS leaves the file
+/// as it was.
+pub(crate) fn merge_claims(args: &Args<'_>) -> Result<Output> {
+    use mg_module::claims::{Side, decode};
+    let prefer = parse_prefer(args.prefer, Side::Ours, Side::Theirs)?;
+    let bytes = |p: &Path| std::fs::read(p).with_context(|| p.display().to_string());
+    let (base, ours, theirs) = (bytes(args.base)?, bytes(args.ours)?, bytes(args.theirs)?);
+    let ((b, _), (o, utf8), (t, _)) = (decode(&base), decode(&ours), decode(&theirs));
+    let name = args.path.unwrap_or(args.ours).display().to_string();
+    let merged = mg_module::claims::merge(&b, &o, &t, prefer.unwrap_or(Side::Ours))
+        .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    let text = |v: &Option<String>| v.clone().unwrap_or_else(|| "(none)".into());
+    let mut out = Output::new(json!({
+        "file": name,
+        "conflicts": merged.conflicts.iter().map(|c| json!({
+            "area": c.area, "base": c.base, "ours": c.ours, "theirs": c.theirs,
+        })).collect::<Vec<_>>(),
+    }));
+    for c in &merged.conflicts {
+        out.line(format!(
+            "CONFLICT {}: {} -> ours {}, theirs {}",
+            c.area,
+            text(&c.base),
+            text(&c.ours),
+            text(&c.theirs)
+        ));
+    }
+    if crate::diff::mark_unsettled(&mut out, merged.conflicts.len(), prefer.is_some(), true, || {
+        format!(
+            "{name}: {} areas were changed by both, each its own way: nothing written (--prefer \
+             ours or theirs takes one side's)",
+            merged.conflicts.len()
+        )
+    }) {
+        return Ok(out);
+    }
+    let target = args.output.unwrap_or(args.ours);
+    let unchanged = merged.text == *o && args.output.is_none();
+    if !unchanged {
+        let data = if utf8 {
+            merged.text.into_bytes()
+        } else {
+            Codepage::WINDOWS_1252.encode_lossy(&merged.text)
+        };
+        crate::write_bytes_whole(target, &data)?;
+    }
+    out.json["written"] = json!((!unchanged).then(|| target.display().to_string()));
+    out.note(match merged.conflicts.len() {
+        0 if unchanged => format!("{name}: merged (ours already was the merge)"),
+        0 => format!("{name}: merged"),
+        n => format!(
+            "{name}: merged, {n} areas changed by both taken from {}",
+            if prefer == Some(Side::Theirs) { "theirs" } else { "ours" }
         ),
     });
     Ok(out)

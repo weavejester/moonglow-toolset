@@ -1,8 +1,8 @@
 //! Item Properties (`TdlgItemEdit`): General (name, costs, the base item's
 //! statistics), Appearance (by the base item's model type: one model,
-//! three weapon parts, or armor parts and colours), Properties (the item
+//! three weapon parts, or armor parts and colors), Properties (the item
 //! properties its base item offers, with their parameters: Aurora's
-//! `TdlgPropEdit` inline), Description, Comments.
+//! `TdlgPropEdit` inline), Variables, Visuals, Description, Comments.
 //!
 //! Every change also stores the item's recomputed `Cost` (in the same
 //! undoable command), as Aurora does on OK.
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use egui::Ui;
 use mg_core::ResType;
-use mg_edit::{Command, Edit};
+use mg_edit::{Command, Edit, lists};
 use mg_gff::{FieldType, Struct, Value};
 use mg_module::palette::BlueprintKind;
 use mg_rules::items::{ItemProperty, ItemValue, PropertyType, part_number, wide_label};
@@ -21,27 +21,16 @@ use super::Form;
 use crate::widgets::spin_number;
 use crate::{Action, Moonglow};
 
-pub(super) const PAGES: [&str; 6] =
-    ["General", "Appearance", "Properties", "Visuals", "Description", "Comments"];
-
-/// The width of the Appearance page's fields beside the model.
-const APPEARANCE_SIDE: f32 = 460.0;
+pub(super) const PAGES: [&str; 7] =
+    ["General", "Appearance", "Properties", "Variables", "Visuals", "Description", "Comments"];
 
 /// The width of a part's choice: a number, "Model 12", "7 (AC 5)".
 const PART_WIDTH: f32 = 110.0;
 
-/// The least height of the model shown beside the icon, in a window too
-/// narrow to have it beside the page's fields.
-const MODEL_SHORT: f32 = 220.0;
-
 pub(super) fn page(f: &mut Form<'_>, ui: &mut Ui, page: &str) {
     match page {
         "General" => general(f, ui),
-        "Appearance" => with_game(f, |f, game| {
-            let fields =
-                |f: &mut Form<'_>, ui: &mut Ui, beside: bool| appearance(f, ui, game, beside);
-            super::situated::beside_model(f, ui, APPEARANCE_SIDE, fields);
-        }),
+        "Appearance" => with_game(f, |f, game| appearance(f, ui, game)),
         "Properties" => with_game(f, |f, game| properties(f, ui, game)),
         "Visuals" => super::visuals::page(f, ui, true),
         "Description" => description(f, ui),
@@ -111,7 +100,7 @@ pub(super) fn statistics(game: &GameData, item: &Struct) -> Vec<(&'static str, S
     let row = item.integer("BaseItem").unwrap_or(0).max(0) as usize;
     let value = ItemValue::from_gff(item);
     let cost = game.item_cost(&value);
-    let mut out = vec![("Total Cost", cost.to_string())];
+    let mut out = vec![("Total cost", cost.to_string())];
     let armor = game.is_armor(value.base_item);
     let ac = armor.then(|| game.armor_class(value.torso));
     let armor_table = game.table("armor").ok();
@@ -140,7 +129,7 @@ pub(super) fn statistics(game: &GameData, item: &Struct) -> Vec<(&'static str, S
             _ => "",
         };
         if !kind.is_empty() {
-            out.push(("Damage Type", kind.to_string()));
+            out.push(("Damage type", kind.to_string()));
         }
     }
     if let Some(ac) = ac {
@@ -152,7 +141,7 @@ pub(super) fn statistics(game: &GameData, item: &Struct) -> Vec<(&'static str, S
             out.push(("Arcane Spell Failure", format!("{v}%")));
         }
         if let Some(v) = armor_cell("DEXBONUS") {
-            out.push(("Max Dex Bonus", if ac == 0 { "-".to_string() } else { v.to_string() }));
+            out.push(("Max dex bonus", if ac == 0 { "-".to_string() } else { v.to_string() }));
         }
     } else if let Some(ac) = t.get_int(row, "BaseAC").filter(|&ac| ac > 0) {
         out.push(("Armor Class", ac.to_string()));
@@ -165,10 +154,10 @@ pub(super) fn statistics(game: &GameData, item: &Struct) -> Vec<(&'static str, S
             .find(|&r| t.get_int(r, col).is_some_and(|max| i64::from(max) >= i64::from(cost)))
     };
     if let Some(r) = first_fit("itemvalue", "MAXSINGLEITEMVALUE") {
-        out.push(("Required Level", (r + 1).to_string()));
+        out.push(("Required level", (r + 1).to_string()));
     }
     if let Some(r) = first_fit("skillvsitemcost", "DeviceCostMax") {
-        out.push(("Required Lore", r.to_string()));
+        out.push(("Required lore", r.to_string()));
     }
     out
 }
@@ -190,69 +179,63 @@ fn general(f: &mut Form<'_>, ui: &mut Ui) {
             Some((name, t.get_int(row, "Stacking").unwrap_or(1).max(1)))
         })
         .unwrap_or_else(|| (format!("({})", f.int("BaseItem")), 1));
-    crate::widgets::two_columns(ui, 340.0, |ui, col| {
+    mg_uikit::form::FormColumns::new(f.id("uti-general")).show(ui, 2, |ui, col| {
         if col == 0 {
-            egui::Grid::new(("uti-general", f.key)).num_columns(2).spacing([12.0, 6.0]).show(
-                ui,
-                |ui| {
-                    crate::widgets::field_label(ui, "Item Name");
-                    f.locstring(ui, "Name", "LocalizedName");
-                    ui.end_row();
-                    crate::widgets::field_label(ui, "Tag");
-                    f.tag(ui, "Tag", "Tag");
-                    ui.end_row();
-                    crate::widgets::field_label(ui, "Blueprint ResRef");
-                    f.blueprint_resref(ui);
-                    ui.end_row();
-                    crate::widgets::field_label(ui, "Base Type Name");
-                    ui.label(&base_name);
-                    ui.end_row();
-                    f.model_warning(ui, mg_rules::ObjectKind::Item);
-                    crate::widgets::field_label(ui, "Category");
-                    f.category(ui, BlueprintKind::Item);
-                    ui.end_row();
-                    // Past the base item's stack size, as Aurora doesn't
-                    // allow: the game keeps the stack whole
-                    // (engine_ee_fields.rs).
-                    crate::widgets::field_label(ui, "Stack Size");
-                    ui.horizontal(|ui| {
-                        f.spin(ui, "Stack size", "StackSize", 1..=65_535);
-                        if f.int("StackSize") > i64::from(stacking) {
-                            ui.weak(format!("more than the base item's {stacking}"));
-                        }
-                    });
-                    ui.end_row();
-                    // The game reads at most 250 (engine_ee_fields.rs).
-                    crate::widgets::field_label(ui, "Charges");
-                    f.spin(ui, "Charges", "Charges", 0..=250);
-                    ui.end_row();
-                    crate::widgets::field_label(ui, "Additional Cost");
-                    f.spin(ui, "Additional cost", "AddCost", 0..=999_999_999);
-                    ui.end_row();
-                    crate::widgets::field_label(ui, "");
-                    ui.horizontal(|ui| {
-                        f.check(ui, "Plot Item", "Plot");
-                        f.check(ui, "Stolen", "Stolen");
-                    });
-                    ui.end_row();
-                    crate::widgets::field_label(ui, "");
-                    super::situated::preview_button(f, ui);
-                    ui.end_row();
-                },
-            );
-        } else {
-            egui::Grid::new(("uti-stats", f.key)).num_columns(2).spacing([12.0, 4.0]).show(
-                ui,
-                |ui| {
-                    for (label, value) in
-                        f.app.game.as_deref().map(|g| statistics(g, &f.root)).unwrap_or_default()
-                    {
-                        crate::widgets::field_label(ui, label);
-                        ui.strong(value);
-                        ui.end_row();
+            super::form_grid(ui, ("uti-general", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+                crate::widgets::field_label(ui, "Item name");
+                f.locstring(ui, "Name", "LocalizedName");
+                ui.end_row();
+                crate::widgets::field_label(ui, "Tag");
+                f.tag(ui, "Tag", "Tag");
+                ui.end_row();
+                crate::widgets::field_label(ui, "Blueprint ResRef");
+                f.blueprint_resref(ui);
+                ui.end_row();
+                crate::widgets::field_label(ui, "Base type name");
+                ui.label(&base_name);
+                ui.end_row();
+                f.model_warning(ui, mg_rules::ObjectKind::Item);
+                crate::widgets::field_label(ui, "Category");
+                f.category(ui, BlueprintKind::Item);
+                ui.end_row();
+                // Past the base item's stack size, as Aurora doesn't
+                // allow: the game keeps the stack whole
+                // (engine_ee_fields.rs).
+                crate::widgets::field_label(ui, "Stack size");
+                super::row(ui, |ui| {
+                    f.spin(ui, "Stack size", "StackSize", 1..=65_535);
+                    if f.int("StackSize") > i64::from(stacking) {
+                        ui.weak(format!("more than the base item's {stacking}"));
                     }
-                },
-            );
+                });
+                ui.end_row();
+                // The game reads at most 250 (engine_ee_fields.rs).
+                crate::widgets::field_label(ui, "Charges");
+                f.spin(ui, "Charges", "Charges", 0..=250);
+                ui.end_row();
+                crate::widgets::field_label(ui, "Additional cost");
+                f.spin(ui, "Additional cost", "AddCost", 0..=999_999_999);
+                ui.end_row();
+                crate::widgets::field_label(ui, "");
+                super::row(ui, |ui| {
+                    f.check(ui, "Plot item", "Plot");
+                    f.check(ui, "Stolen", "Stolen");
+                });
+                ui.end_row();
+                crate::widgets::field_label(ui, "");
+                super::situated::preview_button(f, ui);
+                ui.end_row();
+            });
+        } else {
+            super::form_grid(ui, ("uti-stats", f.key)).spacing([12.0, 4.0]).show(ui, |ui| {
+                for (label, value) in
+                    f.app.game.as_deref().map(|g| statistics(g, &f.root)).unwrap_or_default()
+                {
+                    crate::widgets::field_label(ui, label);
+                    ui.strong(value);
+                    ui.end_row();
+                }
+            });
         }
     });
 }
@@ -269,23 +252,39 @@ fn number_after(name: &str, prefix: &str) -> Option<u16> {
     rest.parse().ok()
 }
 
-/// The numbers `nnn` for which a model `{prefix}{nnn:03}` exists, cached:
-/// an item's parts, and a part-based creature's body parts (`pmh0_chest`).
-pub(super) fn model_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
+/// The numbers `nnn` for which a model `{prefix}{nnn:03}` exists, kept
+/// for the load order `load_order` ([`crate::Moonglow::load_order`]: a
+/// part added to a hak or the override is listed once the resources are
+/// read again): an item's parts, and a part-based creature's body parts
+/// (`pmh0_chest`).
+pub(super) fn model_numbers(
+    ui: &Ui,
+    game: &GameData,
+    load_order: u64,
+    prefix: &str,
+) -> Arc<Vec<u16>> {
     let id = egui::Id::new(("model-numbers", prefix));
-    if let Some(v) = ui.data(|d| d.get_temp::<Arc<Vec<u16>>>(id)) {
-        return v;
-    }
-    let mut v: Vec<u16> = game
-        .resman
-        .list(ResType::MDL)
-        .iter()
-        .filter_map(|r| number_after(&r.to_string(), prefix))
+    super::kept_for_load_order(ui, load_order, id, || {
+        Arc::new(numbered(game, &[ResType::MDL], prefix))
+    })
+}
+
+/// The numbers `nnn` for which the game data has a resource
+/// `{prefix}{nnn:03}` of one of `types`, in order, each once.
+///
+/// (The layers' names looked through once, for all of `types`, those of
+/// another start passed over unread: listed whole, type by type, the
+/// install's and a world's haks' 135,000 textures took 45 ms.)
+fn numbered(game: &GameData, types: &[ResType], prefix: &str) -> Vec<u16> {
+    let start = prefix.as_bytes();
+    let mut v: Vec<u16> = (game.resman.layers().iter())
+        .flat_map(|l| l.container.keys())
+        .filter(|k| types.contains(&k.restype))
+        .filter(|k| k.resref.as_bytes().starts_with(start))
+        .filter_map(|k| number_after(&k.resref.to_string(), prefix))
         .collect();
     v.sort_unstable();
     v.dedup();
-    let v = Arc::new(v);
-    ui.data_mut(|d| d.insert_temp(id, v.clone()));
     v
 }
 
@@ -293,9 +292,9 @@ pub(super) fn model_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u
 /// for, and those it has an icon for (a potion has one model whatever its
 /// parts, and its icons alone tell them apart: with models only, its
 /// lists were empty).
-fn part_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
-    let models = model_numbers(ui, game, prefix);
-    let icons = icon_numbers(ui, game, prefix);
+fn part_numbers(ui: &Ui, game: &GameData, load_order: u64, prefix: &str) -> Arc<Vec<u16>> {
+    let models = model_numbers(ui, game, load_order, prefix);
+    let icons = icon_numbers(ui, game, load_order, prefix);
     if icons.is_empty() {
         return models;
     }
@@ -306,24 +305,15 @@ fn part_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
 }
 
 /// The numbers `nnn` for which an inventory icon `i{prefix}{nnn:03}` exists
-/// (TGA, DDS or PLT), cached: what Aurora offers simple and layered items
-/// ("the icon determines availability", nwn.wiki's baseitems.2da).
-fn icon_numbers(ui: &Ui, game: &GameData, prefix: &str) -> Arc<Vec<u16>> {
+/// (TGA, DDS or PLT), kept as [`model_numbers`] are: what Aurora offers
+/// simple and layered items ("the icon determines availability",
+/// nwn.wiki's baseitems.2da).
+fn icon_numbers(ui: &Ui, game: &GameData, load_order: u64, prefix: &str) -> Arc<Vec<u16>> {
     let id = egui::Id::new(("icon-numbers", prefix));
-    if let Some(v) = ui.data(|d| d.get_temp::<Arc<Vec<u16>>>(id)) {
-        return v;
-    }
-    let icon = format!("i{prefix}");
-    let mut v: Vec<u16> = [ResType::TGA, ResType::DDS, ResType::PLT]
-        .into_iter()
-        .flat_map(|t| game.resman.list(t))
-        .filter_map(|r| number_after(&r.to_string(), &icon))
-        .collect();
-    v.sort_unstable();
-    v.dedup();
-    let v = Arc::new(v);
-    ui.data_mut(|d| d.insert_temp(id, v.clone()));
-    v
+    super::kept_for_load_order(ui, load_order, id, || {
+        let types = [ResType::TGA, ResType::DDS, ResType::PLT];
+        Arc::new(numbered(game, &types, &format!("i{prefix}")))
+    })
 }
 
 /// Sets a model or body part number: the BYTE field and its EE twin (an
@@ -339,17 +329,23 @@ pub(super) fn set_part(f: &mut Form<'_>, what: &str, labels: &[&str], v: i64) {
     f.set_many(what, &fields);
 }
 
-/// A part number chosen among `numbers` (shown as `text(n)`).
+/// A part number chosen among `numbers` (shown as `text(n)`), the
+/// choices made once for them (a base item's thousand icons were each
+/// given a name every frame).
 fn part_choice(
     f: &mut Form<'_>,
     ui: &mut Ui,
     what: &str,
     labels: &[&str],
-    numbers: &[u16],
+    numbers: &Arc<Vec<u16>>,
     text: impl Fn(u16) -> String,
 ) {
-    let choices: Vec<Choice> =
-        numbers.iter().map(|&n| Choice { row: n as usize, text: text(n) }).collect();
+    let id = egui::Id::new(("uti-part-choices", f.key, labels[0]));
+    let choices = super::kept_for(ui.ctx(), id, numbers, &(), || {
+        Arc::new(
+            numbers.iter().map(|&n| Choice { row: n as usize, text: text(n) }).collect::<Vec<_>>(),
+        )
+    });
     pick_part(f, ui, what, labels, &choices);
 }
 
@@ -378,7 +374,7 @@ fn pictured(
     wheel: bool,
 ) -> Option<i64> {
     let female = on_woman(f);
-    let key = f.key;
+    let picks = f.picks();
     let (app, root) = (&mut *f.app, &f.root);
     // (An armor's part: that part alone too.)
     let pieces = (ARMOR_PARTS.iter().chain(&LOWER_PARTS))
@@ -389,7 +385,7 @@ fn pictured(
         let item = labels.iter().fold(root.clone(), |item, label| with_model(&item, label, n));
         super::item_part_picture(app, ui, &item, female, pieces);
     };
-    let list = super::situated::pick_list(key, name, choices, current, PART_WIDTH).ordered();
+    let list = super::situated::pick_list(picks, name, choices, current, PART_WIDTH).ordered();
     let list = if wheel { list.wheel() } else { list };
     list.about(&mut shown).show(ui)
 }
@@ -404,14 +400,14 @@ const ARMOR_PARTS: [(&str, &[&str], &str); 13] = [
     ("Torso", &["ArmorPart_Torso"], "parts_chest"),
     ("Belt", &["ArmorPart_Belt"], "parts_belt"),
     ("Pelvis", &["ArmorPart_Pelvis"], "parts_pelvis"),
-    ("Right Shoulder", &["ArmorPart_RShoul"], "parts_shoulder"),
-    ("Left Shoulder", &["ArmorPart_LShoul"], "parts_shoulder"),
-    ("Right Bicep", &["ArmorPart_RBicep"], "parts_bicep"),
-    ("Left Bicep", &["ArmorPart_LBicep"], "parts_bicep"),
-    ("Right Forearm", &["ArmorPart_RFArm"], "parts_forearm"),
-    ("Left Forearm", &["ArmorPart_LFArm"], "parts_forearm"),
-    ("Right Hand", &["ArmorPart_RHand"], "parts_hand"),
-    ("Left Hand", &["ArmorPart_LHand"], "parts_hand"),
+    ("Right shoulder", &["ArmorPart_RShoul"], "parts_shoulder"),
+    ("Left shoulder", &["ArmorPart_LShoul"], "parts_shoulder"),
+    ("Right bicep", &["ArmorPart_RBicep"], "parts_bicep"),
+    ("Left bicep", &["ArmorPart_LBicep"], "parts_bicep"),
+    ("Right forearm", &["ArmorPart_RFArm"], "parts_forearm"),
+    ("Left forearm", &["ArmorPart_LFArm"], "parts_forearm"),
+    ("Right hand", &["ArmorPart_RHand"], "parts_hand"),
+    ("Left hand", &["ArmorPart_LHand"], "parts_hand"),
     ("Thighs", &["ArmorPart_LThigh", "ArmorPart_RThigh"], "parts_legs"),
 ];
 
@@ -420,6 +416,25 @@ const LOWER_PARTS: [(&str, &[&str], &str); 3] = [
     ("Shins", &["ArmorPart_LShin", "ArmorPart_RShin"], "parts_shin"),
     ("Feet", &["ArmorPart_LFoot", "ArmorPart_RFoot"], "parts_foot"),
     ("Robe", &["ArmorPart_Robe"], "parts_robe"),
+];
+
+const ARMOR_TITLES: [&str; 16] = [
+    "Neck",
+    "Torso",
+    "Belt",
+    "Pelvis",
+    "Right Shoulder",
+    "Left Shoulder",
+    "Right Bicep",
+    "Left Bicep",
+    "Right Forearm",
+    "Left Forearm",
+    "Right Hand",
+    "Left Hand",
+    "Thighs",
+    "Shins",
+    "Feet",
+    "Robe",
 ];
 
 fn colors(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
@@ -445,10 +460,10 @@ fn part_colors(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
     let own = |f: &Form<'_>, part: usize| {
         ArmorChannel::ALL.iter().any(|&c| armor_part_color(&f.root, part, c).is_some())
     };
-    let id = egui::Id::new(("uti-part-colors", f.key));
+    let id = f.id("uti-part-colors");
     let mut part: usize = ui.data(|d| d.get_temp(id)).unwrap_or(7);
-    ui.horizontal(|ui| {
-        crate::widgets::field_label(ui, "Part Colors");
+    super::row(ui, |ui| {
+        crate::widgets::field_label(ui, "Part colors");
         // (A part with colors of its own is marked.)
         let name = |f: &Form<'_>, p: usize| {
             if own(f, p) { format!("{} *", PARTS[p].1) } else { PARTS[p].1.to_string() }
@@ -462,56 +477,61 @@ fn part_colors(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
         );
     })
     .response
-    .on_hover_text("A part takes the armor's color where it has none of its own (*: it has).");
+    .on_hover_text("Parts without a color of their own take the armor's (*: has its own)");
     ui.data_mut(|d| d.insert_temp(id, part));
-    egui::Grid::new(("uti-part-colors", f.key)).num_columns(2).spacing([12.0, 6.0]).show(
-        ui,
-        |ui| {
-            for channel in ArmorChannel::ALL {
-                let palette = channel.palette();
-                let what = format!("{} {}", PARTS[part].1, channel.name());
-                let label = armor_part_color_label(part, channel);
-                let color = armor_part_color(&f.root, part, channel);
-                ui.label(channel.name());
-                ui.horizontal(|ui| {
-                    f.mark_mixed(ui, &label);
-                    // Without one of its own: the armor's, as it shows.
-                    let shown = color.unwrap_or(f.int(channel.field()).clamp(0, 175) as u8);
-                    let text = color.is_none().then_some("Default");
-                    if let Some(v) = f.palette_pick(ui, game, &what, &label, palette, shown, text)
-                        && Some(v) != color
-                    {
-                        f.set(&what, &label, Value::Byte(v));
-                    }
-                    let reset = ui
-                        .add_enabled(color.is_some(), egui::Button::new("Reset").small())
-                        .on_hover_text("Use the armor's color");
-                    reset.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Button,
-                            true,
-                            format!("Reset {what}"),
-                        )
-                    });
-                    if reset.clicked() {
-                        f.set_opt(&what, &label, None);
-                    }
+    super::form_grid(ui, ("uti-part-colors", f.key)).spacing([12.0, 6.0]).show(ui, |ui| {
+        for channel in ArmorChannel::ALL {
+            let palette = channel.palette();
+            let what = format!("{} {}", PARTS[part].1, channel.name());
+            let label = armor_part_color_label(part, channel);
+            let color = armor_part_color(&f.root, part, channel);
+            ui.label(channel.name());
+            super::row(ui, |ui| {
+                f.mark_mixed(ui, &label);
+                // Without one of its own: the armor's, as it shows.
+                let shown = color.unwrap_or(f.int(channel.field()).clamp(0, 175) as u8);
+                let text = color.is_none().then_some("Default");
+                if let Some(v) = f.palette_pick(ui, game, &what, &label, palette, shown, text)
+                    && Some(v) != color
+                {
+                    f.set(&what, &label, Value::Byte(v));
+                }
+                let reset = ui
+                    .add_enabled(color.is_some(), egui::Button::new("Reset").small())
+                    .on_hover_text("Use the armor's color");
+                reset.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        format!("Reset {what}"),
+                    )
                 });
-                ui.end_row();
-            }
-        },
-    );
+                if reset.clicked() {
+                    f.set_opt(&what, &label, None);
+                }
+            });
+            ui.end_row();
+        }
+    });
 }
 
 /// The item with another model number (and its EE twin, where it has one
 /// or the number needs one).
 fn with_model(item: &Struct, label: &str, n: u16) -> Struct {
     let mut s = item.clone();
-    s.set(label, Value::Byte(n.min(255) as u8));
-    if n > 255 || s.get(&wide_label(label)).is_some() {
-        s.set(&wide_label(label), Value::Word(n));
-    }
+    let keep_wide = s.get(&wide_label(label)).is_some();
+    set_model_in_place(&mut s, label, n, keep_wide);
     s
+}
+
+fn set_model_in_place(s: &mut Struct, label: &str, n: u16, keep_wide: bool) {
+    s.set(label, Value::Byte(n.min(255) as u8));
+    let wide = wide_label(label);
+    if n > 255 || keep_wide {
+        s.set(&wide, Value::Word(n));
+    } else {
+        s.remove(&wide);
+    }
 }
 
 /// An item's icon layers (the game lent to the page).
@@ -546,9 +566,78 @@ fn part_icon(
 }
 
 /// Aurora's icon grid: the icon of each model number, a click chooses it.
+/// Every icon stands in a cell of the largest one's size drawn yet (the
+/// owner's ruling of 26 November), at most `ICON_GRID_TALL` of whole lines
+/// in sight: a line out of sight is skipped whole, nothing of it made (a
+/// base item with a thousand icons had them all read and drawn at once,
+/// then each given its room one by one every frame).
 fn icon_grid(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, numbers: &[u16]) {
-    part_grid(f, ui, game, numbers, ("Appearance", "ModelPart1"), None, 220.0);
+    let label = "ModelPart1";
+    let current = part_number(&f.root, label).unwrap_or(0);
+    f.mark_mixed_inline(ui, &[label]);
+    let id = egui::Id::new(("uti-icons", f.key, label));
+    // (The cell kept for these numbers: another base item's icons start
+    // anew.)
+    let numbers_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        numbers.hash(&mut h);
+        h.finish()
+    };
+    let cell_id = id.with("cell");
+    let kept = ui.data(|d| d.get_temp::<(u64, egui::Vec2)>(cell_id));
+    let cell = kept.filter(|(k, _)| *k == numbers_key).map_or(ICON_CELL_FIRST, |(_, c)| c);
+    let gap = ui.spacing().item_spacing;
+    let step = cell + gap;
+    let lines_tall = ((ICON_GRID_TALL + gap.y) / step.y).floor().max(1.0);
+    let mut largest = cell;
+    let mut chosen = None;
+    let scroll = egui::ScrollArea::vertical().max_height(lines_tall * step.y - gap.y).id_salt(id);
+    scroll.show(ui, |ui| {
+        let per = (((ui.available_width() + gap.x) / step.x).floor() as usize).max(1);
+        let lines = numbers.len().div_ceil(per);
+        let size = egui::vec2(ui.available_width(), (lines as f32 * step.y - gap.y).max(0.0));
+        let (grid, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let clip = ui.clip_rect();
+        let first = ((clip.top() - grid.top()) / step.y).floor().max(0.0) as usize;
+        let last = (((clip.bottom() - grid.top()) / step.y).ceil().max(0.0) as usize).min(lines);
+        for (i, &n) in numbers.iter().enumerate().take(last * per).skip(first * per) {
+            let (line, column) = (i / per, i % per);
+            let at = grid.min + egui::vec2(column as f32 * step.x, line as f32 * step.y);
+            let rect = egui::Rect::from_min_size(at, cell);
+            let layout = egui::Layout::centered_and_justified(egui::Direction::TopDown);
+            let mut ui =
+                ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout).id_salt(n));
+            let item = with_model(&f.root, label, n);
+            let alt = format!("Appearance {n}");
+            let layers = icon(f, &ui, game, &item);
+            let r = crate::images::stacked_drawn(&mut ui, &layers, (1.0, CHOICE_TALLEST), &alt)
+                .on_hover_text(alt);
+            largest = largest.max(r.rect.size());
+            if i64::from(n) == current {
+                let stroke = egui::Stroke::new(1.0, mg_uikit::tokens(ui.ctx()).accent);
+                ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+            }
+            if r.clicked() {
+                chosen = Some(n);
+            }
+        }
+    });
+    if kept != Some((numbers_key, largest)) {
+        ui.data_mut(|d| d.insert_temp(cell_id, (numbers_key, largest)));
+        ui.ctx().request_repaint();
+    }
+    if let Some(n) = chosen.filter(|&n| i64::from(n) != current) {
+        set_part(f, "Appearance", &[label], i64::from(n));
+    }
 }
+
+/// The most room a whole item's icon grid takes, in whole lines of its
+/// cells.
+const ICON_GRID_TALL: f32 = 220.0;
+
+/// A whole item's icon cell before any icon is drawn: one inventory slot.
+const ICON_CELL_FIRST: egui::Vec2 = egui::vec2(32.0, 32.0);
 
 /// The largest a composite item's part is drawn among its choices: a
 /// great sword's blade is 190 points in its icon, and three lists of those
@@ -561,18 +650,17 @@ const PART_TALLEST: f32 = 96.0;
 const ICON_TALLEST: f32 = 300.0;
 const CHOICE_TALLEST: f32 = 128.0;
 
-/// The item's icon with each of `numbers` as its part `label` (named
-/// `what`), in a grid at most `height` tall: a click chooses the part.
-/// For a composite item's part (`letter` in its icons' names), that part
-/// alone and no more room than it fills: the icon is the whole item's
-/// size, most of it empty.
+/// A composite item's part `label` (named `what`, `letter` in its icons'
+/// names) as each of `numbers`, in a grid at most `height` tall: that part
+/// alone and no more room than it fills (the icon is the whole item's
+/// size, most of it empty). A click chooses the part.
 fn part_grid(
     f: &mut Form<'_>,
     ui: &mut Ui,
     game: &GameData,
     numbers: &[u16],
     (what, label): (&str, &str),
-    letter: Option<&str>,
+    letter: &str,
     height: f32,
 ) {
     let current = part_number(&f.root, label).unwrap_or(0);
@@ -591,16 +679,35 @@ fn part_grid(
         None => height,
     };
     let mut tallest: f32 = 0.0;
+    // (A choice out of sight takes its room, and nothing of it is made:
+    // the item was copied for each every frame. A part alone is as large
+    // as it was when last drawn.)
+    let sizes_id = egui::Id::new(id).with("sizes");
+    type Sizes = std::collections::HashMap<u16, egui::Vec2>;
+    let mut sizes: Sizes = ui.data(|d| d.get_temp(sizes_id)).unwrap_or_default();
+    let mut learned = false;
     egui::ScrollArea::vertical().max_height(height).id_salt(id).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             for &n in numbers {
+                if let Some(size) = sizes.get(&n).copied() {
+                    // (In this line of them or, this one full, the next.)
+                    let top = ui.cursor().min.y;
+                    let lines = egui::Rect::from_x_y_ranges(
+                        ui.max_rect().x_range(),
+                        top..=top + tallest.max(size.y) + gap + size.y,
+                    );
+                    if !ui.is_rect_visible(lines) {
+                        ui.allocate_exact_size(size, egui::Sense::click());
+                        tallest = tallest.max(size.y);
+                        continue;
+                    }
+                }
                 let item = with_model(&f.root, label, n);
                 let alt = format!("{what} {n}");
-                let alone = letter.and_then(|l| part_icon(f, ui, game, &item, (label, l)));
-                let r = match alone {
+                let r = match part_icon(f, ui, game, &item, (label, letter)) {
                     Some(p) => crate::images::cropped(ui, &p, PART_TALLEST, &alt),
                     // A part with a model and no icon: its number.
-                    None if letter.is_some() => {
+                    None => {
                         let text = egui::RichText::new(n.to_string()).weak();
                         let r = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
                         r.widget_info(|| {
@@ -608,15 +715,14 @@ fn part_grid(
                         });
                         r
                     }
-                    None => {
-                        let layers = icon(f, ui, game, &item);
-                        crate::images::stacked_drawn(ui, &layers, (1.0, CHOICE_TALLEST), &alt)
-                    }
                 }
                 .on_hover_text(alt);
                 tallest = tallest.max(r.rect.height());
+                if sizes.insert(n, r.rect.size()) != Some(r.rect.size()) {
+                    learned = true;
+                }
                 if i64::from(n) == current {
-                    let stroke = ui.visuals().selection.stroke;
+                    let stroke = egui::Stroke::new(1.0, mg_uikit::tokens(ui.ctx()).accent);
                     // (Within the icon's own room: outside it, the grid's
                     // edge cut the top of the first row's off.)
                     ui.painter().rect_stroke(r.rect, 2.0, stroke, egui::StrokeKind::Inside);
@@ -627,6 +733,9 @@ fn part_grid(
             }
         });
     });
+    if learned {
+        ui.data_mut(|d| d.insert_temp(sizes_id, sizes));
+    }
     if ui.data(|d| d.get_temp::<f32>(row_id)) != Some(tallest) {
         ui.data_mut(|d| d.insert_temp(row_id, tallest));
         ui.ctx().request_repaint();
@@ -663,17 +772,26 @@ const PART_PIECES: [&[&str]; 16] = [
 /// an armor class, a torso's with it said, and 0 as well, which most of
 /// the game's tables leave out: no part, so the wearer's own shows there,
 /// as in the game (a builder's report).
-fn armor_part_choices(game: &GameData, table: &str) -> Vec<Choice> {
-    let t = game.table(table).ok();
-    let numbers: Vec<u16> = t.as_ref().map_or_else(Vec::new, |t| {
-        (0..t.len()).filter(|&r| t.get(r, "ACBONUS").is_some()).map(|r| r as u16).collect()
-    });
-    let ac_of = |n: u16| t.as_ref().and_then(|t| t.get_float(n as usize, "ACBONUS")).unwrap_or(0.0);
-    if table == "parts_chest" {
-        super::situated::part_choices(&numbers, |n| format!("{n} (AC {})", ac_of(n).round()))
-    } else {
-        super::situated::part_choices(&numbers, |n| n.to_string())
-    }
+fn armor_part_choices(
+    ctx: &egui::Context,
+    load_order: u64,
+    game: &GameData,
+    table: &'static str,
+) -> Arc<Vec<Choice>> {
+    super::kept_for_key(ctx, egui::Id::new(("armor-part-choices", table)), &load_order, || {
+        let t = game.table(table).ok();
+        let numbers: Vec<u16> = t.as_ref().map_or_else(Vec::new, |t| {
+            (0..t.len()).filter(|&r| t.get(r, "ACBONUS").is_some()).map(|r| r as u16).collect()
+        });
+        let ac_of =
+            |n: u16| t.as_ref().and_then(|t| t.get_float(n as usize, "ACBONUS")).unwrap_or(0.0);
+        let built = if table == "parts_chest" {
+            super::situated::part_choices(&numbers, |n| format!("{n} (AC {})", ac_of(n).round()))
+        } else {
+            super::situated::part_choices(&numbers, |n| n.to_string())
+        };
+        Arc::new(built)
+    })
 }
 
 /// The pictures of an armor's part, each of its models alone (as the body
@@ -682,108 +800,161 @@ fn armor_part_choices(game: &GameData, table: &str) -> Vec<Choice> {
 /// made.
 fn armor_part_gallery(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
     const SIDE: f32 = 96.0;
-    const GAP: f32 = 4.0;
-    let id = egui::Id::new(("uti-part-gallery", f.key));
+    let id = f.id("uti-part-gallery");
     let all: Vec<&(&str, &[&str], &str)> = ARMOR_PARTS.iter().chain(&LOWER_PARTS).collect();
     let mut at: usize = ui.data(|d| d.get_temp(id)).unwrap_or(1).min(all.len() - 1);
+    // (The Pickers board's flat toggles, the one shown in the accent fill.)
     ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 3.0);
         crate::widgets::field_label(ui, "Pictures of");
-        for (i, (text, ..)) in all.iter().enumerate() {
-            if ui.selectable_label(at == i, *text).clicked() {
+        for (i, title) in ARMOR_TITLES.iter().enumerate() {
+            // (On, the kit's toggle in the accent fill; off, flat, still
+            // said as a toggle that is off.)
+            let look = match at == i {
+                true => mg_uikit::ButtonLook::Toggle,
+                false => mg_uikit::ButtonLook::Flat,
+            };
+            let r = ui.add(mg_uikit::KitButton::new(None, *title).toggle(at == i).look(look));
+            let on = at == i;
+            r.widget_info(move || {
+                egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, *title)
+            });
+            if r.clicked() {
                 at = i;
             }
         }
     });
     ui.data_mut(|d| d.insert_temp(id, at));
     let &(text, labels, table) = all[at];
-    let choices = armor_part_choices(game, table);
+    let choices = armor_part_choices(ui.ctx(), f.app.load_order, game, table);
     let current = part_number(&f.root, labels[0]).unwrap_or(0);
     let (female, pieces) = (on_woman(f), PART_PIECES[at]);
-    let room = ui.available_width() - ui.spacing().scroll.bar_width - 10.0;
-    let (per_row, side) = crate::appearance_gallery::fitted(room, SIDE, GAP);
-    let tall = side + crate::widgets::tile_label_height(ui);
+    // (Its number as the name, a torso's armor class the detail under it:
+    // the board's "23" over "AC 8".)
+    let detailed = table == "parts_chest";
+    let label = mg_uikit::gallery::label_height(false, 1, detailed);
+    let tall = SIDE + label;
     let (mut keys, mut chosen) = (Vec::new(), None);
-    let rows = choices.len().div_ceil(per_row);
-    let mut area = egui::ScrollArea::vertical()
-        .id_salt(id.with(at))
-        .max_height(2.0 * tall + 3.0 * ui.spacing().item_spacing.y)
-        .auto_shrink([false, true]);
-    // Opened at the part the armor has (once for each part, once it is in
-    // sight: scrolled out of it, the offset was not kept).
-    let placed = id.with(("placed", at));
     let in_sight =
         ui.is_rect_visible(ui.available_rect_before_wrap().with_max_y(ui.cursor().top() + tall));
-    if in_sight && !ui.data(|d| d.get_temp::<bool>(placed).unwrap_or(false)) {
-        ui.data_mut(|d| d.insert_temp(placed, true));
-        if let Some(i) = choices.iter().position(|c| c.row as i64 == current) {
-            let height = tall + ui.spacing().item_spacing.y;
-            area = area.vertical_scroll_offset((i / per_row) as f32 * height);
+    let here = choices.iter().position(|c| c.row as i64 == current);
+    let keys_allowed = !crate::shell::keys_blocked(ui.ctx());
+    let grid = mg_uikit::gallery::GalleryGrid::new(id.with(("pictures", at)), choices.len(), SIDE)
+        .label(label)
+        .cursor(here)
+        .keys_allowed(keys_allowed)
+        .name(format!("Pictures of {text}"));
+    // (Two rows high, from the grid's own layout in the room it gets: the
+    // cells grow with the page, and a height from SIDE cut the second
+    // row's "AC N" on a wide one. Two rows wherever it is on the page:
+    // low on a long page, the room left in the page's view was all egui
+    // gave it, 64 high.)
+    // (The room the grid gets in the scroll: its width in sight, as
+    // `GalleryGrid::show` takes it. Its bar decided by the count, not by
+    // egui's state: a bar shown only where needed took the room that made
+    // the cells smaller, two rows then fitted, the bar went, the cells grew
+    // past the height, and it came back each frame. All in two rows at the
+    // whole room: no bar; else the bar's room taken off, still more than
+    // two rows with fewer columns.)
+    let seen = ui.clip_rect().right() - ui.cursor().left();
+    let whole = ui.available_width().min(seen).max(1.0);
+    let full = grid.layout(whole);
+    let fits = choices.len() <= 2 * full.columns;
+    let layout = match fits {
+        true => full,
+        false => grid.layout((whole - ui.spacing().scroll.allocated_width()).max(1.0)),
+    };
+    let high = 2.0 * layout.cell.y + layout.gap.y;
+    // Opened at the part the armor has (once for each part, once it is in
+    // sight: scrolled out of it, the offset was not kept; and again where
+    // the page's width changes its columns, the offset being another row).
+    let placed = id.with(("placed", at, layout.columns));
+    let bar = match fits {
+        true => egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+        false => egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+    };
+    let area = egui::ScrollArea::vertical()
+        .id_salt(id.with(at))
+        .scroll_bar_visibility(bar)
+        .max_height(high)
+        .min_scrolled_height(high)
+        .auto_shrink([false, true]);
+    let mut slim = mg_preview::ItemLook::from_uti(&f.root).to_uti(0);
+    let had_wide: [bool; 2] = [
+        labels.first().is_some_and(|l| slim.get(&wide_label(l)).is_some()),
+        labels.get(1).is_some_and(|l| slim.get(&wide_label(l)).is_some()),
+    ];
+    let shown = area.show(ui, |ui| {
+        let mut key_of = |f: &mut Form<'_>, n: u16| {
+            for (j, l) in labels.iter().enumerate() {
+                set_model_in_place(&mut slim, l, n, had_wide[j]);
+            }
+            f.app.thumbnails.item_part(&slim, female, Some(pieces))
+        };
+        let out = grid.show(ui, |ui, i, rect, tile, r, cell| {
+            let c = &choices[i];
+            let n = c.row as u16;
+            let key = key_of(f, n);
+            let made = f.app.thumbnails.made(key);
+            let number = n.to_string();
+            let detail = (c.text.split_once(" (").map(|(_, d)| d.trim_end_matches(')')))
+                .filter(|_| detailed);
+            mg_uikit::gallery::GalleryCell::new(&number, crate::widgets::cell_picture(made))
+                .said(&c.text)
+                .detail(detail)
+                .lines(1)
+                .kind(mg_uikit::Icon::Item)
+                .selected(i64::from(n) == current)
+                .paint(ui, rect, tile, cell, r);
+            if r.clone().on_hover_text(format!("{text} {}", c.text)).clicked() {
+                chosen = Some(n);
+            }
+        });
+        // (Enter or Space on the keys' picture: its click.)
+        if let Some(i) = out.activated {
+            chosen = Some(choices[i].row as u16);
         }
-    }
-    area.show_rows(ui, tall, rows, |ui, lines| {
-        ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
-        for line in lines {
-            ui.horizontal(|ui| {
-                for c in choices.iter().skip(line * per_row).take(per_row) {
-                    let n = c.row as u16;
-                    let item = labels.iter().fold(f.root.clone(), |i, l| with_model(&i, l, n));
-                    let key = f.app.thumbnails.item_part(&item, female, Some(pieces));
-                    let made = f.app.thumbnails.made(key);
-                    let here = i64::from(n) == current;
-                    let (r, seen) = crate::widgets::picture_tile(ui, side, &c.text, here, made);
-                    if seen {
-                        keys.push(key);
-                    }
-                    if r.on_hover_text(format!("{text} {}", c.text)).clicked() {
-                        chosen = Some(n);
-                    }
-                }
-            });
-        }
+        keys.extend(out.ahead.clone().map(|i| key_of(f, choices[i].row as u16)));
+        out
     });
+    if in_sight && !ui.data(|d| d.get_temp::<bool>(placed).unwrap_or(false)) {
+        let done = match here {
+            Some(at) => crate::widgets::open_gallery_at(ui.ctx(), &shown, &shown.inner, at),
+            None => true,
+        };
+        ui.data_mut(|d| d.insert_temp(placed, done));
+    }
     f.app.thumbnails.show(keys);
     if let Some(n) = chosen.filter(|&n| i64::from(n) != current) {
         set_part(f, text, labels, i64::from(n));
     }
 }
 
-fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
+fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
     let Ok(t) = game.table("baseitems") else { return };
     let row = base_row(f);
     let class = t.get(row, "ItemClass").unwrap_or_default().to_ascii_lowercase();
-    // The item's inventory icon, as it is now.
+    // The item's inventory icon, as it is now. (Its model is the Preview
+    // panel's, M4's U11.)
     let root = f.root.clone();
     let layers = icon(f, ui, game, &root);
-    if beside {
-        crate::images::stacked_drawn(ui, &layers, (1.5, ICON_TALLEST), "Icon");
-    } else {
-        // (The page's visible width: see `situated::beside_model`.)
-        let seen = ui.available_width().min(ui.clip_rect().right() - ui.cursor().left());
-        ui.horizontal_top(|ui| {
-            let icon = crate::images::stacked_drawn(ui, &layers, (1.5, ICON_TALLEST), "Icon").rect;
-            let gap = ui.spacing().item_spacing.x;
-            let size = egui::vec2(seen - icon.width() - 2.0 * gap, icon.height().max(MODEL_SHORT));
-            ui.vertical(|ui| super::situated::inline_preview(f, ui, size));
-        });
-    }
+    crate::images::stacked_drawn(ui, &layers, (1.5, ICON_TALLEST), "Icon");
     // Who wears it in the model and the icon shown: armor, cloaks and the
     // items the game has an icon of for each have a man's and a woman's.
     // (Options › General has the choice too, kept: inventories and the
     // palette show the icons and models so.)
     let kind = t.get_int(row, "ModelType").unwrap_or(0);
     if worn_by_either(game, row) {
-        ui.horizontal(|ui| {
+        super::row(ui, |ui| {
             crate::widgets::field_label(ui, "Shown on");
             let on = &mut f.app.settings.armor_on_woman;
             ui.selectable_value(on, false, "Male");
             ui.selectable_value(on, true, "Female");
         })
         .response
-        .on_hover_text(
-            "The body the item's model is shown on, and whose inventory icon is shown, here, \
-             in inventories and in the palette (Options › General); the item is the same",
-        );
+        .on_hover_text("The body the item is shown on, here, in inventories and in the palette");
     }
+    let load_order = f.app.load_order;
     match kind {
         // Composite: bottom, middle, top, each a shape and a colour (the
         // number's tens and units).
@@ -792,7 +963,8 @@ fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
                 ui,
                 |ui| {
                     for (text, label, part) in COMPOSITE_PARTS {
-                        let numbers = part_numbers(ui, game, &format!("{class}_{part}_"));
+                        let numbers =
+                            part_numbers(ui, game, load_order, &format!("{class}_{part}_"));
                         let current = part_number(&f.root, label).unwrap_or(0);
                         let (shape, color) = (current / 10, current % 10);
                         let mut shapes: Vec<u16> = numbers.iter().map(|n| n / 10).collect();
@@ -843,13 +1015,13 @@ fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
             // Each part's shapes and colors as pictures: the item as it
             // would be with each, a click chooses it.
             for (text, label, part) in COMPOSITE_PARTS {
-                let numbers = part_numbers(ui, game, &format!("{class}_{part}_"));
+                let numbers = part_numbers(ui, game, load_order, &format!("{class}_{part}_"));
                 if numbers.len() < 2 {
                     continue;
                 }
                 ui.separator();
                 crate::widgets::field_label(ui, text);
-                part_grid(f, ui, game, &numbers, (text, label), Some(part), 150.0);
+                part_grid(f, ui, game, &numbers, (text, label), part, 150.0);
             }
         }
         // Armor: a part per body part (parts_*.2da), the robe and colours.
@@ -857,17 +1029,18 @@ fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
             ui.columns(2, |cols| {
                 for (col, parts) in [(0, &ARMOR_PARTS[..]), (1, &LOWER_PARTS[..])] {
                     let ui = &mut cols[col];
-                    egui::Grid::new(("uti-armor", f.key, col))
-                        .num_columns(2)
-                        .spacing([12.0, 4.0])
-                        .show(ui, |ui| {
+                    super::form_grid(ui, ("uti-armor", f.key, col)).spacing([12.0, 4.0]).show(
+                        ui,
+                        |ui| {
                             for (text, labels, table) in parts {
                                 crate::widgets::field_label(ui, *text);
-                                let choices = armor_part_choices(game, table);
+                                let choices =
+                                    armor_part_choices(ui.ctx(), f.app.load_order, game, table);
                                 pick_part(f, ui, text, labels, &choices);
                                 ui.end_row();
                             }
-                        });
+                        },
+                    );
                 }
                 colors(f, &mut cols[1], game);
                 cols[1].separator();
@@ -881,19 +1054,21 @@ fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
             let prefix = if class == "cloak" { String::new() } else { format!("{class}_") };
             // The numbers to choose from: a cloak's are cloakmodel.2da's
             // rows, another item's those it has icons for.
-            let numbers: Vec<u16> = if prefix.is_empty() {
-                game.table("cloakmodel")
-                    .map(|t| {
-                        (0..t.len())
-                            .filter(|&r| t.get(r, "LABEL").is_some())
-                            .map(|r| r as u16)
-                            .collect()
-                    })
-                    .unwrap_or_default()
+            let numbers: Arc<Vec<u16>> = if prefix.is_empty() {
+                Arc::new(
+                    game.table("cloakmodel")
+                        .map(|t| {
+                            (0..t.len())
+                                .filter(|&r| t.get(r, "LABEL").is_some())
+                                .map(|r| r as u16)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
             } else {
-                icon_numbers(ui, game, &prefix).to_vec()
+                icon_numbers(ui, game, load_order, &prefix)
             };
-            ui.horizontal(|ui| {
+            super::row(ui, |ui| {
                 crate::widgets::field_label(ui, "Appearance");
                 part_choice(f, ui, "Appearance", &["ModelPart1"], &numbers, |n| n.to_string());
             });
@@ -908,30 +1083,55 @@ fn appearance(f: &mut Form<'_>, ui: &mut Ui, game: &GameData, beside: bool) {
     super::situated::preview_button(f, ui);
 }
 
+/// An assigned property as the Properties page lists it: the property,
+/// and how many of the items edited together have it so (its type,
+/// subtype and value).
+struct Assigned {
+    p: ItemProperty,
+    having: usize,
+}
+
+/// The Properties page: the properties the item's base item takes, beside
+/// those it has. Several items edited together: the properties any has
+/// (matched by type, subtype and value), ≠ with how many where some do;
+/// one added is given to each that lacks it and whose base item takes it,
+/// one removed is taken from each, its parameters are set on each.
 fn properties(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
     let here = f.path.clone();
     let key = f.key;
     let base = f.int("BaseItem").max(0) as u32;
-    let assigned: Vec<ItemProperty> =
-        f.root.list("PropertiesList").unwrap_or(&[]).iter().map(ItemProperty::from_gff).collect();
-    let state_id = egui::Id::new(("uti-props", key));
+    let several = f.several();
+    let targets = f.list_targets();
+    let total = targets.len();
+    // One item's, each as it is listed; several items' merged.
+    let assigned: Vec<Assigned> = if several {
+        let key_of = |e: &Struct| Some(lists::property_key(&ItemProperty::from_gff(e)));
+        lists::merged(&targets, "PropertiesList", key_of)
+            .into_iter()
+            .map(|m| Assigned { p: ItemProperty::from_gff(&m.entry), having: m.having.len() })
+            .collect()
+    } else {
+        let list = f.root.list("PropertiesList").unwrap_or(&[]);
+        list.iter().map(|e| Assigned { p: ItemProperty::from_gff(e), having: 1 }).collect()
+    };
+    let state_id = f.id("uti-props");
     // (available type chosen, its subtype chosen, assigned index chosen)
     let (mut chosen, mut chosen_sub, mut selected): (Option<u16>, Option<u16>, Option<usize>) =
         ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
     selected = selected.filter(|&i| i < assigned.len());
-    let available = game.available_properties(base);
+    let available = game.available_property_list(base);
     let mut add: Option<(PropertyType, Option<u16>)> = None;
-    let mut remove = None;
+    let (mut remove, mut give) = (None, None);
     crate::widgets::two_columns(ui, 340.0, |ui, col| {
         if col == 0 {
             crate::widgets::section_heading(ui, "Available Properties");
             // Search: the properties and their choices (a spell of Cast
             // Spell, a skill of Skill Bonus) that have every word typed,
             // their kinds opened out.
-            let search_id = egui::Id::new(("uti-search", key));
+            let search_id = f.id("uti-search");
             let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
             crate::widgets::SearchField::new(search_id.with("field"), &mut search)
-                .hint("🔍 Search properties")
+                .hint("Search properties")
                 .clear_tip("Clear")
                 .find_over()
                 .show(ui);
@@ -941,19 +1141,27 @@ fn properties(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
             egui::ScrollArea::vertical().id_salt(("uti-available", key)).max_height(380.0).show(
                 ui,
                 |ui| {
+                    mg_uikit::list_rows(ui);
                     let mut found = 0;
-                    for t in &available {
+                    for t in &*available {
                         // A kind's choices by name, as Aurora's tree has
                         // them (Specific Alignment's Chaotic Evil first,
                         // where its table begins with Lawful Good).
-                        let mut subtypes = mg_rules::by_name(game.property_subtypes(t, base));
+                        // (The list the game's data keeps, sorted once:
+                        // not named and sorted again each frame.)
+                        let all = game.property_subtypes_by_name(t, base);
+                        let mut subtypes = std::borrow::Cow::Borrowed(&all[..]);
                         // (A kind found by its own name shows all of its
                         // choices; else those found.)
                         if !needle.is_empty() && !has(&t.name) {
-                            subtypes.retain(|s| has(&format!("{} {}", t.name, s.text)));
-                            if subtypes.is_empty() {
+                            let found: Vec<mg_rules::Choice> = (all.iter())
+                                .filter(|s| has(&format!("{} {}", t.name, s.text)))
+                                .cloned()
+                                .collect();
+                            if found.is_empty() {
                                 continue;
                             }
+                            subtypes = std::borrow::Cow::Owned(found);
                         }
                         found += 1;
                         if subtypes.is_empty() {
@@ -969,10 +1177,11 @@ fn properties(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
                             }
                         } else {
                             egui::CollapsingHeader::new(&t.name)
+                                .icon(mg_uikit::collapsing_icon)
                                 .id_salt(("uti-type", key, t.row))
                                 .open((!needle.is_empty()).then_some(true))
                                 .show(ui, |ui| {
-                                    for s in &subtypes {
+                                    for s in subtypes.iter() {
                                         let sub = s.row as u16;
                                         let on = chosen == Some(t.row) && chosen_sub == Some(sub);
                                         let r = ui.selectable_label(on, &s.text);
@@ -996,15 +1205,19 @@ fn properties(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
             egui::ScrollArea::vertical().id_salt(("uti-assigned", key)).max_height(200.0).show(
                 ui,
                 |ui| {
-                    for (i, p) in assigned.iter().enumerate() {
-                        if ui.selectable_label(selected == Some(i), game.property_text(p)).clicked()
-                        {
-                            selected = Some(i);
-                        }
+                    mg_uikit::list_rows(ui);
+                    for (i, a) in assigned.iter().enumerate() {
+                        super::row(ui, |ui| {
+                            let text = game.property_text(&a.p);
+                            if ui.selectable_label(selected == Some(i), text).clicked() {
+                                selected = Some(i);
+                            }
+                            super::entry_mark(ui, a.having, total);
+                        });
                     }
                 },
             );
-            ui.horizontal(|ui| {
+            super::row(ui, |ui| {
                 let can_add = chosen.is_some();
                 if ui.add_enabled(can_add, egui::Button::new("Add")).clicked()
                     && let Some(t) = chosen.and_then(|c| available.iter().find(|t| t.row == c))
@@ -1014,19 +1227,29 @@ fn properties(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
                 if ui.add_enabled(selected.is_some(), egui::Button::new("Remove")).clicked() {
                     remove = selected;
                 }
+                let some = selected.filter(|&i| assigned[i].having < total);
+                if several
+                    && ui
+                        .add_enabled(some.is_some(), egui::Button::new("Give to All"))
+                        .on_hover_text(super::creature_lists::GIVE_TIP)
+                        .clicked()
+                {
+                    give = some;
+                }
             });
             if let Some(i) = selected {
                 ui.separator();
-                property_editor(f, ui, game, base, i, &assigned[i]);
+                property_editor(f, ui, game, base, i, &assigned[i].p, &targets);
             }
         }
     });
     ui.separator();
-    ui.horizontal(|ui| {
+    super::row(ui, |ui| {
         f.check(ui, "Identified", "Identified");
         f.check(ui, "Undroppable", "Cursed");
         let cost = game.item_cost(&ItemValue::from_gff(&f.root));
-        ui.label(format!("Total Cost: {cost}"));
+        crate::widgets::wrap_for(ui, 100.0);
+        ui.label(format!("Total cost: {cost}"));
     });
     if let Some((t, sub)) = add {
         let mut p = game.new_property(&t, base);
@@ -1038,30 +1261,58 @@ fn properties(f: &mut Form<'_>, ui: &mut Ui, game: &GameData) {
                 table => game.property_params(table).first().map_or(0, |c| c.row as u8),
             };
         }
-        f.app.actions.push(Action::Apply(Command::new(
-            "Add property",
-            vec![Edit::insert_item(
-                key,
-                here.clone(),
-                "PropertiesList",
-                assigned.len(),
-                p.to_gff(),
-            )],
-        )));
-        selected = Some(assigned.len());
+        if several {
+            let out = lists::add_property(&targets, &p, |t| takes(game, t, p.property));
+            f.apply_each("Add property", out, "Added to");
+            let k = lists::property_key(&p);
+            selected = assigned.iter().position(|a| lists::property_key(&a.p) == k);
+            selected = selected.or(Some(assigned.len()));
+        } else {
+            f.app.actions.push(Action::Apply(Command::new(
+                "Add property",
+                vec![Edit::insert_item(
+                    key,
+                    here.clone(),
+                    "PropertiesList",
+                    assigned.len(),
+                    p.to_gff(),
+                )],
+            )));
+            selected = Some(assigned.len());
+        }
+    }
+    if let Some(i) = give {
+        let p = assigned[i].p;
+        let out = lists::add_property(&targets, &p, |t| takes(game, t, p.property));
+        f.apply_each("Add property", out, "Added to");
     }
     if let Some(i) = remove {
-        f.app.actions.push(Action::Apply(Command::new(
-            "Remove property",
-            vec![Edit::remove_item(key, here, "PropertiesList", i)],
-        )));
+        if several {
+            let out = lists::remove_property(&targets, lists::property_key(&assigned[i].p));
+            f.apply_each("Remove Property", out, "Taken from");
+        } else {
+            f.app.actions.push(Action::Apply(Command::new(
+                "Remove Property",
+                vec![Edit::remove_item(key, here, "PropertiesList", i)],
+            )));
+        }
         selected = None;
     }
     ui.data_mut(|d| d.insert_temp(state_id, (chosen, chosen_sub, selected)));
 }
 
+/// Whether the base item of an item edited together takes property type
+/// `property`.
+fn takes(game: &GameData, t: &lists::Target, property: u16) -> bool {
+    let base = t.at.integer("BaseItem").unwrap_or(0).max(0) as u32;
+    game.available_property_list(base).iter().any(|a| a.row == property)
+}
+
 /// An assigned property's parameters (Aurora's Select Property
-/// Parameters): subtype, value, parameter, chance of appearing.
+/// Parameters): subtype, value, parameter, chance of appearing. Several
+/// items edited together: set on each one's property of its type,
+/// subtype and value.
+#[allow(clippy::too_many_arguments)]
 fn property_editor(
     f: &mut Form<'_>,
     ui: &mut Ui,
@@ -1069,72 +1320,83 @@ fn property_editor(
     base: u32,
     index: usize,
     p: &ItemProperty,
+    targets: &[lists::Target],
 ) {
     let here = f.path.clone();
     let Some(t) = game.property_type(p.property) else { return };
     let path = here.item("PropertiesList", index);
     let mut changes: Vec<(&str, Value)> = Vec::new();
-    egui::Grid::new(("uti-prop", f.key, index)).num_columns(2).spacing([12.0, 6.0]).show(
-        ui,
-        |ui| {
-            crate::widgets::field_label(ui, "Item Property");
-            ui.strong(&t.name);
-            ui.end_row();
-            let subtypes = game.property_subtypes(&t, base);
-            if !subtypes.is_empty() {
-                crate::widgets::field_label(ui, "Sub-Property");
-                if let Some(v) =
-                    super::situated::pick(ui, f.key, "prop-sub", &subtypes, i64::from(p.subtype))
-                {
-                    changes.push(("Subtype", Value::Word(v as u16)));
-                    // The parameter follows the subtype's table.
-                    let table = game.property_param_table(&t, v as u16);
-                    if table.unwrap_or(255) != p.param1 {
-                        let first = table
-                            .and_then(|tb| game.property_params(tb).first().map(|c| c.row as u8));
-                        changes.push(("Param1", Value::Byte(table.unwrap_or(255))));
-                        changes.push(("Param1Value", Value::Byte(first.unwrap_or(0))));
-                    }
+    super::form_grid(ui, ("uti-prop", f.key, index)).spacing([12.0, 6.0]).show(ui, |ui| {
+        crate::widgets::field_label(ui, "Item property");
+        ui.strong(&t.name);
+        ui.end_row();
+        let subtypes = game.property_subtype_list(&t, base);
+        if !subtypes.is_empty() {
+            crate::widgets::field_label(ui, "Sub-Property");
+            if let Some(v) =
+                super::situated::pick(ui, f.picks(), "prop-sub", &subtypes, i64::from(p.subtype))
+            {
+                changes.push(("Subtype", Value::Word(v as u16)));
+                // The parameter follows the subtype's table.
+                let table = game.property_param_table(&t, v as u16);
+                if table.unwrap_or(255) != p.param1 {
+                    let first =
+                        table.and_then(|tb| game.property_params(tb).first().map(|c| c.row as u8));
+                    changes.push(("Param1", Value::Byte(table.unwrap_or(255))));
+                    changes.push(("Param1Value", Value::Byte(first.unwrap_or(0))));
                 }
-                ui.end_row();
-            }
-            let costs = game.property_costs(p.cost_table, base);
-            if !costs.is_empty() {
-                crate::widgets::field_label(ui, "Cost Parameter");
-                if let Some(v) = super::situated::pick_ordered(
-                    ui,
-                    f.key,
-                    "prop-cost",
-                    &costs,
-                    i64::from(p.cost_value),
-                ) {
-                    changes.push(("CostValue", Value::Word(v as u16)));
-                }
-                ui.end_row();
-            }
-            if p.param1 != 255 {
-                // In the table's order, as Aurora lists them (iprp_damagetype's
-                // Bludgeoning to Sonic: captured 2026-10-30).
-                let params = game.property_params(p.param1);
-                crate::widgets::field_label(ui, "Parameter 1");
-                if let Some(v) = super::situated::pick_ordered(
-                    ui,
-                    f.key,
-                    "prop-param",
-                    &params,
-                    i64::from(p.param1_value),
-                ) {
-                    changes.push(("Param1Value", Value::Byte(v as u8)));
-                }
-                ui.end_row();
-            }
-            crate::widgets::field_label(ui, "Chance of Appearing (%)");
-            if let Some(v) = spin_number(ui, i64::from(p.chance), 0..=100) {
-                changes.push(("ChanceAppear", Value::Byte(v as u8)));
             }
             ui.end_row();
-        },
-    );
+        }
+        let costs = game.property_cost_list(p.cost_table, base);
+        if !costs.is_empty() {
+            crate::widgets::field_label(ui, "Cost parameter");
+            if let Some(v) = super::situated::pick_ordered(
+                ui,
+                f.picks(),
+                "prop-cost",
+                &costs,
+                i64::from(p.cost_value),
+            ) {
+                changes.push(("CostValue", Value::Word(v as u16)));
+            }
+            ui.end_row();
+        }
+        if p.param1 != 255 {
+            // In the table's order, as Aurora lists them (iprp_damagetype's
+            // Bludgeoning to Sonic: captured 2026-10-30).
+            let params = game.property_param_list(p.param1);
+            crate::widgets::field_label(ui, "Parameter 1");
+            if let Some(v) = super::situated::pick_ordered(
+                ui,
+                f.picks(),
+                "prop-param",
+                &params,
+                i64::from(p.param1_value),
+            ) {
+                changes.push(("Param1Value", Value::Byte(v as u8)));
+            }
+            ui.end_row();
+        }
+        crate::widgets::field_label(ui, "Chance of appearing (%)");
+        if let Some(v) = spin_number(ui, i64::from(p.chance), 0..=100) {
+            changes.push(("ChanceAppear", Value::Byte(v as u8)));
+        }
+        ui.end_row();
+    });
+    if !changes.is_empty() && f.several() {
+        let k = lists::property_key(p);
+        let labels: Vec<&str> = changes.iter().map(|(l, _)| *l).collect();
+        let out = lists::set(
+            targets,
+            "PropertiesList",
+            |e| lists::is_property(e, k),
+            &labels,
+            |_, l| changes.iter().find(|(c, _)| *c == l).map(|(_, v)| v.clone()),
+        );
+        f.apply_each("Property parameters", out, "Set on");
+        return;
+    }
     if !changes.is_empty() {
         let edits = changes
             .into_iter()
@@ -1150,9 +1412,9 @@ fn property_editor(
 }
 
 fn description(f: &mut Form<'_>, ui: &mut Ui) {
-    f.locstring_memo(ui, "Unidentified Description", "Description");
+    f.locstring_memo(ui, "Unidentified description", "Description");
     ui.separator();
-    f.locstring_memo(ui, "Identified Description", "DescIdentified");
+    f.locstring_memo(ui, "Identified description", "DescIdentified");
     ui.separator();
     if let Some(game) = f.app.game.as_deref() {
         let row = base_row(f);
@@ -1161,10 +1423,10 @@ fn description(f: &mut Form<'_>, ui: &mut Ui) {
             .ok()
             .and_then(|t| game.cell_string(&t, row, t.column("Description")?))
             .unwrap_or_default();
-        crate::widgets::field_label(ui, "Item Type Description");
+        crate::widgets::field_label(ui, "Item type description");
         ui.weak(text);
         ui.separator();
-        crate::widgets::field_label(ui, "Item Statistics");
+        crate::widgets::field_label(ui, "Item statistics");
         for s in f.root.list("PropertiesList").unwrap_or(&[]) {
             ui.weak(game.property_text(&ItemProperty::from_gff(s)));
         }
@@ -1176,7 +1438,40 @@ fn description(f: &mut Form<'_>, ui: &mut Ui) {
 
 #[cfg(test)]
 mod tests {
-    use super::number_after;
+    use super::*;
+
+    /// The numbers a part has models and icons of were listed once a
+    /// session (the review's B13): a part added to a hak or the override
+    /// was not offered until Moonglow was started again. They are listed
+    /// again when the load order has changed, and kept while it has not.
+    #[test]
+    fn part_numbers_are_listed_again_when_the_load_order_changes() {
+        let game = |models: &[&str], icons: &[&str]| {
+            let mut c = mg_resman::MemContainer::new();
+            for (names, t) in [(models, ResType::MDL), (icons, ResType::TGA)] {
+                for n in names {
+                    c.insert(mg_resman::ResKey::parse(n, t).unwrap(), Vec::new());
+                }
+            }
+            let mut rm = mg_resman::ResMan::new();
+            rm.add(mg_resman::priority::HAK, "hak:parts", mg_resman::LayerClass::Erf, c);
+            GameData::new(rm, mg_tlk::Tlk::new(mg_core::Language::ENGLISH))
+        };
+        let before = game(&["pmh0_chest001", "pmh0_chest003"], &["iit_midmisc_001"]);
+        let after = game(
+            &["pmh0_chest001", "pmh0_chest003", "pmh0_chest180"],
+            &["iit_midmisc_001", "iit_midmisc_250"],
+        );
+        egui::__run_test_ui(|ui| {
+            assert_eq!(*model_numbers(ui, &before, 1, "pmh0_chest"), [1, 3]);
+            assert_eq!(*icon_numbers(ui, &before, 1, "it_midmisc_"), [1]);
+            // (Kept while the load order is the same: not read again.)
+            assert_eq!(*model_numbers(ui, &after, 1, "pmh0_chest"), [1, 3]);
+            assert_eq!(*model_numbers(ui, &after, 2, "pmh0_chest"), [1, 3, 180]);
+            assert_eq!(*icon_numbers(ui, &after, 2, "it_midmisc_"), [1, 250]);
+            assert_eq!(*part_numbers(ui, &after, 2, "it_midmisc_"), [1, 250]);
+        });
+    }
 
     /// Three digits, and past 999 the number as it is (a hak's it_gem_1000):
     /// nwn-issues 658's appearances of 100 and more are listed.

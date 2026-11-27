@@ -99,6 +99,10 @@ impl PartialEq for Grid {
     }
 }
 
+/// A cell and one of its edges (from [`SOUTH`](crate::SOUTH) counter-clockwise):
+/// the quarter of the cell by that edge.
+pub type Quarter = ((u32, u32), usize);
+
 /// A change a brush makes: the lattice after it and the cells that get new
 /// tiles.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,7 +137,8 @@ impl Grid {
 
     /// Where cell (x, y)'s tile is in the list; `None` outside the grid.
     fn slot(&self, x: u32, y: u32) -> Option<usize> {
-        self.lattice.has_cell(x, y).then(|| (y * self.lattice.width() + x) as usize)
+        (self.lattice.has_cell(x, y))
+            .then(|| y as usize * self.lattice.width() as usize + x as usize)
     }
 
     /// Whether the tile in cell (x, y) is a group's, which changes only
@@ -145,7 +150,10 @@ impl Grid {
 
     /// The groups that `changes` (cells and their new tiles) would leave
     /// part of: each as the cells it has, where it is whole now. A group
-    /// they take away whole, or don't touch, is not one of them.
+    /// they take away whole, or don't touch, is not one of them. (Touched:
+    /// a cell of it gets another tile. Taken whole: every cell of it is
+    /// among the changes, also one whose new tile is the one it has, as
+    /// where a group placed over another shares a tile with it.)
     pub fn groups_broken(
         &self,
         index: &TileIndex,
@@ -154,13 +162,14 @@ impl Grid {
         let changed = |c: (u32, u32)| {
             changes.iter().any(|&(at, p)| at == c && Some(p) != self.get_tile(c.0, c.1))
         };
+        let covered = |c: (u32, u32)| changes.iter().any(|&(at, _)| at == c);
         let mut out: Vec<Vec<(u32, u32)>> = Vec::new();
         for &((x, y), _) in changes {
             if !changed((x, y)) || out.iter().any(|g| g.contains(&(x, y))) {
                 continue;
             }
             if let Some(cells) = self.group_cells(index, x, y)
-                && !cells.iter().all(|&c| changed(c))
+                && !cells.iter().all(|&c| covered(c))
             {
                 out.push(cells);
             }
@@ -217,9 +226,9 @@ impl Grid {
     /// edge of every quarter of a cell the pointer passes through with the
     /// button down (the quarter nearest that edge), from the one it was in
     /// when pressed ([`path_edges`] for a path through cell centres). The
-    /// cells on both sides of each edge choose their tiles again; with no
-    /// edge, the `cells` given (a click). `None` when refused, or for a
-    /// cell outside the grid.
+    /// cells on both sides of each edge choose their tiles again, and the
+    /// `cells` given. A click is one quarter's edge. `None` when refused,
+    /// or for a cell outside the grid.
     ///
     /// [`SOUTH`]: crate::SOUTH
     pub fn draw_crosser(
@@ -245,6 +254,78 @@ impl Grid {
         self.stroke(index, lattice, BTreeSet::new(), cells)
     }
 
+    /// [`Grid::draw_crosser`] as Aurora's brush lays it: edge by edge, in
+    /// the order the drag passed them, each on what those before it left.
+    /// An edge no tile fits is held and tried again with the next (a
+    /// stream across a road fits only both sides at once, as a bridge);
+    /// one that fits neither with them nor alone is passed over, and the
+    /// rest laid (a road dragged on into a wall stops at the wall; one
+    /// dragged through a room goes on beyond it). Returns the stroke,
+    /// `None` when no edge is laid ([`Grid::blocked`] then the tiles that
+    /// refused), and the edges passed over.
+    pub fn lay_crosser(
+        &self,
+        index: &TileIndex,
+        edges: &[((u32, u32), usize)],
+        click: &[(u32, u32)],
+        crosser: Crosser,
+    ) -> (Option<Stroke>, Vec<Quarter>) {
+        if !self.all_inside(edges.iter().map(|(c, _)| c).chain(click)) {
+            return (None, edges.to_vec());
+        }
+        let mut cells: Vec<(u32, u32)> = click.to_vec();
+        let mut last_stroke: Option<Stroke> = None;
+        let (mut held, mut blocked) = (Vec::new(), Vec::new());
+        // The cells and validated stroke with `with` laid on what is laid so far,
+        // if every tile they touch fits.
+        let tried = |lattice: &Lattice, cells: &[(u32, u32)], with: &[((u32, u32), usize)]| {
+            let mut l = lattice.clone();
+            let mut more = cells.to_vec();
+            for &((x, y), edge) in with {
+                l.set_edge(x, y, edge, Some(crosser));
+                for c in std::iter::once((x, y)).chain(beside(&l, x, y, edge)) {
+                    if !more.contains(&c) {
+                        more.push(c);
+                    }
+                }
+            }
+            self.stroke(index, l, BTreeSet::new(), more.clone()).map(|stroke| (more, stroke))
+        };
+        for &e in edges {
+            let cur_lattice = last_stroke.as_ref().map_or(&self.lattice, |s| &s.lattice);
+            let mut with = held.clone();
+            with.push(e);
+            if let Some((more, stroke)) = tried(cur_lattice, &cells, &with) {
+                (cells, last_stroke) = (more, Some(stroke));
+                held.clear();
+            } else if let Some((more, stroke)) =
+                (!held.is_empty()).then(|| tried(cur_lattice, &cells, &[e])).flatten()
+            {
+                (cells, last_stroke) = (more, Some(stroke));
+            } else {
+                if !held.contains(&e) {
+                    held.push(e);
+                }
+                for c in self.blocked() {
+                    if !blocked.contains(&c) {
+                        blocked.push(c);
+                    }
+                }
+            }
+        }
+        // (Those still held at the end are the ones passed over.)
+        match last_stroke {
+            Some(stroke) => {
+                self.blocked.borrow_mut().clear();
+                (Some(stroke), held)
+            }
+            None => {
+                *self.blocked.borrow_mut() = blocked;
+                (None, held)
+            }
+        }
+    }
+
     /// The Eraser on cell (x, y): the crossers on its edges go and its tile
     /// is chosen again, as are those across the cleared edges. A tile that
     /// then has nothing to fit loses its other kinds of crosser (a road
@@ -266,11 +347,44 @@ impl Grid {
     /// The cells of the group that has a tile at (x, y), where it is
     /// whole ([`TileIndex::group_at`]).
     pub fn group_cells(&self, index: &TileIndex, x: u32, y: u32) -> Option<Vec<(u32, u32)>> {
+        self.group_found(index, x, y).map(|(_, cells)| cells)
+    }
+
+    /// [`Grid::group_cells`], with which of the tileset's groups it is.
+    pub fn group_found(
+        &self,
+        index: &TileIndex,
+        x: u32,
+        y: u32,
+    ) -> Option<(usize, Vec<(u32, u32)>)> {
         let (w, h) = (i64::from(self.lattice.width()), i64::from(self.lattice.height()));
         let tile = |cx: i64, cy: i64| {
             (cx >= 0 && cy >= 0 && cx < w && cy < h).then(|| self.tile(cx as u32, cy as u32))
         };
-        index.group_at(&tile, x, y)
+        index.group_found_at(&tile, x, y)
+    }
+
+    /// The groups placed in the grid, each once, where it is whole: the
+    /// group (its index in the tileset) and its cells.
+    pub fn groups(&self, index: &TileIndex) -> Vec<(usize, Vec<(u32, u32)>)> {
+        let (w, h) = (self.lattice.width(), self.lattice.height());
+        let mut seen = vec![false; self.tiles.len()];
+        let mut out = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                if self.slot(x, y).is_some_and(|i| seen.get(i) == Some(&false))
+                    && let Some((group, cells)) = self.group_found(index, x, y)
+                {
+                    for &(cx, cy) in &cells {
+                        if let Some(slot) = self.slot(cx, cy).and_then(|i| seen.get_mut(i)) {
+                            *slot = true;
+                        }
+                    }
+                    out.push((group, cells));
+                }
+            }
+        }
+        out
     }
 
     /// [`Grid::erase`] taking from cell (x, y) only crosser `only` (a road,
@@ -281,6 +395,17 @@ impl Grid {
         x: u32,
         y: u32,
         only: Option<Crosser>,
+    ) -> Option<Stroke> {
+        self.erase_only_unlocking(index, x, y, only, &[])
+    }
+
+    fn erase_only_unlocking(
+        &self,
+        index: &TileIndex,
+        x: u32,
+        y: u32,
+        only: Option<Crosser>,
+        unlocked: &[(u32, u32)],
     ) -> Option<Stroke> {
         if !self.lattice.has_cell(x, y) {
             return None;
@@ -294,8 +419,8 @@ impl Grid {
                      keep: Option<Crosser>,
                      queue: &mut VecDeque<((u32, u32), Crosser)>| {
             let cell = lattice.cell(x, y);
-            for edge in 0..4 {
-                if let Some(c) = cell.edges[edge].filter(|c| Some(*c) != keep) {
+            for (edge, crosser) in cell.edges.into_iter().enumerate() {
+                if let Some(c) = crosser.filter(|c| Some(*c) != keep) {
                     lattice.set_edge(x, y, edge, None);
                     if let Some(n) = beside(lattice, x, y, edge) {
                         queue.push_back((n, c));
@@ -327,7 +452,7 @@ impl Grid {
                 clear(&mut lattice, n, None, &mut queue);
             }
         }
-        self.stroke(index, lattice, BTreeSet::new(), cells)
+        self.stroke_unlocking(index, lattice, BTreeSet::new(), cells, unlocked)
     }
 
     /// Choosing the tiles of `cells` again, the terrain as it is (the
@@ -357,7 +482,6 @@ impl Grid {
         }
         let mut grid = self.clone();
         let mut chosen: Vec<(u32, u32)> = Vec::new();
-        let mut unlocked = Vec::new();
         // (A group's tile: the whole group, where it is whole.)
         let mut all: Vec<(u32, u32)> = Vec::new();
         let mut seen = BTreeSet::new();
@@ -367,6 +491,9 @@ impl Grid {
                 group.unwrap_or_else(|| vec![(x, y)]).into_iter().filter(|c| seen.insert(*c)),
             );
         }
+        // Unlock the entire batch upfront so clearing an internal crosser between
+        // two grouped tiles does not fail against an unvisited sibling cell.
+        let unlocked = all.clone();
         // (Refused on the copy: what refused it is this grid's to show.)
         let refused = |at: Vec<(u32, u32)>| {
             *self.blocked.borrow_mut() = at;
@@ -375,7 +502,6 @@ impl Grid {
         let mut seen = BTreeSet::new();
         for &(x, y) in &all {
             let stroke = if index.is_grouped(grid.tile(x, y).tile) {
-                unlocked.push((x, y));
                 let mut lattice = grid.lattice.clone();
                 let mut also = vec![(x, y)];
                 for edge in 0..4 {
@@ -386,7 +512,7 @@ impl Grid {
                 }
                 grid.stroke_unlocking(index, lattice, BTreeSet::new(), also, &unlocked)
             } else {
-                grid.erase(index, x, y)
+                grid.erase_only_unlocking(index, x, y, None, &unlocked)
             };
             let Some(stroke) = stroke else { return refused(grid.blocked()) };
             // Stand-in tiles, so that the next tile sees what this one leaves.
@@ -540,25 +666,76 @@ impl Grid {
     /// Putting tile `p` in cell (x, y) exactly as it is given, whether it
     /// fits its neighbours or not (the tiles palette's Exact tile): no
     /// other tile, corner terrain, height or crosser around it changes,
-    /// and its own corners and edges are what the tile has. `None` on a
-    /// tile of a group or feature, which changes only with it unless
-    /// [`Grid::free_groups`] is on (that group is then
-    /// [`Grid::blocked`]), or for a tile the tileset hasn't, or a cell
-    /// outside the grid.
+    /// and its own corners and edges are what the tile has. `None` where
+    /// it would leave a group or feature of more than one tile part
+    /// changed, unless [`Grid::free_groups`] is on (that group is then
+    /// [`Grid::blocked`]: a group of one tile, a staircase, is replaced),
+    /// or for a tile the tileset hasn't, or a cell outside the grid.
     pub fn set_exact(&self, index: &TileIndex, x: u32, y: u32, p: Placement) -> Option<Stroke> {
-        if !self.lattice.has_cell(x, y) {
+        self.set_exact_tiles(index, &[((x, y), p)])
+    }
+
+    /// Placing tile group `group` exactly as it is (the tiles palette's
+    /// Exact tile with a group chosen): its first tile (the south-west
+    /// one) in cell (x, y), turned `turns` quarter turns as
+    /// [`Grid::place_group`] turns it, each tile at the height of the
+    /// tile under the first, as [`Grid::set_exact`] puts one tile; the
+    /// tiles around are not fitted to it, and a cell the group leaves
+    /// empty keeps its tile. `None` when it doesn't fit inside the area,
+    /// or would leave another group of more than one tile part changed
+    /// (unless [`Grid::free_groups`] is on).
+    pub fn place_group_exact(
+        &self,
+        index: &TileIndex,
+        group: &mg_set::Group,
+        x: u32,
+        y: u32,
+        turns: u8,
+    ) -> Option<Stroke> {
+        let height = self.get_tile(x, y)?.height;
+        let (w, h) = (i64::from(self.lattice.width()), i64::from(self.lattice.height()));
+        let columns = group.columns.max(1);
+        let mut changes = Vec::new();
+        for (k, tile) in group.tiles.iter().enumerate() {
+            let (c, r) = crate::group_slot(k, columns, turns);
+            let (cx, cy) = (i64::from(x) + c, i64::from(y) + r);
+            if cx < 0 || cy < 0 || cx >= w || cy >= h {
+                return None;
+            }
+            if let Some(t) = tile {
+                let p = Placement { tile: *t, orientation: turns % 4, height };
+                changes.push(((cx as u32, cy as u32), p));
+            }
+        }
+        self.set_exact_tiles(index, &changes)
+    }
+
+    /// Cells set to their tiles exactly as given ([`Grid::set_exact`]):
+    /// refused where that leaves a group part changed.
+    fn set_exact_tiles(
+        &self,
+        index: &TileIndex,
+        changes: &[((u32, u32), Placement)],
+    ) -> Option<Stroke> {
+        if changes.iter().any(|&((x, y), _)| !self.lattice.has_cell(x, y)) {
             return None;
         }
-        if self.locked(index, x, y) {
-            *self.blocked.borrow_mut() =
-                self.group_cells(index, x, y).unwrap_or_else(|| vec![(x, y)]);
-            return None;
+        // (A group of one tile, or one these changes take whole, is not
+        // left half changed: only a larger group's tile is kept.)
+        if !self.free_groups {
+            let broken: Vec<(u32, u32)> =
+                self.groups_broken(index, changes).into_iter().flatten().collect();
+            if !broken.is_empty() {
+                *self.blocked.borrow_mut() = broken;
+                return None;
+            }
         }
         self.blocked.borrow_mut().clear();
-        let cell = index.cell(p)?;
         let mut lattice = self.lattice.clone();
-        lattice.set_cell(x, y, &cell);
-        Some(Stroke { lattice, cells: Vec::new(), fixed: vec![((x, y), p)] })
+        for &((x, y), p) in changes {
+            lattice.set_cell(x, y, &index.cell(p)?);
+        }
+        Some(Stroke { lattice, cells: Vec::new(), fixed: changes.to_vec() })
     }
 
     /// The cells that refused the stroke asked of this grid last (a brush
@@ -1118,10 +1295,25 @@ Top={}\nRight={}\nBottom={}\nLeft={}\n",
             columns: 1,
             tiles: vec![Some(n)],
         });
+        // A hut of two tiles, side by side.
+        for model in ["hut_w", "hut_e"] {
+            let mut t = set.tiles[0].clone();
+            t.model = model.into();
+            set.tiles.push(t);
+        }
+        set.groups.push(mg_set::Group {
+            name: "Hut".into(),
+            strref: Default::default(),
+            rows: 1,
+            columns: 2,
+            tiles: vec![Some(n + 1), Some(n + 2)],
+        });
         let index = TileIndex::new(&set);
         let mut g = grid(&index, 5);
-        let pond = set.groups[0].clone();
+        let (pond, hut) = (set.groups[0].clone(), set.groups[1].clone());
         apply(&mut g, &index, |g| g.place_group(&index, &pond, 4, 4, 0));
+        apply(&mut g, &index, |g| g.place_group(&index, &hut, 0, 3, 0));
+        assert_eq!((g.tile(0, 3).tile, g.tile(1, 3).tile), (n + 1, n + 2));
         let before = g.clone();
         // Tile 15, B at every corner, in open ground of A: it fits none of
         // its neighbours. Turned and two steps up.
@@ -1139,13 +1331,102 @@ Top={}\nRight={}\nBottom={}\nLeft={}\n",
         // The area read back: the tile as put, its neighbours too.
         let back = Grid::new(&index, 5, 5, g.tiles.clone()).unwrap();
         assert_eq!(back.tiles, g.tiles);
-        // Not over the pond's tile, which flashes; freed, it goes.
-        assert!(g.set_exact(&index, 4, 4, p).is_none());
-        assert_eq!(g.blocked(), [(4, 4)]);
+        // Over the pond, a group of one tile (a staircase): it goes, as
+        // nothing is left half changed.
+        let s = g.set_exact(&index, 4, 4, p).expect("over a group of one tile");
+        assert_eq!(s.fixed, [((4, 4), p)]);
+        // Not over half the hut, which flashes; freed, it goes.
+        assert!(g.set_exact(&index, 1, 3, p).is_none());
+        assert_eq!(g.blocked(), [(0, 3), (1, 3)]);
         g.free_groups = true;
-        assert!(g.set_exact(&index, 4, 4, p).is_some());
+        assert!(g.set_exact(&index, 1, 3, p).is_some());
+        g.free_groups = false;
         // A tile the tileset hasn't: refused.
         assert!(g.set_exact(&index, 0, 0, Placement { tile: 999, ..p }).is_none());
+    }
+
+    /// A group placed exactly (Exact tile with a group chosen): its tiles
+    /// as they are, turned, at the height of the tile under its first,
+    /// nothing around fitted to it; refused past the area's edge or over
+    /// part of a larger group, and over a group of one tile let through.
+    #[test]
+    fn a_group_placed_exactly_changes_its_cells_alone() {
+        let mut set = set();
+        let n = set.tiles.len() as u32;
+        for model in ["hut_w", "hut_e", "pond", "barn_e"] {
+            let mut t = set.tiles[15].clone();
+            t.model = model.into();
+            set.tiles.push(t);
+        }
+        let group = |name: &str, tiles: Vec<Option<u32>>| mg_set::Group {
+            name: name.into(),
+            strref: Default::default(),
+            rows: 1,
+            columns: tiles.len() as u32,
+            tiles,
+        };
+        let hut = group("Hut", vec![Some(n), Some(n + 1)]);
+        let pond = group("Pond", vec![Some(n + 2)]);
+        // (A barn whose west tile is the hut's.)
+        let barn = group("Barn", vec![Some(n), Some(n + 3)]);
+        set.groups.extend([hut.clone(), pond, barn.clone()]);
+        let index = TileIndex::new(&set);
+        let mut g = grid(&index, 5);
+        // (A step up under where the hut goes.)
+        let raised = Placement { height: 1, ..g.tile(2, 2) };
+        // (Put as they are: an exact tile needn't fit, as `apply` checks.)
+        let put = |g: &mut Grid, s: Option<Stroke>| {
+            g.apply(&index, s.expect("refused"), &mut fastrand::Rng::with_seed(2));
+        };
+        let s = g.set_exact(&index, 2, 2, raised);
+        put(&mut g, s);
+        // (The pond, a group of one tile, beside it.)
+        let s = g.set_exact(&index, 3, 2, Placement { tile: n + 2, orientation: 0, height: 0 });
+        put(&mut g, s);
+        let before = g.clone();
+        // The hut, turned a quarter (its second tile north of the first),
+        // over the raised tile: both cells as the group has them, at the
+        // height of the tile under its first.
+        let s = g.place_group_exact(&index, &hut, 2, 1, 1).expect("placed");
+        assert!(s.cells.is_empty());
+        let (w, e) = (
+            Placement { tile: n, orientation: 1, height: 0 },
+            Placement { tile: n + 1, orientation: 1, height: 0 },
+        );
+        assert_eq!(s.fixed, [((2, 1), w), ((2, 2), e)]);
+        let changes = g.apply(&index, s, &mut fastrand::Rng::with_seed(3));
+        assert_eq!(changes, [((2, 1), w), ((2, 2), e)]);
+        for (i, (now, was)) in g.tiles.iter().zip(&before.tiles).enumerate() {
+            if i != 5 + 2 && i != 10 + 2 {
+                assert_eq!(now, was, "tile {i} is as it was");
+            }
+        }
+        // At the height of the tile under its first: on the raised one.
+        let g2 = before.clone();
+        let s = g2.place_group_exact(&index, &hut, 1, 2, 0).expect("placed");
+        assert!(s.fixed.iter().all(|(_, p)| p.height == 0), "(1, 2) is at 0");
+        let s = g2.place_group_exact(&index, &hut, 2, 2, 0).expect("over the pond");
+        assert_eq!(s.fixed[0].1.height, 1, "(2, 2) is a step up");
+        assert_eq!(s.fixed[1], ((3, 2), Placement { tile: n + 1, orientation: 0, height: 1 }));
+        // Past the east edge: refused.
+        assert!(before.place_group_exact(&index, &hut, 4, 0, 0).is_none());
+        // Over half of a hut: refused, the hut flashing; over all of it
+        // (the same hut put again): it goes.
+        let mut g = before;
+        let s = g.place_group_exact(&index, &hut, 0, 4, 0);
+        put(&mut g, s);
+        assert!(g.place_group_exact(&index, &hut, 1, 4, 0).is_none());
+        assert_eq!(g.blocked(), [(0, 4), (1, 4)]);
+        assert!(g.place_group_exact(&index, &hut, 0, 4, 0).is_some());
+        // Over all of it by a group that shares a tile with it in one
+        // cell (the barn, whose west tile is the hut's): the hut goes
+        // whole all the same, though that cell's tile stays as it is.
+        let s = g.place_group_exact(&index, &barn, 0, 4, 0);
+        assert_eq!(g.blocked(), []);
+        put(&mut g, s);
+        assert_eq!(g.group_found(&index, 1, 4), Some((2, vec![(0, 4), (1, 4)])));
+        // (And half over the barn is refused, as over the hut.)
+        assert!(g.place_group_exact(&index, &hut, 1, 4, 0).is_none());
     }
 
     #[test]
@@ -1292,6 +1573,40 @@ Top={}\nRight={}\nBottom={}\nLeft={}\n",
     }
 
     #[test]
+    fn a_crosser_is_laid_as_far_as_tiles_fit_it() {
+        // As Aurora's brush lays it (aurora_terrain's drags).
+        let set = set();
+        let index = TileIndex::new(&set);
+        let mut g = grid(&index, 5);
+        let (r, s) = (index.crosser("R").unwrap(), index.crosser("S").unwrap());
+        let road = |path: &[(u32, u32)]| path_edges(path).unwrap();
+        // A road on round a corner, which no tile turns: refused whole,
+        // laid as far as the corner.
+        let path = road(&[(1, 2), (2, 2), (3, 2), (3, 3)]);
+        assert!(g.draw_crosser(&index, &path, &[], r).is_none());
+        let (stroke, passed) = g.lay_crosser(&index, &path, &[], r);
+        assert_eq!(passed, path[2..], "the turn passed over");
+        apply(&mut g, &index, |_| stroke);
+        let row: Vec<Option<Crosser>> =
+            (0..5).map(|x| g.lattice.cell(x, 2).edges[crate::WEST]).collect();
+        assert_eq!(row, [None, None, Some(r), Some(r), None]);
+        assert_eq!(g.lattice.cell(3, 3).edges, [None; 4]);
+        // A stream across it: half a crossing fits no tile, so the first
+        // side is held and laid with the second.
+        let path = road(&[(2, 1), (2, 2), (2, 3)]);
+        assert!(g.lay_crosser(&index, &path[..1], &[], s).0.is_none(), "half a crossing");
+        let (stroke, passed) = g.lay_crosser(&index, &path, &[], s);
+        assert!(passed.is_empty());
+        apply(&mut g, &index, |_| stroke);
+        assert_eq!(g.lattice.cell(2, 2).edges, [Some(s), Some(r), Some(s), Some(r)]);
+        // Nothing that fits: refused, the tiles in the way blocked.
+        let (stroke, passed) = g.lay_crosser(&index, &road(&[(3, 2), (3, 3)]), &[], r);
+        assert!(stroke.is_none());
+        assert_eq!(passed.len(), 1);
+        assert!(!g.blocked().is_empty());
+    }
+
+    #[test]
     fn crossers_go_on_the_edges_a_drag_crosses() {
         let set = set();
         let index = TileIndex::new(&set);
@@ -1352,12 +1667,47 @@ Top={}\nRight={}\nBottom={}\nLeft={}\n",
         }
         // A tile alone in its cell has no other appearance.
         let r = index.crosser("R").unwrap();
-        let mut l = g.lattice.clone();
+        let mut l = g.lattice;
         l.set_edge(1, 1, crate::NORTH, Some(r));
         let end = l.cell(1, 1);
         let only = index.fits(&end);
         assert_eq!(only.len(), 1, "{only:?}");
         assert_eq!(step_appearance(&index, &end, only[0], false), None);
         assert_eq!(turn_fit(&index, &end, only[0], false), None);
+    }
+
+    #[test]
+    fn delete_and_erase_remove_groups_with_internal_crossers() {
+        let mut set = set();
+        let n = set.tiles.len() as u32;
+        let mut west = set.tiles[0].clone();
+        west.model = "bridge_w".into();
+        west.edges[crate::EAST] = "R".into();
+        let mut east = set.tiles[0].clone();
+        east.model = "bridge_e".into();
+        east.edges[crate::WEST] = "R".into();
+        set.tiles.extend([west, east]);
+        set.groups.push(mg_set::Group {
+            name: "Bridge".into(),
+            strref: Default::default(),
+            rows: 1,
+            columns: 2,
+            tiles: vec![Some(n), Some(n + 1)],
+        });
+        let index = TileIndex::new(&set);
+        let bridge = set.groups[0].clone();
+        let mut g = grid(&index, 5);
+        apply(&mut g, &index, |g| g.place_group(&index, &bridge, 1, 2, 0));
+        assert_eq!(g.group_cells(&index, 1, 2), Some(vec![(1, 2), (2, 2)]));
+
+        let via_erase = g.erase(&index, 1, 2).expect("erase clears group with internal crosser");
+        assert!(via_erase.cells.contains(&(1, 2)) && via_erase.cells.contains(&(2, 2)));
+        assert_eq!(via_erase.lattice.cell(1, 2).edges, [None; 4]);
+        assert_eq!(via_erase.lattice.cell(2, 2).edges, [None; 4]);
+
+        let via_delete =
+            g.delete(&index, &[(2, 2)]).expect("delete clears group with internal crosser");
+        assert!(via_delete.cells.contains(&(1, 2)) && via_delete.cells.contains(&(2, 2)));
+        assert_eq!(via_delete.lattice, via_erase.lattice);
     }
 }

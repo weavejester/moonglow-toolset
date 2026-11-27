@@ -58,7 +58,7 @@ fn facts(
     if let Some(g) = group {
         ui.weak(format!("A piece of the group {}: placed with it", g.name));
     } else if ui
-        .button("Paint with it")
+        .button("Paint with It")
         .on_hover_text("Choose it in the tiles palette: a click in the area places it")
         .clicked()
     {
@@ -72,11 +72,18 @@ fn facts(
         app.palette.tile_brush = Some(brush);
         app.palette.tile_choice = Some(tile);
         app.palette.selected = None;
-        // (Out of tile mode, which the brush would sit on top of.)
-        for view in app.area_views.values_mut() {
-            if view.terrain.as_ref().is_some_and(|t| t.tileset == tileset) {
-                view.tile_mode = false;
-            }
+        // (The tool in hand is Terrain, as the shelf takes it: out of
+        // Paint and of tile mode, which the brush would sit on top of.)
+        let areas: Vec<_> = (app.area_views.iter())
+            .filter(|(_, v)| v.terrain.as_ref().is_some_and(|t| t.tileset == tileset))
+            .map(|(a, _)| *a)
+            .collect();
+        for area in areas {
+            crate::area_view::tools::choose_in(
+                app,
+                area,
+                crate::area_view::tools::AreaTool::Terrain,
+            );
         }
     }
     ui.add_space(6.0);
@@ -96,7 +103,7 @@ fn facts(
             ui.end_row();
         }
     });
-    section_heading(ui, "The rest");
+    section_heading(ui, "The Rest");
     let yes = |b: bool| if b { "yes" } else { "no" };
     let named = |n: &Option<String>| n.clone().unwrap_or_else(|| "—".into());
     egui::Grid::new(("tile-rest", tileset, tile)).num_columns(2).show(ui, |ui| {

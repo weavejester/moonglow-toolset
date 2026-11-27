@@ -12,6 +12,7 @@ use naga::{
     Statement, Type, TypeInner,
 };
 
+use crate::layout::{self, Rules};
 use crate::reflect::{Part, Scalar, UniformBlock, ValueType, Varying};
 use crate::{Program, ShaderError};
 
@@ -329,6 +330,182 @@ impl Program {
         self.revalidate()
     }
 
+    /// Darkens the color the program leaves with (the output at location
+    /// 0, the game's `gl_FragColor`) as the shadows darkened what lay under
+    /// it: its red, green and blue times the texel of [`SHADOW_MASK`] at
+    /// the fragment's pixel (a `texture_2d<f32>` bound at `group` and
+    /// `binding`, read with `textureLoad` at the fragment's own position as
+    /// wgpu counts it, from the top). Moonglow's renderer writes the mask
+    /// where it lays the shadows; a see-through mesh's soft part, drawn
+    /// after them, takes their darkness so.
+    pub fn darken_by_mask(&mut self, group: u32, binding: u32) -> Result<(), ShaderError> {
+        let m = &mut self.module;
+        let ty = |inner| Type { name: None, inner };
+        let image = m.types.insert(
+            ty(TypeInner::Image {
+                dim: naga::ImageDimension::D2,
+                arrayed: false,
+                class: naga::ImageClass::Sampled { kind: ScalarKind::Float, multi: false },
+            }),
+            Span::UNDEFINED,
+        );
+        let vec4 = m.types.insert(
+            ty(TypeInner::Vector { size: naga::VectorSize::Quad, scalar: naga::Scalar::F32 }),
+            Span::UNDEFINED,
+        );
+        let mask = m.global_variables.append(
+            naga::GlobalVariable {
+                name: Some(SHADOW_MASK.into()),
+                space: naga::AddressSpace::Handle,
+                binding: Some(naga::ResourceBinding { group, binding }),
+                ty: image,
+                init: None,
+                memory_decorations: naga::MemoryDecorations::default(),
+            },
+            Span::UNDEFINED,
+        );
+        let types = &m.types;
+        let ep = m
+            .entry_points
+            .iter_mut()
+            .find(|e| e.stage == naga::ShaderStage::Fragment)
+            .ok_or_else(|| naga_err("no fragment entry point"))?;
+        let f = &mut ep.function;
+        let result = f.result.as_ref().ok_or_else(|| naga_err("the program writes no color"))?;
+        let result_ty = result.ty;
+        let is_color =
+            |b: &Option<Binding>| matches!(b, Some(Binding::Location { location: 0, .. }));
+        let member = if is_color(&result.binding) {
+            None
+        } else {
+            match &types[result.ty].inner {
+                TypeInner::Struct { members, .. } => Some(
+                    members
+                        .iter()
+                        .position(|m| is_color(&m.binding))
+                        .ok_or_else(|| naga_err("the program writes no color at location 0"))?,
+                ),
+                _ => return Err(naga_err("the program writes no color at location 0")),
+            }
+        };
+        let at = f
+            .body
+            .iter()
+            .rposition(|s| matches!(s, Statement::Return { value: Some(_) }))
+            .ok_or_else(|| naga_err("the fragment entry point returns nothing"))?;
+        let Statement::Return { value: Some(value) } = f.body[at] else { unreachable!() };
+        // (The fragment's position: the program's own argument, or one
+        // given it.)
+        let is_position =
+            |b: &Option<Binding>| matches!(b, Some(Binding::BuiltIn(BuiltIn::Position { .. })));
+        let arg = match f.arguments.iter().position(|a| is_position(&a.binding)) {
+            Some(i) => i,
+            None => {
+                f.arguments.push(naga::FunctionArgument {
+                    name: Some("mg_position".into()),
+                    ty: vec4,
+                    binding: Some(Binding::BuiltIn(BuiltIn::Position { invariant: false })),
+                });
+                f.arguments.len() - 1
+            }
+        };
+        let e = &mut f.expressions;
+        let color = match member {
+            None => value,
+            Some(i) => match &e[value] {
+                Expression::Compose { components, .. } if components.len() > i => components[i],
+                _ => return Err(naga_err("the fragment entry point's result isn't composed")),
+            },
+        };
+        let found = e
+            .iter()
+            .find(|(_, x)| matches!(x, Expression::FunctionArgument(i) if *i as usize == arg))
+            .map(|(h, _)| h);
+        let position = match found {
+            Some(h) => h,
+            None => e.append(Expression::FunctionArgument(arg as u32), Span::UNDEFINED),
+        };
+        let image = e.append(Expression::GlobalVariable(mask), Span::UNDEFINED);
+        let level = e.append(Expression::Literal(Literal::I32(0)), Span::UNDEFINED);
+        let one = e.append(Expression::Literal(Literal::F32(1.0)), Span::UNDEFINED);
+        let one_u = e.append(Expression::Literal(Literal::U32(1)), Span::UNDEFINED);
+        let mut emitter = Emitter::default();
+        emitter.start(e);
+        let xy = e.append(
+            Expression::Swizzle {
+                size: naga::VectorSize::Bi,
+                vector: position,
+                pattern: [
+                    naga::SwizzleComponent::X,
+                    naga::SwizzleComponent::Y,
+                    naga::SwizzleComponent::X,
+                    naga::SwizzleComponent::X,
+                ],
+            },
+            Span::UNDEFINED,
+        );
+        let coords = e.append(
+            Expression::As { expr: xy, kind: ScalarKind::Uint, convert: Some(4) },
+            Span::UNDEFINED,
+        );
+        // (Within the mask: white is a texel alone, where none is laid.)
+        let size = e.append(
+            Expression::ImageQuery { image, query: naga::ImageQuery::Size { level: None } },
+            Span::UNDEFINED,
+        );
+        let ones = e.append(
+            Expression::Splat { size: naga::VectorSize::Bi, value: one_u },
+            Span::UNDEFINED,
+        );
+        let last = e.append(
+            Expression::Binary { op: BinaryOperator::Subtract, left: size, right: ones },
+            Span::UNDEFINED,
+        );
+        let pixel = e.append(
+            Expression::Math {
+                fun: naga::MathFunction::Min,
+                arg: coords,
+                arg1: Some(last),
+                arg2: None,
+                arg3: None,
+            },
+            Span::UNDEFINED,
+        );
+        let texel = e.append(
+            Expression::ImageLoad {
+                image,
+                coordinate: pixel,
+                array_index: None,
+                sample: None,
+                level: Some(level),
+            },
+            Span::UNDEFINED,
+        );
+        let shade = e.append(Expression::AccessIndex { base: texel, index: 0 }, Span::UNDEFINED);
+        let factor = e.append(
+            Expression::Compose { ty: vec4, components: vec![shade, shade, shade, one] },
+            Span::UNDEFINED,
+        );
+        let shaded = e.append(
+            Expression::Binary { op: BinaryOperator::Multiply, left: color, right: factor },
+            Span::UNDEFINED,
+        );
+        let out = match member {
+            None => shaded,
+            Some(i) => {
+                let Expression::Compose { components, .. } = &e[value] else { unreachable!() };
+                let mut components = components.clone();
+                components[i] = shaded;
+                e.append(Expression::Compose { ty: result_ty, components }, Span::UNDEFINED)
+            }
+        };
+        let mut statements: Vec<Statement> =
+            emitter.finish(e).map(|(s, _)| s).into_iter().collect();
+        statements.push(Statement::Return { value: Some(out) });
+        f.body.splice(at..=at, Block::from_vec(statements));
+        self.revalidate()
+    }
+
     /// Whether the program reads uniform `name`: glslang keeps every loose
     /// uniform the program declares in its block (the stock includes
     /// declare `worldtimerTimeOfDay` for every program), read or not.
@@ -375,18 +552,22 @@ impl Program {
         self.revalidate()
     }
 
-    /// Splits the program's uniform block into three by what each member
-    /// is (`part_of`, which says [`Part::Draw`], [`Part::Frame`] or
-    /// [`Part::Bones`]): one a renderer writes for each draw, one written
-    /// once a frame (the projection, the fog, the clock: the same for
-    /// every draw), one of the bones (a skinned draw's). Each is laid out
-    /// anew, its members in the order they came in, and those the program
+    /// Splits the program's uniform block into up to four parts by what each member
+    /// is (`part_of`, which says [`Part::Draw`], [`Part::Frame`], [`Part::Bones`],
+    /// or [`Part::Lights`]): per-draw state (moved into the `DRAWS` storage array),
+    /// per-frame state (the projection, fog, and clock), bone matrices (for skinned
+    /// draws), and light entries (moved into the `LIGHTS` storage array). Each is
+    /// laid out anew, its members in the order they came in, and those the program
     /// never reads left out (glslang keeps every one declared), so a draw's
-    /// block is as small as its own members make it (`vslit`'s whole block is 8.7
+    /// entry is as small as its own members make it (`vslit`'s whole block is 8.7
     /// KB, 4 KB of it `m_bones`). A part with no members holds one unused
-    /// `vec4`. The draw's block keeps the block's binding; the frame's and
-    /// the bones' take the two that were kept for them (bound after the
-    /// rest).
+    /// `vec4`. The draw's and the lights' parts, elements of storage
+    /// arrays, are laid out by OpenGL's std430 and filled to their 16-byte
+    /// span; the frame's and the bones' by std140 (`crate::layout`: naga's
+    /// GLSL keeps no offsets). A program whose parts OpenGL would lay out
+    /// otherwise all the same is an error. Storage buffers (`DRAWS` and `LIGHTS`)
+    /// drop the original uniform block binding; `Frame` and `Bones` take the
+    /// uniform buffer bindings reserved after them.
     ///
     /// `false`, the program unchanged, where it has no one block to split
     /// (no loose uniforms) or uses it otherwise than member by member.
@@ -403,6 +584,13 @@ impl Program {
         .validate(&module)
         .map_err(|e| naga_err(crate::chain(e.as_inner())))?;
         let group = self.reflection.group;
+        // (A layout OpenGL would read otherwise is refused on every back
+        // end, as a program that doesn't compile is: a renderer draws it
+        // with its own shader. `split_module` lays the parts out as OpenGL
+        // does, so this is a guard.)
+        if let Some(why) = layout::module_differs(&module) {
+            return Err(naga_err(format!("laid out otherwise than OpenGL lays it out: {why}")));
+        }
         let name = self.reflection.uniforms.first().map(|b| b.name.clone()).unwrap_or_default();
         self.reflection.uniforms = blocks
             .into_iter()
@@ -459,16 +647,19 @@ impl Program {
     /// Counts `gl_FragCoord.y` from the bottom of the picture, as OpenGL
     /// does (wgpu counts it from the top, on every backend): the fragment
     /// entry point's position is stored for the program as
-    /// `(x, height − y, z, w)`, the height that of the framebuffer's copy
-    /// it reads (the picture's). For a program that reads the copies,
-    /// which Moonglow writes with OpenGL's rows, so that a pixel found from
-    /// `gl_FragCoord` and one found from the projection (y up) are the
-    /// same pixel, as in the client (`docs/framebuffer-proposal.md`).
-    /// `false`, the program unchanged, where it doesn't read the
-    /// fragment's position; an error where it does but declares no copy
-    /// ([`FRAMEBUFFER_IMAGES`]).
-    pub fn frag_coord_from_bottom(&mut self) -> Result<bool, ShaderError> {
-        let changed = frag_coord_from_bottom(&mut self.module).map_err(naga_err)?;
+    /// `(x, height − y, z, w)`, the picture's height. With `copies` (the
+    /// program reads the framebuffer's copies, which Moonglow writes with
+    /// OpenGL's rows, so that a pixel found from `gl_FragCoord` and one
+    /// found from the projection, y up, are the same pixel, as in the
+    /// client: `docs/framebuffer-proposal.md`) the height is the copy's it
+    /// declares ([`FRAMEBUFFER_IMAGES`]); without, the engine's
+    /// `screenParams` (the picture's width and height, which `inc_common`
+    /// declares for every stock program), so that a program that works in
+    /// the screen's pixels and reads no copy isn't upside down. `false`,
+    /// the program unchanged, where it doesn't read the fragment's
+    /// position; an error where it does but has neither height.
+    pub fn frag_coord_from_bottom(&mut self, copies: bool) -> Result<bool, ShaderError> {
+        let changed = frag_coord_from_bottom(&mut self.module, copies).map_err(naga_err)?;
         if changed {
             self.revalidate()?;
         }
@@ -509,15 +700,45 @@ const PAD: &str = "mg_unused";
 /// split): the colour, the depth.
 pub const FRAMEBUFFER_IMAGES: [&str; 2] = ["texFBColor_image", "texFBDepth_image"];
 
+/// The shadows' mask a program darkened by [`Program::darken_by_mask`]
+/// reads (a name no program of the game's gives a variable).
+pub const SHADOW_MASK: &str = "mg_shadow_mask";
+
+/// Where [`Program::frag_coord_from_bottom`] finds the picture's height.
+#[derive(Clone, Copy)]
+enum Height {
+    /// A framebuffer's copy: its size.
+    Copy(naga::Handle<naga::GlobalVariable>),
+    /// The uniform block, and `screenParams`' place in it (`.y`).
+    Screen(naga::Handle<naga::GlobalVariable>, u32),
+}
+
 /// [`Program::frag_coord_from_bottom`] on a module.
-fn frag_coord_from_bottom(module: &mut Module) -> Result<bool, String> {
-    // A copy of the framebuffer the program declares: its size is the
-    // picture's.
-    let image = module
-        .global_variables
-        .iter()
-        .find(|(_, g)| g.name.as_deref().is_some_and(|n| FRAMEBUFFER_IMAGES.contains(&n)))
-        .map(|(h, _)| h);
+fn frag_coord_from_bottom(module: &mut Module, copies: bool) -> Result<bool, String> {
+    // A copy of the framebuffer the program reads, whose size is the
+    // picture's; else the engine's screen size.
+    let image = copies
+        .then(|| {
+            module
+                .global_variables
+                .iter()
+                .find(|(_, g)| g.name.as_deref().is_some_and(|n| FRAMEBUFFER_IMAGES.contains(&n)))
+                .map(|(h, _)| Height::Copy(h))
+        })
+        .flatten();
+    let screen = module.global_variables.iter().find_map(|(h, g)| {
+        if g.space != naga::AddressSpace::Uniform {
+            return None;
+        }
+        let TypeInner::Struct { members, .. } = &module.types[g.ty].inner else { return None };
+        let k = members.iter().position(|m| m.name.as_deref() == Some("screenParams"))?;
+        let two = matches!(
+            module.types[members[k].ty].inner,
+            TypeInner::Vector { size: naga::VectorSize::Bi, scalar: naga::Scalar::F32 }
+        );
+        two.then_some(Height::Screen(h, k as u32))
+    });
+    let height_of = image.or(screen);
     let mut changed = false;
     for ep in module.entry_points.iter_mut().filter(|e| e.stage == naga::ShaderStage::Fragment) {
         let f = &mut ep.function;
@@ -529,9 +750,13 @@ fn frag_coord_from_bottom(module: &mut Module) -> Result<bool, String> {
             continue;
         };
         let pos_ty = f.arguments[arg].ty;
-        let image = image.ok_or("it reads gl_FragCoord but no framebuffer copy")?;
-        let e = &mut f.expressions;
-        let Some(value) = e
+        let height_of = height_of.ok_or(if copies {
+            "it reads gl_FragCoord but no framebuffer copy"
+        } else {
+            "it reads gl_FragCoord but neither a framebuffer copy nor screenParams"
+        })?;
+        let Some(value) = f
+            .expressions
             .iter()
             .find(|(_, x)| matches!(x, Expression::FunctionArgument(i) if *i as usize == arg))
             .map(|(h, _)| h)
@@ -546,40 +771,89 @@ fn frag_coord_from_bottom(module: &mut Module) -> Result<bool, String> {
         else {
             return Err("the fragment entry point doesn't store its position".into());
         };
-        let global = e.append(Expression::GlobalVariable(image), Span::UNDEFINED);
-        let mut emitter = Emitter::default();
-        emitter.start(e);
-        let size = e.append(
-            Expression::ImageQuery { image: global, query: naga::ImageQuery::Size { level: None } },
-            Span::UNDEFINED,
-        );
-        let height = e.append(Expression::AccessIndex { base: size, index: 1 }, Span::UNDEFINED);
-        let height = e.append(
-            Expression::As { expr: height, kind: ScalarKind::Float, convert: Some(4) },
-            Span::UNDEFINED,
-        );
-        let c = |e: &mut naga::Arena<Expression>, index| {
-            e.append(Expression::AccessIndex { base: value, index }, Span::UNDEFINED)
-        };
-        let (x, y, z, w) = (c(e, 0), c(e, 1), c(e, 2), c(e, 3));
-        let y = e.append(
-            Expression::Binary { op: BinaryOperator::Subtract, left: height, right: y },
-            Span::UNDEFINED,
-        );
-        let pos = e.append(
-            Expression::Compose { ty: pos_ty, components: vec![x, y, z, w] },
-            Span::UNDEFINED,
-        );
-        let emit = emitter.finish(e).map(|(s, _)| s);
-        if let Statement::Store { value: v, .. } = &mut f.body[at] {
-            *v = pos;
-        }
-        if let Some(emit) = emit {
-            f.body.splice(at..at, Block::from_vec(vec![emit]));
+        match height_of {
+            Height::Copy(image) => {
+                // In the wrapper, as it stores the position.
+                let e = &mut f.expressions;
+                let global = e.append(Expression::GlobalVariable(image), Span::UNDEFINED);
+                let mut emitter = Emitter::default();
+                emitter.start(e);
+                let size = e.append(
+                    Expression::ImageQuery {
+                        image: global,
+                        query: naga::ImageQuery::Size { level: None },
+                    },
+                    Span::UNDEFINED,
+                );
+                let height =
+                    e.append(Expression::AccessIndex { base: size, index: 1 }, Span::UNDEFINED);
+                let height = e.append(
+                    Expression::As { expr: height, kind: ScalarKind::Float, convert: Some(4) },
+                    Span::UNDEFINED,
+                );
+                let pos = from_bottom(e, value, height, pos_ty);
+                let emit = emitter.finish(e).map(|(s, _)| s);
+                if let Statement::Store { value: v, .. } = &mut f.body[at] {
+                    *v = pos;
+                }
+                if let Some(emit) = emit {
+                    f.body.splice(at..at, Block::from_vec(vec![emit]));
+                }
+            }
+            Height::Screen(block, k) => {
+                // In the program's own `main`, which the wrapper calls once
+                // it has stored the position, as it begins: the uniform
+                // block is read where the program reads it (where
+                // `Program::split_uniforms` finds the spare blocks it moves
+                // the member to).
+                let Statement::Store { pointer, .. } = f.body[at] else { unreachable!() };
+                let Expression::GlobalVariable(var) = f.expressions[pointer] else {
+                    return Err("the fragment entry point stores its position elsewhere".into());
+                };
+                let main = f.body.iter().find_map(|s| match s {
+                    Statement::Call { function, .. } => Some(*function),
+                    _ => None,
+                });
+                let main = main.ok_or("the fragment entry point calls no main")?;
+                let m = &mut module.functions[main];
+                let e = &mut m.expressions;
+                let stored = e.append(Expression::GlobalVariable(var), Span::UNDEFINED);
+                let global = e.append(Expression::GlobalVariable(block), Span::UNDEFINED);
+                let mut emitter = Emitter::default();
+                emitter.start(e);
+                let member =
+                    e.append(Expression::AccessIndex { base: global, index: k }, Span::UNDEFINED);
+                let y =
+                    e.append(Expression::AccessIndex { base: member, index: 1 }, Span::UNDEFINED);
+                let height = e.append(Expression::Load { pointer: y }, Span::UNDEFINED);
+                let was = e.append(Expression::Load { pointer: stored }, Span::UNDEFINED);
+                let pos = from_bottom(e, was, height, pos_ty);
+                let emit = emitter.finish(e).map(|(s, _)| s);
+                let store = Statement::Store { pointer: stored, value: pos };
+                m.body.splice(0..0, Block::from_vec(emit.into_iter().chain([store]).collect()));
+            }
         }
         changed = true;
     }
     Ok(changed)
+}
+
+/// `(x, height − y, z, w)` of a position (expressions appended: emitted
+/// by the caller).
+fn from_bottom(
+    e: &mut naga::Arena<Expression>,
+    position: naga::Handle<Expression>,
+    height: naga::Handle<Expression>,
+    ty: naga::Handle<naga::Type>,
+) -> naga::Handle<Expression> {
+    let mut c =
+        |index| e.append(Expression::AccessIndex { base: position, index }, Span::UNDEFINED);
+    let (x, y, z, w) = (c(0), c(1), c(2), c(3));
+    let y = e.append(
+        Expression::Binary { op: BinaryOperator::Subtract, left: height, right: y },
+        Span::UNDEFINED,
+    );
+    e.append(Expression::Compose { ty, components: vec![x, y, z, w] }, Span::UNDEFINED)
 }
 
 /// [`Program::split_uniforms`] on a module: each part's variable and its
@@ -624,25 +898,38 @@ fn split_module(
         .filter(|(h, g)| g.space == AddressSpace::Uniform && *h != frame && *h != bones)
         .map(|(h, _)| h)
         .collect();
-    let [block] = blocks[..] else { return Ok(None) };
+    // (glslang's block of the loose uniforms, and any block a program
+    // names, `uniform Name { … };`: their members all go to the parts.)
+    let Some(&block) = blocks.first() else { return Ok(None) };
+    let mut members = Vec::new();
+    // Each block's first member's place among them all.
+    let mut first = Vec::with_capacity(blocks.len());
+    for &b in &blocks {
+        let TypeInner::Struct { members: list, .. } =
+            &module.types[module.global_variables[b].ty].inner
+        else {
+            return Ok(None);
+        };
+        first.push(members.len());
+        members.extend(list.iter().cloned());
+    }
     let ty = module.global_variables[block].ty;
-    let TypeInner::Struct { members, .. } = module.types[ty].inner.clone() else {
-        return Ok(None);
-    };
     let block_name = module.types[ty].name.clone().unwrap_or_default();
-    // Every use of the block is a member's access (as glslang writes them).
+    // The block of an expression of a function, and its first member's
+    // place: where it is one of the blocks' variables.
+    let of = |e: &Expression| match e {
+        Expression::GlobalVariable(g) => blocks.iter().position(|b| b == g).map(|k| first[k]),
+        _ => None,
+    };
+    // Every use of a block is a member's access (as glslang writes them).
     for f in module
         .functions
         .iter()
         .map(|(_, f)| f)
         .chain(module.entry_points.iter().map(|e| &e.function))
     {
-        let mine: Vec<_> = f
-            .expressions
-            .iter()
-            .filter(|(_, e)| matches!(e, Expression::GlobalVariable(g) if *g == block))
-            .map(|(h, _)| h)
-            .collect();
+        let mine: Vec<_> =
+            f.expressions.iter().filter(|(_, e)| of(e).is_some()).map(|(h, _)| h).collect();
         let other = f.expressions.iter().any(|(_, e)| match e {
             Expression::Load { pointer } => mine.contains(pointer),
             Expression::Access { base, .. } => mine.contains(base),
@@ -661,24 +948,16 @@ fn split_module(
         .map(|(_, f)| f)
         .chain(module.entry_points.iter().map(|e| &e.function))
     {
-        let mine: Vec<_> = f
-            .expressions
-            .iter()
-            .filter(|(_, e)| matches!(e, Expression::GlobalVariable(g) if *g == block))
-            .map(|(h, _)| h)
-            .collect();
         for (_, e) in f.expressions.iter() {
             if let Expression::AccessIndex { base, index } = e
-                && mine.contains(base)
-                && let Some(r) = read.get_mut(*index as usize)
+                && let Some(at) = of(&f.expressions[*base])
+                && let Some(r) = read.get_mut(at + *index as usize)
             {
                 *r = true;
             }
         }
     }
     // Each part's members, laid out anew (those never read in none).
-    let mut layouter = naga::proc::Layouter::default();
-    layouter.update(module.to_ctx()).map_err(naga_err)?;
     let order = [Part::Draw, Part::Frame, Part::Bones, Part::Lights];
     let mut parts: [Vec<StructMember>; 4] = Default::default();
     let mut ends = [0u32; 4];
@@ -693,18 +972,18 @@ fn split_module(
             p => p,
         };
         let k = order.iter().position(|p| *p == part).unwrap_or(0);
-        let inner = &module.types[m.ty].inner;
-        // (std140's: a vec2 by 8, a vec3, vec4, matrix or array by 16.)
-        let own = match inner {
-            TypeInner::Scalar(_) => 4,
-            TypeInner::Vector { size: naga::VectorSize::Bi, .. } => 8,
-            _ => 16,
+        let rules = if matches!(order[k], Part::Draw | Part::Lights) {
+            Rules::Std430
+        } else {
+            Rules::Std140
         };
-        let align = own.max(layouter[m.ty].alignment * 1);
+        let ty = layout::relayout(module, m.ty, rules);
+        let (align, size) = layout::of(module, ty, rules)
+            .ok_or_else(|| naga_err("a uniform of a type no block holds"))?;
         let offset = ends[k].div_ceil(align) * align;
-        ends[k] = offset + inner.size(module.to_ctx());
+        ends[k] = offset + size;
         moved.push(Some((k, parts[k].len() as u32)));
-        parts[k].push(StructMember { offset, ..m.clone() });
+        parts[k].push(StructMember { offset, ty, ..m.clone() });
     }
     let vec4 = module.types.insert(
         naga::Type {
@@ -725,6 +1004,25 @@ fn split_module(
             ends[k] = 16;
         }
         let span = ends[k].max(16).div_ceil(16) * 16;
+        if matches!(order[k], Part::Draw | Part::Lights) {
+            // Unused words fill an element to its span, so that OpenGL's
+            // std430, which rounds a struct up to its widest member's
+            // alignment alone (one `int`: 4 bytes), makes it as wide.
+            let word = module.types.insert(
+                naga::Type { name: None, inner: TypeInner::Scalar(naga::Scalar::U32) },
+                Span::UNDEFINED,
+            );
+            let mut at = ends[k].div_ceil(4) * 4;
+            while at < span {
+                list.push(StructMember {
+                    name: Some(PAD.into()),
+                    ty: word,
+                    binding: None,
+                    offset: at,
+                });
+                at += 4;
+            }
+        }
         let t = module.types.insert(
             naga::Type {
                 name: Some(format!("{block_name}_{:?}", order[k]).to_ascii_lowercase()),
@@ -786,7 +1084,9 @@ fn split_module(
         },
         Span::UNDEFINED,
     );
-    module.global_variables[block].ty = pad;
+    for &b in &blocks {
+        module.global_variables[b].ty = pad;
+    }
     // Each access to a member goes to its part's block.
     let fns = module
         .functions
@@ -800,12 +1100,9 @@ fn split_module(
                 .find(|(_, e)| matches!(e, Expression::GlobalVariable(x) if *x == g))
                 .map(|(h, _)| h)
         };
-        let olds: Vec<Handle<Expression>> = f
-            .expressions
-            .iter()
-            .filter(|(_, e)| matches!(e, Expression::GlobalVariable(x) if *x == block))
-            .map(|(h, _)| h)
-            .collect();
+        // (Each block's variable here, and its first member's place.)
+        let olds: Vec<(Handle<Expression>, usize)> =
+            f.expressions.iter().filter_map(|(h, e)| of(e).map(|at| (h, at))).collect();
         if olds.is_empty() {
             continue;
         }
@@ -833,10 +1130,10 @@ fn split_module(
         let bases = [de, fe, be, le];
         for (_, e) in f.expressions.iter_mut() {
             if let Expression::AccessIndex { base, index } = e
-                && olds.contains(base)
+                && let Some(&(_, at)) = olds.iter().find(|(h, _)| h == base)
             {
                 let &(k, j) = moved
-                    .get(*index as usize)
+                    .get(at + *index as usize)
                     .and_then(Option::as_ref)
                     .ok_or_else(|| naga_err("an access past the block's members"))?;
                 (*base, *index) = (bases[k], j);
@@ -1244,9 +1541,10 @@ void main () { gl_FragColor = first(lightPosition) + lightColor[1]; }
     }
 
     /// `gl_FragCoord.y` counted from the bottom: the position stored for
-    /// the program is the copy's height less y; the program still splits;
-    /// one that never reads the position is left as it is, and one that
-    /// reads it without a copy is an error.
+    /// the program is the copy's height less y, or without a copy
+    /// `screenParams`'; the program still splits; one that never reads the
+    /// position is left as it is, and one that reads it with neither
+    /// height is an error.
     #[test]
     fn the_fragment_s_position_is_counted_from_the_bottom() {
         let src: BTreeMap<String, String> = [
@@ -1275,10 +1573,16 @@ void main ()
                 "#define SHADER_TYPE 2\nvoid main () { gl_FragColor = gl_FragCoord; }\n"
                     .to_string(),
             ),
+            (
+                "fs_screen".to_string(),
+                "#define SHADER_TYPE 2\nuniform vec2 screenParams;\n\
+                 void main () { gl_FragColor = vec4(gl_FragCoord.xy / screenParams, 0.0, 1.0); }\n"
+                    .to_string(),
+            ),
         ]
         .into();
         let mut p = compile("fs_coord", Stage::Fragment, &Preamble::default(), &src).unwrap();
-        assert!(p.frag_coord_from_bottom().unwrap());
+        assert!(p.frag_coord_from_bottom(true).unwrap());
         let wgsl = naga::back::wgsl::write_string(
             &p.module,
             &p.info,
@@ -1294,10 +1598,170 @@ void main ()
         assert!(p.reflection.uniform("screenParams").is_some());
         let mut plain = compile("fs_plain", Stage::Fragment, &Preamble::default(), &src).unwrap();
         let before = format!("{:?}", plain.module);
-        assert!(!plain.frag_coord_from_bottom().unwrap());
+        assert!(!plain.frag_coord_from_bottom(false).unwrap());
         assert_eq!(before, format!("{:?}", plain.module));
         let mut bare = compile("fs_bare", Stage::Fragment, &Preamble::default(), &src).unwrap();
-        assert!(bare.frag_coord_from_bottom().is_err());
+        assert!(bare.frag_coord_from_bottom(false).is_err());
+        // No copy read: the height is screenParams'.
+        let mut screen = compile("fs_screen", Stage::Fragment, &Preamble::default(), &src).unwrap();
+        assert!(screen.frag_coord_from_bottom(false).unwrap());
+        let wgsl = naga::back::wgsl::write_string(
+            &screen.module,
+            &screen.info,
+            naga::back::wgsl::WriterFlags::empty(),
+        )
+        .unwrap();
+        assert!(!wgsl.contains("textureDimensions"), "{wgsl}");
+        assert!(screen.split_uniforms(part).unwrap());
+        assert!(screen.reflection.uniform("screenParams").is_some());
+    }
+
+    /// A program darkened by the shadows' mask: its color times the mask's
+    /// texel at its pixel, whether it read its position or not; still
+    /// split and its position still counted from the bottom.
+    #[test]
+    fn a_program_is_darkened_by_the_shadows_mask() {
+        let src: BTreeMap<String, String> = [
+            (
+                "fs_plain".to_string(),
+                "#define SHADER_TYPE 2\nuniform vec4 c;\nvoid main () { gl_FragColor = c; }\n"
+                    .to_string(),
+            ),
+            (
+                "fs_screen".to_string(),
+                "#define SHADER_TYPE 2\nuniform vec2 screenParams;\n\
+                 void main () { gl_FragColor = vec4(gl_FragCoord.xy / screenParams, 0.0, 1.0); }\n"
+                    .to_string(),
+            ),
+        ]
+        .into();
+        let part = |_: &crate::Member| Part::Frame;
+        for name in ["fs_plain", "fs_screen"] {
+            let mut p = compile(name, Stage::Fragment, &Preamble::default(), &src).unwrap();
+            p.frag_coord_from_bottom(false).unwrap();
+            p.darken_by_mask(1, 11).unwrap();
+            assert!(p.split_uniforms(part).unwrap());
+            let wgsl = naga::back::wgsl::write_string(
+                &p.module,
+                &p.info,
+                naga::back::wgsl::WriterFlags::empty(),
+            )
+            .unwrap();
+            assert!(wgsl.contains("var mg_shadow_mask: texture_2d<f32>"), "{wgsl}");
+            assert!(wgsl.contains("textureLoad(mg_shadow_mask"), "{wgsl}");
+            assert_eq!(wgsl.matches("@builtin(position)").count(), 1, "{wgsl}");
+            assert!(p.reflection.textures.iter().all(|t| t.name != SHADOW_MASK));
+        }
+    }
+
+    /// A named uniform block beside the loose uniforms is split with them:
+    /// its members go to the parts by what each is, as the loose ones do.
+    #[test]
+    fn a_named_uniform_block_beside_the_loose_ones_is_split_with_them() {
+        let src: BTreeMap<String, String> = [(
+            "fs_named".to_string(),
+            "#define SHADER_TYPE 2\nuniform vec4 loose;\nuniform Glow { vec4 glow; };\n\
+             void main () { gl_FragColor = loose + glow; }\n"
+                .to_string(),
+        )]
+        .into();
+        let mut p = compile("fs_named", Stage::Fragment, &Preamble::default(), &src).unwrap();
+        let part = |m: &crate::Member| if m.name == "glow" { Part::Frame } else { Part::Draw };
+        assert!(p.split_uniforms(part).unwrap());
+        let (draw, loose) = p.reflection.uniform("loose").unwrap();
+        let (frame, glow) = p.reflection.uniform("glow").unwrap();
+        assert_eq!((draw.part, frame.part), (Part::Draw, Part::Frame));
+        assert_eq!((loose.offset, glow.offset), (0, 0));
+        naga::back::wgsl::write_string(&p.module, &p.info, naga::back::wgsl::WriterFlags::empty())
+            .unwrap();
+    }
+
+    /// The program's GLSL, as wgpu's OpenGL back end has naga write it.
+    fn glsl(p: &Program) -> String {
+        use naga::back::glsl;
+        let ep = &p.module.entry_points[0];
+        let mut out = String::new();
+        let options = glsl::Options {
+            version: glsl::Version::Desktop(430),
+            writer_flags: glsl::WriterFlags::empty(),
+            ..Default::default()
+        };
+        let pipeline = glsl::PipelineOptions {
+            shader_stage: ep.stage,
+            entry_point: ep.name.clone(),
+            multiview: None,
+        };
+        glsl::Writer::new(&mut out, &p.module, &p.info, &options, &pipeline, Default::default())
+            .and_then(|mut w| w.write())
+            .unwrap_or_else(|e| panic!("{}: {e}", p.name));
+        out
+    }
+
+    /// A draw's values in a storage array's element are laid out as
+    /// OpenGL's std430 lays them out, since naga's GLSL keeps no offsets
+    /// or strides: an element of one `int` filled to its 16 bytes; arrays
+    /// of scalars and of `vec2`s by their own strides; a nested struct by
+    /// its members; and a whole array of them passed to a function.
+    #[test]
+    fn a_draw_s_values_are_laid_out_as_opengl_s_std430_lays_them_out() {
+        let src: BTreeMap<String, String> = [
+            (
+                "fs_int".to_string(),
+                "#define SHADER_TYPE 2\nuniform int texture0Bound;\n\
+                 void main () { gl_FragColor = vec4(float(texture0Bound)); }\n"
+                    .to_string(),
+            ),
+            (
+                "fs_arrays".to_string(),
+                r#"
+#define SHADER_TYPE 2
+struct Wave { float height; vec2 dir; };
+uniform int count;
+uniform float weights[3];
+uniform vec2 offsets[2];
+uniform Wave wave;
+uniform vec3 tint;
+float sum(float w[3]) { return w[0] + w[1] + w[2]; }
+void main ()
+{
+    gl_FragColor = vec4(tint * sum(weights) * wave.height, float(count))
+        + vec4(offsets[1], wave.dir);
+}
+"#
+                .to_string(),
+            ),
+        ]
+        .into();
+        let draw = |_: &crate::Member| Part::Draw;
+        let mut p = compile("fs_int", Stage::Fragment, &Preamble::default(), &src).unwrap();
+        assert!(p.split_uniforms(draw).unwrap());
+        assert_eq!(p.opengl_layout_differs(), None);
+        let block = &p.reflection.uniforms[0];
+        assert_eq!((block.part, block.size), (Part::Draw, 16));
+        assert_eq!(block.members.len(), 1, "the words that fill it are no uniforms");
+        glsl(&p);
+
+        let mut p = compile("fs_arrays", Stage::Fragment, &Preamble::default(), &src).unwrap();
+        assert!(p.split_uniforms(draw).unwrap());
+        assert_eq!(p.opengl_layout_differs(), None);
+        let block = &p.reflection.uniforms[0];
+        let at = |name: &str| {
+            let m = block.member(name).unwrap();
+            (m.offset, m.stride)
+        };
+        // (std430: the floats 4 apart from byte 4, the pairs 8 apart from
+        // 16, the struct aligned as its `vec2` at 32, the `vec3` at 48.)
+        assert_eq!(at("count"), (0, 4));
+        assert_eq!(at("weights"), (4, 4));
+        assert_eq!(at("offsets"), (16, 8));
+        assert_eq!(at("wave").0, 32);
+        let wave = block.member("wave").unwrap();
+        let inner: Vec<u32> = wave.members.iter().map(|m| m.offset).collect();
+        assert_eq!((inner, wave.size), (vec![0, 8], 16));
+        assert_eq!(at("tint").0, 48);
+        assert_eq!(block.size, 64);
+        let text = glsl(&p);
+        assert!(text.contains("std430"), "{text}");
     }
 
     #[test]
@@ -1312,5 +1776,39 @@ void main ()
             .filter_map(|(_, g)| g.binding.map(|b| b.group))
             .collect();
         assert!(!groups.is_empty() && groups.iter().all(|&g| g == 1), "{groups:?}");
+    }
+
+    #[test]
+    fn frame_block_relayouts_members_to_std140() {
+        let src: BTreeMap<String, String> = [(
+            "fs_frame".to_string(),
+            "#define SHADER_TYPE 2\nstruct FrameS { float x; vec2 y; };\n\
+             uniform FrameS frameS;\nuniform float frameArr[2];\n\
+             void main () { gl_FragColor = vec4(frameS.x, frameS.y, frameArr[1]); }\n"
+                .to_string(),
+        )]
+        .into();
+        let mut p = compile("fs_frame", Stage::Fragment, &Preamble::default(), &src).unwrap();
+        // Re-lay the input uniform block out by Std430 (e.g. stride 4, struct span 8):
+        // split_uniforms must normalize Part::Frame back to Std140 so OpenGL validation passes.
+        let (var_h, var_ty) = p
+            .module
+            .global_variables
+            .iter()
+            .find_map(|(h, g)| {
+                (g.space == naga::AddressSpace::Uniform
+                    && !crate::spirv::SPARE_BLOCKS.contains(&g.name.as_deref().unwrap_or("")))
+                .then_some((h, g.ty))
+            })
+            .unwrap();
+        let std430_ty = layout::relayout(&mut p.module, var_ty, Rules::Std430);
+        p.module.global_variables[var_h].ty = std430_ty;
+        assert!(p.split_uniforms(|_| Part::Frame).unwrap());
+        assert_eq!(p.opengl_layout_differs(), None);
+        let block = p.reflection.uniforms.iter().find(|b| b.part == Part::Frame).unwrap();
+        assert_eq!(block.member("frameS").unwrap().size, 16);
+        assert_eq!(block.member("frameArr").unwrap().offset, 16);
+        assert_eq!(block.member("frameArr").unwrap().stride, 16);
+        assert_eq!(block.size, 48);
     }
 }

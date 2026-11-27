@@ -10,7 +10,7 @@ use crate::common::*;
 fn terrain_screen() {
     use glam::Vec3;
     let Some((mut h, area)) = area_harness("terrain-screen") else { return };
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
     h.get_by_label("Tiles").click();
     h.run_steps(2);
@@ -25,7 +25,7 @@ fn terrain_screen() {
         ("Water", [10.0, 20.0]),
         ("Water", [10.0, 30.0]),
         ("Trees", [30.0, 30.0]),
-        ("↕ Raise/Lower", [40.0, 30.0]),
+        ("Raise/Lower", [40.0, 30.0]),
     ] {
         h.get_by_label(brush).click();
         h.run_steps(2);
@@ -64,7 +64,7 @@ fn look_tile_brush_with_game_shaders() {
     use glam::Vec3;
     let Some((mut h, area)) = area_harness("tile-brush-shaders") else { return };
     h.state_mut().settings.game_shaders = Some(true);
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
     h.get_by_label("Tiles").click();
     h.run_steps(2);
@@ -126,7 +126,7 @@ fn look_gallery_water_with_game_shaders() {
     h.state_mut().set_game_shaders(true);
     h.state_mut().settings.palette_gallery = true;
     h.state_mut().settings.gallery_tile = Some(160);
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
     h.get_by_label("Tiles").click();
     h.run_steps(2);
@@ -498,13 +498,13 @@ fn look_custom_group() {
     let group = std::env::var("MG_GROUP").unwrap_or_else(|_| "Volcano - Path 1".into());
     let Some((mut h, area)) = area_harness_on("custom-group-look", &tileset, None) else { return };
     h.set_size(egui::vec2(1500.0, 1000.0));
-    h.state_mut().actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(h.state_mut());
     h.run_steps(3);
-    palette_type(&mut h, "🗻", "Tiles");
+    palette_type(&mut h, "Tiles");
     h.run_steps(2);
     // (The palette's own Expand All: the one to the right.)
     let expand = h
-        .query_all_by_label("⏷")
+        .query_all_by_label("Expand All")
         .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
         .unwrap()
         .rect()
@@ -580,7 +580,7 @@ fn look_edit_together_mixed() {
     let mut app = game_app(&root, None);
     app.set_render_state(rs.clone());
     app.open_module(&path);
-    app.open_palette = false;
+    app.palette_dock = false;
     let game = app.game.as_deref().unwrap();
     let base = Gff::read(&game.resman.get_named("plc_chest1", ResType::UTP).unwrap()).unwrap();
     let keys: Vec<ResKey> =
@@ -638,7 +638,7 @@ fn look_placeable_appearance() {
     };
     h.state_mut().actions.push(mg_ui::Action::Apply(mg_edit::Command::new("Setup", vec![edit])));
     h.run_steps(20);
-    // MG_AT: "distance,yaw,pitch" to look at it from elsewhere.
+    // Set MG_AT to "distance,yaw,pitch" to change the camera position.
     let at: Vec<f32> = std::env::var("MG_AT")
         .map(|at| at.split(',').filter_map(|t| t.trim().parse().ok()).collect())
         .unwrap_or_default();
@@ -667,7 +667,7 @@ fn look_palette_in_language() {
     let mut app = Moonglow::new(Some(install), Box::new(NoDialogs::default()));
     app.set_render_state(rs.clone());
     app.open_module(&path);
-    app.actions.push(mg_ui::Action::OpenTab(Tab::Palette));
+    show_palette(&mut app);
     app.palette.kind = mg_module::palette::BlueprintKind::Creature;
     app.palette.tiles = false;
     app.palette.custom = std::env::var_os("MG_CUSTOM").is_some();
@@ -676,4 +676,237 @@ fn look_palette_in_language() {
     h.render().expect("render").save(dir.join("a.png")).unwrap();
     let game = h.state().game.as_deref().unwrap();
     eprintln!("LANG {:?} sample {:?}", game.language, game.string(mg_core::StrRef(6686)));
+}
+
+/// Page Up on a market stall (Trades - Market Stall 01, placeables.2da row
+/// 15519, `ptm_market11`), as a builder asked for it: a chest under its
+/// front counter (0.9 m) and the shelf behind it (1.37 m), the awning over
+/// them (`MG_AT=x,y` for elsewhere; the stall at 12, 20), and a picture
+/// before and after each Page Up
+/// (`target/test-output/ui-surface-stall/up-N.png`).
+#[test]
+#[ignore = "a look at Page Up's surfaces on a market stall"]
+fn look_surface_steps_on_a_stall() {
+    use glam::Vec3;
+    use mg_area::ObjectKind;
+    let at: Vec<f32> = std::env::var("MG_AT")
+        .unwrap_or_else(|_| "10,19.2".into())
+        .split(',')
+        .map(|v| v.trim().parse().unwrap())
+        .collect();
+    let (x, y) = (at[0], at[1]);
+    let placed = move |m: &mut mg_module::Module, game: &mg_rules::GameData, area: ResRef| {
+        use mg_module::instances::{Placement, Placing, instance};
+        let key = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+        let bp = Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        let stall_at = Placement { position: [12.0, 20.0, 0.0], rotation: 0.0 };
+        let mut stall = instance(&placing, ResType::UTP, &bp, stall_at, &[]).unwrap();
+        stall.set("Appearance", mg_gff::Value::Dword(15519));
+        let chest_at = Placement { position: [x, y, 0.0], rotation: 0.0 };
+        let chest = instance(&placing, ResType::UTP, &bp, chest_at, &[]).unwrap();
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        git.root.set("Placeable List", mg_gff::Value::List(vec![stall, chest]));
+        m.set_gff(git_key, &git).unwrap();
+    };
+    let Some((mut h, area)) = area_harness_with("surface-stall", "ttr01", None, 4, None, &placed)
+    else {
+        return;
+    };
+    let view = h.state_mut().area_views.get_mut(&area).unwrap();
+    view.selection = vec![(ObjectKind::Placeable, 1)];
+    if let Some(o) = view.orbit.as_mut() {
+        (o.target, o.distance, o.yaw, o.pitch) = (Vec3::new(x, y, 1.4), 6.0, -1.57, 0.45);
+    }
+    h.run_steps(10);
+    let dir = mg_testkit::scratch_dir("ui-surface-stall");
+    let over = h.state().area_views[&area].rect.center();
+    for n in 0..4 {
+        h.render().expect("render").save(dir.join(format!("up-{n}.png"))).unwrap();
+        h.hover_at(over);
+        h.key_press(egui::Key::PageUp);
+        h.run_steps(10);
+    }
+    for (_, line) in &h.state().log.entries {
+        eprintln!("{line}");
+    }
+    eprintln!("{}", dir.display());
+}
+
+/// A copied placeable being pasted (Ctrl+C, Ctrl+V, the pointer still)
+/// beside the same blueprint being placed from the palette, as pictures:
+/// the paste's ghost against the placement's (the owner's report: the
+/// paste's did not always show as a placement's does). By hand: `cargo
+/// test -p mg-ui --test app -- --ignored a_paste_s_ghost_beside_a_placement`.
+#[test]
+#[ignore]
+fn a_paste_s_ghost_beside_a_placement() {
+    use glam::Vec3;
+    use mg_area::ObjectKind;
+    let placed = |m: &mut mg_module::Module, game: &mg_rules::GameData, area: ResRef| {
+        use mg_module::instances::{Placement, Placing, instance};
+        let key = ResKey::parse("plc_chest1", ResType::UTP).unwrap();
+        let bp = Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+        let none = |_: ResRef| None;
+        let placing = Placing { game, item: &none };
+        let at = Placement { position: [12.0, 20.0, 0.0], rotation: 0.0 };
+        let mut chest = instance(&placing, ResType::UTP, &bp, at, &[]).unwrap();
+        // (MG_APPEARANCE: another placeables.2da row, a large one say.)
+        if let Some(row) = std::env::var("MG_APPEARANCE").ok().and_then(|r| r.parse().ok()) {
+            chest.set("Appearance", mg_gff::Value::Dword(row));
+        }
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        git.root.set("Placeable List", mg_gff::Value::List(vec![chest]));
+        m.set_gff(git_key, &git).unwrap();
+    };
+    let Some((mut h, area)) = area_harness_with("paste-ghost", "ttr01", None, 4, None, &placed)
+    else {
+        return;
+    };
+    let view = h.state_mut().area_views.get_mut(&area).unwrap();
+    view.selection = vec![(ObjectKind::Placeable, 0)];
+    if let Some(o) = view.orbit.as_mut() {
+        (o.target, o.distance, o.yaw, o.pitch) = (Vec3::new(14.0, 20.0, 0.5), 8.0, -1.57, 0.6);
+    }
+    h.run_steps(10);
+    let dir = mg_testkit::scratch_dir("ui-paste-ghost");
+    let to = screen(&h, area, Vec3::new(16.0, 20.0, 0.0));
+    h.hover_at(to);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::C);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::V);
+    h.run_steps(1);
+    h.render().expect("render").save(dir.join("paste-first-frame.png")).unwrap();
+    h.run_steps(5);
+    h.render().expect("render").save(dir.join("paste.png")).unwrap();
+    eprintln!(
+        "pasting {} shown {}",
+        h.state().area_views[&area].pasting,
+        h.state().area_views[&area].pasted_shown
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    h.state_mut().area_views.get_mut(&area).unwrap().selection.clear();
+    h.state_mut().palette.selected = ResKey::parse("plc_chest1", ResType::UTP);
+    h.hover_at(to + egui::vec2(1.0, 0.0));
+    h.run_steps(5);
+    h.render().expect("render").save(dir.join("placement.png")).unwrap();
+    eprintln!("{}", dir.display());
+}
+
+/// A look at creatures in PLT clothing and armor close up, for BC's
+/// error on a PLT's layer edges: the stock bandits and commoners in a row,
+/// with the compression as read on, or off with `MG_UNCOMPRESSED`
+/// (`target/test-output/ui-plt-creatures/{on,off}.png`).
+#[test]
+#[ignore = "a look at creatures in PLT clothing close up (MG_UNCOMPRESSED for RGBA8)"]
+fn look_plt_creatures() {
+    use glam::Vec3;
+    use mg_module::instances::{Placement, Placing, instance};
+    const CREATURES: [&str; 8] = [
+        "nw_bandit001",
+        "nw_bandit002",
+        "nw_bandit003",
+        "nw_bandit005",
+        "nw_bandit007",
+        "nw_commale",
+        "nw_comfemale",
+        "nw_bartender",
+    ];
+    let place = |m: &mut mg_module::Module, game: &mg_rules::GameData, area: ResRef| {
+        let git_key = ResKey::new(area, ResType::GIT);
+        let mut git = m.gff(&git_key).unwrap().unwrap();
+        // (Each worn item dyed with colors far apart on each layer, as a
+        // builder dyes them: a PLT's layer edges between unrelated colors,
+        // BC's worst case.)
+        let dye = |s: &mut mg_gff::Struct, seed: u32, fields: &[&str]| {
+            for (i, field) in fields.iter().enumerate() {
+                let color = (seed * 37 + i as u32 * 61) % 176;
+                s.set(field, mg_gff::Value::Byte(color as u8));
+            }
+        };
+        let items = |r: ResRef| {
+            let key = ResKey::new(r, ResType::UTI);
+            let mut root =
+                game.resman.get(&key).ok().and_then(|d| mg_gff::Gff::read(&d).ok())?.root;
+            let seed = r.as_str().unwrap_or_default().bytes().map(u32::from).sum::<u32>();
+            let layers = [
+                "Cloth1Color",
+                "Cloth2Color",
+                "Leather1Color",
+                "Leather2Color",
+                "Metal1Color",
+                "Metal2Color",
+            ];
+            dye(&mut root, seed, &layers);
+            Some(root)
+        };
+        let placing = Placing { game, item: &items };
+        let list = CREATURES
+            .iter()
+            .enumerate()
+            .map(|(i, bp)| {
+                let key = ResKey::parse(bp, ResType::UTC).unwrap();
+                let mut root = mg_gff::Gff::read(&game.resman.get(&key).unwrap()).unwrap().root;
+                let body = ["Color_Skin", "Color_Hair", "Color_Tattoo1", "Color_Tattoo2"];
+                dye(&mut root, 11 + i as u32 * 7, &body);
+                // (A human of parts, its armor and clothes PLTs: the
+                // blueprints' own appearances are whole models with DDS
+                // textures.)
+                root.set("Appearance_Type", mg_gff::Value::Word(6));
+                let at = Placement {
+                    position: [12.0 + i as f32, 20.0, 0.0],
+                    rotation: std::f32::consts::PI,
+                };
+                instance(&placing, ResType::UTC, &root, at, &[]).unwrap()
+            })
+            .collect();
+        git.root.set("Creature List", mg_gff::Value::List(list));
+        m.set_gff(git_key, &git).unwrap();
+    };
+    let Some((mut app, _, area)) = area_app("plt-creatures", "ttr01", None, 4, None, &place) else {
+        return;
+    };
+    // (A device with BC textures, as the desktop app asks for one: the
+    // tests' own has none, so nothing is compressed on it.)
+    let mut setup = egui_kittest::wgpu::default_wgpu_setup();
+    if let egui_wgpu::WgpuSetup::CreateNew(new) = &mut setup {
+        new.device_descriptor = std::sync::Arc::new(|adapter| wgpu::DeviceDescriptor {
+            required_features: adapter.features() & mg_ui::OPTIONAL_FEATURES,
+            required_limits: adapter.limits(),
+            ..Default::default()
+        });
+    }
+    let rs = egui_kittest::wgpu::create_render_state(
+        mg_ui::graphics_setup(setup),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    app.set_render_state(rs.clone());
+    // (Set before the first frame reads a texture: a material keeps the
+    // texture it was made with.)
+    let on = std::env::var_os("MG_UNCOMPRESSED").is_none();
+    let gpu = &app.viewport.as_ref().expect("a viewport with the render state").gpu;
+    gpu.set_compress_read_textures(on);
+    assert_eq!(gpu.compresses_read_textures(), on && gpu.bc_textures());
+    let mut h = area_gpu_harness(app, rs, 1800.0, 1000.0);
+    let view = h.state_mut().area_views.get_mut(&area).unwrap();
+    view.selection.clear();
+    if let Some(o) = view.orbit.as_mut() {
+        // (`MG_AT` the x of the creature looked at, 12 to 19; `MG_DISTANCE`.)
+        let var = |name: &str, or: f32| {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(or)
+        };
+        o.target = Vec3::new(var("MG_AT", 15.5), 20.0, 1.2);
+        (o.distance, o.yaw, o.pitch) = (var("MG_DISTANCE", 5.5), -1.57, 0.15);
+    }
+    settle(&mut h);
+    h.run_steps(20);
+    settle(&mut h);
+    let dir = mg_testkit::scratch_dir("ui-plt-creatures");
+    let name = if on { "on.png" } else { "off.png" };
+    h.render().expect("render").save(dir.join(name)).unwrap();
 }

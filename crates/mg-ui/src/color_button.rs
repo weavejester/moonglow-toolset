@@ -14,10 +14,11 @@ use egui::{Color32, Popup, PopupCloseBehavior, Response, Ui};
 pub fn parse(text: &str) -> Option<Color32> {
     let t = text.trim();
     let hex = t.strip_prefix('#').unwrap_or(t);
-    if matches!(hex.len(), 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-        let a = if hex.len() == 8 { byte(6)? } else { 255 };
-        return Some(Color32::from_rgba_unmultiplied(byte(0)?, byte(2)?, byte(4)?, a));
+    if let Some([r, g, b]) = mg_core::text::hex_bytes::<3>(hex) {
+        return Some(Color32::from_rgb(r, g, b));
+    }
+    if let Some([r, g, b, a]) = mg_core::text::hex_bytes::<4>(hex) {
+        return Some(Color32::from_rgba_unmultiplied(r, g, b, a));
     }
     let inner = t
         .strip_prefix("rgba(")
@@ -46,6 +47,28 @@ pub fn parse(text: &str) -> Option<Color32> {
         byte(numbers[2])?,
         a,
     ))
+}
+
+/// `c` as #rrggbb (#rrggbbaa where the color has an alpha), in lower case.
+fn hex_of(c: Color32, alpha: Alpha) -> String {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    if alpha == Alpha::Opaque {
+        format!("#{r:02x}{g:02x}{b:02x}")
+    } else {
+        format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+    }
+}
+
+/// The width of the picker's hex field in `ui`'s style ([`edit_srgba`]):
+/// its longest text (#rrggbb, or #rrggbbaa with an alpha) in the
+/// monospace font, the field's margins and the room for the cursor
+/// after it.
+fn hex_width(ui: &Ui, alpha: Alpha) -> f32 {
+    let longest = if alpha == Alpha::Opaque { "#000000" } else { "#00000000" };
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let words = ui.painter().layout_no_wrap(longest.to_string(), font, Color32::WHITE).size().x;
+    let margin = mg_uikit::controls::FIELD_MARGIN;
+    (words + f32::from(margin.left) + f32::from(margin.right) + 2.0).ceil()
 }
 
 /// The text the picker's 📋 copies for `c`.
@@ -77,6 +100,17 @@ fn take_paste(ui: &Ui) -> Option<Color32> {
 /// so a caller that watches the picker open sees it as before. The
 /// response is changed when the color is.
 pub fn edit_srgba(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> Response {
+    edit_srgba_with(ui, srgba, alpha, &[])
+}
+
+/// [`edit_srgba`] whose picker has a row of `swatches` over it, each a
+/// named color a click picks (an encounter's Outline color).
+fn edit_srgba_with(
+    ui: &mut Ui,
+    srgba: &mut Color32,
+    alpha: Alpha,
+    swatches: &[(&str, Color32)],
+) -> Response {
     let popup_id = ui.auto_id_with("popup");
     let hsva_id = popup_id.with("hsva");
     let open = Popup::is_id_open(ui.ctx(), popup_id);
@@ -88,10 +122,12 @@ pub fn edit_srgba(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> Response {
         .unwrap_or_else(|| Hsva::from(*srgba));
     let mut button = show_color_button(ui, *srgba, open);
     if ui.style().explanation_tooltips {
-        button = button.on_hover_text("Click to edit color; Ctrl+V pastes one");
+        button = button.on_hover_text("Click to edit the color. Ctrl+V pastes one.");
     }
     let mut pasted = if open || button.hovered() { take_paste(ui) } else { None };
-    button.context_menu(|ui| {
+    // (Its own id: egui's for a context menu is the picker's, which kept
+    // the menu from opening.)
+    Popup::context_menu(&button).id(popup_id.with("menu")).style(mg_uikit::menu_style).show(|ui| {
         if ui.button("Copy Color").on_hover_text("Its values, as 158, 151, 211").clicked() {
             ui.copy_text(text_of(*srgba, alpha));
             ui.close();
@@ -101,35 +137,79 @@ pub fn edit_srgba(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> Response {
             .on_hover_text("From the clipboard: 158, 151, 211, #9e97d3 or rgb(158, 151, 211)")
             .clicked()
         {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-            ui.ctx().request_repaint();
-            ui.data_mut(|d| d.insert_temp(popup_id.with("asked"), true));
+            crate::widgets::ask_paste(ui.ctx(), popup_id.with("asked"));
             ui.close();
         }
     });
     // (Paste asked for from the menu: the clipboard comes as the next
-    // frame's paste event, wherever the pointer is then.)
-    let asked = popup_id.with("asked");
+    // frame's paste event, wherever the pointer is then; text that isn't
+    // a color changes nothing.)
     if pasted.is_none()
-        && ui.data(|d| d.get_temp::<bool>(asked).unwrap_or(false))
-        && let Some(c) = take_paste(ui)
+        && let Some(text) = crate::widgets::asked_paste(ui.ctx(), popup_id.with("asked"))
     {
-        pasted = Some(c);
-        ui.data_mut(|d| d.remove::<bool>(asked));
+        pasted = parse(&text);
     }
     const COLOR_SLIDER_WIDTH: f32 = 275.0;
-    Popup::menu(&button).id(popup_id).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(
-        |ui| {
+    let picker = Popup::menu(&button).id(popup_id).style(mg_uikit::menu_style);
+    picker.close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        // (A picker, not a menu's rows: its parts keep their gaps.)
+        mg_uikit::menu_form(ui, |ui| {
             ui.spacing_mut().slider_width = COLOR_SLIDER_WIDTH;
+            if !swatches.is_empty() {
+                ui.horizontal(|ui| {
+                    for &(name, color) in swatches {
+                        let chosen = Color32::from(hsva) == color;
+                        let swatch = show_color_button(ui, color, chosen);
+                        swatch.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name)
+                        });
+                        if swatch.on_hover_text(name).clicked() {
+                            hsva = Hsva::from(color);
+                            button.mark_changed();
+                        }
+                    }
+                });
+            }
             if color_picker_hsva_2d(ui, &mut hsva, alpha) {
                 button.mark_changed();
             }
             ui.horizontal(|ui| {
+                // The color as #rrggbb, to read, type or paste into (an
+                // owner's ask): it follows the picker, and a color typed
+                // there sets it.
+                let hex_id = popup_id.with("hex");
+                let shown = hex_of(Color32::from(hsva), alpha);
+                let mut text: String = ui.data(|d| d.get_temp(hex_id)).unwrap_or(shown);
+                // (As wide as its text in the window's style, the
+                // conversation editor's larger text too: a fixed 70 points
+                // cut it short there, M2's known difference, settled in
+                // M4's U14.)
+                let width = hex_width(ui, alpha);
+                let field = ui
+                    .add(
+                        mg_uikit::text_field(&mut text)
+                            .desired_width(width)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .on_hover_text("The color as #rrggbb: type or paste one here");
+                if field.changed()
+                    && let Some(mut c) = parse(&text)
+                {
+                    if alpha == Alpha::Opaque {
+                        c = Color32::from_rgb(c.r(), c.g(), c.b());
+                    }
+                    hsva = Hsva::from(c);
+                    button.mark_changed();
+                }
+                if field.has_focus() {
+                    ui.data_mut(|d| d.insert_temp(hex_id, text));
+                } else {
+                    ui.data_mut(|d| d.remove::<String>(hex_id));
+                }
                 if ui
                     .button("Paste Color")
                     .on_hover_text(
-                        "A color from the clipboard: 158, 151, 211 (what 📋 copies), #9e97d3 \
-                         or rgb(158, 151, 211); Ctrl+V does it too",
+                        "Paste a color copied as 158, 151, 211, #9e97d3 or rgb(158, 151, 211)",
                     )
                     .clicked()
                 {
@@ -137,8 +217,8 @@ pub fn edit_srgba(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> Response {
                     ui.ctx().request_repaint();
                 }
             });
-        },
-    );
+        });
+    });
     if let Some(mut c) = pasted {
         if alpha == Alpha::Opaque {
             c = Color32::from_rgb(c.r(), c.g(), c.b());
@@ -163,6 +243,17 @@ pub fn edit_srgb(ui: &mut Ui, srgb: &mut [u8; 3]) -> Response {
     r
 }
 
+/// [`edit_srgb`] whose picker has a row of named `swatches` over it, a
+/// click on one picking it.
+pub fn edit_srgb_with(ui: &mut Ui, srgb: &mut [u8; 3], swatches: &[(&str, [u8; 3])]) -> Response {
+    let swatches: Vec<(&str, Color32)> =
+        swatches.iter().map(|&(n, [r, g, b])| (n, Color32::from_rgb(r, g, b))).collect();
+    let mut c = Color32::from_rgb(srgb[0], srgb[1], srgb[2]);
+    let r = edit_srgba_with(ui, &mut c, Alpha::Opaque, &swatches);
+    *srgb = [c.r(), c.g(), c.b()];
+    r
+}
+
 /// [`edit_srgba`] of an sRGBA color with its alpha not multiplied in.
 pub fn edit_srgba_unmultiplied(ui: &mut Ui, srgba: &mut [u8; 4]) -> Response {
     let mut c = Color32::from_rgba_unmultiplied(srgba[0], srgba[1], srgba[2], srgba[3]);
@@ -183,24 +274,24 @@ pub fn edit_rgb(ui: &mut Ui, rgb: &mut [f32; 3]) -> Response {
     r
 }
 
-/// The swatch button, as egui draws it.
+/// The swatch button: the kit's (`mg_uikit::paint_swatch_button`, the mock's
+/// `.swatch`), lit hovered and open, ringed focused or open inside its own
+/// edge, its color painted as egui paints one (a checker under a color that
+/// is not opaque).
 fn show_color_button(ui: &mut Ui, color: Color32, open: bool) -> Response {
     let size = ui.spacing().interact_size;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ColorButton));
     if ui.is_rect_visible(rect) {
-        let visuals =
-            if open { ui.visuals().widgets.open } else { *ui.style().interact(&response) };
-        let rect = rect.expand(visuals.expansion);
-        let stroke_width = 1.0;
-        show_color_at(ui.painter(), color, rect.shrink(stroke_width));
-        let corner = visuals.corner_radius.at_most(2);
-        ui.painter().rect_stroke(
-            rect,
-            corner,
-            (stroke_width, visuals.bg_fill),
-            egui::StrokeKind::Inside,
-        );
+        let t = mg_uikit::tokens(ui.ctx());
+        let look = mg_uikit::SwatchLook {
+            hovered: response.hovered() || response.is_pointer_button_down_on(),
+            open,
+            focused: response.has_focus(),
+        };
+        mg_uikit::paint_swatch_button(ui.painter(), &t, rect, look, |painter, inner| {
+            show_color_at(painter, color, inner);
+        });
     }
     response
 }
@@ -226,6 +317,65 @@ mod tests {
         assert_eq!(parse("1, 1, 1"), Some(Color32::from_rgb(1, 1, 1)), "whole numbers are bytes");
         for text in ["", "hello", "300, 0, 0", "1, 2", "#12345", "1, 2, 3, 4, 5"] {
             assert_eq!(parse(text), None, "{text:?}");
+        }
+    }
+
+    /// The picker's hex field is as wide as its text in the window's style,
+    /// at the conversation editor's larger text too (Options › Conversation
+    /// Editor, the text half as large again): the known difference "A color
+    /// picker's hex field is cut short under a window's larger text" (a
+    /// fixed 70 points), settled in M4's U14. With and without an alpha.
+    #[test]
+    fn the_hex_field_holds_its_text_at_a_larger_text() {
+        use egui_kittest::kittest::{NodeT as _, Queryable as _};
+        for (alpha, color) in [
+            (Alpha::Opaque, Color32::from_rgb(158, 151, 211)),
+            (Alpha::OnlyBlend, Color32::from_rgba_unmultiplied(158, 151, 211, 128)),
+        ] {
+            for by in [1.0f32, 1.5, 2.0] {
+                let mut h = egui_kittest::Harness::builder()
+                    .with_size(egui::vec2(700.0, 600.0))
+                    .build_ui_state(
+                        move |ui, c: &mut Color32| {
+                            // (From egui's own style each frame: not
+                            // larger again each frame.)
+                            let mut style = egui::Style::default();
+                            for font in style.text_styles.values_mut() {
+                                font.size *= by;
+                            }
+                            ui.set_style(style.clone());
+                            ui.ctx().set_global_style(style);
+                            edit_srgba(ui, c, alpha);
+                        },
+                        color,
+                    );
+                h.run();
+                h.get_by_role(egui::accesskit::Role::ColorWell).click();
+                // (Until the picker shows its hex field, by a deadline, not
+                // a count of frames.)
+                let hex = hex_of(color, alpha);
+                let started = std::time::Instant::now();
+                let field = loop {
+                    h.run();
+                    let found = (h.get_all_by_role(egui::accesskit::Role::TextInput))
+                        .find(|n| n.accesskit_node().value().as_deref() == Some(hex.as_str()))
+                        .map(|n| n.rect());
+                    match found {
+                        Some(field) => break field,
+                        None => assert!(started.elapsed().as_secs() < 10, "never: the hex field"),
+                    }
+                };
+                let font = egui::TextStyle::Monospace.resolve(&h.ctx.global_style());
+                let words = h
+                    .ctx
+                    .fonts_mut(|f| f.layout_no_wrap(hex.clone(), font, Color32::WHITE).size().x);
+                let margins = 2.0 * f32::from(mg_uikit::controls::FIELD_MARGIN.left);
+                assert!(
+                    field.width() >= words + margins,
+                    "{hex} at {by}x: a field {} wide for words {words} and margins {margins}",
+                    field.width()
+                );
+            }
         }
     }
 }

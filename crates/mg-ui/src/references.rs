@@ -8,9 +8,10 @@ use mg_edit::{Command, Edit};
 use mg_module::dialog::{Kind, Parent, is_link, link_index, links};
 use mg_module::rename::{self, Mention, Usage};
 use mg_resman::ResKey;
+use mg_uikit::Controls as _;
 
 use crate::dialog_view::Row;
-use crate::widgets::{autofocus, enter};
+use crate::widgets::autofocus;
 use crate::{Action, Moonglow, Tab};
 
 /// What the References tab looks for.
@@ -47,6 +48,7 @@ impl Default for Index {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Named {
     keys: Vec<ResKey>,
+    identity: u64,
     revision: u64,
     /// The places that name one of them, outside what is deleted with
     /// them.
@@ -70,8 +72,8 @@ pub struct References {
     /// Of a resource, the project file's `[used]` glob that counts it as
     /// used.
     pub marked: Option<String>,
-    /// The workspace revision the results are for.
-    revision: Option<u64>,
+    /// The workspace identity and revision the results are for.
+    revision: Option<(u64, u64)>,
     /// The codepage the scripts' lines were read in (Options › Language).
     codepage: Option<mg_core::Codepage>,
     /// The Find field.
@@ -100,6 +102,10 @@ impl References {
     /// its own (with `background`, as the desktop app runs; tests read
     /// here), and `None` until it is done: ask again at a later frame.
     /// What changed while it was read is read when it is asked again.
+    pub(crate) fn is_reading(&self) -> bool {
+        matches!(self.index, Index::Reading(_))
+    }
+
     pub(crate) fn index(
         &mut self,
         module: &mg_module::Module,
@@ -231,7 +237,7 @@ impl Moonglow {
         let ws = self.ws.as_ref()?;
         let index = self.references.index(&ws.module, self.background_jobs)?;
         let codepage = crate::text::script_codepage();
-        let mentions = index.mentions(&key.resref.to_string(), true, codepage).len();
+        let mentions = index.mentions_of(key.resref.as_bytes(), true, codepage).len();
         Some((index.usages(key).len(), mentions))
     }
 
@@ -241,10 +247,12 @@ impl Moonglow {
     pub fn rename_resource(&mut self, from: ResKey, to: ResRef, literals: bool) {
         // (A NUI window's script is renamed with its window, which takes
         // the new name less the script's suffix.)
-        if let Some(window) = self.window_of_script(main_key(from)) {
-            let suffix = &from.resref.to_string()[window.resref.to_string().len()..];
+        if let Some(window) = self.window_of_script(main_key(from))
+            && let Some(suffix) = from.resref.to_string().strip_prefix(&window.resref.to_string())
+        {
+            let suffix = suffix.to_string();
             let Some(to) =
-                to.to_string().strip_suffix(suffix).and_then(|n| ResRef::from_str(n).ok())
+                to.to_string().strip_suffix(&suffix).and_then(|n| ResRef::from_str(n).ok())
             else {
                 self.log.error(format!(
                     "{from} is {window}'s script: give a new name ending {suffix}, or rename the \
@@ -265,8 +273,13 @@ impl Moonglow {
             self.log.error(e.to_string());
             return;
         }
+        // (What names it is read from the references the window keeps,
+        // where they are at hand: not every resource of the module again.)
+        let holders = (self.references.index(&ws.module, self.background_jobs))
+            .map(|index| index.holders(from, literals));
         let mut staged = ws.module.clone();
-        let report = match rename::rename(&mut staged, from, to, literals) {
+        let renamed = rename::rename_among(&mut staged, from, to, literals, holders.as_deref());
+        let report = match renamed {
             Ok(r) => r,
             Err(e) => {
                 self.log.error(format!("Rename: {e}"));
@@ -285,14 +298,18 @@ impl Moonglow {
                         external.as_ref(),
                         debug,
                     );
+                    // (Told by the script compiled, not by its name being
+                    // somewhere in the message: a failure in an include
+                    // names the include's file.)
                     for r in &results {
                         if let Err(e) = &r.result
-                            && report
-                                .recompile
-                                .iter()
-                                .any(|k| e.message.contains(&k.resref.to_string()))
+                            && report.recompile.iter().any(|k| k.resref == r.script.resref)
                         {
-                            self.log.error(e.message.clone());
+                            let file = format!("{}.nss", r.script.resref);
+                            self.log.error(match e.message.contains(&file) {
+                                true => e.message.clone(),
+                                false => format!("{file}: {}", e.message),
+                            });
                             compiled_ok = false;
                         }
                     }
@@ -317,22 +334,44 @@ impl Moonglow {
             .map(|k| Edit::SetResource { key: k, data: staged.get(&k).map(<[u8]>::to_vec) })
             .collect();
         let new = ResKey::new(to, from.restype);
-        if let Err(e) = self.apply(Command::new(format!("Rename {from} to {new}"), edits)) {
-            self.log.error(e.to_string());
-            return;
+        // (Held for the Protected Area window: what goes ahead from there
+        // is this rename whole, its tabs and its log too.)
+        let again = Action::RenameResource { from, to, literals };
+        let cmd = Command::new(format!("Rename {from} to {new}"), edits);
+        match self.apply_or_ask(cmd, Some(again)) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => return self.log.error(e.to_string()),
         }
         self.retarget(from, to);
+        let in_tables = match report.in_tables {
+            0 => String::new(),
+            n => format!(", {n} in the module's 2DAs"),
+        };
         self.log.info(format!(
-            "Renamed {from} to {new}: {} reference(s), {} in scripts",
+            "Renamed {from} to {new}: {} reference(s), {} in scripts{in_tables}",
             report.references, report.in_scripts
         ));
-        self.warn_still_spelled(&from.resref.to_string());
+        self.warn_still_spelled(from.resref.as_bytes());
+        // (A script's name in the haks' tables, which a rename can't
+        // rewrite.)
+        if matches!(from.restype, ResType::NSS | ResType::NCS | ResType::NDB)
+            && let Some(game) = &self.game
+            && let Some(warning) = rename::hak_scripts_warning(
+                from.resref,
+                &rename::hak_scripts(&game.resman, from.resref),
+            )
+        {
+            self.log.warn(warning);
+        }
         if !compiled_ok {
             self.log.warn(
                 "Some scripts the rename changed aren't compiled; compile them before testing",
             );
         }
-        if self.references.query.is_some() {
+        // (Where it shows the resource renamed: any rename pointed it at
+        // that resource, whatever it was showing.)
+        if self.references.query == Some(Query::Resource(main_key(from))) {
             self.references.query = Some(Query::Resource(new));
             self.references.input = to.to_string();
             self.references.revision = None;
@@ -340,17 +379,19 @@ impl Moonglow {
     }
 
     /// Says which strings in the module's scripts still spell `name`, a
-    /// name a rename just took away.
-    fn warn_still_spelled(&mut self, name: &str) {
+    /// name a rename just took away (its own bytes, as the scripts' files
+    /// have it: as text, a byte above 0x7F was two and matched nothing).
+    fn warn_still_spelled(&mut self, name: &[u8]) {
         let Some(ws) = &self.ws else { return };
         let codepage = crate::text::script_codepage();
         // (From the window's index where it is at hand, the scripts the
         // rename changed read again; else the scripts read for it, while
         // the index is read on its own thread.)
         let left = match self.references.index(&ws.module, self.background_jobs) {
-            Some(index) => index.mentions(name, true, codepage),
-            None => rename::mentions(&ws.module, name, true, codepage),
+            Some(index) => index.mentions_of(name, true, codepage),
+            None => rename::mentions_of(&ws.module, name, true, codepage),
         };
+        let name = codepage.decode(name);
         if !left.is_empty() {
             self.log.warn(format!(
                 "{} still spelled “{}” in scripts ({}); the game won't find it by that name. \
@@ -414,9 +455,11 @@ impl Moonglow {
             None => Ok(None),
         };
         let new = ResKey::new(to, from.restype);
-        if let Err(e) = self.apply(made.command) {
-            self.log.error(e.to_string());
-            return;
+        let again = Action::RenameResource { from, to, literals };
+        match self.apply_or_ask(made.command, Some(again)) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => return self.log.error(e.to_string()),
         }
         // The window's tab and what it keeps, and the tabs and buffers of
         // its two scripts where they moved with it. (Only those: another
@@ -431,7 +474,7 @@ impl Moonglow {
         let moved = |k: &ResKey| scripts.iter().find(|(was, _)| was == k).map(|(_, now)| *now);
         for (_, tab) in self.dock.iter_all_tabs_mut() {
             match tab {
-                Tab::Nui(k) if *k == from => *k = new,
+                Tab::Nui(k) | Tab::NuiSource(k) if *k == from => *k = new,
                 Tab::Script(k) => *k = moved(k).unwrap_or(*k),
                 _ => {}
             }
@@ -454,7 +497,7 @@ impl Moonglow {
             made.in_scripts
         ));
         for spelled in &made.spelled {
-            self.warn_still_spelled(spelled);
+            self.warn_still_spelled(spelled.as_bytes());
         }
         match built {
             Ok(Some(b)) => {
@@ -494,26 +537,19 @@ impl Moonglow {
         };
         let is_area = with(ResType::ARE);
         let from = from.resref;
-        let moved = |k: &mut ResKey| {
-            if k.resref == from && with(k.restype) {
-                k.resref = to;
-            }
-        };
-        let moved_ref = |r: &mut ResRef| {
-            if *r == from && is_area {
-                *r = to;
-            }
-        };
+        // (Every tab that shows it, a tab of several too: `Tab::retarget`
+        // knows them as `Tab::tree_keys` does.)
+        let moved =
+            |k: ResKey| (k.resref == from && with(k.restype)).then(|| ResKey::new(to, k.restype));
         for (_, tab) in self.dock.iter_all_tabs_mut() {
-            match tab {
-                Tab::Script(k) | Tab::Gff(k) | Tab::Dialog(k) | Tab::Blueprint(k) => moved(k),
-                Tab::Nui(k) => moved(k),
-                Tab::Area(r) | Tab::AreaProperties(r) => moved_ref(r),
-                Tab::Instance { area, .. }
-                | Tab::Instances { area, .. }
-                | Tab::InstanceModel { area, .. } => moved_ref(area),
-                _ => {}
-            }
+            tab.retarget(&moved);
+        }
+        // The module tree's keys at the row renamed: at its new row.
+        if let Some(crate::TreeAt::Resource(k)) = self.tree_cursor
+            && let Some(k) = moved(k)
+        {
+            self.tree_cursor = Some(crate::TreeAt::Resource(k));
+            self.tree_cursor_moved = true;
         }
         let old_keys: Vec<ResKey> =
             self.scripts.keys().filter(|k| k.resref == from && with(k.restype)).copied().collect();
@@ -648,9 +684,10 @@ impl Moonglow {
                     Some(Edit::SetResource { key: *k, data })
                 })
                 .collect();
-            if let Err(e) = self.apply(Command::new(format!("Edit {}", unsaved[0]), edits)) {
-                self.log.error(e.to_string());
-                return;
+            match self.apply_or_ask(Command::new(format!("Edit {}", unsaved[0]), edits), None) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => return self.log.error(e.to_string()),
             }
         }
         let mut gone: Vec<ResKey> = going.iter().flat_map(|k| self.deleted_with(*k)).collect();
@@ -668,31 +705,26 @@ impl Moonglow {
         {
             let listed =
                 |a: &mg_gff::Struct| a.resref("Area_Name").is_some_and(|r| areas.contains(&r));
-            let at: Vec<usize> = (0..list.len()).rev().filter(|&i| listed(&list[i])).collect();
+            let at = (0..list.len()).rev().filter(|&i| listed(&list[i]));
             let root = mg_edit::GffPath::root;
-            edits
-                .extend(at.into_iter().map(|i| Edit::remove_item(ifo, root(), "Mod_Area_list", i)));
+            edits.extend(at.map(|i| Edit::remove_item(ifo, root(), "Mod_Area_list", i)));
         }
         edits.extend(gone.iter().map(|k| Edit::SetResource { key: *k, data: None }));
         let label = match going.as_slice() {
             [key] => format!("Delete {key}"),
             several => format!("Delete {} resources", several.len()),
         };
-        if let Err(e) = self.apply(Command::new(label, edits)) {
-            self.log.error(e.to_string());
-            return;
+        // (Held for the Protected Area window: what goes ahead from there
+        // is this deletion whole, its tabs closed too.)
+        let again = Action::DeleteResources(keys.to_vec());
+        match self.apply_or_ask(Command::new(label, edits), Some(again)) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => return self.log.error(e.to_string()),
         }
-        let area_gone = |r: &ResRef| areas.contains(r);
-        crate::tabs::close_tabs(&mut self.dock, |t| match t {
-            Tab::Script(k) | Tab::Gff(k) | Tab::Dialog(k) | Tab::Blueprint(k) | Tab::Nui(k) => {
-                !gone.contains(k)
-            }
-            Tab::Area(r) | Tab::AreaProperties(r) => !area_gone(r),
-            Tab::Instance { area: r, .. }
-            | Tab::Instances { area: r, .. }
-            | Tab::InstanceModel { area: r, .. } => !area_gone(r),
-            _ => true,
-        });
+        // (Every tab that shows one of them: `Tab::tree_keys`'s, an Edit
+        // Together tab of several too.)
+        crate::tabs::close_tabs(&mut self.dock, |t| !t.shows_any(&gone));
         for area in areas {
             self.area_views.remove(&area);
         }
@@ -707,9 +739,10 @@ impl Moonglow {
     /// they are read.
     pub(crate) fn names_of(&mut self, keys: &[ResKey]) -> bool {
         let Some(ws) = self.ws.as_mut() else { return false };
-        let revision = ws.revision();
+        let (identity, revision) = (ws.identity(), ws.revision());
         if let Some(named) = &self.references.named
             && named.keys == keys
+            && named.identity == identity
             && named.revision == revision
         {
             return true;
@@ -739,9 +772,8 @@ impl Moonglow {
         for &key in keys {
             if rename::renamable(key.restype) {
                 usages.extend(index.usages(key).into_iter().filter(outside));
-                let name = key.resref.to_string();
                 mentions.extend(
-                    (index.mentions(&name, true, codepage).into_iter())
+                    (index.mentions_of(key.resref.as_bytes(), true, codepage).into_iter())
                         .filter(|m| !gone.contains(&m.script)),
                 );
             }
@@ -754,7 +786,8 @@ impl Moonglow {
         usages.sort_by_cached_key(|u| (u.from, u.path.to_string()));
         usages.dedup();
         mentions.dedup();
-        self.references.named = Some(Named { keys: keys.to_vec(), revision, usages, mentions });
+        self.references.named =
+            Some(Named { keys: keys.to_vec(), identity, revision, usages, mentions });
         true
     }
 
@@ -787,7 +820,13 @@ impl Moonglow {
             ResType::GIT => self.actions.push(Action::OpenTab(Tab::Area(u.from.resref))),
             ResType::DLG => {
                 if let Some(row) = self.ws.as_ref().and_then(|ws| dialog_row(&ws.module, u)) {
-                    self.dialog_views.entry(u.from).or_default().selected = Some(row);
+                    // (Its parents opened out, and scrolled to.)
+                    let doc = self.ws.as_mut().and_then(|ws| ws.doc(&u.from).ok().cloned());
+                    let view = self.dialog_views.entry(u.from).or_default();
+                    match doc {
+                        Some(g) => crate::dialog_view::go_to_row(view, &g, row),
+                        None => view.selected = Some(row),
+                    }
                 }
                 self.actions.push(Action::OpenTab(Tab::Dialog(u.from)));
             }
@@ -867,7 +906,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     ui.horizontal(|ui| {
         crate::widgets::field_label(ui, "Find references to");
         let r = ui.add(
-            egui::TextEdit::singleline(&mut app.references.input)
+            mg_uikit::text_field(&mut app.references.input)
                 .hint_text("a script, area, conversation, blueprint, tag or StrRef")
                 .desired_width(260.0),
         );
@@ -902,8 +941,9 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     };
     // (The scripts' lines read again in another language's codepage.)
     let codepage = crate::text::script_codepage();
+    let ws_stamp = (ws.identity(), ws.revision());
     let mut reading = false;
-    if app.references.revision != Some(ws.revision()) || app.references.codepage != Some(codepage) {
+    if app.references.revision != Some(ws_stamp) || app.references.codepage != Some(codepage) {
         if ws.flush().is_err() {
             return;
         }
@@ -912,10 +952,18 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         // waited for below.)
         let found =
             app.references.index(&ws.module, app.background_jobs).map(|index| match &query {
+                // (A name's own bytes, as a tag's below.)
                 Query::Resource(k) => {
-                    (index.usages(*k), index.mentions(&k.resref.to_string(), true, codepage))
+                    (index.usages(*k), index.mentions_of(k.resref.as_bytes(), true, codepage))
                 }
-                Query::Tag(t) => (index.tag_usages(t), index.mentions(t, false, codepage)),
+                // (A tag as the files have it: an object's in the game's
+                // codepage, a script's string in the scripts'. Asked as
+                // UTF-8, a tag with a letter outside ASCII was found
+                // nowhere.)
+                Query::Tag(t) => (
+                    index.tag_usages_of(&crate::text::encode(t)),
+                    index.mentions_of(&codepage.encode_lossy(t), false, codepage),
+                ),
                 Query::StrRef(n) => (index.strref_usages(*n), Vec::new()),
             });
         reading = found.is_none();
@@ -933,7 +981,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         return;
     }
-    if app.references.revision != Some(ws.revision()) || app.references.codepage != Some(codepage) {
+    if app.references.revision != Some(ws_stamp) || app.references.codepage != Some(codepage) {
         // (The tables are the game data's, kept read: a scan of their
         // script columns.)
         app.references.run = match (&query, app.game.as_deref()) {
@@ -956,7 +1004,7 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
             }
             _ => None,
         };
-        app.references.revision = Some(ws.revision());
+        app.references.revision = Some(ws_stamp);
         app.references.codepage = Some(codepage);
     }
     ui.separator();
@@ -977,15 +1025,10 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         }
         Query::Tag(t) => _ = ui.heading(format!("Tag “{t}”")),
         Query::StrRef(n) => {
-            ui.heading(format!("Talk-table line {n}")).on_hover_text(
-                "Where the module's blueprints, areas, conversations, palettes, soundsets, \
-                 2DAs and scripts name this line, and its haks' 2DAs",
-            );
+            ui.heading(format!("Talk-table line {n}"))
+                .on_hover_text("Where the module and its haks' 2DAs name this line");
         }
     });
-    // (Which tables that run it are the module's own, to open.)
-    let own_tables: Vec<bool> =
-        app.references.run.iter().map(|r| ws.module.contains(&r.from)).collect();
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         // An area's objects are said to be in the area as the rest of the
         // window names it (Options › General: Show areas by name).
@@ -999,30 +1042,61 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         };
         // (Only the rows in sight are named and laid out: a script that
         // thousands of creatures use is thousands of rows. The others
-        // take a row's room.)
-        let row = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
-        let out_of_sight = |ui: &mut Ui| {
-            let room = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(1.0, row));
-            let hidden = !ui.is_rect_visible(room);
-            if hidden {
-                ui.add_space(row);
-            }
-            hidden
-        };
+        // take one coalesced spacer.)
+        // (A row each, 22 apart: a link or a label in a row as high as one.)
+        mg_uikit::list_rows(ui);
+        let row = mg_uikit::row_pitch(ui);
         // (Taken out while an area's name is looked up, which keeps it.)
         let usages = std::mem::take(&mut app.references.usages);
         if usages.is_empty() {
             ui.weak("Nothing in the module names it.");
         } else {
             ui.label(format!("Used in {}:", places(usages.len())));
-            for (i, u) in usages.iter().enumerate() {
-                if out_of_sight(ui) {
-                    continue;
-                }
+            let commands = app.plugin_menu_commands_cached();
+            // (A row's menu's Copy or Copy All: the text made after the rows.)
+            let mut copy = None;
+            virtual_rows(ui, usages.len(), row, |ui, i| {
+                let u = &usages[i];
                 let label = shown(app, u);
-                if ui.link(label).on_hover_text(format!("{} {}", u.from, u.path)).clicked() {
+                let r = ui.horizontal(|ui| ui.link(label)).inner;
+                let r = r.on_hover_ui(|ui| {
+                    ui.label(format!("{} {}", u.from, u.path));
+                });
+                if r.clicked() {
                     go = Some(i);
                 }
+                // Its menu: the plugins' commands for what names it, then
+                // Copy and Copy All; Shift+F10 and Ctrl+C where the
+                // keyboard is on its link.
+                let on = u.path.gff().map(|path| [crate::plugins::selected_at(u.from, path)]);
+                let on =
+                    on.filter(|on| commands.iter().any(|c| c.fits(&crate::plugins::kinds_of(on))));
+                let (keyed, ctrl_c) = crate::row_copy::focused_keys(ui, &r);
+                if ctrl_c {
+                    copy = Some((crate::row_copy::Asked::Row, i));
+                }
+                let actions = &mut app.actions;
+                let all = "Copy all the places that use it, each on a line of its own";
+                let asked = crate::row_copy::row_menu_saying(ui, &r, keyed, all, |ui| {
+                    let Some(on) = &on else { return false };
+                    crate::plugins::menu_on(ui, &commands, on, actions);
+                    true
+                });
+                if let Some(asked) = asked {
+                    copy = Some((asked, i));
+                }
+            });
+            match copy {
+                Some((crate::row_copy::Asked::Row, i)) => {
+                    let line = usage_line(&shown(app, &usages[i]), &usages[i]);
+                    ui.ctx().copy_text(line);
+                }
+                Some((crate::row_copy::Asked::All, _)) => {
+                    let all = usages.iter().map(|u| usage_line(&shown(app, u), u));
+                    let all: Vec<String> = all.collect();
+                    ui.ctx().copy_text(crate::row_copy::lines(all));
+                }
+                None => {}
             }
         }
         app.references.usages = usages;
@@ -1031,38 +1105,30 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
             ui.add_space(8.0);
             ui.label(format!("Run by the game, from its 2DAs ({}):", refs.run.len()))
                 .on_hover_text(
-                    "Cells of the tables the game runs scripts from (a spell's impact script, \
-                     an area of effect's, a state's, a trap's, a disease's, a poison's), as the \
-                     module sees them: its own 2DAs and its haks' over the game's; and of the \
-                     module's own tables whose description says a column holds a script",
+                    "Cells of the 2DAs the game runs scripts from, as the module sees them",
                 );
-            for (r, own) in refs.run.iter().zip(&own_tables) {
-                if out_of_sight(ui) {
-                    continue;
-                }
+            virtual_rows(ui, refs.run.len(), row, |ui, i| {
+                let r = &refs.run[i];
+                let own = app.ws.as_ref().is_some_and(|ws| ws.module.contains(&r.from));
                 let text = format!("{} › {}", r.from, r.path);
-                if *own {
-                    if ui.link(text).on_hover_text("Open the module's table").clicked() {
-                        go_table = Some(r.from);
+                ui.horizontal(|ui| {
+                    if own {
+                        if ui.link(text).on_hover_text("Open the module's table").clicked() {
+                            go_table = Some(r.from);
+                        }
+                    } else {
+                        ui.label(text);
                     }
-                } else {
-                    ui.label(text);
-                }
-            }
+                });
+            });
         }
         if !refs.hak_cells.is_empty() {
             ui.add_space(8.0);
-            ui.label(format!("In the haks' 2DAs ({}):", refs.hak_cells.len())).on_hover_text(
-                "Cells of the module's haks' tables, in the columns known to hold a talk-table \
-                 line (a class's name, a feat's, a spell's…): each hak's own copy, the one the \
-                 game reads and those under it",
-            );
-            for c in &refs.hak_cells {
-                if out_of_sight(ui) {
-                    continue;
-                }
-                ui.label(c.place());
-            }
+            ui.label(format!("In the haks' 2DAs ({}):", refs.hak_cells.len()))
+                .on_hover_text("Cells of the haks' 2DAs in columns that hold a talk-table line");
+            virtual_rows(ui, refs.hak_cells.len(), row, |ui, i| {
+                ui.horizontal(|ui| ui.label(refs.hak_cells[i].place()));
+            });
         }
         if let Some(glob) = &refs.marked {
             ui.add_space(8.0);
@@ -1071,17 +1137,15 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
         }
         if !refs.mentions.is_empty() {
             ui.add_space(8.0);
-            ui.label(format!("Spelled out in scripts ({}):", refs.mentions.len())).on_hover_text(
-                "Strings in scripts with this name: the script may use it, or mean something else",
-            );
-            for m in &refs.mentions {
-                if out_of_sight(ui) {
-                    continue;
-                }
-                if ui.link(format!("{} line {}: {}", m.script, m.line, m.text)).clicked() {
+            ui.label(format!("Spelled out in scripts ({}):", refs.mentions.len()))
+                .on_hover_text("Strings in scripts with this name, which may or may not mean it");
+            virtual_rows(ui, refs.mentions.len(), row, |ui, i| {
+                let m = &refs.mentions[i];
+                let text = format!("{} line {}: {}", m.script, m.line, m.text);
+                if ui.horizontal(|ui| ui.link(text)).inner.clicked() {
                     go_line = Some((m.script, m.line));
                 }
-            }
+            });
         }
     });
     if let Some(i) = go {
@@ -1096,6 +1160,33 @@ pub(crate) fn ui(app: &mut Moonglow, ui: &mut Ui) {
     }
     if let Some(k) = rename_key {
         app.rename_dialog(k);
+    }
+}
+
+/// Draws only the slice of `count` fixed-`pitch` rows intersecting `ui.clip_rect()`,
+/// coalescing off-screen rows before and after into a single `ui.add_space`.
+fn virtual_rows(ui: &mut Ui, count: usize, pitch: f32, mut draw: impl FnMut(&mut Ui, usize)) {
+    if count == 0 {
+        return;
+    }
+    let top_y = ui.cursor().top();
+    let clip = ui.clip_rect();
+    let first = ((clip.top() - top_y) / pitch).floor().max(0.0) as usize;
+    let last = (((clip.bottom() - top_y) / pitch).ceil().max(0.0) as usize + 1).min(count);
+    let first = first.min(last);
+    if first == last {
+        ui.add_space(count as f32 * pitch);
+        return;
+    }
+    if first > 0 {
+        ui.add_space(first as f32 * pitch);
+    }
+    for i in first..last {
+        draw(ui, i);
+    }
+    let after = count - last;
+    if after > 0 {
+        ui.add_space(after as f32 * pitch);
     }
 }
 
@@ -1141,15 +1232,33 @@ pub(crate) fn delete_window(app: &mut Moonglow, ctx: &egui::Context) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
     let named = named.then(|| app.references.named.take()).flatten();
+    // Nothing names them, nothing unsaved goes, none kept: deleted without
+    // asking, where Options › General › Questions says so (a builder's
+    // ask: a question always given the same answer). What something names
+    // is still asked about: the window says what.
+    let alone = |n: &Named| n.usages.is_empty() && n.mentions.is_empty();
+    if app.settings.delete_without_asking
+        && why_not.is_none()
+        && kept.is_empty()
+        && unsaved.is_empty()
+        && named.as_ref().is_some_and(alone)
+    {
+        app.actions.push(Action::DeleteResources(keys));
+        app.confirm_delete = None;
+        return;
+    }
     let mut open = true;
     let mut find = None;
-    crate::widgets::modal(ctx, "Delete from Module").show(ctx, |ui| {
+    let always_id = egui::Id::new("delete-always");
+    let (always_on, always_tip) = crate::widgets::always_now(
+        ctx,
+        always_id,
+        &format!("{} › Ask before deleting from the module", crate::widgets::QUESTIONS_AT),
+    );
+    let footed = crate::widgets::modal(ctx, "Delete from Module").show_foot(ctx, |ui| {
         if let Some(why) = &why_not {
             ui.label(why);
-            if ui.button("OK").clicked() {
-                open = false;
-            }
-            return;
+            return ((), crate::widgets::Foot::new().leave("OK"));
         }
         ui.label(match keys.as_slice() {
             [key] if key.restype == ResType::ARE => {
@@ -1211,18 +1320,31 @@ pub(crate) fn delete_window(app: &mut Moonglow, ctx: &egui::Context) {
             1 => "Edit › Undo brings it back.",
             _ => "Edit › Undo brings them back.",
         });
-        ui.horizontal(|ui| {
-            // (Once what names them is known, to be said first.)
-            let delete = ui.add_enabled(named.is_some(), egui::Button::new("Delete"));
-            if delete.clicked() {
+        // (Delete once what names them is known, to be said first.)
+        let foot = crate::widgets::Foot::new()
+            .check("Don't ask when nothing else names them", always_on, Some(always_tip))
+            .main("Delete", named.is_some())
+            .cancel();
+        ((), foot)
+    });
+    if let Some(f) = footed {
+        if why_not.is_some() {
+            open &= !f.pressed.cancelled();
+        } else {
+            let always = crate::widgets::always_kept(ctx, always_id, f.pressed.checked);
+            if f.pressed.main() {
+                // (Not asked again: Options' switch, from now on.)
+                if always {
+                    app.settings.delete_without_asking = true;
+                }
                 app.actions.push(Action::DeleteResources(keys.clone()));
                 open = false;
             }
-            if crate::widgets::cancel(ui) {
+            if f.pressed.cancelled() {
                 open = false;
             }
-        });
-    });
+        }
+    }
     if named.is_some() {
         app.references.named = named;
     }
@@ -1283,6 +1405,9 @@ fn named_ui(ui: &mut Ui, named: Option<&Named>, find: &mut Option<ResKey>) {
     }
 }
 
+/// The Rename dialog's width (the Dialogs board's Rename).
+const RENAME_WIDTH: f32 = 440.0;
+
 /// The Rename window.
 pub(crate) fn rename_window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some(mut draft) = app.rename.take() else { return };
@@ -1308,13 +1433,20 @@ pub(crate) fn rename_window(app: &mut Moonglow, ctx: &egui::Context) {
         let ws = app.ws.as_ref().filter(|_| draft.from.restype == ResType::JUI)?;
         mg_nui::can_rename(&ws.module, &draft.from.resref.to_string(), &to.to_string()).err()
     };
-    crate::widgets::dialog(ctx, &format!("Rename {}", draft.from), &mut open)
+    let footed = crate::widgets::dialog(ctx, &format!("Rename {}", draft.from), &mut open)
         .collapsible(false)
         .resizable(false)
-        .show(ctx, |ui| {
+        .show_foot(ctx, |ui| {
+            // (The Dialogs board's 440 points wide, less the body's margins
+            // and the window's edges, where the screen has the room: U30's
+            // #9. Its notes wrap there.)
+            let body = RENAME_WIDTH - 2.0 * mg_uikit::dialog::BODY_PADDING - 2.0;
+            crate::widgets::fit_min_width(ui, body);
+            crate::widgets::fit_width(ui, body);
             ui.horizontal(|ui| {
                 crate::widgets::field_label(ui, "New name");
-                let r = ui.add(egui::TextEdit::singleline(&mut draft.to).desired_width(200.0));
+                let mut text = crate::widgets::ResRefText(&mut draft.to);
+                let r = ui.add(crate::widgets::resref_edit(&mut text).desired_width(200.0));
                 autofocus(ui, &r);
             });
             let name = draft.to.trim();
@@ -1341,31 +1473,44 @@ pub(crate) fn rename_window(app: &mut Moonglow, ctx: &egui::Context) {
             }
             let mentions = draft.counted.map_or(0, |(_, m)| m);
             match draft.counted {
-                _ if draft.from.restype == ResType::JUI => _ = ui.label(
-                    "Its settings and its scripts are renamed with it, and the scripts that \
+                _ if draft.from.restype == ResType::JUI => {
+                    _ = ui.label(
+                        "Its settings and its scripts are renamed with it, and the scripts that \
                      open it are pointed at the new name.",
-                ),
-                None => _ = ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak("Looking for what names it…");
-                }),
+                    )
+                }
+                None => {
+                    _ = ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Looking for what names it…");
+                    })
+                }
                 Some((0, _)) => _ = ui.label("Nothing else in the module names it."),
-                Some((n, _)) => _ = ui.label(format!(
-                    "{} in the module {} it; they will name the new one.",
-                    places(n),
-                    if n == 1 { "names" } else { "name" }
-                )),
+                Some((n, _)) => {
+                    _ = ui.label(format!(
+                        "{} in the module {} it; they will name the new one.",
+                        places(n),
+                        if n == 1 { "names" } else { "name" }
+                    ))
+                }
             }
             if mentions > 0 {
-                ui.checkbox(
+                ui.check_box(
                     &mut draft.literals,
                     format!(
                         "Also change the {} spelling “{}” in scripts",
-                        if mentions == 1 { "string".to_string() } else { format!("{mentions} strings") },
+                        if mentions == 1 {
+                            "string".to_string()
+                        } else {
+                            format!("{mentions} strings")
+                        },
                         draft.from.resref
                     ),
                 )
-                .on_hover_text("Strings like ExecuteScript(\"name\") or CreateObject(…, \"name\", …); a string may also mean something else, so check them in Find References first");
+                .on_hover_text(
+                    "Strings such as ExecuteScript(\"name\"), which may mean something \
+                                else. Check them in Find References.",
+                );
             }
             match &problem {
                 Some((p, true)) => _ = ui.colored_label(ui.visuals().warn_fg_color, p),
@@ -1376,21 +1521,26 @@ pub(crate) fn rename_window(app: &mut Moonglow, ctx: &egui::Context) {
             // to change with it.)
             let ready = problem.is_none()
                 && (draft.counted.is_some() || draft.from.restype == ResType::JUI);
-            ui.horizontal(|ui| {
-                let ok = ui.add_enabled(ready, egui::Button::new("Rename"));
-                if ok.clicked() || (ready && enter(ui)) {
-                    done = true;
-                }
-                if crate::widgets::cancel(ui) {
-                    cancel = true;
-                }
-            });
+            ((), crate::widgets::Foot::new().main("Rename", ready).cancel())
         });
+    if let Some(f) = footed {
+        done = f.pressed.main();
+        cancel = f.pressed.cancelled();
+    }
     if done {
         if let Ok(to) = ResRef::from_str(draft.to.trim()) {
-            app.rename_resource(draft.from, to, draft.literals);
+            let (from, literals) = (draft.from, draft.literals);
+            app.actions.push(Action::RenameResource { from, to, literals });
         }
     } else if open && !cancel {
         app.rename = Some(draft);
     }
+}
+
+/// A place that uses what References looks up as one line of text (its
+/// menu's Copy, a line of Copy All): the place as listed (`shown`), then
+/// the resource and the field that name it, as its tip says them,
+/// "area_01 › Guard: guard.utc Conversation".
+pub fn usage_line(shown: &str, u: &Usage) -> String {
+    format!("{shown}: {} {}", u.from, u.path)
 }

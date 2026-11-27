@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use mg_plugin::{
-    Answer, Existing, Host, Level, MARKER, MAX_FILES, Package, Plugin, PluginError, Question,
-    discover, from_archive, inspect, pack, remove,
+    Existing, MARKER, MAX_FILES, Package, Plugin, PluginError, discover, from_archive, inspect,
+    pack, remove,
 };
 use zip::write::SimpleFileOptions;
+
+use crate::common::TestHost;
 
 fn fixture(file: &str) -> Vec<u8> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tag-conventions");
@@ -54,13 +56,47 @@ fn refusal(bytes: &[u8]) -> String {
     }
 }
 
-struct Quiet;
+/// The fixture's manifest with another id.
+fn manifest_of(id: &str) -> Vec<u8> {
+    String::from_utf8(fixture("plugin.cfg"))
+        .unwrap()
+        .replace("example.tag-conventions", id)
+        .into_bytes()
+}
 
-impl Host for Quiet {
-    fn log(&self, _: Level, _: &str) {}
-    fn ask(&self, _: &Question) -> Option<Answer> {
-        None
+/// An archive of several plugins: each folder at its top with a manifest
+/// (or each of the one folder at its top, as a repository's download has
+/// them), read as one plugin each and installed each into its own
+/// folder; what one plugin's archive takes ([`Package::read`]) refuses it,
+/// and one of them refused refuses the whole archive, saying which.
+#[test]
+fn an_archive_of_several_plugins_is_read_and_installed() {
+    let mut files = plugin_under("tags/", &manifest_of("example.tags"));
+    files.extend(plugin_under("names/", &manifest_of("example.names")));
+    files.push(("README.md".into(), b"Two plugins".to_vec()));
+    let all = Package::read_all(&zipped(&files)).unwrap();
+    let ids: Vec<&str> = all.iter().map(|p| p.manifest.id.as_str()).collect();
+    assert_eq!(ids, ["example.names", "example.tags"]);
+    assert_eq!(all[0].files().collect::<Vec<_>>(), ["main.luau", "plugin.cfg", "rules.luau"]);
+    assert_eq!(refusal(&zipped(&files)), "it holds several plugins (example.names, example.tags)");
+    // A repository's download: its one folder at the top holds them.
+    let mut deeper = plugin_under("repo-main/tags/", &manifest_of("example.tags"));
+    deeper.extend(plugin_under("repo-main/names/", &manifest_of("example.names")));
+    assert_eq!(Package::read_all(&zipped(&deeper)).unwrap().len(), 2);
+    // Installed, each in its own folder.
+    let dir = mg_testkit::scratch_dir("mg-plugin-several");
+    let _ = std::fs::remove_dir_all(&dir);
+    for p in &all {
+        p.install(&dir, false).unwrap();
     }
+    let found: Vec<String> = discover(&dir).into_iter().map(|p| p.unwrap().manifest.id).collect();
+    assert_eq!(found, ["example.names", "example.tags"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    // One of them at fault: the whole archive, by the folder at fault.
+    let mut broken = plugin_under("tags/", &manifest_of("example.tags"));
+    broken.push(("names/plugin.cfg".into(), manifest_of("example.names")));
+    let e = Package::read_all(&zipped(&broken)).unwrap_err().to_string();
+    assert_eq!(e, "names: its entry main.luau is not in it");
 }
 
 /// Everything under `dir`, as paths from it, sorted.
@@ -102,7 +138,7 @@ fn a_plugin_installs_from_its_archive_and_again_over_itself() {
             "example.tag-conventions/rules.luau".to_string(),
         ]
     );
-    assert_eq!(inspect(&installed, Rc::new(Quiet)).unwrap(), Vec::<String>::new());
+    assert_eq!(inspect(&installed, Rc::new(TestHost::default())).unwrap(), Vec::<String>::new());
     assert_eq!(discover(&plugins).len(), 1);
 
     // Again: only when told to replace it, and then all of it (a file
@@ -204,12 +240,12 @@ fn what_is_no_plugin_or_not_safe_is_refused() {
     assert_eq!(with("Main.luau", b"x"), "it has \"Main.luau\" twice");
     assert_eq!(with("rules.luau/more.luau", b"x"), "\"rules.luau\" is a file and a folder in it");
 
-    // Several plugins, a manifest for another API, one that is not text.
+    // One plugin twice, a manifest for another API, one that is not text.
     let mut two = plugin_under("one/", &fixture("plugin.cfg"));
     two.extend(plugin_under("two/", &fixture("plugin.cfg")));
     assert_eq!(
         refusal(&zipped(&two)),
-        "it holds several plugins (one, two): install each from an archive of its own"
+        "it holds the plugin example.tag-conventions twice (1.0.0 and 1.0.0)"
     );
     let other = String::from_utf8(fixture("plugin.cfg")).unwrap().replace("\"0.4\"", "\"7.0\"");
     let e = refusal(&zipped(&plugin_under("", other.as_bytes())));
@@ -356,7 +392,7 @@ fn a_packed_plugin_installs_as_itself() {
     );
     let plugins = dir.join("plugins");
     let installed = package.install(&plugins, false).unwrap();
-    assert_eq!(inspect(&installed, Rc::new(Quiet)).unwrap(), Vec::<String>::new());
+    assert_eq!(inspect(&installed, Rc::new(TestHost::default())).unwrap(), Vec::<String>::new());
     for file in ["plugin.cfg", "main.luau", "rules.luau"] {
         assert_eq!(std::fs::read(installed.dir.join(file)).unwrap(), fixture(file), "{file}");
     }
@@ -373,7 +409,7 @@ fn a_packed_plugin_installs_as_itself() {
 fn an_archive_s_code_is_checked_without_unpacking() {
     // (Its main.luau requires rules.luau: from the archive too.)
     let good = Package::read(&zipped(&plugin_under("", &fixture("plugin.cfg")))).unwrap();
-    assert_eq!(good.inspect(Rc::new(Quiet)).unwrap(), Vec::<String>::new());
+    assert_eq!(good.inspect(Rc::new(TestHost::default())).unwrap(), Vec::<String>::new());
 
     let broken = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/broken");
     let files: Vec<(String, Vec<u8>)> = ["plugin.cfg", "main.luau"]
@@ -381,14 +417,16 @@ fn an_archive_s_code_is_checked_without_unpacking() {
         .map(|f| (format!("broken/{f}"), std::fs::read(broken.join(f)).unwrap()))
         .collect();
     let package = Package::read(&zipped(&files)).unwrap();
-    let from_folder = inspect(&Plugin::load(&broken).unwrap(), Rc::new(Quiet)).unwrap();
+    let from_folder =
+        inspect(&Plugin::load(&broken).unwrap(), Rc::new(TestHost::default())).unwrap();
     assert_eq!(from_folder.len(), 4);
-    assert_eq!(package.inspect(Rc::new(Quiet)).unwrap(), from_folder);
+    assert_eq!(package.inspect(Rc::new(TestHost::default())).unwrap(), from_folder);
 
     // Code that does not load is an error that names the script.
     let mut files = plugin_under("", &fixture("plugin.cfg"));
     files[2].1 = b"this is not Luau".to_vec();
-    let e = Package::read(&zipped(&files)).unwrap().inspect(Rc::new(Quiet)).unwrap_err();
+    let e =
+        Package::read(&zipped(&files)).unwrap().inspect(Rc::new(TestHost::default())).unwrap_err();
     assert!(e.to_string().contains("rules.luau"), "{e}");
 }
 
@@ -427,4 +465,34 @@ fn only_what_was_installed_from_an_archive_is_removed() {
         assert!(!link.exists());
         assert!(kept.dir.join("main.luau").is_file());
     }
+}
+
+/// An installed plugin's code digest is a project's of the same files, and
+/// follows its folder: a file edited by hand is other code.
+#[test]
+fn an_installed_plugin_s_code_digest_is_its_folder_s() {
+    let dir = mg_testkit::scratch_dir("plugin-code-digest");
+    for file in ["plugin.cfg", "main.luau", "rules.luau"] {
+        std::fs::write(dir.join(file), fixture(file)).unwrap();
+    }
+    let installed = Plugin::load(&dir).unwrap();
+    let project = Plugin::load_project(&dir).unwrap();
+    assert_eq!(installed.digest(), None);
+    let digest = installed.code_digest().unwrap();
+    assert!(digest.starts_with("sha256:"), "{digest}");
+    assert_eq!(Some(digest.as_str()), project.digest());
+    assert_eq!(project.code_digest().as_deref(), project.digest());
+    // A test of its author's is not its code.
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(dir.join("tests/a.luau"), "-- a test").unwrap();
+    assert_eq!(installed.code_digest().unwrap(), digest);
+    // Edited by hand under the same version: another digest; the project's
+    // copy, read before, keeps its own.
+    let code = String::from_utf8(fixture("main.luau")).unwrap();
+    std::fs::write(dir.join("main.luau"), format!("{code}\n-- edited\n")).unwrap();
+    assert_ne!(installed.code_digest().unwrap(), digest);
+    assert_eq!(project.code_digest().unwrap(), digest);
+    // Its folder gone: none.
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(installed.code_digest(), None);
 }

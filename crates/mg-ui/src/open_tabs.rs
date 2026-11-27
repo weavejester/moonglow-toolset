@@ -2,8 +2,8 @@
 //! Open a module with the tabs it had): the areas, scripts, blueprints,
 //! conversations, side editors and tools that were open when it was
 //! closed open again with it, in their order and their places (the
-//! middle, the palettes' pane, a pane split off the middle, a window of
-//! their own where it was, split as it was), each pane's tab in front in
+//! middle, a pane split off the middle, a window of their own where it
+//! was, split as it was), each pane's tab in front in
 //! front, and each view as it was left: an area's camera, a model view's,
 //! a script's scroll and cursor, a conversation's selected line,
 //! bookmarks and folded branches, a Properties window's page, a hak's
@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::dialog_view::{DialogView, Row};
 use crate::references::Query;
 use crate::table_view::Home;
-use crate::{Action, Moonglow, Place, Side, Tab, tabs, trace};
+use crate::{Action, Moonglow, Place, Tab, tabs, trace};
 
 /// A module's tabs as they are kept.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -52,6 +52,13 @@ struct Record {
     /// finds each again in its area's list if the list changed since.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     objects: BTreeMap<String, Placed>,
+    /// Whether its windows' rectangles were taken with the theme's rows
+    /// (22 points): absent (false) in a record from before the theme,
+    /// whose windows' heights are made as much taller as their kind's
+    /// windows are now as it is read (`Tab::taller`), once; this version
+    /// writes it. (4.1.0 passes over it.)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    rects_scaled: bool,
 }
 
 /// A pane's tabs (a window's: all its panes'), as [`Moonglow::tab_text`]
@@ -59,8 +66,10 @@ struct Record {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct Pane {
-    /// `middle`, `palettes`, `split left 300` (the side of the middle, and
-    /// thousandths of the two) or `window`.
+    /// `middle`, `split left 300` (the side of the middle, and thousandths
+    /// of the two) or `window`. (`palettes`, the palettes' pane's, written
+    /// before they were the Right Dock's panel, is read as "where its kind
+    /// opens".)
     place: String,
     tabs: Vec<String>,
     /// The tab in front.
@@ -184,6 +193,12 @@ enum Want {
     References(Option<Query>),
     /// Tile Properties of these tiles (by index in the area's tile list).
     TileProperties(ResRef, Vec<usize>),
+    /// The Talk Table tab showing the game's `dialog.tlk`: a record of
+    /// U17's own tab for it (`game-talk-table`), which the owner's ruling
+    /// folded into the Talk Table tab. Nothing writes it now: the tab
+    /// remembers it showed `dialog.tlk` no more than a file it showed by
+    /// Open File….
+    GameTalk,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,22 +228,20 @@ struct Pending {
     views: BTreeMap<String, View>,
 }
 
-/// Tile Properties waiting for its area's view, to open where it was.
+/// An older record's Tile Properties tab, waiting for its area's view:
+/// its tiles (by index in the area's tile list) selected in Select Tiles
+/// then ([`Moonglow::tiles_again`]).
 #[derive(Debug, Clone)]
 struct TilesWaiting {
     area: ResRef,
     tiles: Vec<usize>,
-    place: Option<Place>,
-    rect: Option<egui::Rect>,
-    /// The tabs it was beside: it joins the first that is open.
-    beside: Vec<String>,
 }
 
 /// The open module's tabs as kept and as they are now.
 #[derive(Debug, Default)]
 pub(crate) struct OpenTabs {
     /// The tabs kept, to open once the module's first frame has drawn
-    /// its panes (the palettes' among them), the one in front, and what
+    /// its panes, the one in front, and what
     /// the views showed and the placed objects were.
     pending: Option<Pending>,
     /// What the views opened again showed, until each is first drawn and
@@ -281,6 +294,11 @@ impl View {
     /// A script's scroll and cursor kept.
     pub(crate) fn script(&self) -> (Option<egui::Vec2>, Option<(usize, usize)>) {
         (self.scroll.map(|[x, y]| egui::vec2(x, y)), self.cursor.map(|[a, b]| (a, b)))
+    }
+
+    /// The page kept (a NUI source group's switch: M4's U19).
+    pub(crate) fn page(&self) -> Option<&str> {
+        self.page.as_deref()
     }
 
     /// The talk table's line kept.
@@ -348,6 +366,11 @@ fn parse_path(text: &str) -> Option<GffPath> {
     steps.collect::<Option<Vec<_>>>().map(GffPath)
 }
 
+/// An object placed in an area, as `area:path`.
+fn object_text(area: ResRef, path: &GffPath) -> String {
+    format!("{area}:{}", path_text(path))
+}
+
 /// An `area:path` key of the objects kept, its path in the one form (a
 /// file 3.1.0 and before wrote has them as they wrote paths).
 fn object_key(text: &str) -> String {
@@ -405,14 +428,12 @@ fn parse_row(text: &str) -> Option<Row> {
 }
 
 /// How a tab that is a [`Tab`] as it is, is kept; `None` for those that
-/// are not: the start page, the pane that says no area is open, the
-/// palettes (shown or folded away as they were left, for every module),
-/// what shows the result of a search, and those whose text needs the app
+/// are not: the start page, the pane that says no area is open, what
+/// shows the result of a search, and those whose text needs the app
 /// ([`Moonglow::tab_text`]).
 fn plain_text(tab: &Tab) -> Option<String> {
     Some(match tab {
         Tab::ModuleProperties => "module-properties".into(),
-        Tab::Resources => "resources".into(),
         Tab::Factions => "factions".into(),
         Tab::Journal => "journal".into(),
         Tab::TalkTable => "talk-table".into(),
@@ -420,8 +441,10 @@ fn plain_text(tab: &Tab) -> Option<String> {
         Tab::AdvancedSearch => "advanced-search".into(),
         Tab::Options => "options".into(),
         Tab::PlaceableGallery => "placeable-gallery".into(),
+        Tab::Plugins => "plugins".into(),
         Tab::Script(k) => format!("script:{}", key_text(k)),
         Tab::Nui(k) => format!("nui:{}", key_text(k)),
+        Tab::NuiSource(k) => format!("nui-source:{}", key_text(k)),
         Tab::Gff(k) => format!("gff:{}", key_text(k)),
         Tab::Dialog(k) => format!("dialog:{}", key_text(k)),
         Tab::Resource(k) => format!("resource:{}", key_text(k)),
@@ -437,18 +460,32 @@ fn plain_text(tab: &Tab) -> Option<String> {
         Tab::InstanceModel { area, path } => {
             format!("instance-model:{area}:{}", path_text(path))
         }
-        Tab::Instances { area, paths } => format!("instances:{area}:{}", list(paths, path_text)),
+        // (Of one area as before; of several, each object its area's.)
+        Tab::Instances { objects } => match Tab::one_area(objects) {
+            Some(area) => format!("instances:{area}:{}", list(objects, |(_, p)| path_text(p))),
+            None => format!("instances-of-areas:{}", list(objects, |(a, p)| object_text(*a, p))),
+        },
         Tab::Tile { tileset, tile } => format!("tile:{tileset}:{tile}"),
+        Tab::PluginPanel { plugin, panel } => format!("plugin-panel:{plugin}/{panel}"),
         Tab::Welcome
         | Tab::NoArea
-        | Tab::Palette
-        | Tab::TileProperties
         | Tab::References
         | Tab::Hak(_)
         | Tab::Table(_)
         | Tab::Tileset(_) => return None,
     })
 }
+
+/// How the resource browser's tab was kept, before the browser was the
+/// Left Dock's Resources panel (the redesign's M3 T4): a record that has
+/// it shows the panel ([`Moonglow::read_open_tabs`]); nothing writes it.
+const RESOURCES_TAB: &str = "resources";
+
+/// The palettes' tab, before the palettes were the Right Dock's Palette
+/// panel (M3 T5). No Moonglow wrote it (the palettes were shown or folded
+/// for every module, not kept with a module's tabs); a record that has it
+/// shows the panel all the same, and nothing writes it.
+const PALETTE_TAB: &str = "palette";
 
 /// The tab a text names.
 fn parse_tab(text: &str) -> Option<Want> {
@@ -460,16 +497,24 @@ fn parse_tab(text: &str) -> Option<Want> {
     let file = |rest: &str| (!rest.is_empty()).then(|| PathBuf::from(rest));
     Some(Want::Tab(match kind {
         "module-properties" => Tab::ModuleProperties,
-        "resources" => Tab::Resources,
         "factions" => Tab::Factions,
         "journal" => Tab::Journal,
         "talk-table" => Tab::TalkTable,
+        // (The game's dialog.tlk in a tab of its own, as U17 first kept it
+        // until the owner's ruling: the Talk Table tab, showing it.)
+        "game-talk-table" => return Some(Want::GameTalk),
         "manual" => Tab::Manual,
         "advanced-search" => Tab::AdvancedSearch,
         "options" => Tab::Options,
         "placeable-gallery" => Tab::PlaceableGallery,
+        "plugins" => Tab::Plugins,
+        "plugin-panel" => {
+            let (plugin, panel) = rest.split_once('/')?;
+            Tab::PluginPanel { plugin: plugin.to_string(), panel: panel.to_string() }
+        }
         "script" => Tab::Script(parse_key(rest)?),
         "nui" => Tab::Nui(parse_key(rest)?),
+        "nui-source" => Tab::NuiSource(parse_key(rest)?),
         "gff" => Tab::Gff(parse_key(rest)?),
         "dialog" => Tab::Dialog(parse_key(rest)?),
         "resource" => Tab::Resource(parse_key(rest)?),
@@ -497,8 +542,15 @@ fn parse_tab(text: &str) -> Option<Want> {
         }
         "instances" => {
             let (area, paths) = area_and(rest)?;
-            Tab::Instances { area, paths: parse_list(&paths, parse_path)? }
+            Tab::instances(area, parse_list(&paths, parse_path)?)
         }
+        "instances-of-areas" => Tab::Instances {
+            objects: parse_list(rest, |o| {
+                let (area, path) = area_and(o)?;
+                Some((area, parse_path(&path)?))
+            })?
+            .into(),
+        },
         "tile" => {
             let (tileset, tile) = area_and(rest)?;
             Tab::Tile { tileset, tile: tile.parse().ok()? }
@@ -529,43 +581,14 @@ fn parse_tab(text: &str) -> Option<Want> {
     }))
 }
 
-fn place_text(place: Place) -> String {
-    match place {
-        Place::Window => "window".into(),
-        Place::Middle => "middle".into(),
-        Place::Palettes => "palettes".into(),
-        Place::Split(side, share) => format!("split {} {share}", side.name()),
-    }
-}
-
-fn parse_place(text: &str) -> Option<Place> {
-    let mut words = text.split_whitespace();
-    Some(match (words.next()?, words.next()) {
-        ("window", None) => Place::Window,
-        ("middle", None) => Place::Middle,
-        ("palettes", None) => Place::Palettes,
-        ("split", Some(side)) => {
-            let side = match side {
-                "left" => Side::Left,
-                "right" => Side::Right,
-                "above" => Side::Above,
-                "below" => Side::Below,
-                _ => return None,
-            };
-            Place::Split(side, words.next()?.parse::<u16>().ok()?.clamp(50, 950))
-        }
-        _ => return None,
-    })
-}
-
 /// A placed object as it is found again (`None`: a list of no kind of
 /// object, found by its place alone).
 fn placed(list: &str, index: usize, s: &mg_gff::Struct) -> Option<Placed> {
     let kind = mg_area::ObjectKind::from_list(list)?;
     let at = mg_area::AreaObject::placed(kind, index, s).position;
     Some(Placed {
-        tag: String::from_utf8_lossy(s.string("Tag").unwrap_or_default()).into_owned(),
-        resref: s.resref("TemplateResRef").map(|r| r.to_string()).unwrap_or_default(),
+        tag: crate::text::decode(s.string("Tag").unwrap_or_default()),
+        resref: s.resref(kind.resref_field()).map(|r| r.to_string()).unwrap_or_default(),
         at: at.to_array(),
     })
 }
@@ -582,9 +605,18 @@ fn found_again(git: &mg_gff::Gff, path: &GffPath, kept: Option<&Placed>) -> Opti
     };
     let items = git.root.list(list)?;
     let near = |a: &[f32; 3], b: &[f32; 3]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.01);
+    // (A record written before 5.2.0 kept the tag read as UTF-8 and the
+    // blueprint as `TemplateResRef`, empty for a store: taken as well.)
+    let old = |s: &mg_gff::Struct| {
+        let tag = String::from_utf8_lossy(s.string("Tag").unwrap_or_default()).into_owned();
+        (tag, s.resref("TemplateResRef").map(|r| r.to_string()).unwrap_or_default())
+    };
     let like = |i: usize, exact: bool| {
         placed(list, i, &items[i]).is_some_and(|p| {
-            p.tag == kept.tag && p.resref == kept.resref && (!exact || near(&p.at, &kept.at))
+            let (old_tag, old_resref) = old(&items[i]);
+            (p.tag == kept.tag || old_tag == kept.tag)
+                && (p.resref == kept.resref || old_resref == kept.resref)
+                && (!exact || near(&p.at, &kept.at))
         })
     };
     let item = |i: usize| Some(GffPath::root().item(list, i));
@@ -727,10 +759,6 @@ impl Moonglow {
                 Some(Query::Tag(t)) => format!("references:tag:{t}"),
                 Some(Query::StrRef(n)) => format!("references:strref:{n}"),
             },
-            Tab::TileProperties => {
-                let p = self.tile_props.as_ref()?;
-                format!("tile-properties:{}:{}", p.area, list(&p.tiles, |t| t.to_string()))
-            }
             tab => plain_text(tab)?,
         })
     }
@@ -749,6 +777,7 @@ impl Moonglow {
             Want::Table(TableAt::File(path) | TableAt::Hak(path, _)) => return path.is_file(),
             Want::References(_) => return true,
             Want::TileProperties(a, _) => return area(a),
+            Want::GameTalk => return true,
             Want::Tab(tab) => tab,
         };
         match tab {
@@ -767,15 +796,18 @@ impl Moonglow {
             }
             Tab::Blueprints(keys) => keys.iter().all(|k| module.contains(k)),
             Tab::AreasProperties(areas) => areas.iter().all(area),
+            // (A plugin's panel, while its plugin runs.)
+            Tab::PluginPanel { plugin, panel } => self.enabled_plugins().iter().any(|p| {
+                p.manifest.id == *plugin && p.manifest.panels.iter().any(|d| d.id == *panel)
+            }),
             // (Found again when the record is read: `read_open_tabs`.)
-            Tab::Instance { area: a, .. }
-            | Tab::InstanceModel { area: a, .. }
-            | Tab::Instances { area: a, .. } => area(a),
+            Tab::Instance { area: a, .. } | Tab::InstanceModel { area: a, .. } => area(a),
+            Tab::Instances { objects } => objects.iter().all(|(a, _)| area(a)),
             tab => tab.renamable().is_none_or(|k| module.contains(&k)),
         }
     }
 
-    /// A placed object's tab with its objects found again in their area
+    /// A placed object's tab with its objects found again in their areas
     /// (`None`: one of them is not there now), and what each was, by its
     /// path now, into `found`.
     fn instance_again(
@@ -784,27 +816,35 @@ impl Moonglow {
         objects: &BTreeMap<String, Placed>,
         found: &mut Vec<((ResRef, GffPath), Placed)>,
     ) -> Option<Tab> {
-        let (area, paths) = match &tab {
+        let places: Vec<(ResRef, GffPath)> = match &tab {
             Tab::Instance { area, path } | Tab::InstanceModel { area, path } => {
-                (*area, std::slice::from_ref(path))
+                vec![(*area, path.clone())]
             }
-            Tab::Instances { area, paths } => (*area, paths.as_slice()),
+            Tab::Instances { objects } => objects.to_vec(),
             _ => return Some(tab),
         };
         let ws = self.ws.as_ref()?;
-        let git = ws.module.gff(&ResKey::new(area, ResType::GIT))?.ok()?;
-        let kept = |p: &GffPath| objects.get(&format!("{area}:{}", path_text(p)));
-        let again: Vec<GffPath> =
-            paths.iter().map(|p| found_again(&git, p, kept(p))).collect::<Option<_>>()?;
-        for (was, now) in paths.iter().zip(&again) {
-            if let Some(p) = kept(was) {
-                found.push(((area, now.clone()), p.clone()));
+        let mut gits = BTreeMap::new();
+        let mut again: Vec<(ResRef, GffPath)> = Vec::new();
+        let mut known = Vec::new();
+        for (area, p) in &places {
+            if !gits.contains_key(area) {
+                gits.insert(*area, ws.module.gff(&ResKey::new(*area, ResType::GIT))?.ok()?);
             }
+            let kept = objects.get(&object_text(*area, p));
+            let now = found_again(&gits[area], p, kept)?;
+            if let Some(o) = kept {
+                known.push(((*area, now.clone()), o.clone()));
+            }
+            again.push((*area, now));
         }
+        // (Only once every one of them is found again.)
+        found.extend(known);
+        let (area, first) = again[0].clone();
         Some(match tab {
-            Tab::Instance { .. } => Tab::Instance { area, path: again[0].clone() },
-            Tab::InstanceModel { .. } => Tab::InstanceModel { area, path: again[0].clone() },
-            _ => Tab::Instances { area, paths: again },
+            Tab::Instance { .. } => Tab::Instance { area, path: first },
+            Tab::InstanceModel { .. } => Tab::InstanceModel { area, path: first },
+            _ => Tab::Instances { objects: again.into() },
         })
     }
 
@@ -827,7 +867,20 @@ impl Moonglow {
         let kept: BTreeMap<String, Placed> =
             record.objects.into_iter().map(|(k, p)| (object_key(&k), p)).collect();
         let mut objects = Vec::new();
+        // (The resource browser, a tab before it was the Left Dock's
+        // Resources panel: the panel shown, the tab never kept again.)
+        let mut resources = false;
+        // (And the palettes', the Palette panel.)
+        let mut palette = false;
         let mut found = |text: &str| -> Option<(String, Want)> {
+            if text == RESOURCES_TAB {
+                resources = true;
+                return None;
+            }
+            if text == PALETTE_TAB {
+                palette = true;
+                return None;
+            }
             let passed = |why: &str| trace::note(format!("open tabs: {text} passed over: {why}"));
             let Some(want) = parse_tab(text) else {
                 passed("not understood");
@@ -852,7 +905,9 @@ impl Moonglow {
         };
         // (Each kept text, as it is named now.)
         let mut renamed: HashMap<String, String> = HashMap::new();
-        let mut panes = Vec::new();
+        // (Every pane's tabs found first: the middle's pane's tree of the
+        // editor groups names the other groups' tabs.)
+        let mut found_tabs = Vec::new();
         for pane in &record.panes {
             let mut tabs = Vec::new();
             for text in &pane.tabs {
@@ -861,9 +916,12 @@ impl Moonglow {
                     tabs.push((now, want));
                 }
             }
-            if tabs.is_empty() {
-                continue;
+            if !tabs.is_empty() {
+                found_tabs.push((pane, tabs));
             }
+        }
+        let mut panes = Vec::new();
+        for (pane, tabs) in found_tabs {
             let rename = |t: &Option<String>| t.as_ref().and_then(|t| renamed.get(t)).cloned();
             let mut split = pane.split.clone();
             fn rename_split(s: &mut Split, renamed: &HashMap<String, String>) {
@@ -874,11 +932,29 @@ impl Moonglow {
             if let Some(s) = &mut split {
                 rename_split(s, &renamed);
             }
-            let rect = pane
-                .rect
-                .map(|[x, y, w, h]| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)));
+            // (A record from before the theme: the window as much taller as
+            // its first tab's kind's are now, once, as the remembered sizes
+            // are: `Settings::scale_window_sizes`.)
+            let taller = match (record.rects_scaled, tabs.first()) {
+                (false, Some((_, Want::Tab(tab)))) => tab.taller(),
+                _ => 1.0,
+            };
+            let rect = pane.rect.map(|[x, y, w, h]| {
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, (h * taller).round()))
+            });
             let active = rename(&pane.active);
-            panes.push(Kept { place: parse_place(&pane.place), tabs, active, rect, split });
+            panes.push(Kept { place: Place::parse(&pane.place), tabs, active, rect, split });
+        }
+        // (The record says which panel each dock had in front, never how
+        // the builder left the dock: its fold, `hide_tree` and
+        // `hide_palettes`, stands, as do a narrow window's yields. The
+        // Right Dock on the Palette is not asked for by name: it is drawn
+        // as the active editor has it, beside an area.)
+        if resources {
+            self.left_panel = crate::Panel::Resources;
+        }
+        if palette {
+            self.right_panel = Some(crate::Panel::Palette);
         }
         if panes.is_empty() {
             return false;
@@ -908,6 +984,11 @@ impl Moonglow {
         let git = |a: &ResRef| ResKey::new(*a, ResType::GIT);
         let are = |a: &ResRef| ResKey::new(*a, ResType::ARE);
         match tab {
+            // (A NUI designer's source group: its switch, M4's U19.)
+            Tab::NuiSource(k) => {
+                let page = crate::nui_view::source::switch_name(self.nui_views.get(k)?);
+                Some(View { page: Some(page.to_string()), ..Default::default() })
+            }
             Tab::Area(r) => {
                 let view = self.area_views.get(r)?;
                 let o = view.orbit?;
@@ -940,9 +1021,12 @@ impl Moonglow {
             Tab::Blueprint(k) => page(*k, GffPath::root()),
             Tab::Blueprints(keys) => page(*keys.first()?, GffPath::root()),
             Tab::Instance { area, path } => page(git(area), path.clone()),
-            Tab::Instances { area, paths } => page(git(area), paths.first()?.clone()),
+            Tab::Instances { objects } => {
+                let (area, first) = objects.first()?;
+                page(git(area), first.clone())
+            }
             Tab::AreaProperties(r) => page(are(r), GffPath::root()),
-            Tab::AreasProperties(rs) => page(are(rs.first()?), GffPath::root().field("several")),
+            Tab::AreasProperties(rs) => page(are(rs.first()?), crate::area_props::several_page(rs)),
             Tab::TalkTable => {
                 Some(View { line: Some(self.talk_view.selected?), ..Default::default() })
             }
@@ -991,16 +1075,18 @@ impl Moonglow {
     /// The placed objects a tab shows, as they are found again (by
     /// `area:path`).
     fn objects_of(&self, tab: &Tab, into: &mut BTreeMap<String, Placed>) {
-        let (area, paths) = match tab {
+        let places: Vec<(ResRef, GffPath)> = match tab {
             Tab::Instance { area, path } | Tab::InstanceModel { area, path } => {
-                (*area, std::slice::from_ref(path))
+                vec![(*area, path.clone())]
             }
-            Tab::Instances { area, paths } => (*area, paths.as_slice()),
+            Tab::Instances { objects } => objects.to_vec(),
             _ => return,
         };
-        // (The area as it is edited, if it was read; else as it was kept.)
-        let git = (self.ws.as_ref()).and_then(|ws| ws.loaded(&ResKey::new(area, ResType::GIT)));
-        for path in paths {
+        for (area, path) in &places {
+            let area = *area;
+            // (The area as it is edited, if it was read; else as it was
+            // kept.)
+            let git = (self.ws.as_ref()).and_then(|ws| ws.loaded(&ResKey::new(area, ResType::GIT)));
             let now = match (git, path.0.as_slice()) {
                 (Some(git), [Step::Item(list, index)]) => git
                     .root
@@ -1011,7 +1097,7 @@ impl Moonglow {
                 (None, _) => self.open_tabs.objects.get(&(area, path.clone())).cloned(),
             };
             if let Some(p) = now {
-                into.insert(format!("{area}:{}", path_text(path)), p);
+                into.insert(object_text(area, path), p);
             }
         }
     }
@@ -1056,32 +1142,36 @@ impl Moonglow {
                 // not the order egui_dock's tree has its leaves in.)
                 let tabs = split.as_ref().map_or(tabs, Split::flat);
                 windows.push((path.surface, panes.len()));
-                panes.push(Pane { place: place_text(Place::Window), tabs, active, rect, split });
+                panes.push(Pane { place: Place::Window.text(), tabs, active, rect, split });
                 continue;
             }
-            let place = if leaf.tabs.contains(&Tab::Palette) {
-                Place::Palettes
-            } else {
-                self.split_of(path.node).unwrap_or(Place::Middle)
-            };
-            panes.push(Pane { place: place_text(place), tabs, active, ..Default::default() });
+            let place = self.split_of(path.node).unwrap_or(Place::Middle);
+            panes.push(Pane { place: place.text(), tabs, active, ..Default::default() });
         }
-        // Tile Properties still waiting for its area's view (its tab not
-        // shown since the module opened): kept as it was read, beside the
-        // tabs it was kept with, else where it was.
-        if let Some(w) = &self.open_tabs.tiles {
+        // The editor groups as they lie, on the middle's pane, where there
+        // are two or more: each group has its place too (`split right
+        // 500`), which an older Moonglow reads, and which is the whole of it
+        // for two groups; the tree keeps three or more in their order.
+        if self.editor_groups().len() > 1
+            && let Some(middle) = panes.iter_mut().find(|p| p.place == Place::Middle.text())
+        {
+            middle.split = split_of(self, self.dock.main_surface(), NodeIndex::root())
+                .filter(|s| !s.parts.is_empty());
+        }
+        // An older record's Tile Properties still waiting for its area's
+        // view (`tiles_again`): kept as it was read, in a pane of its own,
+        // until the area is drawn; not once the area has gone from the
+        // module (deleted since: written back for ever, else).
+        let area_kept = |a: ResRef| {
+            self.ws.as_ref().is_some_and(|ws| ws.module.contains(&ResKey::new(a, ResType::ARE)))
+        };
+        if let Some(w) = self.open_tabs.tiles.as_ref().filter(|w| area_kept(w.area)) {
             let text = format!("tile-properties:{}:{}", w.area, list(&w.tiles, |t| t.to_string()));
-            let beside =
-                |p: &&mut Pane| p.split.is_none() && w.beside.iter().any(|b| p.tabs.contains(b));
-            match panes.iter_mut().find(beside) {
-                Some(p) => p.tabs.push(text),
-                None => panes.push(Pane {
-                    place: place_text(w.place.unwrap_or(Place::Window)),
-                    tabs: vec![text],
-                    rect: w.rect.map(|r| [r.left(), r.top(), r.width(), r.height()]),
-                    ..Default::default()
-                }),
-            }
+            panes.push(Pane {
+                place: Place::Window.text(),
+                tabs: vec![text],
+                ..Default::default()
+            });
         }
         let pane = focused.or_else(|| self.tab_pane());
         let leaf = pane.and_then(|p| self.dock.leaf(p).ok());
@@ -1094,7 +1184,7 @@ impl Moonglow {
             }
             self.objects_of(tab, &mut objects);
         }
-        Record { panes, front, views, objects }
+        Record { panes, front, views, objects, rects_scaled: true }
     }
 
     /// Writes the open module's tabs, if they are kept and changed since
@@ -1109,31 +1199,26 @@ impl Moonglow {
             return;
         }
         // (Whole or not at all: written beside it, then put in its place.)
-        let partial = path.with_extension("json.partial");
-        let written = (path.parent().map_or(Ok(()), std::fs::create_dir_all))
-            .and_then(|()| std::fs::write(&partial, &text))
-            .and_then(|()| std::fs::rename(&partial, &path));
+        let written = mg_module::write_replacing_one_of_many(&path, text.as_bytes());
         match written {
-            Ok(()) => trace::note(format!("open tabs written: {}", path.display())),
+            Ok(()) => {
+                trace::note(format!("open tabs written: {}", path.display()));
+                self.open_tabs.told = false;
+                self.open_tabs.written = Some(text);
+            }
             Err(e) if !std::mem::replace(&mut self.open_tabs.told, true) => self.log.warn(format!(
                 "The open tabs could not be kept for the next time: {}: {e}",
                 path.display()
             )),
             Err(_) => {}
         }
-        self.open_tabs.written = Some(text);
     }
 
     /// At the end of each frame: the kept tabs opened, at the module's
-    /// first; then, the tabs written whenever they change, and a second
-    /// after the windows were last moved or resized.
+    /// first; then the tabs written a second after they last changed or
+    /// the windows were last moved or resized (at once the first time,
+    /// and on Close, Open Module and Exit, which write what is pending).
     pub(crate) fn open_tabs_frame(&mut self, ctx: &egui::Context) {
-        // (Not in the frame a module was opened in from a menu: its
-        // palettes' pane opens at the next, as the module tree shows.)
-        if self.open_tabs.pending.is_some() && self.open_palette && self.ws.is_some() {
-            ctx.request_repaint();
-            return;
-        }
         if let Some(Pending { panes, front, views }) = self.open_tabs.pending.take() {
             if self.ws.is_some() {
                 self.restore_tabs(panes, front, views);
@@ -1153,17 +1238,29 @@ impl Moonglow {
         }
         self.dock.focused_leaf().map(|p| (p.surface.0, p.node.0)).hash(&mut h);
         let shape = h.finish();
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        let mut places: Vec<[i32; 4]> = (self.windows.iter())
-            .map(|(t, w)| self.maximized.get(t).map_or(w.now, |m| m.0))
-            .map(|r| [r.left(), r.top(), r.width(), r.height()].map(|v| v.round() as i32))
-            .collect();
-        places.sort_unstable();
-        places.hash(&mut h);
-        let places = h.finish();
+        let places = if self.windows.is_empty() {
+            0
+        } else {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut places: Vec<[i32; 4]> = (self.windows.iter())
+                .map(|(t, w)| self.maximized.get(t).map_or(w.now, |m| m.0))
+                .map(|r| [r.left(), r.top(), r.width(), r.height()].map(|v| v.round() as i32))
+                .collect();
+            places.sort_unstable();
+            places.hash(&mut h);
+            h.finish()
+        };
         let now = ctx.input(|i| i.time);
         if std::mem::replace(&mut self.open_tabs.shape, shape) != shape {
-            self.keep_open_tabs();
+            // Establish initial snapshot immediately when none exists yet; once
+            // written, debounce interactive tab switches on the same 1.0s timer
+            // as window moves (flushed synchronously on Close/OpenModule/Exit).
+            if self.open_tabs.written.is_none() {
+                self.keep_open_tabs();
+            } else {
+                self.open_tabs.moved = Some(now);
+                ctx.request_repaint_after_secs(1.0);
+            }
         } else if std::mem::replace(&mut self.open_tabs.places, places) != places {
             self.open_tabs.moved = Some(now);
             ctx.request_repaint_after_secs(1.0);
@@ -1171,7 +1268,7 @@ impl Moonglow {
             // (Asked for again until it is due: a frame may come a little
             // early.)
             match 1.0 - (now - moved) {
-                left if left > 0.0 => ctx.request_repaint_after_secs(left as f32),
+                left if left > 0.0 => crate::jobs::repaint_in(ctx, left),
                 _ => {
                     self.open_tabs.moved = None;
                     self.keep_open_tabs();
@@ -1217,6 +1314,11 @@ impl Moonglow {
                 Some(Tab::References)
             }
             Want::TileProperties(..) => None,
+            Want::GameTalk => {
+                // (Without the game's data, the module's table alone.)
+                let _ = crate::talk_view::game_table(self);
+                Some(Tab::TalkTable)
+            }
         };
         self.actions.truncate(asked);
         tab
@@ -1232,11 +1334,7 @@ impl Moonglow {
         active: Option<Tab>,
         split: Option<Laid>,
     ) {
-        let palette = self.dock.find_tab(&Tab::Palette).map(|p| (p.surface, p.node));
-        let middle = |app: &Moonglow| {
-            (app.dock.iter_leaves().map(|(p, _)| p))
-                .find(|p| p.surface.is_main() && Some((p.surface, p.node)) != palette)
-        };
+        let middle = |app: &Moonglow| app.middle_pane();
         let pane_of = |app: &Moonglow, tab: &Tab| {
             app.dock.find_tab(tab).map(|p| NodePath { surface: p.surface, node: p.node })
         };
@@ -1246,7 +1344,6 @@ impl Moonglow {
             Some(Place::Middle) => (self.dock.find_tab(&Tab::NoArea))
                 .map(|p| NodePath { surface: p.surface, node: p.node })
                 .or_else(|| middle(self)),
-            Some(Place::Palettes) => pane_of(self, &Tab::Palette),
             Some(Place::Split(side, share)) => self.split_middle(side, share, &first),
             Some(Place::Window) => {
                 // (Its panes as they were, if all their tabs are to come.)
@@ -1309,17 +1406,22 @@ impl Moonglow {
         front: Option<String>,
         mut views: BTreeMap<String, View>,
     ) {
-        let palette = self.dock.find_tab(&Tab::Palette).map(|p| (p.surface, p.node));
         // (The pane that says no area is open keeps the middle's place
         // while they come, and goes once they have: `keep_middle`.)
-        let middle = (self.dock.iter_leaves().map(|(p, _)| p))
-            .find(|p| p.surface.is_main() && Some((p.surface, p.node)) != palette);
+        let middle = self.middle_pane();
         if self.dock.find_tab(&Tab::NoArea).is_none()
             && let Some(at) = middle
         {
             self.dock.set_focused_node_and_surface(at);
             self.dock.push_to_focused_leaf(Tab::NoArea);
         }
+        // (A side editor's tab open already, a hak opened with the module
+        // say, is not the module's to close: back below, if it is not
+        // among those kept.)
+        let side: Vec<Tab> = (self.dock.iter_all_tabs())
+            .map(|(_, t)| t.clone())
+            .filter(|t| crate::side_doc::is_side(t) && self.side_doc(t).is_some())
+            .collect();
         tabs::close_tabs(&mut self.dock, |t| *t != Tab::ModuleProperties);
         // The side editors' files opened first (a 2DA of a hak's needs the
         // hak open), each tab by its text.
@@ -1327,19 +1429,39 @@ impl Moonglow {
         for pane in &panes {
             for (text, want) in &pane.tabs {
                 if let Want::TileProperties(area, tiles) = want {
-                    self.open_tabs.tiles = Some(TilesWaiting {
-                        area: *area,
-                        tiles: tiles.clone(),
-                        place: pane.place,
-                        rect: pane.rect,
-                        beside: pane.tabs.iter().map(|(t, _)| t.clone()).collect(),
-                    });
+                    let tiles = tiles.clone();
+                    self.open_tabs.tiles = Some(TilesWaiting { area: *area, tiles });
                     continue;
                 }
                 match self.open_kept(want.clone()) {
                     Some(tab) => _ = opened.insert(text.clone(), tab),
                     None => trace::note(format!("open tabs: {text} passed over: not opened")),
                 }
+            }
+        }
+        // The editor groups laid out first, as they lay, from the middle's
+        // tree where the record has one (where the pane that says no area
+        // is open holds the middle's place): the groups' own places then
+        // find their tabs placed. (Module Properties, docked as the module
+        // opened, goes where the tree has it.)
+        let groups = (panes.iter())
+            .find(|p| p.place == Some(Place::Middle))
+            .and_then(|p| p.split.as_ref())
+            .and_then(|s| Laid::of(s, &opened));
+        if let Some(groups) = groups {
+            for tab in groups.tabs() {
+                if let Some(path) = self.dock.find_tab(&tab) {
+                    self.dock.remove_tab(path);
+                }
+            }
+            let at = (self.dock.find_tab(&Tab::NoArea))
+                .map(|p| NodePath { surface: p.surface, node: p.node })
+                .or_else(|| self.middle_pane())
+                .filter(|p| p.surface.is_main());
+            if let Some(at) = at {
+                self.dock.set_focused_node_and_surface(at);
+                self.dock.push_to_focused_leaf(groups.first().clone());
+                groups.build(self.dock.main_surface_mut(), at.node);
             }
         }
         for pane in panes {
@@ -1349,6 +1471,29 @@ impl Moonglow {
             let split = pane.split.as_ref().and_then(|s| Laid::of(s, &opened));
             self.place_pane(pane.place, pane.rect, tabs, active, split);
         }
+        for tab in side {
+            if self.dock.find_tab(&tab).is_none() {
+                self.dock.main_surface_mut().push_to_first_leaf(tab);
+            }
+        }
+        // (A NUI designer's source kept without its design: opened as Split
+        // source opens it, the design first. M4's U19 review.)
+        let alone: Vec<ResKey> = (self.dock.iter_all_tabs())
+            .filter_map(|(_, t)| match t {
+                Tab::NuiSource(k) => Some(*k),
+                _ => None,
+            })
+            .filter(|k| self.dock.find_tab(&Tab::Nui(*k)).is_none())
+            .collect();
+        for key in alone {
+            if let Some(path) = self.dock.find_tab(&Tab::NuiSource(key)) {
+                self.dock.remove_tab(path);
+            }
+            self.actions.push(crate::Action::NuiSource(key, true));
+        }
+        // (A side editor's changed document whose tab was closed above, not
+        // among those kept: its tab, rather than none to save it from.)
+        self.side_docs_follow_tabs();
         // What the views showed: the conversations' and the pages of
         // Module Properties and the Options now, the rest as each is
         // first drawn.
@@ -1400,6 +1545,13 @@ impl Moonglow {
                 tab => _ = self.open_tabs.views.insert(tab.clone(), view),
             }
         }
+        // (The main surface's pane with the focus, whose tab in front is the
+        // active editor that the docks follow: the middle's, not the pane
+        // made last; the tab in front, where it is in the main surface,
+        // takes it to its own.)
+        if let Some(middle) = self.middle_pane() {
+            self.dock.main_surface_mut().set_focused_node(middle.node);
+        }
         if let Some(front) = front.and_then(|t| opened.get(&t).cloned()) {
             self.show_tab(front);
         }
@@ -1427,39 +1579,34 @@ impl Moonglow {
         self.open_tabs.views.insert(Tab::Dialog(key), view.clone());
     }
 
-    /// Tile Properties opened again once its area's view has its tiles:
-    /// on the tiles it was of, where it was.
+    /// A record from before Tile Properties was a panel (M4's U5) that
+    /// kept its tab, once its area's view has its tiles: Select Tiles on
+    /// in the area, those of the tiles it was of that the area still has
+    /// selected, and the Right Dock's Tile Properties panel shown (its
+    /// header toggle turned on), as the tile menu's Tile Properties
+    /// does. Nothing else opens. (Records written since keep no such tab.)
     fn tiles_again(&mut self) {
         let Some(w) = &self.open_tabs.tiles else { return };
         let area = w.area;
-        let ready = self.area_views.get(&area).and_then(|v| v.model.as_ref().map(|m| m.width));
-        let (Some(width), true) =
-            (ready, self.area_views.get(&area).is_some_and(|v| v.terrain.is_some()))
-        else {
-            return;
-        };
+        let ready = (self.area_views.get(&area))
+            .filter(|v| v.terrain.is_some())
+            .and_then(|v| v.model.as_ref().map(|m| (m.width, m.height)));
+        let Some((width, height)) = ready else { return };
         let Some(w) = self.open_tabs.tiles.take() else { return };
-        let cells: Vec<(u32, u32)> =
-            w.tiles.iter().map(|&i| (i as u32 % width.max(1), i as u32 / width.max(1))).collect();
+        let width = width.max(1);
+        let cells: Vec<(u32, u32)> = (w.tiles.iter())
+            .filter_map(|&i| u32::try_from(i).ok())
+            .map(|i| (i % width, i / width))
+            .filter(|&(_, y)| y < height)
+            .collect();
+        if cells.is_empty() {
+            return;
+        }
+        // (As the tile menu's Tile Properties shows them: the panel shown
+        // whatever its header toggle said.)
         if let Some(mut view) = self.area_views.remove(&area) {
             crate::tile_select::properties_of(self, &mut view, &cells);
             self.area_views.insert(area, view);
-        }
-        if self.tile_props.is_none() || self.dock.find_tab(&Tab::TileProperties).is_some() {
-            return;
-        }
-        let beside = (w.beside.iter())
-            .filter_map(|t| {
-                (self.dock.iter_all_tabs()).find(|(_, tab)| self.tab_text(tab).as_ref() == Some(t))
-            })
-            .map(|(p, _)| NodePath { surface: p.surface, node: p.node })
-            .next();
-        match beside {
-            Some(at) => {
-                self.dock.set_focused_node_and_surface(at);
-                self.dock.push_to_focused_leaf(Tab::TileProperties);
-            }
-            None => self.place_pane(w.place, w.rect, vec![Tab::TileProperties], None, None),
         }
     }
 }
@@ -1467,6 +1614,7 @@ impl Moonglow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Side;
 
     #[test]
     fn tabs_are_named_and_read_back() {
@@ -1477,6 +1625,7 @@ mod tests {
             Tab::ModuleProperties,
             Tab::Options,
             Tab::PlaceableGallery,
+            Tab::Plugins,
             Tab::Script(key("hello.nss")),
             Tab::Blueprint(key("nw_chest.utp")),
             Tab::Blueprints(vec![key("a.uti"), key("b.uti")]),
@@ -1486,16 +1635,27 @@ mod tests {
             Tab::AreasProperties(vec![area, ResRef::from_str("cave").unwrap()]),
             Tab::Instance { area, path: path.clone() },
             Tab::InstanceModel { area, path: path.clone() },
-            Tab::Instances { area, paths: vec![path, GffPath::root().item("Door List", 0)] },
+            Tab::instances(area, vec![path.clone(), GffPath::root().item("Door List", 0)]),
+            // (Of several areas, each object its area's: a held item too.)
+            Tab::Instances {
+                objects: std::sync::Arc::from([
+                    (area, path.clone()),
+                    (ResRef::from_str("cave").unwrap(), path.item("ItemList", 2)),
+                ]),
+            },
             Tab::Tile { tileset: ResRef::from_str("ttr01").unwrap(), tile: 12 },
         ];
         for tab in tabs {
             let text = plain_text(&tab).unwrap();
             assert_eq!(parse_tab(&text), Some(Want::Tab(tab)), "{text}");
         }
-        assert_eq!(plain_text(&Tab::Palette), None);
         assert_eq!(parse_tab("script:"), None);
         assert_eq!(parse_tab("something-new:x"), None);
+        // (The resource browser's tab of before: not a tab now, the
+        // Resources panel shown by `read_open_tabs`.)
+        assert_eq!(parse_tab(RESOURCES_TAB), None);
+        // (Nor the palettes': the Palette panel shown.)
+        assert_eq!(parse_tab(PALETTE_TAB), None);
         // The side editors' files, and what the tools showed.
         let wants = [
             ("hak:/x/my.hak", Want::Hak("/x/my.hak".into())),
@@ -1519,12 +1679,14 @@ mod tests {
 
     #[test]
     fn places_are_named_and_read_back() {
-        for place in [Place::Window, Place::Middle, Place::Palettes, Place::Split(Side::Above, 300)]
-        {
-            assert_eq!(parse_place(&place_text(place)), Some(place));
+        for place in [Place::Window, Place::Middle, Place::Split(Side::Above, 300)] {
+            assert_eq!(Place::parse(&place.text()), Some(place));
         }
-        assert_eq!(parse_place("split sideways 300"), None);
-        assert_eq!(parse_place("split left 2000"), Some(Place::Split(Side::Left, 950)));
+        // (The palettes' pane, a place before the palettes were the Right
+        // Dock's panel: no place now, "where its kind opens".)
+        assert_eq!(Place::parse("palettes"), None);
+        assert_eq!(Place::parse("split sideways 300"), None);
+        assert_eq!(Place::parse("split left 2000"), Some(Place::Split(Side::Left, 950)));
     }
 
     #[test]
@@ -1546,5 +1708,66 @@ mod tests {
         let r: Record = serde_json::from_str(old).unwrap();
         assert_eq!(r.panes[0].tabs, ["script:a.nss"]);
         assert!(r.views.is_empty() && r.objects.is_empty() && r.panes[0].split.is_none());
+    }
+
+    #[test]
+    fn placed_store_reads_resref_and_decodes_tag() {
+        let mut s = mg_gff::Struct::new(0);
+        s.set("ResRef", mg_gff::Value::ResRef(b"shop_01".to_vec()));
+        s.set("Tag", mg_gff::Value::String(b"Caf\xe9".to_vec()));
+        s.set("XPosition", mg_gff::Value::Float(1.0));
+        s.set("YPosition", mg_gff::Value::Float(2.0));
+        s.set("ZPosition", mg_gff::Value::Float(3.0));
+        let p = placed("StoreList", 0, &s).expect("store placed");
+        assert_eq!(p.resref, "shop_01");
+        assert_eq!(p.tag, crate::text::decode(b"Caf\xe9"));
+        assert!(!p.tag.contains('\u{fffd}'), "{:?}", p.tag);
+    }
+
+    #[test]
+    fn keep_open_tabs_write_failure_does_not_cache_written() {
+        let dir = mg_testkit::scratch_dir("ui-open-tabs-write-fail");
+        let blocker = dir.join("not_a_dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut m = mg_module::Module::new();
+        let m_path = dir.join("m.mod");
+        m.save_as(&mg_module::ModuleLocation::Archive(m_path.clone())).unwrap();
+
+        let mut app = Moonglow::new(None, Box::new(crate::NoDialogs::default()));
+        app.open_module(&m_path);
+        app.open_tabs_dir = Some(blocker);
+        app.open_tabs.written = None;
+        app.open_tabs.told = false;
+        app.keep_open_tabs();
+
+        assert!(app.open_tabs.written.is_none());
+        assert!(app.open_tabs.told);
+    }
+
+    /// A kept tab's object recorded before 5.2.0 (the tag read as UTF-8, a
+    /// store's blueprint kept empty) is found again.
+    #[test]
+    fn an_object_kept_in_the_old_form_is_found_again() {
+        let mut s = mg_gff::Struct::new(0);
+        s.set("ResRef", mg_gff::Value::ResRef(b"shop_01".to_vec()));
+        s.set("Tag", mg_gff::Value::String(b"Caf\xe9".to_vec()));
+        s.set("XPosition", mg_gff::Value::Float(1.0));
+        s.set("YPosition", mg_gff::Value::Float(2.0));
+        let mut git = mg_gff::Gff::new(*b"GIT ");
+        git.root.set("StoreList", mg_gff::Value::List(vec![s]));
+        let path = GffPath::root().item("StoreList", 0);
+        let at = placed("StoreList", 0, &git.root.list("StoreList").unwrap()[0]).unwrap().at;
+        let kept = Placed {
+            tag: String::from_utf8_lossy(b"Caf\xe9").into_owned(),
+            resref: String::new(),
+            at,
+        };
+        assert_eq!(found_again(&git, &path, Some(&kept)), Some(path.clone()));
+        // And as 5.2.0 keeps it.
+        let now = placed("StoreList", 0, &git.root.list("StoreList").unwrap()[0]).unwrap();
+        assert_eq!(found_again(&git, &path, Some(&now)), Some(path.clone()));
+        // Another object's record is not.
+        let other = Placed { tag: "Other".into(), resref: String::new(), at };
+        assert_eq!(found_again(&git, &path, Some(&other)), None);
     }
 }

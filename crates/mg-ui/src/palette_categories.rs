@@ -11,13 +11,16 @@
 //! module's blueprints are in moves them to another, chosen, with the
 //! window's OK: one step to undo, with the skeleton.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use egui::Ui;
 use mg_gff::{Gff, Struct};
 use mg_module::palette::{self, BlueprintKind, NodePath};
 use mg_resman::ResKey;
 
+use mg_core::StrRef;
+
+use crate::talk_view::Pending;
 use crate::{Action, Moonglow};
 
 /// The Palette Categories window's state.
@@ -42,6 +45,10 @@ pub struct PaletteCategories {
     /// A category the module's blueprints are in, asked about before it
     /// is removed.
     removing: Option<Removing>,
+    /// Names moved to the talk table (Move Name to Talk Table), added at
+    /// OK where a node still names them: added at the click, Cancel left
+    /// them in the table, named by nothing.
+    pending: Pending,
 }
 
 /// A removal waiting for the category its blueprints go to.
@@ -81,46 +88,85 @@ pub(crate) fn open(app: &mut Moonglow, kind: BlueprintKind) {
                 changed: false,
                 moves: BTreeMap::new(),
                 removing: None,
+                pending: Pending::default(),
             });
         }
         Err(e) => app.log.error(format!("Palette categories: {e}")),
     }
 }
 
-/// A node's name as shown.
-fn name_of(app: &Moonglow, node: &Struct) -> String {
+/// A node's name as shown (`pending`: the lines on their way to the talk
+/// table, by their text).
+fn name_of(app: &Moonglow, pending: &Pending, node: &Struct) -> String {
     // (As the game reads text in its language; UTF-8 as Moonglow wrote
     // names before 1.19.4.)
     let codepage = app.game.as_deref().map_or_else(Default::default, |g| g.codepage());
-    let text = |label: &str| node.string(label).map(|t| palette::text_of(t, codepage));
-    let named = text("NAME").or_else(|| {
-        let strref = u32::try_from(node.integer("STRREF")?).ok()?;
-        app.game.as_deref()?.string(mg_core::StrRef(strref))
-    });
-    let strref = || Some(format!("(StrRef {})", node.integer("STRREF")?));
-    named.or_else(|| text("DELETE_ME")).or_else(strref).unwrap_or_default()
+    // (By the one reading of a node's name, Aurora's: its STRREF before a
+    // NAME written out, `palette::node_name`. This read the NAME first.)
+    match palette::node_name(node) {
+        palette::PaletteName::Text(t) => palette::text_of(&t, codepage),
+        palette::PaletteName::StrRef(r) => (pending.text(r).map(str::to_string))
+            .or_else(|| app.game.as_deref()?.string(StrRef(r)))
+            .unwrap_or_else(|| format!("(StrRef {r})")),
+    }
 }
 
 /// The skeleton's categories (not groups), each by its name and the
 /// groups it is in: what blueprints can be put in.
-fn categories(app: &Moonglow, skeleton: &Gff) -> Vec<(u8, String)> {
-    fn walk(app: &Moonglow, list: &[Struct], within: &str, out: &mut Vec<(u8, String)>) {
+fn categories(app: &Moonglow, pending: &Pending, skeleton: &Gff) -> Vec<(u8, String)> {
+    type Out = Vec<(u8, String)>;
+    fn walk(app: &Moonglow, p: &Pending, list: &[Struct], within: &str, out: &mut Out) {
         for node in list.iter().filter(|n| !palette::is_placeholder(n)) {
             let name = match within {
-                "" => name_of(app, node),
-                g => format!("{g} › {}", name_of(app, node)),
+                "" => name_of(app, p, node),
+                g => format!("{g} › {}", name_of(app, p, node)),
             };
             if let Some(id) = node.integer("ID").and_then(|i| u8::try_from(i).ok()) {
                 out.push((id, name.clone()));
             }
             if let Some(children) = node.list("LIST") {
-                walk(app, children, &name, out);
+                walk(app, p, children, &name, out);
             }
         }
     }
     let mut out = Vec::new();
-    walk(app, skeleton.root.list("MAIN").unwrap_or(&[]), "", &mut out);
+    walk(app, pending, skeleton.root.list("MAIN").unwrap_or(&[]), "", &mut out);
     out
+}
+
+/// Every talk-table string the skeleton's nodes are named by.
+fn strrefs(skeleton: &Gff) -> BTreeSet<u32> {
+    fn walk(list: &[Struct], out: &mut BTreeSet<u32>) {
+        for node in list {
+            if let palette::PaletteName::StrRef(r) = palette::node_name(node) {
+                out.insert(r);
+            }
+            walk(node.list("LIST").unwrap_or(&[]), out);
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(skeleton.root.list("MAIN").unwrap_or(&[]), &mut out);
+    out
+}
+
+/// Names each node named by a StrRef of `took`'s first by its second
+/// instead (a line that took another number than it was shown with).
+fn renumber(skeleton: &mut Gff, took: &[(StrRef, StrRef)]) {
+    fn walk(list: &mut [Struct], took: &[(StrRef, StrRef)]) {
+        for node in list {
+            if let palette::PaletteName::StrRef(r) = palette::node_name(node)
+                && let Some((_, to)) = took.iter().find(|(shown, _)| shown.0 == r)
+            {
+                node.set("STRREF", mg_gff::Value::Dword(to.0));
+            }
+            if let Some(children) = node.list_mut("LIST") {
+                walk(children, took);
+            }
+        }
+    }
+    if let Some(main) = skeleton.root.list_mut("MAIN") {
+        walk(main, took);
+    }
 }
 
 /// The module's blueprints in the categories `ids` once the window's OK
@@ -145,8 +191,10 @@ struct Drop {
 /// The skeleton's tree: each node a row, the one chosen highlighted. A row
 /// is dragged onto another to move it: on a row's upper half, before it;
 /// on its lower half, after it, or into it if it is a group.
+#[allow(clippy::too_many_arguments)]
 fn rows(
     app: &Moonglow,
+    pending: &Pending,
     ui: &mut Ui,
     list: &[Struct],
     at: &mut NodePath,
@@ -159,7 +207,7 @@ fn rows(
             continue;
         }
         at.push(i);
-        let shown = name_of(app, node);
+        let shown = name_of(app, pending, node);
         let children = node.list("LIST");
         let group = node.integer("ID").is_none();
         let label = match node.integer("ID") {
@@ -196,7 +244,7 @@ fn rows(
         }
         if let Some(children) = children {
             ui.indent(("palette-category", at.clone()), |ui| {
-                rows(app, ui, children, at, selected, name, drop);
+                rows(app, pending, ui, children, at, selected, name, drop);
             });
         }
         at.pop();
@@ -250,11 +298,12 @@ fn node<'a>(skeleton: &'a Gff, path: &[usize]) -> Option<&'a Struct> {
 pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
     let Some(mut w) = app.palette_categories.take() else { return };
     let mut open = true;
-    let mut done = None;
     let title = format!("Palette Categories: {}", w.kind.label());
-    let window =
-        crate::widgets::dialog(ctx, &title, &mut open).default_width(420.0).collapsible(false);
-    window.show(ctx, |ui| {
+    let window = crate::widgets::dialog(ctx, &title, &mut open)
+        .default_width(420.0)
+        .resizable(false)
+        .collapsible(false);
+    let footed = window.show_foot(ctx, |ui| {
         ui.label(if w.own {
             "This module's own categories, kept in the module."
         } else {
@@ -262,9 +311,11 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         });
         ui.weak("Drag a row to move it: before or after another, or into a group.");
         egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
+            mg_uikit::list_rows(ui);
             let list = w.skeleton.root.list("MAIN").unwrap_or(&[]).to_vec();
             let (mut at, mut drop) = (Vec::new(), None);
-            rows(app, ui, &list, &mut at, &mut w.selected, &mut w.name, &mut drop);
+            let p = &w.pending;
+            rows(app, p, ui, &list, &mut at, &mut w.selected, &mut w.name, &mut drop);
             scroll_while_dragging(ui);
             if let Some(d) = drop {
                 match palette::move_category(&mut w.skeleton, &d.from, &d.parent, d.index) {
@@ -294,7 +345,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             crate::widgets::field_label(ui, "Name");
             ui.add(
-                egui::TextEdit::singleline(&mut w.name)
+                mg_uikit::text_field(&mut w.name)
                     .desired_width(220.0)
                     .hint_text("a category's or group's name"),
             );
@@ -346,13 +397,16 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             crate::widgets::field_label(ui, "StrRef");
             ui.add(
-                egui::TextEdit::singleline(&mut w.strref)
+                mg_uikit::text_field(&mut w.strref)
                     .desired_width(100.0)
                     .hint_text("a talk-table line"),
             );
             let typed = w.strref.trim().parse::<u32>().ok();
-            if let Some(text) = typed.and_then(|n| app.game.as_deref()?.string(mg_core::StrRef(n)))
-            {
+            let text = typed.and_then(|n| {
+                let pending = w.pending.text(n).map(|t| format!("{t} (added with OK)"));
+                pending.or_else(|| app.game.as_deref()?.string(StrRef(n)))
+            });
+            if let Some(text) = text {
                 ui.weak(text);
             }
             if ui
@@ -361,8 +415,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     egui::Button::new("Name by StrRef"),
                 )
                 .on_hover_text(
-                    "Names the one chosen by that talk-table line, as the game's own categories \
-                     are: each player sees it in their language",
+                    "Name the one chosen by that talk-table line, shown in each player's language",
                 )
                 .clicked()
                 && let (Some(path), Some(n)) = (&chosen, typed)
@@ -377,13 +430,9 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                 chosen.is_some() && movable && !w.name.trim().is_empty(),
                 egui::Button::new("Move Name to Talk Table"),
             )
-            .on_hover_text(
-                "Adds the name typed to the module's talk table as a new line, and names the one \
-                 chosen by it: translate the line in the talk table's other languages",
-            )
+            .on_hover_text("Name the one chosen by a new talk-table line, added with OK")
             .on_disabled_hover_text(
-                "Needs the module's own talk table (Module Properties › Custom Content), a name \
-                 typed and one chosen",
+                "Needs the module's own talk table, a name typed and one chosen",
             )
             .clicked()
             && let Some(path) = &chosen
@@ -394,13 +443,10 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                 sound: String::new(),
                 sound_length: 0.0,
             };
-            result = Some(match crate::talk_view::add_line(app, &line) {
+            // (Added at OK, where a node still names it.)
+            result = Some(match w.pending.push(app, line) {
                 Ok(strref) => {
                     w.strref = strref.0.to_string();
-                    app.log.info(format!(
-                        "Added talk-table line {}; it's saved with the module",
-                        strref.0
-                    ));
                     palette::name_by_strref(&mut w.skeleton, path, strref.0)
                         .map(|()| Some(path.clone()))
                 }
@@ -425,7 +471,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         if let Some(r) = &mut w.removing {
             let n = r.blueprints.len();
             let s = if n == 1 { " is" } else { "s are" };
-            let left = categories(app, &r.without);
+            let left = categories(app, &w.pending, &r.without);
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(format!("{n} of the module's blueprint{s} in it. Move them to:"));
                 let shown =
@@ -435,6 +481,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
                     .width(260.0)
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
+                        mg_uikit::list_rows(ui);
                         for (id, name) in &left {
                             ui.selectable_value(&mut r.to, Some(*id), name);
                         }
@@ -468,27 +515,39 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
         if let Some(e) = &w.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.add_enabled(w.changed, egui::Button::new("OK")).clicked() {
-                done = Some(Done::Keep);
-            }
-            if crate::widgets::cancel(ui) {
-                done = Some(Done::Cancel);
-            }
-            if ui
-                .add_enabled(w.own, egui::Button::new("Use the Game's Categories"))
-                .on_hover_text(
-                    "Drop the module's own categories. Blueprints in a category the game \
-                         lacks leave the palette until given another",
-                )
-                .clicked()
-            {
-                done = Some(Done::Revert);
-            }
-        });
+        let foot = crate::widgets::Foot::new()
+            .main("OK", w.changed)
+            .button("Use the Game's Categories", w.own)
+            .tip(
+                "Drop the module's own categories. Blueprints in one the game lacks leave the \
+                 palette.",
+            )
+            .cancel();
+        ((), foot)
     });
+    let done = match &footed {
+        Some(f) if f.pressed.main() => Some(Done::Keep),
+        Some(f) if f.pressed.clicked("Use the Game's Categories") => Some(Done::Revert),
+        Some(f) if f.pressed.cancelled() => Some(Done::Cancel),
+        _ => None,
+    };
     let key = w.kind.skeleton_key();
+    // The names moved to the talk table that nodes still name are added
+    // now, each node named by the line it took. (Not added: the window
+    // stays, saying why.)
+    let mut stay = false;
+    let mut done = done;
+    if let Some(Done::Keep) = done
+        && !w.pending.is_empty()
+    {
+        let named = strrefs(&w.skeleton);
+        let (took, added) = w.pending.add(app, |s| named.contains(&s.0));
+        renumber(&mut w.skeleton, &took);
+        if let Err(e) = added {
+            w.error = Some(format!("Move to Talk Table: {e}"));
+            (done, stay) = (None, true);
+        }
+    }
     match done {
         Some(Done::Keep) => match w.skeleton.to_bytes() {
             Ok(data) => {
@@ -514,7 +573,7 @@ pub(crate) fn window(app: &mut Moonglow, ctx: &egui::Context) {
             app.actions.push(Action::Apply(command));
         }
         Some(Done::Cancel) => {}
-        None if open => app.palette_categories = Some(w),
+        None if open || stay => app.palette_categories = Some(w),
         None => {}
     }
 }
@@ -536,9 +595,46 @@ fn remove(app: &mut Moonglow, w: &mut PaletteCategories, path: &[usize]) -> Resu
         w.skeleton = trial;
         return Ok(true);
     }
-    if categories(app, &trial).is_empty() {
+    if categories(app, &w.pending, &trial).is_empty() {
         return Err("the module's blueprints are in it, and there is no other category".into());
     }
     w.removing = Some(Removing { without: trial, blueprints, to: None });
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mg_gff::Value;
+
+    /// The window names a node as every other reader of a palette does
+    /// (`palette::node_name`, Aurora's reading): by its STRREF before a
+    /// NAME written out. It read the NAME first (the review's B29).
+    #[test]
+    fn a_node_is_named_by_its_strref_before_its_name_written_out() {
+        let app = Moonglow::new(None, Box::new(crate::NoDialogs::default()));
+        let node = |fields: &[(&str, Value)]| {
+            let mut s = Struct::new(0);
+            for (label, value) in fields {
+                s.set(label, value.clone());
+            }
+            s
+        };
+        let text = |t: &str| Value::String(t.as_bytes().to_vec());
+        let both = node(&[("NAME", text("Sk")), ("STRREF", Value::Dword(6688))]);
+        let p = Pending::default();
+        assert_eq!(name_of(&app, &p, &both), "(StrRef 6688)", "no talk table here: the number");
+        assert_eq!(name_of(&app, &p, &node(&[("NAME", text("Named"))])), "Named");
+        assert_eq!(name_of(&app, &p, &node(&[("DELETE_ME", text("Older"))])), "Older");
+        let named = node(&[("NAME", text("Named")), ("DELETE_ME", text("Old"))]);
+        assert_eq!(name_of(&app, &p, &named), "Named");
+        for n in [&both, &named] {
+            let codepage = mg_core::Codepage::default();
+            let read = match palette::node_name(n) {
+                palette::PaletteName::Text(t) => palette::text_of(&t, codepage),
+                palette::PaletteName::StrRef(r) => format!("(StrRef {r})"),
+            };
+            assert_eq!(name_of(&app, &p, n), read, "as the one reading names it");
+        }
+    }
 }
